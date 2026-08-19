@@ -94,9 +94,17 @@ fn paint_row(bounds: Bounds<Pixels>, d: &RowDraw, window: &mut Window) {
     let mid = top + px(ROW_H / 2.0);
     let bot = top + px(ROW_H);
 
-    // Lanes that simply continue past this row, plus our own.
+    // Lanes that simply continue past this row, plus our own. These are
+    // straight verticals — i.e. rectangles. Painting them as quads instead of
+    // tessellated stroke paths is the single biggest win in this function:
+    // twelve quads cost a fraction of twelve paths, and with a 12-lane cap
+    // these dominate every frame.
     for &lane in std::iter::once(&d.lane).chain(&d.through) {
-        line(window, point(lane_x(lane), top), point(lane_x(lane), bot), lane_color(lane));
+        let x = lane_x(lane) - px(STROKE / 2.0);
+        window.paint_quad(fill(
+            Bounds::from_corners(point(x, top), point(x + px(STROKE), bot)),
+            lane_color(lane),
+        ));
     }
 
     // A merge commit forks a lane downward: out of the dot, then down.
@@ -110,15 +118,6 @@ fn paint_row(bounds: Bounds<Pixels>, d: &RowDraw, window: &mut Window) {
     }
 
     dot(window, lane_x(d.lane), mid, d.is_merge, lane_color(d.lane));
-}
-
-fn line(window: &mut Window, from: Point<Pixels>, to: Point<Pixels>, color: Rgba) {
-    let mut p = PathBuilder::stroke(px(STROKE));
-    p.move_to(from);
-    p.line_to(to);
-    if let Ok(path) = p.build() {
-        window.paint_path(path, color);
-    }
 }
 
 fn curve(window: &mut Window, from: Point<Pixels>, to: Point<Pixels>, ctrl: Point<Pixels>, color: Rgba) {

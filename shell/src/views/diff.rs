@@ -9,7 +9,7 @@
 
 use gpui::*;
 use gpui_component::scroll::Scrollbar;
-use plait_core::{intraline, parse_unified_diff, replace_pairs, LineKind, Span};
+use plait_core::{intraline, replace_pairs, FileDiff, LineKind, Span};
 use std::cell::Cell;
 use std::rc::Rc;
 
@@ -53,18 +53,7 @@ impl Diff {
 }
 
 impl Diff {
-    pub fn from_fixtures() -> Self {
-        let t = std::time::Instant::now();
-        // Git does not guarantee UTF-8 in commit metadata or file contents —
-        // real history carries Latin-1 author names and worse. Lossy decoding
-        // is correct here: never fail to show a repo over one bad byte.
-        let raw = String::from_utf8_lossy(&std::fs::read("fixtures/big.diff").unwrap_or_default()).into_owned();
-        let t_read = t.elapsed();
-
-        let t = std::time::Instant::now();
-        let files = parse_unified_diff(&raw);
-        let t_parse = t.elapsed();
-
+    pub fn new(files: Vec<FileDiff>) -> Self {
         let t = std::time::Instant::now();
         let mut intraline_time = std::time::Duration::ZERO;
         let mut rows = Vec::new();
@@ -115,8 +104,8 @@ impl Diff {
 
         let t_build = t.elapsed();
         let load = format!(
-            "{} rows · {} files · read {:.0?} parse {:.0?} build {:.0?} (intraline {:.0?})",
-            rows.len(), files.len(), t_read, t_parse, t_build, intraline_time
+            "{} rows · {} files · build {:.0?} (intraline {:.0?})",
+            rows.len(), files.len(), t_build, intraline_time
         );
         eprintln!("{load}");
         Self {

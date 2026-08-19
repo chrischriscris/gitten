@@ -5,6 +5,7 @@ mod views;
 use gpui::*;
 use gpui_component::*;
 use std::cell::Cell;
+use std::path::PathBuf;
 use std::rc::Rc;
 use stats::Stats;
 
@@ -13,9 +14,18 @@ static ALLOC: stats::Counting = stats::Counting;
 
 actions!(plait, [Quit]);
 
-/// The dev harness: a title strip, one view, and an optional stats overlay.
-/// Deliberately one-way — no view depends on anything in here, so each drops
-/// into a real pane unchanged when the layout gets assembled.
+const USAGE: &str = "\
+plait — a git client
+
+  plait commits [REPO] [LIMIT]     history graph      (default: . , 5000)
+  plait diff    [REPO] [REVSPEC]   a diff             (default: . , working tree)
+
+  REVSPEC is anything git takes:  HEAD~50..HEAD   main..feature   <sha>
+  Pass --fixtures instead of REPO to read fixtures/ instead of a repository.
+
+  PLAIT_STATS=1   frame, row and heap overlay
+";
+
 struct DevShell {
     title: SharedString,
     view: AnyView,
@@ -28,9 +38,6 @@ impl Render for DevShell {
             s.tick();
             (s.frames(), s.rows(), s.heap(), s.load.clone())
         });
-
-        // Force a continuous redraw loop so the frame numbers mean something.
-        // Only while the overlay is on: at rest GPUI draws nothing at all.
         if overlay.is_some() {
             window.request_animation_frame();
         }
@@ -76,18 +83,45 @@ impl Render for DevShell {
     }
 }
 
+enum Source {
+    Repo(PathBuf, String),
+    Fixtures,
+}
+
 fn main() {
-    let which = std::env::args().nth(1).unwrap_or_else(|| "commits".into());
-    let title = SharedString::from(format!(
-        "plait · {which}   —  arg: commits | diff   ·   PLAIT_STATS=1 for the overlay"
-    ));
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        print!("{USAGE}");
+        return;
+    }
+    let which = args.first().cloned().unwrap_or_else(|| "commits".into());
+    let source = match args.get(1).map(String::as_str) {
+        Some("--fixtures") => Source::Fixtures,
+        Some(path) => Source::Repo(PathBuf::from(path), args.get(2).cloned().unwrap_or_default()),
+        None => Source::Repo(PathBuf::from("."), args.get(2).cloned().unwrap_or_default()),
+    };
+
+    // Acquire before opening a window: a git error should print and exit, not
+    // flash an empty window and leave you guessing.
+    let loaded = load(&which, &source);
+    let (label, data) = match loaded {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("plait: {e}\n\n{USAGE}");
+            std::process::exit(1);
+        }
+    };
+
+    let build = if cfg!(debug_assertions) {
+        "  ·  DEBUG BUILD — timings meaningless, use --release"
+    } else {
+        ""
+    };
+    let title = SharedString::from(format!("plait · {which} · {label}{build}"));
 
     let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
     app.run(move |cx| {
         gpui_component::init(cx);
-
-        // A non-bundled binary has no application menu, so nothing is wired to
-        // the standard Quit. Register the action, the keystroke and a menu.
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
         cx.set_menus(vec![Menu {
@@ -95,44 +129,78 @@ fn main() {
             items: vec![MenuItem::action("Quit", Quit)],
             disabled: false,
         }]);
-
-        // Closing the last window should end the process. macOS keeps appless
-        // processes alive by convention; for a dev binary that just leaves
-        // orphans behind every time you hit the red button.
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();
             }
         })
         .detach();
+
         cx.spawn(async move |cx| {
             cx.open_window(WindowOptions::default(), |window, cx| {
-                // Each view owns its own counters; we only read them.
                 let (view, rendered, total, load): (AnyView, Rc<Cell<usize>>, usize, String) =
-                    match which.as_str() {
-                        "diff" => {
-                            let e = cx.new(|_| views::diff::Diff::from_fixtures());
+                    match data {
+                        Data::Commits(commits) => {
+                            let e = cx.new(|_| views::commits::Commits::new(commits));
                             let v = e.read(cx);
                             (e.clone().into(), v.rendered.clone(), v.total(), v.load.clone())
                         }
-                        _ => {
-                            let e = cx.new(|_| views::commits::Commits::from_fixtures());
+                        Data::Diff(files) => {
+                            let e = cx.new(|_| views::diff::Diff::new(files));
                             let v = e.read(cx);
                             (e.clone().into(), v.rendered.clone(), v.total(), v.load.clone())
                         }
                     };
-
                 let stats = stats::enabled().then(|| Stats::new(rendered, total, load));
                 let shell = cx.new(|_| DevShell { title, view, stats });
                 cx.new(|cx| Root::new(shell, window, cx))
             })
             .expect("failed to open window");
-
-            // A bare binary launched from a terminal is not an .app bundle, so
-            // macOS treats it as a background process and the window opens
-            // behind whatever you were doing. Ask for the foreground explicitly.
             cx.update(|cx| cx.activate(true));
         })
         .detach();
     });
+}
+
+enum Data {
+    Commits(Vec<plait_core::Commit>),
+    Diff(Vec<plait_core::FileDiff>),
+}
+
+fn read_fixture(path: &str) -> String {
+    // Git guarantees no encoding; never fail over one bad byte.
+    String::from_utf8_lossy(&std::fs::read(path).unwrap_or_default()).into_owned()
+}
+
+fn load(which: &str, source: &Source) -> Result<(String, Data), String> {
+    match (which, source) {
+        ("diff", Source::Repo(repo, revspec)) => {
+            let files = plait_git::diff(repo, revspec)?;
+            if files.is_empty() {
+                return Err(format!(
+                    "no changes for {:?} {}",
+                    repo,
+                    if revspec.is_empty() { "(working tree)" } else { revspec }
+                ));
+            }
+            let label = format!("{} {}", plait_git::describe(repo), revspec);
+            Ok((label.trim().into(), Data::Diff(files)))
+        }
+        ("diff", Source::Fixtures) => Ok((
+            "fixtures".into(),
+            Data::Diff(plait_core::parse_unified_diff(&read_fixture("fixtures/big.diff"))),
+        )),
+        (_, Source::Repo(repo, limit)) => {
+            let n = limit.parse().unwrap_or(5000);
+            let commits = plait_git::log(repo, n)?;
+            if commits.is_empty() {
+                return Err(format!("no commits in {repo:?}"));
+            }
+            Ok((plait_git::describe(repo), Data::Commits(commits)))
+        }
+        (_, Source::Fixtures) => Ok((
+            "fixtures".into(),
+            Data::Commits(plait_core::parse_log(&read_fixture("fixtures/log.txt"))),
+        )),
+    }
 }

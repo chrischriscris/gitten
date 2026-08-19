@@ -4812,6 +4812,13 @@ name = "plait-core"
 version = "0.0.0"
 
 [[package]]
+name = "plait-git"
+version = "0.0.0"
+dependencies = [
+ "plait-core",
+]
+
+[[package]]
 name = "plait-shell"
 version = "0.0.0"
 dependencies = [
@@ -4821,6 +4828,7 @@ dependencies = [
  "gpui-component-assets",
  "gpui_platform",
  "plait-core",
+ "plait-git",
 ]
 
 [[package]]

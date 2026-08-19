@@ -24,6 +24,11 @@ implementation, three doors.
 
 ## Git
 
+`plait-git` is the acquisition layer — the only crate that talks to a repository.
+`core` stays pure and does no I/O; `shell` does no I/O either. Both views take
+already-loaded data, which is also why they are trivial to test and to drop into
+a pane.
+
 **Reads through `gix`** — status, log, diff, graph traversal. These run on every
 keystroke; no process spawn on the hot path.
 
@@ -55,7 +60,9 @@ Cache diffs by blob OID. They never change.
     ./check.sh                          # everything headless: tests + every fixture
     cargo test -p plait-core            # just correctness, sub-second
     cargo build --release -p plait-shell
-    ./target/release/plait-shell [commits|diff]
+    ./target/release/plait-shell commits [REPO] [LIMIT]
+    ./target/release/plait-shell diff    [REPO] [REVSPEC]
+    ./target/release/plait-shell diff --fixtures        # read fixtures/ instead
     PLAIT_STATS=1 ./target/release/plait-shell diff     # frame/heap overlay
 
 The overlay forces a redraw every frame so the fps number means something —
@@ -70,7 +77,10 @@ hand over the command.
 `rust-toolchain.toml` tracks the channel Zed pins. When GPUI fails with an
 unstable-feature error, that pin has drifted — go read Zed's `rust-toolchain.toml`.
 
-Never judge performance on a debug build. GPUI debug is not representative.
+Never judge performance on a debug build — `cargo run` without `--release` is a
+different, much slower binary, and the title bar says so. `[profile.dev.package."*"]
+opt-level = 3` optimizes dependencies in dev builds so `cargo run` is at least
+usable; our own crates stay unoptimized and debuggable.
 
 Fixtures: `./fixtures/dump.sh <repo> [count]` for real, `./fixtures/gen.sh <n> <m>`
 for synthetic at any scale. Use both — synthetic tests scale, real tests *shape*,

@@ -1,7 +1,7 @@
 use crate::graph;
 use gpui::*;
 use gpui_component::scroll::Scrollbar;
-use plait_core::{assign_lanes, parse_log, Commit};
+use plait_core::{assign_lanes, Commit};
 use std::cell::Cell;
 use std::rc::Rc;
 
@@ -31,18 +31,7 @@ impl Commits {
 }
 
 impl Commits {
-    pub fn from_fixtures() -> Self {
-        let t = std::time::Instant::now();
-        // Git does not guarantee UTF-8 in commit metadata or file contents —
-        // real history carries Latin-1 author names and worse. Lossy decoding
-        // is correct here: never fail to show a repo over one bad byte.
-        let raw = String::from_utf8_lossy(&std::fs::read("fixtures/log.txt").unwrap_or_default()).into_owned();
-        let t_read = t.elapsed();
-
-        let t = std::time::Instant::now();
-        let commits = parse_log(&raw);
-        let t_parse = t.elapsed();
-
+    pub fn new(commits: Vec<Commit>) -> Self {
         let t = std::time::Instant::now();
         let rows = assign_lanes(&commits);
         let t_lanes = t.elapsed();
@@ -60,10 +49,11 @@ impl Commits {
             .unwrap_or(0);
 
         let load = format!(
-            "{} commits · {} lanes · read {:.0?} parse {:.0?} lanes {:.0?} draws {:.0?}",
-            commits.len(), lanes, t_read, t_parse, t_lanes, t_draws
+            "{} commits · {} lanes · lanes {:.0?} draws {:.0?}",
+            commits.len(), lanes, t_lanes, t_draws
         );
         eprintln!("{load}");
+
         Self {
             data: Rc::new(Data { commits, draws, lanes, widest }),
             scroll: UniformListScrollHandle::new(),
