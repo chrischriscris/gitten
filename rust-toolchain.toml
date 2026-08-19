@@ -1,0 +1,6 @@
+# Must track the channel Zed pins in its own rust-toolchain.toml. A git
+# dependency does not inherit it, so GPUI fails to build on an older stable
+# with "unstable library feature `cold_path`". Bump this when Zed bumps theirs.
+[toolchain]
+channel = "1.97.1"
+profile = "minimal"

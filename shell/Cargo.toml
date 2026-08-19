@@ -1,0 +1,12 @@
+[package]
+name = "plait-shell"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+plait-core = { path = "../core" }
+gpui = { git = "https://github.com/zed-industries/zed" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
+gpui-component = { git = "https://github.com/longbridge/gpui-component" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
+anyhow = "1.0"

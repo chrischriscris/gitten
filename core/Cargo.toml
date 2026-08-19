@@ -1,0 +1,7 @@
+[package]
+name = "plait-core"
+version = "0.0.0"
+edition = "2021"
+
+# No dependencies, on purpose. Nothing in here may know a UI exists.
+[dependencies]

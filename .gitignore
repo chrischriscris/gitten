@@ -1,0 +1,9 @@
+/target
+
+# Generated and downloaded fixtures. All reproducible:
+#   ./fixtures/fetch.sh              real diffs + the bun tree
+#   ./fixtures/dump.sh <repo> [n]    from any local repo
+#   ./fixtures/gen.sh <n> <m>        synthetic, any scale
+/fixtures/*.txt
+/fixtures/*.diff
+/fixtures/real/
