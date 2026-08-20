@@ -36,6 +36,27 @@ fn main() {
         }
     }
     let intra = t.elapsed();
+
+    // The whole assembly the views use, in one call: clip, intraline, syntax.
+    let host = host::Host::new();
+    let t = Instant::now();
+    let p = prepared::prepare(&files, &host.syntax, 2000);
+    let build = t.elapsed();
+    let (mut tokens, mut bytes) = (0usize, 0usize);
+    for l in p.files.iter().flat_map(|f| &f.hunks).flat_map(|h| &h.lines) {
+        tokens += l.tokens.len();
+        bytes += l.text.len();
+    }
+
     println!("DIFF     {:>9} lines  {:>5} files  {} replace-pairs", nlines, files.len(), pairs);
     println!("  read {:>9.1?}   parse {:>9.1?}   intraline {:>9.1?}", read, parse, intra);
+    println!(
+        "  prepare {:>6.1?}   intraline {:>7.1?}  syntax {:>7.1?}  {} tokens  {:.1} MB scanned ({:.0} MB/s)",
+        build,
+        p.intraline,
+        p.syntax,
+        tokens,
+        bytes as f64 / 1e6,
+        (bytes as f64 / 1e6) / p.syntax.as_secs_f64()
+    );
 }

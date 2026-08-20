@@ -4,6 +4,7 @@ mod views;
 
 use gpui::*;
 use gpui_component::*;
+use plait_core::host::Host;
 use std::cell::Cell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -30,6 +31,7 @@ struct DevShell {
     title: SharedString,
     view: AnyView,
     stats: Option<Stats>,
+    host: Rc<Host>,
 }
 
 impl Render for DevShell {
@@ -42,11 +44,12 @@ impl Render for DevShell {
             window.request_animation_frame();
         }
 
+        let c = self.host.theme.chrome;
         div()
             .size_full()
             .v_flex()
-            .bg(rgb(graph::BG))
-            .text_color(rgb(0xe8e3dc))
+            .bg(rgb(c.bg))
+            .text_color(rgb(c.fg))
             .text_sm()
             .font_family("Menlo")
             .child(
@@ -56,8 +59,8 @@ impl Render for DevShell {
                     .items_center()
                     .h(px(32.))
                     .px_4()
-                    .bg(rgb(0x151312))
-                    .text_color(rgb(0x6e6862))
+                    .bg(rgb(c.title_bg))
+                    .text_color(rgb(c.dim))
                     .child(self.title.clone()),
             )
             .child(div().flex_grow(1.0).overflow_hidden().child(self.view.clone()))
@@ -68,17 +71,17 @@ impl Render for DevShell {
                     .px_4()
                     .py_2()
                     .gap_1()
-                    .bg(rgb(0x131211))
-                    .text_color(rgb(0x6e6862))
+                    .bg(rgb(c.status_bg))
+                    .text_color(rgb(c.dim))
                     .child(
                         div()
                             .flex()
                             .gap_6()
-                            .child(div().text_color(rgb(0xdfa851)).child(frames))
+                            .child(div().text_color(rgb(c.accent)).child(frames))
                             .child(rows)
                             .child(heap),
                     )
-                    .child(div().text_color(rgb(0x4a4540)).child(load))
+                    .child(div().text_color(rgb(c.faint)).child(load))
             }))
     }
 }
@@ -122,6 +125,11 @@ fn main() {
     let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
     app.run(move |cx| {
         gpui_component::init(cx);
+
+        // One host, built before any view exists: the highlighters, the theme,
+        // and whatever else becomes swappable later. An extension registering
+        // itself does it here, and every view reads the same struct.
+        let host = Rc::new(Host::new());
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
         cx.set_menus(vec![Menu {
@@ -137,22 +145,24 @@ fn main() {
         .detach();
 
         cx.spawn(async move |cx| {
-            cx.open_window(WindowOptions::default(), |window, cx| {
+            cx.open_window(WindowOptions::default(), move |window, cx| {
                 let (view, rendered, total, load): (AnyView, Rc<Cell<usize>>, usize, String) =
                     match data {
                         Data::Commits(commits) => {
-                            let e = cx.new(|_| views::commits::Commits::new(commits));
+                            let h = host.clone();
+                            let e = cx.new(|_| views::commits::Commits::new(commits, h));
                             let v = e.read(cx);
                             (e.clone().into(), v.rendered.clone(), v.total(), v.load.clone())
                         }
                         Data::Diff(files) => {
-                            let e = cx.new(|_| views::diff::Diff::new(files));
+                            let h = host.clone();
+                            let e = cx.new(|_| views::diff::Diff::new(files, h));
                             let v = e.read(cx);
                             (e.clone().into(), v.rendered.clone(), v.total(), v.load.clone())
                         }
                     };
                 let stats = stats::enabled().then(|| Stats::new(rendered, total, load));
-                let shell = cx.new(|_| DevShell { title, view, stats });
+                let shell = cx.new(|_| DevShell { title, view, stats, host });
                 cx.new(|cx| Root::new(shell, window, cx))
             })
             .expect("failed to open window");

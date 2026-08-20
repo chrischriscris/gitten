@@ -32,7 +32,7 @@ for d in fixtures/real/*.diff; do
   printf '%s\n' "  $(basename "$d")"
   /bin/cp -f "$d" fixtures/big.diff
   cargo run -q -p plait-core --example bench --release 2>/dev/null \
-    | grep -A1 '^DIFF' | tail -1 | sed 's/^/  /'
+    | grep -A2 '^DIFF' | tail -2 | sed 's/^/  /'
 done
 
 echo

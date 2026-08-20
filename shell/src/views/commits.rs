@@ -1,6 +1,7 @@
 use crate::graph;
 use gpui::*;
 use gpui_component::scroll::Scrollbar;
+use plait_core::host::Host;
 use plait_core::{assign_lanes, initials, Commit};
 use std::cell::Cell;
 use std::rc::Rc;
@@ -24,6 +25,7 @@ struct Data {
 
 pub struct Commits {
     data: Rc<Data>,
+    host: Rc<Host>,
     scroll: UniformListScrollHandle,
     /// Instrumentation the view owns and anyone may read. The view does not
     /// know the stats overlay exists.
@@ -38,7 +40,7 @@ impl Commits {
 }
 
 impl Commits {
-    pub fn new(commits: Vec<Commit>) -> Self {
+    pub fn new(commits: Vec<Commit>, host: Rc<Host>) -> Self {
         let t = std::time::Instant::now();
         let rows = assign_lanes(&commits);
         let t_lanes = t.elapsed();
@@ -50,7 +52,10 @@ impl Commits {
 
         let who: Vec<Who> = commits
             .iter()
-            .map(|c| Who { initials: initials(&c.author).into(), color: author_color(&c.author) })
+            .map(|c| Who {
+                initials: initials(&c.author).into(),
+                color: rgb(host.theme.author(&c.author)),
+            })
             .collect();
 
         // The widest row is no longer just the longest subject: every row's
@@ -73,6 +78,7 @@ impl Commits {
 
         Self {
             data: Rc::new(Data { commits, draws, who, widest }),
+            host,
             scroll: UniformListScrollHandle::new(),
             rendered: Rc::new(Cell::new(0)),
             load,
@@ -83,11 +89,12 @@ impl Commits {
 impl Render for Commits {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let data = self.data.clone();
+        let host = self.host.clone();
         let rendered = self.rendered.clone();
         let list = uniform_list("commits", data.commits.len(), move |range, _, _| {
             rendered.set(range.len());
             range
-                .map(|i| row(&data.commits[i], &data.who[i], &data.draws[i]))
+                .map(|i| row(&data.commits[i], &data.who[i], &data.draws[i], &host))
                 .collect()
         })
         .with_width_from_item(Some(self.data.widest))
@@ -121,25 +128,21 @@ const WHO_W: f32 = 26.0;
 /// subject follows its own row's graph immediately, so a commit on the trunk
 /// reads from the left instead of starting behind the widest merge in the
 /// repository.
-fn row(c: &Commit, who: &Who, d: &graph::RowDraw) -> AnyElement {
+fn row(c: &Commit, who: &Who, d: &graph::RowDraw, host: &Rc<Host>) -> AnyElement {
     div()
         .flex()
         .items_center()
         .h(px(graph::ROW_H))
-        .child(div().flex_none().w(px(SHA_W)).text_color(rgb(0x6e6862)).child(c.short.clone()))
+        .child(
+            div()
+                .flex_none()
+                .w(px(SHA_W))
+                .text_color(rgb(host.theme.chrome.dim))
+                .child(c.short.clone()),
+        )
         .child(div().flex_none().w(px(WHO_W)).text_color(who.color).child(who.initials.clone()))
-        .child(graph::row_canvas(d.clone()))
+        .child(graph::row_canvas(d.clone(), host.clone()))
         .child(div().flex_none().child(c.subject.clone()))
         .into_any_element()
 }
 
-/// Muted enough to stay out of the graph's way — these sit inches from the
-/// lane colours and must not be mistaken for them — but distinct enough that
-/// one author's commits clump visibly in a long list.
-const AUTHOR_COLORS: [u32; 6] =
-    [0x9c8a6b, 0x6f8296, 0x8b7a96, 0x6b8f88, 0x9c7f75, 0x7d8a6b];
-
-fn author_color(author: &str) -> Rgba {
-    let hash = author.bytes().fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
-    rgb(AUTHOR_COLORS[hash as usize % AUTHOR_COLORS.len()])
-}

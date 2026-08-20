@@ -14,16 +14,13 @@
 //! follows (see [`Hues`]) rather than the column it happens to occupy.
 
 use gpui::*;
+use plait_core::host::Host;
+use plait_core::theme::Theme;
 use plait_core::{Commit, GraphRow};
+use std::rc::Rc;
 
 pub const ROW_H: f32 = 22.0;
 const LANE_W: f32 = 14.0;
-
-/// The window background. A node is painted as a ring with this punched
-/// through the middle, so lines pass *behind* it rather than under a blob, and
-/// the graph reads as holes in the sheet. Shared with the shell so the app has
-/// exactly one background colour.
-pub const BG: u32 = 0x0e0d0c;
 
 /// Hard cap on drawn lanes. git/git reaches 280 concurrently, which is a
 /// 3,920px gutter — it pushes the commit text off the screen entirely and no
@@ -31,7 +28,6 @@ pub const BG: u32 = 0x0e0d0c;
 /// onto the last column, dimmed, so it reads as "there is more over here"
 /// rather than silently lying about the topology.
 const MAX_LANES: usize = 12;
-const OVERFLOW_COLOR: u32 = 0x453f39;
 
 /// A lane is 2px, not the 1.5px a dense list first suggests. Thinner reads as
 /// a hairline sketch rather than something you could grab, and 2px straddles
@@ -52,18 +48,20 @@ const RING: f32 = 0.45;
 /// overlap instead of abutting.
 const OVERSHOOT: f32 = 0.5;
 
-/// Warm amber first so the checked-out lane reads as primary; the rest are
-/// spaced around the wheel at roughly matched lightness so no lane shouts.
-const LANE_COLORS: [u32; 6] = [0xdfa851, 0x6f9ecf, 0xa983c9, 0x5fa8a0, 0xc97d6f, 0x8fb35e];
+/// How many hues the wheel hands out. Not the same thing as how many colours a
+/// theme ships: this is the size of the "which branch has which slot" ledger,
+/// and the theme decides what a slot looks like. Six is the number of live
+/// branches that can be told apart at a glance.
+const LANE_HUES: usize = 6;
 
 /// Colour belongs to the *branch*, not to the column it happens to sit in —
 /// see [`Hues`]. Overflow is the exception: past the cap every lane shares one
 /// column, so they share one grey and stop pretending to be individuals.
-fn color(lane: u16, hue: u16) -> Rgba {
+fn color(theme: &Theme, lane: u16, hue: u16) -> Rgba {
     if lane as usize >= MAX_LANES {
-        return rgb(OVERFLOW_COLOR);
+        return rgb(theme.lane_overflow);
     }
-    rgb(LANE_COLORS[hue as usize % LANE_COLORS.len()])
+    rgb(theme.lane(hue as usize))
 }
 
 /// Hands out a colour per branch and keeps it until that branch ends.
@@ -78,7 +76,7 @@ fn color(lane: u16, hue: u16) -> Rgba {
 struct Hues {
     /// Per lane slot, mirroring core's own bookkeeping.
     of: Vec<Option<u16>>,
-    live: [u16; LANE_COLORS.len()],
+    live: [u16; LANE_HUES],
     next: u16,
 }
 
@@ -86,9 +84,9 @@ impl Hues {
     fn new() -> Self {
         Self {
             of: Vec::new(),
-            live: [0; LANE_COLORS.len()],
+            live: [0; LANE_HUES],
             // So the first lane claimed — the trunk — comes out amber.
-            next: LANE_COLORS.len() as u16 - 1,
+            next: LANE_HUES as u16 - 1,
         }
     }
 
@@ -101,7 +99,7 @@ impl Hues {
         if let Some(hue) = self.of[lane] {
             return hue;
         }
-        let n = LANE_COLORS.len() as u16;
+        let n = LANE_HUES as u16;
         // The first free colour from here round the wheel; if all six are
         // live, take the next one anyway — a repeat beats a blank.
         for _ in 0..n {
@@ -308,18 +306,18 @@ pub fn row_draws(commits: &[Commit], rows: &[GraphRow]) -> Vec<RowDraw> {
     draws
 }
 
-pub fn row_canvas(d: RowDraw) -> impl IntoElement {
+pub fn row_canvas(d: RowDraw, host: Rc<Host>) -> impl IntoElement {
     let w = d.width();
     canvas(
         move |_bounds, _window, _cx| d,
-        move |bounds, d: RowDraw, window, _cx| paint_row(bounds, &d, window),
+        move |bounds, d: RowDraw, window, _cx| paint_row(bounds, &d, window, &host.theme),
     )
     .flex_none()
     .w(px(w))
     .h(px(ROW_H))
 }
 
-fn paint_row(bounds: Bounds<Pixels>, d: &RowDraw, window: &mut Window) {
+fn paint_row(bounds: Bounds<Pixels>, d: &RowDraw, window: &mut Window, theme: &Theme) {
     let ox = f32::from(bounds.origin.x);
     let x = |lane: u16| ox + lane_x(lane);
     let top = f32::from(bounds.origin.y);
@@ -337,7 +335,7 @@ fn paint_row(bounds: Bounds<Pixels>, d: &RowDraw, window: &mut Window) {
         let lx = x(l.lane) - STROKE / 2.0;
         window.paint_quad(fill(
             Bounds::from_corners(point(px(lx), px(y0)), point(px(lx + STROKE), px(y1))),
-            color(l.lane, l.hue),
+            color(theme, l.lane, l.hue),
         ));
     }
 
@@ -347,14 +345,14 @@ fn paint_row(bounds: Bounds<Pixels>, d: &RowDraw, window: &mut Window) {
         // and the half in the collapsed column comes out grey, and one curve
         // changes colour halfway across the gutter.
         let side = c.lane.max(c.partner);
-        half_s(window, x(c.lane), x(c.partner), mid, c.down, color(side, c.hue));
+        half_s(window, x(c.lane), x(c.partner), mid, c.down, color(theme, side, c.hue));
     }
 
     // The node last: it is opaque, so it punches through whatever runs under
     // it and the lines read as passing behind. GPUI orders overlapping
     // primitives by insertion, so this is enough — no z-index needed.
     let r = if d.is_merge { MERGE_R } else { DOT_R };
-    dot(window, x(d.lane), mid, r, color(d.lane, d.hue));
+    dot(window, x(d.lane), mid, r, color(theme, d.lane, d.hue), theme.chrome.bg);
 }
 
 /// One row's half of an S, from the dot line at `(x, y)` out through the row
@@ -394,11 +392,11 @@ fn half_s(window: &mut Window, x: f32, partner_x: f32, y: f32, down: bool, color
 /// A ring with the background punched out of the middle — one quad, since a
 /// quad with corner radii at half its size *is* a circle, and the shader
 /// antialiases it better than tessellation would.
-fn dot(window: &mut Window, x: f32, y: f32, r: f32, color: Rgba) {
+fn dot(window: &mut Window, x: f32, y: f32, r: f32, color: Rgba, bg: plait_core::theme::Rgb) {
     window.paint_quad(quad(
         Bounds::from_corners(point(px(x - r), px(y - r)), point(px(x + r), px(y + r))),
         Corners::all(px(r)),
-        rgb(BG),
+        rgb(bg),
         Edges::all(px(r * RING)),
         color,
         BorderStyle::Solid,

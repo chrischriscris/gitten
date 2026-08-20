@@ -4,6 +4,11 @@
 //! or the other way — nothing in this crate changes. Keep it that way: the day
 //! something in here needs to know what a window is, the boundary is gone.
 
+pub mod host;
+pub mod prepared;
+pub mod syntax;
+pub mod theme;
+
 // ---------------------------------------------------------------- commit log
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -278,6 +283,22 @@ fn tokenize(line: &str) -> Vec<(usize, &str)> {
 /// which is the right trade when the line is machine-generated anyway.
 pub const MAX_INTRALINE_TOKENS: usize = 1000;
 
+/// Below this, a pair is not a rewrite of each other and gets no word-level
+/// highlighting at all — the line still carries its add/remove background.
+///
+/// [`replace_pairs`] matches a run of removals to the additions after it by
+/// position, which is right when someone edited N lines in place and wrong when
+/// the counts happen to line up. Measured over the fixtures: of 9,447 pairs in
+/// the zig->rust migration none sit below 0.60 similarity, and the lowest is a
+/// genuine rewrite (`#define ZIG_DECL` -> `#define RUST_DECL`). In the
+/// deletion-heavy fixture 15.6% fall below this floor, and by inspection every
+/// one of them is junk — `/**` paired against `// Historical note: ...` at 0.0.
+///
+/// Highlighting those is worse than useless: it reports a rewrite that never
+/// happened, and it drags the whole line under the changed-word background,
+/// where dim text stops being legible.
+pub const MIN_INTRALINE_SIMILARITY: f32 = 0.4;
+
 /// Word-level diff of one removed/added line pair, returning the byte ranges
 /// that actually changed on each side.
 ///
@@ -305,6 +326,14 @@ pub fn intraline(old: &str, new: &str) -> (Vec<Span>, Vec<Span>) {
         }
     }
 
+    // The table's corner is the length of the longest common subsequence, so
+    // the similarity of the pair is already paid for.
+    let common = lcs[0][0];
+    let similarity = 2.0 * common as f32 / (a.len() + b.len()) as f32;
+    if similarity < MIN_INTRALINE_SIMILARITY {
+        return (Vec::new(), Vec::new());
+    }
+
     let (mut old_spans, mut new_spans) = (Vec::new(), Vec::new());
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
@@ -327,6 +356,8 @@ pub fn intraline(old: &str, new: &str) -> (Vec<Span>, Vec<Span>) {
         push_span(&mut new_spans, b[j].0, b[j].0 + b[j].1.len());
         j += 1;
     }
+    coalesce(&mut old_spans, old);
+    coalesce(&mut new_spans, new);
     (old_spans, new_spans)
 }
 
@@ -337,6 +368,30 @@ fn push_span(spans: &mut Vec<Span>, start: usize, end: usize) {
         Some(last) if last.end == start => last.end = end,
         _ => spans.push(Span { start, end }),
     }
+}
+
+/// Close the gaps that contain only whitespace.
+///
+/// The LCS happily matches the space between two changed words, which leaves a
+/// one-character hole in the highlight for every space in a rewritten sentence —
+/// on screen a run of prose comes out as a row of separate green blocks with the
+/// background showing through between them. A space between two changed words
+/// belongs to the change.
+fn coalesce(spans: &mut Vec<Span>, text: &str) {
+    let mut merged: Vec<Span> = Vec::with_capacity(spans.len());
+    for s in spans.drain(..) {
+        match merged.last_mut() {
+            Some(last)
+                if text
+                    .get(last.end..s.start)
+                    .is_some_and(|gap| !gap.is_empty() && gap.trim().is_empty()) =>
+            {
+                last.end = s.end;
+            }
+            _ => merged.push(s),
+        }
+    }
+    *spans = merged;
 }
 
 /// Pairs each removed line in a hunk with the added line that replaced it.
@@ -488,6 +543,56 @@ index 1111111..2222222 100644
         assert_eq!(&"go ext.Run(ev)"[o[0].start..o[0].end], "Run");
         assert_eq!(n.len(), 1);
         assert_eq!(&"go ext.Submit(ev)"[n[0].start..n[0].end], "Submit");
+    }
+
+    #[test]
+    fn a_rewritten_phrase_highlights_as_one_block() {
+        // Every space the LCS matched used to punch a hole in the highlight, so
+        // a rewritten comment came out as a row of separate blocks.
+        let old = "# Collect the failures first";
+        let new = "# Collect every check failure before exiting";
+        let (_, n) = intraline(old, new);
+        assert_eq!(n.len(), 1, "expected one block, got {:?}", n
+            .iter()
+            .map(|s| &new[s.start..s.end])
+            .collect::<Vec<_>>());
+        assert_eq!(&new[n[0].start..n[0].end], "every check failure before exiting");
+    }
+
+    #[test]
+    fn unrelated_lines_that_happen_to_pair_get_no_highlighting() {
+        // Straight off a screenshot: one removed line, three added, so the
+        // position-matched pair was a shell command against a comment. Marking
+        // the whole comment as "changed words" reports a rewrite that never
+        // happened and buries the text under the highlight background.
+        let (o, n) = intraline(
+            "    - bash cicd/pipeline/run-all-checks.sh;",
+            "    # Collect every check failure before exiting so one bad check does",
+        );
+        assert!(o.is_empty() && n.is_empty(), "{o:?} {n:?}");
+    }
+
+    #[test]
+    fn a_genuine_rewrite_still_highlights_at_the_measured_floor() {
+        // The least similar real pair in the fixtures, at 0.60. If the floor
+        // ever rises past this, actual renames stop being highlighted.
+        let (o, n) = intraline("#define ZIG_DECL AUTO_EXTERN_C_ZIG", "#define RUST_DECL AUTO_EXTERN_C_RUST");
+        assert!(!o.is_empty() && !n.is_empty());
+        // Both identifiers changed and only a space separates them, so they
+        // coalesce into one block — `AUTO_EXTERN_C_ZIG` is a single token, not a
+        // shared prefix with a different tail.
+        let new = "#define RUST_DECL AUTO_EXTERN_C_RUST";
+        assert_eq!(&new[n[0].start..n[0].end], "RUST_DECL AUTO_EXTERN_C_RUST");
+    }
+
+    #[test]
+    fn coalescing_never_swallows_unchanged_words() {
+        // Only whitespace gaps close. A real word between two changed ones stays
+        // outside the highlight, which is the whole point of an intraline diff.
+        let (_, n) = intraline("a keep b", "x keep y");
+        assert_eq!(n.len(), 2, "{:?}", n);
+        assert_eq!(&"x keep y"[n[0].start..n[0].end], "x");
+        assert_eq!(&"x keep y"[n[1].start..n[1].end], "y");
     }
 
     #[test]
