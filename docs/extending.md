@@ -154,6 +154,12 @@ More fits inside `ROW_H` than it looks like. What `MarkdownRows` found:
 - **Row count is not yours to change.** The gutter shows both line numbers and
   they have to keep adding up, so a blank line still costs a whole row. A test
   asserts `MarkdownRows` and `TextRows` produce the same count for the same file.
+- **Anything spanning rows is measured, not laid out.** A table's columns have to
+  line up with the rows above and below, which no per-row API can express. Padding
+  the text in a monospaced face gets it for free and keeps one `StyledText` per
+  row; an element per cell would have cost the render path. If you need this,
+  measure across the run first and rewrite each row exactly once — see the
+  warning on `syntax::for_each_side` about why "exactly once" is load-bearing.
 
 ## What a new seam owes
 

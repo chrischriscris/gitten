@@ -617,6 +617,14 @@ pub fn highlight_hunk(
 /// `markdown::lay_out` are both callers and neither may drift from the other:
 /// if the block pass split a hunk differently from the token pass, a fence would
 /// open on one and not the other and the two would disagree about the same line.
+///
+/// **A context row is visited twice, so `f` must be idempotent per row.**
+/// Assigning `out[row]` is fine — the second assignment writes the same thing.
+/// *Mutating* the row is not, and this is a real bug that has been written once
+/// already: the Markdown table pass padded a context row on the removed side and
+/// then padded the already-padded row again on the added side. If a caller needs
+/// to mutate, it has to measure across both calls and mutate once afterwards, the
+/// way `markdown::align_tables` does.
 pub fn for_each_side(kinds: &[LineKind], mut f: impl FnMut(&[usize])) {
     // A hunk with no added lines has nothing for the added pass to see that the
     // removed pass has not already covered, and pure-deletion diffs are common

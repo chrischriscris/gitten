@@ -73,18 +73,15 @@ pub enum Block {
     Fence,
     /// A line inside a fenced block.
     Code,
-    /// A `|` row. Separator rows (`|---|---|`) are [`Block::Rule`].
-    ///
-    /// Classified but **not rendered**: the row keeps its pipes and its cells are
-    /// not aligned to the columns of the rows around it. Aligning them needs the
-    /// widths of a whole run of rows, and then either an element per cell or
-    /// space padding inside the text — and padding is an *insertion*, which the
-    /// remap in this module deliberately cannot express. See
-    /// `docs/decisions/0010-markdown-rendered-rows.md`.
+    /// A `|` row, aligned to the columns of the run it belongs to.
     Table,
-    /// A thematic break, or a table separator: a line whose only content is
-    /// punctuation drawing a line. The renderer draws an actual rule and does
-    /// not draw the text.
+    /// A table's separator row (`|---|:-:|`), which also carries the column
+    /// alignments for its run. Its text is *regenerated* as a rule sized to the
+    /// columns, so unlike every other block this one does not draw the bytes it
+    /// arrived with.
+    TableRule,
+    /// A thematic break: a line whose only content is punctuation drawing a
+    /// line. The renderer draws an actual rule and does not draw the text.
     Rule,
 }
 
@@ -94,6 +91,9 @@ impl Block {
     pub fn depth(self) -> u8 {
         match self {
             Block::Bullet(d) | Block::Ordered(d) => d,
+            // A table row draws its own grid and sits flush left, whatever the
+            // source indented it by.
+            Block::Table | Block::TableRule => 0,
             // The bar the renderer draws already sits one step in, so the first
             // level of quoting costs no indent of its own.
             Block::Quote(d) => d.saturating_sub(1),
@@ -107,6 +107,74 @@ impl Block {
     pub fn is_code(self) -> bool {
         matches!(self, Block::Code | Block::Fence)
     }
+
+    /// Whether this line is part of a table, and so has to be measured against
+    /// its neighbours rather than laid out on its own.
+    pub fn is_table(self) -> bool {
+        matches!(self, Block::Table | Block::TableRule)
+    }
+}
+
+/// The glyphs a table's grid is drawn with.
+///
+/// Configurable because box-drawing characters are an assumption about the font:
+/// they are single-width in Menlo and most terminal faces, and a face that draws
+/// them wider would knock every column out of line. Swap in `"|"`, `"-"`, `"|"`,
+/// `"|"` for pure ASCII.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableGlyphs {
+    /// Between cells, and at both ends of a row.
+    pub vertical: &'static str,
+    /// The body of a separator row.
+    pub horizontal: &'static str,
+    /// Where a separator row crosses a column boundary.
+    pub cross: &'static str,
+    /// Both ends of a separator row.
+    pub end: (&'static str, &'static str),
+}
+
+impl Default for TableGlyphs {
+    fn default() -> Self {
+        Self { vertical: "│", horizontal: "─", cross: "┼", end: ("├", "┤") }
+    }
+}
+
+/// What [`lay_out`] may assume about the frontend that will draw the result.
+///
+/// One field, and it exists because of one fact: **table alignment is done by
+/// padding cells with spaces**, which only lines up if a character is a column.
+/// `core` cannot see a font, so the frontend says. With `monospaced: false` a
+/// table is left exactly as it was written, which is the honest answer rather
+/// than a grid that is wrong by a fraction of a glyph per cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Layout {
+    pub monospaced: bool,
+    pub table: TableGlyphs,
+}
+
+impl Layout {
+    /// The shipped assumption: a monospaced face, box-drawing glyphs. The GPUI
+    /// shell sets `font_family("Menlo")` and the ANSI painter inherits whatever
+    /// the terminal uses, so both are monospaced.
+    pub fn monospaced() -> Self {
+        Self { monospaced: true, table: TableGlyphs::default() }
+    }
+
+    /// Everything except the table grid, for a frontend whose text is
+    /// proportionally spaced.
+    pub fn proportional() -> Self {
+        Self { monospaced: false, table: TableGlyphs::default() }
+    }
+}
+
+/// How a table column is aligned, from its separator row: `:-:` centres, `-:`
+/// goes right. Left when the separator says nothing, or is not in this hunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Align {
+    #[default]
+    Left,
+    Center,
+    Right,
 }
 
 /// Lays out one hunk's worth of already-prepared lines, in place.
@@ -119,7 +187,7 @@ impl Block {
 /// Runs per hunk *side* — see [`for_each_side`]. A fence opens on one side and
 /// not the other all the time, and classifying the interleaved rows as one
 /// document would have a removed ``` closing an added one.
-pub fn lay_out(lines: &mut [Line]) -> Vec<Block> {
+pub fn lay_out(lines: &mut [Line], layout: &Layout) -> Vec<Block> {
     let mut blocks = vec![Block::Paragraph; lines.len()];
     let kinds: Vec<LineKind> = lines.iter().map(|l| l.kind).collect();
 
@@ -153,7 +221,258 @@ pub fn lay_out(lines: &mut [Line]) -> Vec<Block> {
         mark(line, block, &mut cuts);
         apply(line, &cuts);
     }
+
+    // Third, and only if there is a table at all: a cell's width is a property
+    // of the *run* of rows it sits in, not of its own line, so this cannot join
+    // either pass above. It runs after the cuts because it measures what will be
+    // drawn — a cell holding `` `code` `` is two backticks narrower by now.
+    //
+    // Per side again, for the same reason as the block pass: the removed rows and
+    // the added rows of a table are two different tables and must not be measured
+    // against each other, or a column widens on one side because the other side
+    // has a long cell in it.
+    if layout.monospaced && blocks.iter().any(|b| b.is_table()) {
+        align_tables(lines, &blocks, &kinds, layout);
+    }
     blocks
+}
+
+// -------------------------------------------------------------------- tables
+
+/// One table's measured columns.
+struct Grid {
+    widths: Vec<usize>,
+    aligns: Vec<Align>,
+}
+
+/// Aligns every table in the hunk to its own columns.
+///
+/// **Measure everything first, then rewrite each row once.** Not an optimisation
+/// — a correctness requirement, and a sharp edge worth understanding before
+/// adding a third caller to [`for_each_side`]. A context row belongs to both
+/// sides and so is visited twice. The token pass does not care, because it
+/// *assigns* `out[row]` and assigning twice is the same as assigning once. This
+/// pass *mutates* the row, and padding an already-padded row is not idempotent:
+/// the second visit measured a grid that the first visit had already drawn, and
+/// tripped over the three-byte `│` it had just written.
+///
+/// So the two phases are separated. Measurement reads only original text;
+/// `of_row` records which grid each row belongs to, and because the added side is
+/// visited last it wins for context rows — which is the same rule the token pass
+/// follows for the same reason.
+fn align_tables(lines: &mut [Line], blocks: &[Block], kinds: &[LineKind], layout: &Layout) {
+    let mut grids: Vec<Grid> = Vec::new();
+    let mut of_row: Vec<Option<usize>> = vec![None; lines.len()];
+
+    for_each_side(kinds, |rows| {
+        let mut i = 0;
+        while i < rows.len() {
+            if !blocks[rows[i]].is_table() {
+                i += 1;
+                continue;
+            }
+            // A run, not the whole hunk: two tables separated by a paragraph are
+            // two grids with two sets of widths, and a diff shows that often.
+            let start = i;
+            while i < rows.len() && blocks[rows[i]].is_table() {
+                i += 1;
+            }
+            let run = &rows[start..i];
+            if let Some(grid) = measure(lines, blocks, run) {
+                grids.push(grid);
+                let g = grids.len() - 1;
+                for &r in run {
+                    of_row[r] = Some(g);
+                }
+            }
+        }
+    });
+
+    let mut cells: Vec<Range<usize>> = Vec::new();
+    for (r, grid) in of_row.iter().enumerate() {
+        let Some(grid) = grid.map(|g| &grids[g]) else { continue };
+        if blocks[r] == Block::TableRule {
+            rule_row(&mut lines[r], &grid.widths, layout);
+        } else {
+            split_cells(&lines[r].text, &mut cells);
+            grid_row(&mut lines[r], &cells, grid, layout);
+        }
+    }
+}
+
+/// Column widths and alignments for one run. `None` when the run is nothing but
+/// separators and so has no content to align to.
+fn measure(lines: &[Line], blocks: &[Block], run: &[usize]) -> Option<Grid> {
+    let mut widths: Vec<usize> = Vec::new();
+    let mut aligns: Vec<Align> = Vec::new();
+    let mut cells: Vec<Range<usize>> = Vec::new();
+
+    for &r in run {
+        split_cells(&lines[r].text, &mut cells);
+        // A separator contributes alignment but no width: its own dashes are
+        // punctuation about to be replaced, so measuring them would let
+        // `|:----------:|` set the column instead of the content.
+        if blocks[r] == Block::TableRule {
+            if aligns.len() < cells.len() {
+                aligns.resize(cells.len(), Align::Left);
+            }
+            for (k, c) in cells.iter().enumerate() {
+                aligns[k] = alignment(&lines[r].text[c.clone()]);
+            }
+            continue;
+        }
+        if widths.len() < cells.len() {
+            widths.resize(cells.len(), 0);
+        }
+        for (k, c) in cells.iter().enumerate() {
+            // Characters, not bytes: the padding is counted in columns and a
+            // cell saying "café" is four of them.
+            widths[k] = widths[k].max(lines[r].text[c.clone()].chars().count());
+        }
+    }
+    (!widths.is_empty()).then_some(Grid { widths, aligns })
+}
+
+/// Content ranges of a row's cells, pipes and surrounding spaces excluded.
+///
+/// A `\|` is a pipe in a cell, not a cell boundary — the one escape that matters
+/// here, because a table of operators is full of them.
+fn split_cells(text: &str, out: &mut Vec<Range<usize>>) {
+    out.clear();
+    let b = text.as_bytes();
+    let start = text.len() - text.trim_start().len();
+    // The row begins with a pipe — `classify` required it — so the first field
+    // before it is empty and is not a cell.
+    let mut from = start + 1;
+    let mut i = from;
+    while i < b.len() {
+        if b[i] == b'|' && (i == 0 || b[i - 1] != b'\\') {
+            out.push(trimmed_range(text, from..i));
+            from = i + 1;
+        }
+        i += 1;
+    }
+    // Anything after the last pipe. A row may or may not close with one; if it
+    // does, what follows is the empty field after it and not a cell.
+    let tail = trimmed_range(text, from..text.len());
+    if tail.start < tail.end {
+        out.push(tail);
+    }
+}
+
+fn trimmed_range(text: &str, r: Range<usize>) -> Range<usize> {
+    let slice = &text[r.clone()];
+    let lead = slice.len() - slice.trim_start().len();
+    let trail = slice.len() - slice.trim_end().len();
+    r.start + lead..r.end - trail.min(slice.len() - lead)
+}
+
+fn alignment(cell: &str) -> Align {
+    let c = cell.trim();
+    match (c.starts_with(':'), c.ends_with(':')) {
+        (true, true) => Align::Center,
+        (false, true) => Align::Right,
+        _ => Align::Left,
+    }
+}
+
+/// Rewrites a data row onto the measured grid.
+fn grid_row(line: &mut Line, cells: &[Range<usize>], grid: &Grid, layout: &Layout) {
+    let (widths, aligns) = (&grid.widths, &grid.aligns);
+    let g = &layout.table;
+    let mut out = String::with_capacity(line.text.len() + widths.len() * 8);
+    // Where each cell's content, copied verbatim, now begins. This is the whole
+    // correspondence between the old text and the new one — see `remap`.
+    let mut map: Vec<(Range<usize>, usize)> = Vec::with_capacity(cells.len());
+
+    out.push_str(g.vertical);
+    for k in 0..widths.len() {
+        // A row with fewer cells than the widest one still gets the missing
+        // columns, empty. Ragged tables are normal in hand-written markdown and
+        // a short row that stopped early would break the grid below it.
+        let content = cells.get(k).map_or("", |c| &line.text[c.clone()]);
+        let pad = widths[k].saturating_sub(content.chars().count());
+        let (before, after) = match aligns.get(k).copied().unwrap_or_default() {
+            Align::Left => (0, pad),
+            Align::Right => (pad, 0),
+            Align::Center => (pad / 2, pad - pad / 2),
+        };
+        out.push(' ');
+        for _ in 0..before {
+            out.push(' ');
+        }
+        if let Some(c) = cells.get(k) {
+            map.push((c.clone(), out.len()));
+        }
+        out.push_str(content);
+        for _ in 0..after {
+            out.push(' ');
+        }
+        out.push(' ');
+        out.push_str(g.vertical);
+    }
+
+    remap(line, &map, out.len());
+    line.text = out;
+}
+
+/// Replaces a separator row's dashes with a rule sized to the columns.
+///
+/// The only row whose text is generated rather than trimmed, so it is also the
+/// only one whose tokens and spans are dropped: they describe dashes that are no
+/// longer there. Nothing is lost that a reader wanted — a separator row differing
+/// between two revisions says nothing the columns either side of it do not.
+fn rule_row(line: &mut Line, widths: &[usize], layout: &Layout) {
+    let g = &layout.table;
+    let mut out = String::with_capacity(widths.iter().sum::<usize>() + widths.len() * 8);
+    out.push_str(g.end.0);
+    for (k, w) in widths.iter().enumerate() {
+        for _ in 0..w + 2 {
+            out.push_str(g.horizontal);
+        }
+        out.push_str(if k + 1 == widths.len() { g.end.1 } else { g.cross });
+    }
+    line.text = out;
+    line.tokens.clear();
+    line.spans.clear();
+}
+
+/// Moves tokens and spans onto a rewritten line.
+///
+/// `map` is the correspondence, and it is piecewise-linear: each entry says that
+/// a range of the old text now begins at a new offset with its bytes unchanged.
+/// A position inside a piece keeps its offset within it; a position outside every
+/// piece was punctuation or padding the row no longer draws in the same place,
+/// and collapses to the start of the next piece it can reach — which makes any
+/// token that described only punctuation collapse to nothing and be dropped.
+///
+/// This is the general form of [`apply`], which the rest of the module uses
+/// instead. Both exist on purpose: `apply` handles deletion only, and because
+/// deletion only it works in place on the buffer the line already owns and costs
+/// no allocation, which matters when it runs on every row of a 71k-row diff.
+/// A table is 1–2.5% of rows and needs insertion, so it pays for the general one.
+fn remap(line: &mut Line, map: &[(Range<usize>, usize)], new_len: usize) {
+    let at = |p: usize| -> usize {
+        for (old, new) in map {
+            if p < old.start {
+                return *new;
+            }
+            if p <= old.end {
+                return new + (p - old.start);
+            }
+        }
+        new_len
+    };
+    for t in &mut line.tokens {
+        t.start = at(t.start);
+        t.end = at(t.end);
+    }
+    line.tokens.retain(|t| t.start < t.end);
+    for s in &mut line.spans {
+        s.start = at(s.start);
+        s.end = at(s.end);
+    }
+    line.spans.retain(|s| s.start < s.end);
 }
 
 /// One line's structural role. `fence` carries across lines and is the reason
@@ -185,10 +504,16 @@ fn classify(line: &str, fence: &mut Option<&'static str>, prev: Option<Block>) -
     if (1..=6).contains(&hashes) && matches!(trimmed.as_bytes().get(hashes), None | Some(b' ')) {
         return Block::Heading(hashes as u8);
     }
-    // `---` is a thematic break on its own and a table separator under a table
-    // row, and `is_setext` catches both plus the underline case that `lay_out`
-    // resolves by looking back. All three draw as a rule, so they are one arm.
-    if is_break(trimmed) || is_setext(trimmed) || is_table_separator(trimmed) {
+    // A table separator is a rule *and* the row that says how its columns are
+    // aligned, so it is its own block rather than a thematic break that happens
+    // to sit inside a table.
+    if is_table_separator(trimmed) {
+        return Block::TableRule;
+    }
+    // `---` is a thematic break on its own, and `is_setext` also catches the
+    // underline case that `lay_out` resolves by looking back at the row above.
+    // Both draw as a rule, so they are one arm.
+    if is_break(trimmed) || is_setext(trimmed) {
         return Block::Rule;
     }
     if trimmed.starts_with('>') {
@@ -284,7 +609,7 @@ fn mark(line: &Line, block: Block, out: &mut Vec<Range<usize>>) {
     // `fixtures/real/md.diff` blank lines are 28% of rows and paragraphs 32%,
     // and a paragraph with no inline markup carries no tokens — so the majority
     // of a markdown diff exits here on a discriminant check.
-    if matches!(block, Block::Blank | Block::Rule | Block::Code) {
+    if matches!(block, Block::Blank | Block::Rule | Block::TableRule | Block::Code) {
         return;
     }
     if line.tokens.is_empty()
@@ -506,7 +831,7 @@ mod tests {
         let hl = Highlighters::builtin();
         let mut p = prepare(&parse_unified_diff(&raw), &hl, 2000);
         let mut lines = std::mem::take(&mut p.files[0].hunks[0].lines);
-        let blocks = lay_out(&mut lines);
+        let blocks = lay_out(&mut lines, &Layout::monospaced());
         (blocks, lines)
     }
 
@@ -722,8 +1047,8 @@ diff --git a/d.md b/d.md
         let hl = Highlighters::builtin();
         let mut p = prepare(&parse_unified_diff(raw), &hl, 2000);
         let f = &mut p.files[0];
-        let first = lay_out(&mut f.hunks[0].lines);
-        let second = lay_out(&mut f.hunks[1].lines);
+        let first = lay_out(&mut f.hunks[0].lines, &Layout::monospaced());
+        let second = lay_out(&mut f.hunks[1].lines, &Layout::monospaced());
         assert_eq!(first, vec![Block::Fence, Block::Code]);
         assert_eq!(second[0], Block::Heading(1), "a fence leaked across hunks");
     }
@@ -750,22 +1075,146 @@ diff --git a/d.md b/d.md
 
     #[test]
     fn a_table_row_and_its_separator_are_told_apart() {
-        let (blocks, lines) = run(" | a | b |\n |---|:-:|\n | 1 | 2 |\n");
+        let (blocks, _) = run(" | a | b |\n |---|:-:|\n | 1 | 2 |\n");
         assert_eq!(blocks[0], Block::Table);
-        assert_eq!(lines[0].text, "| a | b |", "a table keeps its pipes");
-        assert_eq!(blocks[1], Block::Rule);
+        assert_eq!(blocks[1], Block::TableRule);
         assert_eq!(blocks[2], Block::Table);
     }
 
     #[test]
-    fn an_empty_header_row_is_a_row_and_not_a_rule() {
+    fn an_empty_header_row_is_a_row_and_not_a_break() {
         // From `docs/README.md` in this repository, which opens a table with one.
-        // A separator draws a line; a row of empty cells does not.
-        let (blocks, lines) = run(" | | |\n |---|---|\n | a | b |\n");
+        // A separator draws a line; a row of empty cells does not, and a thematic
+        // break is neither.
+        let (blocks, _) = run(" | | |\n |---|---|\n | a | b |\n");
         assert_eq!(blocks[0], Block::Table, "an empty header row drew as a break");
-        assert_eq!(lines[0].text, "| | |");
-        assert_eq!(blocks[1], Block::Rule);
+        assert_eq!(blocks[1], Block::TableRule);
         assert_eq!(blocks[2], Block::Table);
+    }
+
+    #[test]
+    fn a_table_is_padded_to_its_widest_cell_in_each_column() {
+        let (_, lines) = run(" | stage | time |\n |---|---|\n | assign lanes | 301 ms |\n");
+        assert_eq!(lines[0].text, "│ stage        │ time   │");
+        assert_eq!(lines[1].text, "├──────────────┼────────┤");
+        assert_eq!(lines[2].text, "│ assign lanes │ 301 ms │");
+        // Every row of a grid is the same width, which is the whole point.
+        let w: Vec<usize> = lines.iter().map(|l| l.text.chars().count()).collect();
+        assert!(w.windows(2).all(|p| p[0] == p[1]), "ragged: {w:?}");
+    }
+
+    #[test]
+    fn the_separator_says_how_its_columns_align() {
+        let (_, lines) =
+            run(" | l | c | r |\n |:--|:-:|--:|\n | 1 | 2 | 3 |\n | xxxx | yyyy | zzzz |\n");
+        assert_eq!(lines[2].text, "│ 1    │  2   │    3 │");
+    }
+
+    #[test]
+    fn a_short_row_still_gets_the_missing_columns() {
+        // Ragged tables are normal by hand, and a row that stopped early would
+        // break the grid under it.
+        let (_, lines) = run(" | a | b | c |\n | d |\n");
+        assert_eq!(lines[0].text, "│ a │ b │ c │");
+        assert_eq!(lines[1].text, "│ d │   │   │");
+    }
+
+    #[test]
+    fn two_tables_separated_by_prose_get_their_own_columns() {
+        // A run, not the hunk: the second table's long cell must not widen the
+        // first table's column.
+        let (_, lines) = run(" | a |\n\x20\n text\n\x20\n | wiiiiiide |\n");
+        assert_eq!(lines[0].text, "│ a │");
+        assert_eq!(lines[4].text, "│ wiiiiiide │");
+    }
+
+    #[test]
+    fn the_two_sides_of_a_table_are_measured_separately() {
+        // Otherwise a long cell on the added side pads out the removed side, and
+        // the removed rows stop lining up with anything.
+        let (_, lines) = run("-| a | b |\n+| a | bbbbbbbbbb |\n");
+        let removed = lines.iter().find(|l| l.kind == LineKind::Removed).unwrap();
+        let added = lines.iter().find(|l| l.kind == LineKind::Added).unwrap();
+        assert_eq!(removed.text, "│ a │ b │");
+        assert_eq!(added.text, "│ a │ bbbbbbbbbb │");
+    }
+
+    #[test]
+    fn a_cell_keeps_its_markup_and_its_token_after_alignment() {
+        // The hard part: the cell was trimmed of backticks by the cut pass and
+        // then moved by the padding, so its token has been through both.
+        let (_, lines) = run(" | `code` | x |\n | aaaaaaaa | y |\n");
+        assert_eq!(lines[0].text, "│ code     │ x │");
+        let t = lines[0].tokens.iter().find(|t| t.kind == Kind::Str).expect("a code span");
+        assert_eq!(&lines[0].text[t.range()], "code");
+    }
+
+    #[test]
+    fn an_escaped_pipe_is_not_a_column_boundary() {
+        let (_, lines) = run(r" | a \| b | c |");
+        assert_eq!(lines[0].text, r"│ a \| b │ c │");
+    }
+
+    #[test]
+    fn a_proportional_frontend_gets_its_table_untouched() {
+        // Padding with spaces only aligns in a monospaced face, so the honest
+        // answer for anything else is to leave the row alone.
+        let raw = "diff --git a/d.md b/d.md\n@@ -1,1 +1,1 @@\n | a | bbbb |\n | cccc | d |\n";
+        let hl = Highlighters::builtin();
+        let mut p = prepare(&parse_unified_diff(raw), &hl, 2000);
+        let mut lines = std::mem::take(&mut p.files[0].hunks[0].lines);
+        let blocks = lay_out(&mut lines, &Layout::proportional());
+        assert_eq!(blocks[0], Block::Table);
+        assert_eq!(lines[0].text, "| a | bbbb |", "a table was padded anyway");
+    }
+
+    #[test]
+    fn a_table_cut_in_half_by_a_hunk_aligns_to_what_is_on_screen() {
+        // A hunk shows three rows out of twenty and has no header and no
+        // separator. Aligning to what is present beats refusing to align.
+        let (blocks, lines) = run(" | mid | row |\n | another | one |\n");
+        assert!(blocks.iter().all(|b| *b == Block::Table));
+        assert_eq!(lines[0].text, "│ mid     │ row │");
+        assert_eq!(lines[1].text, "│ another │ one │");
+    }
+
+    #[test]
+    fn a_context_row_in_a_table_is_aligned_exactly_once() {
+        // The regression. A context row belongs to both sides, so `for_each_side`
+        // hands it to the caller twice; padding it twice widened it by a whole
+        // grid and then panicked splitting the `│` it had just written.
+        let (blocks, lines) = run(" | keep | this |\n-| old | x |\n+| new | y |\n");
+        assert!(blocks.iter().all(|b| *b == Block::Table));
+        let context = lines.iter().find(|l| l.kind == LineKind::Context).unwrap();
+        assert_eq!(context.text, "│ keep │ this │");
+        // Every row of the grid the context row belongs to is the same width.
+        let w: Vec<usize> = lines.iter().map(|l| l.text.chars().count()).collect();
+        assert!(w.windows(2).all(|p| p[0] == p[1]), "ragged: {w:?} in {lines:#?}");
+    }
+
+    #[test]
+    fn a_context_row_takes_the_added_sides_grid() {
+        // It can only have one, and the added side is the one the reader is
+        // looking at — the same rule the token pass uses for context lines.
+        let (_, lines) = run(" | a | b |\n-| c | d |\n+| e | ffffffffff |\n");
+        let context = lines.iter().find(|l| l.kind == LineKind::Context).unwrap();
+        let added = lines.iter().find(|l| l.kind == LineKind::Added).unwrap();
+        assert_eq!(context.text.chars().count(), added.text.chars().count());
+    }
+
+    #[test]
+    fn glyphs_are_configurable_for_a_font_without_box_drawing() {
+        let raw = "diff --git a/d.md b/d.md\n@@ -1,1 +1,1 @@\n | a | b |\n |---|---|\n";
+        let hl = Highlighters::builtin();
+        let mut p = prepare(&parse_unified_diff(raw), &hl, 2000);
+        let mut lines = std::mem::take(&mut p.files[0].hunks[0].lines);
+        let ascii = Layout {
+            monospaced: true,
+            table: TableGlyphs { vertical: "|", horizontal: "-", cross: "+", end: ("+", "+") },
+        };
+        lay_out(&mut lines, &ascii);
+        assert_eq!(lines[0].text, "| a | b |");
+        assert_eq!(lines[1].text, "+---+---+");
     }
 
     #[test]
@@ -848,6 +1297,7 @@ diff --git a/d.md b/d.md
             Block::Fence,
             Block::Code,
             Block::Table,
+            Block::TableRule,
             Block::Rule,
         ] {
             let _ = b.depth();

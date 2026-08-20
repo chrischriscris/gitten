@@ -39,7 +39,7 @@ use super::diff::{
 };
 use gpui::*;
 use plait_core::host::Host;
-use plait_core::markdown::{lay_out, Block};
+use plait_core::markdown::{lay_out, Block, Layout};
 use plait_core::syntax::Token;
 use plait_core::theme::{Rgb, Theme};
 use plait_core::{LineKind, Span};
@@ -63,6 +63,13 @@ pub struct Metrics {
     pub bar: f32,
     /// Bullet glyph per depth; the last one repeats.
     pub bullets: &'static [&'static str],
+    /// What `core` is allowed to assume about the face this draws in. It is here
+    /// rather than defaulted inside `lay_out` because only a frontend knows —
+    /// `main.rs` sets `font_family("Menlo")`, so tables get their grid; a shell
+    /// that switched to a proportional face would set `Layout::proportional()`
+    /// and get its tables back verbatim instead of misaligned by a fraction of a
+    /// glyph per cell.
+    pub layout: Layout,
 }
 
 impl Default for Metrics {
@@ -72,6 +79,7 @@ impl Default for Metrics {
             indent: 14.0,
             bar: 2.0,
             bullets: &["•", "◦", "▪", "·"],
+            layout: Layout::monospaced(),
         }
     }
 }
@@ -159,7 +167,7 @@ impl Rows for MarkdownRows {
             // Per hunk, because that is the largest unit whose block structure is
             // knowable: a fence opened in one hunk and closed in another has
             // everything between them missing from the diff entirely.
-            let blocks = lay_out(&mut h.lines);
+            let blocks = lay_out(&mut h.lines, &self.metrics.layout);
             self.laid_out += blocks.len();
             for (l, block) in h.lines.into_iter().zip(blocks) {
                 self.rows.push(Row::Line {
@@ -185,7 +193,10 @@ impl Rows for MarkdownRows {
                     Block::Heading(l) => self.metrics.size(*l) / 14.0,
                     _ => 1.0,
                 };
-                (text.len() as f32 * scale) as usize + block.depth() as usize + 2
+                // `chars`, not `len`: a table row is full of three-byte box
+                // drawing and would otherwise measure three times too wide and
+                // win the widest-row contest for the whole diff.
+                (text.chars().count() as f32 * scale) as usize + block.depth() as usize + 2
             }
             Row::Hunk(h) => h.len(),
             Row::File { path, .. } => path.len(),
@@ -241,6 +252,25 @@ impl MarkdownRows {
             .child(num(old.clone(), theme.diff.gutter_fg))
             .child(num(new.clone(), theme.diff.gutter_fg))
             .child(div().flex_none().w(px(16.)).text_color(rgb(fg)).child(sign));
+
+        // A table row's grid lives inside its text, aligned character by character
+        // against the rows above and below it. Anything drawn in front of one row
+        // and not the next would shear the grid, so a table gets the gutter and
+        // then nothing: no bar, no indent, no glyph.
+        if block.is_table() {
+            let body = div().flex_none().text_color(rgb(fg)).child(
+                StyledText::new(text.clone())
+                    .with_highlights(runs(text, tokens, spans, theme, kind)),
+            );
+            // The grid is structure, not content, and a separator row is nothing
+            // but grid.
+            let body = if block == Block::TableRule {
+                body.text_color(rgb(md.rule))
+            } else {
+                body
+            };
+            return row.child(body).into_any_element();
+        }
 
         // A rule draws no text: the dashes were the drawing, so they are replaced
         // by the thing they were drawing.
@@ -513,6 +543,33 @@ diff --git a/README.md b/README.md
     }
 
     #[test]
+    fn a_table_reaches_the_rows_as_a_grid() {
+        let r = built(TABLE);
+        let t = texts(&r);
+        assert_eq!(t[0], "│ stage        │ time   │");
+        assert_eq!(t[1], "├──────────────┼────────┤");
+        assert_eq!(t[2], "│ parse log    │ 466 ms │");
+        assert_eq!(t[3], "│ assign lanes │ 301 ms │");
+        let b = blocks(&r);
+        assert_eq!(b[1], Block::TableRule);
+        assert!(b[0].is_table() && b[2].is_table());
+    }
+
+    #[test]
+    fn a_table_row_measures_in_columns_not_bytes() {
+        // Box drawing is three bytes a glyph. Measuring a table row by `len`
+        // makes it three times too wide and it wins `with_width_from_item` for
+        // the whole diff, which scrolls sideways into empty space.
+        let r = built(TABLE);
+        let widest = (0..r.len()).max_by_key(|i| r.width(*i)).unwrap();
+        let table_row = r.width(2);
+        assert!(
+            table_row < 40,
+            "a 25-column table row measured {table_row}; widest row is {widest}"
+        );
+    }
+
+    #[test]
     fn metrics_stay_inside_a_row() {
         // The constraint that decides the whole design: a glyph needs about 1.2x
         // its point size of line box, and a row is ROW_H tall. A heading scale
@@ -528,6 +585,15 @@ diff --git a/README.md b/README.md
         assert_eq!(m.size(9), m.size(6));
         assert_eq!(m.bullet(99), "·");
     }
+
+    const TABLE: &str = "\
+diff --git a/docs/m.md b/docs/m.md
+@@ -1,4 +1,4 @@
+ | stage | time |
+ |---|---|
+ | parse log | 466 ms |
+ | assign lanes | 301 ms |
+";
 
     const MIXED: &str = "\
 diff --git a/a.rs b/a.rs

@@ -57,12 +57,13 @@ fn main() {
     // of every one of those files inside the timer, and reported 610 µs for 44
     // rows. This is also what the view does — `lay_out` runs on the rows
     // `prepare` handed it, still warm.
+    let layout = markdown::Layout::monospaced();
     let t = Instant::now();
     let (mut md_rows, mut md_files) = (0usize, 0usize);
     for f in p.files.iter_mut().filter(|f| is_markdown(&f.path)) {
         md_files += 1;
         for h in &mut f.hunks {
-            md_rows += markdown::lay_out(&mut h.lines).len();
+            md_rows += markdown::lay_out(&mut h.lines, &layout).len();
         }
     }
     let layout = t.elapsed();

@@ -54,8 +54,12 @@ at load, for markdown files only, and adds nothing to the render path. Reported 
 
 | fixture | rows | files | `prepare` | `lay_out` | per row | of `prepare` |
 |---|---|---|---|---|---|---|
-| `md.diff` (rust-lang/book) | 71,705 | 228 | 90.7 ms | 5.1 ms | 71 ns | 5.6% |
-| a technical-docs tree | 75,684 | 1,019 | 16.6 ms | 6.5 ms | 86 ns | 37.5% |
+| `md.diff` (rust-lang/book) | 71,705 | 228 | 89.3 ms | 5.6 ms | 78 ns | 6.2% |
+| a technical-docs tree | 75,684 | 1,019 | 17.0 ms | 7.2 ms | 95 ns | 42.4% |
+
+Table alignment is in those figures and is close to free on average: 70–100 ns a
+row with it, 70–90 without. Tables are 2.4% and 1.0% of changed lines, and a hunk
+with no table skips the pass on one `any(is_table)` scan of the blocks.
 
 **Quote the per-row figure, not the share.** The two shares differ by 7× and the
 per-row costs by 1.2×; the share is a statement about how much intraline work the

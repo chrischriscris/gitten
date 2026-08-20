@@ -106,7 +106,7 @@ shell files before this existed.
 | group | fields |
 |---|---|
 | `diff` | `file_bg` `file_fg` `adds_fg` `dels_fg` `hunk_bg` `hunk_fg` `gutter_fg` `context_bg` `context_fg` `added_bg` `added_fg` `added_word_bg` `removed_bg` `removed_fg` `removed_word_bg` |
-| `markdown` | `code_bar` `quote_bar` `marker` `rule` |
+| `markdown` | `code_bar` `quote_bar` `marker` `rule` (also the table grid) |
 | `chrome` | `bg` `fg` `dim` `faint` `accent` `title_bg` `status_bg` |
 | graph | `lanes` `lane_overflow` |
 | commits | `authors` |

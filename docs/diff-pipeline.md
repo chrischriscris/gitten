@@ -114,9 +114,16 @@ cut, because both have to be in the same coordinates while the mapping is
 computed. Reversed, a token indexes bytes that are gone — the same failure the
 clip ordering in 3a exists to prevent, with the same kind of test pinning it.
 
-Cost: **70–90 ns a row**, at load. On the two markdown fixtures that is 5.1 ms of
-a 90.7 ms `prepare` and 6.5 ms of a 16.6 ms one — the share says nothing about
-this pass and everything about how much intraline work the diff has.
+Tables are the exception to "per line": a cell has to line up with the rows around
+it, so column widths are measured per *run* of table rows and per hunk side, then
+every row of that run is rewritten once to the grid. Padding is an insertion, so
+tables use the general piecewise remap rather than the deletion-only in-place one
+— worth it for 1–2.5% of rows, not worth it for all of them. It only lines up in a
+monospaced face, which is what `Layout::monospaced()` is the frontend asserting.
+
+Cost: **70–100 ns a row**, at load. On the two markdown fixtures that is 5.6 ms of
+an 89.3 ms `prepare` and 7.2 ms of a 17 ms one — the share says nothing about this
+pass and everything about how much intraline work the diff has.
 
 ## 4–5. Rows, and the order table
 

@@ -29,6 +29,7 @@ devices do the work within that:
 | row font size | headings | `HighlightStyle` has no font size — see below |
 | a left bar | fenced blocks, quotes | a background means added/removed, and a diff may not give that up |
 | furniture: glyphs, a rule | the markers that were removed | a bullet as text would become a run in the merge and take the text's colour |
+| space padding | table columns | see *Tables* below — an element per cell costs the render path |
 
 **The size constraint is not taste, it is GPUI.** `HighlightStyle`
 (`gpui/src/style.rs:580`) carries colour, weight, slant, background, underline,
@@ -83,6 +84,46 @@ remapping, and a token indexes bytes that are gone — a panic in a debug build,
 mojibake in release. Same failure mode as the clip ordering in 0007, same kind of
 test pinning it.
 
+### Tables align by padding, not by layout
+
+A table is the one construct whose cells must line up with the rows *around* them,
+so it is the one place a line cannot be laid out on its own. Two ways to do it:
+
+| | space padding | an element per cell |
+|---|---|---|
+| render path | one `StyledText`, unchanged | N `StyledText`s, tokens sliced per cell |
+| fonts | monospaced only | any |
+| the remap | needs insertion | unchanged |
+
+Padding wins because the render path is the thing rule 3 protects and this
+presentation's whole claim is that it costs nothing per frame. The shell sets
+`font_family("Menlo")`, so a space is a column; `Layout::monospaced()` is the
+frontend stating that, and `Layout::proportional()` leaves tables verbatim rather
+than misaligning them by a fraction of a glyph per cell. `core` cannot see a font,
+so it must be told.
+
+The price is that the remap needs *insertion*, which `apply` — deletion-only,
+in place, allocation-free — cannot express. So tables get `remap`, the general
+piecewise-linear form, and a new `String` per table row. Both exist on purpose:
+tables are 1–2.5% of changed lines, and paying for generality on every row of a
+71k-row diff to serve 2% of them would be the wrong trade. Measured cost of the
+whole pass with alignment: **70–100 ns a row**, against 70–90 without.
+
+Column widths are measured per *run* — a maximal stretch of table rows — and per
+hunk side, so two tables either side of a paragraph get two grids and a removed
+row is never widened by an added row's long cell. A hunk that shows the middle of
+a table has no header and no separator; it aligns to what is on screen, which
+beats refusing to align.
+
+**The sharp edge, and it drew blood.** `for_each_side` hands a *context* row to its
+caller twice, because a context row belongs to both sides. The token pass does not
+care — it assigns `out[row]`, and assigning twice is assigning once. This pass
+mutates, and padding an already-padded row is not idempotent: the first pass wrote
+a `│`, the second measured the grid it had just drawn and then panicked splitting
+that three-byte glyph at byte 1. The fix is structural rather than a guard —
+measure every grid first, rewrite each row exactly once, added side winning for
+context rows. `for_each_side` now documents the requirement, and two tests pin it.
+
 ## Why not a CommonMark parser
 
 `markdown 1.0` is already in the tree (`gpui-component` depends on it), so this
@@ -114,7 +155,7 @@ alike — see [../measurements.md](../measurements.md):
 | `md.diff` (rust-lang/book, 80% paragraph) | 71,705 | 228 | 90.7 ms | 5.1 ms | 71 ns |
 | a technical-docs tree (34% paragraph, 12% heading) | 75,684 | 1,019 | 16.6 ms | 6.5 ms | 86 ns |
 
-**70–90 ns a row, at load, once.** The share of `prepare` is 6% on one and 38% on
+**70–100 ns a row, at load, once.** The share of `prepare` is 6% on one and 38% on
 the other, which says nothing about this pass and everything about `prepare`:
 prose is edited sentence by sentence, so the book fixture is 72 ms of intraline
 against the technical-docs one's 1 ms. Quote the per-row figure.

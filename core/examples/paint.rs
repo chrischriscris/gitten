@@ -8,7 +8,7 @@
 //!
 //!   cargo run -q -p plait-core --example paint --release [ROWS] [PATH-FILTER]
 use plait_core::host::Host;
-use plait_core::markdown::{lay_out, Block};
+use plait_core::markdown::{lay_out, Block, Layout};
 use plait_core::prepared::prepare;
 use plait_core::syntax::Kind;
 use plait_core::theme::{MarkdownPalette, Rgb, Style, Surface};
@@ -64,6 +64,9 @@ fn furniture(block: Block, p: &MarkdownPalette) -> String {
         Block::Quote(_) => format!("{indent}{}│ ", fg(p.quote_bar)),
         Block::Fence | Block::Code => format!("{}│ ", fg(p.code_bar)),
         Block::Rule => format!("{}{}", fg(p.rule), "─".repeat(40)),
+        // A table draws its own grid inside its text; anything added in front of
+        // it would shift one row of the grid relative to the next.
+        Block::Table | Block::TableRule => format!("{}", fg(p.marker)),
         _ => format!("{indent}"),
     }
 }
@@ -84,10 +87,18 @@ fn main() {
     // A `.md` file is laid out as a document, the same call the shell's
     // `MarkdownRows` makes and with no markdown logic re-implemented here. What
     // this example adds is escape codes.
+    // A terminal is monospaced by definition, so tables get the grid treatment
+    // here for free — the one assumption `core` cannot make for itself.
+    let layout = Layout::monospaced();
     let mut blocks: Vec<Vec<Vec<Block>>> = Vec::with_capacity(p.files.len());
     for f in &mut p.files {
         let md = matches!(f.path.rsplit('.').next(), Some("md" | "markdown" | "mdx"));
-        blocks.push(f.hunks.iter_mut().map(|h| if md { lay_out(&mut h.lines) } else { Vec::new() }).collect());
+        blocks.push(
+            f.hunks
+                .iter_mut()
+                .map(|h| if md { lay_out(&mut h.lines, &layout) } else { Vec::new() })
+                .collect(),
+        );
     }
     let mut left = budget;
 
