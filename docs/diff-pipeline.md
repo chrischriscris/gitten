@@ -11,12 +11,17 @@ have no idea a window exists.
        3b intraline   changed words, per replace-pair
        3c syntax      tokens, per hunk side
   4  build       Rows::build, per file               renderer-owned rows
+       4a layout      markdown::lay_out, if the renderer asks
   5  order       Vec<RowRef>                         8 bytes per row
   6  draw        Rows::render + Theme                one StyledText per row
 ```
 
 Stages 1–3 run once, at load. Stage 4 runs once, at load. Stage 6 runs per
 visible row per frame and is the only one on the render path.
+
+Stage 4a is indented because it is not part of the pipeline everything goes
+through: it runs only for the renderer that asks for it, and today only
+`MarkdownRows` does.
 
 ## 2. Parse
 
@@ -82,11 +87,47 @@ separately and context lines — which belong to both — are scanned twice.
 
 Details in [syntax-highlighting.md](syntax-highlighting.md).
 
+## 4a. Layout, for a renderer that wants the document
+
+Optional, and owned by the renderer rather than by `prepare`, because whether a
+`.md` file is drawn as prose or as source is a presentation question.
+
+```rust
+markdown::lay_out(&mut hunk.lines) -> Vec<Block>
+```
+
+Per hunk side, through the same `syntax::for_each_side` the token pass uses — a
+fence opens on one side and not the other constantly, and one shared splitter is
+what stops the block pass and the token pass disagreeing about the same line.
+
+It returns what each line structurally is and rewrites each line so its markers
+are gone and every token and span still indexes it. **The markers are located from
+the tokens, not by parsing**: a `Strong` token covers `**word**` including its
+delimiters, so hiding them is a matter of checking the bytes at each end of a
+range that already exists. Nothing is re-scanned and no parser is involved — see
+[decisions/0010](decisions/0010-markdown-rendered-rows.md), which also says why a
+CommonMark parse is the wrong shape for a hunk.
+
+Removal is deletion only, so it is `String::drain` back to front over the buffer
+the line already owns: nothing allocates per row. Ranges move *before* the text is
+cut, because both have to be in the same coordinates while the mapping is
+computed. Reversed, a token indexes bytes that are gone — the same failure the
+clip ordering in 3a exists to prevent, with the same kind of test pinning it.
+
+Cost: **70–90 ns a row**, at load. On the two markdown fixtures that is 5.1 ms of
+a 90.7 ms `prepare` and 6.5 ms of a 16.6 ms one — the share says nothing about
+this pass and everything about how much intraline work the diff has.
+
 ## 4–5. Rows, and the order table
 
 Each file goes to the `Rows` implementation that claims its path; the last
 registered claimant wins, and `TextRows` claims everything, which is what makes it
-the fallback. Implementations keep their own row storage. The list keeps only:
+the fallback. `MarkdownRows` is the second built-in and takes `.md`, `.markdown`
+and `.mdx`; it is registered in `Diff::new` through the same call an extension
+would use, for the same reason `Highlighters::builtin` routes Markdown away from
+the scanner — a built-in that skips the seam leaves the seam untested.
+
+Implementations keep their own row storage. The list keeps only:
 
 ```rust
 struct RowRef { owner: u16, index: u32 }   // 8 bytes
@@ -112,6 +153,12 @@ the whole thing:
                                             (from intraline)    (lifted for
                                                                  its surface)
 ```
+
+Both built-ins draw the same anatomy, share the same gutter, sign column and
+`runs` merge, and differ only in what they do with the text area. `MarkdownRows`
+sets a font size on the row for a heading — `HighlightStyle` has no font size, so
+that cannot be a run — and puts glyphs, bars and rules beside the text as separate
+elements rather than as runs, so they can carry their own colour.
 
 One `StyledText` with a run list, not an element per span:
 

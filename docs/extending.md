@@ -105,10 +105,25 @@ pub trait Rows {
 
 ```rust
 Diff::with_renderers(files, host, vec![
-    Box::new(TextRows::default()),   // [0] is the fallback; must claim everything
-    Box::new(ImageRows::new()),      // claims *.png, wins over the fallback
+    Box::new(TextRows::default()),       // [0] is the fallback; must claim everything
+    Box::new(MarkdownRows::default()),   // the second built-in; claims *.md
+    Box::new(ImageRows::new()),          // claims *.png, wins over both
 ]);
 ```
+
+`Diff::new` is that call with the two built-ins in it, so the shipped
+configuration goes through the seam rather than around it. `MarkdownRows` is the
+worked example: it draws `.md` as the document instead of the source, and it does
+it with no new trait, no new argument and no edit to `TextRows` — which is the
+only test of a seam that counts. Read it before writing a second one; the
+interesting parts are `Metrics`, and how little of it is markdown.
+
+**This is the one seam whose registry is not on `Host`,** and the reason is
+structural rather than an oversight: a `Rows` implementation returns an
+`AnyElement`, `Host` lives in `core`, and `core` never knows a UI exists. So the
+list is an argument to `Diff::with_renderers` instead. If panes arrive and more
+than one view wants a row registry, a shell-side registry is where it goes — not
+`Host`.
 
 What arrives in `build` is already clipped, intraline-diffed and highlighted — see
 [diff-pipeline.md](diff-pipeline.md). An implementation draws; it does not redo any
@@ -118,8 +133,27 @@ is how the list holds 8 bytes per row instead of a box.
 **The constraint to design around:** row height is fixed for the whole list,
 because `uniform_list` is the only reason a 714k-row diff scrolls at all. You may
 draw anything within `ROW_H`, but you cannot ask for more. A presentation that
-genuinely needs variable height — a rendered Markdown preview, a side-by-side
+genuinely needs variable height — a reflowed Markdown *preview*, a side-by-side
 image diff — wants a pane of its own, and that plug point does not exist yet.
+
+More fits inside `ROW_H` than it looks like. What `MarkdownRows` found:
+
+- **Font size is a row property, not a run property.** GPUI's `HighlightStyle`
+  carries colour, weight, slant, background, underline, strikethrough and fade,
+  and is documented as *"a single font, uniformly sized and spaced text."* There
+  is no size on a run. So a heading scales by `.text_size()` on the row and never
+  within one — and the ceiling is `ROW_H / 1.2`, past which it clips into its
+  neighbour.
+- **Leave the row background alone.** In a diff it means added or removed, and
+  that is the one thing a presentation may not spend. Group rows with a bar down
+  their left edge instead.
+- **Punctuation you draw yourself is furniture, not text.** A bullet glyph as part
+  of the string becomes a run in the merge and takes the text's colour; as its own
+  `div` it carries its own. It also keeps every text rewrite a pure deletion,
+  which is what lets the range remapping stay one-directional.
+- **Row count is not yours to change.** The gutter shows both line numbers and
+  they have to keep adding up, so a blank line still costs a whole row. A test
+  asserts `MarkdownRows` and `TextRows` produce the same count for the same file.
 
 ## What a new seam owes
 

@@ -8,9 +8,10 @@
 //!
 //!   cargo run -q -p plait-core --example paint --release [ROWS] [PATH-FILTER]
 use plait_core::host::Host;
+use plait_core::markdown::{lay_out, Block};
 use plait_core::prepared::prepare;
 use plait_core::syntax::Kind;
-use plait_core::theme::{Rgb, Style, Surface};
+use plait_core::theme::{MarkdownPalette, Rgb, Style, Surface};
 use plait_core::{parse_unified_diff, LineKind};
 
 fn fg(c: Rgb) -> String {
@@ -45,6 +46,28 @@ fn styled(s: Style, text: &str) -> String {
     out
 }
 
+/// What a rendered Markdown row puts *before* its text, in place of the markers
+/// that are no longer in it. The window draws a coloured div and a font size;
+/// a terminal draws a glyph and a bold escape. Same [`Block`], same decision,
+/// two frontends — which is the whole point of the block living in `core`.
+///
+/// The one thing a terminal cannot do is the size, so a heading here is bold and
+/// the level shows as its own depth of indent instead.
+fn furniture(block: Block, p: &MarkdownPalette) -> String {
+    let indent = "  ".repeat(block.depth() as usize);
+    match block {
+        Block::Heading(l) => format!("{}{}", fg(p.marker), "  ".repeat(l as usize - 1)),
+        Block::Bullet(d) => {
+            let glyph = ["•", "◦", "▪", "·"][(d as usize).min(3)];
+            format!("{indent}{}{glyph} ", fg(p.marker))
+        }
+        Block::Quote(_) => format!("{indent}{}│ ", fg(p.quote_bar)),
+        Block::Fence | Block::Code => format!("{}│ ", fg(p.code_bar)),
+        Block::Rule => format!("{}{}", fg(p.rule), "─".repeat(40)),
+        _ => format!("{indent}"),
+    }
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let budget: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(60);
@@ -56,10 +79,19 @@ fn main() {
     // one prepare pass. Nothing about the assembly is re-implemented here.
     let host = Host::new();
     let theme = &host.theme;
-    let p = prepare(&parse_unified_diff(&raw), &host.syntax, 2000);
+    let mut p = prepare(&parse_unified_diff(&raw), &host.syntax, 2000);
+
+    // A `.md` file is laid out as a document, the same call the shell's
+    // `MarkdownRows` makes and with no markdown logic re-implemented here. What
+    // this example adds is escape codes.
+    let mut blocks: Vec<Vec<Vec<Block>>> = Vec::with_capacity(p.files.len());
+    for f in &mut p.files {
+        let md = matches!(f.path.rsplit('.').next(), Some("md" | "markdown" | "mdx"));
+        blocks.push(f.hunks.iter_mut().map(|h| if md { lay_out(&mut h.lines) } else { Vec::new() }).collect());
+    }
     let mut left = budget;
 
-    for f in &p.files {
+    for (f, fb) in p.files.iter().zip(&blocks) {
         if left == 0 {
             break;
         }
@@ -75,11 +107,11 @@ fn main() {
             f.adds,
             f.dels,
         );
-        for h in &f.hunks {
+        for (h, hb) in f.hunks.iter().zip(fb) {
             if left == 0 {
                 break;
             }
-            for l in &h.lines {
+            for (i, l) in h.lines.iter().enumerate() {
                 if left == 0 {
                     break;
                 }
@@ -95,7 +127,20 @@ fn main() {
                         (" ", theme.diff.context_bg, theme.diff.context_fg, Surface::Context, Surface::Context)
                     }
                 };
+                let block = hb.get(i).copied();
                 print!("{}{}{sign} ", bg(row_bg), fg(row_fg));
+                if let Some(b) = block {
+                    print!("{}{}", furniture(b, &theme.markdown), fg(row_fg));
+                    // A rule and a blank draw no text: the punctuation *was* the
+                    // drawing, and the furniture has already replaced it.
+                    if matches!(b, Block::Rule | Block::Blank) {
+                        println!("\x1b[0m");
+                        continue;
+                    }
+                    if matches!(b, Block::Heading(_)) {
+                        print!("\x1b[1m");
+                    }
+                }
                 // Syntax colours the text; the intraline spans underline the
                 // words that changed, standing in for the background the window
                 // uses — a terminal cell cannot hold two backgrounds at once.

@@ -595,6 +595,29 @@ pub fn highlight_hunk(
     kinds: &[LineKind],
 ) -> Vec<Vec<Token>> {
     let mut out = vec![Vec::new(); texts.len()];
+    for_each_side(kinds, |rows| {
+        let lines: Vec<&str> = rows.iter().map(|&i| texts[i]).collect();
+        for (row, tokens) in rows.iter().zip(hl.highlight(path, &lines)) {
+            out[*row] = tokens;
+        }
+    });
+    out
+}
+
+/// Calls `f` once per side of a hunk with the row indices that side is made of.
+///
+/// Anything carrying state from one line to the next — a lexer's open string, a
+/// Markdown fence, a block classifier — has to run this way rather than over the
+/// interleaved rows, or a removed line splices into an added one and the state is
+/// nonsense. Context rows belong to both sides and so appear in both calls; the
+/// later call wins wherever the caller writes per row, which makes the *added*
+/// side authoritative for them.
+///
+/// One implementation because there is one rule. [`highlight_hunk`] and
+/// `markdown::lay_out` are both callers and neither may drift from the other:
+/// if the block pass split a hunk differently from the token pass, a fence would
+/// open on one and not the other and the two would disagree about the same line.
+pub fn for_each_side(kinds: &[LineKind], mut f: impl FnMut(&[usize])) {
     // A hunk with no added lines has nothing for the added pass to see that the
     // removed pass has not already covered, and pure-deletion diffs are common
     // enough to be worth the check: it halves the work on them.
@@ -605,21 +628,16 @@ pub fn highlight_hunk(
         // All context selects every line whichever side is asked for.
         _ => &[LineKind::Added],
     };
+    let mut rows: Vec<usize> = Vec::with_capacity(kinds.len());
     // Removed first, then added, so a context line ends up carrying the new
     // side's tokens. The text is identical either way; this is just definite.
     for &side in sides {
-        let rows: Vec<usize> = (0..texts.len())
-            .filter(|&i| kinds[i] == side || kinds[i] == LineKind::Context)
-            .collect();
-        if rows.is_empty() {
-            continue;
-        }
-        let lines: Vec<&str> = rows.iter().map(|&i| texts[i]).collect();
-        for (row, tokens) in rows.iter().zip(hl.highlight(path, &lines)) {
-            out[*row] = tokens;
+        rows.clear();
+        rows.extend((0..kinds.len()).filter(|&i| kinds[i] == side || kinds[i] == LineKind::Context));
+        if !rows.is_empty() {
+            f(&rows);
         }
     }
-    out
 }
 
 // ----------------------------------------------------------------- markdown
@@ -700,24 +718,24 @@ impl Highlighter for Markdown {
     }
 }
 
-fn fence_marker(trimmed: &str) -> Option<&'static str> {
+pub(crate) fn fence_marker(trimmed: &str) -> Option<&'static str> {
     ["```", "~~~"].into_iter().find(|m| trimmed.starts_with(m))
 }
 
 /// `====` or `----` under a line of text. Cheap to spot, and without it every
 /// underlined heading in an old README reads as body text.
-fn is_setext(trimmed: &str) -> bool {
+pub(crate) fn is_setext(trimmed: &str) -> bool {
     let t = trimmed.trim_end();
     t.len() >= 2 && (t.bytes().all(|b| b == b'=') || t.bytes().all(|b| b == b'-'))
 }
 
-fn is_break(trimmed: &str) -> bool {
+pub(crate) fn is_break(trimmed: &str) -> bool {
     let t = trimmed.trim_end();
     t.len() >= 3 && (t.bytes().all(|b| b == b'*') || t.bytes().all(|b| b == b'_'))
 }
 
 /// Length of a leading `- `, `* `, `+ ` or `12. `, or 0 if there is none.
-fn list_marker(trimmed: &str) -> usize {
+pub(crate) fn list_marker(trimmed: &str) -> usize {
     let b = trimmed.as_bytes();
     if matches!(b.first(), Some(b'-' | b'*' | b'+')) && b.get(1) == Some(&b' ') {
         return 2;

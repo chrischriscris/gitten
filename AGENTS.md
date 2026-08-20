@@ -95,8 +95,15 @@ and shape is where the crashes live. Kept under `fixtures/real/`:
   *not* a substitute: bun has 17k commits and 97% of rows sit at one lane,
   because squash-merge workflows produce straight lines.
 - `pr30683.diff` (714k lines, near-pure deletion, a 65k-token line),
-  `pr30698.diff` (the zig→rust migration, heaviest intraline), `pr33933.diff`
-  (near-pure addition). Each pathological in a different direction.
+  `pr30698.diff` (the zig→rust migration), `pr33933.diff` (near-pure addition).
+  Each pathological in a different direction.
+- `md.diff` (rust-lang/book, 72k lines) — the only *prose* fixture, and the one
+  the rendered Markdown presentation is measured on. Prose is edited a sentence at
+  a time, which makes it the heaviest intraline case in the set: 72 ms of a 91 ms
+  `prepare`, ahead of `pr30698`. Code diffs replace lines; prose diffs replace
+  words inside them, and no code fixture showed that. A technical-docs tree is a
+  third distribution again — a third of the paragraphs, six times the headings,
+  92 replace-pairs total — and `docs/measurements.md` has both.
 
 **Always log with `--topo-order`.** It is what git itself uses for `--graph`, and
 lane assignment assumes it: without it, branches interleave and the drawing is

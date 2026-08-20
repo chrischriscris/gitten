@@ -23,13 +23,13 @@ use gpui_component::scroll::Scrollbar;
 use plait_core::host::Host;
 use plait_core::prepared::{prepare, Prepared};
 use plait_core::syntax::Token;
-use plait_core::theme::{Rgb, Surface, Theme};
+use plait_core::theme::{DiffPalette, Rgb, Surface, Theme};
 use plait_core::{FileDiff, LineKind, Span};
 use std::cell::Cell;
 use std::ops::Range;
 use std::rc::Rc;
 
-const ROW_H: f32 = 22.0;
+pub(crate) const ROW_H: f32 = 22.0;
 const GUTTER_W: f32 = 52.0;
 
 /// How wide a row may get before it is clipped — a rendering budget, which is
@@ -99,8 +99,20 @@ impl Diff {
         self.order.len()
     }
 
+    /// The shipped set: the built-in text presentation, plus the rendered
+    /// Markdown one registered on top of it through the same call an extension
+    /// would use. The same argument as `Highlighters::builtin` routing Markdown
+    /// away from the scanner — if a built-in does not go through the seam, the
+    /// seam is untested.
     pub fn new(files: Vec<FileDiff>, host: Rc<Host>) -> Self {
-        Self::with_renderers(files, host, vec![Box::new(TextRows::default())])
+        Self::with_renderers(
+            files,
+            host,
+            vec![
+                Box::new(TextRows::default()),
+                Box::new(super::markdown::MarkdownRows::default()),
+            ],
+        )
     }
 
     /// `renderers[0]` is the fallback and must claim every path; later entries
@@ -265,34 +277,12 @@ impl Rows for TextRows {
         let theme = &host.theme;
         let p = &theme.diff;
         match &self.rows[index] {
-            Row::File { path, adds, dels } => div()
-                .flex()
-                .items_center()
-                .gap_3()
-                .h(px(ROW_H))
-                .px_4()
-                .bg(rgb(p.file_bg))
-                .child(div().text_color(rgb(p.file_fg)).child(path.clone()))
-                .child(div().text_color(rgb(p.adds_fg)).child(format!("+{adds}")))
-                .child(div().text_color(rgb(p.dels_fg)).child(format!("-{dels}")))
-                .into_any_element(),
+            Row::File { path, adds, dels } => file_header(path, *adds, *dels, theme),
 
-            Row::Hunk(header) => div()
-                .flex()
-                .items_center()
-                .h(px(ROW_H))
-                .px_4()
-                .bg(rgb(p.hunk_bg))
-                .text_color(rgb(p.hunk_fg))
-                .child(header.clone())
-                .into_any_element(),
+            Row::Hunk(header) => hunk_header(header, theme),
 
             Row::Line { kind, old, new, text, spans, tokens } => {
-                let (bg, fg, sign) = match kind {
-                    LineKind::Added => (p.added_bg, p.added_fg, "+"),
-                    LineKind::Removed => (p.removed_bg, p.removed_fg, "-"),
-                    LineKind::Context => (p.context_bg, p.context_fg, " "),
-                };
+                let (bg, fg, sign) = line_colors(*kind, p);
                 div()
                     .flex()
                     .items_center()
@@ -314,13 +304,62 @@ impl Rows for TextRows {
     }
 }
 
-fn num(n: SharedString, fg: Rgb) -> Div {
+/// A file's header row. Identical whichever presentation owns the lines beneath
+/// it — a `.md` file is still a file — so it is drawn here and shared.
+pub(crate) fn file_header(
+    path: &SharedString,
+    adds: usize,
+    dels: usize,
+    theme: &Theme,
+) -> AnyElement {
+    let p = &theme.diff;
+    div()
+        .flex()
+        .items_center()
+        .gap_3()
+        .h(px(ROW_H))
+        .px_4()
+        .bg(rgb(p.file_bg))
+        .child(div().text_color(rgb(p.file_fg)).child(path.clone()))
+        .child(div().text_color(rgb(p.adds_fg)).child(format!("+{adds}")))
+        .child(div().text_color(rgb(p.dels_fg)).child(format!("-{dels}")))
+        .into_any_element()
+}
+
+pub(crate) fn hunk_header(header: &SharedString, theme: &Theme) -> AnyElement {
+    let p = &theme.diff;
+    div()
+        .flex()
+        .items_center()
+        .h(px(ROW_H))
+        .px_4()
+        .bg(rgb(p.hunk_bg))
+        .text_color(rgb(p.hunk_fg))
+        .child(header.clone())
+        .into_any_element()
+}
+
+/// Which background a line of `kind` is drawn on, and the surfaces a token
+/// lands on there. Shared so the two presentations cannot drift on what "added"
+/// looks like.
+pub(crate) fn line_colors(
+    kind: LineKind,
+    p: &DiffPalette,
+) -> (Rgb, Rgb, &'static str) {
+    match kind {
+        LineKind::Added => (p.added_bg, p.added_fg, "+"),
+        LineKind::Removed => (p.removed_bg, p.removed_fg, "-"),
+        LineKind::Context => (p.context_bg, p.context_fg, " "),
+    }
+}
+
+pub(crate) fn num(n: SharedString, fg: Rgb) -> Div {
     div().flex_none().w(px(GUTTER_W)).text_color(rgb(fg)).child(n)
 }
 
 /// Line numbers are drawn, so they are formatted once at load rather than on
 /// every frame the row is visible.
-fn number(n: Option<u32>) -> SharedString {
+pub(crate) fn number(n: Option<u32>) -> SharedString {
     n.map(|n| SharedString::from(n.to_string())).unwrap_or_default()
 }
 
@@ -330,7 +369,7 @@ fn number(n: Option<u32>) -> SharedString {
 ///
 /// Both inputs are already sorted and internally non-overlapping, so this is a
 /// sweep over their combined edges rather than a sort.
-fn runs(
+pub(crate) fn runs(
     text: &str,
     tokens: &[Token],
     spans: &[Span],

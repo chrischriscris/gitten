@@ -34,3 +34,4 @@ rather than nine.
 | [0007](0007-assembly-in-core.md) | Row assembly belongs in `core`, not the view |
 | [0008](0008-intraline-similarity-floor.md) | No word highlighting below 0.4 similarity |
 | [0009](0009-contrast-resolution.md) | Resolve foregrounds against their background |
+| [0010](0010-markdown-rendered-rows.md) | Markdown renders as rows, and the markers come off in `core` |

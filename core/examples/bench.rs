@@ -40,13 +40,32 @@ fn main() {
     // The whole assembly the views use, in one call: clip, intraline, syntax.
     let host = host::Host::new();
     let t = Instant::now();
-    let p = prepared::prepare(&files, &host.syntax, 2000);
+    let mut p = prepared::prepare(&files, &host.syntax, 2000);
     let build = t.elapsed();
     let (mut tokens, mut bytes) = (0usize, 0usize);
     for l in p.files.iter().flat_map(|f| &f.hunks).flat_map(|h| &h.lines) {
         tokens += l.tokens.len();
         bytes += l.text.len();
     }
+
+    // The markdown pass, on whatever of this diff is markdown. It reuses the
+    // tokens `prepare` just produced, so what is measured is the block pass, the
+    // marker removal and the range remapping — nothing else.
+    //
+    // In place, on `p` itself, and deliberately not on a clone: duplicating a
+    // 714k-line prepared diff to protect five markdown files put the first touch
+    // of every one of those files inside the timer, and reported 610 µs for 44
+    // rows. This is also what the view does — `lay_out` runs on the rows
+    // `prepare` handed it, still warm.
+    let t = Instant::now();
+    let (mut md_rows, mut md_files) = (0usize, 0usize);
+    for f in p.files.iter_mut().filter(|f| is_markdown(&f.path)) {
+        md_files += 1;
+        for h in &mut f.hunks {
+            md_rows += markdown::lay_out(&mut h.lines).len();
+        }
+    }
+    let layout = t.elapsed();
 
     println!("DIFF     {:>9} lines  {:>5} files  {} replace-pairs", nlines, files.len(), pairs);
     println!("  read {:>9.1?}   parse {:>9.1?}   intraline {:>9.1?}", read, parse, intra);
@@ -59,4 +78,18 @@ fn main() {
         bytes as f64 / 1e6,
         (bytes as f64 / 1e6) / p.syntax.as_secs_f64()
     );
+    if md_files > 0 {
+        println!(
+            "  markdown {:>5.1?}   {} rows  {} files  {:.0} ns/row  ({:.1}% of prepare)",
+            layout,
+            md_rows,
+            md_files,
+            layout.as_secs_f64() * 1e9 / md_rows.max(1) as f64,
+            100.0 * layout.as_secs_f64() / build.as_secs_f64(),
+        );
+    }
+}
+
+fn is_markdown(path: &str) -> bool {
+    matches!(path.rsplit('.').next(), Some("md" | "markdown" | "mdx"))
 }

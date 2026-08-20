@@ -32,10 +32,124 @@ swaps each real fixture in and restores what was there.
 | `pr33933.diff` | 20,831 | 35 | 1.6 ms | 8.0 ms | 6.5 ms | 32,236 | 115 MB/s |
 | `pr30698.diff` | 50,604 | 1,398 | 6.2 ms | 98.9 ms | 35.6 ms | 122,237 | 67 MB/s |
 | `pr30683.diff` | 713,996 | 1,375 | 57.1 ms | 288.7 ms | 237.3 ms | 1,330,580 | 114 MB/s |
+| `md.diff` | 71,756 | 229 | 6.6 ms | 90.7 ms | 12.9 ms | 45,250 | 258 MB/s |
 
-`pr30698` is the outlier because intraline dominates it (57.5 ms): it is the
-zig→rust migration, so nearly every line is a near-identical rewrite of another —
-the worst case for a quadratic word diff and exactly why it is a fixture.
+`pr30698` was the fixture chosen because intraline dominates it (57.5 ms): it is
+the zig→rust migration, so nearly every line is a near-identical rewrite of
+another — the worst case for a quadratic word diff.
+
+`md.diff` turns out to be worse, and unintentionally so. It was added for the
+rendered Markdown presentation and is **71.7 ms of intraline out of a 90.7 ms
+`prepare`, 79% of the pass** — because prose is edited a sentence at a time, so
+almost every changed line is a near-identical rewrite of the one it replaced. It
+is now the heaviest intraline case in the set. Code diffs replace whole lines;
+prose diffs replace words inside them, and nothing in the code fixtures showed
+that.
+
+### The Markdown layout pass
+
+`markdown::lay_out` — block classification, marker removal, range remapping. Runs
+at load, for markdown files only, and adds nothing to the render path. Reported by
+`bench` on its own line whenever the diff contains a `.md` file.
+
+| fixture | rows | files | `prepare` | `lay_out` | per row | of `prepare` |
+|---|---|---|---|---|---|---|
+| `md.diff` (rust-lang/book) | 71,705 | 228 | 90.7 ms | 5.1 ms | 71 ns | 5.6% |
+| a technical-docs tree | 75,684 | 1,019 | 16.6 ms | 6.5 ms | 86 ns | 37.5% |
+
+**Quote the per-row figure, not the share.** The two shares differ by 7× and the
+per-row costs by 1.2×; the share is a statement about how much intraline work the
+*rest* of the diff had, not about this pass.
+
+The per-row figure is only meaningful at scale. `pr30683.diff` has five markdown
+files and 44 markdown rows in 714k, and reports 1,474 ns/row — nearly all of it
+the walk over 1,375 file paths to find those five, and their cold cache lines.
+That number is about finding the work, not doing it.
+
+`bench` measures this in place on the rows `prepare` just produced, which is also
+what the view does. It used to clone the prepared diff first to leave `p`
+untouched, which put the first touch of every markdown file inside the timer and
+reported **610 µs** for those same 44 rows — a tenfold overstatement, entirely
+from page faults on a freshly duplicated 714k-line structure. Worth remembering
+before defensively cloning anything inside a timer.
+
+Breakdown, single runs on the technical-docs fixture, by disabling the later
+stages in turn — this machine is noisy enough (`prepare` itself swings 2× run to
+run) that these are proportions rather than figures:
+
+| stage | cost | share |
+|---|---|---|
+| classify blocks | 2.8 ms | ~37% |
+| derive the cuts from the tokens | +2.1 ms | ~28% |
+| drain the text, remap the ranges | +2.6 ms | ~35% |
+
+### The two Markdown shapes
+
+Every other diff fixture here is code. Prose is a different distribution, and the
+two real markdown corpora measured are not alike either — which is why both are
+recorded. Counted over the `+`/`-` lines:
+
+| | rust-lang/book | a technical-docs tree |
+|---|---|---|
+| diff lines | 71,756 | 75,684 |
+| files | 229 | 1,019 |
+| changed (`+`/`-`) lines | 48,878 | 74,601 |
+| paragraph | 79.7% | 34.2% |
+| blank | 9.2% | 29.6% |
+| heading | 2.2% | 12.1% |
+| bullet / ordered | 2.6% | 19.9% |
+| fence | 1.8% | 3.2% |
+| table | 2.4% | 1.0% |
+| quote | 2.1% | 0.1% |
+| replace-pairs | 13,679 | 92 |
+
+The book is prose: long paragraphs, few headings, and intraline work on 13,679
+line pairs. The technical-docs tree is the opposite — a third of the size in
+paragraphs, six times the headings, eight times the lists, nearly a third of it
+blank, and **92** replace-pairs in the whole diff. A renderer that looked good on
+one and untested on the other would be half tested; so would a claim about what
+this costs.
+
+The percentages are over the changed lines only, which is what
+`grep '^[+-]' | grep -v '^+++\|^---'` gives you; the diff-line counts include
+context and come from `bench`.
+
+### What the marker removal cannot reach
+
+It removes markers the token pass located, so it inherits that pass's blind spots
+exactly. Both were counted over the changed lines of both fixtures:
+
+| | rust-lang/book | a technical-docs tree |
+|---|---|---|
+| headings carrying inline markup | 230 / 1,081 = 21.3% | 306 / 9,008 = 3.4% |
+| — as a share of all changed lines | 0.47% | 0.41% |
+| lines with an unpaired `**` run | 0.05% | 0.17% |
+
+The heading share differs by 6× and lands in the same place either way, because
+the two fixtures have inverse heading counts: a programming book puts `` `code` ``
+in a fifth of its headings and has few of them; a technical-docs tree has eight
+times as many headings and marks up almost none. Under half a percent of rows on
+both, which is the figure that decided it.
+
+```
+grep '^[+-]' F | grep -v '^+++\|^---' | sed 's/^[+-]//' | grep -cE '^ *#{1,6} .*(\*\*|`|\[[^]]+\]\()'
+grep '^[+-]' F | grep -v '^+++\|^---' | sed 's/^[+-]//' \
+  | awk '{s=$0; if (gsub(/\*\*/,"",s)%2==1) o++} END {print o, NR}'
+```
+
+Both are left alone on purpose rather than guessed at; see
+[decisions/0010](decisions/0010-markdown-rendered-rows.md).
+
+Reproducing them:
+
+```
+./fixtures/fetch.sh                                     # builds md.diff from rust-lang/book
+git -C <a docs repo> diff HEAD~2000..HEAD -- '*.md' > fixtures/real/md.diff
+```
+
+The second is the technical-docs shape; the tree measured above is private, so
+that row is not reproducible from this repository — the recipe is. Any repository
+with a large `docs/` tree and a few thousand commits produces the same shape.
 
 ### Synthetic scale
 

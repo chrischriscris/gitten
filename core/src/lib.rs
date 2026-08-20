@@ -5,6 +5,7 @@
 //! something in here needs to know what a window is, the boundary is gone.
 
 pub mod host;
+pub mod markdown;
 pub mod prepared;
 pub mod syntax;
 pub mod theme;

@@ -89,6 +89,26 @@ pub struct DiffPalette {
     pub removed_word_bg: Rgb,
 }
 
+/// The furniture a rendered Markdown row draws in place of the markers it hides.
+///
+/// Bars rather than backgrounds, deliberately. A row's background in a diff means
+/// added, removed or unchanged, and that is the one thing a diff may never give
+/// up — so a fenced block and a blockquote are marked by a rule down their left
+/// edge instead, which groups a run of rows without touching what the row already
+/// says about itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarkdownPalette {
+    /// The rule down the left of a fenced code block.
+    pub code_bar: Rgb,
+    /// The rule down the left of a blockquote.
+    pub quote_bar: Rgb,
+    /// Bullet glyphs, table pipes, a fence's language label: the punctuation the
+    /// renderer draws itself, which should read as structure and not as text.
+    pub marker: Rgb,
+    /// A thematic break, and a table's separator row.
+    pub rule: Rgb,
+}
+
 /// Window furniture: the things that are neither a diff nor a graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChromePalette {
@@ -113,6 +133,7 @@ pub struct Theme {
     /// token run.
     syntax: [Style; Kind::COUNT],
     pub diff: DiffPalette,
+    pub markdown: MarkdownPalette,
     pub chrome: ChromePalette,
     /// Cycled per graph lane, and per author for the initials column. Any
     /// length; the drawing code takes them modulo.
@@ -172,6 +193,15 @@ impl Theme {
                 removed_bg: 0x2a1917,
                 removed_fg: 0xd4a09a,
                 removed_word_bg: 0x43201a,
+            },
+            // Quieter than the syntax palette on purpose: this is punctuation
+            // the reader should be able to ignore, standing in for punctuation
+            // that is no longer on the row.
+            markdown: MarkdownPalette {
+                code_bar: 0x35302b,
+                quote_bar: 0x4d5f6b,
+                marker: 0x6e6862,
+                rule: 0x3a352f,
             },
             chrome: ChromePalette {
                 bg: 0x0e0d0c,

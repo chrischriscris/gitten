@@ -8,7 +8,7 @@ Three crates. The interesting line is between the first two and the third.
    a repository         │                                      │
         │               │  parse_log      assign_lanes         │
         │               │  parse_unified_diff   intraline      │
-        ▼               │  prepared::prepare                   │
+        ▼               │  prepared::prepare   markdown::lay_out│
 ┌───────────────┐ data  │  syntax::{Lexer, Markdown, ...}      │
 │  plait-git    ├──────►│  theme::Theme        host::Host      │
 │               │       │                                      │
@@ -32,6 +32,7 @@ because it compiles in a second and its tests need no window.
 |---|---|
 | `lib.rs` | commit and diff parsing, `assign_lanes`, `intraline`, `replace_pairs`, `initials` |
 | `prepared.rs` | a diff assembled into drawable rows: clip → intraline → syntax |
+| `markdown.rs` | a `.md` diff as blocks, with the markers cut and the ranges moved |
 | `syntax.rs` | the scanner, the language tables, the `Highlighter` trait, routing, Markdown |
 | `theme.rs` | every colour, as `0xRRGGBB` data, plus contrast resolution |
 | `host.rs` | the struct that holds the swappable pieces |
@@ -57,7 +58,8 @@ GPUI. Drawing and input, and as little else as possible.
 | file | what lives there |
 |---|---|
 | `main.rs` | argument parsing, data loading, the window, the `Host` |
-| `views/diff.rs` | the `Rows` seam, `TextRows`, run-list merging |
+| `views/diff.rs` | the `Rows` seam, `TextRows`, run-list merging, the shared row furniture |
+| `views/markdown.rs` | `MarkdownRows`: the rendered-Markdown presentation, and its metrics |
 | `views/commits.rs` | the commit list, author initials, row layout |
 | `graph.rs` | lane geometry and painting: quads, paths, one canvas per row |
 | `stats.rs` | the counting allocator and the `PLAIT_STATS` overlay |
@@ -108,4 +110,9 @@ Listed so nobody reads an intention as a description:
 - **Writes.** No commit, push, stage or rebase. Reads only.
 - **`gix`.** All reads still spawn `git`.
 - **Panes.** One view fills the window, so a presentation needing its own layout
-  has nowhere to go yet — the reason the `Rows` seam is row-shaped.
+  has nowhere to go yet — the reason the `Rows` seam is row-shaped. A rendered
+  Markdown *row* exists ([decisions/0010](decisions/0010-markdown-rendered-rows.md));
+  a rendered Markdown *document*, reflowed and variably tall, is what needs the pane.
+- **Code-block injection.** A fenced block in a `.md` diff knows it said `rust` and
+  is still drawn as one string. See
+  [decisions/0010](decisions/0010-markdown-rendered-rows.md).
