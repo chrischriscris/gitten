@@ -307,7 +307,24 @@ impl Highlighter for Lexer {
 /// reaching `core` — registers here exactly the way [`Markdown`] does below.
 pub struct Highlighters {
     routes: Vec<(Vec<String>, Box<dyn Highlighter>)>,
-    fallback: Box<dyn Highlighter>,
+    fallback: Fallback,
+}
+
+/// The fallback is kept concrete while it is still the scanner, so that
+/// registering a language — much the most common extension there is — does not
+/// mean rebuilding it.
+enum Fallback {
+    Scanner(Lexer),
+    Custom(Box<dyn Highlighter>),
+}
+
+impl Fallback {
+    fn as_highlighter(&self) -> &dyn Highlighter {
+        match self {
+            Fallback::Scanner(l) => l,
+            Fallback::Custom(h) => h.as_ref(),
+        }
+    }
 }
 
 impl Default for Highlighters {
@@ -319,13 +336,28 @@ impl Default for Highlighters {
 impl Highlighters {
     /// The scanner for everything, with Markdown routed away from it.
     pub fn builtin() -> Self {
-        let mut h = Self::with_fallback(Lexer::builtin());
+        let mut h = Self { routes: Vec::new(), fallback: Fallback::Scanner(Lexer::builtin()) };
         h.route(&["md", "markdown", "mdx"], Markdown);
         h
     }
 
     pub fn with_fallback(fallback: impl Highlighter + 'static) -> Self {
-        Self { routes: Vec::new(), fallback: Box::new(fallback) }
+        Self { routes: Vec::new(), fallback: Fallback::Custom(Box::new(fallback)) }
+    }
+
+    /// The scanner's language tables, for adding or replacing one:
+    ///
+    /// ```ignore
+    /// host.syntax.languages().unwrap().register(&["nim"], syntax);
+    /// ```
+    ///
+    /// `None` once the fallback has been replaced by something that is not the
+    /// scanner — there are no tables to register with then.
+    pub fn languages(&mut self) -> Option<&mut Languages> {
+        match &mut self.fallback {
+            Fallback::Scanner(lexer) => Some(&mut lexer.languages),
+            Fallback::Custom(_) => None,
+        }
     }
 
     /// Keys are extensions or whole filenames, matched the way
@@ -337,7 +369,7 @@ impl Highlighters {
     }
 
     pub fn set_fallback(&mut self, hl: impl Highlighter + 'static) {
-        self.fallback = Box::new(hl);
+        self.fallback = Fallback::Custom(Box::new(hl));
     }
 
     pub fn for_path(&self, path: &str) -> &dyn Highlighter {
@@ -349,7 +381,7 @@ impl Highlighters {
                 return hl.as_ref();
             }
         }
-        self.fallback.as_ref()
+        self.fallback.as_highlighter()
     }
 }
 
@@ -1307,6 +1339,25 @@ mod tests {
         hl.route(&["Makefile"], EverythingIsAComment);
         assert_eq!(hl.highlight("deps/Makefile", &["all:"])[0][0].kind, Kind::Comment);
         assert!(hl.highlight("makefile.rs", &["let x = 1;"])[0][0].kind != Kind::Comment);
+    }
+
+    #[test]
+    fn a_language_can_be_added_without_rebuilding_the_fallback() {
+        // The most common extension there is, and it should not cost more than
+        // this: one call, no reconstruction of the scanner.
+        let mut hl = Highlighters::builtin();
+        hl.languages()
+            .expect("the scanner is still the fallback")
+            .register(&["nim"], Syntax::new().line(&["#"]).keywords(&["proc"]));
+        let got = hl.highlight("x.nim", &["proc main() # note"]);
+        assert_eq!(got[0][0].kind, Kind::Keyword);
+        assert_eq!(got[0][1].kind, Kind::Comment);
+    }
+
+    #[test]
+    fn there_are_no_tables_to_register_once_the_scanner_is_gone() {
+        let mut hl = Highlighters::with_fallback(EverythingIsAComment);
+        assert!(hl.languages().is_none());
     }
 
     #[test]

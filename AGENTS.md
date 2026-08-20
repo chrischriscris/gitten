@@ -11,6 +11,10 @@ A desktop git client with lazygit's keyboard model. Rust, GPUI.
 
 They conflict sometimes. That order breaks the tie.
 
+This file is philosophy only. Systems, decisions and the numbers behind them live
+in `docs/` — start at `docs/README.md`. Nothing about a particular feature belongs
+here; if it needs writing down, it goes there or into a doc comment.
+
 ## The one architectural rule
 
 `core/` never knows a UI exists. No GPUI, no rendering, no terminal. It has zero
