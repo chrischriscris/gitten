@@ -108,6 +108,33 @@ fn claim_lane(lanes: &mut Vec<Option<String>>, sha: &str) -> usize {
     }
 }
 
+/// Two letters for an author, the way a dense list wants them: first and last
+/// name, or the first two characters of a single-word name. Uppercased, so a
+/// column of them lines up as initials rather than as words.
+///
+/// Here rather than in the shell because it is a pure text transform, and the
+/// terminal frontend wants exactly the same two letters.
+pub fn initials(author: &str) -> String {
+    let mut words = author.split_whitespace();
+    let first = words.next().unwrap_or_default();
+    let mut out = String::with_capacity(2);
+    let mut push = |c: Option<char>| out.extend(c.into_iter().flat_map(char::to_uppercase));
+    match words.last() {
+        // "Junio C Hamano" -> JH: the last name, never the middle one.
+        Some(last) => {
+            push(first.chars().next());
+            push(last.chars().next());
+        }
+        // One word is all there is: "torvalds" -> TO, "x" -> X, "" -> "".
+        None => {
+            let mut cs = first.chars();
+            push(cs.next());
+            push(cs.next());
+        }
+    }
+    out
+}
+
 // ------------------------------------------------------------------- the diff
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -398,6 +425,18 @@ mod tests {
         // Both lanes were waiting on d; reaching it collapses them back to one.
         assert_eq!(rows[3].lane, 0);
         assert_eq!(rows[3].merges, vec![1]);
+    }
+
+    #[test]
+    fn initials_are_two_letters_however_the_name_is_shaped() {
+        assert_eq!(initials("Junio C Hamano"), "JH");
+        assert_eq!(initials("Ada Lovelace"), "AL");
+        assert_eq!(initials("torvalds"), "TO");
+        assert_eq!(initials("x"), "X");
+        assert_eq!(initials(""), "");
+        assert_eq!(initials("  spaced   out  "), "SO");
+        assert_eq!(initials("émile zola"), "ÉZ");
+        assert_eq!(initials("émile"), "ÉM", "a multi-byte first letter is still one letter");
     }
 
     #[test]

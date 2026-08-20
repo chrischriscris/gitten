@@ -45,7 +45,7 @@ impl Render for DevShell {
         div()
             .size_full()
             .v_flex()
-            .bg(rgb(0x0e0d0c))
+            .bg(rgb(graph::BG))
             .text_color(rgb(0xe8e3dc))
             .text_sm()
             .font_family("Menlo")

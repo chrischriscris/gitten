@@ -4,6 +4,18 @@
 //! GPUI is reactive and idles at zero frames; the overlay requests an animation
 //! frame every render to force a continuous loop. That is the number you want
 //! when judging scroll smoothness, and it is not what the app costs at rest.
+//!
+//! It is also a ceiling, not a throughput. GPUI paces animation frames off
+//! `CVDisplayLink` — one callback per display refresh — so the fps reading is
+//! the display's *current* rate for as long as we stay inside its budget. That
+//! rate is not a constant: Low Power Mode pins a ProMotion panel to 60Hz, as
+//! does running on battery under some settings, so the same binary reads 120
+//! plugged in and 60 unplugged with nothing about the app having changed.
+//!
+//! Which is why `best` is on the line. It is the shortest interval in the ring
+//! — the display's real beat, the one frame we know we made. If `best` and
+//! `p50` agree we never missed one, and the fps figure is the panel's, not
+//! ours. Only when `p50` drifts above `best` are we the reason.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -74,7 +86,11 @@ impl Stats {
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let p50 = v[count / 2].max(0.001);
         let p99 = v[count * 99 / 100];
-        format!("{:>3.0} fps    frame p50 {:>5.2}ms   p99 {:>5.2}ms", 1000.0 / p50, p50, p99)
+        let best = v[0];
+        format!(
+            "{:>3.0} fps    frame p50 {p50:>5.2}ms   p99 {p99:>5.2}ms   best {best:>5.2}ms",
+            1000.0 / p50
+        )
     }
 
     /// Live proof that virtualization is working: rows built this frame vs rows
