@@ -152,6 +152,13 @@ was, and a single bad line is named and skipped while the rest applies. A warnin
 only appears when a value actually *changed* — one that fires on an unchanged
 value teaches you to ignore the ones that matter.
 
+The file holds **data only** — see
+[decisions/0012](decisions/0012-config-is-data-behaviour-is-not.md). No
+expressions and no computed colours, because a settings panel has to be able to
+rewrite the file in place and cannot round-trip a function. When a colour is only
+ever "that one, but lighter", derive it in `Theme` instead of asking the file for
+it; `rebuild` already does exactly that for every syntax colour on every surface.
+
 Implementation is `shell/src/config.rs`. It is in the shell and not in `core`
 because reading a file is I/O and `core` does none; when a `cli/` wants the same
 file it becomes its own crate. `apply` is a pure function of a string, which is

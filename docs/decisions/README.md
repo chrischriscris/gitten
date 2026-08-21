@@ -35,3 +35,11 @@ rather than nine.
 | [0008](0008-intraline-similarity-floor.md) | No word highlighting below 0.4 similarity |
 | [0009](0009-contrast-resolution.md) | Resolve foregrounds against their background |
 | [0010](0010-markdown-rendered-rows.md) | Markdown renders as rows, and the markers come off in `core` |
+| 0011 | *reserved* — see below |
+| [0012](0012-config-is-data-behaviour-is-not.md) | Config is data, behaviour is not |
+
+**0011 is deliberately absent.** It was a rendered-Markdown reader that was built,
+looked at, judged broken and parked in a `git stash` rather than deleted. The
+number is held for it so that recovering the stash needs no renumbering — which
+this file promises never happens. If the work is abandoned for good, this line is
+what should say so.

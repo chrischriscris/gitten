@@ -10,6 +10,20 @@
 //! becomes its own crate — the way `plait-git` is the only crate that talks to a
 //! repository.
 //!
+//! # The one rule about what may go in here
+//!
+//! **Data only. Never behaviour.** Not a stylistic preference — a settings panel
+//! has to be able to rewrite this file in place, keeping the comments and the key
+//! order, and it cannot round-trip a function. So a keybinding names its command
+//! (`lua = "my.toggle"`) and the behaviour lives in a plugin file that this format
+//! only ever points at.
+//!
+//! That is also why there are no expressions and no computed colours here. When a
+//! field is only ever "that one, but lighter", derive it in `Theme` rather than
+//! asking the file for it — `Theme::rebuild` already resolves every syntax colour
+//! against every surface that way. See
+//! `docs/decisions/0012-config-is-data-behaviour-is-not.md`.
+//!
 //! # The split that makes this testable
 //!
 //! [`apply`] is a pure function of a string. Every test below runs it on a
