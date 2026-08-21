@@ -12,6 +12,7 @@ pub mod markdown;
 pub mod prepared;
 pub mod syntax;
 pub mod theme;
+pub mod wrap;
 
 // ---------------------------------------------------------------- commit log
 

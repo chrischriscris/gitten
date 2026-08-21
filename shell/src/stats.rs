@@ -17,8 +17,9 @@
 //! `p50` agree we never missed one, and the fps figure is the panel's, not
 //! ours. Only when `p50` drifts above `best` are we the reason.
 
+use gpui::SharedString;
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::time::Instant;
@@ -58,21 +59,31 @@ pub struct Stats {
     last: Option<Instant>,
     /// Written by whichever view is on screen; it owns the cell, we only read.
     pub rows_drawn: Rc<Cell<usize>>,
-    pub total_rows: usize,
+    /// Also the view's, and also live: wrapping changes how many rows exist on
+    /// every resize, so a number taken at load would be describing the diff as
+    /// it was one window ago.
+    pub total_rows: Rc<Cell<usize>>,
     /// One-off load timings, captured before the window opened.
     pub load: String,
+    /// Whatever the view wants to say about itself right now — the wrap and the
+    /// width it is at. Live, for the same reason `total_rows` is.
+    pub note: Rc<RefCell<SharedString>>,
 }
 
 impl Stats {
-    pub fn new(rows_drawn: Rc<Cell<usize>>, total_rows: usize, load: String) -> Self {
-        Self { ring: [0.0; RING], n: 0, last: None, rows_drawn, total_rows, load }
+    pub fn new(
+        rows_drawn: Rc<Cell<usize>>,
+        total_rows: Rc<Cell<usize>>,
+        note: Rc<RefCell<SharedString>>,
+        load: String,
+    ) -> Self {
+        Self { ring: [0.0; RING], n: 0, last: None, rows_drawn, total_rows, load, note }
     }
 
-    /// After the view rebuilt its rows — a layout or algorithm change. Both
-    /// numbers are one-off measurements of a load that has now happened twice,
-    /// and an overlay reporting the first one is worse than no overlay.
-    pub fn reloaded(&mut self, total_rows: usize, load: String) {
-        self.total_rows = total_rows;
+    /// After the view rebuilt its rows — a layout or algorithm change. A one-off
+    /// measurement of a load that has now happened twice, and an overlay
+    /// reporting the first one is worse than no overlay.
+    pub fn reloaded(&mut self, load: String) {
         self.load = load;
     }
 
@@ -104,7 +115,16 @@ impl Stats {
     /// Live proof that virtualization is working: rows built this frame vs rows
     /// that exist. If the left number tracks the right one, it isn't.
     pub fn rows(&self) -> String {
-        format!("rows {:>4} drawn / {:>9} total", self.rows_drawn.get(), self.total_rows)
+        let note = self.note.borrow();
+        let wrap = match note.is_empty() {
+            true => String::new(),
+            false => format!("   wrap {note}"),
+        };
+        format!(
+            "rows {:>4} drawn / {:>9} total{wrap}",
+            self.rows_drawn.get(),
+            self.total_rows.get()
+        )
     }
 
     pub fn heap(&self) -> String {

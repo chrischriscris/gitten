@@ -7,11 +7,18 @@
 //! If a colour looks wrong here it is wrong there.
 //!
 //!   cargo run -q -p plait-core --example paint --release [ROWS] [PATH-FILTER]
+//!
+//! `WRAP_COLS=n` sets where a long line breaks, and `WRAP_COLS=0` turns wrapping
+//! off. That is the same [`Wrap`] the window uses, reached the same way: a break
+//! point is a property of text, and this is the check that nothing about the seam
+//! is shaped like GPUI. What a terminal supplies is the column count — the one
+//! thing `core` cannot know.
 use plait_core::host::Host;
 use plait_core::markdown::{lay_out, Block, Layout};
 use plait_core::prepared::prepare;
 use plait_core::syntax::Kind;
 use plait_core::theme::{MarkdownPalette, Rgb, Style, Surface};
+use plait_core::wrap::Wrapped;
 use plait_core::{parse_unified_diff, LineKind};
 
 fn fg(c: Rgb) -> String {
@@ -53,13 +60,19 @@ fn styled(s: Style, text: &str) -> String {
 ///
 /// The one thing a terminal cannot do is the size, so a heading here is bold and
 /// the level shows as its own depth of indent instead.
-fn furniture(block: Block, p: &MarkdownPalette) -> String {
+///
+/// `first` is false on a wrapped line's continuation rows. A bar repeats down all
+/// of them — it is the block, and the block continues — but the bullet is drawn
+/// once and its width kept, so the text of a wrapped item lines up under itself
+/// rather than under a column of glyphs. The window does the same thing with the
+/// same distinction.
+fn furniture(block: Block, p: &MarkdownPalette, first: bool) -> String {
     let indent = "  ".repeat(block.depth() as usize);
     match block {
         Block::Heading(l) => format!("{}{}", fg(p.marker), "  ".repeat(l as usize - 1)),
         Block::Bullet(d) => {
             let glyph = ["•", "◦", "▪", "·"][(d as usize).min(3)];
-            format!("{indent}{}{glyph} ", fg(p.marker))
+            format!("{indent}{}{} ", fg(p.marker), if first { glyph } else { " " })
         }
         Block::Quote(_) => format!("{indent}{}│ ", fg(p.quote_bar)),
         Block::Fence | Block::Code => format!("{}│ ", fg(p.code_bar)),
@@ -100,9 +113,27 @@ fn main() {
                 .collect(),
         );
     }
+    // Where every line breaks, from the host's own registry. The sign column and
+    // one space are all this draws in front of the text, so that is the chrome.
+    let cols: usize =
+        std::env::var("WRAP_COLS").ok().and_then(|v| v.parse().ok()).unwrap_or(100);
+    let wrapped: Vec<Wrapped> = p
+        .files
+        .iter()
+        .map(|f| {
+            Wrapped::build(
+                f.hunks
+                    .iter()
+                    .flat_map(|h| &h.lines)
+                    .map(|l| (l.text.as_str(), cols.saturating_sub(2))),
+                host.wrap.current(),
+            )
+        })
+        .collect();
+
     let mut left = budget;
 
-    for (f, fb) in p.files.iter().zip(&blocks) {
+    for ((f, fb), fw) in p.files.iter().zip(&blocks).zip(&wrapped) {
         if left == 0 {
             break;
         }
@@ -118,11 +149,16 @@ fn main() {
             f.adds,
             f.dels,
         );
+        // The wrap table is per *file*, so a hunk's lines have to be found in it
+        // at their offset from the start of the file rather than from the start
+        // of the hunk.
+        let mut line_no = 0usize;
         for (h, hb) in f.hunks.iter().zip(fb) {
             if left == 0 {
                 break;
             }
             for (i, l) in h.lines.iter().enumerate() {
+                let at = line_no + i;
                 if left == 0 {
                     break;
                 }
@@ -139,33 +175,54 @@ fn main() {
                     }
                 };
                 let block = hb.get(i).copied();
-                print!("{}{}{sign} ", bg(row_bg), fg(row_fg));
-                if let Some(b) = block {
-                    print!("{}{}", furniture(b, &theme.markdown), fg(row_fg));
-                    // A rule and a blank draw no text: the punctuation *was* the
-                    // drawing, and the furniture has already replaced it.
-                    if matches!(b, Block::Rule | Block::Blank) {
-                        println!("\x1b[0m");
-                        continue;
+                // One pass per row the line takes. A continuation gets a blank
+                // sign, exactly as it does in the window: the background says
+                // which line it belongs to and there is nothing else to add.
+                for row in 0..fw.rows(at) {
+                    let span = fw.range(at, row, &l.text);
+                    print!(
+                        "{}{}{} ",
+                        bg(row_bg),
+                        fg(row_fg),
+                        if row == 0 { sign } else { " " }
+                    );
+                    if let Some(b) = block {
+                        print!("{}{}", furniture(b, &theme.markdown, row == 0), fg(row_fg));
+                        // A rule and a blank draw no text: the punctuation *was*
+                        // the drawing, and the furniture has replaced it.
+                        if matches!(b, Block::Rule | Block::Blank) {
+                            println!("\x1b[0m");
+                            break;
+                        }
+                        if matches!(b, Block::Heading(_)) {
+                            print!("\x1b[1m");
+                        }
                     }
-                    if matches!(b, Block::Heading(_)) {
-                        print!("\x1b[1m");
+                    // Syntax colours the text; the intraline spans underline the
+                    // words that changed, standing in for the background the
+                    // window uses — a terminal cell cannot hold two backgrounds
+                    // at once. Tokens are in *line* coordinates and clamped into
+                    // this row, which is what `runs` does in the shell.
+                    let mut cursor = span.start;
+                    for t in &l.tokens {
+                        let (s, e) = (t.start.max(span.start), t.end.min(span.end));
+                        if e <= s {
+                            continue;
+                        }
+                        print!("{}", underlined(&l, cursor, s, &l.text[cursor..s]));
+                        let on_word = l.spans.iter().any(|w| w.start < e && w.end > s);
+                        let style = theme.syntax_on(t.kind, if on_word { word } else { surface });
+                        let piece = styled(style, &l.text[s..e]);
+                        print!("{}{}", underlined(&l, s, e, &piece), fg(row_fg));
+                        cursor = e;
                     }
+                    println!(
+                        "{}\x1b[0m",
+                        underlined(&l, cursor, span.end, &l.text[cursor..span.end])
+                    );
                 }
-                // Syntax colours the text; the intraline spans underline the
-                // words that changed, standing in for the background the window
-                // uses — a terminal cell cannot hold two backgrounds at once.
-                let mut cursor = 0;
-                for t in &l.tokens {
-                    print!("{}", underlined(&l, cursor, t.start, &l.text[cursor..t.start]));
-                    let on_word = l.spans.iter().any(|s| s.start < t.end && s.end > t.start);
-                    let style = theme.syntax_on(t.kind, if on_word { word } else { surface });
-                    let piece = styled(style, &l.text[t.range()]);
-                    print!("{}{}", underlined(&l, t.start, t.end, &piece), fg(row_fg));
-                    cursor = t.end;
-                }
-                println!("{}\x1b[0m", underlined(&l, cursor, l.text.len(), &l.text[cursor..]));
             }
+            line_no += h.lines.len();
         }
     }
 

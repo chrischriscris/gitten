@@ -23,7 +23,7 @@ static ALLOC: stats::Counting = stats::Counting;
 
 actions!(plait, [Quit]);
 
-use views::diff::CycleLayout;
+use views::diff::{CycleLayout, CycleWrap};
 
 
 
@@ -37,11 +37,12 @@ plait — a git client
   REVSPEC is anything git takes:  HEAD~50..HEAD   main..feature   <sha>
   Pass --fixtures instead of REPO to read fixtures/ instead of a repository.
 
-  The title bar carries three pickers: the presentation (unified, side-by-side),
-  the diff algorithm (histogram, patience, myers) and how much whitespace has to
-  match (exact, trailing, change, all — git's default, --ignore-space-at-eol, -b
-  and -w). `s` also cycles the presentation. [diff] in plait.toml sets what they
-  open on, plus `context`, `moves` and `indent_heuristic`.
+  The title bar carries four pickers: the presentation (unified, side-by-side),
+  where a line too wide for the window breaks (off, word, char), the diff
+  algorithm (histogram, patience, myers) and how much whitespace has to match
+  (exact, trailing, change, all — git's default, --ignore-space-at-eol, -b and
+  -w). `s` cycles the presentation and `w` the wrap. [diff] in plait.toml sets
+  what they open on, plus `context`, `moves` and `indent_heuristic`.
 
   plait.toml next to the binary (or $PLAIT_CONFIG) is re-read every time it is
   saved, and colours and font apply on the next frame — no rebuild, no relaunch.
@@ -70,6 +71,7 @@ type Rediff = Rc<dyn Fn(&Host, &Overrides) -> Result<Vec<FileDiff>, String>>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Open {
     Layout,
+    Wrap,
     Algorithm,
     Whitespace,
 }
@@ -114,18 +116,24 @@ impl DevShell {
                 self.over = next;
                 self.error = None;
                 diff.update(cx, |d, cx| d.replace(files, &host, cx));
-                let (total, load) = {
-                    let d = diff.read(cx);
-                    (d.total(), d.load.clone())
-                };
+                let load = diff.read(cx).load.clone();
                 if let Some(stats) = &mut self.stats {
-                    stats.reloaded(total, load);
+                    stats.reloaded(load);
                 }
             }
             // The old rows stay on screen, which is the right failure: they are
             // still a true diff, just not the one that was asked for.
             Err(e) => self.error = Some(e.into()),
         }
+        cx.notify();
+    }
+
+    /// Costs no re-diff and no `prepare` — only where the lines break moves —
+    /// which is why this one needs none of `set_overrides`' machinery.
+    fn set_wrap(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(diff) = self.diff.clone() else { return };
+        let host = config::host(cx);
+        diff.update(cx, |d, cx| d.set_wrap(index, &host, cx));
         cx.notify();
     }
 
@@ -136,12 +144,9 @@ impl DevShell {
         self.error = None;
         let host = config::host(cx);
         diff.update(cx, |d, cx| d.set_layout(index, &host, cx));
-        let (total, load) = {
-            let d = diff.read(cx);
-            (d.total(), d.load.clone())
-        };
+        let load = diff.read(cx).load.clone();
         if let Some(stats) = &mut self.stats {
-            stats.reloaded(total, load);
+            stats.reloaded(load);
         }
         cx.notify();
     }
@@ -182,6 +187,11 @@ impl DevShell {
         let names = diff.read(cx).layout_names();
         let layouts = controls::Picker::new("layout", &names, diff.read(cx).layout_index());
 
+        // Straight off the registry in `core`, so a wrap an extension registers
+        // is in this menu the day it exists.
+        let wrap_names = diff.read(cx).wrap_names(host);
+        let wrap = controls::Picker::new("wrap", &wrap_names, diff.read(cx).wrap_index());
+
         let algorithms = host.differ.names();
         let selected = self.over.algorithm.as_deref().unwrap_or(host.differ.selected());
         let algorithm = controls::Picker::new(
@@ -214,6 +224,23 @@ impl DevShell {
                         _ = me.update(cx, |this, cx| {
                             this.open = None;
                             this.set_layout(i, cx);
+                        });
+                    }
+                },
+            ),
+            controls::picker(
+                "wrap-picker",
+                &wrap,
+                self.open == Some(Open::Wrap),
+                &host.theme,
+                &host.font,
+                toggle(Open::Wrap),
+                {
+                    let me = me.clone();
+                    move |i, _, cx| {
+                        _ = me.update(cx, |this, cx| {
+                            this.open = None;
+                            this.set_wrap(i, cx);
                         });
                     }
                 },
@@ -470,6 +497,7 @@ fn main() {
         cx.bind_keys([
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("s", CycleLayout, None),
+            KeyBinding::new("w", CycleWrap, None),
         ]);
         cx.set_menus(vec![Menu {
             name: "plait".into(),
@@ -489,11 +517,13 @@ fn main() {
                 // before the first frame so you never see row 0 flash past.
                 let resume = session::restore(&session_key, &session_path);
                 let mut diff_entity: Option<Entity<views::diff::Diff>> = None;
-                let (view, rendered, top, total, load): (
+                #[allow(clippy::type_complexity)]
+                let (view, rendered, top, total, note, load): (
                     AnyView,
                     Rc<Cell<usize>>,
                     Rc<Cell<usize>>,
-                    usize,
+                    Rc<Cell<usize>>,
+                    Rc<std::cell::RefCell<SharedString>>,
                     String,
                 ) = match data {
                     Data::Commits(commits) => {
@@ -507,7 +537,10 @@ fn main() {
                             e.clone().into(),
                             v.rendered.clone(),
                             v.top.clone(),
-                            v.total(),
+                            // The commit graph has a fixed row count: one per
+                            // commit, and nothing reflows it.
+                            Rc::new(Cell::new(v.total())),
+                            Rc::new(std::cell::RefCell::new(SharedString::default())),
                             v.load.clone(),
                         )
                     }
@@ -523,7 +556,8 @@ fn main() {
                             e.clone().into(),
                             v.rendered.clone(),
                             v.top.clone(),
-                            v.total(),
+                            v.total.clone(),
+                            v.note.clone(),
                             v.load.clone(),
                         )
                     }
@@ -548,7 +582,7 @@ fn main() {
                     })
                     .detach();
                 }
-                let stats = stats::enabled().then(|| Stats::new(rendered, total, load));
+                let stats = stats::enabled().then(|| Stats::new(rendered, total, note, load));
                 let shell = cx.new(|_| DevShell {
                     title,
                     view,

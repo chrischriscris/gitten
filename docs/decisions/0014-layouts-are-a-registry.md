@@ -54,6 +54,9 @@ seam that counts, and a second view would have skipped it.
 
 ## Why one column width for the whole diff, and not per viewport
 
+*Partly revisited by [0017](0017-wrapping-is-more-rows-not-taller-ones.md) — see
+the last paragraph.*
+
 Both columns are as wide as the widest line anywhere in the diff, so the divider
 is one straight vertical line from the first row to the last. Per-file widths
 move the divider as you scroll, and a boundary that drifts is worse than one that
@@ -63,6 +66,14 @@ Half the viewport would be the familiar answer and `uniform_list` cannot give it
 horizontal scrolling needs `flex_none` rows with an intrinsic width, so a row
 cannot be told how wide the window is. Clipping to a fixed column instead would
 lose text that unified mode shows, which is worse than scrolling.
+
+**The last sentence is what wrapping changed.** A row cannot be told the width
+*during* `render`; it can be told on the frame after one was measured, which is
+what the probe in `Diff::render` does. So with wrapping on the columns are half
+the viewport after all — and the divider is still one straight line, because it
+is still one width for the whole diff. Nothing is clipped, because the text that
+does not fit is on the next row rather than off the edge. With wrapping off this
+paragraph is unchanged and still the reason.
 
 ## Why `s` is hardcoded
 

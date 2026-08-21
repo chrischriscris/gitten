@@ -133,6 +133,29 @@ seam is shaped wrong.
 Cache diffs by blob OID. They never change. Acquisition yields both OIDs for
 exactly this reason; the cache itself is not built.
 
+## Wrapping
+
+**A wrapped line is more rows, never a taller one.** `uniform_list` is the only
+reason 714k rows scroll, and it needs every row the same height. So a wrap returns
+byte ranges into a line and the line stays one line — because the edit script, the
+hunk numbers, `replace_pairs`, `align`, the spans and the tokens all address
+lines, and splitting one in two before those ran pairs a removal with the wrong
+addition.
+
+Two things are wrong in the plausible direction. **Word wrap searches backwards
+from the column**, so the row is never wider than the budget; forwards overflows
+by however long the next word is and looks right on prose. And **the budget is per
+line, not per diff** — a bullet, an indent and an 18px heading each cost
+characters, and one number for the whole diff is what makes a presentation write
+its own wrap.
+
+`off` is an entry in the registry, not a flag beside one — the pickers are a pure
+function of a registry, so that is what puts it in the menu for free. Unlike the
+layouts this registry *is* on `Host`: a break point is a property of text, so
+`core` can hold the implementations, and what the frontend supplies is the column
+count. Everything else is shared — the range partition, the validation, the flat
+table — so a `Wrap` decides where a line breaks and nothing else.
+
 ## Building
 
 ```sh
@@ -160,9 +183,9 @@ zero. It measures how fast we *can* redraw, not what the app costs sitting still
 Never read those numbers off a debug build.
 
 Colour and font live in `plait.toml` and reload on the next frame — no rebuild.
-`[diff] algorithm`, `context` and `layout` live there too. `context` applies on
-the next launch; the other two have controls in the title bar and change live,
-and the file sets what they *open* on. A control there is the temporary answer
+`[diff] algorithm`, `context`, `layout` and `wrap` live there too. `context`
+applies on the next launch; the others have controls in the title bar and change
+live, and the file sets what they *open* on. A control there is the temporary answer
 until keybindings and a settings panel are config — the picker is a pure function
 of a list and an index, so any seam with a registry gets one for free.
 `plait config > plait.toml` writes a complete one. Code still costs a rebuild;
@@ -240,6 +263,13 @@ A bare binary is not an `.app` bundle, so the window opens behind everything.
 
 Custom drawing is `canvas()` + `PathBuilder` + `window.paint_path`. Keep it
 per-row where the geometry allows and it virtualizes with the list for free.
+
+**A view cannot know its own size during `render`.** It is handed a box by
+whatever assembled it, and that happens after. A zero-height `canvas` reports the
+box during paint, so anything sized by it lands on the frame *after* — which is
+correct and one frame late, and is what wrapping runs on. Reaching for
+`window.viewport_size()` instead is the shortcut, and it is a view assuming it
+owns the window: right until there are panes.
 
 **Anything that floats needs `deferred`.** Siblings paint in order, so a dropdown
 overflowing the *first* child of a column is painted under the second — visible

@@ -81,6 +81,27 @@ fn main() {
     }
     let aligned = t.elapsed();
 
+    // The wrap pass, which is what a resize costs. Over the prepared rows, at a
+    // budget a real window gives: 1440px of text in a 14px monospaced face is
+    // about 150 columns. This is the number a drag pays per column crossed, so it
+    // is the one that decides whether reflowing on resize is viable at all.
+    // `WRAP_COLS=80` for a narrow window: the budget is what decides how many
+    // rows wrapping adds, and at a normal width on code that is almost none.
+    let cols: usize = std::env::var("WRAP_COLS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(150);
+    let t = Instant::now();
+    let wrapped = wrap::Wrapped::build(
+        p.files
+            .iter()
+            .flat_map(|f| &f.hunks)
+            .flat_map(|h| &h.lines)
+            .map(|l| (l.text.as_str(), cols)),
+        &wrap::Word,
+    );
+    let wrapping = t.elapsed();
+
     println!("DIFF     {:>9} lines  {:>5} files  {} replace-pairs", nlines, files.len(), pairs);
     println!("  read {:>9.1?}   parse {:>9.1?}   intraline {:>9.1?}", read, parse, intra);
     println!(
@@ -100,6 +121,15 @@ fn main() {
         nlines,
         paired,
         aligned.as_secs_f64() * 1e9 / slots.max(1) as f64,
+    );
+    println!(
+        "  wrap {:>9.1?}   {} rows at {cols} cols ({:.2}x {} lines)  {:.0} ns/line  {} rejected",
+        wrapping,
+        wrapped.total(),
+        wrapped.total() as f64 / nlines.max(1) as f64,
+        nlines,
+        wrapping.as_secs_f64() * 1e9 / nlines.max(1) as f64,
+        wrapped.rejected(),
     );
     if md_files > 0 {
         println!(

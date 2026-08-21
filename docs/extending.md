@@ -14,6 +14,7 @@ pub struct Host {
     pub syntax: Highlighters,   // which highlighter each path gets
     pub differ: Differs,        // which algorithm turns two files into a diff
     pub layout: String,         // which diff presentation opens, by name
+    pub wrap: Wraps,            // where a line too wide for the window breaks
     pub theme: Theme,           // every colour the app draws
     pub font: Font,             // the face, and the numbers derived from it
 }
@@ -34,10 +35,15 @@ Not there yet: command dispatch, the mode stack, and any way to load an
 implementation from outside the binary. Today "an extension" means code compiled
 in. The seams are shaped so that stops being true without them changing.
 
-`s` is the first real key binding and is deliberately shaped like the last one
-will be — the view owns a focus handle, the binding is global, the handler is a
-method — so that when dispatch arrives it has something to attach to rather than
-something to replace. Until then the title-bar pickers are how a registry is
+`layout` is a name and `wrap` is a whole registry, and the difference is the
+boundary rather than taste: a `Rows` implementation returns UI elements, so its
+registry cannot be in `core`; a break point is a property of text, so its registry
+can be.
+
+`s` and `w` are the first real key bindings and are deliberately shaped like the
+last one will be — the view owns a focus handle, the binding is global, the handler is a
+method — so that when dispatch arrives they have something to attach to rather
+than something to replace. Until then the title-bar pickers are how a registry is
 reachable without editing a file; they read the same names `plait.toml` does, and
 should collapse into a settings panel when there is one.
 
@@ -204,11 +210,21 @@ pub trait Rows {
     fn claims(&self, path: &str) -> bool;
     fn len(&self) -> usize;
     fn build(&mut self, file: prepared::File);
-    fn render(&self, index: usize, host: &Host) -> AnyElement;
-    fn width(&self, index: usize) -> usize;
+    fn render(&self, index: usize, seg: usize, host: &Host) -> AnyElement;
+    fn width(&self, index: usize, seg: usize) -> usize;
+
+    // Wrapping. Both default, so an implementation that ignores them is exactly
+    // as long as it was — see 8.
+    fn rows(&self, index: usize) -> usize { 1 }
+    fn reflow(&mut self, width: f32, host: &Host, wrap: &dyn Wrap) -> bool { false }
+
     fn report(&self) -> String { String::new() }
 }
 ```
+
+**`len` counts lines; `seg` says which row of one.** A wrapped line is *n* rows of
+`ROW_H` and still one entry in `len`, so the two indices are not the same thing.
+`seg` is 0 for everything that fits, which is nearly everything.
 
 ```rust
 Diff::with_renderers(files, host, vec![
@@ -247,6 +263,10 @@ because `uniform_list` is the only reason a 714k-row diff scrolls at all. You ma
 draw anything within `ROW_H`, but you cannot ask for more. A presentation that
 genuinely needs variable height — a reflowed Markdown *preview*, a side-by-side
 image diff — wants a pane of its own, and that plug point does not exist yet.
+
+What you *can* have is more rows. That is what wrapping is: a line too wide for
+the window is drawn on several rows of `ROW_H` rather than on one tall one, which
+is why it needed no change to this constraint. See [8](#8-where-a-line-breaks).
 
 More fits inside `ROW_H` than it looks like. What `MarkdownRows` found:
 
@@ -324,6 +344,85 @@ Two things to know before writing one:
   fixture. That is the price of a keystroke and it is paid to keep the memory
   cost off the load path; see
   [decisions/0014](decisions/0014-layouts-are-a-registry.md).
+
+## 8. Where a line breaks
+
+```rust
+pub trait Wrap {
+    fn name(&self) -> &'static str;
+    fn breaks_lines(&self) -> bool { true }
+    fn breaks(&self, text: &str, cols: usize, out: &mut Vec<Break>);
+}
+```
+
+```rust
+host.wrap.register(Sentence);       // and then: [diff] wrap = "sentence"
+host.wrap.select("sentence");       // or pick it in the title bar, or press `w`
+```
+
+Three built-ins: `word` (selected), `char`, and `off` — which is an *entry in the
+registry* and not a flag beside it, because the pickers are a pure function of a
+registry and that is what puts it in the menu for free.
+
+An implementation is a pure function of one line and a column budget. No theme, no
+font, no view: a break point is a property of the text, the frontend has already
+turned pixels into columns by the time this is called, and that is what lets the
+same three serve the window, the ANSI `paint` example and a test.
+
+**Everything except the break points is shared.** `wrap::Wrapped` turns them into
+the range partition, validates them, holds them flat and answers by index — so an
+implementation cannot produce a range that points past its line, and its bugs are
+counted and reported on the overlay rather than crashing the app.
+
+Two obvious ones that do not exist yet and should: a code-aware wrap that breaks
+after `,` and `(` the way a formatter does, and one that keeps a continuation
+aligned under the opening bracket. Both are `breaks` and nothing else.
+
+### What a presentation owes it
+
+The two `Rows` methods in [6](#6-how-a-files-diff-is-presented), and they are six
+lines. `TextRows` is the whole of it:
+
+```rust
+fn rows(&self, index: usize) -> usize {
+    self.wrapped.rows(index)
+}
+
+fn reflow(&mut self, width: f32, host: &Host, wrap: &dyn Wrap) -> bool {
+    let cols = columns(width, TEXT_CHROME, host.font.size, host);
+    if cols == self.cols && wrap.name() == self.wrap {
+        return false;      // a resize that crossed no character boundary
+    }
+    self.cols = cols;
+    self.wrap = wrap.name();
+    self.wrapped = Wrapped::build(self.rows.iter().map(|r| (wrappable(r), cols)), wrap);
+    true
+}
+```
+
+Three things about that are the whole design:
+
+- **You own the pixels-to-columns conversion**, because you own what is drawn
+  around the text. `TEXT_CHROME` is two gutters, a sign column and the padding;
+  `SplitRows` halves what is left because it has two columns; `MarkdownRows`
+  computes a budget *per row*, because a bullet, three levels of indent and an
+  18px heading all cost characters. That is why `Wrapped::build` takes the budget
+  per line rather than once.
+- **Return whether the row count moved.** This runs on every frame of a resize
+  drag, and `false` is what makes all but one of those frames a float comparison.
+- **A budget of 0 means "never break this line."** What a Markdown table row
+  asks for: its grid lines up character by character with the rows above and
+  below, and a break shears it.
+
+Then `render` and `width` are handed `seg` and ask `Wrapped` for the byte range.
+`runs` takes that range and clips the tokens and spans into it, so nothing is
+re-derived and nothing extra is allocated per frame.
+
+**Ignoring all of this is a supported answer**, and there is a test asserting it:
+an implementation written before wrapping existed keeps one row per line and
+behaves identically. It is also the weakest point of the seam — see
+[decisions/0017](decisions/0017-wrapping-is-more-rows-not-taller-ones.md) for why
+wrapping cannot happen before `build` and hand it to everybody free.
 
 ## What a new seam owes
 

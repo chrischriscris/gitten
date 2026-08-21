@@ -18,6 +18,7 @@ idea a window exists.
   4  build       Rows::build, per file               renderer-owned rows
        4a layout      markdown::lay_out, if the renderer asks
        4b align       align::align, if the renderer asks
+       4c wrap        wrap::Wrapped, per width     ── the seam: word, char, off
   5  order       Vec<RowRef>                         8 bytes per row
   6  draw        Rows::render + Theme                one StyledText per row
 ```
@@ -25,9 +26,15 @@ idea a window exists.
 Stages 1–5 run once, at load, and again from stage 3 when the layout changes.
 Stage 6 runs per visible row per frame and is the only one on the render path.
 
-Stages 4a and 4b are indented because they are not part of the pipeline
+**Stages 4c and 5 also run again on every resize** that crosses a character
+boundary, and nothing above them does — see [4c](#4c-wrap-for-a-window-that-is-a-certain-width-today).
+That split is the whole reason wrapping is viable: stage 3 is 8–247 ms and
+depends on nothing about the window; 4c is 1–26 ms and depends on nothing else.
+
+Stages 4a, 4b and 4c are indented because they are not part of the pipeline
 everything goes through: each runs only for the renderer that asks for it —
-`MarkdownRows` wants the block structure, `SplitRows` wants the alignment.
+`MarkdownRows` wants the block structure, `SplitRows` wants the alignment, and
+all three built-ins want the wrap.
 
 ## 1. Acquire
 
@@ -351,6 +358,90 @@ Cost: **70–100 ns a row**, at load. On the two markdown fixtures that is 5.6 m
 an 89.3 ms `prepare` and 7.2 ms of a 17 ms one — the share says nothing about this
 pass and everything about how much intraline work the diff has.
 
+## 4c. Wrap, for a window that is a certain width today
+
+```rust
+pub trait Wrap {
+    fn name(&self) -> &'static str;
+    fn breaks_lines(&self) -> bool { true }
+    fn breaks(&self, text: &str, cols: usize, out: &mut Vec<Break>);
+}
+```
+
+A long line is the one thing in a diff you cannot read by scrolling — the eye
+loses the row on the way back, and in the two-column layout it loses both. So it
+wraps, and **a wrapped line is *n* rows of `ROW_H`, never one taller row**:
+`uniform_list` needs every row the same height and that is the only reason 714k
+rows scroll at all.
+
+Which means the wrap cannot make new lines. It returns **byte ranges into the
+line**, and the line — its numbers, its tokens, its spans — is one object shared
+by all of its rows:
+
+```
+  line 41  ────────────────────────────────────────────────────────────►
+    41 │ + let result = compute(alpha, beta,          seg 0   [0 .. 34)
+       │       gamma, delta, epsilon);                seg 1   [35 .. 61)
+       ▲                     ▲
+   no number on a            the space it broke on is dropped, not drawn
+   continuation
+```
+
+Everything except the break points is shared, and deliberately: `Wrapped` turns
+them into the range partition, **validates them**, holds them flat and answers by
+index. So an implementation cannot produce a range that points past its line —
+the same guarantee as clipping before the intraline pass in [3a](#3a-clip-first),
+for the same reason, and it matters more here because this is a seam an extension
+reaches. Invalid breaks are counted and reported on the overlay rather than
+asserted: an assertion makes the validation untestable and turns somebody else's
+bug into a crash.
+
+`Vec<Vec<Break>>` is the obvious storage and the wrong one — 714k allocations for
+a table that is mostly empty, because most lines fit. One contiguous buffer,
+indexed, exactly like the order table below.
+
+### Why it is not part of `prepare`
+
+Because the budget is the window and the window moves. `prepare` produces text,
+spans and tokens, none of which depend on the width; the wrap depends on nothing
+else. One pass would make every frame of a resize drag pay for a syntax scan it
+cannot use.
+
+So a reflow re-runs 4c and 5 and stops. It exits on a float comparison when the
+width crossed no character boundary, which is most frames of a drag, and it exits
+before touching anything when the selected wrap is `off`.
+
+### `off` is in the registry
+
+Not a flag beside it. The title-bar pickers are a pure function of a registry, so
+a registered wrap appears in the menu with nothing written by hand — the property
+[decisions/0015](decisions/0015-title-bar-controls-are-hand-rolled.md) exists to
+preserve. `Off` answers `breaks_lines() == false`, which is what lets a resize
+skip the reflow rather than rescan 714k lines to be told nothing moved.
+
+`word` is selected. It breaks at the last run of whitespace that fits, searching
+*backwards* from the column so the row is never wider than the budget — forwards
+overflows by however long the next word is, and it looks right on prose. The
+whitespace it broke on is dropped, so the partition has holes and only whitespace
+may fall in one. A word longer than the budget is broken mid-word, because the
+alternative is a row wider than the window, which is the thing wrapping is for.
+
+### The budget is per line
+
+Not per diff, because `MarkdownRows` draws a bar, up to three levels of indent
+and a bullet in front of its text, and draws a heading at 18px where the body is
+14. Two rows of the same width hold different numbers of characters, and passing
+the budget in per line is what stops that presentation needing a wrap of its own.
+A table passes 0, which `Wrapped` reads as *never break this line* — its grid is
+aligned character by character against the rows above and below it.
+
+Headers do not wrap. A file header is a path plus `+N -N`, which is not one
+string to slice.
+
+Cost: **36–52 ns a line**, so 0.9–3.0 ms on the real fixtures and 26 ms on the
+714k-line one. Rows added depends on the budget and not on the fixture: 1.00–1.02×
+at 150 columns, 1.04–1.20× at 80. Code lines are short.
+
 ## 4–5. Rows, and the order table
 
 Each file goes to the `Rows` implementation that claims its path; the last
@@ -370,11 +461,21 @@ what the alternative would have cost.
 Implementations keep their own row storage. The list keeps only:
 
 ```rust
-struct RowRef { owner: u16, index: u32 }   // 8 bytes
+struct RowRef { owner: u16, seg: u16, index: u32 }   // 8 bytes
 ```
 
 At 714k rows a boxed row per row would be 714k allocations to chase on every
 scroll. See [decisions/0006](decisions/0006-row-seam-without-boxing.md).
+
+`seg` is which row of a wrapped line this is, and it fits in the two bytes the
+other two fields left over — so wrapping cost this table nothing. The cap is
+65,535 rows per line, which `MAX_LINE_CHARS` over `MIN_WRAP_COLS` puts out of
+reach by a factor of 260.
+
+The table is also its own record of the *unwrapped* shape: consecutive entries
+with the same owner and index are one logical row, and an index is unique within
+an owner. So a reflow expands the previous table in place of a second one kept
+alongside it — 8 bytes a row, once, however many times the window is dragged.
 
 ## 6. Draw
 

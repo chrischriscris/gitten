@@ -11,11 +11,12 @@ Three crates. The interesting line is between the first two and the third.
         ▼               │  prepared::prepare   align::align    │
 ┌───────────────┐ blobs │  intraline   markdown::lay_out       │
 │  plait-git    ├──────►│  syntax::{Lexer, Markdown, ...}      │
-│  two texts    │       │  theme::Theme  font::Font  host::Host │
-│  per file     │       │                                      │
-│  git binary   │       └───────────┬──────────────┬───────────┘
-│  (gix later)  │                   │              │
-└───────────────┘          rows,    │              │  rows, colours
+│  two texts    │       │  wrap::{Word, Char, Wrapped}         │
+│  per file     │       │  theme::Theme  font::Font  host::Host │
+│  git binary   │       │                                      │
+│  (gix later)  │       └───────────┬──────────────┬───────────┘
+└───────────────┘                   │              │
+                           rows,    │              │  rows, colours
                            colours  │              │
                         ┌───────────▼──────┐  ┌────▼─────────────────┐
                         │  plait-shell     │  │  examples/paint.rs   │
@@ -133,8 +134,9 @@ Listed so nobody reads an intention as a description:
 - **`cli/`.** Referenced throughout as the second door. `paint.rs` currently
   stands in for it as the proof that the boundary holds.
 - **Command dispatch and the mode stack.** `Host` is where they belong. `s`
-  cycling the diff layout is the only key binding that is not `cmd-q`, and it is
-  shaped so dispatch has something to attach to rather than something to replace.
+  cycling the diff layout and `w` cycling the wrap are the only key bindings that
+  are not `cmd-q`, and both are shaped so dispatch has something to attach to
+  rather than something to replace.
 - **Configurable keybindings, and a settings panel.** The title-bar pickers are
   the interim answer: a control per registry, driven by the same names
   `plait.toml` uses. When the panel exists it should read the same registries and
@@ -184,6 +186,9 @@ Listed so nobody reads an intention as a description:
   has nowhere to go yet — the reason the `Rows` seam is row-shaped. A rendered
   Markdown *row* exists ([decisions/0010](decisions/0010-markdown-rendered-rows.md));
   a rendered Markdown *document*, reflowed and variably tall, is what needs the pane.
+  The diff view already measures its own box rather than reading the window's, so
+  it is a pane's tenant already — see
+  [decisions/0017](decisions/0017-wrapping-is-more-rows-not-taller-ones.md).
 - **Code-block injection.** A fenced block in a `.md` diff knows it said `rust` and
   is still drawn as one string. See
   [decisions/0010](decisions/0010-markdown-rendered-rows.md).

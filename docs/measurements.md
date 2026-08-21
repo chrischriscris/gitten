@@ -113,6 +113,43 @@ its place: **81% on the two edit-heavy fixtures, 100% on the two that are
 near-pure addition or deletion.** A diff with nothing replaced has nothing to
 pair, and side-by-side gives it two half-empty columns and the same row count.
 
+### Wrapping, and what a resize costs
+
+`wrap::Wrapped::build` — the break points for every line, at one column budget.
+Reported by `bench` on its own line; `WRAP_COLS=n` sets the budget, and the
+default 150 is roughly a 1440px window of text in the shipped 14px face.
+
+| fixture | diff lines | `wrap` | per line | rows at 150 | rows at 80 |
+|---|---|---|---|---|---|
+| `pr33933.diff` | 20,831 | 0.9 ms | 43 ns | 20,831 (1.00×) | 21,736 (1.04×) |
+| `pr30698.diff` | 50,604 | 2.3 ms | 45 ns | 51,465 (1.02×) | 60,526 (1.20×) |
+| `pr30683.diff` | 713,996 | 26.2 ms | 37 ns | 717,534 (1.00×) | 787,218 (1.10×) |
+| `md.diff` | 71,756 | 3.0 ms | 42 ns | 72,257 (1.01×) | 74,959 (1.04×) |
+| synthetic 1M | 928,577 | 44.3 ms | 48 ns | 928,577 (1.00×) | — |
+
+Two numbers matter and neither is the total.
+
+**Per line is what decides whether reflowing on resize is viable**, because a
+drag pays this once per column crossed. 37–48 ns against a `prepare` that is
+5,600 ns a line on the same fixture — so the frame where a resize crosses a
+character boundary costs 26 ms on the worst input in the set and 0.9–3.0 ms on
+the realistic ones, and every other frame of the drag is a float comparison. The
+reason it can be that cheap is that a reflow re-runs stages 4c and 5 and nothing
+above them: no clip, no intraline, no syntax.
+
+**Rows added is far smaller than it looks, and depends on the budget rather than
+the fixture.** At a real window width three of the four fixtures grow by 1% or
+less, because code lines are short — `pr30683` is a 714k-line deletion of source,
+and 150 columns holds nearly all of it. The two that move are the ones with long
+lines: `pr30698`, the zig→rust migration, at 1.20× on an 80-column window, and
+`md.diff`, which is prose. Wrapping is not a 2× row count; it is a few percent,
+paid where the text actually needs it.
+
+`0 rejected` on every fixture is the validation in `Wrapped::build` reporting that
+the shipped wraps produce no invalid break — the column exists because it is a
+seam an extension reaches, and a wrap whose breaks were all thrown away would
+otherwise look exactly like one that found nothing to do.
+
 ### The cost of a pick
 
 Both title-bar controls rebuild rather than re-render, so what they cost is made
@@ -120,6 +157,7 @@ of numbers already in this file:
 
 | control | what it re-runs | typical | pathological fixture |
 |---|---|---|---|
+| wrap | break points + order table | 1–3 ms | 26 ms |
 | layout | `prepare` + row build | 8 ms | 247 ms |
 | algorithm | acquisition + diff + `prepare` + row build | 35–140 ms | — |
 
@@ -132,8 +170,12 @@ The pathological column is blank for algorithm on purpose: the 714k-line fixture
 are `.diff` files, which have no algorithm to change. That is also why the control
 is inert for them.
 
-On a click both are fine. Neither would be on a key held down, which is the other
-reason the algorithm is a menu and only the layout is bound to `s`.
+Wrap re-runs neither: the lines, their tokens and their spans are the same
+objects, and only where they break moves. That is why it is bound to `w` and also
+why it can happen on a resize drag at all — see the table above.
+
+On a click all three are fine. Only wrap would be fine on a key held down, which
+is the other reason the algorithm is a menu.
 
 ### Load, per fixture
 

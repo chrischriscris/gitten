@@ -51,8 +51,8 @@
 //!   width and nothing else.
 //!
 //! The whole `[diff]` table is the same: `algorithm` and `context` are read
-//! during acquisition, before a window exists, and `layout` names the
-//! presentation the view *opens* in — `s` is what changes it afterwards.
+//! during acquisition, before a window exists, and `layout` and `wrap` name what
+//! the view *opens* on — `s` and `w` are what change them afterwards.
 //!
 //! All of them are applied to the `Host` regardless, so a relaunch picks them
 //! up, and [`apply`] says so in its warnings rather than leaving you guessing.
@@ -278,6 +278,20 @@ fn apply_diff(host: &mut Host, value: &toml::Value, warn: &mut Vec<String>) {
                     warn.push("config: diff.indent_heuristic must be true or false".into())
                 }
             },
+            // Validated against the host's own registry, like `algorithm` and
+            // unlike `layout`: the wraps live in `core`, so this layer can name
+            // what is actually registered — including an extension's.
+            "wrap" => match v.as_str() {
+                Some(name) if name == host.wrap.selected() => {}
+                Some(name) if host.wrap.select(name) => {
+                    warn.push("config: diff.wrap applies on the next launch".into())
+                }
+                Some(name) => warn.push(format!(
+                    "config: unknown diff.wrap {name:?}; registered: {}",
+                    host.wrap.names().join(", ")
+                )),
+                None => warn.push("config: diff.wrap must be a string".into()),
+            },
             "layout" => match v.as_str() {
                 Some(name) if name == host.layout => {}
                 Some(name) if !name.trim().is_empty() => {
@@ -485,8 +499,9 @@ pub fn dump(host: &Host) -> String {
     out.push_str(&format!("monospaced = {}\n", f.monospaced));
     out.push_str(&format!("advance = {:?}\n\n", f.advance));
 
-    out.push_str("# All three apply on the next launch: the first two decide what the\n");
-    out.push_str("# diff *is*, and are read before a window exists. `s` cycles the layout.\n");
+    out.push_str("# All of these apply on the next launch. The first five decide what the\n");
+    out.push_str("# diff *is* and are read before a window exists; the last two are how it\n");
+    out.push_str("# is drawn, and `s` and `w` change those live.\n");
     out.push_str("[diff]\n");
     out.push_str(&format!(
         "algorithm = {:?}    # {}\n",
@@ -507,7 +522,12 @@ pub fn dump(host: &Host) -> String {
         "indent_heuristic = {}  # slide each change to a readable boundary, as git does\n",
         host.differ.indent_heuristic
     ));
-    out.push_str(&format!("layout = {:?}    # unified, split\n\n", host.layout));
+    out.push_str(&format!("layout = {:?}    # unified, split\n", host.layout));
+    out.push_str(&format!(
+        "wrap = {:?}        # {} — `w` cycles it\n\n",
+        host.wrap.selected(),
+        host.wrap.names().join(", ")
+    ));
 
     let t = &host.theme;
     out.push_str("[theme]\n");
@@ -700,6 +720,32 @@ mod tests {
     }
 
     #[test]
+    fn a_registered_wrap_is_selectable_from_the_file() {
+        // The same test as the differ's, for the same reason: an extension's wrap
+        // has to be reachable from the file the day it is registered, and the
+        // error message has to name it.
+        use plait_core::wrap::{Break, Wrap};
+        struct Sentence;
+        impl Wrap for Sentence {
+            fn name(&self) -> &'static str {
+                "sentence"
+            }
+            fn breaks(&self, _: &str, _: usize, _: &mut Vec<Break>) {}
+        }
+        let mut h = host();
+        h.wrap.register(Sentence);
+        let warn = apply(&mut h, "[diff]\nwrap = \"sentence\"\n");
+        assert!(warn.iter().all(|w| w.contains("next launch")), "{warn:?}");
+        assert_eq!(h.wrap.selected(), "sentence");
+
+        // And a typo leaves it alone and says what is available.
+        let warn = apply(&mut h, "[diff]\nwrap = \"wrod\"\n");
+        assert_eq!(h.wrap.selected(), "sentence");
+        assert_eq!(warn.len(), 1, "{warn:?}");
+        assert!(warn[0].contains("word") && warn[0].contains("sentence"), "{warn:?}");
+    }
+
+    #[test]
     fn nonsense_in_the_diff_table_is_refused() {
         let mut h = host();
         let warn = apply(
@@ -810,6 +856,7 @@ mod tests {
         original.differ.min_moved = 8;
         original.differ.indent_heuristic = false;
         original.layout = "split".into();
+        original.wrap.select("char");
         original.theme.rebuild();
 
         let text = dump(&original);
@@ -827,6 +874,7 @@ mod tests {
         assert_eq!(restored.differ.min_moved, 8);
         assert!(!restored.differ.indent_heuristic);
         assert_eq!(restored.layout, "split", "diff.layout did not survive");
+        assert_eq!(restored.wrap.selected(), "char", "diff.wrap did not survive");
     }
 
     #[test]

@@ -13,6 +13,7 @@ use crate::differ::Differs;
 use crate::font::Font;
 use crate::syntax::Highlighters;
 use crate::theme::Theme;
+use crate::wrap::Wraps;
 
 pub struct Host {
     /// Which highlighter each path gets. Route a language elsewhere, or replace
@@ -29,6 +30,14 @@ pub struct Host {
     /// same reason `theme.name` is a string: unrecognised is the frontend's
     /// problem to report, not core's to prevent.
     pub layout: String,
+    /// Where a line too wide for the window breaks, and whether it breaks at
+    /// all — `off` is an entry in this registry rather than a flag beside it.
+    ///
+    /// A registry here and not just a name, unlike [`Host::layout`], because a
+    /// break point is a property of text: `core` can hold the implementations
+    /// without knowing a window exists, and a terminal frontend wants the same
+    /// three. What the frontend supplies is the column count.
+    pub wrap: Wraps,
     /// Every colour the app draws.
     pub theme: Theme,
     /// The face it draws in, and the numbers derived from it. More than
@@ -50,6 +59,7 @@ impl Host {
             syntax: Highlighters::builtin(),
             differ: Differs::builtin(),
             layout: "unified".into(),
+            wrap: Wraps::builtin(),
             theme: Theme::default_dark(),
             font: Font::default(),
         }
@@ -69,6 +79,7 @@ mod tests {
         host.syntax.route(&["rs", "Cargo.lock"], Markdown);
         assert!(host.differ.select("myers"));
         host.differ.context = 6;
+        assert!(host.wrap.select("char"));
         host.theme.set_syntax(Kind::Heading, Style::fg(0x00ff00).bold());
         host.theme.diff.added_bg = 0x001100;
         host.font = crate::font::Font::menlo();
@@ -80,6 +91,7 @@ mod tests {
         assert_eq!(host.font.family, "Menlo");
         assert_eq!(host.differ.selected(), "myers");
         assert_eq!(host.differ.context, 6);
+        assert_eq!(host.wrap.selected(), "char");
     }
 
     #[test]
@@ -101,5 +113,8 @@ mod tests {
         assert_eq!(host.differ.selected(), "histogram");
         assert_eq!(host.differ.context, 3);
         assert_eq!(host.layout, "unified");
+        // Wrapping is on out of the box: a diff you have to scroll sideways to
+        // read is the problem it exists to solve.
+        assert_eq!(host.wrap.selected(), "word");
     }
 }
