@@ -13,13 +13,20 @@ the test that proves a second implementation fits.
 pub struct Host {
     pub syntax: Highlighters,   // which highlighter each path gets
     pub theme: Theme,           // every colour the app draws
+    pub font: Font,             // the face, and the numbers derived from it
 }
 ```
 
-Built once in `main.rs` before any view exists, handed to each view as
-`Rc<Host>`. **If a feature needs a knob that is not on `Host` or one of its
-fields, that feature is not extensible yet** — that is the check, and it is cheap
-to run against a diff.
+Built once in `main.rs` before any view exists and held in a GPUI global.
+**If a feature needs a knob that is not on `Host` or one of its fields, that
+feature is not extensible yet** — that is the check, and it is cheap to run
+against a diff.
+
+Views read it through `config::host(cx)` on the render path rather than capturing
+an `Rc` when they are built, and that is not incidental: a captured clone is a
+snapshot, and it is what makes `plait.toml` apply on the next frame instead of the
+next launch. A new view that captures the host instead will work, and will quietly
+not hot-reload.
 
 Not there yet: command dispatch, the mode stack, and any way to load an
 implementation from outside the binary. Today "an extension" means code compiled
@@ -90,7 +97,41 @@ host.theme = theme;
 Plain `0xRRGGBB` throughout, so the ANSI painter and the GPUI window read the same
 one. Details and the contrast machinery: [theming.md](theming.md).
 
-## 4. How a file's diff is presented
+## 4. A font
+
+```rust
+host.font = Font {
+    family: "Iosevka Term".into(),
+    size: 15.0,
+    monospaced: true,
+    advance: 0.5,          // as a fraction of `size`
+};
+```
+
+Type as data, the same way colour is: a family name the platform can match, and
+three numbers. On macOS the family is the *typographic* one — what Font Book
+groups under, so `JetBrainsMono Nerd Font Mono` rather than the `NFM` in its name
+table.
+
+Two fields are not decoration, and this is the reason the font is on `Host` rather
+than a `const` in `main.rs`, where it was:
+
+- **`monospaced`** decides whether Markdown tables get padded into a grid.
+  Setting it true for a proportional face misaligns every table by a fraction of a
+  glyph per cell; setting it false is a supported answer and leaves tables as
+  their source.
+- **`advance`** is one character's width as a fraction of `size`, used to guess
+  which commit row is widest — `uniform_list` measures exactly one row to decide
+  its scrollable width. A fraction rather than a pixel count so changing `size`
+  cannot leave a stale width behind it, which is what happened before: an `8.4`
+  with a comment naming the font it had been measured on.
+
+Everything else derived from the face is derived, not restated:
+`markdown::Metrics::for_font` builds the heading scale relative to `size` and caps
+it at `ROW_H / 1.2`, so a larger body size gives up the top of the scale instead
+of drawing outside its row.
+
+## 5. How a file's diff is presented
 
 ```rust
 pub trait Rows {

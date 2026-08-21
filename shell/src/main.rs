@@ -1,3 +1,4 @@
+mod config;
 mod graph;
 mod stats;
 mod views;
@@ -8,6 +9,9 @@ use plait_core::host::Host;
 use std::cell::Cell;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 use stats::Stats;
 
 #[global_allocator]
@@ -15,14 +19,21 @@ static ALLOC: stats::Counting = stats::Counting;
 
 actions!(plait, [Quit]);
 
+
+
 const USAGE: &str = "\
 plait — a git client
 
   plait commits [REPO] [LIMIT]     history graph      (default: . , 5000)
   plait diff    [REPO] [REVSPEC]   a diff             (default: . , working tree)
+  plait config                     print the current theme and font as TOML
 
   REVSPEC is anything git takes:  HEAD~50..HEAD   main..feature   <sha>
   Pass --fixtures instead of REPO to read fixtures/ instead of a repository.
+
+  plait.toml next to the binary (or $PLAIT_CONFIG) is re-read every time it is
+  saved, and colours and font apply on the next frame — no rebuild, no relaunch.
+  Start one with:  plait config > plait.toml
 
   PLAIT_STATS=1   frame, row and heap overlay
 ";
@@ -45,13 +56,17 @@ impl Render for DevShell {
         }
 
         let c = self.host.theme.chrome;
+        let f = &self.host.font;
         div()
             .size_full()
             .v_flex()
             .bg(rgb(c.bg))
             .text_color(rgb(c.fg))
-            .text_sm()
-            .font_family("Menlo")
+            // From the host, not a constant: `text_sm` was `rems(0.875)` — 14px —
+            // and the family was hardcoded here while three other things
+            // depended on which font it was.
+            .text_size(px(f.size))
+            .font_family(f.family.clone())
             .child(
                 div()
                     .flex_none()
@@ -98,6 +113,19 @@ fn main() {
         return;
     }
     let which = args.first().cloned().unwrap_or_else(|| "commits".into());
+
+    // `plait config > plait.toml` — a complete, correct starting file rather than
+    // a page of documentation to copy out of. No window, so it comes first.
+    if which == "config" {
+        let mut h = Host::new();
+        let path = config::path();
+        for w in config::load(&mut h, &path) {
+            eprintln!("plait: {w}");
+        }
+        print!("{}", config::dump(&h));
+        return;
+    }
+
     let source = match args.get(1).map(String::as_str) {
         Some("--fixtures") => Source::Fixtures,
         Some(path) => Source::Repo(PathBuf::from(path), args.get(2).cloned().unwrap_or_default()),
@@ -127,9 +155,56 @@ fn main() {
         gpui_component::init(cx);
 
         // One host, built before any view exists: the highlighters, the theme,
-        // and whatever else becomes swappable later. An extension registering
-        // itself does it here, and every view reads the same struct.
-        let host = Rc::new(Host::new());
+        // the font, and whatever else becomes swappable later. An extension
+        // registering itself does it here, and every view reads the same struct.
+        let mut built = Host::new();
+        let config_path = config::path();
+        for w in config::load(&mut built, &config_path) {
+            eprintln!("plait: {w}");
+        }
+        let host = Rc::new(built);
+        cx.set_global(config::Active(host.clone()));
+
+        // Re-read the file whenever it is written, and hand the result to every
+        // window. The watcher's callback runs on its own thread, so it only sets
+        // a flag; the task below is what touches the app.
+        //
+        // Polling a flag rather than plumbing an async channel through: a save is
+        // a human action, 120 ms of latency is imperceptible, and this is five
+        // lines with nothing to get wrong about wakeups.
+        let dirty = Arc::new(AtomicBool::new(false));
+        let watcher = {
+            let dirty = dirty.clone();
+            config::watch(&config_path, move || dirty.store(true, Ordering::Relaxed)).ok()
+        };
+        if watcher.is_none() {
+            eprintln!("plait: could not watch {}; config reload is off", config_path.display());
+        }
+        cx.spawn(async move |cx: &mut AsyncApp| {
+            // Held for as long as the task lives: dropping a `notify` watcher
+            // stops it watching, silently.
+            let _watcher = watcher;
+            loop {
+                cx.background_executor().timer(Duration::from_millis(120)).await;
+                if !dirty.swap(false, Ordering::Relaxed) {
+                    continue;
+                }
+                let warnings = cx.update(|cx| {
+                    // From defaults every time, not from the live host: otherwise
+                    // deleting a line from the file would leave the old value in
+                    // place and the file would stop describing what you see.
+                    let mut next = Host::new();
+                    let warnings = config::load(&mut next, &config_path);
+                    cx.set_global(config::Active(Rc::new(next)));
+                    cx.refresh_windows();
+                    warnings
+                });
+                for w in warnings {
+                    eprintln!("plait: {w}");
+                }
+            }
+        })
+        .detach();
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
         cx.set_menus(vec![Menu {

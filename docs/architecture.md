@@ -10,7 +10,7 @@ Three crates. The interesting line is between the first two and the third.
         │               │  parse_unified_diff   intraline      │
         ▼               │  prepared::prepare   markdown::lay_out│
 ┌───────────────┐ data  │  syntax::{Lexer, Markdown, ...}      │
-│  plait-git    ├──────►│  theme::Theme        host::Host      │
+│  plait-git    ├──────►│  theme::Theme  font::Font  host::Host │
 │               │       │                                      │
 │  git binary   │       └───────────┬──────────────┬───────────┘
 │  (gix later)  │                   │              │
@@ -35,6 +35,7 @@ because it compiles in a second and its tests need no window.
 | `markdown.rs` | a `.md` diff as blocks, with the markers cut and the ranges moved |
 | `syntax.rs` | the scanner, the language tables, the `Highlighter` trait, routing, Markdown |
 | `theme.rs` | every colour, as `0xRRGGBB` data, plus contrast resolution |
+| `font.rs` | the face as data: family, size, and whether a char is a column |
 | `host.rs` | the struct that holds the swappable pieces |
 
 Four examples double as the headless test bench: `bench` (timings at fixture
@@ -62,6 +63,7 @@ GPUI. Drawing and input, and as little else as possible.
 | `views/markdown.rs` | `MarkdownRows`: the rendered-Markdown presentation, and its metrics |
 | `views/commits.rs` | the commit list, author initials, row layout |
 | `graph.rs` | lane geometry and painting: quads, paths, one canvas per row |
+| `config.rs` | `plait.toml`: parse, apply, watch, and the live `Host` global |
 | `stats.rs` | the counting allocator and the `PLAIT_STATS` overlay |
 
 ## Which way data moves
@@ -105,6 +107,9 @@ Listed so nobody reads an intention as a description:
 - **`cli/`.** Referenced throughout as the second door. `paint.rs` currently
   stands in for it as the proof that the boundary holds.
 - **Command dispatch and the mode stack.** `Host` is where they belong.
+- **Code hot reload.** The config file reloads *data* live. Changing code is still
+  a 3–5 second rebuild and a relaunch; a dylib swap was considered and judged not
+  worth the fight against GPUI entity and global identity across the boundary.
 - **Extension loading.** Every seam takes an implementation today; nothing loads
   one from outside the binary yet. See [extending.md](extending.md).
 - **Writes.** No commit, push, stage or rebase. Reads only.

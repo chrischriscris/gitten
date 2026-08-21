@@ -4827,8 +4827,10 @@ dependencies = [
  "gpui-component",
  "gpui-component-assets",
  "gpui_platform",
+ "notify",
  "plait-core",
  "plait-git",
+ "toml 0.8.23",
 ]
 
 [[package]]

@@ -25,7 +25,6 @@ struct Data {
 
 pub struct Commits {
     data: Rc<Data>,
-    host: Rc<Host>,
     scroll: UniformListScrollHandle,
     /// Instrumentation the view owns and anyone may read. The view does not
     /// know the stats overlay exists.
@@ -61,10 +60,17 @@ impl Commits {
         // The widest row is no longer just the longest subject: every row's
         // graph is only as wide as its own lanes, so a short message behind a
         // wide graph can still out-reach a long one on the trunk.
+        //
+        // One character's width comes from the host's font rather than a constant
+        // measured on whatever the font used to be. It only picks which row
+        // `uniform_list` measures, so an approximation is fine — and it is
+        // meaningless for a proportional face, which is the honest reason a
+        // long subject may then win over a wide graph.
+        let char_w = host.font.char_width();
         let widest = draws
             .iter()
             .zip(&commits)
-            .map(|(d, c)| d.width() + c.subject.len() as f32 * CHAR_W)
+            .map(|(d, c)| d.width() + c.subject.len() as f32 * char_w)
             .enumerate()
             .max_by(|(_, a), (_, b)| a.total_cmp(b))
             .map(|(i, _)| i)
@@ -78,7 +84,6 @@ impl Commits {
 
         Self {
             data: Rc::new(Data { commits, draws, who, widest }),
-            host,
             scroll: UniformListScrollHandle::new(),
             rendered: Rc::new(Cell::new(0)),
             load,
@@ -89,10 +94,12 @@ impl Commits {
 impl Render for Commits {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let data = self.data.clone();
-        let host = self.host.clone();
         let rendered = self.rendered.clone();
-        let list = uniform_list("commits", data.commits.len(), move |range, _, _| {
+        // Read per batch, not captured at construction — see the note in the
+        // diff view: this is what makes a saved config apply on the next frame.
+        let list = uniform_list("commits", data.commits.len(), move |range, _, cx| {
             rendered.set(range.len());
+            let host = crate::config::host(cx);
             range
                 .map(|i| row(&data.commits[i], &data.who[i], &data.draws[i], &host))
                 .collect()
@@ -115,9 +122,7 @@ impl Render for Commits {
     }
 }
 
-/// Menlo's advance at `text_sm`. Only ever used to guess which row is widest,
-/// so it does not have to be exact.
-const CHAR_W: f32 = 8.4;
+
 
 /// Wide enough for an eleven-character sha and a space after it. Fixed, unlike
 /// the graph: the eye scans this column vertically, so it has to be a column.

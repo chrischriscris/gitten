@@ -98,6 +98,12 @@ host.theme = theme;
 Lane and author colours cycle, so a theme may ship three or twelve. An empty list
 falls back to chrome colours rather than panicking.
 
+Type follows the same pattern in `core::font` and sits beside this on `Host`:
+`Font { family, size, monospaced, advance }`. It is not part of the theme because
+a palette and a face are swapped independently — and because two of those fields
+are load-bearing rather than decorative. See
+[extending.md](extending.md#4-a-font).
+
 ## Every colour the app draws
 
 If a colour is not here, it is a bug — there were 35 hex literals across four
@@ -111,6 +117,47 @@ shell files before this existed.
 | graph | `lanes` `lane_overflow` |
 | commits | `authors` |
 | syntax | 12 `Style`s, resolved across 5 surfaces |
+
+## Changing it without a rebuild
+
+```
+plait config > plait.toml     # a complete, correct starting file
+```
+
+`plait.toml` (or `$PLAIT_CONFIG`) is re-read every time it is saved, and colours,
+the font family and the font size land **on the next frame** — no rebuild, no
+relaunch, no lost scroll position. That is the payoff for colour having been data
+in a dependency-free crate all along.
+
+```toml
+[font]
+family = "JetBrainsMono Nerd Font Mono"
+size = 14.0
+
+[theme.diff]
+added_bg = "#16241a"
+
+[theme.syntax]
+comment = "#615a52 italic"      # colour, then any of bold and italic
+```
+
+Two fields cannot reload live and say so when you change them:
+`font.monospaced`, because Markdown table padding rewrites the row *text* during
+`prepare`, and `font.advance`, because the widest-row guess is made once at load.
+Both still apply on the next launch.
+
+The file is read forgivingly, because it is re-read on every save of something you
+are in the middle of typing: an unparseable file leaves the theme exactly as it
+was, and a single bad line is named and skipped while the rest applies. A warning
+only appears when a value actually *changed* — one that fires on an unchanged
+value teaches you to ignore the ones that matter.
+
+Implementation is `shell/src/config.rs`. It is in the shell and not in `core`
+because reading a file is I/O and `core` does none; when a `cli/` wants the same
+file it becomes its own crate. `apply` is a pure function of a string, which is
+why all of it is tested without a disk or a watcher — including a round-trip
+asserting that what `plait config` writes reads back identically, so the two
+directions cannot drift.
 
 ## Seeing it without a window
 

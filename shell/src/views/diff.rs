@@ -85,7 +85,6 @@ struct RowRef {
 pub struct Diff {
     renderers: Rc<Vec<Box<dyn Rows>>>,
     order: Rc<Vec<RowRef>>,
-    host: Rc<Host>,
     /// See the note in the commits view: uniform_list sizes its scrollable
     /// width from a single measured row, defaulting to row 0.
     widest: usize,
@@ -105,12 +104,19 @@ impl Diff {
     /// away from the scanner — if a built-in does not go through the seam, the
     /// seam is untested.
     pub fn new(files: Vec<FileDiff>, host: Rc<Host>) -> Self {
+        // The Markdown metrics come from the host's font: it decides whether
+        // tables can be padded into a grid, and the heading scale is relative to
+        // the body size rather than a set of pixel constants.
+        let metrics = super::markdown::Metrics::for_font(&host.font);
         Self::with_renderers(
             files,
             host,
             vec![
                 Box::new(TextRows::default()),
-                Box::new(super::markdown::MarkdownRows::default()),
+                Box::new(super::markdown::MarkdownRows::new(
+                    metrics,
+                    &["md", "markdown", "mdx"],
+                )),
             ],
         )
     }
@@ -167,7 +173,6 @@ impl Diff {
         Self {
             renderers: Rc::new(renderers),
             order: Rc::new(order),
-            host,
             widest,
             scroll: UniformListScrollHandle::new(),
             rendered: Rc::new(Cell::new(0)),
@@ -180,11 +185,14 @@ impl Render for Diff {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let renderers = self.renderers.clone();
         let order = self.order.clone();
-        let host = self.host.clone();
         let rendered = self.rendered.clone();
 
-        let list = uniform_list("diff", order.len(), move |range, _, _| {
+        // The host is read here, per batch, rather than cloned in once when the
+        // view was built. That is the whole of what makes a saved config file
+        // appear on the next frame instead of the next launch.
+        let list = uniform_list("diff", order.len(), move |range, _, cx| {
             rendered.set(range.len());
+            let host = crate::config::host(cx);
             range
                 .map(|i| {
                     let r = order[i];

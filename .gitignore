@@ -7,3 +7,8 @@
 /fixtures/*.txt
 /fixtures/*.diff
 /fixtures/real/
+
+# The live config. Reproducible, and personal — colours you are in the middle of
+# tuning are not the repository's business:
+#   plait config > plait.toml
+/plait.toml

@@ -4,6 +4,7 @@
 //! or the other way — nothing in this crate changes. Keep it that way: the day
 //! something in here needs to know what a window is, the boundary is gone.
 
+pub mod font;
 pub mod host;
 pub mod markdown;
 pub mod prepared;

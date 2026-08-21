@@ -63,12 +63,12 @@ pub struct Metrics {
     pub bar: f32,
     /// Bullet glyph per depth; the last one repeats.
     pub bullets: &'static [&'static str],
-    /// What `core` is allowed to assume about the face this draws in. It is here
-    /// rather than defaulted inside `lay_out` because only a frontend knows —
-    /// `main.rs` sets `font_family("Menlo")`, so tables get their grid; a shell
-    /// that switched to a proportional face would set `Layout::proportional()`
-    /// and get its tables back verbatim instead of misaligned by a fraction of a
-    /// glyph per cell.
+    /// What `core` is allowed to assume about the face this draws in.
+    ///
+    /// Derived from `host.font` by [`Metrics::for_font`] rather than assumed,
+    /// because it is the font that decides: a monospaced face gets its table
+    /// columns padded into a grid, and a proportional one gets its tables left
+    /// as written instead of misaligned by a fraction of a glyph per cell.
     pub layout: Layout,
 }
 
@@ -85,6 +85,30 @@ impl Default for Metrics {
 }
 
 impl Metrics {
+    /// The metrics for a given font.
+    ///
+    /// Two things follow from the face and may not be guessed: whether tables can
+    /// be aligned at all, and how large a heading may be. The heading scale is
+    /// capped by [`ROW_H`] and not by the font, but it is *relative* to the body
+    /// size, so a larger font has to give up the top of the scale rather than
+    /// draw outside its row.
+    pub fn for_font(font: &plait_core::font::Font) -> Self {
+        // A glyph needs roughly 1.2x its point size of line box, so this is the
+        // largest a row can hold. At the default 14px body size it lands at 18px,
+        // which is where the scale was pinned when it was a constant.
+        let ceiling = ROW_H / 1.2;
+        let scale = [1.30, 1.18, 1.07, 1.0, 1.0, 1.0];
+        let mut heading = [font.size; 6];
+        for (h, factor) in heading.iter_mut().zip(scale) {
+            *h = font.scaled(factor).min(ceiling);
+        }
+        Self {
+            heading,
+            layout: Layout { monospaced: font.monospaced, ..Default::default() },
+            ..Self::default()
+        }
+    }
+
     fn size(&self, level: u8) -> f32 {
         self.heading[(level.max(1).min(6) - 1) as usize]
     }
@@ -567,6 +591,42 @@ diff --git a/README.md b/README.md
             table_row < 40,
             "a 25-column table row measured {table_row}; widest row is {widest}"
         );
+    }
+
+    #[test]
+    fn metrics_derived_from_the_default_font_match_the_constants_they_replaced() {
+        // The scale used to be pixel constants. Deriving it must not move it.
+        let m = Metrics::for_font(&plait_core::font::Font::default());
+        assert!((m.size(1) - 18.0).abs() < 0.35, "h1 moved to {}", m.size(1));
+        assert!((m.size(2) - 16.5).abs() < 0.35, "h2 moved to {}", m.size(2));
+        assert!((m.size(4) - 14.0).abs() < 0.01, "h4 is not the body size");
+        assert!(m.layout.monospaced, "the default font is monospaced");
+    }
+
+    #[test]
+    fn a_bigger_font_gives_up_the_top_of_the_scale_rather_than_the_row() {
+        // The constraint is the row, not the font: at a 20px body size a 1.3x h1
+        // would be 26px and clip into the row below, so it is capped instead.
+        let big = plait_core::font::Font { size: 20.0, ..plait_core::font::Font::default() };
+        let m = Metrics::for_font(&big);
+        for level in 1..=6u8 {
+            assert!(
+                m.size(level) * 1.2 <= super::ROW_H + 0.01,
+                "h{level} at {}px does not fit ROW_H",
+                m.size(level)
+            );
+        }
+        assert!((1..6u8).all(|l| m.size(l) >= m.size(l + 1)), "scale is not monotonic");
+    }
+
+    #[test]
+    fn a_proportional_font_turns_table_padding_off() {
+        // The whole reason `monospaced` is on the font rather than assumed here.
+        let prop = plait_core::font::Font {
+            monospaced: false,
+            ..plait_core::font::Font::default()
+        };
+        assert!(!Metrics::for_font(&prop).layout.monospaced);
     }
 
     #[test]
