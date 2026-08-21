@@ -63,7 +63,10 @@ Cache diffs by blob OID. They never change.
 
     ./check.sh                          # everything headless: tests + every fixture
     ./dev.sh diff . HEAD~2..HEAD        # rebuild + relaunch on every save,
-                                        # landing back on the same row
+                                        # landing back on the same row.
+                                        # Debug + stats overlay by default,
+                                        # so its timings mean nothing —
+                                        # ./dev.sh --release for real ones
     cargo test -p plait-core            # just correctness, sub-second
     cargo build --release -p plait-shell
     ./target/release/plait-shell commits [REPO] [LIMIT]

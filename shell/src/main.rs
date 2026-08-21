@@ -37,7 +37,8 @@ plait — a git client
   Start one with:  plait config > plait.toml
 
   ./dev.sh <args>  rebuild and relaunch on every source change, landing back
-                   on the row you were reading
+                   on the row you were reading. Debug build and the overlay by
+                   default; pass --release before trusting a timing.
 
   PLAIT_STATS=1   frame, row and heap overlay
 ";

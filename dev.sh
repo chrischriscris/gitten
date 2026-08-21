@@ -3,11 +3,22 @@
 #
 #   ./dev.sh diff . HEAD~2..HEAD
 #   ./dev.sh commits
-#   ./dev.sh --debug diff .            # ~2.5s rebuild, much slower app
+#   ./dev.sh --release diff .          # when you need honest numbers
+#   PLAIT_STATS=0 ./dev.sh commits     # without the overlay
 #
-# Not hot reload. Changing code still costs a rebuild — 3-5 s release — and this
-# removes everything either side of it: no quitting, no retyping the command, and
-# the window comes back on the row you were reading. The position is kept by
+# Debug and the stats overlay by default, because this is the loop you iterate in:
+# ~2.5 s to rebuild instead of ~4 s, and the frame, row and heap readout up
+# without having to remember an environment variable.
+#
+# **The timings in that overlay are meaningless here.** A debug build is a
+# different, much slower binary — `[profile.dev]` is opt-level 1 for our crates —
+# and the title bar says so in as many words. The row count, the heap and the load
+# breakdown are still worth watching; the fps is not a number to quote. Use
+# `--release` before believing anything, and see docs/measurements.md.
+#
+# Not hot reload. Changing code still costs a rebuild and this removes everything
+# either side of it: no quitting, no retyping the command, and the window comes
+# back on the row you were reading. The position is kept by
 # shell/src/session.rs, which writes it *while you scroll* because this script
 # kills the process and nothing runs on the way out.
 #
@@ -20,13 +31,16 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 
-PROFILE=release
-FLAGS=(--release)
-if [ "${1:-}" = "--debug" ]; then
-  PROFILE=debug
-  FLAGS=()
-  shift
-fi
+PROFILE=debug
+FLAGS=()
+case "${1:-}" in
+  --release) PROFILE=release; FLAGS=(--release); shift ;;
+  --debug)   shift ;;   # the default; accepted so it can be written explicitly
+esac
+
+# On unless it was deliberately turned off — `stats::enabled` treats "0" as off,
+# so `PLAIT_STATS=0 ./dev.sh` works and anything else the caller set is kept.
+export PLAIT_STATS="${PLAIT_STATS:-1}"
 
 BIN="target/$PROFILE/plait-shell"
 WATCH=(core/src core/examples git/src shell/src)
@@ -63,7 +77,9 @@ cycle() {
     red "── build failed — fix it and save again ──"
     return
   fi
-  dim "── $((SECONDS - start))s · launching ─────────────────"
+  local note=""
+  [ "$PROFILE" = debug ] && note=" · debug, timings meaningless"
+  dim "── $((SECONDS - start))s · launching$note ──────"
 
   "$BIN" "$@" &
   running=$!
