@@ -79,6 +79,14 @@ permanently, because shelling out is what gets hooks, credential helpers and
 Today: `log`, `pairs`, `diff`, `describe`. All behind one surface, so a frontend
 never learns which path ran.
 
+**Untracked files come from `git status`, not `git diff`.** `git diff` compares
+the index and the working tree against a commit, and an untracked file is in none
+of the three — so it has nothing to diff and never reports one. Every client that
+shows them asks `status` separately, and `pairs` does that for an empty revspec
+and synthesises a pair with an empty old side. Without it, "show me my
+uncommitted work" silently omits every file you just created, which on a real
+branch is most of what you are looking for.
+
 **It acquires content, not diffs.** `pairs` returns two lists of lines per changed
 file; `diff` is that plus the host's `Differs`. It used to run `git diff` and parse
 the unified output back, which meant git chose the algorithm and

@@ -151,6 +151,12 @@ pub fn pairs(repo: &Path, revspec: &str) -> Result<Vec<Pair>> {
     let blobs = cat_file(repo, &wanted)?;
 
     let mut out = Vec::with_capacity(changes.len());
+    // Untracked files first, so they read as new before the modifications —
+    // `git status` lists them last and that is the wrong way round for a diff,
+    // where the thing you just created is the thing you are looking for.
+    if revspec.is_empty() {
+        out.extend(untracked(repo)?);
+    }
     for c in changes {
         // The two sides read a null OID differently, and conflating them is a
         // silent, plausible-looking bug: an added file whose old side falls back
@@ -166,6 +172,65 @@ pub fn pairs(repo: &Path, revspec: &str) -> Result<Vec<Pair>> {
             status: c.status,
             old: if binary { Vec::new() } else { lines(old.as_deref().unwrap_or_default()) },
             new: if binary { Vec::new() } else { lines(new.as_deref().unwrap_or_default()) },
+            binary,
+        });
+    }
+    Ok(out)
+}
+
+/// Every untracked file, as a pair with nothing on its old side.
+///
+/// **`git diff` cannot see these and never will.** It compares the index and the
+/// working tree against a commit, and an untracked file is in none of the three
+/// — so there is nothing for it to diff. `git status` is the only command that
+/// knows they exist, which is why every client that shows them (lazygit, `gh`,
+/// every GUI) asks it separately. Without this, "show me my uncommitted work"
+/// silently omits every file you just created, which on a real branch is most of
+/// what you are looking for.
+///
+/// Only for the working tree. A revspec compares two commits and neither of them
+/// has untracked files in it, so asking would be meaningless.
+///
+/// Three things it gets right that the obvious version does not:
+///
+/// - **Ignored files stay out.** `--untracked-files=all` respects `.gitignore`,
+///   which is what stops `target/` arriving as forty thousand additions.
+/// - **A directory is expanded.** `git status` collapses an untracked directory
+///   to `dir/` by default; `all` lists the files inside it, which is what a diff
+///   wants.
+/// - **A binary file says so** rather than becoming a screenful of NULs, through
+///   the same [`is_binary`] test the tracked side uses.
+fn untracked(repo: &Path) -> Result<Vec<Pair>> {
+    // `-z` for NUL-separated paths, for the reason `--raw -z` has it: a path may
+    // contain anything a filesystem allows, and git otherwise quotes and escapes
+    // it. `--no-renames` because a rename needs an old side and these have none.
+    let raw = run(
+        repo,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"],
+    )?;
+    let text = String::from_utf8_lossy(&raw);
+
+    let mut out = Vec::new();
+    for record in text.split('\0') {
+        // `XY path`: two status letters, a space, then the path. Anything that
+        // is not `??` is a tracked change and `git diff --raw` already had it.
+        let Some(path) = record.strip_prefix("?? ") else { continue };
+        if path.is_empty() {
+            continue;
+        }
+        // Unreadable is skipped rather than an error: a broken symlink, a socket
+        // and a file deleted between the two git calls are all untracked, and
+        // none of them is worth refusing to show the rest of the diff over.
+        let Ok(content) = std::fs::read(repo.join(path)) else { continue };
+        let binary = is_binary(&content);
+        out.push(Pair {
+            path: path.to_string(),
+            old_path: None,
+            // The same letter `git diff --raw` uses for a file that was added,
+            // so nothing downstream has to learn that untracked is a category.
+            status: 'A',
+            old: Vec::new(),
+            new: if binary { Vec::new() } else { lines(&content) },
             binary,
         });
     }
@@ -417,6 +482,148 @@ fn lines(content: &[u8]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A throwaway repository, because untracked files are the one thing that
+    /// cannot be tested against a canned `--raw` string: they are defined by
+    /// *not* being in git, so only a real working tree has any.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("plait-git-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("a temp dir");
+            let me = Scratch(dir);
+            me.git(&["init", "-q", "."]);
+            me
+        }
+
+        fn git(&self, args: &[&str]) {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&self.0)
+                .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        }
+
+        fn write(&self, path: &str, content: &[u8]) {
+            let at = self.0.join(path);
+            if let Some(parent) = at.parent() {
+                std::fs::create_dir_all(parent).expect("a parent");
+            }
+            std::fs::write(at, content).expect("a file");
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn paths(pairs: &[Pair]) -> Vec<&str> {
+        pairs.iter().map(|p| p.path.as_str()).collect()
+    }
+
+    #[test]
+    fn an_untracked_file_is_a_pair_with_nothing_opposite_it() {
+        // The whole point: `git diff` cannot see these, so without the separate
+        // `git status` pass "show me my uncommitted work" omits every file you
+        // just created.
+        let r = Scratch::new("untracked");
+        r.write("tracked.txt", b"one\ntwo\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        r.write("tracked.txt", b"one\nCHANGED\n");
+        r.write("new.txt", b"brand new\nsecond\n");
+
+        let got = pairs(&r.0, "").expect("a working tree diff");
+        assert_eq!(paths(&got), vec!["new.txt", "tracked.txt"], "untracked comes first");
+        let new = &got[0];
+        assert_eq!(new.status, 'A', "an untracked file is an addition like any other");
+        assert!(new.old.is_empty(), "it has no old side");
+        assert_eq!(new.new, vec!["brand new", "second"]);
+        assert!(!new.binary);
+    }
+
+    #[test]
+    fn an_ignored_file_stays_out() {
+        // `--untracked-files=all` respects `.gitignore`, which is what stops
+        // `target/` arriving as forty thousand additions.
+        let r = Scratch::new("ignored");
+        r.write(".gitignore", b"skip/\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        r.write("skip/junk.txt", b"noise\n");
+        r.write("kept.txt", b"yes\n");
+
+        assert_eq!(paths(&pairs(&r.0, "").unwrap()), vec!["kept.txt"]);
+    }
+
+    #[test]
+    fn an_untracked_directory_is_expanded_into_its_files() {
+        // `git status` collapses one to `dir/` by default, and a diff of a
+        // directory is not a thing. `--untracked-files=all` is what asks for
+        // the files inside it.
+        let r = Scratch::new("deep");
+        r.write("seed.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        r.write("a/b/c.txt", b"buried\n");
+
+        assert_eq!(paths(&pairs(&r.0, "").unwrap()), vec!["a/b/c.txt"]);
+    }
+
+    #[test]
+    fn a_path_with_a_space_survives_because_the_records_are_nul_separated() {
+        // `git status` *quotes* such a path in its normal output. `-z` is what
+        // stops it, and without it the pair would be named `"has space.txt"`
+        // — quotes included — and the file read would fail.
+        let r = Scratch::new("spaced");
+        r.write("seed.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        r.write("has space.txt", b"spaced\n");
+
+        let got = pairs(&r.0, "").unwrap();
+        assert_eq!(paths(&got), vec!["has space.txt"]);
+        assert_eq!(got[0].new, vec!["spaced"]);
+    }
+
+    #[test]
+    fn an_untracked_binary_says_so_rather_than_becoming_nul_soup() {
+        let r = Scratch::new("binary");
+        r.write("seed.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        r.write("blob.png", b"\x89PNG\x00\x00rest");
+
+        let got = pairs(&r.0, "").unwrap();
+        assert_eq!(paths(&got), vec!["blob.png"]);
+        assert!(got[0].binary);
+        assert!(got[0].new.is_empty(), "a binary carries no lines");
+    }
+
+    #[test]
+    fn a_revspec_asks_for_no_untracked_files() {
+        // Two commits, and neither of them has untracked files in it. Including
+        // the working tree's would put files in a diff of history that are not
+        // in that history.
+        let r = Scratch::new("revspec");
+        r.write("a.txt", b"one\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "first"]);
+        r.write("a.txt", b"two\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "second"]);
+        r.write("loose.txt", b"not in history\n");
+
+        assert_eq!(paths(&pairs(&r.0, "HEAD~1..HEAD").unwrap()), vec!["a.txt"]);
+        assert!(paths(&pairs(&r.0, "").unwrap()).contains(&"loose.txt"), "the working tree has it");
+    }
 
     #[test]
     fn a_modified_file_is_one_record() {

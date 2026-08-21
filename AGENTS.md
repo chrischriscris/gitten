@@ -77,6 +77,12 @@ reimplement any of that; you will get it subtly wrong.
 
 Both behind one trait. Frontends never learn which path ran.
 
+**Untracked files are `git status`, never `git diff`.** `git diff` compares the
+index and the working tree against a commit and an untracked file is in none of
+the three, so it has nothing to diff and never will. Ask `status` separately for
+an empty revspec and synthesise a pair with an empty old side. Getting this wrong
+means "show me my uncommitted work" silently omits every file you just created.
+
 **It acquires content, not diffs.** Two lists of lines per changed file, and
 `core` decides which lines correspond. Let git produce the diff and git owns the
 algorithm, which makes `trait Differ` decoration and rule 1 false for the most
