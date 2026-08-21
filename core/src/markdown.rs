@@ -41,7 +41,8 @@
 
 use crate::prepared::Line;
 use crate::syntax::{
-    fence_marker, for_each_side, is_break, is_setext, list_marker, Kind, Token,
+    column_indent, fence_marker, for_each_side, heading_level, is_break, is_setext, list_marker,
+    Kind, Token,
 };
 use crate::LineKind;
 use std::ops::Range;
@@ -500,9 +501,11 @@ fn classify(line: &str, fence: &mut Option<&'static str>, prev: Option<Block>) -
         return Block::Blank;
     }
 
-    let hashes = trimmed.bytes().take_while(|b| *b == b'#').count();
-    if (1..=6).contains(&hashes) && matches!(trimmed.as_bytes().get(hashes), None | Some(b' ')) {
-        return Block::Heading(hashes as u8);
+    // The whole line, not the trimmed one: past three columns of indent a `#` is
+    // a comment inside an indented code block, not a heading. Shared with the
+    // token pass so the two cannot disagree about it.
+    if let Some(level) = heading_level(line) {
+        return Block::Heading(level);
     }
     // A table separator is a rule *and* the row that says how its columns are
     // aligned, so it is its own block rather than a thematic break that happens
@@ -573,20 +576,6 @@ fn quote_depth(trimmed: &str) -> u8 {
         }
     }
     depth.max(1)
-}
-
-/// Leading whitespace in columns, counting a tab as four. Bytes would do for
-/// spaces and be wrong for the files that use tabs.
-fn column_indent(line: &str) -> usize {
-    let mut n = 0;
-    for b in line.bytes() {
-        match b {
-            b' ' => n += 1,
-            b'\t' => n += 4,
-            _ => break,
-        }
-    }
-    n
 }
 
 /// Kept deliberately trivial: it exists so `classify` reads as a list of rules
@@ -886,6 +875,19 @@ mod tests {
         assert_eq!(text("# Top"), "Top");
         assert_eq!(one("###### Deep").0, Block::Heading(6));
         assert_eq!(text("###### Deep"), "Deep");
+        // Three columns of indent is still a heading; four is an indented code
+        // block, and a `#` in one is a shell comment. This repository's own
+        // `AGENTS.md` has a block of commands with trailing `# comments`, and
+        // every one of them rendered as a full-width bold heading.
+        assert_eq!(one("   # three spaces").0, Block::Heading(1));
+        assert_ne!(one("    # four spaces").0, Block::Heading(1));
+        assert_eq!(
+            one("    ./dev.sh diff        # rebuild on every save").0,
+            Block::Paragraph,
+            "a command with a trailing comment is not a heading"
+        );
+        assert_ne!(one("\t# a tab is four columns").0, Block::Heading(1));
+
         // Closed form, and an indented one.
         assert_eq!(text("## Middle ##"), "Middle");
         assert_eq!(text("   ## Indented"), "Indented");

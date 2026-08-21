@@ -4,6 +4,8 @@
 //! or the other way — nothing in this crate changes. Keep it that way: the day
 //! something in here needs to know what a window is, the boundary is gone.
 
+pub mod align;
+pub mod differ;
 pub mod font;
 pub mod host;
 pub mod markdown;
@@ -397,31 +399,16 @@ fn coalesce(spans: &mut Vec<Span>, text: &str) {
 }
 
 /// Pairs each removed line in a hunk with the added line that replaced it.
+///
 /// A run of N removals immediately followed by M additions pairs index-wise;
 /// unmatched leftovers are pure adds or deletes and get no highlighting.
+///
+/// One scan, shared with [`align`](crate::align::align), because a side-by-side
+/// view has to put the same two lines on the same row that this hands to the
+/// intraline pass — see that module for what happens when they disagree.
 pub fn replace_pairs(hunk: &Hunk) -> Vec<(usize, usize)> {
-    let mut pairs = Vec::new();
-    let mut i = 0;
-    let lines = &hunk.lines;
-    while i < lines.len() {
-        if lines[i].kind != LineKind::Removed {
-            i += 1;
-            continue;
-        }
-        let del_start = i;
-        while i < lines.len() && lines[i].kind == LineKind::Removed {
-            i += 1;
-        }
-        let add_start = i;
-        while i < lines.len() && lines[i].kind == LineKind::Added {
-            i += 1;
-        }
-        let n = (add_start - del_start).min(i - add_start);
-        for k in 0..n {
-            pairs.push((del_start + k, add_start + k));
-        }
-    }
-    pairs
+    let kinds: Vec<LineKind> = hunk.lines.iter().map(|l| l.kind).collect();
+    crate::align::pairs(&kinds)
 }
 
 // ---------------------------------------------------------------------- tests

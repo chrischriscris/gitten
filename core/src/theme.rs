@@ -87,6 +87,13 @@ pub struct DiffPalette {
     pub removed_bg: Rgb,
     pub removed_fg: Rgb,
     pub removed_word_bg: Rgb,
+    /// The half of a side-by-side row with no line in it.
+    ///
+    /// Its own colour and not `context_bg`, because those two mean opposite
+    /// things: context is a line that did not change, and this is the absence of
+    /// a line. Flatter and darker than every other row background, so a run of
+    /// them reads as a hole in the column rather than as content.
+    pub absent_bg: Rgb,
 }
 
 /// The furniture a rendered Markdown row draws in place of the markers it hides.
@@ -119,6 +126,11 @@ pub struct ChromePalette {
     pub accent: Rgb,
     pub title_bg: Rgb,
     pub status_bg: Rgb,
+    /// Something the app tried and could not do — a diff that failed to
+    /// re-acquire, say. Its own colour and not `diff.dels_fg`: that red means
+    /// "this line was removed", and a palette where one colour means two things
+    /// is a palette a theme cannot retune.
+    pub error: Rgb,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -193,6 +205,7 @@ impl Theme {
                 removed_bg: 0x2a1917,
                 removed_fg: 0xd4a09a,
                 removed_word_bg: 0x43201a,
+                absent_bg: 0x0a0908,
             },
             // Quieter than the syntax palette on purpose: this is punctuation
             // the reader should be able to ignore, standing in for punctuation
@@ -211,6 +224,7 @@ impl Theme {
                 accent: 0xdfa851,
                 title_bg: 0x151312,
                 status_bg: 0x131211,
+                error: 0xd4736b,
             },
             lanes: vec![0xdfa851, 0x6f9ecf, 0xa983c9, 0x5fa8a0, 0xc97d6f, 0x8fb35e],
             lane_overflow: 0x453f39,

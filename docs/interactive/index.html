@@ -1,0 +1,3058 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>plait — the architecture, and the algorithms that run in it</title>
+<style>
+:root{
+  /* Straight out of core/src/theme.rs — Theme::default_dark(). */
+  --ink:#0a0908; --canvas:#0e0d0c; --panel:#151312; --panel-2:#131211;
+  --rule:#241f1b; --rule-2:#1b1815;
+  --text:#e8e3dc; --dim:#a39c93; --faint:#6e6862; --ghost:#4a4540;
+  --amber:#dfa851;
+  --l0:#dfa851; --l1:#6f9ecf; --l2:#a983c9; --l3:#5fa8a0; --l4:#c97d6f; --l5:#8fb35e;
+  --lane-overflow:#453f39;
+  --add-bg:#16241a; --add-word:#1e3a23; --add-fg:#9dc79b; --adds:#6fbf73;
+  --del-bg:#2a1917; --del-word:#43201a; --del-fg:#d4a09a; --dels:#d4736b;
+  --hunk-bg:#14181d; --hunk-fg:#7d8fa8; --file-bg:#151312; --gutter:#4a4540;
+  --k-comment:#615a52; --k-str:#9aab7d; --k-num:#c2a06a; --k-key:#a88fb5;
+  --k-type:#86a6bd; --k-const:#d0b48a; --k-func:#d9c98f; --k-prop:#b5aea5;
+  --k-head:#e8e3dc; --k-strong:#d8d2ca; --k-em:#c9c2b9; --k-link:#7fa2bd;
+
+  --row:22px;                     /* graph.rs ROW_H — the page's whole rhythm */
+  --mono:"JetBrains Mono","JetBrainsMono Nerd Font Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+  --prose:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+@media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}*{animation:none!important;transition:none!important}}
+body{
+  margin:0; background:var(--ink); color:var(--text);
+  font-family:var(--mono); font-size:13px; line-height:var(--row);
+  -webkit-font-smoothing:antialiased;
+}
+::selection{background:#3a2f1c;color:#fff}
+a{color:var(--amber);text-decoration:none;border-bottom:1px solid #4a3a1c}
+a:hover{border-bottom-color:var(--amber)}
+:focus-visible{outline:2px solid var(--amber);outline-offset:2px}
+.skip{position:absolute;left:-9999px}
+.skip:focus{left:8px;top:8px;z-index:99;background:var(--panel);padding:8px 12px;border:1px solid var(--amber)}
+
+/* ---------------------------------------------------------------- the rail */
+/* The nav is a graph gutter: one lane, a dot per section, the active row lit. */
+#rail{
+  position:fixed;inset:0 auto 0 0;width:246px;padding:22px 0 22px 0;
+  background:linear-gradient(180deg,#0c0b0a,#0a0908);border-right:1px solid var(--rule);
+  overflow-y:auto;z-index:20;
+}
+#rail .brand{padding:0 18px 22px;}
+#rail .brand b{display:block;font-size:19px;letter-spacing:-.04em;color:var(--text)}
+#rail .brand span{display:block;font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--ghost)}
+#rail ol{list-style:none;margin:0;padding:0;position:relative}
+#rail ol:before{content:"";position:absolute;left:24px;top:11px;bottom:11px;width:2px;background:var(--rule)}
+#rail a.nav{
+  display:grid;grid-template-columns:34px 1fr auto;align-items:center;gap:8px;
+  height:calc(var(--row) * 2);padding:0 14px 0 8px;color:var(--faint);
+  border:0;font-size:12px;position:relative;
+}
+#rail a.nav .dot{justify-self:center;width:9px;height:9px;border-radius:50%;background:var(--ink);border:2px solid var(--ghost);z-index:2}
+#rail a.nav .key{font-size:10px;color:var(--rule);border:1px solid var(--rule-2);padding:0 4px;border-radius:2px}
+#rail a.nav:hover{color:var(--dim)}
+#rail a.nav:hover .dot{border-color:var(--dim)}
+#rail a.nav[aria-current="true"]{color:var(--text)}
+#rail a.nav[aria-current="true"] .dot{border-color:var(--amber);background:#2a1e0c}
+#rail a.nav[aria-current="true"] .key{color:var(--amber);border-color:#4a3a1c}
+#rail .foot{padding:22px 18px 0;font-size:10.5px;color:var(--ghost);line-height:18px}
+
+/* ------------------------------------------------------------------ layout */
+main{margin-left:246px;padding:0 40px 120px;max-width:1180px}
+section{padding:66px 0 22px;border-top:1px solid var(--rule);scroll-margin-top:0}
+section:first-of-type{border-top:0}
+.eyebrow{font-size:10.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--ghost);margin:0 0 6px}
+h1{font-size:clamp(30px,4.4vw,46px);line-height:1.04;letter-spacing:-.045em;margin:0 0 18px;font-weight:700}
+h2{font-size:23px;line-height:28px;letter-spacing:-.03em;margin:0 0 10px;font-weight:700}
+h3{font-size:14px;margin:22px 0 8px;letter-spacing:-.01em;color:var(--text)}
+h4{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--faint);margin:0 0 8px;font-weight:500}
+p,li{font-family:var(--prose);font-size:14.5px;line-height:23px;color:var(--dim);max-width:74ch}
+p{margin:0 0 14px}
+ul{margin:0 0 14px;padding-left:20px}
+li{margin:0 0 6px}
+strong{color:var(--text);font-weight:600}
+em{color:var(--dim)}
+code,.m{font-family:var(--mono);font-size:.92em;color:var(--k-const)}
+p code,li code,td code{background:#141210;border:1px solid var(--rule-2);border-radius:2px;padding:0 3px}
+.lede{font-family:var(--prose);font-size:17px;line-height:27px;color:var(--dim);max-width:66ch}
+.lede b{color:var(--text);font-weight:600}
+.cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:22px}
+.cols.two{grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}
+
+/* ------------------------------------------------------------------ panels */
+.panel{background:var(--panel);border:1px solid var(--rule);border-radius:3px;margin:0 0 22px}
+.panel > .stamp{
+  display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+  padding:7px 12px;border-bottom:1px solid var(--rule);background:var(--panel-2);
+  font-size:10.5px;letter-spacing:.04em;color:var(--faint)
+}
+.stamp .path{color:var(--dim)}
+.stamp .adr{color:var(--amber);border:1px solid #4a3a1c;border-radius:2px;padding:0 5px}
+.stamp .right{margin-left:auto;color:var(--ghost)}
+.body{padding:16px}
+.body > :last-child{margin-bottom:0}
+.note{font-family:var(--prose);font-size:12.5px;line-height:20px;color:var(--faint);border-left:2px solid var(--rule);padding-left:12px;margin:14px 0 0;max-width:70ch}
+.note b{color:var(--dim)}
+
+/* ----------------------------------------------------------------- controls */
+.ctl{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:0 0 14px}
+.ctl .lbl{font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--ghost);margin-right:4px}
+button.b{
+  font-family:var(--mono);font-size:11.5px;color:var(--dim);background:#100f0e;
+  border:1px solid var(--rule);border-radius:2px;padding:3px 9px;cursor:pointer;line-height:18px;
+}
+button.b:hover{color:var(--text);border-color:var(--ghost)}
+button.b[aria-pressed="true"],button.b.on{color:var(--amber);border-color:#4a3a1c;background:#171310}
+textarea,input[type=text]{
+  width:100%;font-family:var(--mono);font-size:12.5px;line-height:20px;color:var(--text);
+  background:var(--canvas);border:1px solid var(--rule);border-radius:2px;padding:8px 10px;resize:vertical;
+}
+input[type=range]{accent-color:var(--amber);width:170px;vertical-align:middle}
+.pill{font-size:10.5px;color:var(--faint);border:1px solid var(--rule);border-radius:2px;padding:1px 6px}
+.pill b{color:var(--text);font-weight:600}
+.pill.warn{color:var(--dels);border-color:#4a2622}
+.pill.ok{color:var(--adds);border-color:#24422a}
+
+/* --------------------------------------------------------------- diff rows */
+.rows{background:var(--canvas);border:1px solid var(--rule);border-radius:2px;overflow-x:auto;padding:0 0 2px}
+.r{display:flex;align-items:center;height:var(--row);font-size:12.5px;white-space:pre;font-family:var(--mono)}
+.r .n{flex:none;width:46px;padding-right:8px;text-align:right;color:var(--gutter);font-size:11px}
+.r .s{flex:none;width:16px;text-align:center;color:var(--gutter)}
+.r .t{flex:1 0 auto;padding-right:16px}
+.r.add{background:var(--add-bg)} .r.add .s{color:var(--adds)}
+.r.del{background:var(--del-bg)} .r.del .s{color:var(--dels)}
+.r.ctx .t{color:var(--dim)}
+.r.file{background:var(--file-bg);color:var(--text);height:calc(var(--row) + 6px);padding:0 12px}
+.r.file .add-n{color:var(--adds);margin-left:10px} .r.file .del-n{color:var(--dels);margin-left:6px}
+.r.hunk{background:var(--hunk-bg);color:var(--hunk-fg);padding-left:8px}
+.w{border-radius:1px}
+.r.add .w{background:var(--add-word)} .r.del .w{background:var(--del-word)}
+.legend{display:flex;gap:14px;flex-wrap:wrap;margin:10px 0 0;font-size:10.5px;color:var(--ghost)}
+.legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;vertical-align:-1px}
+
+/* ------------------------------------------------------------------ tables */
+table{border-collapse:collapse;width:100%;font-size:11.5px;margin:0 0 14px}
+th{text-align:left;font-weight:500;color:var(--ghost);font-size:10px;letter-spacing:.1em;text-transform:uppercase;padding:0 10px 6px 0;border-bottom:1px solid var(--rule)}
+td{padding:4px 10px 4px 0;border-bottom:1px solid var(--rule-2);color:var(--dim);vertical-align:top}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+tr:hover td{color:var(--text)}
+td b{color:var(--text)}
+details{margin:0 0 14px}
+summary{font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--ghost);cursor:pointer;padding:4px 0}
+summary:hover{color:var(--dim)}
+
+/* ------------------------------------------------------------------ charts */
+figure{margin:0 0 22px}
+figcaption{font-family:var(--prose);font-size:12.5px;line-height:19px;color:var(--faint);margin:8px 0 0;max-width:70ch}
+figcaption b{color:var(--dim)}
+svg{display:block;max-width:100%;overflow:visible}
+svg text{font-family:var(--mono)}
+.tip{
+  position:fixed;pointer-events:none;z-index:60;opacity:0;transition:opacity .08s;
+  background:#1b1815;border:1px solid var(--ghost);border-radius:2px;padding:5px 8px;
+  font-size:11px;color:var(--text);white-space:pre;box-shadow:0 6px 18px #000a
+}
+/* -------------------------------------------------------------- key sheet */
+#sheet{position:fixed;right:22px;bottom:22px;z-index:40;background:var(--panel);border:1px solid var(--ghost);border-radius:3px;padding:12px 14px;display:none}
+#sheet.open{display:block}
+#sheet dl{margin:0;display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:11.5px}
+#sheet dt{color:var(--amber)} #sheet dd{margin:0;color:var(--dim)}
+#hint{position:fixed;right:22px;bottom:22px;z-index:39;font-size:10.5px;color:var(--ghost);cursor:pointer}
+
+@media (max-width:960px){
+  #rail{position:static;width:auto;height:auto;padding:14px 0;border-right:0;border-bottom:1px solid var(--rule)}
+  #rail ol{display:flex;overflow-x:auto;gap:0}
+  #rail ol:before{display:none}
+  #rail a.nav{height:auto;padding:8px 12px;white-space:nowrap;grid-template-columns:auto}
+  #rail a.nav .dot,#rail a.nav .key{display:none}
+  #rail .brand{padding:0 14px 12px} #rail .foot{display:none}
+  main{margin-left:0;padding:0 18px 80px}
+  section{padding-top:44px}
+  #hint,#sheet{display:none}
+}
+</style>
+</head>
+<body>
+<a class="skip" href="#top">Skip to content</a>
+
+<nav id="rail" aria-label="Sections">
+  <div class="brand"><b>plait</b><span>architecture &amp; algorithms</span></div>
+  <ol id="navlist">
+    <li><a class="nav" href="#top"      data-sec="top"><span class="dot"></span><span>The three rules</span><span class="key">0</span></a></li>
+    <li><a class="nav" href="#boundary" data-sec="boundary"><span class="dot"></span><span>The boundary</span><span class="key">1</span></a></li>
+    <li><a class="nav" href="#acquire"  data-sec="acquire"><span class="dot"></span><span>Getting the bytes</span><span class="key">2</span></a></li>
+    <li><a class="nav" href="#differ"   data-sec="differ"><span class="dot"></span><span>Which lines match</span><span class="key">3</span></a></li>
+    <li><a class="nav" href="#intraline"data-sec="intraline"><span class="dot"></span><span>Words in a line</span><span class="key">4</span></a></li>
+    <li><a class="nav" href="#scanner"  data-sec="scanner"><span class="dot"></span><span>Colour, no parser</span><span class="key">5</span></a></li>
+    <li><a class="nav" href="#graph"    data-sec="graph"><span class="dot"></span><span>Lanes and hues</span><span class="key">6</span></a></li>
+    <li><a class="nav" href="#theme"    data-sec="theme"><span class="dot"></span><span>Colour as data</span><span class="key">7</span></a></li>
+    <li><a class="nav" href="#rows"     data-sec="rows"><span class="dot"></span><span>Rows, 8 bytes each</span><span class="key">8</span></a></li>
+    <li><a class="nav" href="#numbers"  data-sec="numbers"><span class="dot"></span><span>The numbers</span><span class="key">9</span></a></li>
+    <li><a class="nav" href="#decisions"data-sec="decisions"><span class="dot"></span><span>The record</span><span class="key">D</span></a></li>
+    <li><a class="nav" href="#edges"    data-sec="edges"><span class="dot"></span><span>Edges &amp; gaps</span><span class="key">E</span></a></li>
+  </ol>
+  <div class="foot">Every panel is stamped with the file that implements it.<br>Read from the source, 2026-08-21.</div>
+</nav>
+
+<main>
+<section id="top">
+  <p class="eyebrow">A desktop git client · Rust · GPUI · lazygit's keyboard model</p>
+  <h1>Three crates.<br>One of them is not<br>allowed to know<br>a window exists.</h1>
+  <p class="lede">plait draws git history and diffs. Everything interesting about it follows from
+  one constraint — <b>core/ has no dependencies and no idea a UI is there</b> — and from three rules
+  that break ties when they disagree. This page runs the real algorithms: the code below is ported
+  from <code>plait-core</code> and checked against it, line for line, on the same test inputs.</p>
+
+  <div class="cols" style="margin:28px 0 0">
+    <div class="panel"><div class="stamp"><span class="path">rule 1</span></div><div class="body">
+      <h3 style="margin-top:0">Extensible</h3>
+      <p style="margin:0">Anything a built-in does, an extension must be able to do too. Catch yourself
+      hardcoding something a user might want to swap — make it a trait first.</p></div></div>
+    <div class="panel"><div class="stamp"><span class="path">rule 2</span></div><div class="body">
+      <h3 style="margin-top:0">Beautiful and usable</h3>
+      <p style="margin:0">Dense, quiet, keyboard-first. Not done until it looks like it belongs.</p></div></div>
+    <div class="panel"><div class="stamp"><span class="path">rule 3</span></div><div class="body">
+      <h3 style="margin-top:0">Blazingly fast</h3>
+      <p style="margin:0">Nothing on the render path allocates per frame or recomputes what a cache
+      could hold. When the rules conflict, that order breaks the tie.</p></div></div>
+  </div>
+
+  <h2 style="margin:44px 0 8px">One file, six stages, live</h2>
+  <p>A changed file goes from two blobs to pixels in six stages. Five of them are in <code>core</code>
+  and could not name a UI if asked. Step through it — the payload below is the actual output of the
+  actual stage, computed here in the browser.</p>
+
+  <div class="panel" id="bench">
+    <div class="stamp">
+      <span class="path">core/src/{differ,prepared,markdown}.rs · shell/src/views/diff.rs</span>
+      <span class="right">← → to step</span>
+    </div>
+    <div class="body">
+      <div class="ctl" id="bench-stages" aria-label="Pipeline stage"></div>
+      <div id="bench-what" style="min-height:44px"></div>
+      <div id="bench-out"></div>
+    </div>
+  </div>
+</section>
+
+<section id="boundary">
+  <p class="eyebrow">The boundary</p>
+  <h2>Three crates, and the line that matters</h2>
+  <p>The interesting line is between the first two and the third. <code>plait-git</code> is the only
+  crate that talks to a repository. <code>plait-core</code> is pure — no GPUI, no gitoxide, no I/O,
+  and <code>[dependencies]</code> is empty on purpose, so it compiles in about a second and its tests
+  need no window. <code>plait-shell</code> draws and takes input, and as little else as possible.</p>
+
+  <div class="panel">
+    <div class="stamp"><span class="path">click a crate</span><span class="right">docs/architecture.md</span></div>
+    <div class="body">
+      <div id="cratemap"></div>
+      <div id="crateinfo" style="margin-top:16px"></div>
+    </div>
+  </div>
+
+  <div class="cols two">
+    <div class="panel"><div class="stamp"><span class="path">the rule</span></div><div class="body">
+      <h4>Two checks, both cheap against a diff</h4>
+      <p><b>core has no dependencies.</b> If something needs adding, the thing wanting it belongs in
+      another crate.</p>
+      <p style="margin:0"><b>A second frontend needs no logic of its own.</b>
+      <code>core/examples/paint.rs</code> draws a real diff — clipped, intraline-marked,
+      syntax-coloured, themed — in 24-bit ANSI, and contains no pipeline code. When that stops being
+      true, logic has leaked into the shell. It happened once already; the record is
+      <span class="m">decisions/0007</span>.</p></div></div>
+    <div class="panel"><div class="stamp"><span class="path">core/src/host.rs</span></div><div class="body">
+      <h4>Where the swappable pieces live</h4>
+      <p>Built once in <code>main.rs</code> before any view exists, then held in a GPUI global and read
+      <em>on the render path</em> — which is why <code>plait.toml</code> lands on the next frame instead
+      of the next launch. A view that captures a clone instead will work, and will quietly not
+      hot-reload.</p>
+      <div id="hostbox"></div>
+      <p class="note" style="margin-top:12px"><b>The check:</b> if a feature needs a knob that is not on
+      <code>Host</code> or one of its fields, that feature is not extensible yet. The font used to be a
+      <code>const</code> in <code>main.rs</code> with three things quietly depending on it; there is a
+      test named after that mistake.</p></div></div>
+  </div>
+</section>
+
+<section id="acquire">
+  <p class="eyebrow">Stage 1 · acquisition</p>
+  <h2>Two processes, whatever the diff size</h2>
+  <p>Reads go through <code>gix</code> eventually; today everything shells out. Writes shell out
+  <em>permanently</em> — push, pull, merge, rebase, commit — because that is what gets hooks,
+  credential helpers, SSH agents and <code>.gitconfig</code> behaving exactly as they do in the
+  user's terminal. Don't reimplement any of it; you will get it subtly wrong.</p>
+
+  <div class="cols two">
+    <div class="panel"><div class="stamp"><span class="path">git/src/lib.rs</span><span class="right">rewritten, uncommitted</span></div><div class="body">
+      <h4>Why it fetches contents, not a diff</h4>
+      <p><code>git diff</code> will hand over a finished unified diff, and this crate used to parse
+      exactly that. It no longer does: then <em>git</em> chooses the algorithm and
+      <code>plait_core::differ</code> is decoration — a semantic or language-aware differ could never
+      be reached, and rule 1 says a built-in may not do anything an extension cannot.</p>
+      <p style="margin:0">So acquisition is two lists of lines per changed file, and <b>which lines
+      correspond is decided in <code>core</code> afterwards</b>. <code>parse_unified_diff</code> stays
+      for reading <code>.diff</code> fixtures off disk, which is a different job.</p>
+    </div></div>
+    <div class="panel"><div class="stamp"><span class="path">the shape of it</span></div><div class="body">
+      <h4>Two processes, not one per file</h4>
+      <div class="rows" style="padding:8px 10px">
+<div class="r"><span class="t" style="color:var(--k-func)">git diff --raw -z -M --no-ext-diff <span style="color:var(--k-str)">HEAD~2..HEAD</span></span></div>
+<div class="r"><span class="t" style="color:var(--faint)">:100644 100644 a1b2c3d 9f8e7d6 M&#9;core/src/differ.rs</span></div>
+<div class="r"><span class="t" style="color:var(--faint)">:100644 100644 4c5d6e7 0000000 M&#9;shell/src/views/diff.rs</span></div>
+<div class="r"><span class="t"></span></div>
+<div class="r"><span class="t" style="color:var(--k-func)">git cat-file --batch</span><span style="color:var(--k-comment)">  # every blob, one process</span></div>
+      </div>
+      <p style="margin:14px 0 0"><code>--raw</code> names every changed path and both blob OIDs;
+      <code>cat-file --batch</code> streams all of them in a single process. A <code>git show</code>
+      per file is a process per file, which on a thousand-file diff is a second of <code>fork</code>
+      before any work happens.</p>
+      <p class="note"><b>The OIDs are the reason to want it this way round anyway.</b> A blob's content
+      never changes, so a diff keyed on the pair of them is cacheable forever. A null OID on the new
+      side means the working tree — the file as it is on disk right now, which is the whole point of a
+      diff with no revspec.</p>
+    </div></div>
+  </div>
+
+  <div class="panel"><div class="stamp"><span class="path">git/src/lib.rs · struct Pair</span></div><div class="body">
+    <div class="cols">
+      <div>
+        <h4>What crosses the boundary</h4>
+        <p style="margin:0">One changed file as the two versions of its text. <code>Vec&lt;String&gt;</code>
+        and not <code>&amp;str</code> into one buffer, because the two sides come from different blobs
+        and a rename means the paths differ too. Splitting into lines happens here rather than in
+        <code>core</code>, so the lossy UTF-8 decode — I/O's problem — stays on this side.</p>
+      </div>
+      <div>
+        <h4>Never read_to_string anything from git</h4>
+        <p style="margin:0">Commit metadata is not guaranteed UTF-8 and real history carries Latin-1
+        author names — <code>git/git</code> panics it outright. Read bytes and
+        <code>String::from_utf8_lossy</code>. Never fail to show a repository over one bad byte.</p>
+      </div>
+      <div>
+        <h4>Binary is a thing to say, not to skip</h4>
+        <p style="margin:0">A NUL byte on either side sets <code>binary</code>, and the file is modelled
+        as a file with no hunks rather than dropped: the diff still has to report that it changed, and
+        "binary" is the honest thing for it to say.</p>
+      </div>
+    </div>
+  </div></div>
+</section>
+
+<section id="differ">
+  <p class="eyebrow">Stage 2 · core/src/differ.rs · decisions/0001</p>
+  <h2>Which lines correspond is a judgement call, not a fact</h2>
+  <p>Myers minimises the edit count. Histogram anchors on rare lines. A semantic differ would ignore
+  both and compare syntax trees. So it is a seam, not a function — and an implementation produces only
+  the <em>edit script</em>. Line numbers, context, hunk headers and the <code>@@ … @@ fn name</code>
+  suffix are shared by every differ, because that bookkeeping is identical for all of them and getting
+  it subtly wrong in a second place is exactly the kind of bug nobody sees until a header points at
+  the wrong line.</p>
+
+  <div class="cols two">
+    <div class="panel"><div class="stamp"><span class="path">the contract</span></div><div class="body">
+      <div class="rows" style="padding:6px 10px">
+<div class="r"><span class="t"><span style="color:var(--k-key)">pub struct</span> <span style="color:var(--k-type)">Edit</span> {</span></div>
+<div class="r"><span class="t">    old_start: <span style="color:var(--k-type)">u32</span>, old_end: <span style="color:var(--k-type)">u32</span>,</span></div>
+<div class="r"><span class="t">    new_start: <span style="color:var(--k-type)">u32</span>, new_end: <span style="color:var(--k-type)">u32</span>,</span></div>
+<div class="r"><span class="t">}</span></div>
+      </div>
+      <p style="margin:14px 0 0">Replace <code>old[old_start..old_end]</code> with
+      <code>new[new_start..new_end]</code>. An empty old range is a pure insertion, an empty new range a
+      pure deletion, and both empty never happens. Sorted by <code>old_start</code>, non-overlapping,
+      and never two adjacent. <code>u32</code> because a diff of more than four billion lines is not a
+      diff, and 16 bytes per edit keeps a large file's script in cache.</p>
+    </div></div>
+    <div class="panel"><div class="stamp"><span class="path">the guards</span></div><div class="body">
+      <h4>Both worst-case quadratic in the differing lines</h4>
+      <p>Every recursion is bounded by <code>MAX_STEPS = 40_000_000</code> and degrades to a
+      whole-region replace rather than stalling the load. 50k lines against 50k different lines is
+      10<sup>10</sup> steps — minutes. Past the budget the honest answer is "this file was replaced",
+      which is what the diff would have looked like anyway.</p>
+      <p style="margin:0"><b>Recursion is an explicit stack, not the call stack.</b> A 50k-line file
+      whose every anchor peels off one line is a 50k-deep recursion — a stack overflow rather than a
+      slow load, and not a hypothetical shape: a generated file with a repeating structure produces
+      exactly it.</p>
+    </div></div>
+  </div>
+
+  <div class="panel"><div class="stamp">
+      <span class="path">run it</span><span class="adr">ported from differ.rs, verified against it</span>
+      <span class="right">edit either side</span></div>
+    <div class="body">
+      <div class="ctl">
+        <span class="lbl">algorithm</span>
+        <button class="b" data-algo="histogram" aria-pressed="true">histogram</button>
+        <button class="b" data-algo="patience" aria-pressed="false">patience</button>
+        <button class="b" data-algo="myers" aria-pressed="false">myers</button>
+        <span class="lbl" style="margin-left:14px">preset</span>
+        <button class="b" data-dpreset="0">moved function</button>
+        <button class="b" data-dpreset="1">edited in place</button>
+        <button class="b" data-dpreset="2">rewritten</button>
+        <span class="lbl" style="margin-left:14px">context</span>
+        <input type="range" id="dctx" min="0" max="6" value="3" step="1">
+        <span class="pill">context <b id="dctxv">3</b></span>
+      </div>
+      <div class="cols two" style="margin-bottom:14px">
+        <div><h4>old</h4><textarea id="dold" rows="11" spellcheck="false"></textarea></div>
+        <div><h4>new</h4><textarea id="dnew" rows="11" spellcheck="false"></textarea></div>
+      </div>
+      <div class="ctl" id="dstats"></div>
+      <div class="cols two">
+        <div><h4>edit script</h4><div id="dedits"></div></div>
+        <div><h4>hunks, assembled</h4><div id="dhunks"></div></div>
+      </div>
+      <p class="note"><b>The invariant, checked live:</b> applying the script to the old file must
+      reproduce the new one exactly — that is what the <code>verify</code> helper in
+      <code>differ.rs</code> asserts for every built-in, and what the badge above reports on whatever
+      you type.</p>
+    </div>
+  </div>
+
+  <div class="cols two">
+    <div class="panel"><div class="stamp"><span class="path">histogram</span><span class="adr">the default</span></div><div class="body">
+      <h4>Anchor on the rarest line, recurse either side</h4>
+      <p>A line that appears once is almost certainly <em>the same line</em>. A <code>}</code> appearing
+      four hundred times tells you nothing. So each candidate run of matching lines is scored by its
+      <em>rarest</em> line and the lowest score wins, with a longer run breaking the tie. That ordering is
+      the whole of histogram diff.</p>
+      <p><b>Both halves of that are wrong in the plausible direction</b>, which is why they are worth
+      reading twice. Score a run by its <em>most common</em> line instead and a four-hundred-line run of
+      unique code loses to a one-line run the moment a single <code>}</code> falls inside it — measured on
+      this repository, that cost <b>582 spurious changed-line pairs on one 690-line file</b>. And the
+      threshold has to tighten as the search runs: once a run scoring 2 is in hand, a line appearing forty
+      times cannot be part of anything better. Without that, a longer run wins on length alone however
+      common its lines are, and this repository's whole history came out <b>10 changed lines worse than
+      <code>git diff --histogram</code></b> over 9,958.</p>
+      <p style="margin:0"><code>MAX_ANCHOR_OCCURRENCES = 64</code>. Git's xdiff uses 64 for the same
+      purpose and the same reason, and matching it means a diff of the same file looks the same in both
+      tools. A region with lines in common but nothing rare enough — or one that has run out of step
+      budget — is handed to <b>Myers</b>: the case histogram exists in order not to guess at goes to the
+      algorithm that does not guess.</p>
+    </div></div>
+    <div class="panel"><div class="stamp"><span class="path">why not Myers, which git defaults to</span></div><div class="body">
+      <p>A minimal edit script is not the same thing as a readable one. Myers is free to match any
+      <code>}</code> to any other <code>}</code>, so a block moved down a file dissolves into a mesh of
+      one-line changes. Anchoring on lines that appear exactly once means a function signature becomes
+      the anchor and the moved block reads as a move.</p>
+      <p style="margin:0">Diverging from git's default means a diff here can differ from
+      <code>git diff</code> on the same commit. That is intended; both are correct, one is easier to
+      read. <b>Patience</b> is the same traversal with the rarity threshold at one, kept under its own
+      name because the difference is visible on real code: a file with three identical
+      <code>impl Default for</code> blocks gets anchored by histogram and not by patience, and which
+      reads better depends on the file.</p>
+    </div></div>
+  </div>
+
+  <div class="panel"><div class="stamp"><span class="path">core/src/differ.rs · fn hunks, fn header</span></div><div class="body">
+    <div class="cols">
+      <div><h4>Grouping</h4><p style="margin:0">Grow the group while the next change is close enough
+      that the context between them would be printed anyway — splitting there would emit the same lines
+      twice under two headers, which is what git avoids too.</p></div>
+      <div><h4>The same lead both sides</h4><p style="margin:0">Take <code>context</code> lines off
+      both sides together. Taking it from each independently drifts the two cursors apart at the top of
+      a file.</p></div>
+      <div><h4>git's two odd conventions</h4><p style="margin:0">Byte-for-byte what git writes,
+      including the two that look like mistakes: a count of 1 is omitted, and a count of 0 prints the
+      line <em>before</em> the change rather than the line at it.</p></div>
+      <div><h4>The header's tail</h4><p style="margin:0">git's default rule and nothing cleverer: a
+      line starting with a letter, <code>_</code> or <code>$</code> is a declaration, anything indented
+      is inside one. Wrong on plenty of languages, right often enough to be worth four lines — and a
+      language that cares can ship a <code>Differ</code> that writes its own headers.</p></div>
+    </div>
+    <p class="note"><b>Correctness is checked against git rather than argued.</b> A minimal edit script
+    has exactly one length, so <code>myers</code> must match <code>git diff --minimal</code> exactly —
+    that is what <code>git/examples/diffcheck.rs</code> runs over real history, from
+    <code>./check.sh</code>. The three algorithms on this page were checked the same way: 162 edit scripts
+    over 54 real file pairs from three repositories, against the Rust, byte for byte.</p>
+    <p class="note"><b>Selection is by name.</b> <code>host.differ.select("myers")</code>,
+    <code>host.differ.route(&amp;["json","lock"], "myers")</code> — a <code>&amp;'static str</code> on
+    the trait rather than a wrapper's business, because a config file has to be able to express it and
+    <span class="m">decisions/0012</span> says the config file holds data, never behaviour.</p>
+  </div></div>
+</section>
+
+<section id="intraline">
+  <p class="eyebrow">Stage 3b · core/src/lib.rs · decisions/0008</p>
+  <h2>The second pass: which words inside the line</h2>
+  <p>Line diff first, then re-diff only the pairs a line diff already matched as a replace. That is why
+  a plain quadratic LCS is the right call here: the inputs are one line each, not one file.
+  <code>replace_pairs</code> matches a run of N removals to the M additions that follow it, by
+  position, and <code>min(N,M)</code> pairs go to the word diff.</p>
+
+  <div class="panel"><div class="stamp">
+      <span class="path">run it</span><span class="adr">ported from lib.rs, verified against it</span>
+      <span class="right">type in either line</span></div>
+    <div class="body">
+      <div class="ctl">
+        <span class="lbl">from a real screenshot / fixture</span>
+        <button class="b" data-ipreset="0">unrelated pair</button>
+        <button class="b" data-ipreset="1">rewritten sentence</button>
+        <button class="b" data-ipreset="2">the floor case</button>
+        <button class="b" data-ipreset="3">one word</button>
+        <button class="b" data-ipreset="4">inserted clause</button>
+      </div>
+      <div style="margin-bottom:8px"><h4>removed line</h4><input type="text" id="iold" spellcheck="false"></div>
+      <div style="margin-bottom:14px"><h4>added line</h4><input type="text" id="inew" spellcheck="false"></div>
+      <div class="ctl">
+        <span class="lbl">floor</span>
+        <input type="range" id="ifloor" min="0" max="100" value="40" step="1">
+        <span class="pill">MIN_INTRALINE_SIMILARITY <b id="ifloorv">0.40</b></span>
+        <button class="b on" id="icoal" aria-pressed="true">coalesce whitespace gaps</button>
+      </div>
+      <div id="iout"></div>
+    </div>
+  </div>
+
+  <div class="cols two">
+    <div class="panel"><div class="stamp"><span class="path">the two guards</span></div><div class="body">
+      <h4>MAX_INTRALINE_TOKENS = 1000</h4>
+      <p>The LCS table is <code>a × b</code> cells. Real repositories contain minified bundles and
+      base64 blobs — a single line of ~14k tokens was measured in the wild, which would allocate over a
+      gigabyte for one line pair. The line still renders with its add/remove background; it just gets no
+      word highlighting, which is the right trade when the line is machine-generated anyway.</p>
+      <h4 style="margin-top:18px">MIN_INTRALINE_SIMILARITY = 0.4</h4>
+      <p style="margin:0">Dice coefficient over tokens, <code>2·LCS / (len_a + len_b)</code>. The LCS
+      table is already built, so its corner gives the similarity for free. Below the floor the pair gets
+      no word highlighting at all — the line keeps its add/remove background.</p>
+    </div></div>
+    <div class="panel"><div class="stamp"><span class="path">why 0.4 — measured, not chosen</span></div><div class="body">
+      <table>
+        <tr><th>fixture</th><th class="num">pairs</th><th class="num">below 0.4</th><th>lowest legitimate</th></tr>
+        <tr><td>pr30698.diff <span style="color:var(--ghost)">zig→rust</span></td><td class="num"><b>9,447</b></td><td class="num"><b>0%</b></td><td>0.60 — a <code>#define</code> rename</td></tr>
+        <tr><td>pr30683.diff <span style="color:var(--ghost)">deletion</span></td><td class="num">396</td><td class="num"><b>15.6%</b></td><td>junk: <code>/**</code> vs a comment, at 0.0</td></tr>
+      </table>
+      <p>91.9% of pr30698's pairs sit above 0.9. The floor is below every legitimate pair measured and
+      above the noise. A test pins the 0.60 case, so tightening the floor cannot silently stop
+      highlighting real renames.</p>
+      <p style="margin:0"><b>Words, not characters.</b> A char diff of code highlights every bracket and
+      reads as confetti. And spans close over whitespace-only gaps, because the LCS happily matches the
+      space between two changed words — every space punched a hole in the highlight, so a rewritten
+      sentence drew as a row of separate blocks with the background showing through.</p>
+    </div></div>
+  </div>
+
+  <p class="note" style="max-width:74ch"><b>Why not fix the pairing instead?</b> Better pairing means
+  matching removals to additions by content rather than position — a second diff inside the hunk. The
+  floor is six lines and removes the damage now. Both can be true. Meanwhile
+  <code>core/src/align.rs</code> makes the same positional guess the one place it has to be shared,
+  because a side-by-side view and the intraline pass must agree or a row shows a removal beside an
+  addition whose highlighted words were computed against a different line.</p>
+</section>
+
+<section id="scanner">
+  <p class="eyebrow">Stage 3c · core/src/syntax.rs · decisions/0003, 0004</p>
+  <h2>Colour, without a parser</h2>
+  <p>A scanner that knows no languages, plus a table per language, plus a router that picks an
+  implementation per path. <code>lex</code> makes one pass over bytes and understands exactly five
+  shapes: line comments, block comments, strings, numbers, words. Everything language-specific is
+  data — eighteen tables covering forty-three extensions and whole filenames, which is how
+  <code>Cargo.lock</code> reaches a table at all.</p>
+
+  <div class="panel"><div class="stamp"><span class="path">the router</span></div><div class="body">
+    <div class="rows" style="padding:8px 12px">
+<div class="r"><span class="t">   path + lines</span></div>
+<div class="r"><span class="t">        │</span></div>
+<div class="r"><span class="t">   <span style="color:var(--k-type)">Highlighters</span> ─── route <span style="color:var(--k-str)">"md"</span>  ──► <span style="color:var(--l2)">Markdown</span>     line-oriented, its own code</span></div>
+<div class="r"><span class="t">   (router)     ─── route …    ──► <span style="color:var(--faint)">your impl</span>    tree-sitter, LSP, anything</span></div>
+<div class="r"><span class="t">                └── fallback   ──► <span style="color:var(--l0)">Lexer</span>        → Languages: path → Syntax table</span></div>
+    </div>
+    <p style="margin:14px 0 0">Last route wins, so a built-in table can be corrected rather than only
+    added to. <code>set_fallback</code> replaces the scanner for everything unrouted, and
+    <code>languages()</code> then returns <code>None</code> — there are no tables to register with any
+    more. A tree-sitter highlighter takes exactly the languages the scanner cannot do, in its own crate,
+    with its own dependencies, none of them reaching <code>core</code>.</p>
+  </div></div>
+
+  <div class="panel"><div class="stamp">
+      <span class="path">run it</span><span class="adr">ported from syntax.rs, token-for-token</span>
+      <span class="right">edit the source</span></div>
+    <div class="body">
+      <div class="ctl">
+        <span class="lbl">table</span>
+        <button class="b" data-lang="rs" aria-pressed="true">rs</button>
+        <button class="b" data-lang="sh" aria-pressed="false">sh</button>
+        <button class="b" data-lang="html" aria-pressed="false">html</button>
+        <button class="b" data-lang="toml" aria-pressed="false">toml</button>
+        <button class="b" data-lang="c" aria-pressed="false">c</button>
+      </div>
+      <textarea id="lsrc" rows="9" spellcheck="false"></textarea>
+      <div class="ctl" style="margin-top:12px" id="lrules"></div>
+      <div id="lout"></div>
+      <div class="legend" id="llegend"></div>
+    </div>
+  </div>
+
+  <div class="cols two">
+    <div class="panel"><div class="stamp"><span class="path">the two rules the measurements forced</span></div><div class="body">
+      <h4>line_needs_boundary</h4>
+      <p><code>#</code> only opens a comment at line start or after whitespace. Without it,
+      <code>$#</code> and <code>${x#y}</code> paint the rest of every shell line. Stray colouring in a
+      shell corpus: <b>0.99% → 0.82%</b>. Turn it off above and watch it happen.</p>
+      <h4 style="margin-top:18px">quote_after_eq</h4>
+      <p style="margin:0">In markup a quote only opens a string directly after <code>=</code>. Prose is
+      full of apostrophes and none of them are strings. HTML bleed: <b>6.21% → 2.46%</b>.</p>
+    </div></div>
+    <div class="panel"><div class="stamp"><span class="path">the invariant that cost three tests</span></div><div class="body">
+      <h4>A byte whose opener matched but whose rule declined must still advance the cursor</h4>
+      <p>An apostrophe in HTML prose, a <code>#</code> inside <code>${x#y}</code>, the <code>/</code>
+      that closed a comment. Three tests hung on this before the fallback existed.</p>
+      <p style="margin:0">The other half of the speed: a first-byte table, <code>opens: [bool; 256]</code>,
+      built with the <code>Syntax</code>, so any byte that cannot open anything skips the whole rule
+      walk. Worth about <b>2×</b> on every language measured.</p>
+    </div></div>
+  </div>
+
+  <h3>Why not a parser</h3>
+  <p>A diff hands you fragments, which is the input a parser is worst at: error recovery is its slow
+  path, and the recovery loses spans. The scanner has no parse context to lose, so fragmentation costs
+  it nothing measurable.</p>
+
+  <div class="cols two">
+    <figure><div class="panel"><div class="stamp"><span class="path">measurements.md · engine shootout</span><span class="right">85 files · 2.41 MB of real Rust</span></div>
+      <div class="body"><div id="chart-throughput"></div></div></div>
+      <figcaption><b>The scanner is 30× tree-sitter and 500× syntect</b> on whole files. syntect's bar is
+      a sliver at this scale, and that is the honest picture: 0.4 MB/s with fancy-regex, roughly 0.8 with
+      Oniguruma. Being already in the dependency tree does not make it fast.</figcaption>
+    </figure>
+    <figure><div class="panel"><div class="stamp"><span class="path">measurements.md · the fragment penalty</span><span class="right">the number that decided it</span></div>
+      <div class="body"><div id="chart-fragment"></div></div></div>
+      <figcaption>Same files, then 12 of every 40 lines, then 6 — roughly the shape of a hunk.
+      <b>Error recovery costs tree-sitter 2.7× the time and a fifth of its spans</b> (142.9 → 114.4
+      spans/KB, 8 ERROR nodes → 333). The scanner does not move: 49.8 → 50.4.</figcaption>
+    </figure>
+  </div>
+
+  <div class="cols two">
+    <div class="panel"><div class="stamp"><span class="path">what it costs</span></div><div class="body">
+      <table>
+        <tr><th></th><th class="num">scanner</th><th class="num">tree-sitter</th><th class="num">syntect</th></tr>
+        <tr><td>whole files</td><td class="num"><b>104–262 MB/s</b></td><td class="num">7.1</td><td class="num">0.4</td></tr>
+        <tr><td>hunk fragments</td><td class="num"><b>unchanged</b></td><td class="num">2.6, ⅕ spans lost</td><td class="num">—</td></tr>
+        <tr><td>binary cost</td><td class="num"><b>0</b></td><td class="num">1.5 MB + 0.2–3.3/grammar</td><td class="num">2.0 MB</td></tr>
+        <tr><td>bytes coloured</td><td class="num">40–67%</td><td class="num"><b>66–89%</b></td><td class="num">—</td></tr>
+      </table>
+      <p style="margin:0">It pays for that in coverage and in semantic classes. A call is a name before
+      <code>(</code>; a type is a capitalised word. There is no scope, no resolution, no injection. Query
+      compilation alone is 20.7 ms for rust and 20.6 for cpp — anything using tree-sitter must compile
+      queries lazily on first use, never at startup.</p>
+    </div></div>
+    <div class="panel"><div class="stamp"><span class="path">where the model breaks</span><span class="right">tree-sitter as the oracle, ~900 KB per language</span></div><div class="body">
+      <h4>Sound — 100% comment precision, ≤0.6% bleed</h4>
+      <p style="margin:0 0 10px">rust, go, java, kotlin, python, ts, js, json, toml, zig, c, c++, lua,
+      css, swift, shell.</p>
+      <h4>Under-colours, never lies</h4>
+      <p style="margin:0 0 10px">yaml and css unquoted scalars, C char literals and
+      <code>#include &lt;…&gt;</code> — recall gaps with no bleed.</p>
+      <h4>Breaks</h4>
+      <p style="margin:0">html with inline <code>&lt;script&gt;</code> (2.46% bleed), php's
+      <code>&lt;?php</code> islands (9.18%, worst run 13,711 bytes), and markdown as a table (21.81%).
+      These need injections, which need a parser. <b>Markdown got no table but its own
+      <code>Highlighter</code></b>; php gets nothing at all, because guessing produced the worst
+      mis-colouring of anything measured.</p>
+    </div></div>
+  </div>
+
+  <div class="cols two">
+    <div class="panel"><div class="stamp"><span class="path">core/src/syntax.rs · Markdown</span><span class="adr">decisions/0004</span></div><div class="body">
+      <h4>The second implementation, and the proof the trait is worth having</h4>
+      <p>Prose has no keywords, an apostrophe is not a string, and what is worth colouring is
+      structure. The table-driven attempt mis-coloured 21.8% of every file — the worst result of any
+      language, by a factor of two. The model was wrong, not the table.</p>
+      <p style="margin:0">So: 100 lines that walk <em>lines</em> instead of bytes. ATX and setext
+      headings, fenced code (the one piece of state that crosses lines), blockquotes, thematic breaks,
+      list markers, then inline code, emphasis, strong and links. <b>Unclosed delimiters are left as
+      text</b> — in a diff a line often <em>is</em> half a construct, and an unmatched <code>*</code> is
+      far more likely to be a bullet than the start of emphasis.</p>
+    </div></div>
+    <div class="panel"><div class="stamp"><span class="path">12 kinds, indexed not matched</span></div><div class="body">
+      <div id="kindgrid"></div>
+      <p style="margin:14px 0 0">Small on purpose: these are the classes a scanner can identify without
+      a parse, and a dense diff should not wear more colours than this. The four prose kinds live in
+      <code>core</code> rather than inside the Markdown highlighter, because <b>a theme has to be able
+      to style them without knowing which highlighter ran</b>.</p>
+    </div></div>
+  </div>
+
+  <p class="note" style="max-width:74ch"><b>Multi-line constructs, and the one-side rule.</b>
+  <code>lex_lines</code> joins the lines, scans once, then splits the tokens back per line, clipping any
+  that cross a boundary — a doc comment or a multi-line string is several rows in a diff and lexing each
+  row alone would lose it. And the old and new lines of a hunk are two different texts that happen to be
+  printed interleaved, so each side is scanned separately through <code>for_each_side</code> and context
+  lines — which belong to both — are scanned twice. Scanning them as one splices a removed line into an
+  added one and produces text that was never valid in any language.</p>
+</section>
+
+<section id="graph">
+  <p class="eyebrow">core/src/lib.rs · shell/src/graph.rs · decisions/0002</p>
+  <h2>Lanes, hues, and a hard cap at twelve</h2>
+  <p>Lane assignment is pure and lives in <code>core</code>; geometry and painting live in the shell.
+  The split is not cosmetic — lane assignment is where the bugs are, and it is testable without opening
+  a window. One vector of "which sha is this lane waiting for", walked newest-first.</p>
+
+  <div class="panel"><div class="stamp">
+      <span class="path">assign_lanes, stepped</span><span class="adr">ported from lib.rs</span>
+      <span class="right">the invariants are asserted against 82k real commits</span></div>
+    <div class="body">
+      <div class="ctl">
+        <span class="lbl">history</span>
+        <button class="b" data-topo="0" aria-pressed="true">a merge</button>
+        <button class="b" data-topo="1" aria-pressed="false">linear</button>
+        <button class="b" data-topo="2" aria-pressed="false">two branches</button>
+        <button class="b" data-topo="3" aria-pressed="false">octopus</button>
+        <button class="b" data-topo="4" aria-pressed="false">16 lanes, over the cap</button>
+      </div>
+      <div class="ctl">
+        <button class="b" id="gprev">◀ step back</button>
+        <button class="b" id="gnext">step ▶</button>
+        <button class="b" id="gall">all rows</button>
+        <span class="pill">row <b id="grow">1</b> / <span id="grows">4</span></span>
+        <button class="b on" id="ghue" aria-pressed="true">hue per branch</button>
+        <button class="b on" id="gcap" aria-pressed="true">cap at 12 lanes</button>
+      </div>
+      <div class="cols two">
+        <div><h4>drawn</h4><div id="ggraph" class="rows" style="padding:8px 4px"></div></div>
+        <div><h4>state after this row</h4><div id="gstate"></div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="cols two">
+    <div class="panel"><div class="stamp"><span class="path">topological order is mandatory</span></div><div class="body">
+      <p><b>Always log with <code>--topo-order</code>.</b> It is what git itself uses for
+      <code>--graph</code>, and <code>assign_lanes</code> assumes it: without it branches interleave and
+      the drawing is simply wrong.</p>
+      <p style="margin:0">It is <em>not</em> a width optimisation. It narrows git/git from 417 lanes to
+      280 and <b>widens</b> cmux from 19 to 73. Correctness, not compactness.</p>
+      <h4 style="margin-top:18px">Two invariants, asserted on real history</h4>
+      <ul style="margin:0">
+        <li>A commit's <b>first parent continues on the same lane</b> — unless an earlier commit already
+        claimed that lane for the same parent, which is a legitimate collapse.</li>
+        <li>A merge's <b>second and later parents never land on the merge's own lane</b>.</li>
+      </ul>
+    </div></div>
+    <div class="panel"><div class="stamp"><span class="path">colour belongs to the branch, not the column</span></div><div class="body">
+      <p>Colouring by lane index is the obvious thing and it is wrong: lane 1 is recycled the moment a
+      branch merges, so unrelated branches come out the same blue and read as one long-running thing.
+      Toggle <em>hue per branch</em> off above to see it.</p>
+      <p style="margin:0">So <code>Hues</code> walks the history and hands each <em>new</em> lane the
+      next hue on the wheel, skipping any hue a concurrently live lane holds, and releases it when the
+      branch ends. <code>LANE_HUES = 6</code> is the size of that ledger — how many live branches can be
+      told apart at a glance — and is <b>not</b> the number of colours a theme ships. A hue resolves
+      through <code>theme.lane(hue)</code>, which cycles over whatever the theme provides.</p>
+    </div></div>
+  </div>
+
+  <div class="cols two">
+    <div class="panel"><div class="stamp"><span class="path">the cap</span><span class="adr">decisions/0002</span></div><div class="body">
+      <p><code>MAX_LANES = 12</code>, hard. git/git reaches 280 concurrent lanes, which at
+      <code>LANE_W = 14px</code> is a <b>3,920px gutter</b> — it pushes the commit subject entirely off
+      screen. Nobody reads past a dozen; git's own <code>--graph</code> is unreadable well before that.</p>
+      <p>Lanes past the cap collapse onto the last column in <code>theme.lane_overflow</code> grey, so
+      the overflow reads as "there is more over here" rather than being silently misdrawn. They collapse
+      in the <em>data</em> too, or git/git would queue 280 identical quads per row.</p>
+      <p style="margin:0"><b>Why not scale the lane width down?</b> Sub-pixel lanes stop being crisp, and
+      280 hairlines is not more legible than 12 lanes and a grey column.</p>
+      <table style="margin-top:14px">
+        <tr><th>repo</th><th class="num">merges</th><th class="num">p50</th><th class="num">p99</th><th class="num">max</th><th class="num">1-lane rows</th></tr>
+        <tr><td>git/git <span style="color:var(--ghost)">82k</span></td><td class="num">25.8%</td><td class="num">126</td><td class="num">226</td><td class="num"><b>280</b></td><td class="num">0.9%</td></tr>
+        <tr><td>cmux</td><td class="num">16.2%</td><td class="num">9</td><td class="num">70</td><td class="num">73</td><td class="num">7.2%</td></tr>
+      </table>
+      <p style="margin:8px 0 0;font-size:12.5px" class="note">Big popular repos are not a substitute:
+      bun has 17k commits and 97% of rows sit at one lane, because squash-merge workflows produce
+      straight lines.</p>
+    </div></div>
+    <div class="panel"><div class="stamp"><span class="path">shell/src/graph.rs · the drawing</span></div><div class="body">
+      <p><code>row_draws</code> flattens each row once, at load, into what painting needs — so the paint
+      callback never touches the commit list. One <code>canvas()</code> per row, so the drawing
+      virtualizes with <code>uniform_list</code> for free.</p>
+      <ul>
+        <li><b>Verticals are quads.</b> A vertical line is a rectangle, and a quad costs a fraction of a
+        tessellated stroke path.</li>
+        <li><b>Curves are half an S each.</b> A curve touches its lane on the dot line and crosses the
+        row boundary halfway to its partner, where the next row picks it up. Each half runs
+        <code>OVERSHOOT = 0.5px</code> past the boundary <em>along its own tangent</em> — collinear, so
+        it cannot kink — because two antialiased butt caps meeting exactly leave a visible crease.</li>
+        <li><b>A dot is one quad with corner radii at half its size</b>, which <em>is</em> a circle, and
+        the shader antialiases it better than tessellation would. The middle is punched out with
+        <code>theme.chrome.bg</code>, so lines pass <em>behind</em> a node and the graph reads as holes
+        in the sheet.</li>
+      </ul>
+      <table>
+        <tr><th>constant</th><th>value</th><th>why</th></tr>
+        <tr><td>ROW_H</td><td class="num">22</td><td>the whole app's rhythm</td></tr>
+        <tr><td>LANE_W</td><td class="num">14</td><td></td></tr>
+        <tr><td>STROKE</td><td class="num">2</td><td>centre on 7, edges on 6 and 8 — crisp at any scale factor</td></tr>
+        <tr><td>DOT_R / MERGE_R</td><td class="num">4.5 / 5.5</td><td>a join stays findable while scrolling</td></tr>
+        <tr><td>RING</td><td class="num">0.45</td><td>of the radius — the node looks drawn with the same pen</td></tr>
+        <tr><td>GAP</td><td class="num">6</td><td>last stroke to first letter, about one character</td></tr>
+      </table>
+    </div></div>
+  </div>
+
+  <div class="panel"><div class="stamp"><span class="path">per-row width, and the row itself</span></div><div class="body">
+    <p>Each row's gutter is measured from <b>its own</b> lanes, not the widest row in the repository, so
+    a commit alone on the trunk gets nearly the whole window for its subject. Widths are measured in
+    whole lanes so text steps on the lane grid: ragged by a column reads as "the graph is wider here",
+    ragged by three pixels reads as broken.</p>
+    <div id="commitrows" class="rows" style="padding:6px 0"></div>
+    <p style="margin:14px 0 0">lazygit's order and lazygit's spacing: sha, initials, the graph at its own
+    width, then the subject. Initials are two letters, first and last name —
+    <code>Junio C Hamano → JH</code>, never the middle one — resolved once at load with their colour,
+    because that is not a per-frame job.</p>
+  </div></div>
+</section>
+
+<section id="theme">
+  <p class="eyebrow">core/src/theme.rs · decisions/0005, 0009</p>
+  <h2>A token is never drawn on "the background"</h2>
+  <p>A theme is a struct of <code>0xRRGGBB</code> numbers plus two booleans — no GPUI, no
+  <code>Hsla</code>, nothing a terminal could not read. That is the test: <b>a palette only one frontend
+  can read is a palette in the wrong crate</b>. The ANSI painter and the GPUI window read the same
+  numbers.</p>
+  <p>But a diff draws on five different surfaces, and two of them are much lighter. The comment grey that
+  reads as pleasantly quiet on the file body measured <b>1.15:1</b> against the old changed-word
+  background — a grey smear on green, which is how a screenshot found it. WCAG AA for body text is 4.5.</p>
+
+  <div class="panel"><div class="stamp">
+      <span class="path">every kind × every surface</span><span class="adr">ported from theme.rs</span>
+      <span class="right">hover a cell</span></div>
+    <div class="body">
+      <div class="ctl">
+        <button class="b on" id="tmode" aria-pressed="true">as shipped — resolved</button>
+        <span class="lbl" style="margin-left:10px">min_contrast</span>
+        <input type="range" id="tfloor" min="10" max="70" step="1" value="35">
+        <span class="pill">floor <b id="tfloorv">3.5</b></span>
+        <span class="pill" id="tfails"></span>
+      </div>
+      <div id="theatmap"></div>
+      <p class="note"><b>Resolution is not per frame.</b> <code>readable</code> costs six
+      <code>powf</code> per call and <code>render</code> asks for a style per run per visible row per
+      frame, so the whole <code>12 × 5</code> table is computed once in <code>rebuild()</code> and render
+      is one index. The consequence to remember: after mutating <code>syntax</code>, <code>diff</code> or
+      <code>min_contrast</code> directly, call <code>rebuild()</code>. <code>set_syntax</code> does it for
+      you.</p>
+    </div>
+  </div>
+
+  <div class="cols two">
+    <div class="panel"><div class="stamp"><span class="path">fn readable</span></div><div class="body">
+      <h4>Blend, don't substitute</h4>
+      <p><code>readable</code> returns the colour untouched if it already clears the target. Otherwise it
+      blends toward white — or black, if the background is light — in 24 steps, stopping at the first
+      that clears. Blending keeps the hue: a lifted comment is the same grey-brown, just far enough off
+      the background to read.</p>
+      <p><b>Themes therefore only have to be tasteful.</b> They never enumerate a colour per surface; the
+      floor guarantees the rest.</p>
+      <p style="margin:0">The shipped floor is <b>3.5, not 4.5</b>. A diff wants its comments to recede,
+      and lifting them to 4.5 makes them louder than the code around them. Drag the slider and watch the
+      comment overtake the keywords.</p>
+      <p class="note"><b>The lift alone was not enough.</b> Taking the comment all the way to
+      <code>#b7b3b0</code> made it the loudest thing on the line, so the changed-word backgrounds were
+      darkened in the same change: <code>#2c5c33 → #1e3a23</code> and <code>#6b2f2a → #43201a</code>.</p>
+    </div></div>
+    <div class="panel"><div class="stamp"><span class="path">every colour the app draws</span></div><div class="body">
+      <p style="margin:0 0 12px">If a colour is not here, it is a bug — there were 35 hex literals across
+      four shell files before this existed.</p>
+      <div id="palette"></div>
+      <p style="margin:14px 0 0">Weight and slant are in <code>Style</code> because emphasis in prose is
+      not a colour: a Markdown <code>**word**</code> that only changed hue would be wrong. Lane and
+      author colours cycle, so a theme may ship three or twelve, and an empty list falls back to chrome
+      colours rather than panicking.</p>
+    </div></div>
+  </div>
+
+  <div class="panel"><div class="stamp"><span class="path">shell/src/config.rs · plait.toml</span><span class="adr">decisions/0012</span></div><div class="body">
+    <div class="cols two">
+      <div>
+        <h4>Changing it without a rebuild</h4>
+        <p>Colours, the font family and the font size are read on the render path, so a saved
+        <code>plait.toml</code> lands <b>on the next frame</b> — no rebuild, no relaunch, no lost scroll
+        position. That is the payoff for colour having been data in a dependency-free crate all along.</p>
+        <p style="margin:0">The file is read <em>forgivingly</em>, because it is re-read on every save of
+        something you are in the middle of typing: an unparseable file leaves the theme exactly as it
+        was, and a single bad line is named and skipped while the rest applies. A warning only appears
+        when a value actually <em>changed</em> — one that fires on an unchanged value teaches you to
+        ignore the ones that matter.</p>
+      </div>
+      <div>
+        <h4>Data only. Never behaviour.</h4>
+        <p>Not a stylistic preference: a settings panel has to rewrite this file in place, keeping
+        comments and key order, and it cannot round-trip a function. So a keybinding names its command
+        and the behaviour lives in a plugin file the format only ever points at.</p>
+        <p style="margin:0">Which is also why there are no computed colours. When a field is only ever
+        "that one, but lighter", derive it in <code>Theme</code> instead of asking the file for it —
+        <code>rebuild</code> already does exactly that for every syntax colour on every surface. Two
+        fields cannot reload live and say so: <code>font.monospaced</code>, because table padding rewrites
+        row text during <code>prepare</code>, and <code>font.advance</code>, because the widest-row guess
+        is made once at load.</p>
+      </div>
+    </div>
+  </div></div>
+</section>
+
+<section id="rows">
+  <p class="eyebrow">Stages 4–6 · shell/src/views · decisions/0006, 0010</p>
+  <h2>Rows, at eight bytes each</h2>
+  <p>The diff view used to flatten every file into a closed <code>enum Row</code> and draw it with a
+  <code>match</code>. A different presentation for one file type meant editing that enum and that match.
+  Rule 1 says an extension must be able to do what a built-in does — and the obvious fix breaks rule 3,
+  because <code>Vec&lt;Box&lt;dyn Row&gt;&gt;</code> is one allocation per row and the deletion fixture
+  has 714,000 of them.</p>
+
+  <div class="cols two">
+    <div class="panel"><div class="stamp"><span class="path">shell/src/views/diff.rs · trait Rows</span></div><div class="body">
+      <div class="rows" style="padding:6px 10px">
+<div class="r"><span class="t"><span style="color:var(--k-key)">pub trait</span> <span style="color:var(--k-type)">Rows</span> {</span></div>
+<div class="r"><span class="t">    <span style="color:var(--k-key)">fn</span> <span style="color:var(--k-func)">claims</span>(&amp;<span style="color:var(--k-key)">self</span>, path: &amp;<span style="color:var(--k-type)">str</span>) -&gt; <span style="color:var(--k-type)">bool</span>;</span></div>
+<div class="r"><span class="t">    <span style="color:var(--k-key)">fn</span> <span style="color:var(--k-func)">len</span>(&amp;<span style="color:var(--k-key)">self</span>) -&gt; <span style="color:var(--k-type)">usize</span>;</span></div>
+<div class="r"><span class="t">    <span style="color:var(--k-key)">fn</span> <span style="color:var(--k-func)">build</span>(&amp;<span style="color:var(--k-key)">mut self</span>, file: prepared::<span style="color:var(--k-type)">File</span>);</span></div>
+<div class="r"><span class="t">    <span style="color:var(--k-key)">fn</span> <span style="color:var(--k-func)">render</span>(&amp;<span style="color:var(--k-key)">self</span>, i: <span style="color:var(--k-type)">usize</span>, host: &amp;<span style="color:var(--k-type)">Host</span>) -&gt; <span style="color:var(--k-type)">AnyElement</span>;</span></div>
+<div class="r"><span class="t">    <span style="color:var(--k-key)">fn</span> <span style="color:var(--k-func)">width</span>(&amp;<span style="color:var(--k-key)">self</span>, i: <span style="color:var(--k-type)">usize</span>) -&gt; <span style="color:var(--k-type)">usize</span>;</span></div>
+<div class="r"><span class="t">}</span></div>
+      </div>
+      <p>Each file goes to the implementation that claims its path; the last registered claimant wins,
+      and <code>TextRows</code> claims everything, which is what makes it the fallback.
+      <code>MarkdownRows</code> is the second built-in and takes <code>.md</code>, <code>.markdown</code>
+      and <code>.mdx</code> — registered through the same call an extension would use, because <b>a
+      built-in that skips the seam leaves the seam untested</b>.</p>
+      <p style="margin:0"><code>SplitRows</code> is the third, and the one that pays for the seam: a
+      two-column diff sounds like a different view and is a different <em>presentation</em>. It claims
+      every path, takes the same prepared lines, and draws them in two columns — no new trait, no new
+      argument, no edit to <code>TextRows</code>. A shell-side <code>Layouts</code> registry holds the
+      whole-diff presentations and <code>s</code> cycles them; <code>host.layout</code> is which one the
+      window opens in.</p>
+      <p class="note" style="margin-top:12px">It cost the theme exactly one colour:
+      <code>diff.absent_bg</code>, for the half of a row with no line in it. Its own field and not
+      <code>context_bg</code>, because the two mean opposite things — context is a line that did not
+      change, and this is <em>the absence of a line</em>. Flatter and darker than every other row
+      background, so a run of them reads as a hole in the column rather than as content. That is what
+      "every colour the app draws lives in <code>Theme</code>" costs when it is kept honest: a new
+      presentation adds a field, not a hex literal.</p>
+    </div></div>
+    <div class="panel"><div class="stamp"><span class="path">the order table</span></div><div class="body">
+      <div class="rows" style="padding:6px 10px">
+<div class="r"><span class="t"><span style="color:var(--k-key)">struct</span> <span style="color:var(--k-type)">RowRef</span> { owner: <span style="color:var(--k-type)">u16</span>, index: <span style="color:var(--k-type)">u32</span> }   <span style="color:var(--k-comment)">// 8 bytes</span></span></div>
+      </div>
+      <p style="margin:14px 0 0">Implementations keep their own row storage; the list keeps only which
+      implementation owns each row and where in that storage it sits. At 714k rows a boxed row is 714k
+      allocations to build and to chase on every scroll, against <b>5.7 MB of flat index table</b>. The
+      indirection would land exactly where it hurts most — the render path — for no expressive gain.</p>
+      <p class="note"><b>The constraint to design around:</b> row height is fixed for the whole list,
+      because <code>uniform_list</code> is the only reason a 714k-row diff scrolls at all. You may draw
+      anything within <code>ROW_H</code>; you cannot ask for more. A presentation that genuinely needs
+      variable height — a reflowed Markdown preview, a side-by-side image diff — wants a pane.</p>
+    </div></div>
+  </div>
+
+  <div class="panel"><div class="stamp">
+      <span class="path">fn runs — the only thing that runs per frame</span>
+      <span class="right">click a row</span></div>
+    <div class="body">
+      <p style="margin:0 0 14px">Syntax sets the foreground, intraline sets the background, and the
+      foreground is resolved against whichever background it lands on. Both inputs are already sorted and
+      internally non-overlapping, so this is a sweep over their combined edges rather than a sort — one
+      <code>StyledText</code> with a run list, never an element per span.</p>
+      <div id="runsrows"></div>
+      <div id="runsview" style="margin-top:14px"></div>
+      <p class="note"><b>The run list <em>is</em> rebuilt per visible row per frame</b>, and that is a
+      deliberate exception to "recomputes what a cache could hold": caching it for 714k rows costs roughly
+      40× the memory of the rows themselves, and 50 rows × ~15 runs is nothing. Rows hold
+      <code>SharedString</code>, not <code>String</code> — handing GPUI a <code>String</code> copies the
+      line every frame.</p>
+    </div>
+  </div>
+
+  <div class="panel"><div class="stamp">
+      <span class="path">core/src/markdown.rs · MarkdownRows</span><span class="adr">decisions/0010</span>
+      <span class="right">edit the line</span></div>
+    <div class="body">
+      <h4>The markers are found from the tokens, not by parsing</h4>
+      <p>By the time a row reaches <code>lay_out</code>, the Markdown highlighter has already emitted a
+      <code>Strong</code> token over <code>**word**</code> and a <code>Link</code> over
+      <code>[text](url)</code> — <em>delimiters included</em>, because a token is a range of the source.
+      So the set of bytes to hide is derivable from ranges that already exist, by checking the bytes at
+      each end of each token. No second scan, and no parser.</p>
+      <div class="ctl" style="margin-top:14px">
+        <span class="lbl">try</span>
+        <button class="b" data-mdp="0">heading</button>
+        <button class="b" data-mdp="1">strong + code</button>
+        <button class="b" data-mdp="2">link</button>
+        <button class="b" data-mdp="3">bullet</button>
+        <button class="b" data-mdp="4">unpaired **</button>
+      </div>
+      <input type="text" id="mdsrc" spellcheck="false">
+      <div id="mdout" style="margin-top:14px"></div>
+      <p class="note"><b>Deriving it from the bytes rather than from the token's provenance</b> is what
+      keeps it correct if <code>.md</code> is routed elsewhere: a tree-sitter highlighter puts
+      <code>Strong</code> over different ranges, and the check is "does this token begin with two
+      asterisks", so the answer stays right. A <code>Strong</code> token wearing no delimiters keeps every
+      byte it has, and there is a test for exactly that.</p>
+    </div>
+  </div>
+
+  <div class="cols two">
+    <div class="panel"><div class="stamp"><span class="path">what fits inside 22 pixels</span></div><div class="body">
+      <ul style="margin:0">
+        <li><b>Font size is a row property, not a run property.</b> GPUI's <code>HighlightStyle</code>
+        carries colour, weight, slant, background, underline, strikethrough and fade — and is documented as
+        "a single font, uniformly sized and spaced text." There is no size on a run. So a heading scales by
+        <code>.text_size()</code> on the row and never within one, and the ceiling is
+        <code>ROW_H / 1.2</code> — about 18px — past which it clips into its neighbour.</li>
+        <li><b>Leave the row background alone.</b> In a diff it means added or removed, and that is the one
+        thing a presentation may not spend. Group rows with a bar down their left edge instead.</li>
+        <li><b>Punctuation you draw yourself is furniture, not text.</b> A bullet glyph inside the string
+        becomes a run in the merge and takes the text's colour; as its own <code>div</code> it carries its
+        own. It also keeps every text rewrite a pure deletion, which is what lets the range remapping stay
+        one-directional.</li>
+        <li><b>Row count is not yours to change.</b> The gutter shows both line numbers and they have to
+        keep adding up, so a blank line still costs a whole row — 9% of the book fixture, 30% of a
+        technical-docs tree. A test asserts both presentations produce the same count for the same file.</li>
+      </ul>
+    </div></div>
+    <div class="panel"><div class="stamp"><span class="path">the ordering trap, twice</span></div><div class="body">
+      <p><b>Clip before both passes</b>, so no span or token can point past what will be drawn. Reversed,
+      the renderer indexes a line by a range that no longer exists in it: a panic in a debug build,
+      mojibake in a release one.</p>
+      <p><b>Move the ranges before cutting the text</b>, because both have to be in the same coordinates
+      while the mapping is computed. Reversed, a token indexes bytes that are gone. Same failure mode, same
+      kind of test pinning it.</p>
+      <p style="margin:0"><b>And the sharp edge that drew blood:</b> <code>for_each_side</code> hands a
+      <em>context</em> row to its caller twice, because a context row belongs to both sides. The token pass
+      does not care — assigning twice is assigning once. The table pass mutates, and padding an
+      already-padded row is not idempotent: the first pass wrote a <code>│</code>, the second measured the
+      grid it had just drawn and then panicked splitting that three-byte glyph at byte 1. The fix is
+      structural — measure every grid first, rewrite each row exactly once, added side winning for context
+      rows.</p>
+      <p class="note">Tables are the one construct whose cells must line up with the rows <em>around</em>
+      them, so widths are measured per <em>run</em> of table rows and per hunk side. Padding wins over an
+      element per cell because the render path is what rule 3 protects — and it only lines up in a
+      monospaced face, which is what <code>Layout::monospaced()</code> is the frontend asserting.
+      <code>core</code> cannot see a font, so it must be told.</p>
+    </div></div>
+  </div>
+</section>
+
+<section id="numbers">
+  <p class="eyebrow">docs/measurements.md</p>
+  <h2>Every number carries the command that produced it</h2>
+  <p>A figure that cannot be reproduced is folklore. Machine for all of these: Apple M1 Pro, macOS,
+  <code>--release</code>. <b>Never read a timing off a debug build</b> — <code>cargo run</code> without
+  <code>--release</code> is a different, much slower binary, and the title bar says so.</p>
+
+  <figure><div class="panel"><div class="stamp"><span class="path">./check.sh · load, per fixture</span><span class="right">parse + prepare, in milliseconds</span></div>
+    <div class="body"><div id="chart-load"></div></div></div>
+    <figcaption><b>It is load, not the render path</b>, and <code>prepare</code> dominates it. On the
+    714k-line deletion fixture syntax is 237 ms of 289; on the two prose fixtures intraline is, because
+    prose is edited a sentence at a time so almost every changed line is a near-identical rewrite of the
+    one it replaced. Making <code>prepare</code> lazy per file is the next lever if a third of a second
+    on a 714k-line diff ever matters.</figcaption>
+  </figure>
+
+  <div class="cols two">
+    <div class="panel"><div class="stamp"><span class="path">the fixtures, and why each is kept</span></div><div class="body">
+      <table>
+        <tr><th>fixture</th><th>what makes it worth keeping</th></tr>
+        <tr><td><b>~/Projects/git</b><br><span style="color:var(--ghost)">82k commits, blobless</span></td><td>the tree stress case: 26% merges, 280 lanes, 37 octopus merges up to 10 parents, 7 roots</td></tr>
+        <tr><td><b>pr30683.diff</b></td><td>714k lines, near-pure deletion, one 65k-token line</td></tr>
+        <tr><td><b>pr30698.diff</b></td><td>the zig→rust migration: 1,398 files, heaviest intraline case in the code set</td></tr>
+        <tr><td><b>pr33933.diff</b></td><td>near-pure addition</td></tr>
+        <tr><td><b>md.diff</b><br><span style="color:var(--ghost)">rust-lang/book</span></td><td>the only <em>prose</em> fixture, and the heaviest intraline case of all: 71.7 ms of a 90.7 ms <code>prepare</code></td></tr>
+      </table>
+      <p style="margin:0"><b>Use both kinds.</b> Synthetic tests scale, real tests <em>shape</em>, and
+      shape is where the crashes live. A million commits and ~929k diff lines:
+      <code>parse log 466 ms · assign lanes 301 ms · parse diff 76 ms · prepare 683 ms</code>.</p>
+    </div></div>
+    <div class="panel"><div class="stamp"><span class="path">the markdown layout pass</span></div><div class="body">
+      <table>
+        <tr><th>fixture</th><th class="num">rows</th><th class="num">lay_out</th><th class="num">per row</th><th class="num">of prepare</th></tr>
+        <tr><td>md.diff <span style="color:var(--ghost)">80% paragraph</span></td><td class="num">71,705</td><td class="num">5.6 ms</td><td class="num"><b>78 ns</b></td><td class="num">6.2%</td></tr>
+        <tr><td>technical docs <span style="color:var(--ghost)">34% paragraph</span></td><td class="num">75,684</td><td class="num">7.2 ms</td><td class="num"><b>95 ns</b></td><td class="num">42.4%</td></tr>
+      </table>
+      <p><b>Quote the per-row figure, not the share.</b> The two shares differ by 7× and the per-row costs
+      by 1.2×; the share is a statement about how much intraline work the <em>rest</em> of the diff had.</p>
+      <p style="margin:0" class="note"><b>And a warning worth keeping.</b> The same measurement once
+      reported 610 µs for 44 rows, because the benchmark defensively cloned the prepared diff first and
+      put the first touch of every page inside the timer. A tenfold overstatement, entirely page faults.
+      Think twice before cloning anything inside a timer.</p>
+    </div></div>
+  </div>
+
+  <div class="panel"><div class="stamp"><span class="path">shell/src/stats.rs · PLAIT_STATS=1</span></div><div class="body">
+    <p><b>The overlay measures how fast we <em>can</em> redraw, not what the app costs at rest.</b> GPUI is
+    reactive and idles at zero frames, so the overlay requests an animation frame every render to force a
+    continuous loop.</p>
+    <p style="margin:0">It is also a ceiling, not a throughput. GPUI paces animation frames off
+    <code>CVDisplayLink</code>, so the fps reading is the display's current rate for as long as we stay
+    inside its budget — and that rate is not a constant: Low Power Mode pins a ProMotion panel to 60 Hz, so
+    the same binary reads 120 plugged in and 60 unplugged with nothing about the app having changed. Which
+    is why <b><code>best</code></b> is on the line: the shortest interval in the ring, the one frame we know
+    we made. If <code>best</code> and <code>p50</code> agree, the fps figure is the panel's and not ours.</p>
+  </div></div>
+</section>
+
+<section id="decisions">
+  <p class="eyebrow">docs/decisions</p>
+  <h2>One file per decision that would otherwise be re-argued</h2>
+  <p>Numbered in the order they were taken, never renumbered, never deleted — a decision that turned out
+  wrong gets a <em>superseded by</em> line and stays, because the reasoning is the point. Each record
+  quotes the one figure that decided it and links to the rest, so a stale number has one home rather than
+  nine.</p>
+  <div class="ctl" id="dfilter">
+    <span class="lbl">filter</span>
+    <button class="b on" data-tag="all" aria-pressed="true">all</button>
+    <button class="b" data-tag="legibility" aria-pressed="false">legibility</button>
+    <button class="b" data-tag="speed" aria-pressed="false">speed</button>
+    <button class="b" data-tag="seam" aria-pressed="false">extensibility</button>
+    <button class="b" data-tag="boundary" aria-pressed="false">the boundary</button>
+  </div>
+  <div class="cols" id="adrs"></div>
+  <p class="note" style="max-width:74ch"><b>0011 is deliberately absent.</b> It was a rendered-Markdown
+  reader that was built, looked at, judged broken and parked in a <code>git stash</code> rather than
+  deleted. The number is held so that recovering the stash needs no renumbering — which the index promises
+  never happens. If the work is abandoned for good, that line is what should say so.</p>
+</section>
+
+<section id="edges">
+  <p class="eyebrow">honesty section</p>
+  <h2>Not built, and moving right now</h2>
+  <p>Listed so nobody reads an intention as a description. A doc describing an unbuilt feature is worse
+  than no doc, because it costs a reader real time before they find out.</p>
+
+  <div class="cols two">
+    <div class="panel"><div class="stamp"><span class="path">not built yet</span></div><div class="body">
+      <ul style="margin:0">
+        <li><b>cli/.</b> Referenced throughout as the second door. <code>paint.rs</code> currently stands in
+        for it as the proof that the boundary holds.</li>
+        <li><b>Command dispatch and the mode stack.</b> <code>Host</code> is where they belong.</li>
+        <li><b>Extension loading.</b> Every seam takes an implementation today; nothing loads one from
+        outside the binary yet. "An extension" means code compiled in — the seams are shaped so that stops
+        being true without them changing.</li>
+        <li><b>Writes.</b> No commit, push, stage or rebase. Reads only.</li>
+        <li><b>gix.</b> All reads still spawn <code>git</code>.</li>
+        <li><b>Panes.</b> One view fills the window, which is why the <code>Rows</code> seam is row-shaped.
+        A rendered Markdown <em>row</em> exists; a rendered Markdown <em>document</em>, reflowed and variably
+        tall, is what needs the pane.</li>
+        <li><b>Code-block injection.</b> A fenced block in a <code>.md</code> diff knows it said
+        <code>rust</code> and is still drawn as one string.</li>
+      </ul>
+    </div></div>
+    <div class="panel"><div class="stamp"><span class="path">code hot reload — investigated and rejected</span></div><div class="body">
+      <p>The config file reloads <em>data</em> live and <code>./dev.sh</code> removes everything either side
+      of a code rebuild, but the rebuild itself remains: 3–5 s.</p>
+      <p>A dylib swap was rejected for reasons specific enough to be worth keeping. GPUI holds a
+      thread-local element arena (a raw pointer, so a second copy allocates into nothing), a process-wide
+      entity id counter, and forty uses of <code>TypeId::of</code> for global and entity lookup. A dylib that
+      statically links its own gpui forks all three.</p>
+      <p style="margin:0">The fix is making gpui a real <code>dylib</code> and building with
+      <code>-C prefer-dynamic</code> the way Bevy does — possible, multi-day, and broken by every gpui update.
+      Dioxus's <code>subsecond</code> hot-<em>patches</em> the binary instead and sidesteps the ABI problem
+      entirely; that is the direction to watch.</p>
+    </div></div>
+  </div>
+
+  <div class="panel"><div class="stamp"><span class="path">the working tree, uncommitted</span><span class="right">read off git status, not off the docs</span></div>
+    <div class="body">
+      <p>Three of the panels above describe code that is not in a commit yet. It is in the tree, it is
+      wired, and <code>cargo test -p plait-core</code> passes <b>139 tests in 0.55 s</b> — but a reader
+      going by <code>git log</code> will not find any of it.</p>
+      <table>
+        <tr><th>file</th><th>state</th><th>what it is</th></tr>
+        <tr><td><code>core/src/differ.rs</code></td><td><span class="pill ok">new, wired</span></td><td>The <code>Differ</code> seam: histogram, patience, myers, the shared hunk assembly, the by-name registry. Reachable as <code>host.differ</code>.</td></tr>
+        <tr><td><code>core/src/align.rs</code></td><td><span class="pill ok">new, wired</span></td><td>Which removed line sits opposite which added one — <code>Slot::{Context,Replace,Removed,Added}</code>. One rule, shared with the intraline pass, because the two answers have to agree.</td></tr>
+        <tr><td><code>git/src/lib.rs</code></td><td><span class="pill ok">rewritten</span></td><td>Acquisition switched from parsing git's unified diff to fetching blob pairs, so <code>core</code> chooses the algorithm. <code>plait_git::diff</code> now takes a <code>&amp;Differs</code>.</td></tr>
+        <tr><td><code>shell/src/views/split.rs</code></td><td><span class="pill ok">new</span></td><td>Side-by-side, as a third <code>Rows</code> implementation and nothing more: same prepared lines, two columns instead of one, no new trait and no edit to <code>TextRows</code>. That is the seam being paid for.</td></tr>
+        <tr><td><code>shell/src/views/diff.rs</code></td><td><span class="pill ok">grew a registry</span></td><td><code>Layouts</code>: the registry of whole-diff presentations, and <code>s</code> to cycle it — the first key binding that is not <code>cmd-q</code>, shaped so command dispatch has something to attach to rather than something to replace.</td></tr>
+        <tr><td><code>docs/decisions/0013</code></td><td><span class="pill ok">new</span></td><td>Why the differs are written in <code>core</code> instead of pulled in, and why acquisition hands over content rather than a diff.</td></tr>
+      </table>
+      <p style="margin:0" class="note">This table is the part of the page that will rot first — the tree
+      moved three times while the page was being written. Everything else here was read out of the source.</p>
+    </div>
+  </div>
+
+  <div class="panel"><div class="stamp"><span class="path">don't</span></div><div class="body">
+    <div class="cols">
+      <div><h4>Don't add dependencies to core/</h4><p style="margin:0">It compiles in a second and its tests
+      need no window. That is worth more than any crate.</p></div>
+      <div><h4>Don't put logic in shell/ that cli/ would duplicate</h4><p style="margin:0">Three copies of
+      the prepare loop existed before anyone wrote a <code>cli/</code>.</p></div>
+      <div><h4>Don't build what the framework already has</h4><p style="margin:0"><code>uniform_list</code>
+      was there the whole time and a hand-rolled list cost a day.</p></div>
+      <div><h4>Don't let an AI feature bypass the extension API</h4><p style="margin:0">The built-ins are
+      extensions; that is the proof the API is worth using.</p></div>
+    </div>
+  </div></div>
+
+  <p style="font-family:var(--prose);color:var(--faint);font-size:12.5px;margin-top:28px;max-width:74ch">
+  Built from <code>AGENTS.md</code>, <code>docs/</code> and the source of <code>plait-core</code>,
+  <code>plait-git</code> and <code>plait-shell</code>. The interactive panels run ports of
+  <code>differ.rs</code>, <code>lib.rs</code>, <code>syntax.rs</code> and <code>theme.rs</code>, checked
+  against the Rust on the same inputs its own tests use — the edit scripts, hunk headers, token lists and
+  contrast ratios on this page are the ones the binary produces. No libraries, no network, one file:
+  <code>core</code>'s empty <code>[dependencies]</code>, kept.</p>
+</section>
+</main>
+
+<div id="hint">? for keys</div>
+<div id="sheet" role="dialog" aria-label="Keyboard shortcuts">
+  <dl>
+    <dt>j / k</dt><dd>next / previous section</dd>
+    <dt>0–9 D E</dt><dd>jump to a section</dd>
+    <dt>← / →</dt><dd>step the pipeline bench</dd>
+    <dt>?</dt><dd>close this</dd>
+  </dl>
+</div>
+<div class="tip" id="tip"></div>
+<script>
+/* ===== ports of plait-core. Verified against the Rust on the inputs its own tests use. ===== */
+// Ports of plait-core, for the explainer page. Faithful to the Rust where it
+// matters; indices are JS string indices rather than UTF-8 byte offsets.
+
+// ---------------------------------------------------------------- intraline
+
+const MAX_INTRALINE_TOKENS = 1000;
+const MIN_INTRALINE_SIMILARITY = 0.4;
+
+const isWordByte = (c) => /[A-Za-z0-9_]/.test(c);
+
+function tokenize(line) {
+  const out = [];
+  let i = 0;
+  while (i < line.length) {
+    const start = i;
+    if (isWordByte(line[i])) {
+      while (i < line.length && isWordByte(line[i])) i++;
+    } else {
+      i++;
+    }
+    out.push([start, line.slice(start, i)]);
+  }
+  return out;
+}
+
+function pushSpan(spans, start, end) {
+  const last = spans[spans.length - 1];
+  if (last && last.end === start) last.end = end;
+  else spans.push({ start, end });
+}
+
+function coalesce(spans, text) {
+  const merged = [];
+  for (const s of spans) {
+    const last = merged[merged.length - 1];
+    const gap = last ? text.slice(last.end, s.start) : null;
+    if (last && gap.length > 0 && gap.trim() === '') last.end = s.end;
+    else merged.push(s);
+  }
+  return merged;
+}
+
+// Returns {old, new, similarity, bailed} — `bailed` names which guard fired.
+function intraline(oldS, newS, opts = {}) {
+  const floor = opts.floor ?? MIN_INTRALINE_SIMILARITY;
+  const doCoalesce = opts.coalesce ?? true;
+  const a = tokenize(oldS);
+  const b = tokenize(newS);
+  if (a.length > MAX_INTRALINE_TOKENS || b.length > MAX_INTRALINE_TOKENS) {
+    return { old: [], new: [], similarity: 0, bailed: 'tokens', a, b, lcs: null };
+  }
+  const lcs = Array.from({ length: a.length + 1 }, () => new Uint32Array(b.length + 1));
+  for (let i = a.length - 1; i >= 0; i--) {
+    for (let j = b.length - 1; j >= 0; j--) {
+      lcs[i][j] = a[i][1] === b[j][1]
+        ? lcs[i + 1][j + 1] + 1
+        : Math.max(lcs[i + 1][j], lcs[i][j + 1]);
+    }
+  }
+  const common = lcs[0][0];
+  const similarity = (2 * common) / (a.length + b.length || 1);
+  if (similarity < floor) {
+    return { old: [], new: [], similarity, bailed: 'similarity', a, b, lcs };
+  }
+  let oldSpans = [], newSpans = [];
+  let i = 0, j = 0;
+  while (i < a.length && j < b.length) {
+    if (a[i][1] === b[j][1]) { i++; j++; }
+    else if (lcs[i + 1][j] >= lcs[i][j + 1]) { pushSpan(oldSpans, a[i][0], a[i][0] + a[i][1].length); i++; }
+    else { pushSpan(newSpans, b[j][0], b[j][0] + b[j][1].length); j++; }
+  }
+  while (i < a.length) { pushSpan(oldSpans, a[i][0], a[i][0] + a[i][1].length); i++; }
+  while (j < b.length) { pushSpan(newSpans, b[j][0], b[j][0] + b[j][1].length); j++; }
+  if (doCoalesce) {
+    oldSpans = coalesce(oldSpans, oldS);
+    newSpans = coalesce(newSpans, newS);
+  }
+  return { old: oldSpans, new: newSpans, similarity, bailed: null, a, b, lcs };
+}
+
+function replacePairs(lines) {
+  const pairs = [];
+  let i = 0;
+  while (i < lines.length) {
+    if (lines[i].kind !== 'Removed') { i++; continue; }
+    const delStart = i;
+    while (i < lines.length && lines[i].kind === 'Removed') i++;
+    const addStart = i;
+    while (i < lines.length && lines[i].kind === 'Added') i++;
+    const n = Math.min(addStart - delStart, i - addStart);
+    for (let k = 0; k < n; k++) pairs.push([delStart + k, addStart + k]);
+  }
+  return pairs;
+}
+
+// ------------------------------------------------------------ unified parse
+
+function parseUnifiedDiff(raw) {
+  const files = [];
+  let oldNo = 0, newNo = 0;
+  for (const line of raw.split('\n')) {
+    if (line.startsWith('diff --git ')) {
+      const parts = line.slice('diff --git '.length).split(/\s+/);
+      const p = parts[1] || '';
+      files.push({ path: p.startsWith('b/') ? p.slice(2) : '?', hunks: [] });
+      continue;
+    }
+    if (line.startsWith('@@ ')) {
+      const [o, n] = parseHunkHeader(line);
+      oldNo = o; newNo = n;
+      files[files.length - 1]?.hunks.push({ header: line, lines: [] });
+      continue;
+    }
+    if (line.startsWith('+++ ') || line.startsWith('--- ') || line.startsWith('index ')) continue;
+    const f = files[files.length - 1];
+    const hunk = f?.hunks[f.hunks.length - 1];
+    if (!hunk) continue;
+    let kind, text;
+    if (line[0] === '+') { kind = 'Added'; text = line.slice(1); }
+    else if (line[0] === '-') { kind = 'Removed'; text = line.slice(1); }
+    else if (line[0] === ' ') { kind = 'Context'; text = line.slice(1); }
+    else continue;
+    const o = kind === 'Added' ? null : oldNo;
+    const n = kind === 'Removed' ? null : newNo;
+    if (kind !== 'Added') oldNo++;
+    if (kind !== 'Removed') newNo++;
+    hunk.lines.push({ kind, old_no: o, new_no: n, text });
+  }
+  return files;
+}
+
+function parseHunkHeader(line) {
+  let old = 0, nw = 0;
+  for (const tok of line.split(/\s+/)) {
+    const num = (s) => parseInt(s.split(',')[0], 10) || 0;
+    if (tok.startsWith('-')) old = num(tok.slice(1));
+    else if (tok.startsWith('+')) nw = num(tok.slice(1));
+  }
+  return [old, nw];
+}
+
+// ------------------------------------------------------------------ differ
+
+const MAX_STEPS = 40000000;
+const MAX_ANCHOR_OCCURRENCES = 64;
+
+function intern(oldL, newL) {
+  const ids = new Map();
+  let next = 0;
+  const map = (s) => {
+    let id = ids.get(s);
+    if (id === undefined) { id = next++; ids.set(s, id); }
+    return id;
+  };
+  return [oldL.map(map), newL.map(map)];
+}
+
+const regionWhole = (a, b) => ({ a0: 0, a1: a.length, b0: 0, b1: b.length });
+const regionEmpty = (r) => r.a0 === r.a1 && r.b0 === r.b1;
+const regionEdit = (r) => ({ old_start: r.a0, old_end: r.a1, new_start: r.b0, new_end: r.b1 });
+
+function trimmed(r, a, b) {
+  const o = { ...r };
+  while (o.a0 < o.a1 && o.b0 < o.b1 && a[o.a0] === b[o.b0]) { o.a0++; o.b0++; }
+  while (o.a0 < o.a1 && o.b0 < o.b1 && a[o.a1 - 1] === b[o.b1 - 1]) { o.a1--; o.b1--; }
+  return o;
+}
+
+function pushEdit(out, e) {
+  if (e.old_start === e.old_end && e.new_start === e.new_end) return;
+  const last = out[out.length - 1];
+  if (last && last.old_end === e.old_start && last.new_end === e.new_start) {
+    last.old_end = e.old_end;
+    last.new_end = e.new_end;
+    return;
+  }
+  out.push(e);
+}
+
+class Ctx {
+  constructor() {
+    this.steps = MAX_STEPS;
+    this.occ = new Map();
+    this.work = 0;      // instrumentation for the page: steps actually spent
+    this.fallbacks = 0; // regions handed to myers because nothing was rare
+  }
+
+  spend(n) {
+    this.work += n;
+    this.steps = Math.max(0, this.steps - n);
+    return this.steps > 0;
+  }
+
+  myers(a, b, region, out) {
+    // Sized on the region, so a fallback for six anchorless lines inside a
+    // large file allocates for six lines.
+    const span = (region.a1 - region.a0) + (region.b1 - region.b0);
+    const fwd = new V(span), bwd = new V(span);
+    const stack = [region];
+    while (stack.length) {
+      const r = trimmed(stack.pop(), a, b);
+      if (regionEmpty(r)) continue;
+      if (r.a0 === r.a1 || r.b0 === r.b1) { pushEdit(out, regionEdit(r)); continue; }
+      const split = this.split(a, b, r, fwd, bwd);
+      if (split) {
+        const [x, y] = split;
+        stack.push({ a0: x, a1: r.a1, b0: y, b1: r.b1 });
+        stack.push({ a0: r.a0, a1: x, b0: r.b0, b1: y });
+      } else pushEdit(out, regionEdit(r));
+    }
+  }
+
+  split(aFull, bFull, r, fwd, bwd) {
+    const a = aFull.slice(r.a0, r.a1);
+    const b = bFull.slice(r.b0, r.b1);
+    const n = a.length, m = b.length;
+    const delta = n - m;
+    const dmax = Math.floor((n + m + 1) / 2) + 1;
+    const inside = (x, y) => (x === 0 && y === 0) || (x === n && y === m)
+      ? null : [r.a0 + x, r.b0 + y];
+    fwd.set(1, 0);
+    bwd.set(1, 0);
+    for (let d = 0; d <= dmax; d++) {
+      for (let k = d; k >= -d; k -= 2) {
+        if (!this.spend(1)) return null;
+        let x = (k === -d || (k !== d && fwd.get(k - 1) < fwd.get(k + 1)))
+          ? fwd.get(k + 1) : fwd.get(k - 1) + 1;
+        let y = x - k;
+        while (x < n && y < m && a[x] === b[y]) { x++; y++; }
+        fwd.set(k, x);
+        if (delta % 2 !== 0 && d >= 1 && Math.abs(delta - k) <= d - 1) {
+          if (x + bwd.get(delta - k) >= n) return inside(x, y);
+        }
+      }
+      for (let k = d; k >= -d; k -= 2) {
+        if (!this.spend(1)) return null;
+        let x = (k === -d || (k !== d && bwd.get(k - 1) < bwd.get(k + 1)))
+          ? bwd.get(k + 1) : bwd.get(k - 1) + 1;
+        let y = x - k;
+        while (x < n && y < m && a[n - x - 1] === b[m - y - 1]) { x++; y++; }
+        bwd.set(k, x);
+        if (delta % 2 === 0 && Math.abs(delta - k) <= d) {
+          if (fwd.get(delta - k) + x >= n) return inside(n - x, m - y);
+        }
+      }
+    }
+    return null;
+  }
+
+  anchored(a, b, max, out) {
+    const stack = [regionWhole(a, b)];
+    while (stack.length) {
+      const r = trimmed(stack.pop(), a, b);
+      if (regionEmpty(r)) continue;
+      if (r.a0 === r.a1 || r.b0 === r.b1) { pushEdit(out, regionEdit(r)); continue; }
+      const res = this.anchor(a, b, r, max);
+      if (res.kind === 'disjoint') pushEdit(out, regionEdit(r));
+      else if (res.kind === 'too_common') { this.fallbacks++; this.myers(a, b, r, out); }
+      else {
+        stack.push({ a0: res.a_at + res.len, a1: r.a1, b0: res.b_at + res.len, b1: r.b1 });
+        stack.push({ a0: r.a0, a1: res.a_at, b0: r.b0, b1: res.b_at });
+      }
+    }
+  }
+
+  // The longest run of matching lines whose *rarest* line is rarest of all —
+  // score by the most common line instead and a four-hundred-line run of unique
+  // code loses to a one-line run the moment a single `}` falls inside it.
+  anchor(a, b, r, max) {
+    if (!this.spend((r.a1 - r.a0) + (r.b1 - r.b0))) return { kind: 'too_common' };
+    const occ = this.occ;
+    occ.clear();
+    for (let i = r.a0; i < r.a1; i++) {
+      let chain = occ.get(a[i]);
+      if (!chain) { chain = { count: 0, at: [] }; occ.set(a[i], chain); }
+      chain.count++;
+    }
+    // Positions in a second pass, and only for the lines that survived the
+    // threshold: recording every position of a line that turns out to appear
+    // four hundred times is the allocation this avoids.
+    for (let i = r.a0; i < r.a1; i++) {
+      const chain = occ.get(a[i]);
+      if (chain.count <= max && chain.at.length < MAX_ANCHOR_OCCURRENCES) chain.at.push(i);
+    }
+    let best = null, common = false;
+    let j = r.b0;
+    while (j < r.b1) {
+      const chain = occ.get(b[j]);
+      if (!chain) { j++; continue; }
+      common = true;
+      // The threshold tightens as the search goes: once a run scoring 2 is in
+      // hand, a line appearing forty times cannot be part of anything better.
+      // Not only an optimisation — without it a longer run wins on length alone
+      // however common its lines are.
+      if (chain.count > (best ? Math.max(best.score, 1) : max)) { j++; continue; }
+      let skip = 0;
+      for (const i of chain.at) {
+        let score = chain.count;
+        let back = 0;
+        while (i - back > r.a0 && j - back > r.b0 && a[i - back - 1] === b[j - back - 1]) {
+          back++;
+          score = Math.min(score, occ.get(a[i - back]).count);
+        }
+        let ahead = 0;
+        while (i + ahead + 1 < r.a1 && j + ahead + 1 < r.b1 && a[i + ahead + 1] === b[j + ahead + 1]) {
+          ahead++;
+          score = Math.min(score, occ.get(a[i + ahead]).count);
+        }
+        const len = back + 1 + ahead;
+        skip = Math.max(skip, ahead);
+        const better = !best || score < best.score || len > best.len;
+        if (better) best = { score, len, a_at: i - back, b_at: j - back };
+      }
+      j += skip + 1;
+    }
+    if (best) return { kind: 'at', a_at: best.a_at, b_at: best.b_at, len: best.len };
+    return { kind: common ? 'too_common' : 'disjoint' };
+  }
+}
+
+class V {
+  constructor(span) {
+    this.offset = Math.floor((span + 1) / 2) + 3;
+    this.buf = new Int32Array(2 * this.offset + 1);
+  }
+  get(k) { return this.buf[k + this.offset]; }
+  set(k, v) { this.buf[k + this.offset] = v; }
+}
+
+// name: 'histogram' | 'patience' | 'myers'
+function diff(name, oldL, newL) {
+  const [a, b] = intern(oldL, newL);
+  const ctx = new Ctx();
+  const out = [];
+  if (name === 'myers') ctx.myers(a, b, regionWhole(a, b), out);
+  else ctx.anchored(a, b, name === 'patience' ? 1 : MAX_ANCHOR_OCCURRENCES, out);
+  return { edits: out, work: ctx.work, fallbacks: ctx.fallbacks };
+}
+
+function enclosing(oldL, from) {
+  for (let i = from - 1; i >= 0; i--) {
+    const c = oldL[i][0];
+    if (c && /[A-Za-z_$]/.test(c)) return oldL[i].replace(/\s+$/, '');
+  }
+  return null;
+}
+
+function hunks(oldL, newL, edits, context = 3) {
+  const out = [];
+  let i = 0;
+  while (i < edits.length) {
+    let j = i;
+    while (j + 1 < edits.length && edits[j + 1].old_start <= edits[j].old_end + 2 * context) j++;
+    const first = edits[i], last = edits[j];
+    const lead = Math.min(context, first.old_start, first.new_start);
+    const trail = Math.min(context, oldL.length - last.old_end, newL.length - last.new_end);
+    const oStart = first.old_start - lead, nStart = first.new_start - lead;
+    const oEnd = last.old_end + trail, nEnd = last.new_end + trail;
+    const lines = [];
+    let o = oStart, n = nStart;
+    for (let k = i; k <= j; k++) {
+      const e = edits[k];
+      while (o < e.old_start) { lines.push(mkline('Context', o, n, oldL[o])); o++; n++; }
+      for (let q = e.old_start; q < e.old_end; q++) lines.push(mkline('Removed', q, null, oldL[q]));
+      for (let q = e.new_start; q < e.new_end; q++) lines.push(mkline('Added', null, q, newL[q]));
+      o = e.old_end; n = e.new_end;
+    }
+    while (o < oEnd) { lines.push(mkline('Context', o, n, oldL[o])); o++; n++; }
+    const range = (start, count) => count === 0 ? `${start}` : count === 1 ? `${start + 1}` : `${start + 1},${count}`;
+    let header = `@@ -${range(oStart, oEnd - oStart)} +${range(nStart, nEnd - nStart)} @@`;
+    const name = enclosing(oldL, oStart);
+    if (name) header += ' ' + name;
+    out.push({ header, lines });
+    i = j + 1;
+  }
+  return out;
+}
+
+function mkline(kind, oldNo, newNo, text) {
+  return {
+    kind,
+    old_no: oldNo === null ? null : oldNo + 1,
+    new_no: newNo === null ? null : newNo + 1,
+    text,
+  };
+}
+
+// ------------------------------------------------------------------ scanner
+
+const KINDS = ['Comment','Str','Number','Keyword','Type','Constant','Func','Property','Heading','Strong','Emphasis','Link'];
+
+function syntax(spec) {
+  const s = {
+    line: spec.line || [],
+    block: spec.block || [],
+    nested_block: !!spec.nested_block,
+    strings: (spec.strings || []).map(([open, close, escape, multiline]) => ({ open, close, escape, multiline })),
+    keywords: new Set(spec.keywords || []),
+    capitalized_types: !!spec.capitalized_types,
+    call_heuristic: !!spec.call_heuristic,
+    line_needs_boundary: !!spec.line_needs_boundary,
+    quote_after_eq: !!spec.quote_after_eq,
+    opens: new Set(),
+  };
+  for (const p of s.line) s.opens.add(p[0]);
+  for (const [o] of s.block) s.opens.add(o[0]);
+  for (const r of s.strings) s.opens.add(r.open[0]);
+  return s;
+}
+
+const at = (src, i, pat) => src.startsWith(pat, i);
+const isWs = (c) => /\s/.test(c);
+
+function lex(src, syn) {
+  const out = [];
+  let i = 0;
+  scan: while (i < src.length) {
+    const c = src[i];
+    if (!syn.opens.has(c) && !isWordByte(c)) { i++; continue; }
+
+    for (const pat of syn.line) {
+      const boundaryOk = !syn.line_needs_boundary || i === 0 || isWs(src[i - 1]);
+      if (boundaryOk && at(src, i, pat)) {
+        const start = i;
+        while (i < src.length && src[i] !== '\n') i++;
+        out.push({ start, end: i, kind: 'Comment' });
+        continue scan;
+      }
+    }
+    for (const [open, close] of syn.block) {
+      if (at(src, i, open)) {
+        const start = i;
+        i += open.length;
+        let depth = 1;
+        while (i < src.length && depth > 0) {
+          if (at(src, i, close)) { depth--; i += close.length; }
+          else if (syn.nested_block && at(src, i, open)) { depth++; i += open.length; }
+          else i++;
+        }
+        out.push({ start, end: i, kind: 'Comment' });
+        continue scan;
+      }
+    }
+    for (const r of syn.strings) {
+      if (!at(src, i, r.open)) continue;
+      if (syn.quote_after_eq && (r.open === '"' || r.open === "'")) {
+        let p = i - 1;
+        while (p >= 0 && isWs(src[p])) p--;
+        if (src[p] !== '=') continue;
+      }
+      const start = i;
+      i += r.open.length;
+      while (i < src.length) {
+        if (r.escape && src[i] === '\\') { i += 2; continue; }
+        if (!r.multiline && src[i] === '\n') break;
+        if (at(src, i, r.close)) { i += r.close.length; break; }
+        i++;
+      }
+      out.push({ start, end: Math.min(i, src.length), kind: 'Str' });
+      continue scan;
+    }
+    if (/[0-9]/.test(c)) {
+      const start = i;
+      while (i < src.length && (isWordByte(src[i]) || (src[i] === '.' && /[0-9]/.test(src[i + 1] || '')))) i++;
+      out.push({ start, end: i, kind: 'Number' });
+      continue;
+    }
+    if (isWordByte(c)) {
+      const start = i;
+      while (i < src.length && isWordByte(src[i])) i++;
+      const word = src.slice(start, i);
+      if (syn.keywords.has(word)) out.push({ start, end: i, kind: 'Keyword' });
+      else if (syn.capitalized_types && /[A-Z]/.test(c)) {
+        const shouty = word.length > 2 && !/[a-z]/.test(word);
+        out.push({ start, end: i, kind: shouty ? 'Constant' : 'Type' });
+      } else if (syn.call_heuristic) {
+        let p = i;
+        while (p < src.length && isWs(src[p])) p++;
+        const next = src[p];
+        let q = start - 1;
+        while (q >= 0 && isWs(src[q])) q--;
+        const prev = q >= 0 ? src[q] : undefined;
+        if (next === '(' || next === '!') out.push({ start, end: i, kind: 'Func' });
+        else if (prev === '.' && !src.slice(0, start).replace(/\s+$/, '').endsWith('..'))
+          out.push({ start, end: i, kind: 'Property' });
+      }
+      continue;
+    }
+    i++;
+  }
+  return out;
+}
+
+// One side of a hunk at a time: context rows belong to both, so they are
+// scanned twice and the added side wins.
+function forEachSide(kinds, f) {
+  for (const side of ['Removed', 'Added']) {
+    const rows = [];
+    kinds.forEach((k, i) => { if (k === 'Context' || k === side) rows.push(i); });
+    f(rows);
+  }
+}
+
+function highlightHunk(texts, kinds, syn) {
+  const out = texts.map(() => []);
+  forEachSide(kinds, (rows) => {
+    const joined = rows.map((r) => texts[r]).join('\n');
+    const tokens = lex(joined, syn);
+    // split back per line, clipping any token that crosses a boundary
+    let offset = 0;
+    const bounds = rows.map((r) => {
+      const start = offset;
+      offset += texts[r].length + 1;
+      return { row: r, start, end: start + texts[r].length };
+    });
+    for (const b of bounds) out[b.row] = [];
+    for (const t of tokens) {
+      for (const b of bounds) {
+        if (t.end <= b.start || t.start >= b.end) continue;
+        out[b.row].push({
+          start: Math.max(t.start, b.start) - b.start,
+          end: Math.min(t.end, b.end) - b.start,
+          kind: t.kind,
+        });
+      }
+    }
+  });
+  return out;
+}
+
+// --------------------------------------------------------------- theme math
+
+function luminance(c) {
+  const ch = (v) => {
+    const s = v / 255;
+    return s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+  };
+  const r = ch((c >> 16) & 0xff), g = ch((c >> 8) & 0xff), b = ch(c & 0xff);
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+function contrast(a, b) {
+  const la = luminance(a), lb = luminance(b);
+  const hi = Math.max(la, lb), lo = Math.min(la, lb);
+  return (hi + 0.05) / (lo + 0.05);
+}
+
+function mix(a, b, t) {
+  const ch = (sh) => {
+    const x = (a >> sh) & 0xff, y = (b >> sh) & 0xff;
+    return Math.round(x + (y - x) * t) & 0xff;
+  };
+  return (ch(16) << 16) | (ch(8) << 8) | ch(0);
+}
+
+function readable(fg, bg, target) {
+  if (contrast(fg, bg) >= target) return { fg, steps: 0 };
+  const toward = luminance(bg) < 0.35 ? 0xffffff : 0x000000;
+  const STEPS = 24;
+  for (let i = 1; i <= STEPS; i++) {
+    const candidate = mix(fg, toward, i / STEPS);
+    if (contrast(candidate, bg) >= target) return { fg: candidate, steps: i };
+  }
+  return { fg: toward, steps: STEPS };
+}
+
+// --------------------------------------------------------- lane assignment
+
+function assignLanes(commits) {
+  const lanes = [];
+  const rows = [];
+  const claim = (sha) => {
+    const i = lanes.findIndex((l) => l === null);
+    if (i >= 0) { lanes[i] = sha; return i; }
+    lanes.push(sha);
+    return lanes.length - 1;
+  };
+  for (const c of commits) {
+    let lane = lanes.indexOf(c.sha);
+    if (lane < 0) lane = claim(c.sha);
+    const merges = [];
+    for (let i = 0; i < lanes.length; i++) {
+      if (i !== lane && lanes[i] === c.sha) { merges.push(i); lanes[i] = null; }
+    }
+    const through = lanes.map((l, i) => (i !== lane && l !== null ? i : -1)).filter((i) => i >= 0);
+    lanes[lane] = c.parents[0] ?? null;
+    const forks = c.parents.slice(1).map((p) => claim(p));
+    rows.push({ lane, through, merges, forks, snapshot: lanes.slice() });
+  }
+  return rows;
+}
+
+const LANE_HUES = 6;
+
+// Two letters for an author: first and last name, or the first two characters
+// of a single-word name. Uppercased, so a column lines up as initials rather
+// than as words — "Junio C Hamano" is JH, never the middle name.
+function initials(author) {
+  const words = author.split(/\s+/).filter(Boolean);
+  const first = words[0] ?? '';
+  const up = (c) => (c ? c.toUpperCase() : '');
+  if (words.length > 1) return up([...first][0]) + up([...words[words.length - 1]][0]);
+  const cs = [...first];
+  return up(cs[0]) + up(cs[1]);
+}
+
+/* ============================================================ theme, as data */
+const SYNTAX = {
+  Comment:{fg:0x615a52,italic:true}, Str:{fg:0x9aab7d}, Number:{fg:0xc2a06a},
+  Keyword:{fg:0xa88fb5}, Type:{fg:0x86a6bd}, Constant:{fg:0xd0b48a},
+  Func:{fg:0xd9c98f}, Property:{fg:0xb5aea5}, Heading:{fg:0xe8e3dc,bold:true},
+  Strong:{fg:0xd8d2ca,bold:true}, Emphasis:{fg:0xc9c2b9,italic:true}, Link:{fg:0x7fa2bd},
+};
+const SURFACE_BG = {
+  Context:0x0e0d0c, Added:0x16241a, Removed:0x2a1917, AddedWord:0x1e3a23, RemovedWord:0x43201a,
+};
+const OLD_WORD_BG = { AddedWord:0x2c5c33, RemovedWord:0x6b2f2a };
+const DIFF_FG = { Context:0xa39c93, Added:0x9dc79b, Removed:0xd4a09a };
+const LANES = [0xdfa851,0x6f9ecf,0xa983c9,0x5fa8a0,0xc97d6f,0x8fb35e];
+const LANE_OVERFLOW = 0x453f39;
+const AUTHORS = [0x9c8a6b,0x6f8296,0x8b7a96,0x6b8f88,0x9c7f75,0x7d8a6b];
+const hex = (n) => '#' + n.toString(16).padStart(6, '0');
+const MIN_CONTRAST = 3.5;
+
+function styleOn(kind, surface, floor = MIN_CONTRAST) {
+  const base = SYNTAX[kind] || { fg: 0xa39c93 };
+  const bg = SURFACE_BG[surface];
+  return { fg: readable(base.fg, bg, floor).fg, bold: !!base.bold, italic: !!base.italic };
+}
+
+/* ---------------------------------------------------------------- utilities */
+const $ = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => [...r.querySelectorAll(s)];
+const esc = (s) => s.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+function press(group, val, attr) {
+  $$(group).forEach((b) => b.setAttribute('aria-pressed', String(b.dataset[attr] === val)));
+}
+const tip = $('#tip');
+function showTip(e, text) {
+  tip.textContent = text;
+  tip.style.opacity = 1;
+  const pad = 14;
+  tip.style.left = Math.min(e.clientX + pad, innerWidth - tip.offsetWidth - 8) + 'px';
+  tip.style.top = Math.max(e.clientY - tip.offsetHeight - 10, 8) + 'px';
+}
+const hideTip = () => { tip.style.opacity = 0; };
+
+/* --------------------------------------------- one row, the way runs() does */
+// Faithful to shell/src/views/diff.rs: tokens set the foreground, spans set the
+// background, and the foreground is resolved against whichever it lands on.
+function runs(text, tokens, spans, kind, floor = MIN_CONTRAST) {
+  const [plain, word] = kind === 'Added' ? ['Added', 'AddedWord']
+    : kind === 'Removed' ? ['Removed', 'RemovedWord'] : ['Context', 'Context'];
+  if (!tokens.length && !spans.length) return [];
+  const edges = [];
+  for (const t of tokens) edges.push(t.start, t.end);
+  for (const s of spans) edges.push(s.start, s.end);
+  edges.push(text.length);
+  const uniq = [...new Set(edges)].sort((a, b) => a - b);
+  const out = [];
+  let ti = 0, si = 0, cursor = uniq[0];
+  for (const edge of uniq.slice(1)) {
+    while (ti < tokens.length && tokens[ti].end <= cursor) ti++;
+    while (si < spans.length && spans[si].end <= cursor) si++;
+    const onWord = spans[si] && spans[si].start <= cursor;
+    const surface = onWord ? word : plain;
+    const tok = tokens[ti] && tokens[ti].start <= cursor ? tokens[ti] : null;
+    if (tok || onWord) {
+      out.push({ start: cursor, end: edge, kind: tok ? tok.kind : null, word: !!onWord, surface });
+    }
+    cursor = edge;
+  }
+  return out;
+}
+
+function rowText(text, tokens = [], spans = [], kind = 'Context', floor = MIN_CONTRAST) {
+  const rs = runs(text, tokens, spans, kind, floor);
+  if (!rs.length) return `<span style="color:${hex(DIFF_FG[kind])}">${esc(text)}</span>`;
+  let out = '', at = 0;
+  for (const r of rs) {
+    if (r.start > at) out += `<span style="color:${hex(DIFF_FG[kind])}">${esc(text.slice(at, r.start))}</span>`;
+    const st = r.kind ? styleOn(r.kind, r.surface, floor) : { fg: DIFF_FG[kind] };
+    const css = [`color:${hex(st.fg)}`];
+    if (st.bold) css.push('font-weight:700');
+    if (st.italic) css.push('font-style:italic');
+    out += `<span class="${r.word ? 'w' : ''}" style="${css.join(';')}">${esc(text.slice(r.start, r.end))}</span>`;
+    at = r.end;
+  }
+  if (at < text.length) out += `<span style="color:${hex(DIFF_FG[kind])}">${esc(text.slice(at))}</span>`;
+  return out;
+}
+
+const SIGN = { Added: '+', Removed: '-', Context: ' ' };
+const CLS = { Added: 'add', Removed: 'del', Context: 'ctx' };
+function lineRow(l, floor) {
+  return `<div class="r ${CLS[l.kind]}"><span class="n">${l.old_no ?? ''}</span>` +
+    `<span class="n">${l.new_no ?? ''}</span><span class="s">${SIGN[l.kind]}</span>` +
+    `<span class="t">${rowText(l.text, l.tokens || [], l.spans || [], l.kind, floor)}</span></div>`;
+}
+
+/* ------------------------------------------------------- language tables */
+const LANGS = {
+  rs: { label: 'rs', syn: {
+      line: ['//'], block: [['/*', '*/']], nested_block: true,
+      strings: [['r#"', '"#', false, true], ['"', '"', true, true]],
+      keywords: ['Self','as','async','await','break','const','continue','crate','dyn','else','enum','extern','false','fn','for','if','impl','in','let','loop','match','mod','move','mut','pub','ref','return','self','static','struct','super','trait','true','type','union','unsafe','use','where','while'],
+      capitalized_types: true, call_heuristic: true },
+    src: `/* outer /* nested */ still comment */\npub fn dispatch(ev: &Event) -> Result<(), Error> {\n    let n = 0xFF_u32; // hex with a suffix\n    let s = "escaped \\" quote";\n    let r = r#"raw "quote" here"#;\n    if MAX_LANES > 12 { self.pool.submit(ev)?; }\n    Ok(())\n}` },
+  sh: { label: 'sh', syn: {
+      line: ['#'], line_needs_boundary: true,
+      strings: [['"', '"', true, false], ["'", "'", false, false]],
+      keywords: ['if','then','else','elif','fi','for','while','do','done','case','esac','function','return','local','export','in'] },
+    src: `name=\${path#/tmp/}   # a comment\nif [ -n "$name" ]; then\n  echo "$name" | grep -c '#'\nfi` },
+  html: { label: 'html', syn: {
+      block: [['<!--', '-->']],
+      strings: [['"', '"', true, true], ["'", "'", true, true]],
+      quote_after_eq: true,
+      keywords: ['div','span','script','class','href','src','id'] },
+    src: `<!-- the apostrophe below is not a string -->\n<a class="nav" href='/docs'>it's the reader's problem</a>\n<p>don't quote me on that</p>` },
+  toml: { label: 'toml', syn: {
+      line: ['#'], strings: [['"""', '"""', false, true], ['"', '"', true, false], ["'", "'", false, false]],
+      keywords: ['true','false'] },
+    src: `# plait config\n[font]\nfamily = "JetBrainsMono Nerd Font Mono"\nsize = 14.0\nmonospaced = true\n\n[theme.syntax]\ncomment = "#615a52 italic"` },
+  c: { label: 'c', syn: {
+      line: ['//'], block: [['/*', '*/']],
+      strings: [['"', '"', true, false], ["'", "'", true, false]],
+      keywords: ['auto','break','case','char','const','continue','default','do','double','else','enum','extern','float','for','goto','if','int','long','register','return','short','signed','sizeof','static','struct','switch','typedef','union','unsigned','void','volatile','while'] },
+    src: `#include <stdio.h>\n/* capitalized_types is OFF for c: nearly every\n   capitalised word here is a macro */\nint main(void) {\n    char c = 'x';\n    printf("%d\\n", MAX_LANES);\n    return 0;\n}` },
+};
+
+/* ================================================================ the bench */
+const BENCH_OLD = [
+  'fn dispatch(ev: Event) -> Result<()> {',
+  '    let budget = 64;   // lanes we can draw',
+  '    for ext in self.enabled() {',
+  '        ext.run(ev)?;',
+  '    }',
+  '    Ok(())',
+  '}',
+];
+const BENCH_NEW = [
+  'fn dispatch(ev: Event) -> Result<()> {',
+  '    let budget = 12;   // lanes we can draw',
+  '    for ext in self.enabled() {',
+  '        self.pool.submit(ev)?;',
+  '    }',
+  '    Ok(())',
+  '}',
+];
+const BENCH_PATH = 'core/src/host.rs';
+const STAGES = [
+  ['acquire', 'plait_git::pairs', 'two blobs, as two lists of lines'],
+  ['diff', 'Differs::file', 'an edit script, then hunks'],
+  ['prepare', 'prepared::prepare', 'clip → intraline → syntax'],
+  ['build', 'Rows::build', 'the renderer that claims the path'],
+  ['order', 'Vec&lt;RowRef&gt;', '8 bytes a row'],
+  ['draw', 'runs() + Theme', 'one StyledText per row'],
+];
+
+const RUST_SYN = syntax(LANGS.rs.syn);
+function benchPipeline() {
+  const { edits, work } = diff('histogram', BENCH_OLD, BENCH_NEW);
+  const hs = hunks(BENCH_OLD, BENCH_NEW, edits, 3);
+  const prepared = hs.map((h) => {
+    const texts = h.lines.map((l) => l.text);
+    const kinds = h.lines.map((l) => l.kind);
+    const spans = texts.map(() => []);
+    const pairs = replacePairs(h.lines);
+    for (const [d, a] of pairs) {
+      const r = intraline(texts[d], texts[a]);
+      spans[d] = r.old; spans[a] = r.new;
+    }
+    const tokens = highlightHunk(texts, kinds, RUST_SYN);
+    return {
+      header: h.header, pairs,
+      lines: h.lines.map((l, i) => ({ ...l, spans: spans[i], tokens: tokens[i] })),
+    };
+  });
+  const adds = prepared.flatMap((h) => h.lines).filter((l) => l.kind === 'Added').length;
+  const dels = prepared.flatMap((h) => h.lines).filter((l) => l.kind === 'Removed').length;
+  const rows = [{ type: 'file', path: BENCH_PATH, adds, dels }];
+  for (const h of prepared) {
+    rows.push({ type: 'hunk', text: h.header });
+    for (const l of h.lines) rows.push({ type: 'line', line: l });
+  }
+  return { edits, work, hunks: prepared, rows, adds, dels };
+}
+const BENCH = benchPipeline();
+let benchStage = 0;
+
+function benchRows(floor) {
+  return `<div class="rows">` + BENCH.rows.map((r) => {
+    if (r.type === 'file') return `<div class="r file"><span class="t">${r.path}` +
+      `<span class="add-n">+${r.adds}</span><span class="del-n">−${r.dels}</span></span></div>`;
+    if (r.type === 'hunk') return `<div class="r hunk"><span class="t">${esc(r.text)}</span></div>`;
+    return lineRow(r.line, floor);
+  }).join('') + `</div>`;
+}
+
+function editTable(edits) {
+  return `<table><tr><th>#</th><th>old</th><th>new</th><th>meaning</th></tr>` + edits.map((e, i) => {
+    const oldN = e.old_end - e.old_start, newN = e.new_end - e.new_start;
+    const what = oldN === 0 ? `insert ${newN}` : newN === 0 ? `delete ${oldN}` : `replace ${oldN} with ${newN}`;
+    return `<tr><td>${i}</td><td class="num">${e.old_start}..${e.old_end}</td>` +
+      `<td class="num">${e.new_start}..${e.new_end}</td><td>${what}</td></tr>`;
+  }).join('') + `</table>`;
+}
+function rowKindTable() {
+  const kinds = {};
+  for (const r of BENCH.rows) kinds[r.type] = (kinds[r.type] || 0) + 1;
+  return `<table><tr><th>row</th><th class="num">count</th><th>drawn as</th></tr>` +
+    `<tr><td>file header</td><td class="num">${kinds.file || 0}</td><td>path, +adds, −dels</td></tr>` +
+    `<tr><td>hunk header</td><td class="num">${kinds.hunk || 0}</td><td>the <code>@@</code> line</td></tr>` +
+    `<tr><td>line</td><td class="num">${kinds.line || 0}</td><td>two gutters, a sign column, one StyledText</td></tr></table>`;
+}
+function refTable() {
+  return `<table><tr><th class="num">i</th><th>owner</th><th class="num">index</th><th>row</th></tr>` +
+    BENCH.rows.map((r, i) => `<tr><td class="num">${i}</td><td>0 <span style="color:var(--ghost)">TextRows</span></td>` +
+      `<td class="num">${i}</td><td style="color:var(--faint)">${r.type}</td></tr>`).join('') + `</table>`;
+}
+
+function drawBench() {
+  $('#bench-stages').innerHTML = STAGES.map((s, i) =>
+    `<button class="b" data-stage="${i}" aria-pressed="${i === benchStage}">${i + 1} ${s[0]}</button>`).join('');
+  const [name, fn, what] = STAGES[benchStage];
+  $('#bench-what').innerHTML =
+    `<p style="margin:0 0 12px"><span class="m" style="color:var(--amber)">${fn}</span> — ${what}. ` +
+    (benchStage < 5 ? `Runs once, at load.`
+      : `<b>The only stage on the render path</b>, per visible row per frame.`) + `</p>`;
+  const out = $('#bench-out');
+
+  if (benchStage === 0) {
+    out.innerHTML = `<div class="rows" style="padding:6px 10px;margin-bottom:12px">
+      <div class="r"><span class="t" style="color:var(--faint)">:100644 100644 <span style="color:var(--k-const)">a1b2c3d</span> <span style="color:var(--k-const)">9f8e7d6</span> M&#9;${BENCH_PATH}</span></div></div>
+      <div class="cols two"><div><h4>old — blob a1b2c3d</h4><div class="rows">` +
+      BENCH_OLD.map((t, i) => `<div class="r ctx"><span class="n">${i + 1}</span><span class="s"></span><span class="t">${esc(t)}</span></div>`).join('') +
+      `</div></div><div><h4>new — blob 9f8e7d6</h4><div class="rows">` +
+      BENCH_NEW.map((t, i) => `<div class="r ctx"><span class="n">${i + 1}</span><span class="s"></span><span class="t">${esc(t)}</span></div>`).join('') +
+      `</div></div></div>
+      <p class="note">No unified diff anywhere yet. A blob's content never changes, so the pair of OIDs
+      makes this cacheable forever.</p>`;
+  } else if (benchStage === 1) {
+    out.innerHTML = `<div class="cols two"><div><h4>edit script — histogram, ${BENCH.work} steps</h4>` +
+      editTable(BENCH.edits) + `</div><div><h4>hunks, with git's own header rules</h4><div class="rows">` +
+      BENCH.hunks.map((h) => `<div class="r hunk"><span class="t">${esc(h.header)}</span></div>` +
+        h.lines.map((l) => `<div class="r ${CLS[l.kind]}"><span class="n">${l.old_no ?? ''}</span><span class="n">${l.new_no ?? ''}</span><span class="s">${SIGN[l.kind]}</span><span class="t">${esc(l.text)}</span></div>`).join('')).join('') +
+      `</div></div></div>`;
+  } else if (benchStage === 2) {
+    const pairs = BENCH.hunks[0].pairs;
+    out.innerHTML = `<div class="rows">` + BENCH.hunks[0].lines.map((l) => {
+      let under = '';
+      if (l.spans.length) {
+        let at = 0, s = '';
+        for (const sp of l.spans) { s += ' '.repeat(sp.start - at) + '~'.repeat(sp.end - sp.start); at = sp.end; }
+        under = `<div class="r"><span class="n"></span><span class="n"></span><span class="s"></span><span class="t" style="color:var(--amber)">${s}</span></div>`;
+      }
+      return `<div class="r ${CLS[l.kind]}"><span class="n">${l.old_no ?? ''}</span><span class="n">${l.new_no ?? ''}</span><span class="s">${SIGN[l.kind]}</span><span class="t">${esc(l.text)}<span style="color:var(--ghost)">   ${l.tokens.length} tokens</span></span></div>` + under;
+    }).join('') + `</div>
+    <p class="note"><b>${pairs.length} replace-pair${pairs.length === 1 ? '' : 's'}</b> matched by position, each
+    word-diffed on its own; amber marks the spans. Clipping came first, so no span and no token can point
+    past what will be drawn — there is a test for exactly that ordering.</p>`;
+  } else if (benchStage === 3) {
+    out.innerHTML = `<div class="rows" style="padding:6px 10px">
+      <div class="r"><span class="t"><span style="color:var(--k-type)">TextRows</span>.claims(<span style="color:var(--k-str)">"${BENCH_PATH}"</span>) → <span style="color:var(--l5)">true</span>   <span style="color:var(--k-comment)">// claims everything: the fallback</span></span></div>
+      <div class="r"><span class="t"><span style="color:var(--k-type)">MarkdownRows</span>.claims(…) → <span style="color:var(--l4)">false</span>   <span style="color:var(--k-comment)">// wants .md, .markdown, .mdx</span></span></div>
+      </div>
+      <p style="margin:14px 0 0">The last registered claimant wins, so a specialist takes
+      <code>.png</code> without the generalist knowing it exists. What arrives in <code>build</code> is
+      already clipped, intraline-diffed and highlighted — an implementation draws; it does not redo any of
+      that. It keeps its own storage and answers by index.</p>
+      <div style="margin-top:14px">${rowKindTable()}</div>`;
+  } else if (benchStage === 4) {
+    out.innerHTML = `<div class="cols two"><div><h4>the order table</h4>` + refTable() + `</div>
+      <div><h4>what it costs</h4>
+      <p>${BENCH.rows.length} rows here; the deletion fixture has 713,996. At 8 bytes a row that is
+      <b>5.7 MB of flat index</b> against 714k allocations to chase on every scroll.</p>
+      <p style="margin:0">The rows themselves live in whichever implementation built them, so
+      <code>u16</code> is the renderer and <code>u32</code> the index into its own storage.</p></div></div>`;
+  } else {
+    out.innerHTML = benchRows(MIN_CONTRAST) +
+      `<div class="legend">
+        <span><i style="background:${hex(SURFACE_BG.Added)}"></i>added line</span>
+        <span><i style="background:${hex(SURFACE_BG.AddedWord)}"></i>changed word</span>
+        <span><i style="background:${hex(SURFACE_BG.Removed)}"></i>removed line</span>
+        <span><i style="background:${hex(SURFACE_BG.RemovedWord)}"></i>changed word</span>
+        <span><i style="background:${hex(SYNTAX.Comment.fg)}"></i>comment, lifted for its surface</span>
+      </div>
+      <p class="note">Every colour on this row came out of <code>Theme</code> as a
+      <code>0xRRGGBB</code> number, resolved against the background it landed on. The ANSI painter in
+      <code>core/examples/paint.rs</code> reads the same numbers and draws the same diff in a terminal —
+      that is the test that the boundary still holds.</p>`;
+  }
+}
+$('#bench-stages').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-stage]');
+  if (!b) return;
+  benchStage = +b.dataset.stage;
+  drawBench();
+});
+drawBench();
+
+/* ============================================================== crate map */
+const CRATES = {
+  core: { name: 'plait-core', deps: 'zero dependencies, and [dependencies] is empty on purpose',
+    files: [
+      ['lib.rs', 'commit and diff parsing, assign_lanes, intraline, replace_pairs, initials'],
+      ['differ.rs', 'the Differ seam: histogram, patience, myers, hunk assembly, the registry'],
+      ['align.rs', 'which removed line sits opposite which added one, for a two-column view'],
+      ['prepared.rs', 'a diff assembled into drawable rows: clip → intraline → syntax'],
+      ['markdown.rs', 'a .md diff as blocks, with the markers cut and the ranges moved'],
+      ['syntax.rs', 'the scanner, the language tables, the Highlighter trait, routing, Markdown'],
+      ['theme.rs', 'every colour, as 0xRRGGBB data, plus contrast resolution'],
+      ['font.rs', 'the face as data: family, size, and whether a char is a column'],
+      ['host.rs', 'the struct that holds the swappable pieces'],
+    ],
+    note: 'Four examples double as the headless test bench: bench (timings at fixture scale), shape (topology statistics), verify (lane invariants), paint (the diff view in ANSI). 139 tests, 0.55 s.' },
+  git: { name: 'plait-git', deps: 'the only crate that talks to a repository',
+    files: [
+      ['log', '--topo-order, always. Lane assignment assumes it.'],
+      ['pairs', 'git diff --raw -z -M, then one cat-file --batch for every blob'],
+      ['diff', 'the pairs, through whichever Differ the host routed each path to'],
+      ['describe', 'a short label for the window title'],
+    ],
+    note: 'Reads are meant to move to gix; writes stay on the git binary permanently, because shelling out is what gets hooks, credential helpers and .gitconfig semantics exactly right. Both behind one surface, so a frontend never learns which path ran.' },
+  shell: { name: 'plait-shell', deps: 'GPUI. Drawing and input, and as little else as possible.',
+    files: [
+      ['main.rs', 'argument parsing, data loading, the window, the Host'],
+      ['views/diff.rs', 'the Rows seam, TextRows, run-list merging, the shared row furniture'],
+      ['views/markdown.rs', 'MarkdownRows: the rendered-Markdown presentation, and its metrics'],
+      ['views/split.rs', 'SplitRows: the same prepared lines, in two columns'],
+      ['views/commits.rs', 'the commit list, author initials, row layout'],
+      ['graph.rs', 'lane geometry and painting: quads, paths, one canvas per row'],
+      ['config.rs', 'plait.toml: parse, apply, watch, and the live Host global'],
+      ['session.rs', 'the row you were on, so ./dev.sh can put you back after a restart'],
+      ['stats.rs', 'the counting allocator and the PLAIT_STATS overlay'],
+    ],
+    note: 'GPUI notes worth knowing: interactivity requires identity — .id() before .overflow_y_scroll(), clicks, hover, drag. uniform_list for anything long, and point it at the widest row with with_width_from_item, because it measures exactly ONE row to decide its scrollable width and defaults to row 0.' },
+};
+let crate_ = 'core';
+function drawCrateMap() {
+  $('#cratemap').innerHTML = `<div class="rows" style="padding:10px 12px">
+    <div class="r"><span class="t"><span style="color:var(--faint)">a repository</span>  ──►  <button class="b ${crate_ === 'git' ? 'on' : ''}" data-crate="git">plait-git</button>  ──► <span style="color:var(--k-comment)">data</span> ──►  <button class="b ${crate_ === 'core' ? 'on' : ''}" data-crate="core">plait-core</button></span></div>
+    <div class="r"><span class="t">                                                              │</span></div>
+    <div class="r"><span class="t">                                          <span style="color:var(--k-comment)">rows, colours</span>       │</span></div>
+    <div class="r"><span class="t">                                    ┌─────────────────────────┴──────────┐</span></div>
+    <div class="r"><span class="t">                                    <button class="b ${crate_ === 'shell' ? 'on' : ''}" data-crate="shell">plait-shell</button>  <span style="color:var(--faint)">GPUI</span>      <span style="color:var(--faint)">examples/paint.rs — ANSI, headless</span></span></div>
+    <div class="r"><span class="t">                                                                        <span style="color:var(--ghost)">(and a cli/, one day)</span></span></div>
+  </div>`;
+  const c = CRATES[crate_];
+  $('#crateinfo').innerHTML = `<h3 style="margin:0 0 2px">${c.name}</h3>
+    <p style="margin:0 0 12px;color:var(--amber);font-family:var(--mono);font-size:12px">${c.deps}</p>
+    <table>${c.files.map(([f, w]) => `<tr><td style="white-space:nowrap"><b>${f}</b></td><td>${w}</td></tr>`).join('')}</table>
+    <p class="note" style="margin-top:0">${c.note}</p>`;
+}
+$('#cratemap').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-crate]');
+  if (!b) return;
+  crate_ = b.dataset.crate;
+  drawCrateMap();
+});
+drawCrateMap();
+
+$('#hostbox').innerHTML = `<div class="rows" style="padding:6px 10px">
+  <div class="r"><span class="t"><span style="color:var(--k-key)">pub struct</span> <span style="color:var(--k-type)">Host</span> {</span></div>
+  <div class="r"><span class="t">    <span style="color:var(--k-key)">pub</span> syntax: <span style="color:var(--k-type)">Highlighters</span>,  <span style="color:var(--k-comment)">// which highlighter each path gets</span></span></div>
+  <div class="r"><span class="t">    <span style="color:var(--k-key)">pub</span> differ: <span style="color:var(--k-type)">Differs</span>,       <span style="color:var(--k-comment)">// which algorithm, and how much context</span></span></div>
+  <div class="r"><span class="t">    <span style="color:var(--k-key)">pub</span> layout: <span style="color:var(--k-type)">String</span>,        <span style="color:var(--k-comment)">// the presentation, by name — "unified"</span></span></div>
+  <div class="r"><span class="t">    <span style="color:var(--k-key)">pub</span> theme:  <span style="color:var(--k-type)">Theme</span>,         <span style="color:var(--k-comment)">// every colour the app draws</span></span></div>
+  <div class="r"><span class="t">    <span style="color:var(--k-key)">pub</span> font:   <span style="color:var(--k-type)">Font</span>,          <span style="color:var(--k-comment)">// the face, and the numbers from it</span></span></div>
+  <div class="r"><span class="t">}</span></div>
+</div>
+<p style="margin:12px 0 0;font-size:12.5px" class="note"><b>Why <code>layout</code> is a
+<code>String</code> and not a type:</b> <code>core</code> never knows a UI exists and a presentation
+returns UI elements, so the registry of them is a frontend's. This is the frontend's <em>choice</em> out
+of it, which is data — the same reason <code>theme.name</code> is a string. Unrecognised is the
+frontend's problem to report, not core's to prevent.</p>`;
+
+/* =============================================================== differ lab */
+const DPRESETS = [
+  { old: 'def load(path):\n    with open(path) as f:\n        return f.read()\n\ndef save(path, data):\n    with open(path, "w") as f:\n        f.write(data)\n\ndef sync(path, data):\n    with open(path, "a") as f:\n        f.write(data)',
+    new: 'def load(path):\n    with open(path) as f:\n        return f.read()\n\ndef sync(path, data):\n    with open(path, "a") as f:\n        f.write(data)\n\ndef save(path, data):\n    with open(path, "w") as f:\n        f.write(data)' },
+  { old: 'fn dispatch(ev: Event) -> Result<()> {\n    let budget = 64;\n    for ext in self.enabled() {\n        ext.run(ev)?;\n    }\n    Ok(())\n}',
+    new: 'fn dispatch(ev: Event) -> Result<()> {\n    let budget = 12;\n    for ext in self.enabled() {\n        self.pool.submit(ev)?;\n    }\n    Ok(())\n}' },
+  { old: 'one\ntwo\nthree\nfour\nfive', new: 'alpha\nbeta\ngamma\ndelta' },
+];
+let dalgo = 'histogram';
+function drawDiffer() {
+  const old = $('#dold').value.replace(/\n+$/, '').split('\n');
+  const nw = $('#dnew').value.replace(/\n+$/, '').split('\n');
+  const ctx = +$('#dctx').value;
+  $('#dctxv').textContent = ctx;
+  const { edits, work, fallbacks } = diff(dalgo, old, nw);
+  const hs = hunks(old, nw, edits, ctx);
+  let rebuilt = [], o = 0;
+  for (const e of edits) {
+    rebuilt = rebuilt.concat(old.slice(o, e.old_start), nw.slice(e.new_start, e.new_end));
+    o = e.old_end;
+  }
+  rebuilt = rebuilt.concat(old.slice(o));
+  const ok = rebuilt.join('\n') === nw.join('\n');
+  const changed = edits.reduce((n, e) => n + (e.old_end - e.old_start) + (e.new_end - e.new_start), 0);
+  $('#dstats').innerHTML =
+    `<span class="pill">edits <b>${edits.length}</b></span>` +
+    `<span class="pill">changed lines <b>${changed}</b></span>` +
+    `<span class="pill">hunks <b>${hs.length}</b></span>` +
+    `<span class="pill">steps spent <b>${work}</b></span>` +
+    `<span class="pill">${fallbacks ? 'regions handed to myers <b>' + fallbacks + '</b>' : 'no myers fallback'}</span>` +
+    `<span class="pill ${ok ? 'ok' : 'warn'}">${ok ? '✓ the script applies' : '✗ script does not apply'}</span>`;
+  $('#dedits').innerHTML = edits.length ? editTable(edits)
+    : `<p style="margin:0;color:var(--faint)">No edits — the two sides are identical.</p>`;
+  $('#dhunks').innerHTML = `<div class="rows">` + (hs.length ? hs.map((h) =>
+    `<div class="r hunk"><span class="t">${esc(h.header)}</span></div>` +
+    h.lines.map((l) => `<div class="r ${CLS[l.kind]}"><span class="n">${l.old_no ?? ''}</span>` +
+      `<span class="n">${l.new_no ?? ''}</span><span class="s">${SIGN[l.kind]}</span>` +
+      `<span class="t">${esc(l.text)}</span></div>`).join('')).join('')
+    : `<div class="r ctx"><span class="t" style="color:var(--faint)">nothing to show</span></div>`) + `</div>`;
+}
+function loadDPreset(i) {
+  $('#dold').value = DPRESETS[i].old;
+  $('#dnew').value = DPRESETS[i].new;
+  drawDiffer();
+}
+$$('[data-algo]').forEach((b) => b.addEventListener('click', () => {
+  dalgo = b.dataset.algo; press('[data-algo]', dalgo, 'algo'); drawDiffer();
+}));
+$$('[data-dpreset]').forEach((b) => b.addEventListener('click', () => loadDPreset(+b.dataset.dpreset)));
+['#dold', '#dnew'].forEach((s) => $(s).addEventListener('input', drawDiffer));
+$('#dctx').addEventListener('input', drawDiffer);
+loadDPreset(0);
+
+/* ============================================================ intraline lab */
+const IPRESETS = [
+  ['    - bash cicd/pipeline/run-all-checks.sh;', '    # Collect every check failure before exiting so one bad check does'],
+  ['# Collect the failures first', '# Collect every check failure before exiting'],
+  ['#define ZIG_DECL AUTO_EXTERN_C_ZIG', '#define RUST_DECL AUTO_EXTERN_C_RUST'],
+  ['a keep b', 'x keep y'],
+  ['if !ext.Handles(ev.Kind) {', 'if !ext.Handles(ev.Kind) || h.budget.Exhausted() {'],
+];
+function drawIntraline() {
+  const oldS = $('#iold').value, newS = $('#inew').value;
+  const floor = +$('#ifloor').value / 100;
+  const doCoal = $('#icoal').getAttribute('aria-pressed') === 'true';
+  $('#ifloorv').textContent = floor.toFixed(2);
+  const r = intraline(oldS, newS, { floor, coalesce: doCoal });
+  const pct = Math.round(r.similarity * 100);
+  const bar = `<div style="height:6px;background:#100f0e;border:1px solid var(--rule);border-radius:2px;position:relative;margin:6px 0 10px;max-width:420px">
+      <div style="position:absolute;inset:0 auto 0 0;width:${pct}%;background:${r.bailed === 'similarity' ? 'var(--dels)' : 'var(--adds)'}"></div>
+      <div style="position:absolute;top:-4px;bottom:-4px;left:${Math.round(floor * 100)}%;width:1px;background:var(--amber)"></div>
+    </div>`;
+  const rows = [
+    { kind: 'Removed', old_no: 42, new_no: null, text: oldS, spans: r.old, tokens: [] },
+    { kind: 'Added', old_no: null, new_no: 42, text: newS, spans: r.new, tokens: [] },
+  ];
+  $('#iout').innerHTML =
+    `<div style="display:flex;gap:14px;flex-wrap:wrap;align-items:baseline">
+      <span class="pill">tokens <b>${r.a.length}</b> / <b>${r.b.length}</b></span>
+      <span class="pill">LCS table <b>${((r.a.length + 1) * (r.b.length + 1)).toLocaleString()}</b> cells</span>
+      <span class="pill">similarity <b>${r.similarity.toFixed(3)}</b></span>
+      <span class="pill ${r.bailed ? 'warn' : 'ok'}">${r.bailed === 'similarity'
+        ? 'below the floor — no word highlighting' : r.bailed === 'tokens'
+        ? 'over MAX_INTRALINE_TOKENS — no word highlighting'
+        : r.old.length + r.new.length + ' spans'}</span>
+    </div>${bar}<div class="rows">${rows.map((l) => lineRow(l)).join('')}</div>` + lcsGrid(r);
+}
+function lcsGrid(r) {
+  if (!r.lcs || r.a.length > 22 || r.b.length > 22) {
+    return `<p class="note">The LCS table is ${r.a.length}×${r.b.length} here; the grid is drawn when both
+      sides are under 22 tokens. That product is the whole reason
+      <code>MAX_INTRALINE_TOKENS = 1000</code> exists — a 14k-token line would be 196 million cells.</p>`;
+  }
+  const cw = 15, ch = 15, padL = 8, padT = 8;
+  const w = padL + r.b.length * cw + 96, h = padT + r.a.length * ch + 8;
+  let cells = '';
+  const max = r.lcs[0][0] || 1;
+  for (let i = 0; i < r.a.length; i++) {
+    for (let j = 0; j < r.b.length; j++) {
+      const v = r.lcs[i][j];
+      const match = r.a[i][1] === r.b[j][1];
+      const alpha = 0.08 + 0.62 * (v / max);
+      cells += `<rect x="${padL + j * cw}" y="${padT + i * ch}" width="${cw - 1}" height="${ch - 1}" ` +
+        `fill="${match ? '#dfa851' : '#6f9ecf'}" opacity="${match ? Math.min(1, alpha + .2) : alpha * .55}"></rect>`;
+    }
+  }
+  return `<figure style="margin:14px 0 0"><h4>the LCS table — amber where the two tokens are equal</h4>
+    <svg viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" role="img"
+      aria-label="LCS table, ${r.a.length} by ${r.b.length} cells">${cells}
+      <text x="${padL + r.b.length * cw + 6}" y="${padT + 10}" fill="#6e6862" font-size="9">corner = ${r.lcs[0][0]}</text>
+    </svg>
+    <figcaption>The corner is the length of the longest common subsequence, so the similarity of the pair
+    is <b>already paid for</b> — <code>2·LCS / (len_a + len_b)</code>, no second pass.</figcaption></figure>`;
+}
+$$('[data-ipreset]').forEach((b) => b.addEventListener('click', () => {
+  const [o, n] = IPRESETS[+b.dataset.ipreset];
+  $('#iold').value = o; $('#inew').value = n; drawIntraline();
+}));
+['#iold', '#inew'].forEach((s) => $(s).addEventListener('input', drawIntraline));
+$('#ifloor').addEventListener('input', drawIntraline);
+$('#icoal').addEventListener('click', () => {
+  const on = $('#icoal').getAttribute('aria-pressed') === 'true';
+  $('#icoal').setAttribute('aria-pressed', String(!on));
+  $('#icoal').classList.toggle('on', !on);
+  drawIntraline();
+});
+$('#iold').value = IPRESETS[1][0]; $('#inew').value = IPRESETS[1][1];
+drawIntraline();
+
+/* ============================================================== scanner lab */
+let lang = 'rs';
+const LRULES = ['line_needs_boundary', 'quote_after_eq', 'capitalized_types', 'call_heuristic', 'nested_block'];
+const loff = new Set();
+function drawScanner() {
+  const spec = { ...LANGS[lang].syn };
+  for (const r of LRULES) if (loff.has(r)) spec[r] = false;
+  const syn = syntax(spec);
+  const src = $('#lsrc').value;
+  const lines = src.split('\n');
+  const toks = lex(src, syn);
+  let off = 0;
+  const per = lines.map((l) => { const s = off; off += l.length + 1; return { s, e: s + l.length, t: [] }; });
+  for (const t of toks) for (const b of per) {
+    if (t.end <= b.s || t.start >= b.e) continue;
+    b.t.push({ start: Math.max(t.start, b.s) - b.s, end: Math.min(t.end, b.e) - b.s, kind: t.kind });
+  }
+  const coloured = per.reduce((n, b) => n + b.t.reduce((m, t) => m + (t.end - t.start), 0), 0);
+  $('#lrules').innerHTML = `<span class="lbl">rules</span>` + LRULES.map((r) => {
+    const has = !!LANGS[lang].syn[r];
+    return `<button class="b ${has && !loff.has(r) ? 'on' : ''}" data-rule="${r}" ${has ? '' : 'disabled style="opacity:.35"'}
+      aria-pressed="${has && !loff.has(r)}">${r}</button>`;
+  }).join('') + `<span class="pill" style="margin-left:8px">tokens <b>${toks.length}</b></span>` +
+    `<span class="pill">coloured <b>${src.length ? Math.round((coloured / src.length) * 100) : 0}%</b> of bytes</span>`;
+  $('#lout').innerHTML = `<div class="rows" style="margin-top:12px">` + per.map((b, i) =>
+    `<div class="r ctx"><span class="n">${i + 1}</span><span class="s"></span>` +
+    `<span class="t">${rowText(lines[i], b.t, [], 'Context')}</span></div>`).join('') + `</div>`;
+  const used = [...new Set(toks.map((t) => t.kind))];
+  $('#llegend').innerHTML = used.map((k) =>
+    `<span><i style="background:${hex(styleOn(k, 'Context').fg)}"></i>${k}</span>`).join('') ||
+    '<span>no tokens — nothing in this text can open anything</span>';
+}
+$$('[data-lang]').forEach((b) => b.addEventListener('click', () => {
+  lang = b.dataset.lang; press('[data-lang]', lang, 'lang');
+  loff.clear();
+  $('#lsrc').value = LANGS[lang].src;
+  drawScanner();
+}));
+$('#lrules').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-rule]');
+  if (!b || b.disabled) return;
+  const r = b.dataset.rule;
+  loff.has(r) ? loff.delete(r) : loff.add(r);
+  drawScanner();
+});
+$('#lsrc').addEventListener('input', drawScanner);
+$('#lsrc').value = LANGS.rs.src;
+drawScanner();
+
+$('#kindgrid').innerHTML = `<div class="rows" style="padding:4px 0">` + [
+  ['Comment', '// a comment'], ['Str', '"a string"'], ['Number', '0xFF_u32'], ['Keyword', 'impl'],
+  ['Type', 'GraphRow'], ['Constant', 'MAX_LANES'], ['Func', 'assign_lanes'], ['Property', '.pool'],
+  ['Heading', '## a heading'], ['Strong', 'strong'], ['Emphasis', 'emphasis'], ['Link', '[link](url)'],
+].map(([k, sample]) => {
+  const st = styleOn(k, 'Context');
+  return `<div class="r ctx"><span class="n" style="width:82px;text-align:left;padding-left:10px;color:var(--ghost)">${k}</span>` +
+    `<span class="s"></span><span class="t" style="color:${hex(st.fg)};${st.bold ? 'font-weight:700;' : ''}${st.italic ? 'font-style:italic' : ''}">${esc(sample)}</span></div>`;
+}).join('') + `</div>`;
+
+/* =================================================================== charts */
+// Hand-rolled SVG. One axis, thin marks, rounded data-ends, 2px gaps between
+// fills, direct labels, and a table under every figure.
+function barPath(x, y, w, h, r) {
+  r = Math.max(0, Math.min(r, w, h / 2));
+  return `M${x},${y}h${w - r}a${r},${r} 0 0 1 ${r},${r}v${h - 2 * r}a${r},${r} 0 0 1 ${-r},${r}H${x}z`;
+}
+function wireTips(el) {
+  $$('[data-tip]', el).forEach((n) => {
+    n.addEventListener('mousemove', (e) => showTip(e, n.dataset.tip));
+    n.addEventListener('mouseleave', hideTip);
+  });
+}
+function hbars(el, { rows, unit, labelW = 108, barH = 13, gap = 9, valueFmt }) {
+  const max = Math.max(...rows.map((r) => r.value));
+  const plotW = 320, h = rows.length * (barH + gap) + 6;
+  const fmt = valueFmt || ((v) => v.toLocaleString());
+  let s = `<svg viewBox="0 0 ${labelW + plotW + 86} ${h}" width="100%" height="${h}" role="img">`;
+  rows.forEach((r, i) => {
+    const y = i * (barH + gap) + 2;
+    const w = Math.max(1.5, (r.value / max) * plotW);
+    s += `<text x="${labelW - 8}" y="${y + barH - 2}" text-anchor="end" font-size="11" fill="#a39c93">${r.label}</text>`;
+    s += `<path d="${barPath(labelW, y, w, barH, 4)}" fill="${r.color}" opacity="${r.dim ? .5 : 1}"
+      data-tip="${r.label}: ${fmt(r.value)} ${unit}${r.note ? '\n' + r.note : ''}"></path>`;
+    s += `<text x="${labelW + w + 7}" y="${y + barH - 2}" font-size="11" fill="${r.dim ? '#6e6862' : '#e8e3dc'}"
+      font-variant-numeric="tabular-nums">${fmt(r.value)}</text>`;
+  });
+  s += `</svg><div style="font-size:10.5px;color:var(--ghost);margin-top:2px">${unit}</div>`;
+  el.innerHTML = s;
+  wireTips(el);
+}
+function numbersTable(headers, rows) {
+  return `<details><summary>show the numbers</summary><table><tr>` +
+    headers.map((h, i) => `<th class="${i ? 'num' : ''}">${h}</th>`).join('') + `</tr>` +
+    rows.map((r) => `<tr>` + r.map((c, i) => `<td class="${i ? 'num' : ''}">${c}</td>`).join('') + `</tr>`).join('') +
+    `</table></details>`;
+}
+
+(function () {
+  const el = $('#chart-throughput');
+  const box = document.createElement('div');
+  el.appendChild(box);
+  hbars(box, {
+    unit: 'MB/s, whole files of real Rust',
+    rows: [
+      { label: 'table scanner', value: 212, color: '#dfa851', note: '77 µs p50 per 28 KB file · 0 init · +0 RSS' },
+      { label: 'tree-sitter, parse', value: 12.5, color: '#8a7350', note: '+7.7 MB RSS' },
+      { label: 'ts, parse + query', value: 7.1, color: '#8a7350', note: '2–21 ms of query compilation per grammar' },
+      { label: 'syntect, fancy-regex', value: 0.4, color: '#5c4e38', dim: true, note: '39 ms p50 per file · +15 MB RSS' },
+    ],
+    valueFmt: (v) => (v < 1 ? v.toFixed(1) : v.toLocaleString()),
+  });
+  el.insertAdjacentHTML('beforeend', numbersTable(
+    ['engine', 'MB/s', 'lines/s', 'p50 / file', 'p99', 'RSS'],
+    [['table scanner', '212–227', '6.2 M', '77 µs', '1.3 ms', '+0'],
+     ['tree-sitter, parse only', '12.5', '358 k', '1.4 ms', '22 ms', '+7.7 MB'],
+     ['tree-sitter, parse + query', '7.1–7.6', '217 k', '2.2 ms', '34 ms', '+8 MB'],
+     ['tree-sitter-highlight', '7.1', '204 k', '2.4 ms', '38 ms', '+8 MB'],
+     ['syntect, fancy-regex', '0.4', '12.5 k', '39 ms', '674 ms', '+15 MB']]));
+})();
+
+(function () {
+  const el = $('#chart-fragment');
+  const inputs = [
+    { label: 'whole files', ts: 7.1, sc: 211.8, tsSpans: 142.9, scSpans: 49.8, errs: 8 },
+    { label: '12 of every 40 lines', ts: 2.8, sc: 201.1, tsSpans: 124.1, scSpans: 50.3, errs: 316 },
+    { label: '6 of every 40 lines', ts: 2.6, sc: 195.7, tsSpans: 114.4, scSpans: 50.4, errs: 333 },
+  ];
+  const labelW = 120, plotW = 250, barH = 11, pairGap = 2, grpGap = 14;
+  const max = 150;
+  const h = inputs.length * (barH * 2 + pairGap + grpGap);
+  let s = `<svg viewBox="0 0 ${labelW + plotW + 90} ${h}" width="100%" height="${h}" role="img"
+    aria-label="spans per KB, scanner against tree-sitter, on whole files and on hunk-shaped fragments">`;
+  inputs.forEach((d, i) => {
+    const y = i * (barH * 2 + pairGap + grpGap);
+    s += `<text x="0" y="${y + barH}" font-size="11" fill="#a39c93">${d.label}</text>`;
+    const rows = [
+      { v: d.tsSpans, c: '#6f9ecf', n: 'tree-sitter', tip: `tree-sitter: ${d.tsSpans} spans/KB at ${d.ts} MB/s · ${d.errs} ERROR nodes` },
+      { v: d.scSpans, c: '#dfa851', n: 'scanner', tip: `scanner: ${d.scSpans} spans/KB at ${d.sc} MB/s` },
+    ];
+    rows.forEach((r, k) => {
+      const yy = y + k * (barH + pairGap);
+      const w = (r.v / max) * plotW;
+      s += `<path d="${barPath(labelW, yy, w, barH, 4)}" fill="${r.c}" data-tip="${r.tip}"></path>`;
+      s += `<text x="${labelW + w + 6}" y="${yy + barH - 1}" font-size="10.5" fill="#e8e3dc"
+        font-variant-numeric="tabular-nums">${r.v}</text>`;
+      if (i === 0) s += `<text x="${labelW + w + 40}" y="${yy + barH - 1}" font-size="10" fill="${r.c}">${r.n}</text>`;
+    });
+  });
+  s += `</svg><div style="font-size:10.5px;color:var(--ghost)">spans per KB — how much highlighting survives</div>`;
+  el.innerHTML = s;
+  wireTips(el);
+  el.insertAdjacentHTML('beforeend', numbersTable(
+    ['input', 'tree-sitter MB/s', 'spans/KB', 'ERROR nodes', 'scanner MB/s', 'spans/KB'],
+    inputs.map((d) => [d.label, d.ts, d.tsSpans, d.errs, d.sc, d.scSpans])));
+})();
+
+(function () {
+  const el = $('#chart-load');
+  const F = [
+    { label: 'pr33933.diff', lines: '20,831', parse: 1.6, syntax: 6.5, rest: 1.5 },
+    { label: 'md.diff', lines: '71,756', parse: 6.6, syntax: 12.9, rest: 77.8, note: 'intraline is 71.7 ms of the rest' },
+    { label: 'pr30698.diff', lines: '50,604', parse: 6.2, syntax: 35.6, rest: 63.3, note: 'intraline is 57.5 ms of the rest' },
+    { label: 'pr30683.diff', lines: '713,996', parse: 57.1, syntax: 237.3, rest: 51.4, note: '714k lines, near-pure deletion' },
+  ];
+  const seg = [['parse', 'parse', '#f0d9a8'], ['syntax', 'syntax pass', '#dfa851'], ['rest', 'clip + intraline', '#96703a']];
+  const max = Math.max(...F.map((f) => f.parse + f.syntax + f.rest));
+  const labelW = 116, plotW = 360, barH = 15, gap = 13;
+  const h = F.length * (barH + gap) + 20;
+  let s = `<svg viewBox="0 0 ${labelW + plotW + 70} ${h}" width="100%" height="${h}" role="img"
+    aria-label="parse and prepare, milliseconds, per fixture">`;
+  F.forEach((f, i) => {
+    const y = i * (barH + gap);
+    const total = f.parse + f.syntax + f.rest;
+    s += `<text x="${labelW - 8}" y="${y + barH - 3}" text-anchor="end" font-size="11" fill="#a39c93">${f.label}</text>`;
+    s += `<text x="${labelW - 8}" y="${y + barH + 9}" text-anchor="end" font-size="9.5" fill="#4a4540">${f.lines} lines</text>`;
+    let x = labelW;
+    seg.forEach(([k, name, c], j) => {
+      const w = (f[k] / max) * plotW;
+      const last = j === seg.length - 1;
+      s += `<path d="${last ? barPath(x, y, Math.max(w - 2, 1), barH, 4) :
+        `M${x},${y}h${Math.max(w - 2, 1)}v${barH}h${-Math.max(w - 2, 1)}z`}" fill="${c}"
+        data-tip="${f.label} — ${name}: ${f[k]} ms${f.note && last ? '\n' + f.note : ''}"></path>`;
+      x += w;
+    });
+    s += `<text x="${x + 6}" y="${y + barH - 3}" font-size="11" fill="#e8e3dc"
+      font-variant-numeric="tabular-nums">${total.toFixed(1)}</text>`;
+  });
+  s += `</svg><div style="display:flex;gap:14px;font-size:10.5px;color:var(--ghost);margin-top:4px">` +
+    seg.map(([, name, c]) => `<span><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:${c};margin-right:5px"></i>${name}</span>`).join('') +
+    `<span style="margin-left:auto">milliseconds</span></div>`;
+  el.innerHTML = s;
+  wireTips(el);
+  el.insertAdjacentHTML('beforeend', numbersTable(
+    ['fixture', 'diff lines', 'files', 'parse', 'prepare', 'of which syntax', 'tokens', 'scanned'],
+    [['pr33933.diff', '20,831', '35', '1.6 ms', '8.0 ms', '6.5 ms', '32,236', '115 MB/s'],
+     ['md.diff', '71,756', '229', '6.6 ms', '90.7 ms', '12.9 ms', '45,250', '258 MB/s'],
+     ['pr30698.diff', '50,604', '1,398', '6.2 ms', '98.9 ms', '35.6 ms', '122,237', '67 MB/s'],
+     ['pr30683.diff', '713,996', '1,375', '57.1 ms', '288.7 ms', '237.3 ms', '1,330,580', '114 MB/s']]));
+})();
+
+/* ================================================================ the graph */
+const TOPOS = [
+  { name: 'a merge', commits: [
+    ['a', ['b', 'c'], 'Ada Lovelace', "Merge branch 'pool'"],
+    ['b', ['d'], 'Grace Hopper', 'Cap the gutter at twelve lanes'],
+    ['c', ['d'], 'Ada Lovelace', 'Submit through the pool'],
+    ['d', [], 'Junio C Hamano', 'Initial commit'],
+  ] },
+  { name: 'linear', commits: [
+    ['a', ['b'], 'Grace Hopper', 'Resolve foregrounds against their background'],
+    ['b', ['c'], 'Grace Hopper', 'Darken the changed-word backgrounds'],
+    ['c', ['d'], 'Ada Lovelace', 'Add the contrast floor'],
+    ['d', [], 'Ada Lovelace', 'Initial commit'],
+  ] },
+  { name: 'two branches', commits: [
+    ['h', ['g', 'f'], 'Ada Lovelace', "Merge branch 'markdown'"],
+    ['g', ['e'], 'Ada Lovelace', 'Cut the markers from the tokens'],
+    ['f', ['e'], 'Grace Hopper', 'Route .md away from the scanner'],
+    ['e', ['d', 'c'], 'Junio C Hamano', "Merge branch 'scanner'"],
+    ['d', ['b'], 'Grace Hopper', 'Add the first-byte opener table'],
+    ['c', ['b'], 'Ada Lovelace', 'Give shell a word boundary'],
+    ['b', ['a'], 'Junio C Hamano', 'Lex one side of a hunk at a time'],
+    ['a', [], 'Junio C Hamano', 'Initial commit'],
+  ] },
+  { name: 'octopus', commits: [
+    ['o', ['p', 'q', 'r', 's'], 'Junio C Hamano', 'Merge four topics'],
+    ['p', ['z'], 'Ada Lovelace', 'Histogram, not Myers'],
+    ['q', ['z'], 'Grace Hopper', 'Patience, kept by name'],
+    ['r', ['z'], 'Ada Lovelace', 'Myers, linear space'],
+    ['s', ['z'], 'Grace Hopper', 'Bound every recursion'],
+    ['z', [], 'Junio C Hamano', 'Initial commit'],
+  ] },
+  { name: '16 lanes', commits: (() => {
+    const n = 16;
+    const kids = Array.from({ length: n }, (_, i) => 'p' + i);
+    const rows = [['m', kids, 'Junio C Hamano', 'An octopus of sixteen']];
+    kids.forEach((k, i) => rows.push([k, ['z'], 'Ada Lovelace', 'Topic ' + (i + 1)]));
+    rows.push(['z', [], 'Junio C Hamano', 'Initial commit']);
+    return rows;
+  })() },
+];
+let topo = 0, gstep = 1, ghue = true, gcap = true;
+
+// shell/src/graph.rs Hues: a colour per branch, released when the branch ends.
+function laneHues(rows) {
+  const of = [], live = new Array(LANE_HUES).fill(0);
+  let next = LANE_HUES - 1;
+  const claim = (lane) => {
+    if (of[lane] != null) return of[lane];
+    for (let i = 0; i < LANE_HUES; i++) {
+      next = (next + 1) % LANE_HUES;
+      if (live[next] === 0) break;
+    }
+    live[next]++;
+    of[lane] = next;
+    return next;
+  };
+  const release = (lane) => {
+    if (of[lane] != null) { live[of[lane]] = Math.max(0, live[of[lane]] - 1); of[lane] = null; }
+  };
+  return rows.map((r) => {
+    const own = claim(r.lane);
+    const mergeHues = {};
+    for (const m of r.merges) mergeHues[m] = claim(m);
+    for (const m of r.merges) release(m);
+    const forkHues = {};
+    for (const f of r.forks) forkHues[f] = claim(f);
+    if (r.snapshot[r.lane] == null) release(r.lane);
+    return { own, mergeHues, forkHues, of: of.slice() };
+  });
+}
+
+function drawGraph() {
+  const commits = TOPOS[topo].commits.map(([sha, parents, author, subject]) =>
+    ({ sha, parents, author, subject }));
+  const rows = assignLanes(commits);
+  const H = laneHues(rows);
+  const n = Math.min(gstep, rows.length);
+  $('#grow').textContent = n;
+  $('#grows').textContent = rows.length;
+
+  const CAP = 12, LW = 14, RH = 22, PAD = 8;
+  const maxLane = Math.max(...rows.slice(0, n).flatMap((r) => [r.lane, ...r.through, ...r.forks, ...r.merges]));
+  const shown = gcap ? Math.min(maxLane, CAP - 1) : maxLane;
+  const laneX = (l) => PAD + (gcap ? Math.min(l, CAP - 1) : l) * LW + LW / 2;
+  const hueOf = (row, lane, fallback) => {
+    if (gcap && lane >= CAP) return hex(LANE_OVERFLOW);
+    const h = ghue ? (fallback != null ? fallback : H[row].of[lane]) : lane % LANE_HUES;
+    return hex(LANES[(h == null ? lane : h) % LANES.length]);
+  };
+  const w = PAD * 2 + (shown + 1) * LW, h = n * RH + 4;
+  let g = '';
+  for (let i = 0; i < n; i++) {
+    const r = rows[i], c0 = commits[i], cy = i * RH + RH / 2 + 2;
+    const prev = i > 0 ? rows[i - 1] : null;
+    for (const l of r.through) {
+      g += `<rect x="${laneX(l) - 1}" y="${i * RH + 2}" width="2" height="${RH}" fill="${hueOf(i, l)}"></rect>`;
+    }
+    if (prev && prev.snapshot[r.lane] === c0.sha) {
+      g += `<rect x="${laneX(r.lane) - 1}" y="${i * RH + 2}" width="2" height="${RH / 2}" fill="${hueOf(i, r.lane, H[i].own)}"></rect>`;
+    }
+    if (r.snapshot[r.lane] != null) {
+      g += `<rect x="${laneX(r.lane) - 1}" y="${cy}" width="2" height="${RH / 2 + 2}" fill="${hueOf(i, r.lane, H[i].own)}"></rect>`;
+    }
+    for (const f of r.forks) {
+      const x0 = laneX(r.lane), x1 = laneX(f), y1 = cy + RH;
+      g += `<path d="M${x0},${cy} C${x0},${cy + RH / 2} ${x1},${cy + RH / 2} ${x1},${y1}"
+        fill="none" stroke="${hueOf(i, f, H[i].forkHues[f])}" stroke-width="2"></path>`;
+    }
+    for (const m of r.merges) {
+      const x0 = laneX(m), x1 = laneX(r.lane), y0 = cy - RH;
+      g += `<path d="M${x0},${y0} C${x0},${y0 + RH / 2} ${x1},${y0 + RH / 2} ${x1},${cy}"
+        fill="none" stroke="${hueOf(i, m, H[i].mergeHues[m])}" stroke-width="2"></path>`;
+    }
+    const rad = c0.parents.length > 1 || r.merges.length ? 5.5 : 4.5;
+    g += `<circle cx="${laneX(r.lane)}" cy="${cy}" r="${rad - 1}" fill="${hex(SURFACE_BG.Context)}"
+      stroke="${hueOf(i, r.lane, H[i].own)}" stroke-width="2"></circle>`;
+    g += `<text x="${w + 6}" y="${cy + 4}" font-size="11" fill="${i === n - 1 ? '#e8e3dc' : '#6e6862'}">${c0.sha} · ${esc(c0.subject)}</text>`;
+  }
+  $('#ggraph').innerHTML = `<svg viewBox="0 0 ${w + 320} ${h}" width="100%" height="${h}"
+    role="img" aria-label="commit graph, ${n} rows">${g}</svg>`;
+
+  const r = rows[n - 1], c = commits[n - 1];
+  const lanes = r.snapshot;
+  const liveN = lanes.filter(Boolean).length;
+  $('#gstate').innerHTML = `<div class="rows" style="padding:8px 10px">
+    <div class="r"><span class="t"><span style="color:var(--faint)">commit</span> <b>${c.sha}</b>  <span style="color:var(--faint)">parents</span> ${c.parents.join(' ') || '—'}</span></div>
+    <div class="r"><span class="t"><span style="color:var(--faint)">lane</span> <span style="color:${hueOf(n - 1, r.lane, H[n - 1].own)}">${r.lane}</span>   <span style="color:var(--faint)">through</span> [${r.through.join(', ')}]</span></div>
+    <div class="r"><span class="t"><span style="color:var(--faint)">merges</span> [${r.merges.join(', ')}]   <span style="color:var(--faint)">forks</span> [${r.forks.join(', ')}]</span></div>
+  </div>
+  <h4 style="margin-top:14px">lanes[] — the sha each lane is waiting to draw</h4>
+  <div class="rows" style="padding:8px 10px">` +
+    lanes.map((l, i) => `<div class="r"><span class="t"><span style="color:var(--faint)">[${String(i).padStart(2)}]</span> ` +
+      (l ? `<span style="color:${hueOf(n - 1, i)}">${l}</span>` : `<span style="color:var(--ghost)">·  free, and the next claim takes it</span>`) +
+      (gcap && i >= 12 ? `  <span style="color:${hex(LANE_OVERFLOW)}">past the cap — collapsed onto column 11</span>` : '') +
+      `</span></div>`).join('') + `</div>
+  <p style="margin:12px 0 0;font-size:12.5px" class="note">${liveN} live lane${liveN === 1 ? '' : 's'}
+  at this row. A lane is claimed by <code>claim_lane</code>, which takes the first free slot and only
+  grows the vector when there is none — which is why lane numbers are recycled, and why colouring by
+  lane index reads as one long-running branch.</p>`;
+}
+$$('[data-topo]').forEach((b) => b.addEventListener('click', () => {
+  topo = +b.dataset.topo; press('[data-topo]', b.dataset.topo, 'topo');
+  gstep = 1; drawGraph();
+}));
+$('#gnext').addEventListener('click', () => { gstep = Math.min(gstep + 1, TOPOS[topo].commits.length); drawGraph(); });
+$('#gprev').addEventListener('click', () => { gstep = Math.max(1, gstep - 1); drawGraph(); });
+$('#gall').addEventListener('click', () => { gstep = TOPOS[topo].commits.length; drawGraph(); });
+$('#ghue').addEventListener('click', () => {
+  ghue = !ghue;
+  $('#ghue').setAttribute('aria-pressed', String(ghue));
+  $('#ghue').classList.toggle('on', ghue);
+  $('#ghue').textContent = ghue ? 'hue per branch' : 'hue per lane index — wrong';
+  drawGraph();
+});
+$('#gcap').addEventListener('click', () => {
+  gcap = !gcap;
+  $('#gcap').setAttribute('aria-pressed', String(gcap));
+  $('#gcap').classList.toggle('on', gcap);
+  $('#gcap').textContent = gcap ? 'cap at 12 lanes' : 'no cap — the gutter eats the subject';
+  drawGraph();
+});
+drawGraph();
+
+(function () {
+  const sample = [
+    { sha: 'a1b2c3d', author: 'Junio C Hamano', subject: 'Refine the commit graph', lanes: 1 },
+    { sha: '9f8e7d6', author: 'Ada Lovelace', subject: 'Add the other thing', lanes: 2 },
+    { sha: '4c5d6e7', author: 'Grace Hopper', subject: "Merge branch 'x'", lanes: 2, merge: true },
+    { sha: '77aa11b', author: 'Junio C Hamano', subject: 'Deep in a wide merge fan', lanes: 4 },
+  ];
+  $('#commitrows').innerHTML = sample.map((c) => {
+    const w = c.lanes * 14 + 6;
+    let g = '';
+    for (let l = 0; l < c.lanes - 1; l++) g += `<rect x="${l * 14 + 6}" y="0" width="2" height="22" fill="${hex(LANES[l % 6])}"/>`;
+    g += `<circle cx="${(c.lanes - 1) * 14 + 7}" cy="11" r="${c.merge ? 4.5 : 3.5}" fill="${hex(SURFACE_BG.Context)}" stroke="${hex(LANES[(c.lanes - 1) % 6])}" stroke-width="2"/>`;
+    const ini = initials(c.author);
+    // theme.rs author(): fold over the bytes, wrapping u32, index the cycle.
+    const bytes = new TextEncoder().encode(c.author);
+    const hash = bytes.reduce((h, b) => (Math.imul(h, 31) + b) >>> 0, 0);
+    const col = AUTHORS[hash % AUTHORS.length];
+    return `<div class="r ctx" style="gap:0">
+      <span class="n" style="width:90px;text-align:left;padding-left:12px;color:var(--k-const)">${c.sha}</span>
+      <span class="n" style="width:26px;text-align:left;color:${hex(col)}">${ini}</span>
+      <span style="flex:none;width:${w}px"><svg width="${w}" height="22" style="display:block">${g}</svg></span>
+      <span class="t" style="padding-left:6px">${esc(c.subject)}</span></div>`;
+  }).join('');
+})();
+
+/* =========================================================== theme heatmap */
+const KINDS_ALL = Object.keys(SYNTAX);
+const SURFACES = ['Context', 'Added', 'Removed', 'AddedWord', 'RemovedWord'];
+const SURFACE_LABEL = { Context: 'context', Added: 'added', Removed: 'removed', AddedWord: 'added word', RemovedWord: 'removed word' };
+let tResolved = true;
+function drawHeat() {
+  const floor = +$('#tfloor').value / 10;
+  $('#tfloorv').textContent = floor.toFixed(1);
+  let fails = 0, worst = { r: 99 };
+  const head = `<tr><th></th>` + SURFACES.map((s) => `<th class="num">${SURFACE_LABEL[s]}</th>`).join('') + `</tr>`;
+  let body = '';
+  for (const k of KINDS_ALL) {
+    body += `<tr><td style="white-space:nowrap;color:var(--faint)">${k}</td>`;
+    for (const s of SURFACES) {
+      // "before the fix" is the palette as it shipped: no resolution, and the
+      // lighter changed-word backgrounds it was measured against.
+      const bg = tResolved ? SURFACE_BG[s] : (OLD_WORD_BG[s] ?? SURFACE_BG[s]);
+      const base = SYNTAX[k].fg;
+      const fg = tResolved ? readable(base, bg, floor).fg : base;
+      const ratio = contrast(fg, bg);
+      const bad = ratio < floor;
+      if (bad) fails++;
+      if (ratio < worst.r) worst = { r: ratio, k, s };
+      const st = SYNTAX[k];
+      body += `<td class="num" style="padding:0 2px 2px 0">
+        <div data-tip="${k} on ${SURFACE_LABEL[s]}\n${hex(base)} → ${hex(fg)} on ${hex(bg)}\ncontrast ${ratio.toFixed(2)}:1${bad ? '  ✗ below the floor' : ''}"
+          style="background:${hex(bg)};border:1px solid ${bad ? 'var(--dels)' : 'var(--rule)'};border-radius:2px;padding:3px 6px;text-align:right">
+          <span style="color:${hex(fg)};${st.bold ? 'font-weight:700;' : ''}${st.italic ? 'font-style:italic;' : ''}float:left">Aa</span>
+          <span style="color:${bad ? 'var(--dels)' : 'var(--faint)'};font-variant-numeric:tabular-nums">${ratio.toFixed(2)}</span>
+        </div></td>`;
+    }
+    body += `</tr>`;
+  }
+  $('#theatmap').innerHTML = `<table style="font-size:11px">${head}${body}</table>`;
+  $('#tfails').className = 'pill ' + (fails ? 'warn' : 'ok');
+  $('#tfails').innerHTML = fails
+    ? `<b>${fails}</b> of 60 below the floor · worst ${worst.k} on ${SURFACE_LABEL[worst.s]} at <b>${worst.r.toFixed(2)}:1</b>`
+    : `all 60 clear it · worst ${worst.k} on ${SURFACE_LABEL[worst.s]} at <b>${worst.r.toFixed(2)}:1</b>`;
+  wireTips($('#theatmap'));
+}
+$('#tmode').addEventListener('click', () => {
+  tResolved = !tResolved;
+  $('#tmode').setAttribute('aria-pressed', String(tResolved));
+  $('#tmode').classList.toggle('on', tResolved);
+  $('#tmode').textContent = tResolved ? 'as shipped — resolved' : 'before the fix — one colour per class';
+  drawHeat();
+});
+$('#tfloor').addEventListener('input', drawHeat);
+drawHeat();
+
+(function () {
+  const groups = [
+    ['diff', [['file_bg', 0x151312], ['file_fg', 0xe8e3dc], ['adds_fg', 0x6fbf73], ['dels_fg', 0xd4736b],
+      ['hunk_bg', 0x14181d], ['hunk_fg', 0x7d8fa8], ['gutter_fg', 0x4a4540], ['context_bg', 0x0e0d0c],
+      ['context_fg', 0xa39c93], ['added_bg', 0x16241a], ['added_fg', 0x9dc79b], ['added_word_bg', 0x1e3a23],
+      ['removed_bg', 0x2a1917], ['removed_fg', 0xd4a09a], ['removed_word_bg', 0x43201a],
+      ['absent_bg', 0x0a0908]]],
+    ['markdown', [['code_bar', 0x35302b], ['quote_bar', 0x4d5f6b], ['marker', 0x6e6862], ['rule', 0x3a352f]]],
+    ['chrome', [['bg', 0x0e0d0c], ['fg', 0xe8e3dc], ['dim', 0x6e6862], ['faint', 0x4a4540],
+      ['accent', 0xdfa851], ['title_bg', 0x151312], ['status_bg', 0x131211]]],
+    ['lanes', LANES.map((c, i) => ['lane ' + i, c]).concat([['lane_overflow', LANE_OVERFLOW]])],
+    ['authors', AUTHORS.map((c, i) => ['author ' + i, c])],
+  ];
+  $('#palette').innerHTML = groups.map(([g, cs]) =>
+    `<div style="margin-bottom:10px"><h4 style="margin:0 0 4px">${g} — ${cs.length}</h4>
+      <div style="display:flex;flex-wrap:wrap;gap:2px">` + cs.map(([n, c]) =>
+        `<span data-tip="${g}.${n}\n${hex(c)}" style="width:20px;height:20px;border-radius:2px;background:${hex(c)};border:1px solid var(--rule-2)"></span>`).join('') +
+    `</div></div>`).join('') +
+    `<div><h4 style="margin:0 0 4px">syntax — 12 styles, resolved across 5 surfaces</h4>
+      <div style="display:flex;flex-wrap:wrap;gap:2px">` + KINDS_ALL.map((k) =>
+        `<span data-tip="syntax.${k.toLowerCase()}\n${hex(SYNTAX[k].fg)}" style="width:20px;height:20px;border-radius:2px;background:${hex(SYNTAX[k].fg)};border:1px solid var(--rule-2)"></span>`).join('') +
+      `</div></div>`;
+  wireTips($('#palette'));
+})();
+
+/* ============================================== the runs sweep, per row */
+(function () {
+  const lines = BENCH.hunks[0].lines.filter((l) => l.tokens.length || l.spans.length);
+  let sel = lines.findIndex((l) => l.spans.length);
+  if (sel < 0) sel = 0;
+  function draw() {
+    $('#runsrows').innerHTML = `<div class="rows">` + lines.map((l, i) =>
+      `<div class="r ${CLS[l.kind]}" data-row="${i}" style="cursor:pointer;${i === sel ? 'outline:1px solid var(--amber);outline-offset:-1px' : ''}">
+        <span class="n">${l.old_no ?? ''}</span><span class="n">${l.new_no ?? ''}</span>
+        <span class="s">${SIGN[l.kind]}</span><span class="t">${rowText(l.text, l.tokens, l.spans, l.kind)}</span></div>`).join('') + `</div>`;
+    const l = lines[sel];
+    const rs = runs(l.text, l.tokens, l.spans, l.kind);
+    const cw = 7.4, pad = 4;
+    const w = Math.max(l.text.length * cw + 40, 200);
+    const band = (items, y, colour, label) => items.map((t) =>
+      `<rect x="${pad + t.start * cw}" y="${y}" width="${Math.max((t.end - t.start) * cw - 2, 2)}" height="7"
+        rx="2" fill="${colour(t)}" data-tip="${label(t)}"></rect>`).join('');
+    const svg = `<svg viewBox="0 0 ${w} 74" width="100%" height="74" role="img" aria-label="how the run list is built">
+      <text x="${pad}" y="9" font-size="9.5" fill="#6e6862">tokens — foreground</text>
+      ${band(l.tokens, 12, (t) => hex(styleOn(t.kind, 'Context').fg), (t) => `${t.kind}  ${t.start}..${t.end}`)}
+      <text x="${pad}" y="34" font-size="9.5" fill="#6e6862">spans — background</text>
+      ${band(l.spans, 37, () => hex(SURFACE_BG[l.kind === 'Added' ? 'AddedWord' : 'RemovedWord']), (t) => `changed words ${t.start}..${t.end}`)}
+      <text x="${pad}" y="59" font-size="9.5" fill="#dfa851">runs — one per segment, ${rs.length} of them</text>
+      ${rs.map((r) => `<rect x="${pad + r.start * cw}" y="62" width="${Math.max((r.end - r.start) * cw - 2, 2)}" height="7" rx="2"
+        fill="${r.kind ? hex(styleOn(r.kind, r.surface).fg) : '#4a4540'}"
+        stroke="${r.word ? hex(SURFACE_BG[r.surface]) : 'none'}" stroke-width="2"
+        data-tip="${r.start}..${r.end}\nfg: ${r.kind || 'none'} on ${SURFACE_LABEL[r.surface]}\nbg: ${r.word ? 'changed word' : 'the line'}"></rect>`).join('')}
+    </svg>`;
+    $('#runsview').innerHTML = svg +
+      `<p style="margin:8px 0 0;font-family:var(--prose);font-size:12.5px;color:var(--faint)">
+      ${l.tokens.length} tokens + ${l.spans.length} span${l.spans.length === 1 ? '' : 's'} →
+      <b style="color:var(--dim)">${rs.length} runs</b>, emitted in one sweep over their combined edges.
+      50 visible rows × ~15 runs is nothing; caching it for 714k rows costs 40× the rows themselves.</p>`;
+    wireTips($('#runsview'));
+  }
+  $('#runsrows').addEventListener('click', (e) => {
+    const r = e.target.closest('[data-row]');
+    if (!r) return;
+    sel = +r.dataset.row;
+    draw();
+  });
+  draw();
+})();
+
+/* ================================================= the markdown row pass */
+// The inline half of core/src/syntax.rs Markdown, plus the marker removal from
+// core/src/markdown.rs: derive the cuts from the token bytes, move the ranges,
+// then drain the text back to front.
+function mdTokens(line) {
+  const out = [];
+  const h = /^ {0,3}(#{1,6}) \S/.exec(line);
+  if (h) { out.push({ start: 0, end: line.length, kind: 'Heading', level: h[1].length }); return out; }
+  const push = (start, end, kind) => out.push({ start, end, kind });
+  let i = 0;
+  while (i < line.length) {
+    const c = line[i];
+    if (c === '`') {
+      const j = line.indexOf('`', i + 1);
+      if (j > i) { push(i, j + 1, 'Str'); i = j + 1; continue; }
+    }
+    if (c === '*' && line[i + 1] === '*') {
+      const j = line.indexOf('**', i + 2);
+      if (j > i) { push(i, j + 2, 'Strong'); i = j + 2; continue; }
+    }
+    if ((c === '*' || c === '_') && line[i + 1] !== c) {
+      const j = line.indexOf(c, i + 1);
+      if (j > i + 1) { push(i, j + 1, 'Emphasis'); i = j + 1; continue; }
+    }
+    if (c === '[') {
+      const close = line.indexOf(']', i + 1);
+      if (close > i && line[close + 1] === '(') {
+        const end = line.indexOf(')', close + 2);
+        if (end > close) { push(i, end + 1, 'Link'); i = end + 1; continue; }
+      }
+    }
+    i++;
+  }
+  return out;
+}
+function mdBlock(line) {
+  if (!line.trim()) return { kind: 'Blank' };
+  const h = /^ {0,3}(#{1,6}) /.exec(line);
+  if (h) return { kind: 'Heading', level: h[1].length };
+  if (/^ *(```|~~~)/.test(line)) return { kind: 'Fence' };
+  if (/^ *> /.test(line)) return { kind: 'Quote', depth: 1 };
+  const b = /^( *)([-*+]) /.exec(line);
+  if (b) return { kind: 'Bullet', depth: Math.floor(b[1].length / 2) };
+  if (/^ *\d+[.)] /.test(line)) return { kind: 'Ordered', depth: 0 };
+  if (/^ *\|.*\|/.test(line)) return { kind: 'Table' };
+  if (/^ *([-*_] *){3,}$/.test(line)) return { kind: 'Rule' };
+  return { kind: 'Paragraph' };
+}
+// Cuts are derived from the bytes at each end of a range that already exists.
+function mdCuts(line, tokens, block) {
+  const cuts = [];
+  const seg = (s, e) => line.slice(s, e);
+  for (const t of tokens) {
+    const s = seg(t.start, t.end);
+    if (t.kind === 'Heading') {
+      const m = /^( {0,3})(#{1,6}) /.exec(s);
+      if (m) cuts.push({ start: t.start + m[1].length, end: t.start + m[0].length, why: 'the ATX marker' });
+    } else if (t.kind === 'Str' && s.startsWith('`') && s.endsWith('`') && s.length > 1) {
+      cuts.push({ start: t.start, end: t.start + 1, why: 'a code-span tick' });
+      cuts.push({ start: t.end - 1, end: t.end, why: 'a code-span tick' });
+    } else if (t.kind === 'Strong' && s.startsWith('**') && s.endsWith('**') && s.length > 4) {
+      cuts.push({ start: t.start, end: t.start + 2, why: 'the strong delimiter' });
+      cuts.push({ start: t.end - 2, end: t.end, why: 'the strong delimiter' });
+    } else if (t.kind === 'Emphasis' && s.length > 2) {
+      cuts.push({ start: t.start, end: t.start + 1, why: 'the emphasis delimiter' });
+      cuts.push({ start: t.end - 1, end: t.end, why: 'the emphasis delimiter' });
+    } else if (t.kind === 'Link') {
+      const close = s.indexOf('](');
+      if (close > 0) {
+        cuts.push({ start: t.start, end: t.start + 1, why: 'the link bracket' });
+        cuts.push({ start: t.start + close, end: t.end, why: 'the URL — furniture, not text' });
+      }
+    }
+  }
+  if (block.kind === 'Bullet') {
+    const m = /^( *)([-*+] )/.exec(line);
+    if (m) cuts.push({ start: m[1].length, end: m[1].length + m[2].length, why: 'the bullet — the glyph is drawn instead' });
+  }
+  if (block.kind === 'Quote') {
+    const m = /^( *)(> ?)/.exec(line);
+    if (m) cuts.push({ start: m[1].length, end: m[1].length + m[2].length, why: 'the quote marker — a bar is drawn instead' });
+  }
+  return cuts.sort((a, b) => a.start - b.start || a.end - b.end);
+}
+// Deletion only, so the remap is one-directional: bytes cut strictly before p,
+// with a position inside a cut collapsing to where that cut began.
+function mdApply(line, tokens, cuts) {
+  const shift = (p) => {
+    let gone = 0;
+    for (const c of cuts) {
+      if (c.end <= p) gone += c.end - c.start;
+      else if (c.start < p) gone += p - c.start;
+    }
+    return p - gone;
+  };
+  const moved = tokens.map((t) => ({ ...t, start: shift(t.start), end: shift(t.end) }))
+    .filter((t) => t.end > t.start);
+  let text = line;
+  for (const c of [...cuts].reverse()) text = text.slice(0, c.start) + text.slice(c.end);
+  return { text, tokens: moved };
+}
+const MDPRESETS = [
+  '## The graph gutter is `capped`',
+  'It anchors on **lines appearing exactly once**, so a `moved block` reads as a move.',
+  'See [decisions/0002](docs/decisions/0002-graph-lane-cap.md) for the reasoning.',
+  '  - lanes past the cap collapse onto the *last* column',
+  'A footnote marker like ** on its own is far more likely to be a bullet',
+];
+const MD_METRICS = { heading: [18, 16.5, 15, 14, 14, 14], indent: 14, bullets: ['•', '◦', '▪', '·'] };
+function drawMd() {
+  const line = $('#mdsrc').value;
+  const block = mdBlock(line);
+  const tokens = mdTokens(line);
+  const cuts = mdCuts(line, tokens, block);
+  const after = mdApply(line, tokens, cuts);
+  const src = `<div class="r ctx"><span class="n">41</span><span class="n">41</span><span class="s"> </span>
+    <span class="t">${rowText(line, tokens, [], 'Context')}</span></div>`;
+  const size = block.kind === 'Heading' ? MD_METRICS.heading[block.level - 1] : 12.5;
+  const bullet = block.kind === 'Bullet' ? MD_METRICS.bullets[Math.min(block.depth, 3)] : '';
+  const bar = block.kind === 'Quote' ? hex(0x4d5f6b) : block.kind === 'Fence' ? hex(0x35302b) : null;
+  const pres = `<div class="r ctx"><span class="n">41</span><span class="n">41</span><span class="s"> </span>
+    <span class="t" style="display:flex;align-items:center;gap:0">
+      ${bar ? `<span style="flex:none;width:2px;height:16px;background:${bar};margin-right:8px"></span>` : ''}
+      ${bullet ? `<span style="flex:none;color:${hex(0x6e6862)};width:14px">${bullet}</span>` : ''}
+      <span style="font-size:${size}px;line-height:22px">${rowText(after.text, after.tokens, [], 'Context')}</span>
+      ${block.kind === 'Rule' ? `<span style="flex:1;height:1px;background:${hex(0x3a352f)}"></span>` : ''}
+    </span></div>`;
+  const cutList = cuts.length
+    ? cuts.map((c) => `<div class="r"><span class="t"><span style="color:var(--amber)">${c.start}..${c.end}</span> ` +
+        `<span style="color:var(--k-str)">${esc(JSON.stringify(line.slice(c.start, c.end)))}</span>` +
+        `<span style="color:var(--faint)">  ${c.why}</span></span></div>`).join('')
+    : `<div class="r"><span class="t" style="color:var(--faint)">nothing to cut — every delimiter here is unpaired, so the highlighter never located it and this pass has nothing to remove</span></div>`;
+  $('#mdout').innerHTML = `
+    <h4>block</h4><div class="rows" style="padding:6px 10px"><div class="r"><span class="t">
+      <span style="color:var(--k-type)">Block::${block.kind}${block.level ? '(' + block.level + ')' : block.depth ? '(' + block.depth + ')' : ''}</span>
+      <span style="color:var(--faint)">  ${tokens.length} token${tokens.length === 1 ? '' : 's'} from the highlighter</span></span></div></div>
+    <h4 style="margin-top:14px">the source, as git shows it</h4><div class="rows">${src}</div>
+    <h4 style="margin-top:14px">cuts, derived from the token bytes</h4><div class="rows" style="padding:6px 10px">${cutList}</div>
+    <h4 style="margin-top:14px">the row, presented — ranges moved, then the text drained</h4><div class="rows">${pres}</div>`;
+}
+$$('[data-mdp]').forEach((b) => b.addEventListener('click', () => {
+  $('#mdsrc').value = MDPRESETS[+b.dataset.mdp]; drawMd();
+}));
+$('#mdsrc').addEventListener('input', drawMd);
+$('#mdsrc').value = MDPRESETS[1];
+drawMd();
+
+/* ============================================================== decisions */
+const ADRS = [
+  { n: '0001', t: 'Histogram diff, not Myers', tags: ['legibility'], d: 'Histogram anchors on lines appearing exactly once, so a moved function reads as a move. Diffing is a trait; histogram and myers are the first two implementations.', x: 'Myers minimises the edit count, and a minimal script is not a readable one — it dissolves a moved block into line-soup.', e: 'Qualitative, deliberately: the failure is legibility, not throughput. Any repository with a moved function shows it.' },
+  { n: '0002', t: 'Cap the graph gutter at 12 lanes', tags: ['legibility'], d: 'MAX_LANES = 12, hard. Past it, lanes collapse onto the last column in grey — and collapse in the data too.', x: 'Drawing all 280 means 280 quads per row for a column no reader can decode. Scaling the lane width down loses crispness and 280 hairlines are not more legible.', e: 'git/git: p50 126 lanes, p99 226, max 280, and only 0.9% of rows at a single lane.' },
+  { n: '0003', t: 'A table-driven scanner, not tree-sitter', tags: ['speed', 'seam'], d: 'A single-pass byte scanner in core with every language-specific fact as data. Highlighting is a trait, so this is one implementation rather than the mechanism.', x: 'tree-sitter was free to adopt — gpui-component ships it — and syntect was already in the lock file. A diff hands you fragments, which is the input a parser is worst at.', e: '2.6 MB/s and 114 spans/KB on fragments, against 7.1 MB/s and 143 on whole files. The scanner does not move.' },
+  { n: '0004', t: 'Markdown as a second Highlighter', tags: ['seam', 'legibility'], d: 'Not a table: 100 lines walking lines instead of bytes, routed by Highlighters::route.', x: 'The model was wrong, not the table. Every table that got closer on headings got worse on prose. tree-sitter would have worked and costs 1.55 MB of engine plus a grammar.', e: '21.81% of every file mis-coloured by the table, worst contiguous run 25,701 bytes.' },
+  { n: '0005', t: 'Colour is data, and it lives in core', tags: ['boundary'], d: 'Theme holds every colour as 0xRRGGBB plus bold and italic. The shell converts to Hsla; the ANSI painter converts the same numbers to escape codes.', x: 'A theme file format first would have meant designing one before knowing which fields exist. Parsing TOML into this struct is additive.', e: '35 hex literals across four shell files, and a private fn colour(kind) inside the diff view.' },
+  { n: '0006', t: 'Row presentation behind a trait, 8 bytes a row', tags: ['seam', 'speed'], d: 'trait Rows claims paths, owns its rows, draws them by index. The list keeps RowRef { owner: u16, index: u32 }.', x: 'Vec&lt;Box&lt;dyn Row&gt;&gt; is 714k allocations to build and to chase on every scroll, against 5.7 MB of flat index — and the indirection lands on the render path.', e: 'The deletion fixture has 713,996 rows. Variable height means giving up uniform_list, which is the only reason it scrolls.' },
+  { n: '0007', t: 'Row assembly belongs in core, not the view', tags: ['boundary'], d: 'prepared::prepare(files, highlighter, max_line_chars): clip, then intraline, then syntax. A frontend’s share is drawing.', x: 'It was in views/diff.rs, and within one sitting the loop had been copy-pasted into two examples — only the shell’s copy clipped, so both examples measured something the app does not do.', e: 'Three call sites collapsed to one. bench had been reporting 237 ms for the syntax pass alone and calling it the cost of prepare; the honest total is 288.7 ms.' },
+  { n: '0008', t: 'No word highlighting below 0.4 similarity', tags: ['legibility'], d: 'Dice coefficient over tokens. Below the floor, the pair gets no word highlighting; the line keeps its add/remove background. The LCS table is already built, so its corner is free.', x: 'Better pairing — by content rather than position — is a real improvement and a bigger change. The floor is six lines and removes the damage now.', e: 'Of 9,447 pairs in the zig→rust fixture none sit below 0.60. In the deletion fixture 15.6% fall below 0.4 and every one is junk by inspection.' },
+  { n: '0009', t: 'Resolve foregrounds against their background', tags: ['legibility'], d: 'A contrast floor on the theme, and every class resolved against every surface once, into a 12 × 5 table.', x: 'Picking a second colour per surface loses the hue. Blending keeps it: a lifted comment is the same grey-brown, just far enough off the background to read.', e: 'The comment grey measured 1.15:1 against the old changed-word background. A screenshot found it; a test now asserts the floor for all 60 pairs.' },
+  { n: '0010', t: 'Markdown renders as rows, and the markers come off in core', tags: ['seam', 'boundary'], d: 'Rendered rows, not a rendered document: row font size for headings, a left bar for blocks, drawn furniture for removed markers, space padding for tables.', x: 'A CommonMark parser was in the tree at zero build cost and was the wrong shape twice: core takes no dependencies, and a hunk is not a document — it hands you the middle of a list and half a fence, constantly.', e: '70–100 ns a row at load. Inline markup inside a heading keeps its markers, measured at under half a percent of changed rows on both fixtures — the figure that decided it.' },
+  { n: '0012', t: 'Config is data, behaviour is not', tags: ['seam'], d: 'plait.toml for data, round-tripped with toml_edit; plugins in their own files, referenced by name. Behaviour never appears in the settings file.', x: 'Lua is the tempting answer and its computed themes are a real argument. It loses on three counts, and the decisive one is that a settings panel cannot round-trip code.', e: 'Rows::render runs ~50× a frame and runs() rebuilds per visible row per redraw — neither can cross a script boundary. Lua’s territory is commands, keybindings and workflow.' },
+  { n: '0013', t: 'The differs live in core, not in a dependency', tags: ['boundary', 'seam'], d: 'Histogram, patience and myers are written in core rather than pulled in, and acquisition hands over two lists of lines instead of a finished unified diff.', x: 'Letting git diff choose the algorithm makes plait_core::differ decoration — a semantic or language-aware differ could never be reached, and rule 1 says a built-in may not do anything an extension cannot. imara-diff would have meant a dependency in the one crate that has none.', e: 'Correctness is checked against git rather than argued: a minimal edit script has exactly one length, so myers must match git diff --minimal exactly. git/examples/diffcheck.rs runs it over real history, from ./check.sh.' },
+];
+let adrTag = 'all';
+function drawAdrs() {
+  $('#adrs').innerHTML = ADRS.filter((a) => adrTag === 'all' || a.tags.includes(adrTag)).map((a) =>
+    `<div class="panel"><div class="stamp"><span class="adr">${a.n}</span><span class="path">${a.t}</span>
+      <span class="right">accepted</span></div><div class="body">
+      <p style="margin:0 0 10px">${a.d}</p>
+      <h4>why not</h4><p style="margin:0 0 10px;font-size:13.5px">${a.x}</p>
+      <h4>the number that decided it</h4><p style="margin:0;font-size:13.5px;color:var(--faint)">${a.e}</p>
+    </div></div>`).join('');
+}
+$('#dfilter').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-tag]');
+  if (!b) return;
+  adrTag = b.dataset.tag;
+  $$('#dfilter [data-tag]').forEach((x) => {
+    const on = x.dataset.tag === adrTag;
+    x.setAttribute('aria-pressed', String(on));
+    x.classList.toggle('on', on);
+  });
+  drawAdrs();
+});
+drawAdrs();
+
+/* ========================================================= nav & keyboard */
+const SECS = $$('main section');
+const NAVS = $$('#rail a.nav');
+const KEYMAP = { '0': 'top', '1': 'boundary', '2': 'acquire', '3': 'differ', '4': 'intraline',
+  '5': 'scanner', '6': 'graph', '7': 'theme', '8': 'rows', '9': 'numbers', 'd': 'decisions', 'e': 'edges' };
+let current = 0;
+const spy = new IntersectionObserver((entries) => {
+  for (const en of entries) {
+    if (!en.isIntersecting) continue;
+    const i = SECS.indexOf(en.target);
+    if (i >= 0) {
+      current = i;
+      NAVS.forEach((a, k) => a.setAttribute('aria-current', String(k === i)));
+    }
+  }
+}, { rootMargin: '-45% 0px -50% 0px' });
+SECS.forEach((s) => spy.observe(s));
+NAVS[0].setAttribute('aria-current', 'true');
+
+function go(i) {
+  const t = SECS[Math.max(0, Math.min(i, SECS.length - 1))];
+  t.scrollIntoView({ behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
+}
+addEventListener('keydown', (e) => {
+  if (/^(INPUT|TEXTAREA)$/.test(e.target.tagName) || e.metaKey || e.ctrlKey || e.altKey) return;
+  const k = e.key.toLowerCase();
+  if (k === 'j') { go(current + 1); e.preventDefault(); }
+  else if (k === 'k') { go(current - 1); e.preventDefault(); }
+  else if (k === '?') { $('#sheet').classList.toggle('open'); e.preventDefault(); }
+  else if (k === 'escape') $('#sheet').classList.remove('open');
+  else if (k === 'arrowright' || k === 'arrowleft') {
+    benchStage = Math.max(0, Math.min(STAGES.length - 1, benchStage + (k === 'arrowright' ? 1 : -1)));
+    drawBench();
+    if (current !== 0) go(0);
+    e.preventDefault();
+  } else if (KEYMAP[k]) {
+    const i = SECS.findIndex((s) => s.id === KEYMAP[k]);
+    if (i >= 0) { go(i); e.preventDefault(); }
+  }
+});
+$('#hint').addEventListener('click', () => $('#sheet').classList.toggle('open'));
+</script>
+</body>
+</html>

@@ -17,6 +17,18 @@
 //! presentation of a `.md` or a `.png` is a new implementation rather than
 //! another arm of a match in here. [`TextRows`] is the built-in one, and it
 //! claims every path, which is what makes it the fallback.
+//!
+//! # Layouts
+//!
+//! A named set of those implementations is a [`Layout`], and `s` cycles them
+//! live. Unified and side-by-side are two entries in a registry, not two
+//! branches: the second one is `SplitRows` claiming every path in place of
+//! `TextRows`, and nothing in here knows which of them is loaded.
+//!
+//! Switching rebuilds the rows, which means running `prepare` again — the parsed
+//! diff is kept for exactly that. It is not free on a 700k-line diff and it is
+//! not on the render path either; see [`Diff::cycle_layout`] for the trade and
+//! what the alternative would cost.
 
 use gpui::*;
 use gpui_component::scroll::Scrollbar;
@@ -73,6 +85,98 @@ pub trait Rows {
     }
 }
 
+// ---------------------------------------------------------------- the layouts
+
+/// A named set of [`Rows`] implementations: one way of presenting a whole diff.
+///
+/// `build` is a closure rather than a `Vec` because a layout has to be
+/// *rebuildable*. Switching re-runs the pipeline and hands each implementation
+/// its files again, and a `Vec` that has already been consumed cannot be handed
+/// anything. It takes the `Host` because a presentation is entitled to depend on
+/// the font — `MarkdownRows` derives its whole heading scale from it.
+pub struct Layout {
+    pub name: &'static str,
+    #[allow(clippy::type_complexity)]
+    pub build: Box<dyn Fn(&Host) -> Vec<Box<dyn Rows>>>,
+}
+
+/// Every presentation the diff view can be in, in the order `s` cycles them.
+///
+/// This registry and the one inside it are both here rather than on `Host` for
+/// the same structural reason: a `Rows` implementation returns an `AnyElement`,
+/// `Host` lives in `core`, and `core` never knows a UI exists. What *is* on
+/// `Host` is `layout` — the name of the one to open in, which is data and
+/// therefore configurable.
+pub struct Layouts(Vec<Layout>);
+
+impl Default for Layouts {
+    fn default() -> Self {
+        Self::builtin()
+    }
+}
+
+impl Layouts {
+    /// The two shipped presentations. Both go through `register`, so the shipped
+    /// configuration uses the seam rather than going around it.
+    pub fn builtin() -> Self {
+        let mut l = Self(Vec::new());
+        l.register("unified", |host| {
+            vec![
+                Box::new(TextRows::default()),
+                // The Markdown metrics come from the host's font: it decides
+                // whether tables can be padded into a grid, and the heading
+                // scale is relative to the body size rather than a set of pixel
+                // constants.
+                Box::new(super::markdown::MarkdownRows::new(
+                    super::markdown::Metrics::for_font(&host.font),
+                    &["md", "markdown", "mdx"],
+                )),
+            ]
+        });
+        // No Markdown specialist here on purpose: a rendered document in a
+        // 44-character column is worse than its source, and the two-column
+        // presentation is already the answer to "show me both versions".
+        l.register("split", |_| vec![Box::new(super::split::SplitRows::default())]);
+        l
+    }
+
+    /// Adds a presentation, replacing any already registered under the same
+    /// name — so `unified` can be corrected rather than only added to.
+    pub fn register(
+        &mut self,
+        name: &'static str,
+        build: impl Fn(&Host) -> Vec<Box<dyn Rows>> + 'static,
+    ) {
+        let layout = Layout { name, build: Box::new(build) };
+        match self.0.iter().position(|l| l.name == name) {
+            Some(i) => self.0[i] = layout,
+            None => self.0.push(layout),
+        }
+    }
+
+    pub fn names(&self) -> Vec<&'static str> {
+        self.0.iter().map(|l| l.name).collect()
+    }
+
+    pub fn position(&self, name: &str) -> Option<usize> {
+        self.0.iter().position(|l| l.name == name)
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+
+}
+
+// Cycle to the next presentation. Bound to `s` in `main.rs`.
+//
+// The first real action in the app, and deliberately shaped like the last one
+// will be: the view owns a focus handle, the binding is global, and the handler
+// is a method. When command dispatch and the mode stack land in `core` this
+// becomes a named command they can reach — see `docs/extending.md`.
+actions!(plait, [CycleLayout]);
+
 /// 8 bytes per row: which implementation owns it, and where in that
 /// implementation's own storage it sits. The rows themselves are never boxed —
 /// at 700k rows that would be 700k allocations to chase on every scroll.
@@ -83,12 +187,27 @@ struct RowRef {
 }
 
 pub struct Diff {
+    /// The parsed diff, kept so a layout change can rebuild the rows.
+    ///
+    /// This is the memory cost of a live toggle, and it is a real one: on the
+    /// 714k-line fixture it is a second copy of every line. The alternatives are
+    /// worse — cloning the *prepared* diff pays the same memory plus the clone at
+    /// load, whether or not anybody ever presses the key, and re-acquiring means
+    /// the view needs a repository, which it does not have and should not.
+    files: Rc<Vec<FileDiff>>,
+    layouts: Rc<Layouts>,
+    current: usize,
     renderers: Rc<Vec<Box<dyn Rows>>>,
     order: Rc<Vec<RowRef>>,
     /// See the note in the commits view: uniform_list sizes its scrollable
     /// width from a single measured row, defaulting to row 0.
     widest: usize,
     scroll: UniformListScrollHandle,
+    /// Absent in the headless tests, which build a `Diff` with no window and no
+    /// `Context` to take a handle from. Present in the app, where it is what
+    /// puts this view in the key dispatch path at all.
+    focus: Option<FocusHandle>,
+    focused: bool,
     pub rendered: Rc<Cell<usize>>,
     /// First visible row, written on every batch the list asks for. Read by the
     /// session so a restart can put you back on it — see `session.rs`.
@@ -99,6 +218,52 @@ pub struct Diff {
 impl Diff {
     pub fn total(&self) -> usize {
         self.order.len()
+    }
+
+    /// Which presentation is loaded. Read by the tests and by anything that
+    /// wants to name it; the control strip asks for the index and the list.
+    #[allow(dead_code)]
+    pub fn layout(&self) -> &'static str {
+        self.layouts.names().get(self.current).copied().unwrap_or("custom")
+    }
+
+    /// Every presentation registered, in the order `s` cycles them. What a
+    /// control strip lists.
+    pub fn layout_names(&self) -> Vec<&'static str> {
+        self.layouts.names()
+    }
+
+    pub fn layout_index(&self) -> usize {
+        self.current
+    }
+
+    /// Loads a presentation by index, keeping the reading position. Out of range
+    /// is ignored rather than clamped: the index came from a list this view
+    /// published, so a stale one means the list moved and picking a neighbour
+    /// would be a guess.
+    pub fn set_layout(&mut self, index: usize, host: &Host, cx: &mut Context<Self>) {
+        if index >= self.layouts.len() || index == self.current {
+            return;
+        }
+        self.apply_layout(index, host);
+        cx.notify();
+    }
+
+    /// Swaps the diff itself, keeping the presentation and the reading position.
+    ///
+    /// What changing the algorithm does. The rows are rebuilt from stage 3 the
+    /// same way a layout change rebuilds them; the only difference is that the
+    /// `FileDiff`s underneath are new ones.
+    pub fn replace(&mut self, files: Vec<FileDiff>, host: &Host, cx: &mut Context<Self>) {
+        self.swap(files, host);
+        cx.notify();
+    }
+
+    /// The half of [`Diff::replace`] that needs no window, and therefore the
+    /// half with tests.
+    fn swap(&mut self, files: Vec<FileDiff>, host: &Host) {
+        self.files = Rc::new(files);
+        self.apply_layout(self.current, host);
     }
 
     /// Puts a saved row back at the top of the viewport.
@@ -113,92 +278,201 @@ impl Diff {
         self.scroll.scroll_to_item(row.min(self.order.len() - 1), ScrollStrategy::Top);
     }
 
-    /// The shipped set: the built-in text presentation, plus the rendered
-    /// Markdown one registered on top of it through the same call an extension
-    /// would use. The same argument as `Highlighters::builtin` routing Markdown
-    /// away from the scanner — if a built-in does not go through the seam, the
-    /// seam is untested.
-    pub fn new(files: Vec<FileDiff>, host: Rc<Host>) -> Self {
-        // The Markdown metrics come from the host's font: it decides whether
-        // tables can be padded into a grid, and the heading scale is relative to
-        // the body size rather than a set of pixel constants.
-        let metrics = super::markdown::Metrics::for_font(&host.font);
-        Self::with_renderers(
-            files,
-            host,
-            vec![
-                Box::new(TextRows::default()),
-                Box::new(super::markdown::MarkdownRows::new(
-                    metrics,
-                    &["md", "markdown", "mdx"],
-                )),
-            ],
-        )
+    /// The shipped set: the registry of presentations, opened on whichever one
+    /// the host names. An unknown name falls back to the first rather than
+    /// failing — the config layer is what reports it, because it is the layer
+    /// that knows it came from a file somebody is editing.
+    pub fn new(files: Vec<FileDiff>, host: Rc<Host>, cx: &mut Context<Self>) -> Self {
+        let mut d = Self::with_layouts(files, &host, Layouts::builtin());
+        d.focus = Some(cx.focus_handle());
+        d
     }
 
+    /// One presentation, pinned: no registry, so nothing to cycle to.
+    ///
     /// `renderers[0]` is the fallback and must claim every path; later entries
-    /// are specialists and win over earlier ones.
+    /// are specialists and win over earlier ones. This is the entry point an
+    /// extension uses to install its own set — see `docs/extending.md`.
+    ///
+    /// `dead_code` because nothing in the binary calls it: the shipped
+    /// configuration goes through `Layouts`, and this is the seam plus the tests
+    /// that prove a second set fits. A binary crate does not count a test as a
+    /// use.
+    #[allow(dead_code)]
     pub fn with_renderers(
         files: Vec<FileDiff>,
         host: Rc<Host>,
-        mut renderers: Vec<Box<dyn Rows>>,
+        renderers: Vec<Box<dyn Rows>>,
     ) -> Self {
-        let t = std::time::Instant::now();
-        let mut order: Vec<RowRef> = Vec::new();
+        let mut layouts = Layouts(Vec::new());
+        // Moved into the closure through a cell, because `build` may be called
+        // more than once in general and here can only be called once. A pinned
+        // presentation has nothing to switch to, so once is all it gets — and if
+        // it is somehow asked twice, the fallback rather than an empty list,
+        // because `assemble` indexes `renderers[0]`.
+        let once = std::cell::RefCell::new(Some(renderers));
+        layouts.register("custom", move |_| {
+            once.borrow_mut()
+                .take()
+                .filter(|r| !r.is_empty())
+                .unwrap_or_else(|| vec![Box::new(TextRows::default()) as Box<dyn Rows>])
+        });
+        Self::with_layouts(files, &host, layouts)
+    }
 
-        // One pass in core, shared with the CLI and the ANSI painter, before any
-        // renderer sees a row.
-        let Prepared { files, intraline, syntax } =
-            prepare(&files, &host.syntax, MAX_LINE_CHARS);
-        let file_count = files.len();
-
-        for f in files {
-            let owner = renderers
-                .iter()
-                .enumerate()
-                .rev()
-                .find(|(_, r)| r.claims(&f.path))
-                .map_or(0, |(i, _)| i);
-            let r = &mut renderers[owner];
-            let first = r.len();
-            r.build(f);
-            for index in first..r.len() {
-                order.push(RowRef { owner: owner as u16, index: index as u32 });
+    /// The general form: a registry, and the host's chosen entry out of it.
+    pub fn with_layouts(files: Vec<FileDiff>, host: &Host, layouts: Layouts) -> Self {
+        // Reported here and not by the config layer, because this is the layer
+        // that holds the registry: `core` cannot see a `Rows` implementation and
+        // an extension may have registered a name the config layer never heard
+        // of. Falling back rather than failing — a typo in a live-reloaded file
+        // must not leave you with no diff.
+        let current = match layouts.position(&host.layout) {
+            Some(i) => i,
+            None => {
+                eprintln!(
+                    "plait: unknown diff.layout {:?}; registered: {}",
+                    host.layout,
+                    layouts.names().join(", ")
+                );
+                0
             }
-        }
-
-        let widest = order
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, r)| renderers[r.owner as usize].width(r.index as usize))
-            .map_or(0, |(i, _)| i);
-
-        let mut reports: Vec<String> =
-            vec![format!("intraline {intraline:.0?} · syntax {syntax:.0?}")];
-        reports.extend(renderers.iter().map(|r| r.report()).filter(|s| !s.is_empty()));
-        let load = format!(
-            "{} rows · {} files · build {:.0?} ({})",
-            order.len(),
-            file_count,
-            t.elapsed(),
-            reports.join(" · "),
-        );
-        eprintln!("{load}");
-
+        };
+        let files = Rc::new(files);
+        let built = assemble(&files, host, &layouts, current);
         Self {
-            renderers: Rc::new(renderers),
-            order: Rc::new(order),
-            widest,
+            files,
+            layouts: Rc::new(layouts),
+            current,
+            renderers: Rc::new(built.renderers),
+            order: Rc::new(built.order),
+            widest: built.widest,
             scroll: UniformListScrollHandle::new(),
+            focus: None,
+            focused: false,
             rendered: Rc::new(Cell::new(0)),
             top: Rc::new(Cell::new(0)),
-            load,
+            load: built.load,
         }
+    }
+
+    /// Moves to the next presentation and rebuilds the rows, keeping you roughly
+    /// where you were reading.
+    ///
+    /// **Roughly, and not exactly.** The two presentations do not have the same
+    /// number of rows — a replace pair is one row in the two-column layout and
+    /// two in the unified one — so a row index means something different in each
+    /// and there is nothing to preserve exactly. The proportion through the diff
+    /// is preserved instead, which lands you on the same screenful.
+    ///
+    /// The whole pipeline from stage 3 runs again. That is 8 ms on a typical diff
+    /// and 289 ms on the pathological fixture, once, on a keystroke — which is
+    /// the right place to spend it. Making it instant would mean the row
+    /// implementations sharing their text behind a refcount instead of owning
+    /// it, and that is a change to `prepared::Line`, not to this function.
+    pub fn cycle_layout(&mut self, cx: &mut Context<Self>) {
+        if self.layouts.len() < 2 {
+            return;
+        }
+        // The live host, not one captured when this view was built — the same
+        // reason `render` reads it per batch. A layout rebuilt from a stale font
+        // would quietly disagree with the row it replaced.
+        let host = crate::config::host(cx);
+        self.apply_layout((self.current + 1) % self.layouts.len(), &host);
+        cx.notify();
+    }
+
+    /// Rebuilds the rows for `index`, keeping the reading position. The half of
+    /// [`Diff::cycle_layout`] and [`Diff::replace`] that needs no window, and
+    /// therefore the half with tests.
+    fn apply_layout(&mut self, index: usize, host: &Host) {
+        let fraction = match self.order.len() {
+            0 => 0.0,
+            n => self.top.get() as f32 / n as f32,
+        };
+        self.current = index;
+        let built = assemble(&self.files, host, &self.layouts, index);
+        self.order = Rc::new(built.order);
+        self.renderers = Rc::new(built.renderers);
+        self.widest = built.widest;
+        self.load = built.load;
+        let row = (fraction * self.order.len() as f32) as usize;
+        self.top.set(row);
+        self.scroll_to(row);
     }
 }
 
+/// What one pass of stages 3–5 produces.
+struct Built {
+    renderers: Vec<Box<dyn Rows>>,
+    order: Vec<RowRef>,
+    widest: usize,
+    load: String,
+}
+
+/// Prepare the diff, hand each file to the implementation that claims it, and
+/// build the order table.
+///
+/// A free function rather than a method because it runs before a `Diff` exists
+/// and again after one does, and both callers want exactly this.
+fn assemble(files: &[FileDiff], host: &Host, layouts: &Layouts, current: usize) -> Built {
+    let t = std::time::Instant::now();
+    let mut renderers = match layouts.0.get(current) {
+        Some(layout) => (layout.build)(host),
+        None => Vec::new(),
+    };
+    // `renderers[0]` is indexed unconditionally below, so an empty list from a
+    // registered builder is a panic rather than an empty diff. The fallback is
+    // the built-in, which claims everything.
+    if renderers.is_empty() {
+        renderers.push(Box::new(TextRows::default()));
+    }
+    let name = layouts.names().get(current).copied().unwrap_or("custom");
+    let mut order: Vec<RowRef> = Vec::new();
+
+    // One pass in core, shared with the CLI and the ANSI painter, before any
+    // renderer sees a row.
+    let Prepared { files: prepared, intraline, syntax } =
+        prepare(files, &host.syntax, MAX_LINE_CHARS);
+    let file_count = prepared.len();
+
+    for f in prepared {
+        let owner = renderers
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, r)| r.claims(&f.path))
+            .map_or(0, |(i, _)| i);
+        let r = &mut renderers[owner];
+        let first = r.len();
+        r.build(f);
+        for index in first..r.len() {
+            order.push(RowRef { owner: owner as u16, index: index as u32 });
+        }
+    }
+
+    let widest = order
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, r)| renderers[r.owner as usize].width(r.index as usize))
+        .map_or(0, |(i, _)| i);
+
+    let mut reports: Vec<String> =
+        vec![format!("intraline {intraline:.0?} · syntax {syntax:.0?}")];
+    reports.extend(renderers.iter().map(|r| r.report()).filter(|s| !s.is_empty()));
+    let load = format!(
+        "{} rows · {} files · {name} · build {:.0?} ({})",
+        order.len(),
+        file_count,
+        t.elapsed(),
+        reports.join(" · "),
+    );
+    eprintln!("{load}");
+    Built { renderers, order, widest, load }
+}
+
 impl Render for Diff {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let renderers = self.renderers.clone();
         let order = self.order.clone();
         let rendered = self.rendered.clone();
@@ -223,12 +497,28 @@ impl Render for Diff {
         .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
         .size_full();
 
-        div()
+        let mut root = div()
             .relative()
             .size_full()
             .child(list)
             .child(Scrollbar::vertical(&self.scroll))
-            .child(Scrollbar::horizontal(&self.scroll))
+            .child(Scrollbar::horizontal(&self.scroll));
+
+        // Key dispatch runs down the focus path, so an action handler on an
+        // element nothing has focused is never reached. Taking focus on the
+        // first frame is what puts this view in that path; there is no other
+        // focusable thing in the window yet, and when there is, a mode stack is
+        // what should be deciding.
+        if let Some(focus) = self.focus.clone() {
+            if !self.focused {
+                self.focused = true;
+                window.focus(&focus, cx);
+            }
+            root = root
+                .track_focus(&focus)
+                .on_action(cx.listener(|this, _: &CycleLayout, _, cx| this.cycle_layout(cx)));
+        }
+        root
     }
 }
 
@@ -464,7 +754,7 @@ pub(crate) fn runs(
 mod tests {
     // By name, not a glob: `use gpui::*` in the parent shadows `#[test]` with
     // GPUI's own attribute macro and every test in here fails to expand.
-    use super::{runs, Diff, Rows, TextRows};
+    use super::{runs, Diff, Layouts, Rows, TextRows};
     use gpui::{div, AnyElement, FontStyle, FontWeight, HighlightStyle, IntoElement, ParentElement};
     use plait_core::host::Host;
     use plait_core::syntax::{Kind, Token};
@@ -684,6 +974,202 @@ diff --git a/b.md b/b.md
         assert_eq!(by_owner(1), 1);
         assert_eq!(diff.total(), 6);
         assert!(diff.load.contains("2 files"));
+    }
+
+    #[test]
+    fn the_shipped_registry_has_both_presentations() {
+        let l = Layouts::builtin();
+        assert_eq!(l.names(), vec!["unified", "split"]);
+        assert_eq!(l.position("split"), Some(1));
+        assert_eq!(l.position("sidebyside"), None);
+    }
+
+    #[test]
+    fn the_host_chooses_which_presentation_opens() {
+        let mut host = Host::new();
+        host.layout = "split".into();
+        let diff = Diff::with_layouts(
+            parse_unified_diff(TWO_FILES),
+            &host,
+            Layouts::builtin(),
+        );
+        assert_eq!(diff.layout(), "split");
+        // The two-column layout collapses a replace pair onto one row, so it has
+        // strictly fewer rows than unified for the same diff.
+        let unified =
+            Diff::with_layouts(parse_unified_diff(TWO_FILES), &Host::new(), Layouts::builtin());
+        assert_eq!(unified.layout(), "unified");
+        assert!(diff.total() < unified.total(), "{} vs {}", diff.total(), unified.total());
+    }
+
+    #[test]
+    fn an_unknown_layout_name_opens_the_first_rather_than_nothing() {
+        let mut host = Host::new();
+        host.layout = "sidebyside".into();
+        let diff = Diff::with_layouts(parse_unified_diff(SAMPLE), &host, Layouts::builtin());
+        assert_eq!(diff.layout(), "unified");
+        assert!(diff.total() > 0, "a typo in a live-reloaded file must not blank the diff");
+    }
+
+    #[test]
+    fn cycling_returns_to_where_it_started() {
+        let host = Host::new();
+        let mut diff =
+            Diff::with_layouts(parse_unified_diff(TWO_FILES), &host, Layouts::builtin());
+        let (name, total) = (diff.layout(), diff.total());
+        diff.apply_layout(1, &host);
+        assert_eq!(diff.layout(), "split");
+        assert_ne!(diff.total(), total);
+        diff.apply_layout(0, &host);
+        assert_eq!(diff.layout(), name);
+        assert_eq!(diff.total(), total, "a round trip must rebuild the same rows");
+    }
+
+    #[test]
+    fn swapping_the_diff_keeps_the_presentation() {
+        // What changing the algorithm does: new `FileDiff`s underneath, same
+        // layout on top. A swap that reset to unified would make the control
+        // disagree with the screen.
+        let host = Host::new();
+        let mut diff = Diff::with_layouts(parse_unified_diff(SAMPLE), &host, Layouts::builtin());
+        diff.apply_layout(1, &host);
+        assert_eq!(diff.layout(), "split");
+
+        diff.swap(parse_unified_diff(TWO_FILES), &host);
+        assert_eq!(diff.layout(), "split", "the swap reset the presentation");
+        assert!(diff.load.contains("2 files"), "{}", diff.load);
+        assert!(diff.load.contains("split"), "{}", diff.load);
+
+        // And an empty diff is a swap too — a revspec whose changes vanished.
+        diff.swap(Vec::new(), &host);
+        assert_eq!(diff.total(), 0);
+        assert_eq!(diff.layout(), "split");
+    }
+
+    #[test]
+    fn cycling_keeps_you_at_the_same_point_in_the_diff() {
+        // Exactly is impossible — the two presentations do not have the same
+        // number of rows — so the proportion is what is preserved.
+        let host = Host::new();
+        let mut diff = Diff::with_layouts(long_diff(), &host, Layouts::builtin());
+        let total = diff.total();
+        diff.top.set(total / 2);
+        diff.apply_layout(1, &host);
+        let landed = diff.top.get() as f32 / diff.total() as f32;
+        assert!((landed - 0.5).abs() < 0.05, "landed {landed} of the way through");
+    }
+
+    #[test]
+    fn a_registered_presentation_is_cycled_to_like_a_built_in() {
+        // Rule 1, as a test: a third presentation needs no edit to the two
+        // shipped ones, and `[diff] layout` reaches it.
+        let mut layouts = Layouts::builtin();
+        layouts.register("one-liner", |_| vec![Box::new(OneLinerEverything::default())]);
+        assert_eq!(layouts.names(), vec!["unified", "split", "one-liner"]);
+
+        let mut host = Host::new();
+        host.layout = "one-liner".into();
+        let diff = Diff::with_layouts(parse_unified_diff(TWO_FILES), &host, layouts);
+        assert_eq!(diff.layout(), "one-liner");
+        assert_eq!(diff.total(), 2, "one row per file and nothing else");
+    }
+
+    #[test]
+    fn registering_a_name_twice_replaces_the_presentation() {
+        let mut layouts = Layouts::builtin();
+        layouts.register("unified", |_| vec![Box::new(OneLinerEverything::default())]);
+        assert_eq!(layouts.names(), vec!["unified", "split"], "a replacement must not append");
+        let diff =
+            Diff::with_layouts(parse_unified_diff(TWO_FILES), &Host::new(), layouts);
+        assert_eq!(diff.total(), 2);
+    }
+
+    #[test]
+    fn a_pinned_set_of_renderers_has_nothing_to_cycle_to() {
+        let diff = Diff::with_renderers(
+            parse_unified_diff(SAMPLE),
+            Rc::new(Host::new()),
+            vec![Box::new(TextRows::default())],
+        );
+        assert_eq!(diff.layouts.len(), 1);
+        assert_eq!(diff.layout(), "custom");
+    }
+
+    /// A presentation that claims everything, for the registry tests: one row
+    /// per file, so a row count identifies which one ran.
+    #[derive(Default)]
+    struct OneLinerEverything {
+        rows: Vec<String>,
+    }
+
+    impl Rows for OneLinerEverything {
+        fn claims(&self, _: &str) -> bool {
+            true
+        }
+        fn len(&self) -> usize {
+            self.rows.len()
+        }
+        fn build(&mut self, file: PreparedFile) {
+            self.rows.push(file.path);
+        }
+        fn width(&self, index: usize) -> usize {
+            self.rows[index].len()
+        }
+        fn render(&self, index: usize, _host: &Host) -> AnyElement {
+            div().child(self.rows[index].clone()).into_any_element()
+        }
+    }
+
+    /// Enough rows that a proportional scroll position means something.
+    fn long_diff() -> Vec<plait_core::FileDiff> {
+        let mut raw = String::from("diff --git a/big.rs b/big.rs\n@@ -1,200 +1,200 @@\n");
+        for i in 0..200 {
+            if i % 5 == 0 {
+                raw.push_str(&format!("-    let x{i} = {i};\n+    let x{i} = {};\n", i + 1));
+            } else {
+                raw.push_str(&format!("     let y{i} = {i};\n"));
+            }
+        }
+        parse_unified_diff(&raw)
+    }
+
+    #[test]
+    fn every_layout_survives_the_shapes_that_break_things() {
+        // Not a rendering test — nothing here opens a window. It is the load
+        // path over the inputs that have broken it before: a line far past the
+        // clip budget, multi-byte text that measures three times its width in
+        // bytes, a markdown file that one layout has a specialist for and the
+        // other does not, a file with no extension, and a hunk that is pure
+        // addition so one column is empty for all of it.
+        let long = "x".repeat(9000);
+        let raw = format!(
+            "diff --git a/min.js b/min.js\n@@ -1,1 +1,1 @@\n-var a={long};\n+var b={long};\n\
+             diff --git a/wide.txt b/wide.txt\n@@ -1,2 +1,2 @@\n-箱の中身は「猫」\n+箱の中身は「犬」\n \
+             😀 unchanged\n\
+             diff --git a/doc.md b/doc.md\n@@ -1,3 +1,4 @@\n # Heading\n-| a | b |\n+| a | bb |\n+| c | d |\n\
+             diff --git a/Makefile b/Makefile\n@@ -1,0 +1,2 @@\n+all:\n+\tcargo build\n"
+        );
+        let files = parse_unified_diff(&raw);
+        assert_eq!(files.len(), 4);
+        let host = Host::new();
+        for name in Layouts::builtin().names() {
+            let mut h = Host::new();
+            h.layout = name.into();
+            let diff = Diff::with_layouts(files.clone(), &h, Layouts::builtin());
+            assert_eq!(diff.layout(), name);
+            assert!(diff.total() > 0, "{name} produced no rows");
+            // Every row answers a width, and the widest index is one of them.
+            for r in diff.order.iter() {
+                let _ = diff.renderers[r.owner as usize].width(r.index as usize);
+            }
+            assert!(diff.widest < diff.total(), "{name}: widest {} of {}", diff.widest, diff.total());
+        }
+        // And cycling between them, both ways, over the same input.
+        let mut diff = Diff::with_layouts(files, &host, Layouts::builtin());
+        for i in [1, 0, 1, 0] {
+            diff.apply_layout(i, &host);
+            assert!(diff.total() > 0);
+        }
     }
 
     #[test]

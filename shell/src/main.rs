@@ -1,4 +1,5 @@
 mod config;
+mod controls;
 mod graph;
 mod session;
 mod stats;
@@ -7,6 +8,7 @@ mod views;
 use gpui::*;
 use gpui_component::*;
 use plait_core::host::Host;
+use plait_core::FileDiff;
 use std::cell::Cell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -20,6 +22,8 @@ static ALLOC: stats::Counting = stats::Counting;
 
 actions!(plait, [Quit]);
 
+use views::diff::CycleLayout;
+
 
 
 const USAGE: &str = "\
@@ -32,6 +36,10 @@ plait — a git client
   REVSPEC is anything git takes:  HEAD~50..HEAD   main..feature   <sha>
   Pass --fixtures instead of REPO to read fixtures/ instead of a repository.
 
+  The title bar carries two pickers: the presentation (unified, side-by-side)
+  and the diff algorithm (histogram, patience, myers). `s` also cycles the
+  presentation. [diff] in plait.toml sets what they open on.
+
   plait.toml next to the binary (or $PLAIT_CONFIG) is re-read every time it is
   saved, and colours and font apply on the next frame — no rebuild, no relaunch.
   Start one with:  plait config > plait.toml
@@ -43,15 +51,175 @@ plait — a git client
   PLAIT_STATS=1   frame, row and heap overlay
 ";
 
+/// How to acquire the diff again with a different algorithm.
+///
+/// A closure and not a repository, because the shell does no I/O and must not
+/// learn what one is: `main` captures the source and hands over the single
+/// operation the control needs. The live [`Host`] is passed *in* rather than
+/// captured, so a config reload cannot leave a stale registry behind it.
+///
+/// `None` on `DevShell` means the source cannot be re-diffed at all — a `.diff`
+/// fixture was diffed by somebody else — and the control is drawn inert.
+type Rediff = Rc<dyn Fn(&Host, Option<&str>) -> Result<Vec<FileDiff>, String>>;
+
+/// Which picker is open. At most one, because two open menus over a diff is two
+/// things to dismiss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Open {
+    Layout,
+    Algorithm,
+}
+
 struct DevShell {
     title: SharedString,
     view: AnyView,
     stats: Option<Stats>,
-    host: Rc<Host>,
+    /// The diff view, when that is what is on screen. Held so the control strip
+    /// can drive it — the view itself stays a data-in view and never learns the
+    /// strip exists.
+    diff: Option<Entity<views::diff::Diff>>,
+    rediff: Option<Rediff>,
+    /// The live pick. `None` is "whatever the config selected", which is what the
+    /// control shows until somebody changes it — so the strip agrees with
+    /// `plait.toml` rather than with a copy of it taken at startup.
+    algorithm: Option<String>,
+    open: Option<Open>,
+    /// A failed re-diff. Shown, not swallowed: the usual cause is a repository
+    /// that moved under the window, and silently keeping the old rows would be a
+    /// diff labelled with an algorithm that did not produce it.
+    error: Option<SharedString>,
+}
+
+impl DevShell {
+    /// Re-acquires the diff through `name` and swaps it in.
+    ///
+    /// The whole cost is one acquisition plus one `prepare` — 25–110 ms and
+    /// 8–250 ms respectively, on a click. Cheap enough not to need a spinner and
+    /// not cheap enough to do on a keystroke repeat, which is why this is a
+    /// menu and `s` is not.
+    fn set_algorithm(&mut self, name: &str, cx: &mut Context<Self>) {
+        let (Some(rediff), Some(diff)) = (self.rediff.clone(), self.diff.clone()) else {
+            return;
+        };
+        let host = config::host(cx);
+        // Against the *effective* algorithm, not against the override: picking
+        // the one the config already selected would otherwise re-acquire and
+        // rebuild the whole diff to arrive back where it started.
+        if self.algorithm.as_deref().unwrap_or(host.differ.selected()) == name {
+            return;
+        }
+        match rediff(&host, Some(name)) {
+            Ok(files) => {
+                self.algorithm = Some(name.to_string());
+                self.error = None;
+                diff.update(cx, |d, cx| d.replace(files, &host, cx));
+                let (total, load) = {
+                    let d = diff.read(cx);
+                    (d.total(), d.load.clone())
+                };
+                if let Some(stats) = &mut self.stats {
+                    stats.reloaded(total, load);
+                }
+            }
+            // The old rows stay on screen, which is the right failure: they are
+            // still a true diff, just not the one that was asked for.
+            Err(e) => self.error = Some(format!("{name}: {e}").into()),
+        }
+        cx.notify();
+    }
+
+    fn set_layout(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(diff) = self.diff.clone() else { return };
+        // A layout change is a fresh look at the same diff, so a message about
+        // an algorithm that failed to load is no longer describing the screen.
+        self.error = None;
+        let host = config::host(cx);
+        diff.update(cx, |d, cx| d.set_layout(index, &host, cx));
+        let (total, load) = {
+            let d = diff.read(cx);
+            (d.total(), d.load.clone())
+        };
+        if let Some(stats) = &mut self.stats {
+            stats.reloaded(total, load);
+        }
+        cx.notify();
+    }
+
+    /// The two pickers, right-aligned in the title bar. Nothing when the diff
+    /// view is not what is on screen — the commit graph has neither to choose.
+    fn strip(&self, host: &Host, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let Some(diff) = &self.diff else { return Vec::new() };
+        let names = diff.read(cx).layout_names();
+        let layout = controls::Picker::new(
+            "layout",
+            &names,
+            diff.read(cx).layout_index(),
+        );
+
+        // The configured selection until somebody picks, so the control reads
+        // back what `plait.toml` says rather than a snapshot of it.
+        let algorithms = host.differ.names();
+        let selected = self.algorithm.as_deref().unwrap_or(host.differ.selected());
+        let algorithm =
+            controls::Picker::new("algorithm", &algorithms, algorithms
+                .iter()
+                .position(|n| *n == selected)
+                .unwrap_or(0))
+                .enabled(self.rediff.is_some());
+
+        let me = cx.entity().downgrade();
+        let toggle = |me: WeakEntity<Self>, which: Open| {
+            move |next: bool, _: &mut Window, cx: &mut App| {
+                _ = me.update(cx, |this, cx| {
+                    this.open = next.then_some(which);
+                    cx.notify();
+                });
+            }
+        };
+
+        vec![
+            controls::picker(
+                "layout-picker",
+                &layout,
+                self.open == Some(Open::Layout),
+                &host.theme,
+                &host.font,
+                toggle(me.clone(), Open::Layout),
+                {
+                    let me = me.clone();
+                    move |i, _, cx| {
+                        _ = me.update(cx, |this, cx| {
+                            this.open = None;
+                            this.set_layout(i, cx);
+                        });
+                    }
+                },
+            ),
+            controls::picker(
+                "algorithm-picker",
+                &algorithm,
+                self.open == Some(Open::Algorithm),
+                &host.theme,
+                &host.font,
+                toggle(me.clone(), Open::Algorithm),
+                {
+                    let me = me.clone();
+                    let names: Vec<String> = algorithms.iter().map(|s| s.to_string()).collect();
+                    move |i, _, cx| {
+                        let Some(name) = names.get(i).cloned() else { return };
+                        _ = me.update(cx, |this, cx| {
+                            this.open = None;
+                            this.set_algorithm(&name, cx);
+                        });
+                    }
+                },
+            ),
+        ]
+    }
 }
 
 impl Render for DevShell {
-    fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let overlay = self.stats.as_mut().map(|s| {
             s.tick();
             (s.frames(), s.rows(), s.heap(), s.load.clone())
@@ -60,8 +228,17 @@ impl Render for DevShell {
             window.request_animation_frame();
         }
 
-        let c = self.host.theme.chrome;
-        let f = &self.host.font;
+        // The live host, read per frame, not the one captured when this was
+        // built. It was the captured one, which meant the window chrome and the
+        // *font for the whole window* silently did not hot-reload while every
+        // view inside it did — the exact trap `docs/extending.md` warns about,
+        // in the one place nobody looked.
+        let host = config::host(cx);
+        let c = host.theme.chrome;
+        let f = &host.font;
+        let strip = self.strip(&host, cx);
+        let error = self.error.clone();
+
         div()
             .size_full()
             .v_flex()
@@ -77,11 +254,20 @@ impl Render for DevShell {
                     .flex_none()
                     .flex()
                     .items_center()
+                    .gap_2()
                     .h(px(32.))
                     .px_4()
                     .bg(rgb(c.title_bg))
                     .text_color(rgb(c.dim))
-                    .child(self.title.clone()),
+                    .child(div().flex_none().child(self.title.clone()))
+                    .children(
+                        error.map(|e| div().flex_none().text_color(rgb(c.error)).child(e)),
+                    )
+                    // Pushes the controls to the right edge and takes the clicks
+                    // that land between them, so a stray click on the title bar
+                    // does not fall through to whatever is under it.
+                    .child(div().flex_grow(1.0))
+                    .children(strip),
             )
             .child(div().flex_grow(1.0).overflow_hidden().child(self.view.clone()))
             .children(overlay.map(|(frames, rows, heap, load)| {
@@ -147,9 +333,37 @@ fn main() {
     };
     let session_path = session::path();
 
+    // One host, built before anything reads it: the highlighters, the differs,
+    // the theme, the font. An extension registering itself does it here, and
+    // every view reads the same struct.
+    //
+    // Before acquisition and not inside `app.run`, because the host is what
+    // chooses the diff algorithm now — building it after the diff had been
+    // fetched would leave `[diff] algorithm` describing nothing.
+    let config_path = config::path();
+    let mut built = Host::new();
+    for w in config::load(&mut built, &config_path) {
+        eprintln!("plait: {w}");
+    }
+    let host = Rc::new(built);
+
+    // How to fetch the diff again with a different algorithm. Built here, where
+    // the source is known, so nothing downstream has to learn what a repository
+    // is. `None` for a `.diff` fixture and for the commit graph — neither has an
+    // algorithm to choose, and the control says so by being inert.
+    let rediff: Option<Rediff> = match (which.as_str(), &source) {
+        ("diff", Source::Repo(repo, revspec)) => {
+            let (repo, revspec) = (repo.clone(), revspec.clone());
+            Some(Rc::new(move |host: &Host, algorithm: Option<&str>| {
+                plait_git::diff(&repo, &revspec, &host.differ, algorithm)
+            }))
+        }
+        _ => None,
+    };
+
     // Acquire before opening a window: a git error should print and exit, not
     // flash an empty window and leave you guessing.
-    let loaded = load(&which, &source);
+    let loaded = load(&which, &source, &host);
     let (label, data) = match loaded {
         Ok(v) => v,
         Err(e) => {
@@ -168,16 +382,6 @@ fn main() {
     let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
     app.run(move |cx| {
         gpui_component::init(cx);
-
-        // One host, built before any view exists: the highlighters, the theme,
-        // the font, and whatever else becomes swappable later. An extension
-        // registering itself does it here, and every view reads the same struct.
-        let mut built = Host::new();
-        let config_path = config::path();
-        for w in config::load(&mut built, &config_path) {
-            eprintln!("plait: {w}");
-        }
-        let host = Rc::new(built);
         cx.set_global(config::Active(host.clone()));
 
         // Re-read the file whenever it is written, and hand the result to every
@@ -221,7 +425,13 @@ fn main() {
         })
         .detach();
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
-        cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+        // No context predicate: there is one focusable view and no mode stack
+        // yet, so a binding is global and the view that has focus gets it. The
+        // day there is a second pane, this is what a keymap replaces.
+        cx.bind_keys([
+            KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("s", CycleLayout, None),
+        ]);
         cx.set_menus(vec![Menu {
             name: "plait".into(),
             items: vec![MenuItem::action("Quit", Quit)],
@@ -239,6 +449,7 @@ fn main() {
                 // Where the last run of this exact command left off. Restored
                 // before the first frame so you never see row 0 flash past.
                 let resume = session::restore(&session_key, &session_path);
+                let mut diff_entity: Option<Entity<views::diff::Diff>> = None;
                 let (view, rendered, top, total, load): (
                     AnyView,
                     Rc<Cell<usize>>,
@@ -263,7 +474,8 @@ fn main() {
                     }
                     Data::Diff(files) => {
                         let h = host.clone();
-                        let e = cx.new(|_| views::diff::Diff::new(files, h));
+                        let e = cx.new(|cx| views::diff::Diff::new(files, h, cx));
+                        diff_entity = Some(e.clone());
                         let v = e.read(cx);
                         if let Some(r) = &resume {
                             v.scroll_to(r.top);
@@ -298,7 +510,18 @@ fn main() {
                     .detach();
                 }
                 let stats = stats::enabled().then(|| Stats::new(rendered, total, load));
-                let shell = cx.new(|_| DevShell { title, view, stats, host });
+                let shell = cx.new(|_| DevShell {
+                    title,
+                    view,
+                    stats,
+                    // Only where there is something to drive: the commit graph
+                    // gets no strip rather than a strip of dead controls.
+                    rediff: diff_entity.as_ref().and(rediff),
+                    diff: diff_entity,
+                    algorithm: None,
+                    open: None,
+                    error: None,
+                });
                 cx.new(|cx| Root::new(shell, window, cx))
             })
             .expect("failed to open window");
@@ -318,10 +541,12 @@ fn read_fixture(path: &str) -> String {
     String::from_utf8_lossy(&std::fs::read(path).unwrap_or_default()).into_owned()
 }
 
-fn load(which: &str, source: &Source) -> Result<(String, Data), String> {
+fn load(which: &str, source: &Source, host: &Host) -> Result<(String, Data), String> {
     match (which, source) {
         ("diff", Source::Repo(repo, revspec)) => {
-            let files = plait_git::diff(repo, revspec)?;
+            // The host's differs, not a default: which algorithm ran is a
+            // configured choice, and this is the one place it is made.
+            let files = plait_git::diff(repo, revspec, &host.differ, None)?;
             if files.is_empty() {
                 return Err(format!(
                     "no changes for {:?} {}",
@@ -329,6 +554,8 @@ fn load(which: &str, source: &Source) -> Result<(String, Data), String> {
                     if revspec.is_empty() { "(working tree)" } else { revspec }
                 ));
             }
+            // No algorithm in the label: there is a control in the title bar
+            // that says which one, and it stays true when you change it.
             let label = format!("{} {}", plait_git::describe(repo), revspec);
             Ok((label.trim().into(), Data::Diff(files)))
         }

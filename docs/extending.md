@@ -12,6 +12,8 @@ the test that proves a second implementation fits.
 ```rust
 pub struct Host {
     pub syntax: Highlighters,   // which highlighter each path gets
+    pub differ: Differs,        // which algorithm turns two files into a diff
+    pub layout: String,         // which diff presentation opens, by name
     pub theme: Theme,           // every colour the app draws
     pub font: Font,             // the face, and the numbers derived from it
 }
@@ -31,6 +33,13 @@ not hot-reload.
 Not there yet: command dispatch, the mode stack, and any way to load an
 implementation from outside the binary. Today "an extension" means code compiled
 in. The seams are shaped so that stops being true without them changing.
+
+`s` is the first real key binding and is deliberately shaped like the last one
+will be — the view owns a focus handle, the binding is global, the handler is a
+method — so that when dispatch arrives it has something to attach to rather than
+something to replace. Until then the title-bar pickers are how a registry is
+reachable without editing a file; they read the same names `plait.toml` does, and
+should collapse into a settings panel when there is one.
 
 ## 1. A language
 
@@ -83,7 +92,49 @@ The contract, in full: ranges index their own line, are sorted, never overlap, a
 land on char boundaries. Break the last one and a debug build panics in GPUI's
 text layout.
 
-## 3. A theme
+## 3. A diff algorithm
+
+Which lines correspond is a judgement, so it is a trait. An implementation returns
+only the edit script — line numbers, context and hunk headers are
+`differ::hunks`, shared by all of them, because that bookkeeping is identical and
+a second copy of it is a hunk header that quietly disagrees with its lines.
+
+```rust
+struct TreeSitterDiff { /* parsers, a blob cache */ }
+
+impl Differ for TreeSitterDiff {
+    fn name(&self) -> &'static str { "tree-sitter" }
+
+    fn diff(&self, path: &str, old: &[&str], new: &[&str]) -> Vec<Edit> {
+        // sorted by old_start, non-overlapping, none empty, none adjacent
+    }
+}
+
+host.differ.register(TreeSitterDiff::new());
+host.differ.select("tree-sitter");            // for everything…
+host.differ.route(&["json", "lock"], "myers"); // …or all but these
+host.differ.context = 6;
+```
+
+Selection is by **name**, not by value, and that is the whole point: `[diff]
+algorithm = "tree-sitter"` in `plait.toml` reaches a registered implementation the
+day it exists, and an unknown name reports the ones that do — from the registry,
+so the message cannot go stale. `route` matches extensions or whole filenames the
+way `Highlighters::route` does, and a later route wins.
+
+`path` is in the signature for exactly this: a language-aware differ needs to know
+what it is looking at. If you need the *blob* rather than the split lines,
+acquisition is what would have to change; see
+[decisions/0013](decisions/0013-differs-in-core-not-a-dependency.md).
+
+The contract, in full: edits are sorted by `old_start`, never overlap, are never
+empty, and no two are adjacent — two touching edits describe one change and must
+be one. `verify` in `differ.rs`'s tests checks every clause of that and every
+built-in is run through it. If your implementation is meant to be *minimal*, check
+it against `git diff --minimal` with `git/examples/diffcheck.rs`; a minimal script
+has exactly one length, so that is a real test and not a comparison.
+
+## 4. A theme
 
 ```rust
 let mut theme = Theme::default_dark();
@@ -97,7 +148,7 @@ host.theme = theme;
 Plain `0xRRGGBB` throughout, so the ANSI painter and the GPUI window read the same
 one. Details and the contrast machinery: [theming.md](theming.md).
 
-## 4. A font
+## 5. A font
 
 ```rust
 host.font = Font {
@@ -131,7 +182,7 @@ Everything else derived from the face is derived, not restated:
 it at `ROW_H / 1.2`, so a larger body size gives up the top of the scale instead
 of drawing outside its row.
 
-## 5. How a file's diff is presented
+## 6. How a file's diff is presented
 
 ```rust
 pub trait Rows {
@@ -152,19 +203,24 @@ Diff::with_renderers(files, host, vec![
 ]);
 ```
 
-`Diff::new` is that call with the two built-ins in it, so the shipped
-configuration goes through the seam rather than around it. `MarkdownRows` is the
-worked example: it draws `.md` as the document instead of the source, and it does
-it with no new trait, no new argument and no edit to `TextRows` — which is the
-only test of a seam that counts. Read it before writing a second one; the
-interesting parts are `Metrics`, and how little of it is markdown.
+That pins one presentation with nothing to cycle to. The general form is a
+[layout](#7-a-whole-diff-presentation), and `Layouts::builtin` builds the two
+shipped ones through it, so the shipped configuration goes through the seam rather
+than around it.
+
+`MarkdownRows` is the worked example: it draws `.md` as the document instead of the
+source, and it does it with no new trait, no new argument and no edit to
+`TextRows` — which is the only test of a seam that counts. Read it before writing
+a second one; the interesting parts are `Metrics`, and how little of it is
+markdown. `SplitRows` is the second, and it is the one to read for a presentation
+of the whole diff rather than of one kind of file.
 
 **This is the one seam whose registry is not on `Host`,** and the reason is
 structural rather than an oversight: a `Rows` implementation returns an
 `AnyElement`, `Host` lives in `core`, and `core` never knows a UI exists. So the
-list is an argument to `Diff::with_renderers` instead. If panes arrive and more
-than one view wants a row registry, a shell-side registry is where it goes — not
-`Host`.
+registry is shell-side and `Host` carries only the *name* of the entry to open,
+which is data. If panes arrive and more than one view wants one, that is where a
+second shell-side registry goes — not `Host`.
 
 What arrives in `build` is already clipped, intraline-diffed and highlighted — see
 [diff-pipeline.md](diff-pipeline.md). An implementation draws; it does not redo any
@@ -192,15 +248,67 @@ More fits inside `ROW_H` than it looks like. What `MarkdownRows` found:
   of the string becomes a run in the merge and takes the text's colour; as its own
   `div` it carries its own. It also keeps every text rewrite a pure deletion,
   which is what lets the range remapping stay one-directional.
-- **Row count is not yours to change.** The gutter shows both line numbers and
-  they have to keep adding up, so a blank line still costs a whole row. A test
-  asserts `MarkdownRows` and `TextRows` produce the same count for the same file.
+- **Row count is not yours to change — within a column.** The gutter shows both
+  line numbers and they have to keep adding up, so a blank line still costs a
+  whole row. A test asserts `MarkdownRows` and `TextRows` produce the same count
+  for the same file. A *second column* is a different claim, and `SplitRows` is
+  the presentation that makes it: a removal and the addition that replaced it
+  share a row, so it has strictly fewer rows than unified for the same diff.
 - **Anything spanning rows is measured, not laid out.** A table's columns have to
   line up with the rows above and below, which no per-row API can express. Padding
   the text in a monospaced face gets it for free and keeps one `StyledText` per
   row; an element per cell would have cost the render path. If you need this,
   measure across the run first and rewrite each row exactly once — see the
   warning on `syntax::for_each_side` about why "exactly once" is load-bearing.
+
+## 7. A whole-diff presentation
+
+A [`Rows`](#6-how-a-files-diff-is-presented) implementation presents one kind of
+file. A `Layout` is a named set of them: one way of presenting the whole diff, and
+what `s` cycles.
+
+```rust
+let mut layouts = Layouts::builtin();          // unified, split
+layouts.register("inline-words", |host| {
+    vec![Box::new(InlineWordRows::new(&host.font))]
+});
+
+// and then, in plait.toml:  [diff] layout = "inline-words"
+```
+
+`build` is a closure and not a `Vec`, because a layout has to be *rebuildable*:
+switching re-runs the pipeline from stage 3 and hands each implementation its
+files again, and a `Vec` that has already been consumed cannot be handed anything.
+It takes the `Host` because a presentation is entitled to depend on the font —
+`MarkdownRows` derives its whole heading scale from it.
+
+`renderers[0]` is the fallback for that layout and must claim every path. `split`
+has exactly one entry for that reason: `SplitRows` claims everything, because it
+is a presentation of the diff rather than of `.md`.
+
+Registering a name twice replaces it, so `unified` can be corrected rather than
+only added to. An unknown `[diff] layout` opens the first entry and says so —
+falling back rather than failing, because the file is live-reloaded and a typo must
+not leave you with no diff.
+
+**A registered layout appears in the title-bar picker with no further work**, and
+so does a registered algorithm. That is the property to preserve: the pickers in
+`controls.rs` are a pure function of a list of names and an index, so a seam with
+a registry gets a control for free. If a new seam needs a control written for it
+by hand, the seam is the wrong shape — see
+[decisions/0015](decisions/0015-title-bar-controls-are-hand-rolled.md).
+
+Two things to know before writing one:
+
+- **The alignment is `core`'s, not yours.** `align::align` decides which removal
+  sits opposite which addition, and it is the same function `replace_pairs` is
+  built on. Pair differently and you will draw a removal beside an addition whose
+  changed words were computed against another line — highlighted fragments
+  corresponding to nothing on screen.
+- **Switching costs a `prepare`.** 8 ms typically, 247 ms on the pathological
+  fixture. That is the price of a keystroke and it is paid to keep the memory
+  cost off the load path; see
+  [decisions/0014](decisions/0014-layouts-are-a-registry.md).
 
 ## What a new seam owes
 
@@ -212,7 +320,10 @@ If you are adding one, match what the existing four do:
 3. **A default that claims everything**, so behaviour with nothing registered is
    the shipped behaviour.
 4. **A test that swaps it.** `Highlighters` has one per routing rule; `Rows` has
-   two; `Theme` has the field-by-field rewrite. Counts go stale, so grep for the
-   swap rather than trusting this line.
+   two; `Differs` has `an_algorithm_can_be_added_selected_and_routed` and a config
+   test that reaches a registered one by name; `Layouts` has
+   `a_registered_presentation_is_cycled_to_like_a_built_in`; `Theme` has the
+   field-by-field rewrite. Counts go stale, so grep for the swap rather than
+   trusting this line.
 5. **A line in `AGENTS.md`** if it changes the philosophy, and a page here if it
    does not.

@@ -43,36 +43,95 @@ reimplement any of that; you will get it subtly wrong.
 
 Both behind one trait. Frontends never learn which path ran.
 
+**It acquires content, not diffs.** Two lists of lines per changed file, and
+`core` decides which lines correspond. Let git produce the diff and git owns the
+algorithm, which makes `trait Differ` decoration and rule 1 false for the most
+important thing this app does. Two processes for a whole diff however many files:
+one `git diff --raw`, one `git cat-file --batch`.
+
 ## Diffs
 
-`imara-diff`, Histogram — not Myers. Histogram anchors on lines appearing exactly
-once, so function signatures become anchors and a moved block reads as a move
-instead of dissolving into line-soup. Git defaults to Myers. We deliberately don't.
+Histogram — not Myers. Histogram anchors on lines appearing exactly once, so
+function signatures become anchors and a moved block reads as a move instead of
+dissolving into line-soup. Git defaults to Myers. We deliberately don't.
 
-Diffing is a `trait Differ`. Histogram and Myers are only the first two
-implementations; semantic and language-aware differs arrive as extensions. The
-view never calls a differ directly.
+Diffing is a `trait Differ` and the algorithms are written out in `core`, not
+pulled in — `core` has no dependencies and that is the rule, not housekeeping.
+Histogram, patience and Myers are the first three; semantic and language-aware
+differs arrive as extensions. The view never calls a differ directly, and an
+implementation returns only the edit script: line numbers, context and hunk
+headers are shared.
+
+**Check a differ against git, don't argue about it.** A minimal edit script has
+exactly one length, so ours must match `git diff --minimal` exactly — and does, on
+every repository in `./check.sh`. Two bugs during this work were invisible in the
+totals and obvious in the per-file deltas.
+
+Two things in histogram are wrong in the plausible direction, so read them before
+touching them: a run is scored by its **rarest** line, not its most common one,
+and the threshold **tightens** as the search runs. Getting either backwards costs
+hundreds of spurious changed lines and still looks like a working diff.
+
+Both algorithms are quadratic in the number of differing lines in the worst case.
+Bound them and degrade to "this region was replaced"; a line-for-line pairing of a
+generated file is not worth a visible pause and nobody was reading it. Recurse on
+an explicit stack — a file whose every anchor peels off one line is as deep as it
+is long, and generated code has that shape.
+
+**Fence a code block; never indent one.** The renderer knows fences and nothing
+else, so a four-space block is prose — emphasis, links and list markers all get
+interpreted inside it. `#` was the worst of it: a `# comment` trailing an
+indented command read as an `<h1>` until `heading_level` started counting the
+indent, which is CommonMark's rule and now shared by the block pass and the token
+pass. Applies to this file too.
 
 Intraline highlighting is a **second pass**: line diff first, then re-diff only the
 changed pairs at word level. Words, not characters — char diffs on code are
 confetti. Never diff untokenized text; it degrades badly.
 
-Cache diffs by blob OID. They never change.
+**Which removal pairs with which addition is decided once, in `core::align`.** The
+intraline pass and the side-by-side layout both read it. Pair differently in a
+renderer and you draw a removal beside an addition whose changed words were
+computed against another line — highlighting that corresponds to nothing on
+screen.
+
+## Layouts
+
+Unified and side-by-side are two entries in a registry, not two branches of a
+`render`. A `Layout` is a name and a closure that builds a set of `Rows`; `s`
+cycles them and `[diff] layout` picks the one to open in. The registry is
+shell-side because a `Rows` implementation returns a UI element; the *name* is on
+`Host`, because a name is data.
+
+Adding a presentation must need no edit to the existing ones. `SplitRows` needed
+no new trait, no new argument and no change to `TextRows` — that is the only test
+of a seam that counts. A registered layout appears in the title-bar dropdown
+without being told to; if a new seam needs a control written for it by hand, the
+seam is shaped wrong.
+
+Cache diffs by blob OID. They never change. Acquisition yields both OIDs for
+exactly this reason; the cache itself is not built.
 
 ## Building
 
-    ./check.sh                          # everything headless: tests + every fixture
-    ./dev.sh diff . HEAD~2..HEAD        # rebuild + relaunch on every save,
-                                        # landing back on the same row.
-                                        # Debug + stats overlay by default,
-                                        # so its timings mean nothing —
-                                        # ./dev.sh --release for real ones
-    cargo test -p plait-core            # just correctness, sub-second
-    cargo build --release -p plait-shell
-    ./target/release/plait-shell commits [REPO] [LIMIT]
-    ./target/release/plait-shell diff    [REPO] [REVSPEC]
-    ./target/release/plait-shell diff --fixtures        # read fixtures/ instead
-    PLAIT_STATS=1 ./target/release/plait-shell diff     # frame/heap overlay
+```sh
+./check.sh                          # everything headless: tests, every fixture,
+                                    # and the differs against git's own answer
+cargo run -q -p plait-git --example diffcheck --release [REPO] [REVSPEC]
+                                    # just that comparison; WORST=1 for the
+                                    # files it did worst on
+./dev.sh diff . HEAD~2..HEAD        # rebuild + relaunch on every save,
+                                    # landing back on the same row.
+                                    # Debug + stats overlay by default,
+                                    # so its timings mean nothing —
+                                    # ./dev.sh --release for real ones
+cargo test -p plait-core            # just correctness, sub-second
+cargo build --release -p plait-shell
+./target/release/plait-shell commits [REPO] [LIMIT]
+./target/release/plait-shell diff    [REPO] [REVSPEC]
+./target/release/plait-shell diff --fixtures        # read fixtures/ instead
+PLAIT_STATS=1 ./target/release/plait-shell diff     # frame/heap overlay
+```
 
 The overlay forces a redraw every frame so the fps number means something —
 GPUI is reactive and draws nothing at rest, so an honest idle reading would be
@@ -80,6 +139,11 @@ zero. It measures how fast we *can* redraw, not what the app costs sitting still
 Never read those numbers off a debug build.
 
 Colour and font live in `plait.toml` and reload on the next frame — no rebuild.
+`[diff] algorithm`, `context` and `layout` live there too. `context` applies on
+the next launch; the other two have controls in the title bar and change live,
+and the file sets what they *open* on. A control there is the temporary answer
+until keybindings and a settings panel are config — the picker is a pure function
+of a list and an index, so any seam with a registry gets one for free.
 `plait config > plait.toml` writes a complete one. Code still costs a rebuild;
 `./dev.sh` is what removes the quitting and retyping around it.
 
@@ -155,6 +219,24 @@ A bare binary is not an `.app` bundle, so the window opens behind everything.
 
 Custom drawing is `canvas()` + `PathBuilder` + `window.paint_path`. Keep it
 per-row where the geometry allows and it virtualizes with the list for free.
+
+**Anything that floats needs `deferred`.** Siblings paint in order, so a dropdown
+overflowing the *first* child of a column is painted under the second — visible
+nowhere, and it looks like the element was never built. `gpui::deferred(child)`
+keeps the layout where it is and moves the paint after every ancestor.
+`.occlude()` on top of that, or the rows underneath take the clicks: hit-testing
+is paint order too, and an absolutely positioned child does not claim the space it
+covers.
+
+**An element's identity is its path, and unnamed ancestors are not in it.** Two
+controls whose inner elements are both `.id("list")` are the *same* element, so
+one drives the other's hover and click state. Give the wrapper an id, or make the
+inner ones unique.
+
+**Read the host on the render path, never a captured clone.** `DevShell` held an
+`Rc<Host>` from startup, so the window chrome and the font for the whole window
+silently did not hot-reload while every view inside them did. `config::host(cx)`
+per frame is a refcount bump.
 
 ## Don't
 

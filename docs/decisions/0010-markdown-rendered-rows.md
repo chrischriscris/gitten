@@ -195,6 +195,20 @@ highlighter, not to this.
 **Blank lines cost a full row.** 9% of the book fixture and 30% of the
 technical-docs one. Fixed row height, and not fixable here.
 
+**An indented code block is not recognised as code.** `classify` knows fences and
+nothing else, so a four-space block is prose — its contents get emphasis, links
+and list markers interpreted, and its `# comments` were read as headings until
+`heading_level` started counting the indent. Detecting it properly is not a
+one-liner: within a hunk a four-space line is equally likely to be a list
+continuation, and `Block::Ordered` already claims `indent >= 2` for exactly that
+case, so the two rules would have to be arbitrated with a blank line that may not
+be in the hunk at all.
+
+Fences are unambiguous, so the answer for now is to use them — this repository's
+own docs had exactly one indented block left and it is the one that surfaced the
+heading bug. There is a scan for them in the git history of this file if a future
+one creeps back in.
+
 **A new fixture.** Every other diff fixture is code, and prose is a different
 distribution: `fixtures/fetch.sh` now builds `md.diff` from rust-lang/book. It
 turned out to be the heaviest intraline case in the set as well — 72 ms of a

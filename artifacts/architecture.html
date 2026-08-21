@@ -1,0 +1,853 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>plait — Architecture &amp; Algorithms</title>
+<style>
+  :root {
+    --bg: #0e0d0c;
+    --bg-2: #161412;
+    --bg-3: #1d1a17;
+    --fg: #d6d2cb;
+    --fg-dim: #8a857c;
+    --fg-faint: #5c5851;
+    --accent: #e0b96a;
+    --accent-2: #6aa9e0;
+    --green: #4c9a6e;
+    --green-bg: #16241a;
+    --red: #c96f5f;
+    --red-bg: #2a1917;
+    --word-green: #1e3a23;
+    --word-red: #43201a;
+    --line: #2a2723;
+    --mono: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--sans);
+    line-height: 1.55;
+    font-size: 15px;
+  }
+  a { color: var(--accent-2); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  /* ---------- header ---------- */
+  header {
+    position: sticky; top: 0; z-index: 50;
+    background: linear-gradient(180deg, rgba(14,13,12,.97), rgba(14,13,12,.92));
+    backdrop-filter: blur(6px);
+    border-bottom: 1px solid var(--line);
+    padding: 14px 28px;
+    display: flex; align-items: baseline; gap: 18px; flex-wrap: wrap;
+  }
+  header .logo { font-family: var(--mono); font-weight: 700; font-size: 20px; color: var(--accent); }
+  header .tagline { color: var(--fg-dim); font-size: 13px; }
+  nav { display: flex; gap: 6px; flex-wrap: wrap; margin-left: auto; }
+  nav button {
+    background: transparent; color: var(--fg-dim); border: 1px solid transparent;
+    padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 13px; font-family: var(--sans);
+    transition: all .15s;
+  }
+  nav button:hover { color: var(--fg); background: var(--bg-2); }
+  nav button.active { color: var(--accent); border-color: var(--line); background: var(--bg-2); }
+
+  main { max-width: 1080px; margin: 0 auto; padding: 28px 28px 80px; }
+  section { display: none; }
+  section.active { display: block; animation: fade .25s ease; }
+  @keyframes fade { from { opacity: 0; transform: translateY(4px);} to { opacity: 1; transform: none;} }
+
+  h1 { font-size: 26px; margin: 0 0 6px; }
+  h2 { font-size: 20px; margin: 40px 0 12px; color: var(--accent); border-bottom: 1px solid var(--line); padding-bottom: 6px; }
+  h3 { font-size: 16px; margin: 26px 0 8px; color: var(--fg); }
+  p { margin: 10px 0; }
+  .lead { color: var(--fg-dim); font-size: 16px; max-width: 70ch; }
+  .muted { color: var(--fg-dim); }
+  .faint { color: var(--fg-faint); }
+  code { font-family: var(--mono); font-size: .88em; background: var(--bg-2); padding: 1px 5px; border-radius: 4px; color: #e6c98a; }
+  pre { background: var(--bg-2); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; overflow-x: auto; }
+  pre code { background: none; padding: 0; color: var(--fg); }
+  .grid { display: grid; gap: 16px; }
+  .grid-2 { grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+  .card {
+    background: var(--bg-2); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px;
+  }
+  .card h3 { margin-top: 0; }
+  .card .num { font-family: var(--mono); font-size: 22px; color: var(--accent); font-weight: 700; }
+  .card .lbl { color: var(--fg-dim); font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
+
+  /* ---------- architecture diagram ---------- */
+  .arch { display: flex; flex-direction: column; gap: 14px; margin: 20px 0; }
+  .arch-box {
+    border-radius: 10px; padding: 14px 18px; border: 1px solid var(--line);
+  }
+  .arch-core { background: var(--bg-2); border-color: var(--accent); }
+  .arch-git { background: var(--bg-2); border-color: var(--accent-2); }
+  .arch-shell { background: var(--bg-2); border-color: var(--green); }
+  .arch-title { font-family: var(--mono); font-weight: 700; font-size: 14px; margin-bottom: 6px; }
+  .arch-core .arch-title { color: var(--accent); }
+  .arch-git .arch-title { color: var(--accent-2); }
+  .arch-shell .arch-title { color: var(--green); }
+  .arch-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .arch-tag { font-family: var(--mono); font-size: 12px; background: var(--bg-3); border: 1px solid var(--line); padding: 3px 8px; border-radius: 5px; color: var(--fg-dim); }
+  .flow { display: flex; align-items: center; justify-content: center; color: var(--fg-faint); font-size: 13px; font-family: var(--mono); gap: 8px; }
+  .flow .arrow { color: var(--accent); font-size: 16px; }
+
+  /* ---------- pipeline ---------- */
+  .pipeline { display: flex; flex-direction: column; gap: 0; margin: 20px 0; }
+  .stage {
+    display: flex; gap: 14px; align-items: stretch; position: relative;
+  }
+  .stage .rail { width: 46px; display: flex; flex-direction: column; align-items: center; flex: none; }
+  .stage .dot {
+    width: 30px; height: 30px; border-radius: 50%; background: var(--bg-3);
+    border: 2px solid var(--accent); color: var(--accent); font-family: var(--mono);
+    font-size: 13px; font-weight: 700; display: flex; align-items: center; justify-content: center;
+  }
+  .stage .dot.off { border-color: var(--fg-faint); color: var(--fg-faint); }
+  .stage .line { flex: 1; width: 2px; background: var(--line); }
+  .stage .body { flex: 1; padding: 4px 0 22px; }
+  .stage .body .name { font-family: var(--mono); font-weight: 700; color: var(--fg); }
+  .stage .body .where { font-family: var(--mono); font-size: 12px; color: var(--fg-faint); }
+  .stage .body p { margin: 4px 0; color: var(--fg-dim); }
+  .stage.sub { margin-left: 46px; }
+  .stage.sub .dot { width: 22px; height: 22px; font-size: 11px; border-width: 1px; }
+
+  /* ---------- tables ---------- */
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 13.5px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+  th { color: var(--fg-dim); font-size: 12px; text-transform: uppercase; letter-spacing: .05em; }
+  td code { background: none; padding: 0; }
+  tr:hover td { background: var(--bg-2); }
+
+  /* ---------- interactive graph demo ---------- */
+  .demo { background: var(--bg-2); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin: 16px 0; }
+  .demo .controls { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; align-items: center; }
+  .demo button {
+    background: var(--bg-3); color: var(--fg); border: 1px solid var(--line);
+    padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 13px; font-family: var(--sans);
+  }
+  .demo button:hover { border-color: var(--accent); color: var(--accent); }
+  .demo button.active { border-color: var(--accent); color: var(--accent); }
+  .graph-svg { display: block; width: 100%; overflow: visible; }
+  .graph-svg text { font-family: var(--mono); font-size: 11px; fill: var(--fg-dim); }
+  .graph-svg .subject { fill: var(--fg); }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 10px; font-size: 12px; color: var(--fg-dim); }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .sw { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+
+  /* ---------- diff anatomy ---------- */
+  .diff-row {
+    font-family: var(--mono); font-size: 12.5px; display: flex; align-items: center;
+    border-radius: 4px; margin: 3px 0; padding: 3px 6px; white-space: pre; overflow-x: auto;
+  }
+  .diff-row .gutter { color: var(--fg-faint); width: 44px; flex: none; text-align: right; margin-right: 10px; }
+  .diff-row .sign { width: 14px; flex: none; }
+  .diff-row.add { background: var(--green-bg); }
+  .diff-row.del { background: var(--red-bg); }
+  .diff-row.ctx { background: var(--bg-3); color: var(--fg-dim); }
+  .diff-row.add .sign { color: var(--green); }
+  .diff-row.del .sign { color: var(--red); }
+  .word { border-radius: 2px; padding: 0 1px; }
+  .word.add { background: var(--word-green); }
+  .word.del { background: var(--word-red); }
+  .kw { color: #e0b96a; }
+  .fn { color: #6aa9e0; }
+  .cm { color: #615a52; font-style: italic; }
+  .str { color: #9ec97a; }
+
+  /* ---------- callout ---------- */
+  .callout {
+    border-left: 3px solid var(--accent); background: var(--bg-2); padding: 12px 16px;
+    border-radius: 0 8px 8px 0; margin: 16px 0;
+  }
+  .callout .t { font-family: var(--mono); font-weight: 700; color: var(--accent); font-size: 13px; }
+  .callout p { margin: 4px 0; }
+
+  .pill { display: inline-block; font-family: var(--mono); font-size: 11px; padding: 2px 8px; border-radius: 20px; border: 1px solid var(--line); color: var(--fg-dim); margin: 2px; }
+  .pill.core { border-color: var(--accent); color: var(--accent); }
+  .pill.git { border-color: var(--accent-2); color: var(--accent-2); }
+  .pill.shell { border-color: var(--green); color: var(--green); }
+
+  .toc { background: var(--bg-2); border: 1px solid var(--line); border-radius: 10px; padding: 16px 20px; }
+  .toc a { display: block; padding: 4px 0; color: var(--fg); }
+  .toc a:hover { color: var(--accent); text-decoration: none; }
+  .toc .n { color: var(--fg-faint); font-family: var(--mono); margin-right: 8px; }
+
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 760px) { .two-col { grid-template-columns: 1fr; } }
+
+  footer { max-width: 1080px; margin: 0 auto; padding: 20px 28px 40px; color: var(--fg-faint); font-size: 13px; border-top: 1px solid var(--line); }
+</style>
+</head>
+<body>
+
+<header>
+  <span class="logo">plait</span>
+  <span class="tagline">a desktop git client — architecture &amp; algorithms</span>
+  <nav id="nav">
+    <button data-sec="overview" class="active">Overview</button>
+    <button data-sec="crates">Crates</button>
+    <button data-sec="pipeline">Diff pipeline</button>
+    <button data-sec="graph">Commit graph</button>
+    <button data-sec="syntax">Syntax</button>
+    <button data-sec="theme">Theming</button>
+    <button data-sec="extend">Extending</button>
+  </nav>
+</header>
+
+<main>
+
+<!-- ================= OVERVIEW ================= -->
+<section id="overview" class="active">
+  <h1>plait</h1>
+  <p class="lead">A desktop git client with lazygit's keyboard model, written in Rust on GPUI. It is a <em>reader</em>: it acquires, parses, prepares and draws git data — commits and diffs — as fast as it can, with every stage testable without a window.</p>
+
+  <h2>Three rules, in priority order</h2>
+  <div class="grid grid-2">
+    <div class="card">
+      <h3>1. Extensible</h3>
+      <p class="muted">Anything a built-in does, an extension must be able to do too. Hardcoding something a user might want to swap means making it a trait first. Every seam is exercised by a test that swaps the implementation.</p>
+    </div>
+    <div class="card">
+      <h3>2. Beautiful &amp; usable</h3>
+      <p class="muted">Dense, quiet, keyboard-first. Not done until it looks like it belongs. Colour is data; contrast is resolved, not guessed.</p>
+    </div>
+    <div class="card">
+      <h3>3. Blazingly fast</h3>
+      <p class="muted">Nothing on the render path allocates per frame or recomputes what a cache could hold. The render path is one <code>StyledText</code> per visible row.</p>
+    </div>
+  </div>
+
+  <h2>The one architectural rule</h2>
+  <div class="callout">
+    <div class="t">core/ never knows a UI exists.</div>
+    <p>No GPUI, no rendering, no terminal, and <code>[dependencies]</code> is empty — deliberately. <code>core</code> compiles in a second and its tests need no window. Everything except drawing and input lives there: git parsing, lane assignment, diffs, the extension host.</p>
+    <p>Two cheap checks keep it honest: <code>core/Cargo.toml</code> ends with an empty <code>[dependencies]</code>, and a second frontend (<code>examples/paint.rs</code>, ANSI) draws a real diff with <em>no pipeline code of its own</em>.</p>
+  </div>
+
+  <h2>Data flow at a glance</h2>
+  <div class="arch">
+    <div class="arch-box arch-git">
+      <div class="arch-title">plait-git — the acquisition layer</div>
+      <p class="muted" style="margin:0">The only crate that talks to a repository. Reads through <code>gix</code> (no process spawn on the hot path); writes through the <code>git</code> binary so hooks, credential helpers and <code>.gitconfig</code> behave exactly as they do in a terminal. Both behind one surface.</p>
+      <div class="arch-tags"><span class="arch-tag">log</span><span class="arch-tag">diff</span><span class="arch-tag">describe</span></div>
+    </div>
+    <div class="flow"><span>bytes</span><span class="arrow">▼</span></div>
+    <div class="arch-box arch-core">
+      <div class="arch-title">plait-core — pure, zero deps</div>
+      <p class="muted" style="margin:0">Everything except drawing and input. Parsing, preparation, lane assignment, syntax, theming, fonts, the swappable <code>Host</code>.</p>
+      <div class="arch-tags"><span class="arch-tag">parse_unified_diff</span><span class="arch-tag">assign_lanes</span><span class="arch-tag">prepared::prepare</span><span class="arch-tag">intraline</span><span class="arch-tag">syntax</span><span class="arch-tag">theme</span><span class="arch-tag">font</span><span class="arch-tag">host</span></div>
+    </div>
+    <div class="flow"><span>rows, colours</span><span class="arrow">▼</span></div>
+    <div class="arch-box arch-shell">
+      <div class="arch-title">plait-shell — GPUI</div>
+      <p class="muted" style="margin:0">Drawing and input, and as little else as possible. Views consume already-loaded data; they never mutate it.</p>
+      <div class="arch-tags"><span class="arch-tag">views/diff</span><span class="arch-tag">views/markdown</span><span class="arch-tag">views/commits</span><span class="arch-tag">graph</span><span class="arch-tag">config</span><span class="arch-tag">session</span><span class="arch-tag">stats</span></div>
+    </div>
+  </div>
+
+  <h2>Interactive tour</h2>
+  <div class="toc">
+    <a href="#" data-go="crates"><span class="n">01</span>The three crates and the boundary</a>
+    <a href="#" data-go="pipeline"><span class="n">02</span>The diff pipeline — six stages, five in core</a>
+    <a href="#" data-go="graph"><span class="n">03</span>Commit graph — lane assignment &amp; drawing</a>
+    <a href="#" data-go="syntax"><span class="n">04</span>Syntax highlighting — a scanner that knows no languages</a>
+    <a href="#" data-go="theme"><span class="n">05</span>Theming — colour as data, contrast resolution</a>
+    <a href="#" data-go="extend"><span class="n">06</span>Extending — every seam, with a worked example</a>
+  </div>
+</section>
+
+<!-- ================= CRATES ================= -->
+<section id="crates">
+  <h1>The three crates</h1>
+  <p class="lead">The interesting line is between the first two crates and the third. Everything below that line is pure, dependency-free and testable without a window.</p>
+
+  <h2>plait-core</h2>
+  <div class="grid grid-2">
+    <div class="card"><h3><code>lib.rs</code></h3><p class="muted">Commit &amp; diff parsing, <code>assign_lanes</code>, <code>intraline</code>, <code>replace_pairs</code>, <code>initials</code>.</p></div>
+    <div class="card"><h3><code>prepared.rs</code></h3><p class="muted">A diff assembled into drawable rows: clip → intraline → syntax.</p></div>
+    <div class="card"><h3><code>markdown.rs</code></h3><p class="muted">A <code>.md</code> diff as blocks, markers cut, ranges moved.</p></div>
+    <div class="card"><h3><code>syntax.rs</code></h3><p class="muted">The scanner, language tables, the <code>Highlighter</code> trait, routing, Markdown.</p></div>
+    <div class="card"><h3><code>theme.rs</code></h3><p class="muted">Every colour as <code>0xRRGGBB</code> data, plus contrast resolution.</p></div>
+    <div class="card"><h3><code>font.rs</code></h3><p class="muted">The face as data: family, size, whether a char is a column.</p></div>
+    <div class="card"><h3><code>host.rs</code></h3><p class="muted">The struct that holds the swappable pieces.</p></div>
+  </div>
+  <p class="muted">Four examples double as the headless test bench: <code>bench</code> (timings), <code>shape</code> (topology), <code>verify</code> (lane invariants), <code>paint</code> (the diff view in ANSI).</p>
+
+  <h2>plait-git</h2>
+  <p class="muted">The only crate that talks to a repository. Today it shells out to the <code>git</code> binary for <code>log</code>, <code>diff</code> and <code>describe</code>; reads are meant to move to <code>gix</code> while writes stay on the binary permanently — shelling out is what gets hooks, credential helpers and <code>.gitconfig</code> semantics exactly right. Both paths sit behind one surface, so a frontend never learns which ran.</p>
+
+  <h2>plait-shell</h2>
+  <div class="grid grid-2">
+    <div class="card"><h3><code>main.rs</code></h3><p class="muted">Argument parsing, data loading, the window, the <code>Host</code>.</p></div>
+    <div class="card"><h3><code>views/diff.rs</code></h3><p class="muted">The <code>Rows</code> seam, <code>TextRows</code>, run-list merging, row furniture.</p></div>
+    <div class="card"><h3><code>views/markdown.rs</code></h3><p class="muted"><code>MarkdownRows</code>: the rendered-Markdown presentation and its metrics.</p></div>
+    <div class="card"><h3><code>views/commits.rs</code></h3><p class="muted">The commit list, author initials, row layout.</p></div>
+    <div class="card"><h3><code>graph.rs</code></h3><p class="muted">Lane geometry &amp; painting: quads, paths, one canvas per row.</p></div>
+    <div class="card"><h3><code>config.rs</code></h3><p class="muted"><code>plait.toml</code>: parse, apply, watch, and the live <code>Host</code> global.</p></div>
+    <div class="card"><h3><code>session.rs</code></h3><p class="muted">The row you were on, so <code>./dev.sh</code> puts you back after a restart.</p></div>
+    <div class="card"><h3><code>stats.rs</code></h3><p class="muted">The counting allocator and the <code>PLAIT_STATS</code> overlay.</p></div>
+  </div>
+
+  <h2>Which way data moves</h2>
+  <pre><code>git binary ──► bytes ──► parse_unified_diff ──► Vec&lt;FileDiff&gt;
+                                        │
+                       prepared::prepare │  clip, intraline, syntax
+                                        ▼
+                                  Vec&lt;prepared::File&gt;
+                                        │
+                        Rows::build (per file) │  claimed by path
+                                        ▼
+                        Vec&lt;RowRef&gt;  ──►  uniform_list  ──►  Rows::render
+                         8 bytes/row                      + Theme</code></pre>
+  <p class="muted">Nothing flows back. A view never mutates what it was handed — which is why every stage is testable without a window and why <code>paint.rs</code> can join the pipeline one stage from the end.</p>
+
+  <h2>Not built yet</h2>
+  <p class="muted">Listed so nobody reads an intention as a description: <code>cli/</code>, command dispatch &amp; the mode stack, code hot reload, extension loading from outside the binary, writes (reads only), <code>gix</code>, panes, and code-block injection into rendered Markdown.</p>
+</section>
+
+<!-- ================= PIPELINE ================= -->
+<section id="pipeline">
+  <h1>The diff pipeline</h1>
+  <p class="lead">From <code>git diff</code> bytes to pixels, in six stages. Five are in <code>core</code> and have no idea a window exists.</p>
+
+  <div class="pipeline">
+    <div class="stage">
+      <div class="rail"><div class="dot">1</div><div class="line"></div></div>
+      <div class="body">
+        <div class="name">Acquire <span class="pill git">plait-git</span></div>
+        <div class="where">plait_git::diff → bytes</div>
+        <p>Reads bytes — never <code>read_to_string</code>, because commit metadata is not guaranteed UTF-8 and real history carries Latin-1 author names.</p>
+      </div>
+    </div>
+    <div class="stage">
+      <div class="rail"><div class="dot">2</div><div class="line"></div></div>
+      <div class="body">
+        <div class="name">Parse <span class="pill core">core</span></div>
+        <div class="where">parse_unified_diff → Vec&lt;FileDiff&gt;</div>
+        <p>Walks unified output into <code>FileDiff → Hunk → DiffLine</code>, tracking both line numbers. Binary files, renames and mode changes are skipped rather than modelled — a gap, not a design.</p>
+      </div>
+    </div>
+    <div class="stage">
+      <div class="rail"><div class="dot">3</div><div class="line"></div></div>
+      <div class="body">
+        <div class="name">Prepare <span class="pill core">core</span></div>
+        <div class="where">prepared::prepare → Vec&lt;prepared::File&gt;</div>
+        <p>One pass, in this order, because each step depends on the last.</p>
+      </div>
+    </div>
+    <div class="stage sub">
+      <div class="rail"><div class="dot">a</div><div class="line"></div></div>
+      <div class="body">
+        <div class="name">Clip</div>
+        <p>Every line to a column budget (<code>MAX_LINE_CHARS = 2000</code>). Clipping comes first so no span or token can ever point past what will be drawn — get this backwards and the renderer indexes a line by a range that no longer exists. Real repos contain minified bundles; a 9.6-million-character line was measured in the wild.</p>
+      </div>
+    </div>
+    <div class="stage sub">
+      <div class="rail"><div class="dot">b</div><div class="line"></div></div>
+      <div class="body">
+        <div class="name">Intraline — second pass only</div>
+        <p>Line diff first, then re-diff only the pairs a line diff already matched as a replace. <code>replace_pairs</code> matches a run of removals to the additions that follow it, by position. Two guards: <code>MAX_INTRALINE_TOKENS = 1000</code> (the LCS table is a×b cells) and <code>MIN_INTRALINE_SIMILARITY = 0.4</code>. Words, not characters — char diffs on code are confetti.</p>
+      </div>
+    </div>
+    <div class="stage sub">
+      <div class="rail"><div class="dot">c</div><div class="line"></div></div>
+      <div class="body">
+        <div class="name">Syntax — per hunk side</div>
+        <p>The old and new lines of a hunk are two different texts printed interleaved; scanning them as one splices a removed line into an added one. Each side is scanned separately, and context lines — which belong to both — are scanned twice.</p>
+      </div>
+    </div>
+    <div class="stage">
+      <div class="rail"><div class="dot">4</div><div class="line"></div></div>
+      <div class="body">
+        <div class="name">Build <span class="pill shell">shell</span></div>
+        <div class="where">Rows::build, per file → renderer-owned rows</div>
+        <p>Each file goes to the <code>Rows</code> implementation that claims its path; the last registered claimant wins, and <code>TextRows</code> claims everything, which makes it the fallback. <code>MarkdownRows</code> takes <code>.md</code>, <code>.markdown</code>, <code>.mdx</code>.</p>
+      </div>
+    </div>
+    <div class="stage sub">
+      <div class="rail"><div class="dot">a</div><div class="line"></div></div>
+      <div class="body">
+        <div class="name">Layout (optional)</div>
+        <p><code>markdown::lay_out</code>, only if the renderer asks. Returns what each line structurally is and rewrites each line so its markers are gone and every token and span still indexes it. Removal is deletion only — <code>String::drain</code> back to front, nothing allocates per row. Tables are the exception: column widths are measured per run, then each row rewritten once to the grid. 70–100 ns a row.</p>
+      </div>
+    </div>
+    <div class="stage">
+      <div class="rail"><div class="dot">5</div><div class="line"></div></div>
+      <div class="body">
+        <div class="name">Order <span class="pill shell">shell</span></div>
+        <div class="where">Vec&lt;RowRef&gt; — 8 bytes per row</div>
+        <p><code>struct RowRef { owner: u16, index: u32 }</code>. Implementations keep their own row storage; the list holds only these 8-byte handles. At 714k rows a boxed row per row would be 714k allocations to chase on every scroll.</p>
+      </div>
+    </div>
+    <div class="stage">
+      <div class="rail"><div class="dot">6</div></div>
+      <div class="body">
+        <div class="name">Draw <span class="pill shell">shell</span></div>
+        <div class="where">Rows::render + Theme → one StyledText per row</div>
+        <p>The only stage on the render path. One <code>StyledText</code> with a run list, not an element per span. Syntax sets the foreground, intraline sets the background, and the foreground is resolved against whichever background it lands on.</p>
+      </div>
+    </div>
+  </div>
+
+  <h2>Anatomy of a line row</h2>
+  <p class="muted">All rows the same height (<code>ROW_H = 22px</code>) so <code>uniform_list</code> can virtualize the whole thing.</p>
+  <div class="demo">
+    <div class="diff-row del"><span class="gutter">12</span><span class="sign">−</span><span>fn <span class="fn">draw</span>(&amp;self) { <span class="cm">// later</span></span></div>
+    <div class="diff-row add"><span class="gutter">12</span><span class="sign">+</span><span>fn <span class="fn">draw</span>(&amp;self) { <span class="word add">self.<span class="fn">paint</span>(1);</span> } <span class="cm">// now</span></span></div>
+    <div class="diff-row ctx"><span class="gutter">13</span><span class="sign"> </span><span>    <span class="kw">let</span> x = <span class="str">"hello"</span>;</span></div>
+  </div>
+  <p class="muted">Syntax sets the foreground, intraline sets the background (the highlighted words above), and the foreground is resolved against whichever background it lands on. Rows hold <code>SharedString</code>, not <code>String</code>, so render doesn't copy the line every frame.</p>
+
+  <h2>Load cost (release, this machine)</h2>
+  <table>
+    <tr><th>fixture</th><th>diff lines</th><th>parse</th><th>prepare</th></tr>
+    <tr><td><code>pr33933.diff</code></td><td>20,831</td><td>1.6 ms</td><td>8.0 ms</td></tr>
+    <tr><td><code>pr30698.diff</code></td><td>50,604</td><td>6.2 ms</td><td>98.9 ms</td></tr>
+    <tr><td><code>pr30683.diff</code></td><td>713,996</td><td>57.1 ms</td><td>288.7 ms</td></tr>
+  </table>
+  <p class="muted"><code>prepare</code> dominates load on the pathological fixture, and syntax dominates <code>prepare</code>. It is load, not the render path.</p>
+</section>
+
+<!-- ================= GRAPH ================= -->
+<section id="graph">
+  <h1>The commit graph</h1>
+  <p class="lead">Lane assignment is pure and lives in <code>core</code>; geometry and painting live in the shell. The split is not cosmetic — lane assignment is where the bugs are, and it is testable without a window.</p>
+
+  <h2>Interactive: lane assignment</h2>
+  <p class="muted">One vector of "which sha is this lane waiting for", walked newest-first. First parent continues on the same lane; a merge's 2nd+ parents fork to new lanes; lanes converge when a commit satisfies several at once. Press <strong>Step</strong> to walk the history.</p>
+  <div class="demo">
+    <div class="controls">
+      <button id="graph-prev">◀ Step back</button>
+      <button id="graph-next">Step ▶</button>
+      <button id="graph-reset">Reset</button>
+      <span class="muted" id="graph-status" style="margin-left:auto"></span>
+    </div>
+    <svg id="graph-svg" class="graph-svg" viewBox="0 0 760 220"></svg>
+    <div class="legend">
+      <span><span class="sw" style="background:var(--accent)"></span> current commit</span>
+      <span><span class="sw" style="background:var(--accent-2)"></span> waiting lane</span>
+      <span><span class="sw" style="background:var(--green)"></span> merge</span>
+    </div>
+  </div>
+
+  <h2>Colour belongs to the branch, not the column</h2>
+  <p class="muted">Colouring by lane index is the obvious thing and it is wrong: lane 1 is recycled the moment a branch merges, so unrelated branches come out the same blue and read as one long-running thing. So <code>Hues</code> walks history and hands each <em>new</em> lane the next hue on the wheel, skipping any hue a concurrently live lane holds, and releases it when the branch ends. <code>LANE_HUES = 6</code> is the size of that ledger.</p>
+
+  <h2>The cap</h2>
+  <div class="callout">
+    <div class="t">MAX_LANES = 12, hard.</div>
+    <p>git/git reaches 280 concurrent lanes — a 3,920px gutter that pushes the commit text clean off the screen. Lanes past the cap collapse onto the last column in <code>theme.lane_overflow</code> grey, and collapse in the data too, or git/git would queue 280 identical quads per row. Overflow is visible rather than silently misdrawn.</p>
+  </div>
+
+  <h2>Per-row width</h2>
+  <p class="muted">Each row's gutter is measured from its <em>own</em> lanes, not the widest row in the repository. A commit alone on the trunk gets nearly the whole window for its subject. Widths are measured in whole lanes so text steps on the lane grid — ragged by a column reads as "the graph is wider here", ragged by three pixels reads as broken.</p>
+
+  <h2>Drawing</h2>
+  <div class="grid grid-2">
+    <div class="card">
+      <h3>Verticals are quads</h3>
+      <p class="muted">A vertical line is a rectangle — a quad costs a fraction of a tessellated stroke path.</p>
+    </div>
+    <div class="card">
+      <h3>Curves are half an S</h3>
+      <p class="muted">Each half runs <code>OVERSHOOT = 0.5px</code> past the boundary along its own tangent (collinear, so it cannot kink) because two antialiased butt caps meeting exactly leave a visible crease.</p>
+    </div>
+    <div class="card">
+      <h3>A dot is one quad</h3>
+      <p class="muted">With corner radii at half its size — which <em>is</em> a circle — and the shader antialiases it better than tessellation. The middle is punched out with the chrome background, so lines pass <em>behind</em> a node and the graph reads as holes in the sheet.</p>
+    </div>
+    <div class="card">
+      <h3>One canvas per row</h3>
+      <p class="muted">So the drawing virtualizes with <code>uniform_list</code> for free. <code>row_draws</code> flattens each row once at load into <code>RowDraw { lane, hue, is_merge, lines, curves, width }</code>.</p>
+    </div>
+  </div>
+
+  <h2>Geometry constants</h2>
+  <table>
+    <tr><th>const</th><th>value</th><th>why</th></tr>
+    <tr><td><code>ROW_H</code></td><td>22</td><td>uniform row height so the list virtualizes</td></tr>
+    <tr><td><code>LANE_W</code></td><td>14</td><td>gutter column width</td></tr>
+    <tr><td><code>STROKE</code></td><td>2</td><td>straddles no pixel boundary — lane centre on 7, edges on 6 and 8, crisp at any scale</td></tr>
+    <tr><td><code>DOT_R</code></td><td>4.5</td><td>node radius</td></tr>
+    <tr><td><code>MERGE_R</code></td><td>5.5</td><td>so a join is findable while scrolling</td></tr>
+    <tr><td><code>RING</code></td><td>0.45 × r</td><td>ring thickness</td></tr>
+    <tr><td><code>GAP</code></td><td>6</td><td>between the last stroke and the first letter</td></tr>
+  </table>
+
+  <h2>Topology on real repos</h2>
+  <table>
+    <tr><th>repo</th><th>merges</th><th>p50 lanes</th><th>p99</th><th>max</th><th>rows at 1 lane</th></tr>
+    <tr><td>git/git</td><td>25.8%</td><td>126</td><td>226</td><td>280</td><td>0.9%</td></tr>
+    <tr><td>cmux</td><td>16.2%</td><td>9</td><td>70</td><td>73</td><td>7.2%</td></tr>
+  </table>
+  <p class="muted">Big popular repos are not a substitute for git/git: bun has 17k commits and 97% of rows sit at one lane, because squash-merge workflows produce straight lines.</p>
+</section>
+
+<!-- ================= SYNTAX ================= -->
+<section id="syntax">
+  <h1>Syntax highlighting</h1>
+  <p class="lead">A scanner that knows no languages, plus a table per language, plus a router that picks an implementation per path.</p>
+
+  <div class="arch">
+    <div class="arch-box arch-core">
+      <div class="arch-title">Highlighters (router)</div>
+      <p class="muted" style="margin:0">Routes each path to an implementation. <code>route("md") → Markdown</code>, <code>route(...) → your impl</code>, fallback → <code>Lexer</code>.</p>
+    </div>
+    <div class="flow"><span>path + lines</span><span class="arrow">▼</span></div>
+    <div class="arch-box arch-core">
+      <div class="arch-title">Lexer → Languages → Syntax</div>
+      <p class="muted" style="margin:0">One pass over bytes, appending non-overlapping <code>Token</code>s. Understands exactly five shapes: line comments, block comments, strings, numbers, words. Everything language-specific is data.</p>
+    </div>
+    <div class="flow"><span>lex() / lex_lines()</span><span class="arrow">▼</span></div>
+    <div class="arch-box arch-core">
+      <div class="arch-title">Vec&lt;Vec&lt;Token&gt;&gt;</div>
+      <p class="muted" style="margin:0">One list per line, ranges relative to that line, sorted, non-overlapping, on char boundaries.</p>
+    </div>
+  </div>
+
+  <h2>The scanner</h2>
+  <p class="muted">Per position it tries, in order: line-comment openers, block-comment openers, string openers, digits, word characters. A first-byte table (<code>opens: [bool; 256]</code>, built with the <code>Syntax</code>) skips the whole rule walk for any byte that cannot open anything — worth about 2× on every language measured.</p>
+  <div class="callout">
+    <div class="t">The one non-obvious invariant</div>
+    <p>A byte whose opener matched but whose rule then declined must still advance the cursor. An apostrophe in HTML prose, a <code>#</code> inside <code>${x#y}</code>, the <code>/</code> that closed a comment. Three tests hung on this before the fallback existed.</p>
+  </div>
+
+  <h2>Building a table</h2>
+  <pre><code>Syntax::new()
+    .line(&amp;["//"])
+    .block(&amp;[("/*", "*/")]).nested_block()
+    .strings(&amp;[("r#\"", "\"#", false, true), ("\"", "\"", true, true)])
+    .keywords(&amp;["fn", "let", "match"])
+    .capitalized_types()
+    .call_heuristic()
+    .line_needs_boundary()
+    .quote_after_eq()</code></pre>
+
+  <h2>Two rules the measurements forced</h2>
+  <div class="grid grid-2">
+    <div class="card">
+      <h3><code>line_needs_boundary</code></h3>
+      <p class="muted"><code>#</code> only opens a comment at line start or after whitespace. Without it, <code>$#</code> and <code>${x#y}</code> paint the rest of every shell line. Stray colouring in a shell corpus: 0.99% → 0.82%.</p>
+    </div>
+    <div class="card">
+      <h3><code>quote_after_eq</code></h3>
+      <p class="muted">In markup a quote only opens a string directly after <code>=</code>. Prose is full of apostrophes and none of them are strings. HTML: 6.2% → 2.5%.</p>
+    </div>
+  </div>
+
+  <h2>Why not a parser</h2>
+  <table>
+    <tr><th></th><th>scanner</th><th>tree-sitter</th><th>syntect</th></tr>
+    <tr><td>whole files</td><td>104–262 MB/s</td><td>7.1 MB/s</td><td>0.4 MB/s</td></tr>
+    <tr><td>hunk-shaped fragments</td><td>unchanged</td><td>2.6 MB/s, a fifth of spans lost</td><td>—</td></tr>
+    <tr><td>binary cost</td><td>0</td><td>1.5 MB + 0.2–3.3 MB per grammar</td><td>2.0 MB</td></tr>
+    <tr><td>bytes coloured</td><td>40–67%</td><td>66–89%</td><td>—</td></tr>
+  </table>
+  <p class="muted">A diff hands you fragments, which is the input a parser is worst at: error recovery is its slow path, and the recovery loses spans. The scanner has no parse context to lose, so fragmentation costs it nothing measurable (49.8 → 50.4 spans/KB). It pays for that in coverage and semantic classes — a call is a name before <code>(</code>, with no scope, resolution or injection.</p>
+
+  <h2>Where the model breaks</h2>
+  <p class="muted">Measured per language against tree-sitter as the oracle, ~900 KB of real source each:</p>
+  <ul class="muted">
+    <li><strong>Sound</strong> — 100% comment precision, ≤0.6% stray colouring: rust, go, java, kotlin, python, ts, js, json, toml, zig, c, c++, lua, css, swift, shell.</li>
+    <li><strong>Under-colours, never lies</strong> — yaml and css unquoted scalars, C char literals and <code>#include &lt;...&gt;</code>: recall gaps with no bleed.</li>
+    <li><strong>Breaks</strong> — html with inline <code>&lt;script&gt;</code>, php's <code>&lt;?php</code> islands, markdown. These need injections, which need a parser. The last group gets <em>no table rather than a wrong one</em>.</li>
+  </ul>
+
+  <h2>Markdown, the second implementation</h2>
+  <p class="muted">Markdown ships as a <code>Highlighter</code> of its own, not a table — the proof the trait is worth having. 100 lines that walk lines instead of bytes: ATX and setext headings, fenced code (the one piece of state that crosses lines), blockquotes, thematic breaks, list markers, then inline code spans, emphasis, strong and links. It emits <code>Heading</code>, <code>Strong</code>, <code>Emphasis</code> and <code>Link</code>.</p>
+
+  <h2>Kinds</h2>
+  <p class="muted">Twelve, indexed rather than matched so a theme lookup is one load:</p>
+  <p>
+    <span class="pill">Comment</span><span class="pill">Str</span><span class="pill">Number</span><span class="pill">Keyword</span><span class="pill">Type</span><span class="pill">Constant</span><span class="pill">Func</span><span class="pill">Property</span>
+    <span class="pill">Heading</span><span class="pill">Strong</span><span class="pill">Emphasis</span><span class="pill">Link</span>
+  </p>
+  <p class="muted">Small on purpose. These are the classes a scanner can identify without a parse, and a dense diff should not wear more colours than this.</p>
+
+  <h2>Multi-line constructs</h2>
+  <p class="muted"><code>lex_lines</code> joins the lines, scans once, then splits the tokens back per line, clipping any that cross a boundary. A doc comment or a multi-line string is several rows in a diff, and lexing each row alone would lose it. An unterminated single-line string stops at its newline; a language whose strings legitimately span lines (Rust) can run on, but only to the end of the text it was given — one side of one hunk.</p>
+</section>
+
+<!-- ================= THEME ================= -->
+<section id="theme">
+  <h1>Theming</h1>
+  <p class="lead">A theme is a struct of <code>0xRRGGBB</code> numbers plus two booleans. No GPUI, no <code>Hsla</code>, nothing a terminal could not read — which is the test: a palette only one frontend can read is a palette in the wrong crate.</p>
+
+  <h2>Surfaces, and why one colour per class is not enough</h2>
+  <p class="muted">A token is not drawn on "the background". It is drawn on one of five:</p>
+  <div class="demo">
+    <div class="diff-row ctx"><span class="gutter">—</span><span class="sign"> </span><span>Context&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <span class="cm">#0e0d0c</span> — the near-black body of the file</span></div>
+    <div class="diff-row add"><span class="gutter">—</span><span class="sign">+</span><span>Added&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <span class="cm">#16241a</span> — an added line</span></div>
+    <div class="diff-row del"><span class="gutter">—</span><span class="sign">−</span><span>Removed&nbsp;&nbsp;&nbsp;&nbsp; <span class="cm">#2a1917</span> — a removed line</span></div>
+    <div class="diff-row add"><span class="gutter">—</span><span class="sign">+</span><span>AddedWord&nbsp;&nbsp; <span class="word add"><span class="cm">#1e3a23</span></span> — a changed word inside an added line</span></div>
+    <div class="diff-row del"><span class="gutter">—</span><span class="sign">−</span><span>RemovedWord <span class="word del"><span class="cm">#43201a</span></span> — a changed word inside a removed line</span></div>
+  </div>
+  <p class="muted">The comment grey that reads as pleasantly quiet on <code>Context</code> measured <strong>1.15:1</strong> against the old changed-word background — a grey smear on green. So every class is resolved against every surface: <code>theme.syntax_on(Kind::Comment, Surface::AddedWord)</code> — one index, no maths.</p>
+
+  <h2>Contrast resolution</h2>
+  <pre><code>pub fn luminance(c: Rgb) -> f32          // WCAG 2.1 relative luminance
+pub fn contrast(a: Rgb, b: Rgb) -> f32   // 1.0 … 21.0
+pub fn readable(fg: Rgb, bg: Rgb, target: f32) -> Rgb</code></pre>
+  <p class="muted"><code>readable</code> returns <code>fg</code> untouched if it already clears the target. Otherwise it blends toward white — or black, if the background is light — in 24 steps, stopping at the first that clears. Blending rather than substituting keeps the hue.</p>
+  <div class="callout">
+    <div class="t">The shipped floor is 3.5, not the WCAG 4.5</div>
+    <p>A diff wants its comments to recede, and lifting comments to 4.5 makes them louder than the code around them. It is one public field; raise it and call <code>rebuild()</code>. Themes therefore only have to be <em>tasteful</em> — they never enumerate a colour per surface; the floor guarantees the rest.</p>
+  </div>
+
+  <h2>Cost, and where it is paid</h2>
+  <p class="muted"><code>readable</code> costs six <code>powf</code> per call and <code>render</code> asks for a style per run per visible row per frame. So resolution happens once, in <code>rebuild()</code>, into a <code>12 × 5</code> table of <code>Style</code>. Render is one index. After mutating <code>syntax</code>, <code>diff</code> or <code>min_contrast</code> directly, call <code>rebuild()</code>.</p>
+
+  <h2>Changing it without a rebuild</h2>
+  <pre><code>plait config &gt; plait.toml     # a complete, correct starting file
+
+[font]
+family = "JetBrainsMono Nerd Font Mono"
+size = 14.0
+
+[theme.diff]
+added_bg = "#16241a"
+
+[theme.syntax]
+comment = "#615a52 italic"</code></pre>
+  <p class="muted"><code>plait.toml</code> is re-read every time it is saved, and colours, the font family and the font size land <strong>on the next frame</strong> — no rebuild, no relaunch, no lost scroll position. Two fields cannot reload live and say so: <code>font.monospaced</code> (Markdown table padding rewrites row text during <code>prepare</code>) and <code>font.advance</code> (the widest-row guess is made once at load).</p>
+  <p class="muted">The file holds <strong>data only</strong> — no expressions, no computed colours — because a settings panel has to be able to rewrite the file in place and cannot round-trip a function.</p>
+</section>
+
+<!-- ================= EXTEND ================= -->
+<section id="extend">
+  <h1>Extending</h1>
+  <p class="lead">Rule 1 says anything a built-in does, an extension must be able to do too. Every seam is exercised by a test that swaps the implementation — one implementation and no test is a promise, not a seam.</p>
+
+  <div class="callout">
+    <div class="t">The Host</div>
+    <pre style="margin:8px 0 0"><code>pub struct Host {
+    pub syntax: Highlighters,   // which highlighter each path gets
+    pub theme: Theme,           // every colour the app draws
+    pub font: Font,             // the face, and the numbers derived from it
+}</code></pre>
+    <p>Built once in <code>main.rs</code> before any view exists and held in a GPUI global. <strong>If a feature needs a knob that is not on <code>Host</code> or one of its fields, that feature is not extensible yet</strong> — that is the check.</p>
+  </div>
+
+  <h2>The five seams</h2>
+  <div class="grid grid-2">
+    <div class="card">
+      <h3>1. A language</h3>
+      <p class="muted">Data, not code. Nothing about the scanner changes.</p>
+      <pre style="margin:6px 0 0"><code>host.syntax.languages().unwrap()
+    .register(&amp;["nim", "nims"], Syntax::new()
+        .line(&amp;["#"])
+        .block(&amp;[("#[", "]#")]).nested_block()
+        .keywords(&amp;["proc", "var", "let", "type"]))</code></pre>
+    </div>
+    <div class="card">
+      <h3>2. A highlighter</h3>
+      <p class="muted">When the scanner's model does not fit — markup, scope, injections — implement the trait and route paths to it.</p>
+      <pre style="margin:6px 0 0"><code>impl Highlighter for TreeSitter {
+    fn highlight(&amp;self, path: &amp;str, lines: &amp;[&amp;str]) -&gt; Vec&lt;Vec&lt;Token&gt;&gt; { ... }
+}
+host.syntax.route(&amp;["html", "php", "vue"], TreeSitter::new());</code></pre>
+    </div>
+    <div class="card">
+      <h3>3. A theme</h3>
+      <p class="muted">Plain <code>0xRRGGBB</code> throughout, so the ANSI painter and the GPUI window read the same one.</p>
+      <pre style="margin:6px 0 0"><code>let mut theme = Theme::default_dark();
+theme.set_syntax(Kind::Comment, Style::fg(0x93a1a1).italic());
+theme.min_contrast = 4.5;
+theme.rebuild();
+host.theme = theme;</code></pre>
+    </div>
+    <div class="card">
+      <h3>4. A font</h3>
+      <p class="muted">Type as data, the same way colour is: a family name and three numbers.</p>
+      <pre style="margin:6px 0 0"><code>host.font = Font {
+    family: "Iosevka Term".into(),
+    size: 15.0,
+    monospaced: true,
+    advance: 0.5,   // as a fraction of size
+};</code></pre>
+      <p class="muted" style="margin-top:6px"><code>monospaced</code> decides whether Markdown tables get padded into a grid; <code>advance</code> guesses which commit row is widest.</p>
+    </div>
+    <div class="card" style="grid-column: 1 / -1">
+      <h3>5. How a file's diff is presented</h3>
+      <p class="muted">The <code>Rows</code> trait — the one seam whose registry is not on <code>Host</code>, because a <code>Rows</code> implementation returns an <code>AnyElement</code> and <code>core</code> never knows a UI exists. The list is an argument to <code>Diff::with_renderers</code> instead.</p>
+      <pre style="margin:6px 0 0"><code>pub trait Rows {
+    fn claims(&amp;self, path: &amp;str) -&gt; bool;
+    fn len(&amp;self) -&gt; usize;
+    fn build(&amp;mut self, file: prepared::File);
+    fn render(&amp;self, index: usize, host: &amp;Host) -&gt; AnyElement;
+    fn width(&amp;self, index: usize) -&gt; usize;
+    fn report(&amp;self) -&gt; String { String::new() }
+}
+
+Diff::with_renderers(files, host, vec![
+    Box::new(TextRows::default()),       // fallback; must claim everything
+    Box::new(MarkdownRows::default()),   // claims *.md
+    Box::new(ImageRows::new()),          // claims *.png, wins over both
+]);</code></pre>
+      <p class="muted" style="margin-top:6px">What arrives in <code>build</code> is already clipped, intraline-diffed and highlighted — an implementation draws; it does not redo any of that. <strong>The constraint to design around:</strong> row height is fixed for the whole list, because <code>uniform_list</code> is the only reason a 714k-row diff scrolls at all.</p>
+    </div>
+  </div>
+
+  <h2>What a new seam owes</h2>
+  <ol class="muted">
+    <li><strong>A trait or a data structure, not a match arm.</strong> The test is whether a second implementation can exist without editing the first.</li>
+    <li><strong>A registration point on <code>Host</code></strong>, or on something reachable from it.</li>
+    <li><strong>A default that claims everything</strong>, so behaviour with nothing registered is the shipped behaviour.</li>
+    <li><strong>A test that swaps it.</strong></li>
+    <li><strong>A line in <code>AGENTS.md</code></strong> if it changes the philosophy, and a page in <code>docs/</code> if it does not.</li>
+  </ol>
+</section>
+
+</main>
+
+<footer>
+  Built from the plait <code>docs/</code> — architecture, diff-pipeline, commit-graph, syntax-highlighting, theming, extending, and the decisions. Numbers and commands live in <code>docs/measurements.md</code>.
+</footer>
+
+<script>
+(function(){
+  // ---- navigation ----
+  var nav = document.getElementById('nav');
+  var sections = document.querySelectorAll('section');
+  function show(id){
+    sections.forEach(function(s){ s.classList.toggle('active', s.id === id); });
+    nav.querySelectorAll('button').forEach(function(b){ b.classList.toggle('active', b.dataset.sec === id); });
+    window.scrollTo({top:0, behavior:'smooth'});
+  }
+  nav.addEventListener('click', function(e){
+    var b = e.target.closest('button'); if(!b) return;
+    show(b.dataset.sec);
+  });
+  document.querySelectorAll('[data-go]').forEach(function(a){
+    a.addEventListener('click', function(e){ e.preventDefault(); show(a.dataset.go); });
+  });
+
+  // ---- interactive lane-assignment demo ----
+  // A small synthetic history: newest-first topo order.
+  // Each commit: sha, subject, parents (newest-first order, parent[0] is first parent).
+  var commits = [
+    { sha:'d', sub:'merge branch x', parents:['b','c'] },
+    { sha:'c', sub:'add the other thing', parents:['a'] },
+    { sha:'b', sub:'fix the thing', parents:['a'] },
+    { sha:'a', sub:'initial commit', parents:[] },
+  ];
+  var HUES = ['#e0b96a','#6aa9e0','#9ec97a','#d88a8a','#b48ad8','#7ac9c9'];
+  var step = 0; // number of commits revealed
+  var svg = document.getElementById('graph-svg');
+  var status = document.getElementById('graph-status');
+
+  function assignLanes(shown){
+    // lanes: array of sha waiting
+    var lanes = [];
+    var rows = [];
+    for(var i=0;i<shown;i++){
+      var cm = commits[i];
+      var row = { lane:-1, through:[], merges:[], forks:[] };
+      // find lane(s) waiting on this sha
+      var waiting = [];
+      for(var l=0;l<lanes.length;l++) if(lanes[l]===cm.sha) waiting.push(l);
+      if(waiting.length===0){
+        // new lane
+        row.lane = lanes.length;
+        lanes.push(null);
+        waiting.push(row.lane);
+      } else {
+        row.lane = waiting[0];
+      }
+      if(waiting.length>1) row.merges = waiting.slice(1);
+      // first parent continues on same lane
+      var fp = cm.parents[0];
+      if(fp){
+        lanes[row.lane] = fp;
+      } else {
+        lanes[row.lane] = null;
+      }
+      // 2nd+ parents fork to new lanes
+      for(var p=1;p<cm.parents.length;p++){
+        var nl = lanes.length;
+        lanes.push(cm.parents[p]);
+        row.forks.push(nl);
+      }
+      rows.push(row);
+    }
+    return rows;
+  }
+
+  function render(){
+    var rows = assignLanes(step);
+    var ROW=34, LANE=18, DOT=6;
+    var maxLanes = 0;
+    rows.forEach(function(r){ maxLanes = Math.max(maxLanes, r.lane+1, r.through.length, r.merges.length, r.forks.length); });
+    var W = 760, H = Math.max(220, rows.length*ROW + 30);
+    svg.setAttribute('viewBox','0 0 '+W+' '+H);
+    var html = '';
+    // grid of lanes per row: which lanes are "live" (waiting) after this row
+    var laneState = []; // sha waiting per lane
+    for(var i=0;i<rows.length;i++){
+      var r = rows[i];
+      var cm = commits[i];
+      var y = i*ROW + ROW/2;
+      // verticals for lanes that pass through (lanes with waiting sha)
+      // Draw connectors from previous row
+      // For simplicity draw verticals for all lanes currently active
+      var activeLanes = [];
+      for(var l=0;l<laneState.length;l++) if(laneState[l]) activeLanes.push(l);
+      // draw verticals above current dot for active lanes
+      activeLanes.forEach(function(l){
+        var x = 20 + l*LANE;
+        var top = i===0 ? y : y-ROW;
+        html += '<line x1="'+x+'" y1="'+top+'" x2="'+x+'" y2="'+y+'" stroke="'+HUES[l%HUES.length]+'" stroke-width="2" opacity="0.7"/>';
+      });
+      // forks: lines from merge dot to fork lanes
+      r.forks.forEach(function(l){
+        var x0 = 20 + r.lane*LANE, x1 = 20 + l*LANE;
+        var mid = (x0+x1)/2;
+        html += '<path d="M'+x0+' '+y+' C'+mid+' '+y+','+mid+' '+y+','+x1+' '+y+'" stroke="'+HUES[l%HUES.length]+'" stroke-width="2" fill="none" opacity="0.7"/>';
+      });
+      // merges: lines from merge lanes converging to dot
+      r.merges.forEach(function(l){
+        var x1 = 20 + l*LANE, x0 = 20 + r.lane*LANE;
+        var mid=(x0+x1)/2;
+        html += '<path d="M'+x1+' '+y+' C'+mid+' '+y+','+mid+' '+y+','+x0+' '+y+'" stroke="'+HUES[l%HUES.length]+'" stroke-width="2" fill="none" opacity="0.7"/>';
+      });
+      // dot
+      var cx = 20 + r.lane*LANE;
+      var isMerge = cm.parents.length>1;
+      var rad = isMerge?7:6;
+      html += '<circle cx="'+cx+'" cy="'+y+'" r="'+rad+'" fill="'+HUES[r.lane%HUES.length]+'"/>';
+      if(isMerge){
+        html += '<circle cx="'+cx+'" cy="'+y+'" r="'+(rad-2)+'" fill="var(--bg-2)"/>';
+        html += '<circle cx="'+cx+'" cy="'+y+'" r="'+(rad-2)+'" fill="none" stroke="'+HUES[r.lane%HUES.length]+'" stroke-width="1.5"/>';
+      }
+      // subject text
+      var tx = 20 + (maxLanes)*LANE + 12;
+      html += '<text x="'+tx+'" y="'+(y+4)+'" class="subject">'+cm.sha+' — '+cm.sub+'</text>';
+      // update laneState for next row
+      var next = [];
+      for(var l=0;l<laneState.length;l++) next[l]=laneState[l];
+      // current commit satisfied waiting lanes -> clear them
+      for(var l=0;l<next.length;l++) if(next[l]===cm.sha) next[l]=null;
+      // set first parent lane
+      if(cm.parents[0]) next[r.lane]=cm.parents[0];
+      // forks
+      r.forks.forEach(function(l){ next[l]=cm.parents[1]; });
+      laneState = next;
+    }
+    svg.innerHTML = html;
+    status.textContent = step===0 ? 'No commits shown' : (step===commits.length ? 'All '+step+' commits — history complete' : 'Showing '+step+' of '+commits.length+' commits');
+  }
+
+  document.getElementById('graph-next').addEventListener('click', function(){ if(step<commits.length){step++; render();} });
+  document.getElementById('graph-prev').addEventListener('click', function(){ if(step>0){step--; render();} });
+  document.getElementById('graph-reset').addEventListener('click', function(){ step=0; render(); });
+  render();
+})();
+</script>
+</body>
+</html>

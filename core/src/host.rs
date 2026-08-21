@@ -9,6 +9,7 @@
 //! It is deliberately small. Command dispatch and the mode stack belong here
 //! too and are not written; when they are, they land next to these.
 
+use crate::differ::Differs;
 use crate::font::Font;
 use crate::syntax::Highlighters;
 use crate::theme::Theme;
@@ -17,6 +18,17 @@ pub struct Host {
     /// Which highlighter each path gets. Route a language elsewhere, or replace
     /// the fallback for all of them.
     pub syntax: Highlighters,
+    /// Which algorithm turns two files into a diff, and how much context its
+    /// hunks carry. Register a new one, select it, or route it to some paths.
+    pub differ: Differs,
+    /// Which presentation the diff view opens in, by name.
+    ///
+    /// A `String` and not a type, because `core` never knows a UI exists and a
+    /// presentation returns UI elements — the registry of them is a frontend's,
+    /// and this is the frontend's *choice* out of it, which is data. Exactly the
+    /// same reason `theme.name` is a string: unrecognised is the frontend's
+    /// problem to report, not core's to prevent.
+    pub layout: String,
     /// Every colour the app draws.
     pub theme: Theme,
     /// The face it draws in, and the numbers derived from it. More than
@@ -31,11 +43,13 @@ impl Default for Host {
 }
 
 impl Host {
-    /// The shipped configuration: the built-in highlighters, the dark theme and
-    /// the default face.
+    /// The shipped configuration: the built-in highlighters and differs, the
+    /// dark theme, the default face, the unified presentation.
     pub fn new() -> Self {
         Self {
             syntax: Highlighters::builtin(),
+            differ: Differs::builtin(),
+            layout: "unified".into(),
             theme: Theme::default_dark(),
             font: Font::default(),
         }
@@ -50,9 +64,11 @@ mod tests {
 
     #[test]
     fn everything_a_built_in_uses_is_reachable_and_replaceable() {
-        // The whole of what an extension does at startup, in seven lines.
+        // The whole of what an extension does at startup, in nine lines.
         let mut host = Host::new();
         host.syntax.route(&["rs", "Cargo.lock"], Markdown);
+        assert!(host.differ.select("myers"));
+        host.differ.context = 6;
         host.theme.set_syntax(Kind::Heading, Style::fg(0x00ff00).bold());
         host.theme.diff.added_bg = 0x001100;
         host.font = crate::font::Font::menlo();
@@ -62,6 +78,8 @@ mod tests {
         assert_eq!(host.theme.syntax(Kind::Heading).fg, 0x00ff00);
         assert_eq!(host.theme.diff.added_bg, 0x001100);
         assert_eq!(host.font.family, "Menlo");
+        assert_eq!(host.differ.selected(), "myers");
+        assert_eq!(host.differ.context, 6);
     }
 
     #[test]
@@ -75,5 +93,13 @@ mod tests {
         host.font.monospaced = false;
         assert_eq!(host.font.family, "Iosevka");
         assert!(!host.font.monospaced);
+    }
+
+    #[test]
+    fn the_shipped_diff_defaults_are_the_ones_the_docs_name() {
+        let host = Host::new();
+        assert_eq!(host.differ.selected(), "histogram");
+        assert_eq!(host.differ.context, 3);
+        assert_eq!(host.layout, "unified");
     }
 }

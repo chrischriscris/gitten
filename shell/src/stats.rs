@@ -68,6 +68,14 @@ impl Stats {
         Self { ring: [0.0; RING], n: 0, last: None, rows_drawn, total_rows, load }
     }
 
+    /// After the view rebuilt its rows — a layout or algorithm change. Both
+    /// numbers are one-off measurements of a load that has now happened twice,
+    /// and an overlay reporting the first one is worse than no overlay.
+    pub fn reloaded(&mut self, total_rows: usize, load: String) {
+        self.total_rows = total_rows;
+        self.load = load;
+    }
+
     pub fn tick(&mut self) {
         let now = Instant::now();
         if let Some(prev) = self.last {

@@ -17,11 +17,96 @@ cargo run -q -p plait-core --example bench   --release   # load timings, per fix
 cargo run -q -p plait-core --example shape   --release   # topology statistics
 cargo run -q -p plait-core --example verify  --release   # lane invariants
 cargo run -q -p plait-core --example paint   --release   # the diff view, in ANSI
+cargo run -q -p plait-git  --example diffcheck --release [REPO] [REVSPEC]
+                                                        # differs, against git's own answer
 PLAIT_STATS=1 ./target/release/plait-shell diff         # frame/heap overlay
 ```
 
 `bench` and `shape` read `fixtures/big.diff` and `fixtures/log.txt`; `check.sh`
 swaps each real fixture in and restores what was there.
+
+### The differs, against git
+
+`git/examples/diffcheck.rs`, run for four inputs by `./check.sh`'s `differs vs
+git` section. **A minimal edit script has exactly one length, so Myers must match
+`git diff --minimal` exactly** — that is the correctness check, not a benchmark.
+Hunk *offsets* are deliberately not compared: git runs `--indent-heuristic` by
+default, which slides a hunk to an equivalent, more readable position, so the
+counts agree while the hunk count occasionally differs by one.
+
+Changed lines, ours against git's, on this machine:
+
+| input | files | old+new lines | our histogram | git `--histogram` | our myers | git `--minimal` |
+|---|---|---|---|---|---|---|
+| this repo, `HEAD~4..HEAD` | 19 | 25,587 | +1693 −46 | +1693 −46 | +1693 −46 | +1693 −46 |
+| this repo, whole history | 49 | 30,216 | +9633 −315 | +9633 −315 | +9625 −307 | +9625 −307 |
+| `cmux`, `HEAD~5..HEAD` | 36 | 622,288 | +2264 −224 | +2264 −224 | +2264 −224 | +2264 −224 |
+| `git/git`, `HEAD~5..HEAD` | 18 | 40,753 | +527 −36 | +527 −36 | +527 −36 | +527 −36 |
+
+Every algorithm agrees with git on every input, except our `patience`, which is
+**+4 changed lines in 9,938** on the whole-history diff. Not a bug and not
+tolerated silently: ours is patience's *idea* — anchor only on lines appearing
+once — through the histogram machinery, where git's `--patience` takes the longest
+increasing subsequence of all unique-line matches at once. `diffcheck` flags a
+drift past 1%.
+
+Time, same inputs, ours against the `git` process it replaced. The comparison is
+unfair in git's favour on nothing and in ours on process startup, so read it as an
+order of magnitude and not as a factor:
+
+| input | our histogram | our myers | `git diff --histogram` |
+|---|---|---|---|
+| this repo, `HEAD~4..HEAD` | 1.3 ms | 1.1 ms | 15.7 ms |
+| this repo, whole history | 2.1 ms | 3.1 ms | 19.8 ms |
+| `cmux`, `HEAD~5..HEAD` | 28.6 ms | 23.5 ms | 53.0 ms |
+| `git/git`, `HEAD~5..HEAD` | 2.4 ms | 1.6 ms | 22.4 ms |
+
+Acquisition is separate and is two processes regardless of file count: 25–32 ms on
+this repository, 96 ms for cmux's 622k lines. One exception worth knowing about —
+**a blobless partial clone fetches over the network on demand.** The first
+`HEAD~5..HEAD` in `~/Projects/git` cost **15.0 s** of `cat-file` waiting on the
+promisor remote and **42 ms** once the blobs were local. `git diff` in the same
+repository does exactly the same thing.
+
+### Alignment, for the two-column layout
+
+`align::align` — one `Slot` per side-by-side row, and the pairing the intraline
+pass shares. Reported by `bench` on its own line.
+
+| fixture | diff lines | split rows | of unified | paired both sides | `align` | per row |
+|---|---|---|---|---|---|---|
+| `pr33933.diff` | 20,831 | 20,829 | 100% | 48 | 86 µs | 4 ns |
+| `pr30698.diff` | 50,604 | 41,129 | 81% | 41,129 | 366 µs | 9 ns |
+| `pr30683.diff` | 713,996 | 713,595 | 100% | 1,811 | 3.1 ms | 4 ns |
+| `md.diff` | 71,756 | 58,077 | 81% | 36,537 | 561 µs | 10 ns |
+
+The cost is nothing — 3.1 ms against a 247 ms `prepare` on the same input. The
+interesting column is *of unified*, because it says when the presentation earns
+its place: **81% on the two edit-heavy fixtures, 100% on the two that are
+near-pure addition or deletion.** A diff with nothing replaced has nothing to
+pair, and side-by-side gives it two half-empty columns and the same row count.
+
+### The cost of a pick
+
+Both title-bar controls rebuild rather than re-render, so what they cost is made
+of numbers already in this file:
+
+| control | what it re-runs | typical | pathological fixture |
+|---|---|---|---|
+| layout | `prepare` + row build | 8 ms | 247 ms |
+| algorithm | acquisition + diff + `prepare` + row build | 35–140 ms | — |
+
+Layout re-runs the pipeline from stage 3 against the parsed diff the view is
+holding, so it is the `prepare` column of the table below. Algorithm has to
+acquire again — 25–110 ms of `git diff --raw` and `cat-file` from the table above,
+plus 1–29 ms of diffing — because it changes what the diff *is*.
+
+The pathological column is blank for algorithm on purpose: the 714k-line fixtures
+are `.diff` files, which have no algorithm to change. That is also why the control
+is inert for them.
+
+On a click both are fine. Neither would be on a key held down, which is the other
+reason the algorithm is a menu and only the layout is bound to `s`.
 
 ### Load, per fixture
 

@@ -7,11 +7,12 @@ Three crates. The interesting line is between the first two and the third.
                         │  plait-core          zero deps       │
    a repository         │                                      │
         │               │  parse_log      assign_lanes         │
-        │               │  parse_unified_diff   intraline      │
-        ▼               │  prepared::prepare   markdown::lay_out│
-┌───────────────┐ data  │  syntax::{Lexer, Markdown, ...}      │
-│  plait-git    ├──────►│  theme::Theme  font::Font  host::Host │
-│               │       │                                      │
+        │               │  differ::{Histogram, Myers, hunks}   │
+        ▼               │  prepared::prepare   align::align    │
+┌───────────────┐ blobs │  intraline   markdown::lay_out       │
+│  plait-git    ├──────►│  syntax::{Lexer, Markdown, ...}      │
+│  two texts    │       │  theme::Theme  font::Font  host::Host │
+│  per file     │       │                                      │
 │  git binary   │       └───────────┬──────────────┬───────────┘
 │  (gix later)  │                   │              │
 └───────────────┘          rows,    │              │  rows, colours
@@ -31,6 +32,8 @@ because it compiles in a second and its tests need no window.
 | module | what lives there |
 |---|---|
 | `lib.rs` | commit and diff parsing, `assign_lanes`, `intraline`, `replace_pairs`, `initials` |
+| `differ.rs` | the `Differ` trait, Histogram/Patience/Myers, hunk assembly, routing |
+| `align.rs` | which removal sits opposite which addition, for a two-column view |
 | `prepared.rs` | a diff assembled into drawable rows: clip → intraline → syntax |
 | `markdown.rs` | a `.md` diff as blocks, with the markers cut and the ranges moved |
 | `syntax.rs` | the scanner, the language tables, the `Highlighter` trait, routing, Markdown |
@@ -49,8 +52,19 @@ The only crate that talks to a repository. Everything currently shells out to th
 permanently, because shelling out is what gets hooks, credential helpers and
 `.gitconfig` semantics exactly right.
 
-Today: `log`, `diff`, `describe`. Both behind one surface, so a frontend never
-learns which path ran.
+Today: `log`, `pairs`, `diff`, `describe`. All behind one surface, so a frontend
+never learns which path ran.
+
+**It acquires content, not diffs.** `pairs` returns two lists of lines per changed
+file; `diff` is that plus the host's `Differs`. It used to run `git diff` and parse
+the unified output back, which meant git chose the algorithm and
+`plait_core::differ` could not have existed — see
+[decisions/0013](decisions/0013-differs-in-core-not-a-dependency.md). Two
+processes for a whole diff whatever the file count: one `git diff --raw`, one `git
+cat-file --batch`.
+
+`examples/diffcheck.rs` is the headless check that the differs agree with git on
+real history, and is run by `./check.sh`.
 
 ## plait-shell
 
@@ -60,9 +74,12 @@ GPUI. Drawing and input, and as little else as possible.
 |---|---|
 | `main.rs` | argument parsing, data loading, the window, the `Host` |
 | `views/diff.rs` | the `Rows` seam, `TextRows`, run-list merging, the shared row furniture |
+| `views/diff.rs` | …and `Layouts`, the registry of whole-diff presentations |
 | `views/markdown.rs` | `MarkdownRows`: the rendered-Markdown presentation, and its metrics |
+| `views/split.rs` | `SplitRows`: the two-column presentation |
 | `views/commits.rs` | the commit list, author initials, row layout |
 | `graph.rs` | lane geometry and painting: quads, paths, one canvas per row |
+| `controls.rs` | the title-bar pickers: a label, a value, and the registered alternatives |
 | `config.rs` | `plait.toml`: parse, apply, watch, and the live `Host` global |
 | `session.rs` | the row you were on, so `./dev.sh` can put you back after a restart |
 | `stats.rs` | the counting allocator and the `PLAIT_STATS` overlay |
@@ -70,21 +87,29 @@ GPUI. Drawing and input, and as little else as possible.
 ## Which way data moves
 
 ```
-  git binary ──► bytes ──► parse_unified_diff ──► Vec<FileDiff>
-                                                      │
-                                    prepared::prepare │  clip, intraline, syntax
-                                                      ▼
-                                                Vec<prepared::File>
-                                                      │
-                              Rows::build (per file)  │  claimed by path
-                                                      ▼
-                              Vec<RowRef>  ──►  uniform_list  ──►  Rows::render
-                                8 bytes/row                          + Theme
+  git --raw ──► git cat-file ──► Vec<Pair>        two texts per changed file
+                                     │
+                    Differs::file    │  Differ::diff, then differ::hunks
+                                     ▼
+                               Vec<FileDiff>  ◄──── or parse_unified_diff,
+                                     │              for a .diff fixture
+                   prepared::prepare │  clip, intraline, syntax
+                                     ▼
+                             Vec<prepared::File>
+                                     │
+             Rows::build (per file)  │  claimed by path, within a Layout
+                                     ▼
+                             Vec<RowRef>  ──►  uniform_list  ──►  Rows::render
+                               8 bytes/row                          + Theme
 ```
 
-Nothing flows back. A view never mutates what it was handed, which is why every
-stage above is testable without a window and why `paint.rs` can join the pipeline
-one stage from the end.
+Nothing flows backwards, but the tail is re-run: cycling the layout replays
+everything from `prepare` against the same `Vec<FileDiff>`, which is why the view
+keeps it.
+
+A view never mutates what it was handed, which is why every stage above is
+testable without a window and why `paint.rs` can join the pipeline one stage from
+the end.
 
 ## The rule this shape exists to enforce
 
@@ -107,7 +132,13 @@ Listed so nobody reads an intention as a description:
 
 - **`cli/`.** Referenced throughout as the second door. `paint.rs` currently
   stands in for it as the proof that the boundary holds.
-- **Command dispatch and the mode stack.** `Host` is where they belong.
+- **Command dispatch and the mode stack.** `Host` is where they belong. `s`
+  cycling the diff layout is the only key binding that is not `cmd-q`, and it is
+  shaped so dispatch has something to attach to rather than something to replace.
+- **Configurable keybindings, and a settings panel.** The title-bar pickers are
+  the interim answer: a control per registry, driven by the same names
+  `plait.toml` uses. When the panel exists it should read the same registries and
+  these should collapse into it.
 - **Code hot reload.** The config file reloads *data* live, and `./dev.sh` removes
   everything either side of a code rebuild — but the rebuild itself remains, 3–5 s.
   A dylib swap was investigated and rejected, and the reasons are specific enough
@@ -122,7 +153,23 @@ Listed so nobody reads an intention as a description:
 - **Extension loading.** Every seam takes an implementation today; nothing loads
   one from outside the binary yet. See [extending.md](extending.md).
 - **Writes.** No commit, push, stage or rebase. Reads only.
+- **A diff cache keyed by blob id.** Acquisition now yields the pair of object ids
+  that produced a diff, and a blob never changes, so the cache is possible. It is
+  not built.
+- **`\ No newline at end of file`.** Content is split into lines, so a file with
+  and without a trailing newline produce the same list and the distinction is
+  lost. Needs a per-side flag on `Pair` and somewhere in `DiffLine` for a note.
+- **git's `--indent-heuristic`.** Ours does not slide a hunk to a more readable
+  equivalent position, so hunk offsets occasionally differ from git's by one while
+  the changed-line count does not.
 - **`gix`.** All reads still spawn `git`.
+- **A rendering test.** Every stage up to `Rows::render` is tested headlessly and
+  `paint.rs` draws a real diff in ANSI, but nothing exercises a GPUI element tree:
+  a panic in `render`, a colliding element id or a floating element painted under
+  its sibling are all found by launching. `gpui`'s `test-support` feature would
+  fix it and unifies onto every build — proptest and a leak detector on a
+  three-second rebuild loop — so it has not been taken. The two GPUI traps in
+  AGENTS.md's notes are what that costs.
 - **Panes.** One view fills the window, so a presentation needing its own layout
   has nowhere to go yet — the reason the `Rows` seam is row-shaped. A rendered
   Markdown *row* exists ([decisions/0010](decisions/0010-markdown-rendered-rows.md));

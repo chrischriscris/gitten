@@ -68,6 +68,19 @@ fn main() {
     }
     let layout = t.elapsed();
 
+    // The alignment pass, which is what a two-column presentation costs in
+    // `core`. Over the prepared rows, which is where a renderer calls it from.
+    let t = Instant::now();
+    let (mut slots, mut paired) = (0usize, 0usize);
+    for h in p.files.iter().flat_map(|f| &f.hunks) {
+        let kinds: Vec<LineKind> = h.lines.iter().map(|l| l.kind).collect();
+        for s in align::align(&kinds) {
+            slots += 1;
+            paired += (s.old().is_some() && s.new().is_some()) as usize;
+        }
+    }
+    let aligned = t.elapsed();
+
     println!("DIFF     {:>9} lines  {:>5} files  {} replace-pairs", nlines, files.len(), pairs);
     println!("  read {:>9.1?}   parse {:>9.1?}   intraline {:>9.1?}", read, parse, intra);
     println!(
@@ -78,6 +91,15 @@ fn main() {
         tokens,
         bytes as f64 / 1e6,
         (bytes as f64 / 1e6) / p.syntax.as_secs_f64()
+    );
+    println!(
+        "  align {:>8.1?}   {} rows ({:.0}% of {} lines)  {} paired  {:.0} ns/row",
+        aligned,
+        slots,
+        100.0 * slots as f64 / nlines.max(1) as f64,
+        nlines,
+        paired,
+        aligned.as_secs_f64() * 1e9 / slots.max(1) as f64,
     );
     if md_files > 0 {
         println!(

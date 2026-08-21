@@ -37,6 +37,9 @@ rather than nine.
 | [0010](0010-markdown-rendered-rows.md) | Markdown renders as rows, and the markers come off in `core` |
 | 0011 | *reserved* — see below |
 | [0012](0012-config-is-data-behaviour-is-not.md) | Config is data, behaviour is not |
+| [0013](0013-differs-in-core-not-a-dependency.md) | The diff algorithms are written in `core`, not pulled in |
+| [0014](0014-layouts-are-a-registry.md) | Side-by-side is a registered layout, not a second view |
+| [0015](0015-title-bar-controls-are-hand-rolled.md) | The title-bar pickers are hand-rolled |
 
 **0011 is deliberately absent.** It was a rendered-Markdown reader that was built,
 looked at, judged broken and parked in a `git stash` rather than deleted. The

@@ -50,8 +50,12 @@
 //!   width, computed once at load. A stale value costs a slightly wrong scroll
 //!   width and nothing else.
 //!
-//! Both are applied to the `Host` regardless, so a relaunch picks them up, and
-//! [`apply`] says so in its warnings rather than leaving you guessing.
+//! The whole `[diff]` table is the same: `algorithm` and `context` are read
+//! during acquisition, before a window exists, and `layout` names the
+//! presentation the view *opens* in — `s` is what changes it afterwards.
+//!
+//! All of them are applied to the `Host` regardless, so a relaunch picks them
+//! up, and [`apply`] says so in its warnings rather than leaving you guessing.
 
 use gpui::{App, Global};
 use plait_core::font::Font;
@@ -104,7 +108,8 @@ rgb_fields! {
     "chrome":
         "bg" = chrome.bg, "fg" = chrome.fg, "dim" = chrome.dim,
         "faint" = chrome.faint, "accent" = chrome.accent,
-        "title_bg" = chrome.title_bg, "status_bg" = chrome.status_bg;
+        "title_bg" = chrome.title_bg, "status_bg" = chrome.status_bg,
+        "error" = chrome.error;
     "diff":
         "file_bg" = diff.file_bg, "file_fg" = diff.file_fg,
         "adds_fg" = diff.adds_fg, "dels_fg" = diff.dels_fg,
@@ -114,7 +119,8 @@ rgb_fields! {
         "added_bg" = diff.added_bg, "added_fg" = diff.added_fg,
         "added_word_bg" = diff.added_word_bg,
         "removed_bg" = diff.removed_bg, "removed_fg" = diff.removed_fg,
-        "removed_word_bg" = diff.removed_word_bg;
+        "removed_word_bg" = diff.removed_word_bg,
+        "absent_bg" = diff.absent_bg;
     "markdown":
         "code_bar" = markdown.code_bar, "quote_bar" = markdown.quote_bar,
         "marker" = markdown.marker, "rule" = markdown.rule;
@@ -184,12 +190,65 @@ pub fn apply(host: &mut Host, text: &str) -> Vec<String> {
         // syntax-by-surface table is what the render path reads.
         host.theme.rebuild();
     }
+    if let Some(diff) = doc.get("diff") {
+        apply_diff(host, diff, &mut warn);
+    }
     for key in doc.keys() {
-        if !matches!(key.as_str(), "font" | "theme") {
+        if !matches!(key.as_str(), "font" | "theme" | "diff") {
             warn.push(format!("config: unknown section [{key}]"));
         }
     }
     warn
+}
+
+/// `[diff]` — which algorithm, how much context, which presentation.
+///
+/// `algorithm` is validated against the host's own registry rather than a list
+/// here, so an extension that registers a fourth one is selectable from the file
+/// the same day it exists and the error message names it. `layout` is not
+/// validated at all for the same reason turned the other way: the registry of
+/// presentations is the diff view's, `core` cannot see it, and the view reports
+/// an unknown name when it opens.
+fn apply_diff(host: &mut Host, value: &toml::Value, warn: &mut Vec<String>) {
+    let Some(t) = value.as_table() else {
+        warn.push("config: [diff] is not a table".into());
+        return;
+    };
+    for (key, v) in t {
+        match key.as_str() {
+            "algorithm" => match v.as_str() {
+                Some(name) if name == host.differ.selected() => {}
+                Some(name) if host.differ.select(name) => {
+                    warn.push("config: diff.algorithm applies on the next launch".into())
+                }
+                Some(name) => warn.push(format!(
+                    "config: unknown diff.algorithm {name:?}; registered: {}",
+                    host.differ.names().join(", ")
+                )),
+                None => warn.push("config: diff.algorithm must be a string".into()),
+            },
+            "context" => match v.as_integer() {
+                // Zero is meaningful — just the changed lines — and past a few
+                // dozen a hunk is the whole file, which the diff already shows.
+                Some(n) if (0..=100).contains(&n) => {
+                    if n as usize != host.differ.context {
+                        host.differ.context = n as usize;
+                        warn.push("config: diff.context applies on the next launch".into());
+                    }
+                }
+                _ => warn.push("config: diff.context must be between 0 and 100".into()),
+            },
+            "layout" => match v.as_str() {
+                Some(name) if name == host.layout => {}
+                Some(name) if !name.trim().is_empty() => {
+                    host.layout = name.to_string();
+                    warn.push("config: diff.layout applies on the next launch".into());
+                }
+                _ => warn.push("config: diff.layout must be a non-empty string".into()),
+            },
+            other => warn.push(format!("config: unknown key diff.{other}")),
+        }
+    }
 }
 
 fn apply_font(font: &mut Font, value: &toml::Value, warn: &mut Vec<String>) {
@@ -386,6 +445,17 @@ pub fn dump(host: &Host) -> String {
     out.push_str(&format!("monospaced = {}\n", f.monospaced));
     out.push_str(&format!("advance = {:?}\n\n", f.advance));
 
+    out.push_str("# All three apply on the next launch: the first two decide what the\n");
+    out.push_str("# diff *is*, and are read before a window exists. `s` cycles the layout.\n");
+    out.push_str("[diff]\n");
+    out.push_str(&format!(
+        "algorithm = {:?}    # {}\n",
+        host.differ.selected(),
+        host.differ.names().join(", ")
+    ));
+    out.push_str(&format!("context = {}\n", host.differ.context));
+    out.push_str(&format!("layout = {:?}    # unified, split\n\n", host.layout));
+
     let t = &host.theme;
     out.push_str("[theme]\n");
     out.push_str(&format!("name = {:?}\n", t.name));
@@ -528,6 +598,57 @@ mod tests {
     }
 
     #[test]
+    fn the_diff_table_reaches_the_host() {
+        let mut h = host();
+        let warn = apply(&mut h, "[diff]\nalgorithm = \"myers\"\ncontext = 7\nlayout = \"split\"\n");
+        assert!(warn.iter().all(|w| w.contains("next launch")), "{warn:?}");
+        assert_eq!(h.differ.selected(), "myers");
+        assert_eq!(h.differ.context, 7);
+        assert_eq!(h.layout, "split");
+    }
+
+    #[test]
+    fn an_unknown_algorithm_names_the_ones_that_exist() {
+        // A list written out here would go stale the day an extension registers
+        // one, so the message comes from the registry itself.
+        let mut h = host();
+        let warn = apply(&mut h, "[diff]\nalgorithm = \"patients\"\n");
+        assert_eq!(h.differ.selected(), "histogram", "a typo must not change the algorithm");
+        assert_eq!(warn.len(), 1, "{warn:?}");
+        assert!(warn[0].contains("histogram") && warn[0].contains("myers"), "{warn:?}");
+    }
+
+    #[test]
+    fn a_registered_algorithm_is_selectable_from_the_file() {
+        // Rule 1, as a test: an extension's differ has to be reachable from the
+        // config the same way a built-in's is.
+        use plait_core::differ::{Differ, Edit};
+        struct Semantic;
+        impl Differ for Semantic {
+            fn name(&self) -> &'static str {
+                "semantic"
+            }
+            fn diff(&self, _: &str, _: &[&str], _: &[&str]) -> Vec<Edit> {
+                Vec::new()
+            }
+        }
+        let mut h = host();
+        h.differ.register(Semantic);
+        let warn = apply(&mut h, "[diff]\nalgorithm = \"semantic\"\n");
+        assert!(warn.iter().all(|w| w.contains("next launch")), "{warn:?}");
+        assert_eq!(h.differ.selected(), "semantic");
+    }
+
+    #[test]
+    fn nonsense_in_the_diff_table_is_refused() {
+        let mut h = host();
+        let warn = apply(&mut h, "[diff]\ncontext = -1\nlayout = \"\"\nwobble = 1\n");
+        assert_eq!(h.differ.context, 3);
+        assert_eq!(h.layout, "unified");
+        assert_eq!(warn.len(), 3, "{warn:?}");
+    }
+
+    #[test]
     fn the_fields_that_need_a_relaunch_say_so() {
         let mut h = host();
         let warn = apply(&mut h, "[font]\nmonospaced = false\n");
@@ -613,6 +734,9 @@ mod tests {
         original.theme.min_contrast = 4.5;
         original.theme.name = "round trip".into();
         original.font = Font { family: "Iosevka".into(), size: 15.0, monospaced: true, advance: 0.5 };
+        original.differ.select("patience");
+        original.differ.context = 5;
+        original.layout = "split".into();
         original.theme.rebuild();
 
         let text = dump(&original);
@@ -624,6 +748,9 @@ mod tests {
         );
         assert_eq!(restored.theme, original.theme, "theme did not survive:\n{text}");
         assert_eq!(restored.font, original.font, "font did not survive");
+        assert_eq!(restored.differ.selected(), "patience", "diff.algorithm did not survive");
+        assert_eq!(restored.differ.context, 5, "diff.context did not survive");
+        assert_eq!(restored.layout, "split", "diff.layout did not survive");
     }
 
     #[test]

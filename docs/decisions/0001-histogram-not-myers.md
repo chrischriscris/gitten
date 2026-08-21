@@ -1,6 +1,7 @@
 # 0001 — Histogram diff, not Myers
 
-**Status** accepted
+**Status** accepted; implementation superseded by
+[0013](0013-differs-in-core-not-a-dependency.md)
 **Date** 2026-08
 
 ## Context
@@ -10,8 +11,15 @@ the algorithm decides what "the change" even looks like.
 
 ## Decision
 
-`imara-diff`, Histogram. Diffing is a `trait Differ`; Histogram and Myers are the
-first two implementations and the view never calls a differ directly.
+Histogram. Diffing is a `trait Differ`; the view never calls a differ directly.
+
+This originally said *`imara-diff`, Histogram* and named Histogram and Myers as
+its first two implementations, describing something that had not been built —
+`plait-git` ran `git diff` and the unified output was parsed back. The trait and
+the algorithms now exist, written out in `core` rather than pulled in, and there
+are three of them. [0013](0013-differs-in-core-not-a-dependency.md) is why, and
+is also the record of a doc describing an intention being read as a description
+for two weeks.
 
 ## Why not Myers
 
@@ -22,8 +30,13 @@ happen to be minimal and are unreadable.
 
 ## Evidence
 
-Qualitative, and deliberately so: the failure is legibility, not throughput. Any
-real repository with a moved function shows it.
+Qualitative on the thing that decided it: the failure is legibility, not
+throughput, and any real repository with a moved function shows it. There is a
+test — `histogram_reads_a_moved_block_as_a_move` — that pins the shape.
+
+Quantitatively, both are now checked against git on real history; see
+[0013](0013-differs-in-core-not-a-dependency.md) and
+[../measurements.md](../measurements.md).
 
 ## Consequences
 

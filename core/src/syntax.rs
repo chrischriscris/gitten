@@ -696,10 +696,7 @@ impl Highlighter for Markdown {
                     whole(&mut toks, Kind::Str);
                 }
                 (None, None) => {
-                    let hashes = trimmed.bytes().take_while(|b| *b == b'#').count();
-                    let heading = (1..=6).contains(&hashes)
-                        && matches!(trimmed.as_bytes().get(hashes), None | Some(b' '));
-                    if heading || is_setext(trimmed) {
+                    if heading_level(line).is_some() || is_setext(trimmed) {
                         whole(&mut toks, Kind::Heading);
                     } else if trimmed.starts_with('>') {
                         whole(&mut toks, Kind::Comment);
@@ -724,6 +721,45 @@ impl Highlighter for Markdown {
         }
         out
     }
+}
+
+/// How far a construct may be indented and still be one, in columns.
+///
+/// CommonMark's number, and it is not pedantry: at four columns a line is an
+/// *indented code block*, and this repository's own `AGENTS.md` has a block of
+/// shell commands with trailing `# comments` in it. Testing the fully trimmed
+/// line made every one of those an `<h1>` — a wall of bold text where a command
+/// list should be, which is what caught it.
+pub(crate) const MAX_MARKUP_INDENT: usize = 3;
+
+/// Leading whitespace in columns, counting a tab as four. Bytes would do for
+/// spaces and be wrong for the files that use tabs.
+pub(crate) fn column_indent(line: &str) -> usize {
+    let mut n = 0;
+    for b in line.bytes() {
+        match b {
+            b' ' => n += 1,
+            b'\t' => n += 4,
+            _ => break,
+        }
+    }
+    n
+}
+
+/// The level of the ATX heading this line opens, if it opens one.
+///
+/// Takes the *whole* line, not the trimmed one, because the indentation is half
+/// the rule — see [`MAX_MARKUP_INDENT`]. One function so the block pass and the
+/// token pass cannot disagree about what a heading is, the same argument as
+/// [`for_each_side`] for what a hunk side is.
+pub(crate) fn heading_level(line: &str) -> Option<u8> {
+    if column_indent(line) > MAX_MARKUP_INDENT {
+        return None;
+    }
+    let trimmed = line.trim_start();
+    let hashes = trimmed.bytes().take_while(|b| *b == b'#').count();
+    let closed = matches!(trimmed.as_bytes().get(hashes), None | Some(b' '));
+    ((1..=6).contains(&hashes) && closed).then_some(hashes as u8)
 }
 
 pub(crate) fn fence_marker(trimmed: &str) -> Option<&'static str> {
@@ -1393,6 +1429,28 @@ mod tests {
         hl.route(&["md"], Markdown);
         assert_eq!(hl.highlight("whatever.xyz", &["hello"])[0][0].kind, Kind::Comment);
         assert_eq!(hl.highlight("r.md", &["# h"])[0][0].kind, Kind::Heading);
+    }
+
+    #[test]
+    fn a_hash_past_three_columns_is_not_a_heading() {
+        // CommonMark's rule, and the bug it exists to prevent: a block of shell
+        // commands indented four spaces, with `# comments` trailing them, came
+        // out as a wall of bold headings. Both passes share `heading_level`, so
+        // this pins the token side and `markdown.rs` pins the block side.
+        assert_eq!(heading_level("# one"), Some(1));
+        assert_eq!(heading_level("###### six"), Some(6));
+        assert_eq!(heading_level("   # three columns"), Some(1));
+        assert_eq!(heading_level("    # four columns"), None);
+        assert_eq!(heading_level("\t# a tab is four"), None);
+        assert_eq!(heading_level("####### seven hashes"), None);
+        assert_eq!(heading_level("#no space"), None);
+
+        let hl = Highlighters::builtin();
+        let indented = "    ./check.sh        # everything headless";
+        assert!(
+            hl.highlight("a.md", &[indented])[0].iter().all(|t| t.kind != Kind::Heading),
+            "an indented command with a trailing comment was highlighted as a heading"
+        );
     }
 
     #[test]
