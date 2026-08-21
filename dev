@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+# One entry point for every client, with the development defaults already on.
+#
+#   ./dev                            what this says
+#   ./dev tui       diff . HEAD~2..HEAD
+#   ./dev desktop   commits
+#   ./dev web       diff --fixtures
+#   ./dev dump      commits ~/Projects/git 600     one frame, no takeover
+#   ./dev check                                    everything headless
+#   ./dev config                                   a starting plait.toml
+#
+#   ./dev --release tui diff .       when you need honest numbers
+#   PLAIT_STATS=0 ./dev tui          without the frame readout
+#
+# **Debug and the stats readout by default**, because this is the loop you
+# iterate in: ~2.5 s to rebuild instead of ~4 s, and the frame and cell counts
+# up without having to remember an environment variable.
+#
+# **The timings are meaningless in a debug build.** It is a different, much
+# slower binary — `[profile.dev]` is opt-level 1 for our crates — and both
+# clients say so. The row counts, the cell counts and the load breakdown are
+# still worth watching; the frame time is not a number to quote. Use
+# `--release` before believing anything, and see docs/measurements.md.
+#
+# `desktop` and `web` rebuild and relaunch on every save. `tui` does not, and
+# cannot: it owns the terminal's stdin, so it cannot be backgrounded for a
+# watcher to sit in front of. Quit it with `q` and press up-enter — the rebuild
+# is the same 2.5 s either way. `./dev dump` is the watchable one, because a
+# frame on stdout interrupts nobody.
+#
+# Colour, font, `[diff]` and `[keys]` changes need none of this: plait.toml
+# reloads live in both clients, on the next frame. Use this for code.
+set -uo pipefail
+cd "$(dirname "$0")"
+
+PROFILE=debug
+FLAGS=()
+while true; do
+  case "${1:-}" in
+    --release) PROFILE=release; FLAGS=(--release); shift ;;
+    --debug)   shift ;;   # the default; accepted so it can be written explicitly
+    *) break ;;
+  esac
+done
+
+# On unless it was deliberately turned off — both clients treat "0" as off, so
+# `PLAIT_STATS=0 ./dev tui` works and anything else the caller set is kept.
+export PLAIT_STATS="${PLAIT_STATS:-1}"
+
+WHAT="${1:-}"
+[ $# -gt 0 ] && shift
+
+# Progress on stderr, always: `./dev config > plait.toml` has to produce a file
+# with a config in it and not a build log.
+dim() { printf '\033[2m%s\033[0m\n' "$1" >&2; }
+red() { printf '\033[31m%s\033[0m\n' "$1" >&2; }
+
+usage() {
+  sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'
+  exit "${1:-0}"
+}
+
+# Everything a client is built out of. `find -newer` walks these, so keep it to
+# source: a new crate that is not here will not trigger a rebuild, and that is
+# the failure mode to remember.
+WATCH=(core/src core/examples git/src app/src shell/src tui/src web/src web/ui)
+
+build() { # build <crate>
+  local crate=$1 log
+  log=$(mktemp)
+  dim "── building $crate ───────────────────────"
+  local start=$SECONDS
+  # To a file, not a pipe: a pipe loses cargo's exit status under pipefail, and
+  # launching a stale binary after a failed build is the one thing this must not
+  # do. Output is only worth seeing when it went wrong.
+  if ! cargo build "${FLAGS[@]}" -p "$crate" >"$log" 2>&1; then
+    grep -vE '^\s*(Compiling|Finished|Blocking|Downloaded|Updating)' "$log"
+    rm -f "$log"
+    red "── build failed ──────────────────────────"
+    return 1
+  fi
+  rm -f "$log"
+  local note=""
+  [ "$PROFILE" = debug ] && note=" · debug, timings meaningless"
+  dim "── $((SECONDS - start))s$note ──────────────────"
+}
+
+# Rebuild and relaunch on every save. For clients that do not read stdin, which
+# is why `tui` is not one of them.
+watch_run() { # watch_run <crate> <binary> [args...]
+  local crate=$1 bin=$2
+  shift 2
+  local marker running=""
+  marker=$(mktemp)
+
+  cleanup() {
+    [ -n "$running" ] && kill "$running" 2>/dev/null
+    rm -f "$marker"
+    exit 0
+  }
+  trap cleanup INT TERM
+
+  cycle() {
+    # Kill first: two of them fighting over one session file or one port is
+    # confusing, and the binary underneath the running one is about to be
+    # replaced anyway.
+    if [ -n "$running" ]; then
+      kill "$running" 2>/dev/null
+      wait "$running" 2>/dev/null
+      running=""
+    fi
+    build "$crate" || return
+    "$bin" "$@" &
+    running=$!
+  }
+
+  cycle "$@"
+  # POSIX, no dependencies, and `-quit` stops at the first hit instead of
+  # walking the whole tree. 400 ms of latency on a 3-second rebuild is nothing.
+  while true; do
+    sleep 0.4
+    if [ -n "$(find "${WATCH[@]}" \( -name '*.rs' -o -name '*.toml' -o -name '*.js' \
+                -o -name '*.css' -o -name '*.html' \) -newer "$marker" -print -quit 2>/dev/null)" ]; then
+      touch "$marker"
+      cycle "$@"
+    fi
+    # Closed by hand: stop, rather than leaving a watcher running in a terminal
+    # you have stopped looking at.
+    if [ -n "$running" ] && ! kill -0 "$running" 2>/dev/null; then
+      dim "── it exited ─────────────────────────────"
+      cleanup
+    fi
+  done
+}
+
+case "$WHAT" in
+  desktop|shell|gui)
+    watch_run plait-shell "target/$PROFILE/plait-shell" "$@"
+    ;;
+
+  web|browser)
+    watch_run plait-web "target/$PROFILE/plait-web" "$@"
+    ;;
+
+  tui|terminal)
+    build plait-tui || exit 1
+    # In the foreground: it reads the terminal, so there is nothing to put in
+    # front of it. Raw mode and the alternate screen are restored on exit and on
+    # panic by `term.rs`; this is the belt for the case it is killed instead.
+    "target/$PROFILE/plait-tui" "$@"
+    status=$?
+    printf '\033[?25h\033[?1049l'
+    stty sane 2>/dev/null
+    exit $status
+    ;;
+
+  dump)
+    # One frame of the terminal views on stdout, the timing on stderr. Release
+    # by default here and nowhere else: the whole reason to run it is the
+    # number, and a debug one is not a number.
+    : "${COLS:=$(tput cols 2>/dev/null || echo 120)}"
+    : "${ROWS:=$(tput lines 2>/dev/null || echo 40)}"
+    export COLS ROWS
+    exec cargo run -q -p plait-tui --example dump --release -- "$@"
+    ;;
+
+  check)
+    exec ./check.sh
+    ;;
+
+  config)
+    build plait-tui || exit 1
+    exec "target/$PROFILE/plait-tui" config
+    ;;
+
+  ""|-h|--help|help)
+    usage 0
+    ;;
+
+  *)
+    red "no such client: $WHAT"
+    echo
+    usage 1
+    ;;
+esac

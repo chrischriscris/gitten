@@ -34,12 +34,9 @@ pub struct Session {
     pub top: usize,
 }
 
-impl Session {
-    /// The key for one invocation. Everything that changes what is on screen.
-    pub fn key(which: &str, repo: &str, revspec: &str) -> String {
-        format!("{which} {repo} {revspec}")
-    }
-}
+// The key for one invocation is `plait_app::cli::Source::key`: it is everything
+// that changes what is on screen, and every client has to agree about it or a
+// position saved by one is restored by another into a different diff.
 
 /// Under `target/`, because that is already git-ignored and already what you
 /// delete for a clean slate. Overridable so a test never writes to a real one.
@@ -84,8 +81,15 @@ pub fn save(s: &Session, path: &Path) {
 mod tests {
     use super::*;
 
+    use plait_app::cli::{Source, View};
+    use std::path::PathBuf;
+
+    fn key(view: View, repo: &str, arg: &str) -> String {
+        Source::Repo { path: PathBuf::from(repo), arg: arg.into() }.key(view)
+    }
+
     fn session() -> Session {
-        Session { key: Session::key("diff", ".", "HEAD~2..HEAD"), top: 431 }
+        Session { key: key(View::Diff, ".", "HEAD~2..HEAD"), top: 431 }
     }
 
     #[test]
@@ -105,8 +109,8 @@ mod tests {
         save(&s, &path);
 
         assert_eq!(restore(&s.key, &path).map(|r| r.top), Some(431));
-        assert_eq!(restore(&Session::key("diff", ".", "main..feature"), &path), None);
-        assert_eq!(restore(&Session::key("commits", ".", ""), &path), None);
+        assert_eq!(restore(&key(View::Diff, ".", "main..feature"), &path), None);
+        assert_eq!(restore(&key(View::Commits, ".", ""), &path), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -134,9 +138,12 @@ mod tests {
 
     #[test]
     fn the_key_distinguishes_everything_that_changes_the_view() {
-        let a = Session::key("diff", ".", "HEAD~1");
-        assert_ne!(a, Session::key("commits", ".", "HEAD~1"), "verb ignored");
-        assert_ne!(a, Session::key("diff", "/other", "HEAD~1"), "repo ignored");
-        assert_ne!(a, Session::key("diff", ".", "HEAD~2"), "revspec ignored");
+        // The key is `plait_app`'s, shared with every client, and this is the
+        // property the shell depends on: a position taken in one diff is never
+        // restored into another.
+        let a = key(View::Diff, ".", "HEAD~1");
+        assert_ne!(a, key(View::Commits, ".", "HEAD~1"), "verb ignored");
+        assert_ne!(a, key(View::Diff, "/other", "HEAD~1"), "repo ignored");
+        assert_ne!(a, key(View::Diff, ".", "HEAD~2"), "revspec ignored");
     }
 }

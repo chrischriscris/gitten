@@ -31,6 +31,35 @@ the cheap check on this. Anything two of them need is a bug until it is in
 `core`: the row flattening, the order table, the token-versus-span merge and the
 graph's branch colours were each written twice before they were written once.
 
+**A client is drawing and input, and nothing else.** Everything before it is
+shared: `plait-git` acquires, `plait-app` holds `plait.toml` and the command line,
+`core` holds the rest. A client that has to write its own argument parsing is a
+client nobody else will write — which is why the config parser living behind GPUI
+was a bug and not a layout choice.
+
+**The desktop app is the product.** A terminal client is planned and comes later;
+the browser one is a proof and not a plan. **A feature asked for without a client
+named means the GPUI window** — build it there, and stop.
+
+That is not in tension with the paragraph above; it is the reason for it. The
+other doors exist to keep this honest, because they are the cheapest way to find
+out that something UI-shaped leaked into `core`, and because somebody else's
+client should be possible without a patch to this repo. They are not equal claims
+on the roadmap. So: put the *seam* in `core` in the same pass as the feature, and
+put the *implementation* only where it was asked for. A second client's
+implementation, written unasked, is scope nobody wanted; a hardcoded constant
+that makes the second client impossible is a bug either way.
+
+And the tie-break, when the two pull against each other: **a shared seam is never
+worth a worse window.** If the abstraction that would serve three clients makes
+the desktop slower or uglier, the desktop wins and the seam waits.
+
+**A key is data and a command is a name.** `core::command` resolves a keypress to
+a command *name*; a client turns that name into a method call. Nothing in the
+chain is a function pointer, which is what lets a config file hold it, a help
+screen list it and an extension add one. A `match` on keypresses inside a client
+is a keymap that client owns alone.
+
 ## Git
 
 `plait-git` is the acquisition layer — the only crate that talks to a repository.
@@ -163,29 +192,40 @@ table — so a `Wrap` decides where a line breaks and nothing else.
 
 ## Building
 
-```sh
-./check.sh                          # everything headless: tests, every fixture,
-                                    # and the differs against git's own answer
-cargo run -q -p plait-git --example diffcheck --release [REPO] [REVSPEC]
-                                    # just that comparison; WORST=1 for the
-                                    # files it did worst on
-./dev.sh diff . HEAD~2..HEAD        # rebuild + relaunch on every save,
-                                    # landing back on the same row.
-                                    # Debug + stats overlay by default,
-                                    # so its timings mean nothing —
-                                    # ./dev.sh --release for real ones
-cargo test -p plait-core            # just correctness, sub-second
-cargo build --release -p plait-shell
-./target/release/plait-shell commits [REPO] [LIMIT]
-./target/release/plait-shell diff    [REPO] [REVSPEC]
-./target/release/plait-shell diff --fixtures        # read fixtures/ instead
-PLAIT_STATS=1 ./target/release/plait-shell diff     # frame/heap overlay
+**`./dev` is the way in.** One script, every client, development defaults on.
 
-COLS=120 ROWS=40 cargo run -q -p plait-tui --example dump --release -- \
-    diff . HEAD~2..HEAD              # one frame of the terminal views on
-                                     # stdout, per-frame timing on stderr.
-                                     # LAYOUT, WRAP, AT, FRAMES. No window
-                                     # opens, so this one is safe to just run.
+```sh
+./dev                               what it does, and the rest of the flags
+./dev tui     diff . HEAD~2..HEAD   the terminal
+./dev desktop commits               the window: rebuild + relaunch on save,
+                                    landing back on the same row
+./dev web     diff --fixtures       a browser tab; prints a URL, opens nothing
+./dev dump    commits ~/src 600     one frame on stdout, timing on stderr.
+                                    COLS, ROWS, LAYOUT, WRAP, AT, FRAMES
+./dev check                         everything headless
+./dev config > plait.toml           a complete, correct starting file
+
+./dev --release tui diff .          when you need honest numbers
+PLAIT_STATS=0 ./dev tui             without the readout
+```
+
+Debug and the stats readout are the defaults, because that is the loop you
+iterate in. **The frame timings are meaningless in a debug build** — a different,
+much slower binary, and both clients say so. What is still worth watching is the
+row counts, the cell counts and the load breakdown.
+
+`desktop` and `web` relaunch on every save; `tui` cannot, because it owns the
+terminal's stdin and there is nothing to put in front of it. Quit with `q` and
+press up-enter. `./dev dump` is the watchable one.
+
+Under it, and worth knowing when something is wrong:
+
+```sh
+cargo test -p plait-core            # just correctness, sub-second
+cargo test -p plait-app             # the config file and the command line
+cargo run -q -p plait-git --example diffcheck --release [REPO] [REVSPEC]
+                                    # the differs against git's own answer;
+                                    # WORST=1 for the files it did worst on
 ```
 
 The overlay forces a redraw every frame so the fps number means something —
@@ -196,14 +236,17 @@ Never read those numbers off a debug build.
 Colour and font live in `plait.toml` and reload on the next frame — no rebuild.
 `[diff] algorithm`, `context`, `layout` and `wrap` live there too. `context`
 applies on the next launch; the others have controls in the title bar and change
-live, and the file sets what they *open* on. A control there is the temporary answer
-until keybindings and a settings panel are config — the picker is a pure function
-of a list and an index, so any seam with a registry gets one for free.
-`plait config > plait.toml` writes a complete one. Code still costs a rebuild;
-`./dev.sh` is what removes the quitting and retyping around it.
+live, and the file sets what they *open* on. A control there is the temporary
+answer until a settings panel exists — the picker is a pure function of a list
+and an index, so any seam with a registry gets one for free, and the terminal's
+`?` panel is the same trick over the keymap.
+`./dev config > plait.toml` writes a complete one, and `[keys]` is in it — every
+client reads the same file. Code still costs a rebuild; `./dev` is what removes
+the quitting and retyping around it.
 
-**Never launch the app unless asked.** Build it, test it, bench it — but a window
-appearing unannounced interrupts whoever is at the keyboard. Say it's ready and
+**Never launch a client unless asked.** Build it, test it, bench it — but a
+window appearing unannounced, or a terminal taken over, interrupts whoever is at
+the keyboard. Say it's ready and
 hand over the command. The terminal frontend's `dump` example is the exception
 and exists for it — a frame on stdout interrupts nobody, so look at a colour or
 a glyph there rather than asking someone to open something.

@@ -11,16 +11,16 @@ without `--release` is a different, much slower binary, and the title bar says s
 ## Reproducible from this repo
 
 ```
-./check.sh                                              # all of the below, plus tests
+./dev check                                             # all of the below, plus tests
 cargo test -p plait-core                                # correctness, sub-second
+cargo test -p plait-app                                 # the config file and the command line
 cargo run -q -p plait-core --example bench   --release   # load timings, per fixture
 cargo run -q -p plait-core --example shape   --release   # topology statistics
 cargo run -q -p plait-core --example verify  --release   # lane invariants
 cargo run -q -p plait-core --example paint   --release   # the diff view, in ANSI
 cargo run -q -p plait-git  --example diffcheck --release [REPO] [REVSPEC]
                                                         # differs, against git's own answer
-COLS=120 ROWS=40 cargo run -q -p plait-tui --example dump --release -- diff --fixtures
-                                                        # a terminal frame, and what it cost
+./dev dump diff --fixtures                              # a terminal frame, and what it cost
 PLAIT_STATS=1 ./target/release/plait-shell diff         # frame/heap overlay
 ```
 
@@ -343,8 +343,8 @@ with a large `docs/` tree and a few thousand commits produces the same shape.
 ### The terminal frontend
 
 ```sh
-COLS=120 ROWS=40 cargo run -q -p plait-tui --example dump --release -- diff --fixtures
-COLS=120 ROWS=40 cargo run -q -p plait-tui --example dump --release -- commits ~/Projects/git 82000
+COLS=120 ROWS=40 ./dev dump diff --fixtures
+COLS=120 ROWS=40 ./dev dump commits ~/Projects/git 82000
 ```
 
 Load is `core`'s and is the same work in every frontend — the numbers above for

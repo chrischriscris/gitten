@@ -8,9 +8,13 @@ edition = "2021"
 # still work and nothing needs to reach a wasm target. What crosses the wire is
 # rows.
 #
-# No third-party dependencies. An HTTP server for one reader on loopback is a
-# `TcpListener` and a `Vec<u8>`; a JSON writer for types we own is a `String`.
-# Neither is worth async, and neither is worth two hundred crates.
+# No third-party dependencies of its own. An HTTP server for one reader on
+# loopback is a `TcpListener` and a `Vec<u8>`; a JSON writer for types we own is
+# a `String`. Neither is worth async, and neither is worth two hundred crates.
+#
+# `plait-app` is the shared startup — arguments, `plait.toml`, acquisition —
+# which is also how this client reaches the config file at all. It brings `toml`
+# and `notify` with it; both were already in the lock.
 [dependencies]
+plait-app = { path = "../app" }
 plait-core = { path = "../core" }
-plait-git = { path = "../git" }

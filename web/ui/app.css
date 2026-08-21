@@ -219,6 +219,48 @@ main {
 /* A row whose page has not arrived. Sized exactly like a real one so its
  * arrival never moves anything, and dim rather than blank so a scroll that
  * outruns the fetch reads as loading and not as an empty diff. */
+/* ------------------------------------------------------------- the commit list
+
+   lazygit's order and lazygit's spacing: sha, author, graph, subject. The graph
+   is the column that changes width, which is why it is not last. */
+.row.commit {
+  background: var(--chrome-bg);
+  color: var(--chrome-fg);
+  gap: 8px;
+  padding-left: 10px;
+}
+.row.commit .sha {
+  color: var(--dim);
+  /* Fixed, unlike the graph: the eye scans this column vertically, so it has to
+     be a column and not a ragged edge. */
+  flex: 0 0 auto;
+  width: 8ch;
+  overflow: hidden;
+}
+.row.commit .who {
+  flex: 0 0 auto;
+  width: 2ch;
+}
+/* The gutter is one width for the whole list, from `meta.lanes` — see
+   `Log::lanes` for why this client agrees with the terminal and not with the
+   window. `flex-none` so a long subject cannot squeeze it. */
+.row.commit .gutter {
+  flex: 0 0 auto;
+  display: block;
+  /* `overflow: visible` on purpose: a curve's overshoot runs half a pixel past
+     the row boundary so two halves overlap instead of abutting, and clipping it
+     puts the crease back. */
+  overflow: visible;
+}
+.row.commit .subject {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.row.commit.cursor {
+  background: var(--selection-bg);
+}
+
 .row.pending {
   background: var(--context-bg);
   color: var(--faint);

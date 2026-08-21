@@ -6,9 +6,12 @@
 //! be able to do too" checkable — if a feature needs a knob that is not on this
 //! struct or on one of its fields, it is not extensible yet.
 //!
-//! It is deliberately small. Command dispatch and the mode stack belong here
-//! too and are not written; when they are, they land next to these.
+//! It is deliberately small. Command dispatch landed here as [`Host::keys`] and
+//! [`Host::commands`]; the mode stack is [`crate::command::Modes`] and is a
+//! client's, because which modes are active is a property of what is on screen
+//! rather than of the configuration.
 
+use crate::command::{Commands, Keymap};
 use crate::differ::Differs;
 use crate::font::Font;
 use crate::syntax::Highlighters;
@@ -38,6 +41,18 @@ pub struct Host {
     /// without knowing a window exists, and a terminal frontend wants the same
     /// three. What the frontend supplies is the column count.
     pub wrap: Wraps,
+    /// Which command each key runs, per mode.
+    ///
+    /// On `Host` and not in a client for the reason the whole struct exists: a
+    /// keybinding is the promise that plait behaves the same in a window, a
+    /// browser and a terminal. What `core` resolves is a command *name*; what a
+    /// client does with that name is the only part it owns.
+    pub keys: Keymap,
+    /// Every command name that exists, and one line each.
+    ///
+    /// Beside the keymap rather than inside it, because a command with no key is
+    /// still a command — it is in the help, and a config file can bind it.
+    pub commands: Commands,
     /// Every colour the app draws.
     pub theme: Theme,
     /// The face it draws in, and the numbers derived from it. More than
@@ -60,6 +75,8 @@ impl Host {
             differ: Differs::builtin(),
             layout: "unified".into(),
             wrap: Wraps::builtin(),
+            keys: Keymap::builtin(),
+            commands: Commands::builtin(),
             theme: Theme::default_dark(),
             font: Font::default(),
         }
@@ -83,6 +100,8 @@ mod tests {
         host.theme.set_syntax(Kind::Heading, Style::fg(0x00ff00).bold());
         host.theme.diff.added_bg = 0x001100;
         host.font = crate::font::Font::menlo();
+        host.commands.register("blame.toggle", "show blame beside the diff");
+        host.keys.bind("diff", "b", "blame.toggle").unwrap();
 
         let got = host.syntax.highlight("a.rs", &["# routed away from the scanner"]);
         assert_eq!(got[0][0].kind, Kind::Heading);
@@ -92,6 +111,8 @@ mod tests {
         assert_eq!(host.differ.selected(), "myers");
         assert_eq!(host.differ.context, 6);
         assert_eq!(host.wrap.selected(), "char");
+        assert!(host.commands.known("blame.toggle"));
+        assert_eq!(host.keys.keys_for("blame.toggle"), vec!["b"]);
     }
 
     #[test]
@@ -116,5 +137,10 @@ mod tests {
         // Wrapping is on out of the box: a diff you have to scroll sideways to
         // read is the problem it exists to solve.
         assert_eq!(host.wrap.selected(), "word");
+        // Every shipped binding names a command that exists — the check the
+        // config layer runs against the file, applied to the defaults.
+        for b in host.keys.bindings() {
+            assert!(host.commands.known(&b.command), "{} is not a command", b.command);
+        }
     }
 }

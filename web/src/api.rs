@@ -11,11 +11,13 @@
 //! quietly not have one.
 
 use crate::json::*;
+use crate::log::Log;
 use crate::rows::{pieces, Doc, Piece, Row};
+use plait_core::graph::{Draw, MAX_LANES};
 use plait_core::host::Host;
 use plait_core::syntax::Kind;
 use plait_core::theme::{Surface, Theme};
-use plait_core::{assign_lanes, Commit, LineKind};
+use plait_core::LineKind;
 
 /// The name a client uses for a syntax class.
 ///
@@ -60,6 +62,18 @@ fn line_kind_name(k: LineKind) -> &'static str {
     }
 }
 
+/// The face, for both views. A client measures its own advance from the font
+/// the browser actually resolved — see `app.js` — and takes the rest of it.
+fn font(out: &mut String, host: &Host) {
+    object(out, |o, f| {
+        field_str(o, f, "family", &host.font.family);
+        field_num(o, f, "size", host.font.size);
+        field_bool(o, f, "monospaced", host.font.monospaced);
+        field_num(o, f, "advance", host.font.advance);
+        field_num(o, f, "charWidth", host.font.char_width());
+    });
+}
+
 fn theme(out: &mut String, t: &Theme) {
     object(out, |o, f| {
         field_str(o, f, "name", &t.name);
@@ -98,6 +112,7 @@ fn theme(out: &mut String, t: &Theme) {
             field_rgb(o, f, "accent", c.accent);
             field_rgb(o, f, "titleBg", c.title_bg);
             field_rgb(o, f, "statusBg", c.status_bg);
+            field_rgb(o, f, "selectionBg", c.selection_bg);
             field_rgb(o, f, "error", c.error);
         });
 
@@ -172,13 +187,7 @@ pub fn meta(out: &mut String, doc: &Doc, host: &Host, label: &str) {
         });
 
         key(o, f, "font");
-        object(o, |o, f| {
-            field_str(o, f, "family", &host.font.family);
-            field_num(o, f, "size", host.font.size);
-            field_bool(o, f, "monospaced", host.font.monospaced);
-            field_num(o, f, "advance", host.font.advance);
-            field_num(o, f, "charWidth", host.font.char_width());
-        });
+        font(o, host);
 
         // Served in full, read only for its length.
         //
@@ -283,31 +292,106 @@ pub fn rows(out: &mut String, doc: &Doc, from: usize, count: usize) {
 /// The commit graph. Lanes come from
 /// [`assign_lanes`](plait_core::assign_lanes) — the geometry is `core`'s, and
 /// what a frontend adds is a curve.
-pub fn commits(out: &mut String, all: &[Commit], from: usize, count: usize) {
-    let graph = assign_lanes(all);
-    let end = from.saturating_add(count).min(all.len());
+/// Everything about the commit list that a scroll does not change: the theme,
+/// how wide the gutter is, and how many lanes there really are.
+///
+/// Split from [`commits`] for the reason [`meta`] is split from [`rows`] — the
+/// syntax table alone is 7 surfaces by 12 classes, and sending it with every
+/// page of a 82,000-commit log is a megabyte of colours nobody asked for twice.
+pub fn commits_meta(out: &mut String, log: &Log, host: &Host, label: &str) {
+    object(out, |o, f| {
+        field_str(o, f, "kind", "commits");
+        field_str(o, f, "label", label);
+        field_num(o, f, "total", log.len());
+        // One width for the whole list — see `Log::lanes` for why this client
+        // and the terminal agree, and the window does not.
+        field_num(o, f, "lanes", log.lanes);
+        // The honest count, against the drawn one. "280 lanes · 12 drawn" is
+        // worth knowing; silently drawing twelve is not.
+        field_num(o, f, "concurrent", log.concurrent);
+        field_num(o, f, "maxLanes", MAX_LANES);
+        key(o, f, "font");
+        font(o, host);
+        key(o, f, "theme");
+        theme(o, &host.theme);
+    });
+}
+
+/// A window of the commit list, with each row's graph already resolved.
+///
+/// The **shape** of a row — which halves of which lanes exist, which curve pairs
+/// with which — is [`plait_core::graph::plan`], the same plan the window paints
+/// as Bézier curves and the terminal paints as box characters. What crosses the
+/// wire is that plan, not a drawing of it: turning a half-curve into an SVG path
+/// is arithmetic, and it is the client's.
+///
+/// Hues are **indices** into `theme.lanes` rather than colours, unlike the
+/// syntax table: a lane colour has no contrast floor to resolve against, so
+/// there is nothing the server knows that the client does not. `capped` is the
+/// exception it exists for — a row hiding lanes past the cap draws its last
+/// column in `laneOverflow`, and only the server can know it is hiding any.
+pub fn commits(out: &mut String, log: &Log, host: &Host, from: usize, count: usize) {
+    let end = from.saturating_add(count).min(log.len());
     object(out, |o, f| {
         field_num(o, f, "from", from);
-        field_num(o, f, "total", all.len());
+        field_num(o, f, "total", log.len());
         field_str(o, f, "kind", "commits");
         key(o, f, "rows");
         list(o, from..end, |o, i| {
-            let (c, g) = (&all[i], &graph[i]);
+            let (c, d) = (&log.commits[i], &log.plan[i]);
             object(o, |o, f| {
                 field_str(o, f, "sha", &c.short);
                 field_str(o, f, "author", &c.author);
                 field_str(o, f, "initials", &plait_core::initials(&c.author));
+                // Resolved here because the hash that picks it is `Theme`'s,
+                // and a client reimplementing it would drift the moment the
+                // palette changed length.
+                field_rgb(o, f, "authorFg", host.theme.author(&c.author));
                 field_num(o, f, "timestamp", c.timestamp);
                 field_str(o, f, "subject", &c.subject);
-                field_num(o, f, "lane", g.lane);
                 field_num(o, f, "parents", c.parents.len());
-                key(o, f, "through");
-                list(o, &g.through, |o, l| o.push_str(&l.to_string()));
-                key(o, f, "merges");
-                list(o, &g.merges, |o, l| o.push_str(&l.to_string()));
-                key(o, f, "forks");
-                list(o, &g.forks, |o, l| o.push_str(&l.to_string()));
+                draw(o, f, d);
             });
+        });
+    });
+}
+
+/// One row's plan: where the dot is, and every half that reaches it.
+fn draw(out: &mut String, first: &mut bool, d: &Draw) {
+    field_num(out, first, "lane", d.lane);
+    field_num(out, first, "hue", d.hue);
+    field_num(out, first, "lanes", d.lanes);
+    if d.merge {
+        field_bool(out, first, "merge", true);
+    }
+    if d.capped {
+        field_bool(out, first, "capped", true);
+    }
+    key(out, first, "lines");
+    list(out, &d.lines, |o, l| {
+        object(o, |o, f| {
+            field_num(o, f, "lane", l.lane);
+            field_num(o, f, "hue", l.hue);
+            // Omitted when false: a straight lane through the middle of a busy
+            // repository is most of the payload, and `up`/`down` are true far
+            // more often than not.
+            if l.up {
+                field_bool(o, f, "up", true);
+            }
+            if l.down {
+                field_bool(o, f, "down", true);
+            }
+        });
+    });
+    key(out, first, "curves");
+    list(out, &d.curves, |o, c| {
+        object(o, |o, f| {
+            field_num(o, f, "lane", c.lane);
+            field_num(o, f, "partner", c.partner);
+            field_num(o, f, "hue", c.hue);
+            if c.down {
+                field_bool(o, f, "down", true);
+            }
         });
     });
 }
@@ -420,8 +504,21 @@ diff --git a/a.rs b/a.rs
              bbbb2222\x1fbbbb222\x1f\x1fAda Lovelace\x1f1699999999\x1froot\x1e",
         );
         assert_eq!(log.len(), 2, "the fixture parses");
+        let host = Host::new();
+        let log = Log::build(log);
         let mut out = String::new();
-        commits(&mut out, &log, 0, 10);
+        commits(&mut out, &log, &host, 0, 10);
         well_formed(&out);
+        // The graph crosses the wire as a plan, not as a drawing.
+        assert!(out.contains("\"lines\":"), "{out}");
+        assert!(out.contains("\"curves\":"), "{out}");
+        assert!(out.contains("\"authorFg\":\"#"), "{out}");
+
+        let mut meta = String::new();
+        commits_meta(&mut meta, &log, &host, "test");
+        well_formed(&meta);
+        assert!(meta.contains("\"lanes\":1"), "{meta}");
+        assert!(meta.contains("\"maxLanes\":12"), "{meta}");
+        assert!(meta.contains("\"laneOverflow\":"), "the palette did not ride along");
     }
 }

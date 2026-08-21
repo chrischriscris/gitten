@@ -10,6 +10,7 @@ which numbers those decisions rest on, and the diagrams.
 | | |
 |---|---|
 | [architecture.md](architecture.md) | crates, the boundary, what flows where |
+| [clients.md](clients.md) | writing one: what is shared, what is yours, keys and commands |
 | [diff-pipeline.md](diff-pipeline.md) | raw diff → rows on screen, stage by stage |
 | [syntax-highlighting.md](syntax-highlighting.md) | the scanner, the tables, the routing |
 | [theming.md](theming.md) | colour as data, surfaces, contrast resolution |

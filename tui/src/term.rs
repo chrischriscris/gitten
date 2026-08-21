@@ -26,57 +26,20 @@
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal;
+use plait_core::command::{Code, Key};
 use std::io::{self, BufWriter, Stdout, Write};
 use std::time::Duration;
 
-/// A keypress, normalised.
+/// Something that happened.
 ///
-/// Its own enum rather than crossterm's, so nothing above this module names a
-/// dependency — and so that a keymap, when there is one, binds against something
-/// `core`'s command dispatch could also be handed. The set is deliberately what
-/// a keyboard-first app binds and nothing more; a key with no variant arrives as
-/// [`Key::Char`] or is dropped.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Key {
-    Char(char),
-    Up,
-    Down,
-    Left,
-    Right,
-    Home,
-    End,
-    PageUp,
-    PageDown,
-    Enter,
-    Tab,
-    BackTab,
-    Backspace,
-    Delete,
-    Esc,
-}
-
-/// Which modifiers were held. `shift` is deliberately absent for
-/// [`Key::Char`] — a terminal reports `Shift-a` as `A`, and a binding on both
-/// is a binding that never fires.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub struct Mods {
-    pub ctrl: bool,
-    pub alt: bool,
-    pub shift: bool,
-}
-
-impl Mods {
-    pub fn none(&self) -> bool {
-        !self.ctrl && !self.alt && !self.shift
-    }
-}
-
-/// Something that happened. Anything a view cannot act on is never constructed,
-/// so a `match` over this is exhaustive without a catch-all that hides new
-/// variants.
+/// The key is [`plait_core::command::Key`] and not a type of this crate's, which
+/// is the whole reason `term.rs` exists as a boundary: a keypress becomes
+/// `core`'s idea of a keypress at the edge, and everything inland — the keymap,
+/// the modes, `plait.toml` — is shared with every other client. A second client
+/// on a second platform writes this function and nothing else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Input {
-    Key(Key, Mods),
+    Key(Key),
     /// The terminal changed size. Carries the new one, so nothing has to ask.
     Resize(usize, usize),
 }
@@ -145,12 +108,16 @@ impl Term {
     /// The terminal's size in columns and rows.
     ///
     /// Falls back to 80×24 rather than failing: a pipe has no size, and a diff
-    /// drawn at a guessed width is more use than an error. That is also what
-    /// makes `--dump` work with no terminal attached at all.
+    /// drawn at a guessed width is more use than an error.
+    ///
+    /// **Zero counts as no size**, which is not the same check as an error and
+    /// is the one that actually fires: a pty opened by `script`, by a CI runner
+    /// or by a test harness reports `Ok((0, 0))`, and a client that believes it
+    /// draws a blank screen and looks hung.
     pub fn size() -> (usize, usize) {
         match terminal::size() {
-            Ok((w, h)) => (w as usize, h as usize),
-            Err(_) => (80, 24),
+            Ok((w, h)) if w > 0 && h > 0 => (w as usize, h as usize),
+            _ => (80, 24),
         }
     }
 
@@ -165,11 +132,7 @@ impl Term {
         if !event::poll(timeout)? {
             return Ok(None);
         }
-        Ok(match event::read()? {
-            Event::Resize(w, h) => Some(Input::Resize(w as usize, h as usize)),
-            Event::Key(k) if k.kind != KeyEventKind::Release => translate(k),
-            _ => None,
-        })
+        Ok(translate_event(event::read()?))
     }
 }
 
@@ -179,77 +142,115 @@ impl Drop for Term {
     }
 }
 
+/// Which events are inputs at all.
+///
+/// Anything that is not a keypress or a resize — a mouse move, a focus change, a
+/// bracketed paste — is dropped, so a caller sees `None` for a timeout and for
+/// noise alike. Key *release* events are dropped too: terminals with the kitty
+/// protocol on report both, and acting on each is every binding firing twice.
+///
+/// Separate from [`Term::poll`] so it can be tested without a terminal, which is
+/// the same reason every other module in this crate can be.
+fn translate_event(event: Event) -> Option<Input> {
+    match event {
+        Event::Resize(w, h) => Some(Input::Resize(w as usize, h as usize)),
+        Event::Key(k) if k.kind != KeyEventKind::Release => translate(k),
+        _ => None,
+    }
+}
+
+/// crossterm's event into `core`'s key. The whole of what this module is for.
+///
+/// A key with no [`Code`] is dropped rather than guessed at: a binding that
+/// fires on the wrong key is worse than one that does not fire, and `Code` is
+/// deliberately only what a keyboard-first app binds.
 fn translate(k: KeyEvent) -> Option<Input> {
-    let key = match k.code {
-        KeyCode::Char(c) => Key::Char(c),
-        KeyCode::Up => Key::Up,
-        KeyCode::Down => Key::Down,
-        KeyCode::Left => Key::Left,
-        KeyCode::Right => Key::Right,
-        KeyCode::Home => Key::Home,
-        KeyCode::End => Key::End,
-        KeyCode::PageUp => Key::PageUp,
-        KeyCode::PageDown => Key::PageDown,
-        KeyCode::Enter => Key::Enter,
-        KeyCode::Tab => Key::Tab,
-        KeyCode::BackTab => Key::BackTab,
-        KeyCode::Backspace => Key::Backspace,
-        KeyCode::Delete => Key::Delete,
-        KeyCode::Esc => Key::Esc,
+    let m = k.modifiers;
+    // A terminal in raw mode sends CR for the return key and crossterm reports
+    // that as `Enter`. Some layers in between — `script`, a few ssh setups, a
+    // pty opened by a test harness — send LF instead, which arrives as
+    // `Ctrl-J`. Folded into `Enter` here, **modifier and all**: leaving the
+    // control bit set produces `ctrl-enter`, which is not a key anything binds
+    // either. Nothing wants `ctrl-j` for itself, and "the return key does
+    // nothing" is the worst failure a keyboard-first app has.
+    let feed = matches!(k.code, KeyCode::Char('j')) && m.contains(KeyModifiers::CONTROL);
+    let code = match k.code {
+        _ if feed => Code::Enter,
+        KeyCode::Char(c) => Code::Char(c),
+        KeyCode::Up => Code::Up,
+        KeyCode::Down => Code::Down,
+        KeyCode::Left => Code::Left,
+        KeyCode::Right => Code::Right,
+        KeyCode::Home => Code::Home,
+        KeyCode::End => Code::End,
+        KeyCode::PageUp => Code::PageUp,
+        KeyCode::PageDown => Code::PageDown,
+        KeyCode::Enter => Code::Enter,
+        KeyCode::Tab => Code::Tab,
+        KeyCode::BackTab => Code::BackTab,
+        KeyCode::Backspace => Code::Backspace,
+        KeyCode::Delete => Code::Delete,
+        KeyCode::Esc => Code::Esc,
         _ => return None,
     };
-    let m = k.modifiers;
-    // Shift is dropped for a character: the terminal already applied it, and
-    // `Shift-a` arriving as both `A` and `shift + a` is a binding that never
-    // fires.
-    let shift = m.contains(KeyModifiers::SHIFT) && !matches!(key, Key::Char(_));
-    Some(Input::Key(
-        key,
-        Mods {
-            ctrl: m.contains(KeyModifiers::CONTROL),
-            alt: m.contains(KeyModifiers::ALT),
-            shift,
-        },
-    ))
+    // `Key::new` drops shift on a character, which is the invariant that stops
+    // `Shift-a` arriving as both `A` and `shift-a`.
+    Some(Input::Key(Key::new(
+        code,
+        m.contains(KeyModifiers::CONTROL) && !feed,
+        m.contains(KeyModifiers::ALT),
+        m.contains(KeyModifiers::SHIFT),
+    )))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use plait_core::command::{Keymap, Modes, Resolve};
 
-    fn key(code: KeyCode, mods: KeyModifiers) -> Option<Input> {
-        translate(KeyEvent::new(code, mods))
+    fn key(code: KeyCode, mods: KeyModifiers) -> Option<Key> {
+        match translate(KeyEvent::new(code, mods)) {
+            Some(Input::Key(k)) => Some(k),
+            _ => None,
+        }
     }
 
     #[test]
-    fn a_plain_character_carries_no_modifiers() {
-        assert_eq!(key(KeyCode::Char('j'), KeyModifiers::NONE), Some(Input::Key(Key::Char('j'), Mods::default())));
+    fn a_keypress_becomes_cores_own_key() {
+        // The boundary this module exists to be: what leaves here is the type
+        // `plait.toml` and the keymap already speak.
+        assert_eq!(key(KeyCode::Char('j'), KeyModifiers::NONE), Some(Key::char('j')));
+        assert_eq!(key(KeyCode::Esc, KeyModifiers::NONE), Some(Key::plain(Code::Esc)));
+        assert_eq!(
+            key(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            Some(Key::ctrl(Code::Char('d')))
+        );
+        // ...and it spells itself the way a config file writes it.
+        assert_eq!(key(KeyCode::Char('d'), KeyModifiers::CONTROL).unwrap().to_string(), "ctrl-d");
     }
 
     #[test]
     fn shift_is_dropped_for_a_character_and_kept_for_a_named_key() {
         // The trap: a terminal reports `Shift-a` as `A` *and* sets the shift
-        // bit, so a binding on `shift + a` never fires and one on `A` fires
-        // twice if both are registered.
-        let Some(Input::Key(Key::Char('A'), m)) = key(KeyCode::Char('A'), KeyModifiers::SHIFT)
-        else {
-            panic!("shifted character did not arrive as a character");
-        };
-        assert!(!m.shift);
-        let Some(Input::Key(Key::Tab, m)) = key(KeyCode::Tab, KeyModifiers::SHIFT) else {
-            panic!("shifted tab was dropped");
-        };
-        assert!(m.shift);
+        // bit, so a binding on `shift-a` never fires and one written both ways
+        // fires twice.
+        let a = key(KeyCode::Char('A'), KeyModifiers::SHIFT).unwrap();
+        assert_eq!(a, Key::char('A'));
+        assert!(!a.shift);
+        assert!(key(KeyCode::Tab, KeyModifiers::SHIFT).unwrap().shift);
     }
 
     #[test]
-    fn ctrl_and_alt_survive() {
-        let Some(Input::Key(Key::Char('c'), m)) = key(KeyCode::Char('c'), KeyModifiers::CONTROL)
-        else {
-            panic!("ctrl-c was dropped, and raw mode means nothing else will catch it");
-        };
-        assert!(m.ctrl && !m.alt);
-        assert!(!m.none());
+    fn a_line_feed_is_the_return_key() {
+        // What `script`, and a few ssh setups, send instead of a carriage
+        // return. Both have to be Enter or the key that opens things is dead.
+        assert_eq!(key(KeyCode::Enter, KeyModifiers::NONE), Some(Key::plain(Code::Enter)));
+        assert_eq!(
+            key(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            Some(Key::plain(Code::Enter))
+        );
+        // ...and an unmodified `j` is still `j`.
+        assert_eq!(key(KeyCode::Char('j'), KeyModifiers::NONE), Some(Key::char('j')));
     }
 
     #[test]
@@ -259,11 +260,30 @@ mod tests {
     }
 
     #[test]
+    fn a_resize_carries_the_new_size() {
+        let got = match translate_event(Event::Resize(120, 40)) {
+            Some(Input::Resize(w, h)) => (w, h),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(got, (120, 40));
+    }
+
+    #[test]
     fn a_key_release_is_not_an_input() {
-        // Terminals with the kitty protocol on report press *and* release; a
-        // binding acting on both fires twice per keystroke.
+        // Terminals with the kitty protocol on report press *and* release, and
+        // acting on both is every binding firing twice.
         let mut k = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
         k.kind = KeyEventKind::Release;
-        assert!(k.kind == KeyEventKind::Release);
+        assert_eq!(translate_event(Event::Key(k)), None);
+    }
+
+    #[test]
+    fn the_shipped_keymap_resolves_what_this_module_produces() {
+        // End to end across the boundary: crossterm's event, `core`'s key,
+        // `core`'s keymap, a command name — and not one line of it in between
+        // belongs to this client.
+        let map = Keymap::builtin();
+        let press = key(KeyCode::Char('d'), KeyModifiers::CONTROL).unwrap();
+        assert_eq!(map.resolve(&Modes::new(), &[press]), Resolve::Run("view.page-down"));
     }
 }

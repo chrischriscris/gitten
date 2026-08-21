@@ -208,12 +208,19 @@ pub fn diff(
 
 /// A short label for the window title.
 pub fn describe(repo: &Path) -> String {
-    let name = repo.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    // Canonicalised first: `file_name()` of `.` is `None`, and `.` is what every
+    // client is given by default — so without this the commonest invocation of
+    // all produces a label with the repository's name missing from it.
+    let named = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
+    let name = named.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let branch = run(repo, &["rev-parse", "--abbrev-ref", "HEAD"])
         .ok()
         .map(|b| String::from_utf8_lossy(&b).trim().to_string())
         .unwrap_or_default();
-    if branch.is_empty() { name } else { format!("{name} · {branch}") }
+    // `name (branch)` and not `name · branch`: a client puts this after its own
+    // name and view, so a third middle dot in one line of chrome reads as four
+    // things of equal weight when it is one repository on one branch.
+    if branch.is_empty() { name } else { format!("{name} ({branch})") }
 }
 
 // ------------------------------------------------------------------- internals

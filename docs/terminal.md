@@ -8,8 +8,10 @@ hardest place to cheat: it has no layout engine to hide work in, no container
 that scrolls itself, and no element tree. If something a view needs is not in
 `core`, it is immediately obvious, because there is nothing else there.
 
-Writing it moved three things out of the frontends. That is the interesting part
-of this page.
+Writing it moved six things out of the clients, and one of them —
+`plait.toml` — could not be reached from anywhere but the window before. That is
+the interesting part of this page; [clients.md](clients.md) is the general
+version.
 
 ## What is shared, and what each door still owns
 
@@ -24,14 +26,20 @@ of this page.
   runs::runs     tokens × spans → styled runs     → HighlightStyle / SGR / JSON
   graph::Hues    which branch is which colour     → curves / box drawing
   graph::MAX_LANES, lane_count
+  command::*     a key → a command name            → a platform event → Key,
+                                                     and a match on the name
+  app::config    plait.toml, watched                how a reload reaches a view
+  app::cli       the arguments, the usage           its own flags
+  app::acquire   a view of a source → data
   theme, font, wrap, differ, syntax
 ```
 
-Everything on the left had at least two implementations before this crate
-existed and now has one. `web/src/rows.rs` and `shell/src/views/diff.rs` have not
-been migrated onto `core::rows` yet — see [Still to do](#still-to-do) — so the
-row flattening currently has one canonical implementation and two copies that
-predate it. `runs` and `graph` are canonical everywhere except `plait-web`.
+Everything on the left had at least two implementations before, or — for
+`command` — none that was shared at all. `web/src/rows.rs` and
+`shell/src/views/diff.rs` have not been migrated onto `core::rows` yet, so the row
+flattening has one canonical implementation and two copies that predate it;
+`runs` and `graph` are canonical everywhere except `plait-web`; `command` is used
+by this client and not yet by the window. See [Still to do](#still-to-do).
 
 ## The one thing a `Rows` implementation owns
 
@@ -148,6 +156,34 @@ The window can scroll a container wider than itself; a terminal cannot, and a
 subject starting in a different column on every row is a list the eye cannot
 scan.
 
+## The loop
+
+`main.rs`, and it is thin on purpose: a key, a command name, a method.
+
+```text
+  crossterm event → term::translate → Key → Keymap::resolve → "diff.next-file"
+                                                                    │
+                                                    Screens::run ───┘
+```
+
+Nothing in that file decides what a key *does*. The keymap is on `Host`, so
+`plait.toml` and an extension reach it the same way, and `?` lists whatever is
+actually bound because the help panel is a pure function of the registry. See
+[clients.md](clients.md) for the seam.
+
+Two things about it are decisions:
+
+**It is idle at rest.** The loop blocks on input with a 150 ms timeout, and the
+timeout exists only so a saved `plait.toml` is noticed. Nothing redraws unless
+something happened — the property GPUI gives the window for free, arrived at here
+on purpose.
+
+**`enter` opens a diff and `esc` comes back**, as a *stack of screens* rather
+than a pane. The acquisition is in `main`, not in the view: a view takes
+already-loaded data and never learns what a repository is, which is the same rule
+the GPUI client follows. A bare revision is "what did this commit change" to
+`plait_git::pairs`, merges included.
+
 ## Cost
 
 Loading is `core`'s and is the same number in every frontend. Drawing is
@@ -162,7 +198,7 @@ per-visible-row and independent of the diff, which is the whole claim:
 | `git/git`, 82k commits | — | 138 ms | 26 µs |
 
 ```sh
-COLS=120 ROWS=40 cargo run -q -p plait-tui --example dump --release -- diff --fixtures
+./dev dump diff --fixtures
 ```
 prints the frame and the timings; `FRAMES=n` sets how many repaints to average.
 Release only — a debug build measures a different program, exactly as the
@@ -203,9 +239,13 @@ to. A terminal does the same.
 - **`MarkdownRows`.** `core/examples/paint.rs` already draws the furniture in
   ANSI, so the terminal version is that function and a `Rows` impl — and the
   furniture itself is then a fourth thing to lift into `core`.
-- **A config file.** `plait.toml` is read by `shell/src/config.rs`, which is
-  where the I/O lives; the terminal reads none of it yet, including
-  `chrome.selection_bg` and the `SCROLLOFF` that should be in it.
+- **`SCROLLOFF` in the config file.** Everything else in `plait.toml` reaches
+  this client now — see [clients.md](clients.md) — but how many rows of lead the
+  cursor keeps is still a constant in `diff.rs`.
 - **`selection_bg` in the shell.** It was added to `ChromePalette` for this
-  frontend because a hardcoded selection colour is not a seam. No GPUI view
-  draws a selection yet.
+  client because a hardcoded selection colour is not a seam. No GPUI view draws a
+  selection yet.
+- **Panes.** One screen at a time: `enter` on a commit opens its diff *over* the
+  list and `esc` comes back. lazygit puts them side by side, and
+  `Screen::span` is already the shape that would do it — nothing uses it for
+  that yet.

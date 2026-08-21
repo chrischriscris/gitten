@@ -18,6 +18,7 @@ edition = "2021"
 # answer to the same question. Already in the lock file as a gpui dependency, so
 # it costs no download and no fresh compile.
 [dependencies]
+plait-app = { path = "../app" }
 plait-core = { path = "../core" }
 plait-git = { path = "../git" }
 crossterm = "0.29"

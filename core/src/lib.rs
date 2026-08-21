@@ -5,6 +5,7 @@
 //! something in here needs to know what a window is, the boundary is gone.
 
 pub mod align;
+pub mod command;
 pub mod differ;
 pub mod font;
 pub mod graph;

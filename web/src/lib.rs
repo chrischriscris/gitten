@@ -11,16 +11,31 @@
 //! It follows that nothing in here needs a wasm target and nothing in `core`
 //! had to change. The cost is on the other side: the browser reimplements the
 //! drawing, because a `Rows` returns a UI element and that registry is a
-//! frontend's. See `docs/` for where that seam wants to move.
+//! client's. See `docs/clients.md` for exactly where that line falls.
+//!
+//! # Two views, one page
+//!
+//! `/` serves the same document for a diff and for a commit list; which one it
+//! is arrives in `meta` and the script branches on it. A second page would be a
+//! second copy of the virtual list, the theme and the keys.
+//!
+//! The commit graph crosses the wire as `plait_core::graph`'s **plan** — which
+//! halves of which lanes exist, which curve pairs with which, which branch is
+//! which colour — and the browser turns each half into one SVG path. It is the
+//! same plan the window paints as Bézier curves and the terminal paints as box
+//! characters, so all three agree about the shape of history and only the
+//! arithmetic differs. See [`log::Log`].
 
 pub mod api;
 pub mod http;
 pub mod json;
+pub mod log;
 pub mod rows;
 
 use http::{Request, Response};
+use plait_app::MIN_WRAP_COLS;
 use plait_core::host::Host;
-use plait_core::Commit;
+use log::Log;
 use rows::Doc;
 use std::sync::Mutex;
 
@@ -28,41 +43,21 @@ const INDEX: &str = include_str!("../ui/index.html");
 const CSS: &str = include_str!("../ui/app.css");
 const JS: &str = include_str!("../ui/app.js");
 
-/// The commits view has an endpoint and no drawing.
+/// The narrowest and widest column budgets a *client* may be asked for.
 ///
-/// Served instead of the diff page rather than letting the script fail on a
-/// payload with no theme in it: a blank window that says nothing is the worst of
-/// the three options, and claiming a view exists because its data does is the
-/// second worst.
-const NOT_DRAWN: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><title>plait</title>\
-<style>body{background:#181614;color:#a39c93;font:14px ui-monospace,monospace;padding:3rem;line-height:1.6}\
-code{color:#d9c98f}</style></head><body>\
-<p>The commit graph is served but not drawn yet: <code>GET /api/commits?from=0&amp;count=200</code> \
-returns the rows, lanes included, from <code>core</code>&rsquo;s own <code>assign_lanes</code>.</p>\
-<p>What is missing is the gutter &mdash; the curves live in <code>shell/src/graph.rs</code> and want \
-porting to SVG. For a diff instead: <code>plait-web diff [REPO] [REVSPEC]</code>.</p>\
-</body></html>";
-
-/// How wide a row may get before it is clipped. The shell's `MAX_LINE_CHARS`,
-/// and the same reasoning: a rendering budget, owned by the frontend, applied by
-/// `core`. A 9.6-million-character line was measured in the wild and nobody
-/// reads past column 2000.
-pub const MAX_LINE_CHARS: usize = 2000;
-
-/// Narrowest budget a client can ask to wrap at, mirroring the shell's
-/// `MIN_WRAP_COLS`. A budget of one character is a row per character and a row
-/// count that grows without bound.
-const MIN_WRAP_COLS: usize = 8;
-
-/// Widest, so a client cannot ask for a `Wrapped` the size of the diff squared.
-/// Well past any window; the point is that the number came from a URL.
+/// [`MIN_WRAP_COLS`] is the shared floor; the ceiling is this crate's own,
+/// because only this client takes its budget from a URL. Well past any window —
+/// the point is that the number came from outside the process, so a client
+/// cannot be asked for a break table the size of the diff squared.
 const MAX_WRAP_COLS: usize = 10_000;
 
 pub enum Data {
     /// Behind a `Mutex` because a request can reflow it: the column budget is
     /// the client's to set, and rebuilding the break table mutates.
     Diff(Mutex<Doc>),
-    Commits(Vec<Commit>),
+    /// Not behind one: a commit list has no width to be cut for, so every
+    /// request reads the same resolved graph and nothing mutates.
+    Commits(Log),
 }
 
 pub struct State {
@@ -100,8 +95,10 @@ impl State {
 
     pub fn route(&self, req: &Request) -> Response {
         match (req.path.as_str(), &self.data) {
-            ("/", Data::Diff(_)) => Response::html(INDEX),
-            ("/", Data::Commits(_)) => Response::html(NOT_DRAWN),
+            // One page for both views. Which one it is arrives in `meta`, and
+            // the script branches on it — a second page would be a second copy
+            // of the virtual list, the theme and the keys.
+            ("/", _) => Response::html(INDEX),
             ("/app.css", _) => Response::css(CSS),
             ("/app.js", _) => Response::js(JS),
 
@@ -123,15 +120,15 @@ impl State {
                 api::rows(&mut out, &doc, req.number("from", 0), count);
                 Response::json(out)
             }
-            ("/api/commits", Data::Commits(all)) => {
+            ("/api/commits", Data::Commits(log)) => {
                 let count = req.number("count", 200).min(2000);
-                let mut out = String::with_capacity(count * 128);
-                api::commits(&mut out, all, req.number("from", 0), count);
+                let mut out = String::with_capacity(count * 256);
+                api::commits(&mut out, log, &self.host, req.number("from", 0), count);
                 Response::json(out)
             }
-            ("/api/meta", Data::Commits(all)) => {
+            ("/api/meta", Data::Commits(log)) => {
                 let mut out = String::new();
-                api::commits(&mut out, all, 0, 0);
+                api::commits_meta(&mut out, log, &self.host, &self.label);
                 Response::json(out)
             }
 
@@ -155,7 +152,8 @@ mod tests {
     fn diff_state() -> State {
         let host = Host::new();
         let raw = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,2 +1,2 @@\n-let a = 1;\n+let a = 2;\n fn b() {}\n";
-        let doc = Doc::build(prepare(&parse_unified_diff(raw), &host.syntax, MAX_LINE_CHARS));
+        let doc =
+            Doc::build(prepare(&parse_unified_diff(raw), &host.syntax, plait_app::MAX_LINE_CHARS));
         State { label: "test".into(), host, data: Data::Diff(Mutex::new(doc)) }
     }
 
@@ -234,10 +232,15 @@ mod tests {
     fn the_commits_view_serves_its_own_rows() {
         let host = Host::new();
         let log = parse_log("aaaa1111\x1faaaa111\x1f\x1fAda Lovelace\x1f1700000000\x1froot\x1e");
-        let s = State { label: "t".into(), host, data: Data::Commits(log) };
+        let s = State { label: "t".into(), host, data: Data::Commits(Log::build(log)) };
         let out = body(get(&s, "/api/commits?from=0&count=10"));
         assert!(out.contains("\"subject\":\"root\""));
         assert!(out.contains("\"initials\":\"AL\""));
         assert_eq!(get(&s, "/api/rows").status, 404);
+        // The page is the same page: which view it is arrives in `meta`.
+        assert_eq!(get(&s, "/").status, 200);
+        let meta = body(get(&s, "/api/meta"));
+        assert!(meta.contains("\"kind\":\"commits\""), "{meta}");
+        assert!(meta.contains("\"theme\":"), "the commits view got no theme");
     }
 }

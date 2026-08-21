@@ -1,35 +1,42 @@
 # Architecture
 
-Five crates. The interesting line is between the first two and the rest.
+**A core and a set of clients.** Three shared layers, then one crate per client,
+and anyone can write another.
 
 ```
-                        ┌──────────────────────────────────────┐
-                        │  plait-core          zero deps       │
-   a repository         │                                      │
-        │               │  parse_log      assign_lanes         │
-        │               │  differ::{Histogram, Myers, hunks}   │
-        ▼               │  prepared::prepare   align::align    │
-┌───────────────┐ blobs │  intraline   markdown::lay_out       │
-│  plait-git    ├──────►│  rows::{Flat, Present, expand}       │
-│  two texts    │       │  runs::runs   graph::{Hues, cap}     │
-│  per file     │       │  syntax::{Lexer, Markdown, ...}      │
-│  git binary   │       │  wrap::{Word, Char, Wrapped}         │
-│  (gix later)  │       │  theme::Theme  font::Font  host::Host │
-└───────────────┘       └──┬────────┬────────┬────────┬───────┘
-                           │        │        │        │
-                     rows, │        │        │        │  rows, colours
-                   colours │        │        │        │
-              ┌────────────▼─┐ ┌────▼─────┐ ┌▼───────────┐ ┌▼──────────────┐
-              │ plait-shell  │ │plait-tui │ │ plait-web  │ │examples/paint │
-              │ GPUI window  │ │ cells,   │ │ loopback   │ │ ANSI,         │
-              │              │ │ crossterm│ │ HTTP + JS  │ │ headless      │
-              └──────────────┘ └──────────┘ └────────────┘ └───────────────┘
+   ┌──────────────────────────────────────────────────────────────────────┐
+   │  plait-core                                              zero deps   │
+   │  parse_log  assign_lanes  differ::{Histogram, Myers}  align  wrap    │
+   │  prepared::prepare  rows::{Flat, Present, expand}  runs  markdown    │
+   │  syntax  graph::Hues  command::{Key, Keymap, Modes}  theme  font     │
+   │  host::Host — every swappable piece, in one struct                   │
+   └───────────────────────────────┬──────────────────────────────────────┘
+   ┌───────────────────────────────┴──────────────────────────────────────┐
+   │  plait-git      the only crate that talks to a repository            │
+   │  plait-app      plait.toml, the command line, acquisition            │
+   └──┬──────────────────┬──────────────────┬─────────────────────────────┘
+      │                  │                  │
+ ┌────▼───────┐ ┌────────▼─────┐ ┌──────────▼──┐   ┌──────────────────┐
+ │plait-shell │ │  plait-tui   │ │  plait-web  │   │ yours            │
+ │GPUI window │ │cells, raw tty│ │loopback HTTP│   │ AnyElement, a    │
+ │            │ │              │ │  + a page   │   │ cell, a payload  │
+ └────────────┘ └──────────────┘ └─────────────┘   └──────────────────┘
 ```
 
-Three real frontends and one example, and the example is still the cheapest place
-to look at a colour. Each door draws and nothing else: what a `Rows`
-implementation returns is an `AnyElement`, a row of cells or a JSON payload, and
-everything above that line is one implementation in `core`.
+A client is **drawing and input, and nothing else.** Everything above that line
+is one implementation: the same differ, the same rows, the same order table, the
+same `plait.toml`, the same keymap. What differs is the type a `Rows`
+implementation returns — an `AnyElement`, a row of cells, a JSON payload — and
+that is the only reason the `Rows` trait itself cannot live in `core`.
+
+**The three are not equal.** `plait-shell` is the product; `plait-tui` is
+planned and built and comes after it; `plait-web` is a proof that the boundary
+holds and not a thing anybody asked to ship. A feature asked for without a client
+named means the window. See [clients.md](clients.md), and `AGENTS.md` for the
+tie-break when a shared seam and a good window disagree.
+
+`core/examples/paint.rs` is a fourth, tiny client: a real diff in ANSI, no
+crate of its own, and still the cheapest place to look at a colour.
 
 ## plait-core
 
@@ -39,6 +46,7 @@ because it compiles in a second and its tests need no window.
 | module | what lives there |
 |---|---|
 | `lib.rs` | commit and diff parsing, `assign_lanes`, `intraline`, `replace_pairs`, `initials` |
+| `command.rs` | keys, chords, the mode stack, the keymap, the command registry |
 | `graph.rs` | which branch is which colour, the lane cap, the honest lane count |
 | `rows.rs` | a diff flattened to rows, the wrap index, the order table, the load path |
 | `runs.rs` | syntax tokens × intraline spans → one flat styled run list |
@@ -55,9 +63,11 @@ Four examples double as the headless test bench: `bench` (timings at fixture
 scale), `shape` (topology statistics), `verify` (lane-assignment invariants),
 `paint` (the diff view in ANSI).
 
-Three of these modules exist because a third frontend was written. `rows`, `runs`
-and `graph::Hues` each had two implementations in two frontends before they had
-one here — see [terminal.md](terminal.md) for which copies are still outstanding.
+Four of these modules exist because a third client was written. `rows`, `runs`
+and `graph::Hues` each had two implementations in two clients before they had one
+here; `command` had none, and the keymap it replaced was three `match` statements
+that could not agree — see [terminal.md](terminal.md) and
+[clients.md](clients.md).
 
 ## plait-git
 
@@ -80,6 +90,27 @@ cat-file --batch`.
 `examples/diffcheck.rs` is the headless check that the differs agree with git on
 real history, and is run by `./check.sh`.
 
+## plait-app
+
+The config file, the command line, and acquisition — everything a client needs
+before it can draw, and nothing that draws.
+
+| module | what lives there |
+|---|---|
+| `config.rs` | `plait.toml`: parse, apply, write out, watch |
+| `cli.rs` | `View`, `Source`, `Request`, the usage text, a client's own flags |
+| `acquire.rs` | one view of one source into `Vec<FileDiff>` or `Vec<Commit>` |
+| `lib.rs` | `Startup` — the four lines a client's `main` starts with |
+
+It exists because all of that was written twice and about to be written a third
+time, and because `config.rs` used to live behind GPUI, which made the window the
+only client that could be configured. `toml` and `notify` are here rather than in
+`core` for the reason `core` has no dependencies at all: reading a file is I/O.
+
+What is *not* here is how a reload reaches the views. `watch` is shared; what to
+do when it fires is a client's, because GPUI swaps a global and a terminal drops
+a flag into its event loop.
+
 ## plait-tui
 
 The terminal. A cell grid, the presentations that fill it, and escape codes.
@@ -91,7 +122,9 @@ The terminal. A cell grid, the presentations that fill it, and escape codes.
 | `split.rs` | `SplitRows`, at half the width and with its own scroll |
 | `diff.rs` | the diff view: viewport, reflow, commands |
 | `commits.rs` | the commit list, and the graph in box drawing |
+| `help.rs` | what the keys do, as a pure function of the keymap |
 | `term.rs` | the only module that touches `crossterm` |
+| `main.rs` | the event loop: a key, a command name, a method |
 
 `examples/dump.rs` prints one frame of either view to stdout, which is how it is
 looked at without a terminal — and, because `Screen` is a `Vec<Cell>`, it is the
@@ -99,10 +132,34 @@ one frontend whose *drawing* is unit-tested. See [terminal.md](terminal.md).
 
 ## plait-web
 
-A loopback HTTP server and a page. No third-party dependencies: the server is a
-`TcpListener`, the JSON writer is a `String`. Everything above drawing runs
-natively in the process you started, so nothing needs a wasm target; the browser
-re-implements the drawing.
+**A proof, not a product.** It exists to answer one question — can a client
+written in a different language, with no access to any of this crate's types,
+draw a plait diff? — and the answer being yes is what says `core` has no UI in
+it. Nobody asked for a web app and the roadmap does not have one.
+
+Read it that way when deciding whether to invest in it. It still holds its own
+row flattening (`rows.rs`) and its own keymap (`ui/app.js`), and those are worth
+*knowing about* rather than worth fixing: closing them buys a client nobody
+ships. What matters is that it never constrains `core` — if `plait-web` ever
+wants something in `core` that the window does not, the window wins.
+
+A loopback HTTP server and a page. No third-party dependencies of its own: the
+server is a `TcpListener`, the JSON writer is a `String`. Everything above
+drawing runs natively in the process you started, so nothing needs a wasm target;
+the browser re-implements the drawing.
+
+| file | what lives there |
+|---|---|
+| `lib.rs` | the routes, and which view is loaded |
+| `api.rs` | the payloads: `meta`, `rows`, `commits`, and the theme resolved |
+| `rows.rs` | the diff flattened to rows, and the wrap table |
+| `log.rs` | the commit list, with `core::graph`'s plan resolved once |
+| `http.rs`, `json.rs` | a server and a writer, both a few hundred lines |
+| `ui/` | one page for both views: a virtual list, the theme as custom properties, SVG for the graph |
+
+The graph crosses the wire as `core::graph::plan` — the halves, not a drawing of
+them — so the browser's SVG paths and the window's Bézier curves are the same
+shape from the same numbers.
 
 ## plait-shell
 
@@ -119,7 +176,7 @@ GPUI. Drawing and input, and as little else as possible.
 | `graph.rs` | lane geometry and painting: quads, paths, one canvas per row |
 | `controls.rs` | the title-bar pickers: a label, a value, and the registered alternatives |
 | `config.rs` | `plait.toml`: parse, apply, watch, and the live `Host` global |
-| `session.rs` | the row you were on, so `./dev.sh` can put you back after a restart |
+| `session.rs` | the row you were on, so `./dev desktop` can put you back after a restart |
 | `stats.rs` | the counting allocator and the `PLAIT_STATS` overlay |
 
 ## Which way data moves
@@ -184,7 +241,7 @@ Listed so nobody reads an intention as a description:
   the interim answer: a control per registry, driven by the same names
   `plait.toml` uses. When the panel exists it should read the same registries and
   these should collapse into it.
-- **Code hot reload.** The config file reloads *data* live, and `./dev.sh` removes
+- **Code hot reload.** The config file reloads *data* live, and `./dev` removes
   everything either side of a code rebuild — but the rebuild itself remains, 3–5 s.
   A dylib swap was investigated and rejected, and the reasons are specific enough
   to be worth keeping: GPUI holds a thread-local element arena

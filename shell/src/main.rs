@@ -7,11 +7,13 @@ mod views;
 
 use gpui::*;
 use gpui_component::*;
-use plait_core::host::Host;
+use plait_app::acquire::Data;
+use plait_app::cli::{Source, View};
+use plait_app::{Started, Startup};
 use plait_core::differ::{Overrides, Whitespace};
+use plait_core::host::Host;
 use plait_core::FileDiff;
 use std::cell::Cell;
-use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -27,26 +29,18 @@ use views::diff::{CycleLayout, CycleWrap};
 
 
 
-const USAGE: &str = "\
-plait — a git client
-
-  plait commits [REPO] [LIMIT]     history graph      (default: . , 5000)
-  plait diff    [REPO] [REVSPEC]   a diff             (default: . , working tree)
-  plait config                     print the current theme and font as TOML
-
-  REVSPEC is anything git takes:  HEAD~50..HEAD   main..feature   <sha>
-  Pass --fixtures instead of REPO to read fixtures/ instead of a repository.
-
-  The title bar carries four pickers: the presentation (unified, side-by-side),
+/// What only this client has. The two views, the arguments and `plait.toml` are
+/// documented once, in `plait_app::cli::usage`, because they are the same in
+/// every client — see that function for why that is a promise and not a
+/// convenience.
+const EXTRA: &str = "  The title bar carries four pickers: the presentation (unified, side-by-side),
   where a line too wide for the window breaks (off, word, char), the diff
   algorithm (histogram, patience, myers) and how much whitespace has to match
   (exact, trailing, change, all — git's default, --ignore-space-at-eol, -b and
-  -w). `s` cycles the presentation and `w` the wrap. [diff] in plait.toml sets
-  what they open on, plus `context`, `moves` and `indent_heuristic`.
+  -w). `s` cycles the presentation and `w` the wrap.
 
-  plait.toml next to the binary (or $PLAIT_CONFIG) is re-read every time it is
-  saved, and colours and font apply on the next frame — no rebuild, no relaunch.
-  Start one with:  plait config > plait.toml
+  The file is re-read every time it is saved, and colours and font apply on the
+  next frame — no rebuild, no relaunch.
 
   ./dev.sh <args>  rebuild and relaunch on every source change, landing back
                    on the row you were reading. Debug build and the overlay by
@@ -358,68 +352,33 @@ impl Render for DevShell {
     }
 }
 
-enum Source {
-    Repo(PathBuf, String),
-    Fixtures,
-}
-
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|a| a == "-h" || a == "--help") {
-        print!("{USAGE}");
-        return;
-    }
-    let which = args.first().cloned().unwrap_or_else(|| "commits".into());
-
-    // `plait config > plait.toml` — a complete, correct starting file rather than
-    // a page of documentation to copy out of. No window, so it comes first.
-    if which == "config" {
-        let mut h = Host::new();
-        let path = config::path();
-        for w in config::load(&mut h, &path) {
-            eprintln!("plait: {w}");
-        }
-        print!("{}", config::dump(&h));
-        return;
-    }
-
-    let source = match args.get(1).map(String::as_str) {
-        Some("--fixtures") => Source::Fixtures,
-        Some(path) => Source::Repo(PathBuf::from(path), args.get(2).cloned().unwrap_or_default()),
-        None => Source::Repo(PathBuf::from("."), args.get(2).cloned().unwrap_or_default()),
+    // Arguments, `plait.toml`, `--help`, `plait config` and acquisition, all of
+    // it shared with every other client — see `plait_app`. What is left in this
+    // file is a window.
+    let started = match Startup::new("plait", View::Commits)
+        .blurb("a git client")
+        .extra(EXTRA)
+        .go()
+    {
+        Ok(started) => started,
+        Err(exit) => exit.finish(),
     };
+    let Started { view: which, source, host, loaded, config: config_path } = started;
+    let host = Rc::new(host);
 
     // Names this exact view, so a saved scroll position is only ever restored
     // into the diff it was taken in — see `session.rs`.
-    let session_key = match &source {
-        Source::Repo(repo, revspec) => {
-            session::Session::key(&which, &repo.to_string_lossy(), revspec)
-        }
-        Source::Fixtures => session::Session::key(&which, "--fixtures", ""),
-    };
+    let session_key = source.key(which);
     let session_path = session::path();
-
-    // One host, built before anything reads it: the highlighters, the differs,
-    // the theme, the font. An extension registering itself does it here, and
-    // every view reads the same struct.
-    //
-    // Before acquisition and not inside `app.run`, because the host is what
-    // chooses the diff algorithm now — building it after the diff had been
-    // fetched would leave `[diff] algorithm` describing nothing.
-    let config_path = config::path();
-    let mut built = Host::new();
-    for w in config::load(&mut built, &config_path) {
-        eprintln!("plait: {w}");
-    }
-    let host = Rc::new(built);
 
     // How to fetch the diff again with a different algorithm. Built here, where
     // the source is known, so nothing downstream has to learn what a repository
     // is. `None` for a `.diff` fixture and for the commit graph — neither has an
     // algorithm to choose, and the control says so by being inert.
-    let rediff: Option<Rediff> = match (which.as_str(), &source) {
-        ("diff", Source::Repo(repo, revspec)) => {
-            let (repo, revspec) = (repo.clone(), revspec.clone());
+    let rediff: Option<Rediff> = match (which, &source) {
+        (View::Diff, Source::Repo { path, arg }) => {
+            let (repo, revspec) = (path.clone(), arg.clone());
             Some(Rc::new(move |host: &Host, over: &Overrides| {
                 plait_git::diff(&repo, &revspec, &host.differ, over)
             }))
@@ -427,23 +386,8 @@ fn main() {
         _ => None,
     };
 
-    // Acquire before opening a window: a git error should print and exit, not
-    // flash an empty window and leave you guessing.
-    let loaded = load(&which, &source, &host);
-    let (label, data) = match loaded {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("plait: {e}\n\n{USAGE}");
-            std::process::exit(1);
-        }
-    };
-
-    let build = if cfg!(debug_assertions) {
-        "  ·  DEBUG BUILD — timings meaningless, use --release"
-    } else {
-        ""
-    };
-    let title = SharedString::from(format!("plait · {which} · {label}{build}"));
+    let title = SharedString::from(started_title(which, &loaded.label));
+    let data = loaded.data;
 
     let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
     app.run(move |cx| {
@@ -604,49 +548,15 @@ fn main() {
     });
 }
 
-enum Data {
-    Commits(Vec<plait_core::Commit>),
-    Diff(Vec<plait_core::FileDiff>),
-}
-
-fn read_fixture(path: &str) -> String {
-    // Git guarantees no encoding; never fail over one bad byte.
-    String::from_utf8_lossy(&std::fs::read(path).unwrap_or_default()).into_owned()
-}
-
-fn load(which: &str, source: &Source, host: &Host) -> Result<(String, Data), String> {
-    match (which, source) {
-        ("diff", Source::Repo(repo, revspec)) => {
-            // The host's differs, not a default: which algorithm ran is a
-            // configured choice, and this is the one place it is made.
-            let files = plait_git::diff(repo, revspec, &host.differ, &Overrides::default())?;
-            if files.is_empty() {
-                return Err(format!(
-                    "no changes for {:?} {}",
-                    repo,
-                    if revspec.is_empty() { "(working tree)" } else { revspec }
-                ));
-            }
-            // No algorithm in the label: there is a control in the title bar
-            // that says which one, and it stays true when you change it.
-            let label = format!("{} {}", plait_git::describe(repo), revspec);
-            Ok((label.trim().into(), Data::Diff(files)))
-        }
-        ("diff", Source::Fixtures) => Ok((
-            "fixtures".into(),
-            Data::Diff(plait_core::parse_unified_diff(&read_fixture("fixtures/big.diff"))),
-        )),
-        (_, Source::Repo(repo, limit)) => {
-            let n = limit.parse().unwrap_or(5000);
-            let commits = plait_git::log(repo, n)?;
-            if commits.is_empty() {
-                return Err(format!("no commits in {repo:?}"));
-            }
-            Ok((plait_git::describe(repo), Data::Commits(commits)))
-        }
-        (_, Source::Fixtures) => Ok((
-            "fixtures".into(),
-            Data::Commits(plait_core::parse_log(&read_fixture("fixtures/log.txt"))),
-        )),
-    }
+/// The window title: the client, the view, and what was loaded.
+///
+/// `Started::title` is the shared one; this exists because the window is opened
+/// after the `Started` has been taken apart, and reassembling it to ask would be
+/// sillier than the two lines.
+fn started_title(view: View, label: &str) -> String {
+    let build = match cfg!(debug_assertions) {
+        true => "  ·  DEBUG BUILD — timings meaningless, use --release",
+        false => "",
+    };
+    format!("plait · {} · {label}{build}", view.name())
 }

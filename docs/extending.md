@@ -15,6 +15,8 @@ pub struct Host {
     pub differ: Differs,        // which algorithm turns two files into a diff
     pub layout: String,         // which diff presentation opens, by name
     pub wrap: Wraps,            // where a line too wide for the window breaks
+    pub keys: Keymap,           // which command each key runs, per mode
+    pub commands: Commands,     // every command name that exists, and one line each
     pub theme: Theme,           // every colour the app draws
     pub font: Font,             // the face, and the numbers derived from it
 }
@@ -31,9 +33,12 @@ snapshot, and it is what makes `plait.toml` apply on the next frame instead of t
 next launch. A new view that captures the host instead will work, and will quietly
 not hot-reload.
 
-Not there yet: command dispatch, the mode stack, and any way to load an
-implementation from outside the binary. Today "an extension" means code compiled
-in. The seams are shaped so that stops being true without them changing.
+Built once in a client's `main` by `plait_app::Startup`, which reads
+`plait.toml` into it before any view exists.
+
+Not there yet: any way to load an implementation from outside the binary. Today
+"an extension" means code compiled in. The seams are shaped so that stops being
+true without them changing.
 
 `layout` is a name and `wrap` is a whole registry, and the difference is the
 boundary rather than taste: a `Rows` implementation returns UI elements, so its
@@ -498,6 +503,39 @@ corners. A terminal without box drawing, a Nerd Font set and a
 one-column-per-lane experiment are all constructors, and none of them touch
 `paint`.
 
+## 10. A key, and a command
+
+`core::command`, and the shape is the whole point: **a key is data and a command
+is a name.** Nothing in the chain is a function pointer, which is what lets
+`plait.toml` hold it and a settings panel rewrite it.
+
+```rust
+host.commands.register("blame.toggle", "show blame beside the diff");
+host.keys.bind("diff", "b", "blame.toggle")?;
+```
+
+Two lines, and: `b` works in a diff, `?` lists it with its description, and
+`plait config` writes it back out. A client that does not know what
+`blame.toggle` is treats it as an unbound key, which is the honest answer.
+
+The registry is validated *against itself* — `apply_keys` refuses a binding whose
+command is not registered — so a typo is named and a key is never silently bound
+to nothing. That is the same trick `[diff] algorithm` plays against `Differs`.
+
+Two things it will not do, both because the alternative needs a clock `core` does
+not have:
+
+- **A prefix is refused.** Binding `g g` when `g` exists, or the other way round,
+  is an error and the binding is not added — so the map is never in a state that
+  cannot resolve without a timeout.
+- **Shift on a character is dropped.** Every platform reports `Shift-a` as `A`; a
+  binding on `shift-a` would never fire and one written both ways would fire
+  twice. `Key::new` enforces it, so no client can get it wrong.
+
+What a client writes is a translation from its own platform's event to
+`command::Key` — `plait-tui`'s is `term.rs`, and it is the only file in that
+crate that imports `crossterm`. See [clients.md](clients.md).
+
 ## What a new seam owes
 
 If you are adding one, match what the existing four do:
@@ -515,3 +553,6 @@ If you are adding one, match what the existing four do:
    trusting this line.
 5. **A line in `AGENTS.md`** if it changes the philosophy, and a page here if it
    does not.
+6. **Reachable from a client's `main` without that client being special.**
+   `plait_app::Startup` hands back the `Host`; if a seam needs something else,
+   it is not a seam three clients can use.

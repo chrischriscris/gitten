@@ -42,26 +42,17 @@
 //! | [`split`] | `SplitRows`: the two-column presentation |
 //! | [`diff`] | the diff view: viewport, reflow, horizontal scroll |
 //! | [`commits`] | the commit list, and the graph gutter in box drawing |
+//! | [`help`] | what the keys do, as a function of the keymap |
 //! | [`term`] | the only module that touches `crossterm` |
 
 pub mod commits;
 pub mod diff;
+pub mod help;
 pub mod rows;
 pub mod screen;
 pub mod split;
 pub mod term;
 
-/// How wide a row may get before it is clipped.
-///
-/// A rendering budget, which is why the frontend owns the number and `core`
-/// applies it — the same reasoning, and the same 2000, as the shell and the
-/// browser. Text layout is linear in length, a 9.6-million-character line was
-/// measured in the wild, and nobody reads past column 2000.
-pub const MAX_LINE_CHARS: usize = 2000;
-
-/// Narrowest wrap budget worth having.
-///
-/// A terminal dragged narrower than a presentation's own gutter would otherwise
-/// ask for one character a row, which is a diff turned into a column of letters.
-/// Overflowing the edge is the better failure, and the pen clips it.
-pub const MIN_WRAP_COLS: usize = 8;
+/// The two rendering budgets, from `plait_app` — where they are shared rather
+/// than picked independently by three clients that all picked the same numbers.
+pub use plait_app::{MAX_LINE_CHARS, MIN_WRAP_COLS};

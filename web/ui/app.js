@@ -23,6 +23,7 @@ const dom = {
   spacer: el("spacer"),
   window: el("window"),
   position: el("position"),
+  keys: el("keys"),
 };
 
 /** Rows per request. Big enough that a page-down is one fetch, small enough
@@ -35,6 +36,9 @@ const OVERSCAN = 12;
 
 const state = {
   meta: null,
+  /** "diff" or "commits". From `meta`, so one page serves both and neither has
+   *  to be told which it is before the first fetch. */
+  kind: "diff",
   /** page index -> array of rows, or a Promise while it is in flight. */
   pages: new Map(),
   total: 0,
@@ -118,7 +122,8 @@ function columns() {
 
 async function fetchMeta() {
   const wrap = state.wrapName ? `&wrap=${encodeURIComponent(state.wrapName)}` : "";
-  const r = await fetch(`/api/meta?cols=${state.cols}${wrap}`);
+  const query = state.kind === "commits" ? "" : `?cols=${state.cols}${wrap}`;
+  const r = await fetch(`/api/meta${query}`);
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 }
@@ -136,8 +141,12 @@ function ensure(from, to) {
   const generation = state.generation;
   for (let p = pageOf(from); p <= pageOf(to); p++) {
     if (state.pages.has(p)) continue;
+    // A commit list has no width to be cut for, so no budget and no wrap.
     const wrap = state.wrapName ? `&wrap=${encodeURIComponent(state.wrapName)}` : "";
-    const url = `/api/rows?from=${p * PAGE}&count=${PAGE}&cols=${state.cols}${wrap}`;
+    const url =
+      state.kind === "commits"
+        ? `/api/commits?from=${p * PAGE}&count=${PAGE}`
+        : `/api/rows?from=${p * PAGE}&count=${PAGE}&cols=${state.cols}${wrap}`;
     const inflight = fetch(url)
       .then((r) => r.json())
       .then((payload) => {
@@ -186,7 +195,114 @@ function pieceHtml(p, kind, moved, theme) {
   return style.length ? `<span style="${style.join(";")}">${text}</span>` : text;
 }
 
+// ------------------------------------------------------------------ the graph
+
+/** Columns per lane. Not derived from the font: a lane is a drawn thing, and
+ *  tying its width to the type would reflow the graph when the text reflows.
+ *  14 is the window's, so a repository looks the same in both. */
+const LANE_W = 14;
+const STROKE = 2;
+const DOT_R = 4.5;
+const MERGE_R = 5.5;
+
+/** Where a lane is centred. */
+const laneX = (lane) => lane * LANE_W + LANE_W / 2;
+
+/** A lane's colour, or the collapsed grey when this row is hiding lanes past
+ *  the cap.
+ *
+ *  `capped` and not `lane === maxLanes - 1`: a repository with exactly twelve
+ *  lanes hides nothing, and dimming its last column would say there is more
+ *  history over there when there is not. The server sends the fact. */
+function laneColor(theme, hue, overflow) {
+  if (overflow) return theme.laneOverflow;
+  return theme.lanes[hue % theme.lanes.length] || theme.chrome.fg;
+}
+
+/** Half an S, as a cubic.
+ *
+ *  A branch changing lanes spans a *whole* row, and each row draws its own half:
+ *  the two meet on the row boundary, at the midpoint between the two lanes,
+ *  sharing a tangent. That is why the server sends a `partner` and a direction
+ *  rather than a start and an end — see `plait_core::graph`. The control points
+ *  are the window's, so the curve has the same shape in both clients.
+ *
+ *  The last segment runs half a pixel *past* the boundary along the tangent: two
+ *  antialiased ends meeting exactly leaves a faint crease, and a collinear
+ *  overlap cannot kink. */
+function halfS(x, partnerX, y, down, rowH) {
+  const dx = (partnerX - x) / 2;
+  const dy = down ? rowH / 2 : -rowH / 2;
+  const [tx, ty] = [dx * 0.5, dy * 0.25];
+  const len = Math.hypot(tx, ty);
+  const over = len > 0 ? 0.5 / len : 0;
+  return (
+    `M${x} ${y}` +
+    `C${x} ${y + dy * 0.5} ${x + dx * 0.5} ${y + dy * 0.75} ${x + dx} ${y + dy}` +
+    (over ? `L${x + dx + tx * over} ${y + dy + ty * over}` : "")
+  );
+}
+
+/** One row's gutter.
+ *
+ *  Straight halves as rects and curves as paths, then the node — last, because
+ *  it is opaque and punches through whatever runs under it, so the lines read as
+ *  passing behind. Same order as the window, for the same reason. */
+function gutter(row, meta) {
+  const t = meta.theme;
+  const rowH = state.rowH;
+  const w = meta.lanes * LANE_W;
+  const mid = rowH / 2;
+  const over = (lane) => !!row.capped && lane === meta.maxLanes - 1;
+  let out = "";
+
+  for (const l of row.lines || []) {
+    const y0 = l.up ? 0 : mid;
+    const y1 = l.down ? rowH : mid;
+    if (y0 === y1) continue; // a lane that is curve at both ends
+    out +=
+      `<rect x="${laneX(l.lane) - STROKE / 2}" y="${y0}" ` +
+      `width="${STROKE}" height="${y1 - y0}" fill="${laneColor(t, l.hue, over(l.lane))}"/>`;
+  }
+  for (const c of row.curves || []) {
+    // Either end in the collapsed column makes the whole half overflow, or one
+    // curve changes colour halfway across the gutter.
+    const colour = laneColor(t, c.hue, over(Math.max(c.lane, c.partner)));
+    const d = halfS(laneX(c.lane), laneX(c.partner), mid, !!c.down, rowH);
+    out += `<path d="${d}" fill="none" stroke="${colour}" stroke-width="${STROKE}"/>`;
+  }
+  const r = row.merge ? MERGE_R : DOT_R;
+  out +=
+    `<circle cx="${laneX(row.lane)}" cy="${mid}" r="${r - STROKE / 2}" ` +
+    `fill="${t.chrome.bg}" stroke="${laneColor(t, row.hue, over(row.lane))}" ` +
+    `stroke-width="${STROKE}"/>`;
+
+  return `<svg class="gutter" width="${w}" height="${rowH}" viewBox="0 0 ${w} ${rowH}">${out}</svg>`;
+}
+
+/** lazygit's order — sha, author, graph, subject — because the graph is the
+ *  column that changes width, and putting it last would move the subject. */
+function commitHtml(row, index) {
+  const cursor = index === state.cursor ? " cursor" : "";
+  if (!row) return `<div class="row commit pending${cursor}">…</div>`;
+  return (
+    `<div class="row commit${cursor}">` +
+    `<span class="sha">${escape(row.sha)}</span>` +
+    `<span class="who" style="color:${row.authorFg}" title="${escape(row.author)}">` +
+    `${escape(row.initials)}</span>` +
+    gutter(row, state.meta) +
+    `<span class="subject">${escape(row.subject)}</span>` +
+    `</div>`
+  );
+}
+
+/** Which view is on screen. From `meta`, so one page serves both. */
 function rowHtml(row, index) {
+  return state.kind === "commits" ? commitHtml(row, index) : diffRowHtml(row, index);
+}
+
+
+function diffRowHtml(row, index) {
   const cursor = index === state.cursor ? " cursor" : "";
   if (!row) return `<div class="row pending${cursor}">…</div>`;
 
@@ -240,13 +356,24 @@ function paint(force) {
   }
   dom.window.innerHTML = html;
   dom.window.style.transform = `translateY(${first * state.rowH}px)`;
+  const what = state.kind === "commits" ? "commit" : "row";
   dom.position.textContent = state.total
-    ? `row ${state.cursor + 1} / ${state.total}`
-    : "no rows";
+    ? `${what} ${state.cursor + 1} / ${state.total}`
+    : `no ${what}s`;
 }
 
 function chrome(meta) {
   dom.label.textContent = `plait · ${meta.label}`;
+  if (meta.kind === "commits") {
+    // The uncapped count against the drawn one: "280 lanes · 12 drawn" is worth
+    // knowing, and silently drawing twelve is not.
+    const bits = [`${meta.total} commits`, `${meta.concurrent} lanes`];
+    if (meta.concurrent > meta.maxLanes) bits.push(`${meta.maxLanes} drawn`);
+    dom.stats.textContent = bits.join(" · ");
+    dom.wrap.hidden = true;
+    dom.keys.textContent = "j k · g G · ctrl-d ctrl-u";
+    return;
+  }
   dom.wrap.textContent = `wrap: ${meta.wrap.selected}`;
   const bits = [
     `${meta.files.length} files`,
@@ -278,8 +405,11 @@ async function reflow() {
   // Superseded while this was in flight.
   if (token !== state.reflowing) return;
   state.meta = meta;
-  state.total = meta.rows;
-  state.wrapName = meta.wrap.selected;
+  state.kind = meta.kind;
+  // A diff's row count is *after* wrapping and moves with the width; a commit
+  // list's is the number of commits and does not.
+  state.total = meta.kind === "commits" ? meta.total : meta.rows;
+  state.wrapName = meta.wrap ? meta.wrap.selected : null;
   applyTheme(meta);
   chrome(meta);
   dom.spacer.style.height = `${state.total * state.rowH}px`;
@@ -303,6 +433,7 @@ function moveTo(row, centre) {
 }
 
 async function cycleWrap() {
+  if (state.kind === "commits") return;
   const names = state.meta.wrap.names;
   const at = names.indexOf(state.meta.wrap.selected);
   state.wrapName = names[(at + 1) % names.length];
@@ -357,7 +488,8 @@ function wire() {
   const resized = () => {
     clearTimeout(pending);
     pending = setTimeout(() => {
-      if (columns() !== state.cols) reflow();
+      // Only a diff has a column budget to cross. A commit list just redraws.
+      if (state.kind !== "commits" && columns() !== state.cols) reflow();
       else paint(true);
     }, 80);
   };
@@ -385,6 +517,7 @@ async function main() {
     // later reflow agrees with. Measured on this repo: 105 columns on load
     // against 104 after, which is 45 rows of difference.
     state.meta = await fetchMeta();
+    state.kind = state.meta.kind;
     applyTheme(state.meta);
     await reflow();
     dom.scroll.focus();

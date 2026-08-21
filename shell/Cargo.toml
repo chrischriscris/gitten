@@ -4,6 +4,7 @@ version = "0.0.0"
 edition = "2021"
 
 [dependencies]
+plait-app = { path = "../app" }
 plait-core = { path = "../core" }
 plait-git = { path = "../git" }
 gpui = { git = "https://github.com/zed-industries/zed" }
@@ -11,9 +12,3 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["fo
 gpui-component = { git = "https://github.com/longbridge/gpui-component" }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
 anyhow = "1.0"
-
-# Both already in the lock file as gpui-component dependencies, so neither adds
-# a download or a fresh compile. Config is I/O, which is why it is here and not
-# in core: core has no dependencies and does no I/O.
-toml = "0.8"
-notify = "7.0"

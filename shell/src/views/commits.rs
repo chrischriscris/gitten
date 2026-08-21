@@ -15,7 +15,7 @@ struct Who {
 
 struct Data {
     commits: Vec<Commit>,
-    draws: Vec<graph::RowDraw>,
+    draws: Vec<graph::Draw>,
     who: Vec<Who>,
     /// uniform_list measures exactly ONE row to decide how wide the content is,
     /// and by default that is row 0. If row 0 is short there is nothing to
@@ -81,7 +81,7 @@ impl Commits {
         let widest = draws
             .iter()
             .zip(&commits)
-            .map(|(d, c)| d.width() + c.subject.len() as f32 * char_w)
+            .map(|(d, c)| graph::row_width(d) + c.subject.len() as f32 * char_w)
             .enumerate()
             .max_by(|(_, a), (_, b)| a.total_cmp(b))
             .map(|(i, _)| i)
@@ -147,7 +147,7 @@ const WHO_W: f32 = 26.0;
 /// subject follows its own row's graph immediately, so a commit on the trunk
 /// reads from the left instead of starting behind the widest merge in the
 /// repository.
-fn row(c: &Commit, who: &Who, d: &graph::RowDraw, host: &Rc<Host>) -> AnyElement {
+fn row(c: &Commit, who: &Who, d: &graph::Draw, host: &Rc<Host>) -> AnyElement {
     div()
         .flex()
         .items_center()

@@ -14,21 +14,21 @@
 //! follows (see [`plait_core::graph::Hues`]) rather than the column it happens to occupy.
 
 use gpui::*;
-use plait_core::graph::{Hues, MAX_LANES};
+use plait_core::graph::MAX_LANES;
 use plait_core::host::Host;
 use plait_core::theme::Theme;
-use plait_core::{Commit, GraphRow};
 use std::rc::Rc;
 
 pub const ROW_H: f32 = 22.0;
 const LANE_W: f32 = 14.0;
 
-/// Which lane is which colour, how many may be drawn, and how many there really
-/// are — all three from `core`, because all three are pure functions of the
-/// topology. A terminal gutter drawn in box characters and this canvas therefore
-/// agree about which branch is amber and where the overflow starts. See
-/// `plait_core::graph`.
-pub use plait_core::graph::lane_count;
+/// The whole plan — which halves exist, which curve pairs with which, which
+/// branch is which colour, how many columns a row needs, how many lanes there
+/// really are — comes from `core`, because every part of it is a pure function
+/// of the topology. A terminal gutter in box characters, a browser drawing SVG
+/// and this canvas therefore agree about all of it, and what is left in this
+/// file is geometry. See `plait_core::graph`.
+pub use plait_core::graph::{lane_count, plan as row_draws, Draw};
 
 /// A lane is 2px, not the 1.5px a dense list first suggests. Thinner reads as
 /// a hairline sketch rather than something you could grab, and 2px straddles
@@ -52,11 +52,20 @@ const OVERSHOOT: f32 = 0.5;
 /// Colour belongs to the *branch*, not to the column it happens to sit in —
 /// see [`plait_core::graph::Hues`]. Overflow is the exception: past the cap every lane shares one
 /// column, so they share one grey and stop pretending to be individuals.
-fn color(theme: &Theme, lane: u16, hue: u16) -> Rgba {
-    if lane as usize >= MAX_LANES {
+fn color(theme: &Theme, overflow: bool, hue: u16) -> Rgba {
+    if overflow {
         return rgb(theme.lane_overflow);
     }
     rgb(theme.lane(hue as usize))
+}
+
+/// Whether this lane is the collapsed column of a row that is hiding lanes.
+///
+/// Two conditions and not one: a repository with exactly [`MAX_LANES`] lanes
+/// hides nothing, and dimming its last column would claim there is more history
+/// over there. `Draw::capped` is what says there is.
+fn overflowed(d: &Draw, lane: u16) -> bool {
+    d.capped && lane as usize == MAX_LANES - 1
 }
 
 /// The breath between the last stroke of the graph and the first letter of the
@@ -70,179 +79,24 @@ fn lane_x(lane: u16) -> f32 {
     (lane as usize).min(MAX_LANES - 1) as f32 * LANE_W + LANE_W / 2.0
 }
 
-/// A straight lane, in halves: `up` runs from the row's top edge to the dot
-/// line, `down` from the dot line to the bottom edge. A half is missing when a
-/// curve has taken it over, or when there is simply no history that way.
-#[derive(Clone, Copy)]
-struct Line {
-    lane: u16,
-    hue: u16,
-    up: bool,
-    down: bool,
+/// Pixels for a row's own lane count, plus the breath before the subject. The
+/// one thing this file adds to `core`'s plan besides the drawing itself.
+pub fn row_width(d: &Draw) -> f32 {
+    d.lanes as f32 * LANE_W + GAP
 }
 
-/// Half an S. It touches `lane` on the dot line and crosses the row boundary
-/// halfway to `partner`, where the neighbouring row picks it up.
-#[derive(Clone, Copy)]
-struct Curve {
-    lane: u16,
-    partner: u16,
-    /// Whose colour it carries: always the branch, never the trunk it leaves
-    /// or joins. For a lane collapsing onto a dot that is the lane's own hue;
-    /// for one born out of a dot it is the far end's.
-    hue: u16,
-    /// Leaving the dot line downward, or reaching up out of it.
-    down: bool,
-}
-
-/// A row flattened to just what painting needs, precomputed once at load so
-/// the paint callback never touches the commit list.
-#[derive(Clone)]
-pub struct RowDraw {
-    lane: u16,
-    hue: u16,
-    is_merge: bool,
-    lines: Vec<Line>,
-    curves: Vec<Curve>,
-    /// This row's gutter width, measured once here rather than per frame.
-    width: f32,
-}
-
-impl RowDraw {
-    /// How much room this row's graph needs — its own lanes, not the widest
-    /// row in the repository. A commit sitting alone on the trunk gets nearly
-    /// the whole window for its subject, and only rows where the graph really
-    /// is wider push their text across. Measured in whole lanes so the text
-    /// steps on the lane grid: ragged by a column reads as "the graph is wider
-    /// here", ragged by three pixels just reads as broken.
-    pub fn width(&self) -> f32 {
-        self.width
-    }
-}
-
-fn measure(lane: u16, lines: &[Line], curves: &[Curve]) -> f32 {
-    let col = |x: f32| (x / LANE_W) as usize;
-    let mut last = col(lane_x(lane));
-    for l in lines {
-        last = last.max(col(lane_x(l.lane)));
-    }
-    for c in curves {
-        // A half only travels to the midpoint between the two lanes, so it
-        // often stops short of its partner's column entirely.
-        let reach = lane_x(c.lane).max((lane_x(c.lane) + lane_x(c.partner)) / 2.0) + STROKE / 2.0;
-        last = last.max(col(reach));
-    }
-    (last + 1) as f32 * LANE_W + GAP
-}
-
-/// Lanes past the cap collapse onto one column, so they may as well collapse
-/// in the data too: git/git would otherwise queue 280 identical quads per row.
-fn cap(lane: usize) -> u16 {
-    lane.min(MAX_LANES) as u16
-}
-
-pub fn row_draws(commits: &[Commit], rows: &[GraphRow]) -> Vec<RowDraw> {
-    let mut hues = Hues::new();
-    let mut draws = Vec::with_capacity(rows.len());
-
-    for (i, (c, r)) in commits.iter().zip(rows).enumerate() {
-        let above = i.checked_sub(1).map(|j| &rows[j]);
-        let below = rows.get(i + 1);
-
-        // A lane born at the fork above arrives on a curve and so has no top
-        // half; one ending at the merge below leaves on a curve and so has no
-        // bottom half. Either way the partner is that row's dot.
-        let arrives = |lane| above.filter(|a| a.forks.contains(&lane)).map(|a| a.lane);
-        let departs = |lane| below.filter(|b| b.merges.contains(&lane)).map(|b| b.lane);
-
-        let mut lines: Vec<Line> = Vec::with_capacity(r.through.len().min(MAX_LANES) + 1);
-        let mut curves = Vec::with_capacity(r.forks.len() + r.merges.len());
-
-        // Our own lane may be a branch tip nothing has drawn yet.
-        let hue = hues.claim(r.lane);
-
-        // Lanes converging on this dot: the tail half of their curve, in their
-        // own colour, before that colour goes back on the wheel below.
-        for &m in &r.merges {
-            // A lane forked one row up and merged away again immediately never
-            // gets a column of its own, so the far end of the curve is that
-            // row's dot — otherwise the two halves would aim at different
-            // midpoints and tear apart at the boundary.
-            let end = arrives(m).unwrap_or(m);
-            curves.push(Curve { lane: cap(r.lane), partner: cap(end), hue: hues.claim(m), down: false });
-        }
-
-        for &lane in r.through.iter().chain(std::iter::once(&r.lane)) {
-            let own = lane == r.lane;
-            let (up, down) = (arrives(lane), departs(lane));
-            let line = Line {
-                lane: cap(lane),
-                hue: hues.claim(lane),
-                // Nothing exists above the newest row, and a root commit's
-                // lane stops at its dot. Don't draw history that isn't there.
-                up: up.is_none() && !(own && i == 0),
-                down: down.is_none() && !(own && c.parents.is_empty()),
-            };
-            // Everything past the cap shares a column: share the line too,
-            // or git/git would queue 280 identical quads per row.
-            match lines.last_mut().filter(|l| l.lane == line.lane) {
-                Some(prev) => {
-                    prev.up |= line.up;
-                    prev.down |= line.down;
-                }
-                None => lines.push(line),
-            }
-            for (end, down) in [(up, false), (down, true)] {
-                if let Some(partner) = end {
-                    curves.push(Curve {
-                        lane: cap(lane),
-                        partner: cap(partner),
-                        hue: line.hue,
-                        down,
-                    });
-                }
-            }
-        }
-
-        // Branches that end here give their colour back, and a root gives up
-        // its own lane, before the forks below claim theirs.
-        for &m in &r.merges {
-            hues.release(m);
-        }
-        if c.parents.is_empty() {
-            hues.release(r.lane);
-        }
-
-        // Lanes born out of this dot: the head half of their curve.
-        for &f in &r.forks {
-            let end = departs(f).unwrap_or(f);
-            curves.push(Curve { lane: cap(r.lane), partner: cap(end), hue: hues.claim(f), down: true });
-        }
-
-        draws.push(RowDraw {
-            lane: cap(r.lane),
-            hue,
-            is_merge: c.parents.len() > 1,
-            width: measure(cap(r.lane), &lines, &curves),
-            lines,
-            curves,
-        });
-    }
-    draws
-}
-
-pub fn row_canvas(d: RowDraw, host: Rc<Host>) -> impl IntoElement {
-    let w = d.width();
+pub fn row_canvas(d: Draw, host: Rc<Host>) -> impl IntoElement {
+    let w = row_width(&d);
     canvas(
         move |_bounds, _window, _cx| d,
-        move |bounds, d: RowDraw, window, _cx| paint_row(bounds, &d, window, &host.theme),
+        move |bounds, d: Draw, window, _cx| paint_row(bounds, &d, window, &host.theme),
     )
     .flex_none()
     .w(px(w))
     .h(px(ROW_H))
 }
 
-fn paint_row(bounds: Bounds<Pixels>, d: &RowDraw, window: &mut Window, theme: &Theme) {
+fn paint_row(bounds: Bounds<Pixels>, d: &Draw, window: &mut Window, theme: &Theme) {
     let ox = f32::from(bounds.origin.x);
     let x = |lane: u16| ox + lane_x(lane);
     let top = f32::from(bounds.origin.y);
@@ -260,24 +114,24 @@ fn paint_row(bounds: Bounds<Pixels>, d: &RowDraw, window: &mut Window, theme: &T
         let lx = x(l.lane) - STROKE / 2.0;
         window.paint_quad(fill(
             Bounds::from_corners(point(px(lx), px(y0)), point(px(lx + STROKE), px(y1))),
-            color(theme, l.lane, l.hue),
+            color(theme, overflowed(d, l.lane), l.hue),
         ));
     }
 
     for c in &d.curves {
-        // Either end past the cap makes the whole thing overflow — otherwise
-        // the half anchored on a visible lane comes out in the branch's colour
-        // and the half in the collapsed column comes out grey, and one curve
-        // changes colour halfway across the gutter.
-        let side = c.lane.max(c.partner);
-        half_s(window, x(c.lane), x(c.partner), mid, c.down, color(theme, side, c.hue));
+        // Either end in the collapsed column makes the whole thing overflow —
+        // otherwise the half anchored on a visible lane comes out in the
+        // branch's colour and the half in the collapsed column comes out grey,
+        // and one curve changes colour halfway across the gutter.
+        let over = overflowed(d, c.lane.max(c.partner));
+        half_s(window, x(c.lane), x(c.partner), mid, c.down, color(theme, over, c.hue));
     }
 
     // The node last: it is opaque, so it punches through whatever runs under
     // it and the lines read as passing behind. GPUI orders overlapping
     // primitives by insertion, so this is enough — no z-index needed.
-    let r = if d.is_merge { MERGE_R } else { DOT_R };
-    dot(window, x(d.lane), mid, r, color(theme, d.lane, d.hue), theme.chrome.bg);
+    let r = if d.merge { MERGE_R } else { DOT_R };
+    dot(window, x(d.lane), mid, r, color(theme, overflowed(d, d.lane), d.hue), theme.chrome.bg);
 }
 
 /// One row's half of an S, from the dot line at `(x, y)` out through the row
@@ -327,111 +181,3 @@ fn dot(window: &mut Window, x: f32, y: f32, r: f32, color: Rgba, bg: plait_core:
         BorderStyle::Solid,
     ));
 }
-
-#[cfg(test)]
-mod tests {
-    // Deliberately not `use super::*`: that pulls in gpui's glob, whose own
-    // `test` attribute shadows the built-in one and blows the macro recursion
-    // limit. Name what we need instead.
-    use super::{row_draws, Curve, RowDraw};
-    use plait_core::Commit;
-
-    fn commit(sha: &str, parents: &[&str]) -> Commit {
-        Commit {
-            sha: sha.into(),
-            short: sha.into(),
-            parents: parents.iter().map(|p| p.to_string()).collect(),
-            author: "Ada".into(),
-            timestamp: 0,
-            subject: sha.into(),
-        }
-    }
-
-    fn draws(cs: &[Commit]) -> Vec<RowDraw> {
-        row_draws(cs, &plait_core::assign_lanes(cs))
-    }
-
-    /// The two halves of every curve live in different rows, so the pair of
-    /// lanes they aim at has to agree — otherwise they cross the boundary at
-    /// different x and the branch visibly tears in half.
-    fn halves_meet(ds: &[RowDraw]) {
-        for (i, d) in ds.iter().enumerate() {
-            for c in &d.curves {
-                let (row, want_down) = if c.down { (i + 1, false) } else { (i.wrapping_sub(1), true) };
-                let Some(other) = ds.get(row) else { continue };
-                let pair = |c: &Curve| {
-                    let (a, b) = (c.lane.min(c.partner), c.lane.max(c.partner));
-                    (a, b, c.hue)
-                };
-                assert!(
-                    other.curves.iter().any(|o| o.down == want_down && pair(o) == pair(c)),
-                    "row {i} curve {:?} has no other half in row {row}: {:?}",
-                    pair(c),
-                    other.curves.iter().map(pair).collect::<Vec<_>>(),
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn a_branch_and_its_merge_are_one_unbroken_curve() {
-        //   a (merge of b, c)   fork out of a's dot, arriving on c's lane
-        //   |\
-        //   b c
-        //   |/
-        //   d                   and collapsing back into d's dot
-        let cs = [
-            commit("a", &["b", "c"]),
-            commit("b", &["d"]),
-            commit("c", &["d"]),
-            commit("d", &[]),
-        ];
-        halves_meet(&draws(&cs));
-    }
-
-    #[test]
-    fn a_branch_that_lasts_one_row_is_still_one_unbroken_curve() {
-        // c is both a's second parent and b's only parent, so its lane is born
-        // and dies without ever getting a column of its own.
-        let cs = [
-            commit("a", &["b", "c"]),
-            commit("b", &["c"]),
-            commit("c", &["d"]),
-            commit("d", &[]),
-        ];
-        halves_meet(&draws(&cs));
-    }
-
-    #[test]
-    fn history_stops_where_it_stops() {
-        let cs = [commit("a", &["b"]), commit("b", &[])];
-        let ds = draws(&cs);
-        assert!(!ds[0].lines[0].up, "nothing exists above the newest commit");
-        assert!(ds[0].lines[0].down);
-        assert!(!ds[1].lines[0].down, "a root's lane ends at its dot");
-    }
-
-    #[test]
-    fn consecutive_branches_in_one_lane_get_different_colours() {
-        //   a (merge of b, c) ... e (merge of f, g): two branches, both of
-        //   which live in lane 1, one after the other.
-        let cs = [
-            commit("a", &["b", "c"]),
-            commit("b", &["e"]),
-            commit("c", &["e"]),
-            commit("e", &["f", "g"]),
-            commit("f", &["h"]),
-            commit("g", &["h"]),
-            commit("h", &[]),
-        ];
-        let ds = draws(&cs);
-        let hue = |row: usize| ds[row].hue;
-        assert_eq!(ds[2].lane, 1);
-        assert_eq!(ds[5].lane, 1);
-        assert_ne!(hue(2), hue(5), "lane 1 recycled, colour must not be");
-        assert_eq!(hue(0), hue(3), "the trunk keeps its colour throughout");
-    }
-}
-
-
-
