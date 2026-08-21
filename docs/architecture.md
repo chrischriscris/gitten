@@ -64,6 +64,7 @@ GPUI. Drawing and input, and as little else as possible.
 | `views/commits.rs` | the commit list, author initials, row layout |
 | `graph.rs` | lane geometry and painting: quads, paths, one canvas per row |
 | `config.rs` | `plait.toml`: parse, apply, watch, and the live `Host` global |
+| `session.rs` | the row you were on, so `./dev.sh` can put you back after a restart |
 | `stats.rs` | the counting allocator and the `PLAIT_STATS` overlay |
 
 ## Which way data moves
@@ -107,9 +108,17 @@ Listed so nobody reads an intention as a description:
 - **`cli/`.** Referenced throughout as the second door. `paint.rs` currently
   stands in for it as the proof that the boundary holds.
 - **Command dispatch and the mode stack.** `Host` is where they belong.
-- **Code hot reload.** The config file reloads *data* live. Changing code is still
-  a 3–5 second rebuild and a relaunch; a dylib swap was considered and judged not
-  worth the fight against GPUI entity and global identity across the boundary.
+- **Code hot reload.** The config file reloads *data* live, and `./dev.sh` removes
+  everything either side of a code rebuild — but the rebuild itself remains, 3–5 s.
+  A dylib swap was investigated and rejected, and the reasons are specific enough
+  to be worth keeping: GPUI holds a thread-local element arena
+  (`window.rs:321`, a raw pointer, so a second copy allocates into nothing), a
+  process-wide entity id counter (`entity_map.rs:672`), and forty uses of
+  `TypeId::of` for global and entity lookup. A dylib that statically links its own
+  gpui forks all three. The fix is making gpui a real `dylib` and building with
+  `-C prefer-dynamic` the way Bevy does — possible, multi-day, and broken by every
+  gpui update. Dioxus's `subsecond` hot-*patches* the binary instead and sidesteps
+  the ABI problem entirely; that is the direction to watch.
 - **Extension loading.** Every seam takes an implementation today; nothing loads
   one from outside the binary yet. See [extending.md](extending.md).
 - **Writes.** No commit, push, stage or rebase. Reads only.

@@ -62,6 +62,8 @@ Cache diffs by blob OID. They never change.
 ## Building
 
     ./check.sh                          # everything headless: tests + every fixture
+    ./dev.sh diff . HEAD~2..HEAD        # rebuild + relaunch on every save,
+                                        # landing back on the same row
     cargo test -p plait-core            # just correctness, sub-second
     cargo build --release -p plait-shell
     ./target/release/plait-shell commits [REPO] [LIMIT]
@@ -73,6 +75,10 @@ The overlay forces a redraw every frame so the fps number means something —
 GPUI is reactive and draws nothing at rest, so an honest idle reading would be
 zero. It measures how fast we *can* redraw, not what the app costs sitting still.
 Never read those numbers off a debug build.
+
+Colour and font live in `plait.toml` and reload on the next frame — no rebuild.
+`plait config > plait.toml` writes a complete one. Code still costs a rebuild;
+`./dev.sh` is what removes the quitting and retyping around it.
 
 **Never launch the app unless asked.** Build it, test it, bench it — but a window
 appearing unannounced interrupts whoever is at the keyboard. Say it's ready and

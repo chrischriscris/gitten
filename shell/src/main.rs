@@ -1,5 +1,6 @@
 mod config;
 mod graph;
+mod session;
 mod stats;
 mod views;
 
@@ -34,6 +35,9 @@ plait — a git client
   plait.toml next to the binary (or $PLAIT_CONFIG) is re-read every time it is
   saved, and colours and font apply on the next frame — no rebuild, no relaunch.
   Start one with:  plait config > plait.toml
+
+  ./dev.sh <args>  rebuild and relaunch on every source change, landing back
+                   on the row you were reading
 
   PLAIT_STATS=1   frame, row and heap overlay
 ";
@@ -132,6 +136,16 @@ fn main() {
         None => Source::Repo(PathBuf::from("."), args.get(2).cloned().unwrap_or_default()),
     };
 
+    // Names this exact view, so a saved scroll position is only ever restored
+    // into the diff it was taken in — see `session.rs`.
+    let session_key = match &source {
+        Source::Repo(repo, revspec) => {
+            session::Session::key(&which, &repo.to_string_lossy(), revspec)
+        }
+        Source::Fixtures => session::Session::key(&which, "--fixtures", ""),
+    };
+    let session_path = session::path();
+
     // Acquire before opening a window: a git error should print and exit, not
     // flash an empty window and leave you guessing.
     let loaded = load(&which, &source);
@@ -221,21 +235,67 @@ fn main() {
 
         cx.spawn(async move |cx| {
             cx.open_window(WindowOptions::default(), move |window, cx| {
-                let (view, rendered, total, load): (AnyView, Rc<Cell<usize>>, usize, String) =
-                    match data {
-                        Data::Commits(commits) => {
-                            let h = host.clone();
-                            let e = cx.new(|_| views::commits::Commits::new(commits, h));
-                            let v = e.read(cx);
-                            (e.clone().into(), v.rendered.clone(), v.total(), v.load.clone())
+                // Where the last run of this exact command left off. Restored
+                // before the first frame so you never see row 0 flash past.
+                let resume = session::restore(&session_key, &session_path);
+                let (view, rendered, top, total, load): (
+                    AnyView,
+                    Rc<Cell<usize>>,
+                    Rc<Cell<usize>>,
+                    usize,
+                    String,
+                ) = match data {
+                    Data::Commits(commits) => {
+                        let h = host.clone();
+                        let e = cx.new(|_| views::commits::Commits::new(commits, h));
+                        let v = e.read(cx);
+                        if let Some(r) = &resume {
+                            v.scroll_to(r.top);
                         }
-                        Data::Diff(files) => {
-                            let h = host.clone();
-                            let e = cx.new(|_| views::diff::Diff::new(files, h));
-                            let v = e.read(cx);
-                            (e.clone().into(), v.rendered.clone(), v.total(), v.load.clone())
+                        (
+                            e.clone().into(),
+                            v.rendered.clone(),
+                            v.top.clone(),
+                            v.total(),
+                            v.load.clone(),
+                        )
+                    }
+                    Data::Diff(files) => {
+                        let h = host.clone();
+                        let e = cx.new(|_| views::diff::Diff::new(files, h));
+                        let v = e.read(cx);
+                        if let Some(r) = &resume {
+                            v.scroll_to(r.top);
                         }
-                    };
+                        (
+                            e.clone().into(),
+                            v.rendered.clone(),
+                            v.top.clone(),
+                            v.total(),
+                            v.load.clone(),
+                        )
+                    }
+                };
+
+                // Persist as you scroll, so any kind of death keeps the position:
+                // `dev.sh` kills the process, and nothing runs on the way out.
+                // Only on change, so an idle window writes nothing at all.
+                {
+                    let (key, path) = (session_key.clone(), session_path.clone());
+                    let start = resume.map(|r| r.top).unwrap_or(0);
+                    cx.spawn(async move |cx: &mut AsyncApp| {
+                        let mut last = start;
+                        loop {
+                            cx.background_executor().timer(Duration::from_millis(400)).await;
+                            let now = top.get();
+                            if now != last {
+                                last = now;
+                                session::save(&session::Session { key: key.clone(), top: now }, &path);
+                            }
+                        }
+                    })
+                    .detach();
+                }
                 let stats = stats::enabled().then(|| Stats::new(rendered, total, load));
                 let shell = cx.new(|_| DevShell { title, view, stats, host });
                 cx.new(|cx| Root::new(shell, window, cx))

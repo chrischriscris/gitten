@@ -90,12 +90,27 @@ pub struct Diff {
     widest: usize,
     scroll: UniformListScrollHandle,
     pub rendered: Rc<Cell<usize>>,
+    /// First visible row, written on every batch the list asks for. Read by the
+    /// session so a restart can put you back on it — see `session.rs`.
+    pub top: Rc<Cell<usize>>,
     pub load: String,
 }
 
 impl Diff {
     pub fn total(&self) -> usize {
         self.order.len()
+    }
+
+    /// Puts a saved row back at the top of the viewport.
+    ///
+    /// Clamped rather than validated: the diff may be shorter than it was when
+    /// the position was taken — a rebuild is usually a code change, but nothing
+    /// stops the working tree having moved too.
+    pub fn scroll_to(&self, row: usize) {
+        if self.order.is_empty() {
+            return;
+        }
+        self.scroll.scroll_to_item(row.min(self.order.len() - 1), ScrollStrategy::Top);
     }
 
     /// The shipped set: the built-in text presentation, plus the rendered
@@ -176,6 +191,7 @@ impl Diff {
             widest,
             scroll: UniformListScrollHandle::new(),
             rendered: Rc::new(Cell::new(0)),
+            top: Rc::new(Cell::new(0)),
             load,
         }
     }
@@ -186,12 +202,14 @@ impl Render for Diff {
         let renderers = self.renderers.clone();
         let order = self.order.clone();
         let rendered = self.rendered.clone();
+        let top = self.top.clone();
 
         // The host is read here, per batch, rather than cloned in once when the
         // view was built. That is the whole of what makes a saved config file
         // appear on the next frame instead of the next launch.
         let list = uniform_list("diff", order.len(), move |range, _, cx| {
             rendered.set(range.len());
+            top.set(range.start);
             let host = crate::config::host(cx);
             range
                 .map(|i| {

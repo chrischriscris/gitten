@@ -29,10 +29,21 @@ pub struct Commits {
     /// Instrumentation the view owns and anyone may read. The view does not
     /// know the stats overlay exists.
     pub rendered: Rc<Cell<usize>>,
+    /// First visible row, for the session — see the note in the diff view.
+    pub top: Rc<Cell<usize>>,
     pub load: String,
 }
 
 impl Commits {
+    /// Puts a saved row back at the top of the viewport. Clamped — see the diff
+    /// view's note.
+    pub fn scroll_to(&self, row: usize) {
+        if self.data.commits.is_empty() {
+            return;
+        }
+        self.scroll.scroll_to_item(row.min(self.data.commits.len() - 1), ScrollStrategy::Top);
+    }
+
     pub fn total(&self) -> usize {
         self.data.commits.len()
     }
@@ -86,6 +97,7 @@ impl Commits {
             data: Rc::new(Data { commits, draws, who, widest }),
             scroll: UniformListScrollHandle::new(),
             rendered: Rc::new(Cell::new(0)),
+            top: Rc::new(Cell::new(0)),
             load,
         }
     }
@@ -95,10 +107,12 @@ impl Render for Commits {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let data = self.data.clone();
         let rendered = self.rendered.clone();
+        let top = self.top.clone();
         // Read per batch, not captured at construction — see the note in the
         // diff view: this is what makes a saved config apply on the next frame.
         let list = uniform_list("commits", data.commits.len(), move |range, _, cx| {
             rendered.set(range.len());
+            top.set(range.start);
             let host = crate::config::host(cx);
             range
                 .map(|i| row(&data.commits[i], &data.who[i], &data.draws[i], &host))
