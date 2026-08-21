@@ -1,0 +1,811 @@
+//! The diff view: a viewport over the order table, and the state a keyboard
+//! moves.
+//!
+//! This is `shell/src/views/diff.rs`'s `Diff` with GPUI taken out, and it turns
+//! out to be much smaller — because `uniform_list` is replaced by a `for` over
+//! the visible rows, and because the pipeline it used to drive now lives in
+//! [`plait_core::rows`].
+//!
+//! # No events in here
+//!
+//! Every method is a *command*: [`Diff::down`], [`Diff::page`],
+//! [`Diff::next_file`], [`Diff::cycle_layout`]. Nothing in this file knows what
+//! a keypress is, and the keymap is not here — because command dispatch and the
+//! mode stack belong on `Host` and are not built yet, and a keymap written here
+//! would be one `cli/` would have to duplicate. When dispatch lands these are
+//! what it binds to.
+//!
+//! # Two positions, and why the cursor is the anchor
+//!
+//! [`Diff::cursor`] is the row the keyboard is on; [`Diff::top`] is the first
+//! row drawn. The cursor moves and the viewport follows it, never the other way
+//! round — which is the lazygit model, and which also gives a reflow something
+//! honest to keep still: the *line you are on* still exists at a different
+//! width, so it is what a resize is anchored to. Anchoring the top row instead
+//! keeps a position you were not looking at.
+//!
+//! # What a resize costs
+//!
+//! A rescan of the text and a new order table, and nothing above them: no clip,
+//! no intraline pass, no highlighting. On the 714k-line fixture the shell
+//! measures that at 26 ms against 241 ms for a full `prepare`, which is why a
+//! width change re-expands and a *layout* change rebuilds.
+
+use crate::rows::{assemble, Frame, Layouts, Rows};
+use crate::screen::{Ink, Screen};
+use plait_core::host::Host;
+use plait_core::rows::{expand, RowRef};
+use plait_core::runs::Run;
+use plait_core::FileDiff;
+use std::time::Duration;
+
+/// How many rows of context to keep between the cursor and the edge when
+/// scrolling.
+///
+/// Three, because a cursor pinned to the last row of the screen gives you no
+/// idea what you are scrolling into — the same reason `scrolloff` exists in
+/// every editor. Not configurable yet, and it is exactly the kind of number that
+/// belongs in `plait.toml` when the terminal frontend reads one.
+const SCROLLOFF: usize = 3;
+
+pub struct Diff {
+    /// The parsed diff, kept so a layout change can rebuild the rows.
+    ///
+    /// The memory cost of a live toggle, and a real one: on the 714k-line
+    /// fixture it is a second copy of every line. The alternatives are worse —
+    /// cloning the *prepared* diff pays the same memory plus the clone at load
+    /// whether or not anybody presses the key, and re-acquiring means the view
+    /// needs a repository, which it does not have and should not.
+    files: Vec<FileDiff>,
+    layouts: Layouts,
+    current: usize,
+    /// Which entry of `host.wrap` is in use.
+    ///
+    /// The view's own pick, not the host's: `Host` is rebuilt from defaults
+    /// whenever a config file is reloaded, so a field on it would be reset by an
+    /// unrelated edit. What the file says is what this *opens* on.
+    wrap: usize,
+    owners: Vec<Box<dyn Rows>>,
+    /// One entry per visual row. Re-expanded on a resize and on a wrap change,
+    /// rebuilt from scratch on a layout change.
+    order: Vec<RowRef>,
+    /// Index into `order` of the widest row, which is what a horizontal scroll
+    /// is bounded by.
+    widest: usize,
+    /// Where each file's header landed in `order`, ascending.
+    ///
+    /// Cached because it moves only when the order table does, and finding it on
+    /// demand is a scan of `order` per file: 5,953 files against a million rows
+    /// is six billion comparisons for a keypress. One scan per reflow instead.
+    headers: Vec<usize>,
+    /// The width and wrap the rows were last expanded for. A resize that does
+    /// not cross a column boundary compares equal here and stops.
+    applied: (usize, &'static str),
+    cols: usize,
+    height: usize,
+    top: usize,
+    cursor: usize,
+    /// Columns of text scrolled off the left edge. Only reachable with wrapping
+    /// off, because with it on there is nothing off the edge to reach.
+    shift: usize,
+    intraline: Duration,
+    syntax: Duration,
+    file_count: usize,
+}
+
+impl Diff {
+    pub fn new(files: Vec<FileDiff>, host: &Host) -> Self {
+        Self::with_layouts(files, host, Layouts::builtin())
+    }
+
+    /// The constructor an extension uses: its own registry, with the built-ins
+    /// still in it unless it replaced them by name.
+    pub fn with_layouts(files: Vec<FileDiff>, host: &Host, layouts: Layouts) -> Self {
+        // Reported here and not by a config layer, because this is the layer
+        // that holds the registry: `core` cannot see a `Rows` implementation and
+        // an extension may have registered a name nothing else has heard of.
+        // Falling back rather than failing — a typo must not leave you with no
+        // diff.
+        let current = match layouts.position(&host.layout) {
+            Some(i) => i,
+            None => {
+                eprintln!(
+                    "plait: unknown diff.layout {:?}; registered: {}",
+                    host.layout,
+                    layouts.names().join(", ")
+                );
+                0
+            }
+        };
+        let mut view = Self {
+            files,
+            layouts,
+            current,
+            wrap: host.wrap.selected_index(),
+            owners: Vec::new(),
+            order: Vec::new(),
+            widest: 0,
+            headers: Vec::new(),
+            applied: (usize::MAX, ""),
+            cols: 0,
+            height: 0,
+            top: 0,
+            cursor: 0,
+            shift: 0,
+            intraline: Duration::ZERO,
+            syntax: Duration::ZERO,
+            file_count: 0,
+        };
+        view.rebuild(host, 0.0);
+        view
+    }
+
+    /// Rebuilds the rows from the parsed diff, keeping your place proportionally.
+    ///
+    /// Proportionally and not by row, because a layout change has no row
+    /// correspondence to keep: side-by-side puts a removal and its replacement
+    /// on one row, so row 900 of one presentation is not row 900 of the other.
+    /// A reflow *does* have that correspondence, which is why it anchors on the
+    /// cursor's logical row instead.
+    fn rebuild(&mut self, host: &Host, at: f32) {
+        self.owners = self.layouts.build(self.current, host);
+        let built = assemble(&self.files, host, &mut self.owners);
+        self.order = built.ordered.order;
+        self.widest = built.ordered.widest;
+        self.index_headers();
+        self.file_count = built.files;
+        self.intraline = built.intraline;
+        self.syntax = built.syntax;
+        // The width has to be re-applied: the presentations are new objects and
+        // have never been told how wide they are.
+        self.applied = (usize::MAX, "");
+        self.cursor = ((self.order.len() as f32 * at) as usize).min(self.rows().saturating_sub(1));
+        self.reflow(host);
+        self.follow();
+    }
+
+    // ------------------------------------------------------------------ layout
+
+    /// A new size, in columns and rows. Call it before [`Diff::paint`] on any
+    /// frame the terminal may have changed size on; it is two comparisons when
+    /// nothing did.
+    pub fn resize(&mut self, cols: usize, height: usize, host: &Host) {
+        self.cols = cols;
+        self.height = height;
+        self.reflow(host);
+        self.follow();
+    }
+
+    /// Re-expands the rows for the current width and wrap, keeping the line the
+    /// cursor is on.
+    ///
+    /// Three ways out before any work, in increasing cost: nothing moved,
+    /// nothing *can* move because the wrap never breaks, and no presentation's
+    /// row count actually changed.
+    fn reflow(&mut self, host: &Host) {
+        let wrap = host.wrap.at(self.wrap);
+        if (self.cols, wrap.name()) == self.applied || self.cols == 0 {
+            return;
+        }
+        let same_wrap = self.applied.1 == wrap.name();
+        self.applied = (self.cols, wrap.name());
+        // A wrap that never breaks has no width to be wrong about. Without this,
+        // every column of a drag rescans the whole diff to be told nothing moved.
+        if !wrap.breaks_lines() && same_wrap {
+            return;
+        }
+
+        let cols = self.cols;
+        let changed = self
+            .owners
+            .iter_mut()
+            .fold(false, |acc, o| o.reflow(cols, host, wrap) | acc);
+        if !changed {
+            return;
+        }
+        let anchor = self.order.get(self.cursor).copied();
+        let built = expand(&self.order, &self.owners, anchor);
+        self.order = built.order;
+        self.widest = built.widest;
+        self.index_headers();
+        self.cursor = built.anchor.min(self.rows().saturating_sub(1));
+        // A wrapped diff has nothing off the left edge to reach.
+        if wrap.breaks_lines() {
+            self.shift = 0;
+        }
+    }
+
+    /// One pass over the order table, marking the rows that are file headers.
+    ///
+    /// A binary search per row against that owner's own header list, which is
+    /// sorted because [`plait_core::rows::assemble`] builds it in file order.
+    /// Only the first visual row of a logical one can be a header, so a wrapped
+    /// diff costs no more than an unwrapped one.
+    fn index_headers(&mut self) {
+        let per_owner: Vec<Vec<u32>> = self
+            .owners
+            .iter()
+            .map(|o| o.files().iter().map(|f| f.row as u32).collect())
+            .collect();
+        self.headers.clear();
+        for (at, r) in self.order.iter().enumerate() {
+            if r.seg != 0 {
+                continue;
+            }
+            let Some(rows) = per_owner.get(r.owner as usize) else { continue };
+            if rows.binary_search(&r.index).is_ok() {
+                self.headers.push(at);
+            }
+        }
+    }
+
+    // ----------------------------------------------------------------- commands
+
+    pub fn rows(&self) -> usize {
+        self.order.len()
+    }
+
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    pub fn top(&self) -> usize {
+        self.top
+    }
+
+    pub fn shift(&self) -> usize {
+        self.shift
+    }
+
+    /// Moves the cursor `by` rows, clamping at both ends.
+    ///
+    /// Signed, so one method is `j`, `k`, `Ctrl-D` and `Ctrl-U`. Clamping rather
+    /// than wrapping: a list that jumps from the last row to the first loses
+    /// your place by the whole diff.
+    pub fn move_by(&mut self, by: isize) {
+        let last = self.rows().saturating_sub(1);
+        self.cursor = match by.is_negative() {
+            true => self.cursor.saturating_sub(by.unsigned_abs()),
+            false => (self.cursor + by as usize).min(last),
+        };
+        self.follow();
+    }
+
+    pub fn down(&mut self) {
+        self.move_by(1);
+    }
+
+    pub fn up(&mut self) {
+        self.move_by(-1);
+    }
+
+    /// A screenful, less one row of overlap so the eye has something to land on.
+    pub fn page(&mut self, pages: isize) {
+        let step = self.height.saturating_sub(1).max(1) as isize;
+        self.move_by(pages * step);
+    }
+
+    pub fn to_top(&mut self) {
+        self.cursor = 0;
+        self.follow();
+    }
+
+    pub fn to_bottom(&mut self) {
+        self.cursor = self.rows().saturating_sub(1);
+        self.follow();
+    }
+
+    /// Moves the cursor to the header of the next or previous file.
+    ///
+    /// The jump list is [`plait_core::rows::Present::files`], so a presentation
+    /// that is not file-shaped offers no jumps rather than wrong ones — and this
+    /// works for a presentation registered by an extension without it doing
+    /// anything but hold a [`plait_core::rows::Flat`].
+    pub fn jump_file(&mut self, by: isize) {
+        // Binary search rather than a scan: a 5,953-file diff is a realistic
+        // input and this is a keypress.
+        let target = match by.is_negative() {
+            true => self
+                .headers
+                .partition_point(|&h| h < self.cursor)
+                .checked_sub(1)
+                .and_then(|i| self.headers.get(i))
+                .copied(),
+            false => {
+                self.headers.get(self.headers.partition_point(|&h| h <= self.cursor)).copied()
+            }
+        };
+        if let Some(t) = target {
+            self.cursor = t;
+            self.follow();
+        }
+    }
+
+    /// Where every file header is, in visual rows. What a sidebar or a jump
+    /// picker lists.
+    pub fn headers(&self) -> &[usize] {
+        &self.headers
+    }
+
+    /// Scrolls sideways. A no-op with wrapping on, where nothing is off the edge.
+    pub fn scroll_x(&mut self, by: isize) {
+        let bound = self.order.get(self.widest).map_or(0, |r| {
+            self.owners[r.owner as usize].width(r.index as usize, r.seg as usize)
+        });
+        self.shift = match by.is_negative() {
+            true => self.shift.saturating_sub(by.unsigned_abs()),
+            false => (self.shift + by as usize).min(bound),
+        };
+    }
+
+    /// Keeps the cursor on screen, with [`SCROLLOFF`] rows of lead where there
+    /// is room for it.
+    fn follow(&mut self) {
+        if self.height == 0 {
+            self.top = self.cursor;
+            return;
+        }
+        // Half a screen or less: the margin would pin the cursor to the middle
+        // and make every keypress scroll, so it is dropped rather than scaled.
+        let pad = match self.height > 2 * SCROLLOFF + 1 {
+            true => SCROLLOFF,
+            false => 0,
+        };
+        let last = self.rows().saturating_sub(1);
+        self.top = self.top.min(last);
+        if self.cursor < self.top + pad {
+            self.top = self.cursor.saturating_sub(pad);
+        }
+        let bottom = self.top + self.height.saturating_sub(1);
+        if self.cursor + pad > bottom {
+            self.top = (self.cursor + pad + 1).saturating_sub(self.height);
+        }
+        // Never scrolled past the end: a screen of blank rows below a short diff
+        // is a scroll position that says nothing.
+        let max_top = self.rows().saturating_sub(self.height);
+        self.top = self.top.min(max_top);
+    }
+
+    // ------------------------------------------------------------- the registries
+
+    pub fn layout_names(&self) -> Vec<&'static str> {
+        self.layouts.names()
+    }
+
+    pub fn layout_index(&self) -> usize {
+        self.current
+    }
+
+    pub fn layout_name(&self) -> &'static str {
+        self.layouts.name(self.current)
+    }
+
+    /// Loads a layout by index. Out of range is ignored rather than clamped: a
+    /// stale index means a menu moved, and redrawing the diff the way it is
+    /// already drawn surprises nobody.
+    pub fn set_layout(&mut self, index: usize, host: &Host) {
+        if index >= self.layouts.len() || index == self.current {
+            return;
+        }
+        let at = self.progress();
+        self.current = index;
+        self.rebuild(host, at);
+    }
+
+    pub fn cycle_layout(&mut self, host: &Host) {
+        if self.layouts.len() < 2 {
+            return;
+        }
+        self.set_layout((self.current + 1) % self.layouts.len(), host);
+    }
+
+    pub fn wrap_names(&self, host: &Host) -> Vec<&'static str> {
+        host.wrap.names()
+    }
+
+    pub fn wrap_index(&self) -> usize {
+        self.wrap
+    }
+
+    pub fn set_wrap(&mut self, index: usize, host: &Host) {
+        if index >= host.wrap.len() || index == self.wrap {
+            return;
+        }
+        self.wrap = index;
+        self.reflow(host);
+        self.follow();
+    }
+
+    /// Moves to the next wrap.
+    ///
+    /// Unlike a layout change this rebuilds nothing above the break table: the
+    /// lines, their tokens and their spans are the same objects, and only where
+    /// they break moves. That is why it is a keystroke and the algorithm is a
+    /// menu.
+    pub fn cycle_wrap(&mut self, host: &Host) {
+        if host.wrap.len() < 2 {
+            return;
+        }
+        self.set_wrap((self.wrap + 1) % host.wrap.len(), host);
+    }
+
+    fn progress(&self) -> f32 {
+        match self.order.is_empty() {
+            true => 0.0,
+            false => self.cursor as f32 / self.order.len() as f32,
+        }
+    }
+
+    // ------------------------------------------------------------------ drawing
+
+    /// Draws the visible rows into `screen`, starting at row `y`.
+    ///
+    /// Only the visible rows are ever built or measured, which is what
+    /// `uniform_list` does for the window and what a `for` over a range does
+    /// here. `out` is the run-list scratch buffer, owned by the caller across
+    /// frames so that drawing a row allocates nothing.
+    pub fn paint(&self, screen: &mut Screen, y: usize, host: &Host, out: &mut Vec<Run>) {
+        let blank = Ink::new(host.theme.chrome.dim, host.theme.chrome.bg);
+        for i in 0..self.height {
+            let row = y + i;
+            match self.order.get(self.top + i) {
+                Some(r) => {
+                    let at = Frame {
+                        host,
+                        shift: self.shift,
+                        current: self.top + i == self.cursor,
+                    };
+                    let mut pen = screen.row(row);
+                    self.owners[r.owner as usize]
+                        .render(r.index as usize, r.seg as usize, &at, &mut pen, out);
+                }
+                // Past the end of a diff shorter than the screen. Washed in the
+                // chrome's background rather than left as whatever the last
+                // frame drew there.
+                None => screen.row(row).wash(blank),
+            }
+        }
+    }
+
+    /// One line describing what is on screen, for whatever draws a status bar.
+    ///
+    /// Assembled here because every number in it belongs to this view, and
+    /// because a frontend asking six accessors and formatting them is six
+    /// chances to describe a different frame than the one that was drawn.
+    pub fn status(&self, host: &Host) -> String {
+        let mut out = format!(
+            "{}/{} · {} files · {} · {}",
+            (self.cursor + 1).min(self.rows()),
+            self.rows(),
+            self.file_count,
+            self.layout_name(),
+            host.wrap.at(self.wrap).name(),
+        );
+        if self.shift > 0 {
+            out.push_str(&format!(" · +{}c", self.shift));
+        }
+        for report in self.owners.iter().map(|o| o.report()).filter(|r| !r.is_empty()) {
+            out.push_str(" · ");
+            out.push_str(&report);
+        }
+        out
+    }
+
+    /// What the two expensive passes cost, for a stats line. Measured once at
+    /// load by `core`, not timed again here.
+    pub fn timings(&self) -> (Duration, Duration) {
+        (self.intraline, self.syntax)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rows::TextRows;
+    use plait_core::parse_unified_diff;
+    use plait_core::prepared::File;
+    use plait_core::rows::Present;
+
+    fn diff(lines: usize) -> Vec<FileDiff> {
+        let mut raw = String::from("diff --git a/a.rs b/a.rs\n@@ -1,1 +1,1 @@\n");
+        for i in 0..lines {
+            raw.push_str(&format!(" line {i}\n"));
+        }
+        parse_unified_diff(&raw)
+    }
+
+    fn two_files() -> Vec<FileDiff> {
+        let mut raw = String::new();
+        for name in ["a.rs", "b.rs", "c.rs"] {
+            raw.push_str(&format!(
+                "diff --git a/{name} b/{name}\n@@ -1,2 +1,2 @@\n-one\n+two\n"
+            ));
+        }
+        parse_unified_diff(&raw)
+    }
+
+    fn view(files: Vec<FileDiff>, cols: usize, height: usize) -> (Diff, Host) {
+        let host = Host::new();
+        let mut d = Diff::new(files, &host);
+        d.resize(cols, height, &host);
+        (d, host)
+    }
+
+    #[test]
+    fn the_cursor_clamps_rather_than_wrapping_at_both_ends() {
+        let (mut d, _) = view(diff(10), 60, 6);
+        d.up();
+        assert_eq!(d.cursor(), 0);
+        d.move_by(9999);
+        assert_eq!(d.cursor(), d.rows() - 1);
+    }
+
+    #[test]
+    fn the_viewport_follows_the_cursor_and_keeps_a_margin() {
+        let (mut d, _) = view(diff(40), 60, 12);
+        assert_eq!(d.top(), 0);
+        // Down to just inside the margin: nothing has scrolled yet.
+        d.move_by(8);
+        assert_eq!(d.top(), 0);
+        d.down();
+        assert_eq!(d.top(), 1, "the margin did not push the viewport");
+        d.to_bottom();
+        assert_eq!(d.top(), d.rows() - 12, "scrolled past the end");
+    }
+
+    #[test]
+    fn a_screen_too_short_for_a_margin_drops_it_rather_than_pinning_the_cursor() {
+        let (mut d, _) = view(diff(40), 60, 4);
+        d.down();
+        assert_eq!(d.top(), 0);
+        d.move_by(2);
+        assert_eq!(d.cursor(), 3);
+        assert_eq!(d.top(), 0, "a four-row screen scrolled on the first keypress");
+    }
+
+    #[test]
+    fn a_diff_shorter_than_the_screen_never_scrolls() {
+        let (mut d, _) = view(diff(3), 60, 40);
+        d.to_bottom();
+        assert_eq!(d.top(), 0);
+    }
+
+    #[test]
+    fn a_page_keeps_one_row_of_overlap() {
+        let (mut d, _) = view(diff(100), 60, 20);
+        d.page(1);
+        assert_eq!(d.cursor(), 19);
+        d.page(-1);
+        assert_eq!(d.cursor(), 0);
+    }
+
+    #[test]
+    fn a_file_jump_lands_on_a_header_and_stops_at_the_ends() {
+        let (mut d, _) = view(two_files(), 60, 20);
+        assert_eq!(d.cursor(), 0);
+        d.jump_file(1);
+        let second = d.cursor();
+        assert!(second > 0);
+        d.jump_file(1);
+        assert!(d.cursor() > second);
+        let last = d.cursor();
+        d.jump_file(1);
+        assert_eq!(d.cursor(), last, "jumped past the last file");
+        d.jump_file(-1);
+        assert_eq!(d.cursor(), second);
+    }
+
+    #[test]
+    fn a_file_jump_is_a_search_and_not_a_scan_of_the_whole_diff() {
+        // 200 files is not the interesting number; 200 × the row count is. This
+        // is the shape of the input that made the naive version quadratic.
+        let mut raw = String::new();
+        for i in 0..200 {
+            raw.push_str(&format!(
+                "diff --git a/f{i}.rs b/f{i}.rs\n@@ -1,20 +1,20 @@\n{}",
+                (0..20).map(|l| format!(" line {l}\n")).collect::<String>()
+            ));
+        }
+        let (mut d, _) = view(parse_unified_diff(&raw), 60, 20);
+        assert_eq!(d.headers().len(), 200);
+        // Forward through every file, then back through every file.
+        let mut seen = vec![d.cursor()];
+        for _ in 0..199 {
+            d.jump_file(1);
+            seen.push(d.cursor());
+        }
+        assert_eq!(seen, *d.headers(), "a jump landed off a header");
+        d.jump_file(1);
+        assert_eq!(d.cursor(), *d.headers().last().unwrap(), "jumped past the last file");
+        for _ in 0..199 {
+            d.jump_file(-1);
+        }
+        assert_eq!(d.cursor(), 0);
+        d.jump_file(-1);
+        assert_eq!(d.cursor(), 0, "jumped above the first file");
+    }
+
+    #[test]
+    fn a_jump_from_the_middle_of_a_file_goes_to_that_files_header() {
+        let (mut d, _) = view(two_files(), 60, 20);
+        d.jump_file(1);
+        let second = d.cursor();
+        d.move_by(2);
+        d.jump_file(-1);
+        assert_eq!(d.cursor(), second, "landed on the previous file, not this one");
+    }
+
+    #[test]
+    fn a_presentation_with_no_jump_list_offers_no_jumps() {
+        // Defaulted on the trait, so this is what an extension gets for free
+        // rather than a special case in the view.
+        #[derive(Default)]
+        struct Bare(usize);
+        impl Present for Bare {
+            fn claims(&self, _: &str) -> bool {
+                true
+            }
+            fn len(&self) -> usize {
+                self.0
+            }
+            fn build(&mut self, f: File) {
+                self.0 += 1 + f.hunks.iter().map(|h| 1 + h.lines.len()).sum::<usize>();
+            }
+        }
+        impl Rows for Bare {
+            fn render(&self, _: usize, _: usize, _: &Frame, _: &mut crate::screen::Pen, _: &mut Vec<Run>) {}
+        }
+        let host = Host::new();
+        let mut layouts = Layouts::builtin();
+        layouts.register("bare", |_| vec![Box::new(Bare::default())]);
+        let mut d = Diff::with_layouts(two_files(), &host, layouts);
+        d.set_layout(2, &host);
+        d.resize(60, 20, &host);
+        d.jump_file(1);
+        assert_eq!(d.cursor(), 0, "a jump list appeared out of nowhere");
+    }
+
+    #[test]
+    fn a_reflow_keeps_the_line_the_cursor_is_on() {
+        let long = format!(
+            "diff --git a/a.rs b/a.rs\n@@ -1,1 +1,1 @@\n{}",
+            (0..12).map(|i| format!(" line {i} {}\n", "padding ".repeat(6))).collect::<String>()
+        );
+        let (mut d, host) = view(parse_unified_diff(&long), 100, 20);
+        d.move_by(8);
+        let before = d.order[d.cursor()].logical();
+        d.resize(30, 20, &host);
+        assert_eq!(d.order[d.cursor()].logical(), before, "the cursor left its line");
+        assert_eq!(d.order[d.cursor()].seg, 0, "it landed mid-line");
+        assert!(d.rows() > 14, "nothing wrapped at 30 columns");
+    }
+
+    #[test]
+    fn a_resize_that_changes_nothing_costs_nothing() {
+        let (mut d, host) = view(diff(20), 60, 10);
+        let before = d.rows();
+        d.resize(60, 10, &host);
+        assert_eq!(d.rows(), before);
+    }
+
+    #[test]
+    fn switching_layout_keeps_your_place_proportionally() {
+        // A layout change has no row correspondence to keep: side-by-side puts a
+        // removal and its replacement on one row.
+        let (mut d, host) = view(two_files(), 60, 8);
+        d.to_bottom();
+        let before = d.cursor() as f32 / d.rows() as f32;
+        d.cycle_layout(&host);
+        assert_eq!(d.layout_name(), "side-by-side");
+        let after = d.cursor() as f32 / d.rows() as f32;
+        assert!((before - after).abs() < 0.2, "{before} -> {after}");
+        assert!(d.cursor() < d.rows());
+    }
+
+    #[test]
+    fn cycling_the_layout_returns_to_where_it_started() {
+        let (mut d, host) = view(diff(10), 60, 8);
+        let first = d.layout_name();
+        for _ in 0..d.layout_names().len() {
+            d.cycle_layout(&host);
+        }
+        assert_eq!(d.layout_name(), first);
+    }
+
+    #[test]
+    fn cycling_the_wrap_changes_the_row_count_and_off_is_one_of_them() {
+        let long = format!(
+            "diff --git a/a.rs b/a.rs\n@@ -1,1 +1,1 @@\n-{}\n",
+            "word ".repeat(40)
+        );
+        let (mut d, host) = view(parse_unified_diff(&long), 40, 10);
+        let mut seen = Vec::new();
+        for _ in 0..host.wrap.len() {
+            seen.push((host.wrap.at(d.wrap_index()).name(), d.rows()));
+            d.cycle_wrap(&host);
+        }
+        assert!(seen.iter().any(|(n, _)| *n == "off"));
+        let off = seen.iter().find(|(n, _)| *n == "off").unwrap().1;
+        let word = seen.iter().find(|(n, _)| *n == "word").unwrap().1;
+        assert!(word > off, "{seen:?}");
+    }
+
+    #[test]
+    fn a_horizontal_scroll_is_bounded_by_the_widest_row_and_reset_by_wrapping() {
+        let long = "diff --git a/a.rs b/a.rs\n@@ -1,1 +1,1 @@\n-".to_string()
+            + &"x".repeat(200)
+            + "\n";
+        let (mut d, host) = view(parse_unified_diff(&long), 40, 10);
+        d.set_wrap(host.wrap.position("off").unwrap(), &host);
+        d.scroll_x(-5);
+        assert_eq!(d.shift(), 0, "scrolled left of column zero");
+        d.scroll_x(9999);
+        assert_eq!(d.shift(), 200, "the bound was not the widest row");
+        d.set_wrap(host.wrap.position("word").unwrap(), &host);
+        assert_eq!(d.shift(), 0, "a wrapped diff kept a horizontal offset");
+    }
+
+    #[test]
+    fn every_visible_row_is_drawn_and_nothing_below_the_diff_is_stale() {
+        let (mut d, host) = view(diff(4), 40, 10);
+        let mut screen = Screen::new(40, 12);
+        let mut out = Vec::new();
+        screen.clear(Ink::new(0xffffff, 0x000000));
+        // Row 0 is reserved for a title bar the assembly owns; the view starts
+        // at 1 and must not touch the row above it.
+        d.paint(&mut screen, 1, &host, &mut out);
+        assert_eq!(screen.ink(0, 0).unwrap().bg, 0x000000, "the view wrote above its box");
+        assert!(screen.row_text(1).contains("a.rs"));
+        assert!(screen.row_text(4).contains("line 1"));
+        // Past the end of the diff: the chrome's background, not the last frame.
+        assert_eq!(screen.ink(0, 9).unwrap().bg, host.theme.chrome.bg);
+        d.to_bottom();
+    }
+
+    #[test]
+    fn the_status_line_describes_the_frame_that_was_drawn() {
+        let (mut d, host) = view(two_files(), 60, 20);
+        let s = d.status(&host);
+        assert!(s.starts_with("1/"), "{s}");
+        assert!(s.contains("3 files"), "{s}");
+        assert!(s.contains("unified"), "{s}");
+        assert!(s.contains("word"), "{s}");
+        d.cycle_layout(&host);
+        assert!(d.status(&host).contains("split"), "{}", d.status(&host));
+    }
+
+    #[test]
+    fn an_unknown_layout_name_falls_back_and_says_so() {
+        let mut host = Host::new();
+        host.layout = "nonexistent".into();
+        let d = Diff::new(diff(4), &host);
+        assert_eq!(d.layout_index(), 0);
+    }
+
+    #[test]
+    fn an_empty_diff_draws_nothing_and_panics_nowhere() {
+        let (mut d, host) = view(Vec::new(), 40, 6);
+        assert_eq!(d.rows(), 0);
+        d.down();
+        d.page(1);
+        d.to_bottom();
+        d.jump_file(1);
+        assert_eq!(d.cursor(), 0);
+        let mut screen = Screen::new(40, 6);
+        let mut out = Vec::new();
+        d.paint(&mut screen, 0, &host, &mut out);
+        assert_eq!(screen.dump().trim(), "");
+    }
+
+    #[test]
+    fn a_zero_width_terminal_does_not_reflow_into_a_row_per_character() {
+        // A budget floor is what stops this; without it a diff becomes a column
+        // of letters and the row count explodes.
+        let (mut d, host) = view(diff(4), 0, 6);
+        d.resize(0, 6, &host);
+        assert!(d.rows() <= 32, "{} rows at zero columns", d.rows());
+        let mut owners: Vec<Box<dyn Rows>> = vec![Box::new(TextRows::default())];
+        owners[0].reflow(1, &host, host.wrap.current());
+        let _ = &owners;
+    }
+}

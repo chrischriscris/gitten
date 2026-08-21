@@ -1,0 +1,24 @@
+[package]
+name = "plait-tui"
+version = "0.0.0"
+edition = "2021"
+
+# The terminal door. Everything above drawing is `core` and `plait-git`, exactly
+# as it is for the window and the browser; what is here is a cell grid, the
+# presentations that fill it and the escape codes that put it on screen.
+#
+# Two dependencies, and the line between them matters. `crossterm` is what
+# `gpui_platform` is to the shell: raw mode, the alternate screen, and parsing a
+# keypress out of a byte stream — the last of which is a decade of terminal
+# archaeology nobody should retype. It is confined to `term.rs`, so every other
+# module in here is testable with no terminal at all.
+#
+# `unicode-width` is how many columns a character occupies, which a terminal
+# needs and a proportional font does not — `Font::advance` is the window's
+# answer to the same question. Already in the lock file as a gpui dependency, so
+# it costs no download and no fresh compile.
+[dependencies]
+plait-core = { path = "../core" }
+plait-git = { path = "../git" }
+crossterm = "0.29"
+unicode-width = "0.2"

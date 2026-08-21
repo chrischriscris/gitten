@@ -19,6 +19,8 @@ cargo run -q -p plait-core --example verify  --release   # lane invariants
 cargo run -q -p plait-core --example paint   --release   # the diff view, in ANSI
 cargo run -q -p plait-git  --example diffcheck --release [REPO] [REVSPEC]
                                                         # differs, against git's own answer
+COLS=120 ROWS=40 cargo run -q -p plait-tui --example dump --release -- diff --fixtures
+                                                        # a terminal frame, and what it cost
 PLAIT_STATS=1 ./target/release/plait-shell diff         # frame/heap overlay
 ```
 
@@ -337,6 +339,38 @@ with a large `docs/` tree and a few thousand commits produces the same shape.
 | after: scanner, theme, host, prepared, seams | 13,056,496 bytes (+123 KB) |
 | new dependencies | none |
 | `core` dependencies | none, and `[dependencies]` is empty |
+
+### The terminal frontend
+
+```sh
+COLS=120 ROWS=40 cargo run -q -p plait-tui --example dump --release -- diff --fixtures
+COLS=120 ROWS=40 cargo run -q -p plait-tui --example dump --release -- commits ~/Projects/git 82000
+```
+
+Load is `core`'s and is the same work in every frontend — the numbers above for
+`prepare` are inside it. What is new is the frame, and the claim being measured is
+that it does not depend on the size of the diff: it is 50 rows either way.
+`FRAMES` sets how many repaints to average; the default is 50.
+
+| view | rows | load | frame |
+|---|---|---|---|
+| `pr30683.diff`, unified | 740,383 | 421 ms | 12 µs |
+| `pr30683.diff`, side-by-side | 973,394 | 476 ms | 13 µs |
+| `md.diff`, unified | 74,467 | 118 ms | 10 µs |
+| `md.diff`, side-by-side | 90,963 | 103 ms | 12 µs |
+| `git/git`, 82k commits | — | 138 ms | 26 µs |
+
+Ten times the rows costs nothing per frame, which is the point. The 12 µs is 40
+rows × the run merge × a memcpy into the cell buffer, and nothing in it
+allocates: `runs` walks the tokens and the spans together rather than collecting
+their edges, the run-list buffer belongs to the caller, and a row's text is
+sliced out of the line rather than copied. Collecting edges into a `Vec` per row
+was the first version and cost 2 µs a frame — 14%, for an answer the sweep
+already had.
+
+The side-by-side row count is *higher* than unified's here, which looks wrong and
+is not: `pr30683` is near-pure deletion, so almost every row has one side, and the
+column is half the width so more of them wrap.
 
 ## Not reproducible from this repo
 

@@ -14,6 +14,7 @@ which numbers those decisions rest on, and the diagrams.
 | [syntax-highlighting.md](syntax-highlighting.md) | the scanner, the tables, the routing |
 | [theming.md](theming.md) | colour as data, surfaces, contrast resolution |
 | [commit-graph.md](commit-graph.md) | lane assignment, hues, the cap, the drawing |
+| [terminal.md](terminal.md) | the terminal frontend, and what writing it moved into `core` |
 | [extending.md](extending.md) | every seam, with a worked example each |
 
 ## Decisions

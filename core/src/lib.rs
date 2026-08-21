@@ -7,9 +7,12 @@
 pub mod align;
 pub mod differ;
 pub mod font;
+pub mod graph;
 pub mod host;
 pub mod markdown;
 pub mod prepared;
+pub mod rows;
+pub mod runs;
 pub mod syntax;
 pub mod theme;
 pub mod wrap;

@@ -76,13 +76,13 @@ pub fn surfaces(kind: LineKind, moved: bool) -> (Surface, Surface) {
 /// row would otherwise lose text rather than lose styling, and one that draws
 /// backgrounds needs a run to paint the gap with.
 ///
-/// Both inputs arrive sorted and internally non-overlapping from
-/// [`prepared`](crate::prepared), so this is a sweep over their combined edges
-/// rather than a sort of the pair.
-///
-/// `out` is cleared and reused: this runs once per visible row per frame, and
-/// allocating a vector there is the one thing on the render path that must not
-/// happen.
+/// **Allocation-free after the first call.** Both inputs arrive sorted and
+/// internally non-overlapping from [`prepared`](crate::prepared), so this walks
+/// them together and emits each run as it finds it. Collecting the combined
+/// edges into a vector first is the obvious way to write it, it is what this
+/// replaced, and it is a `Vec` per visible row per frame for an answer the sweep
+/// already had. `out` is cleared and reused, which is the one thing on a render
+/// path that must not allocate.
 ///
 /// A **moved** line drops its spans. It is the same text in a different place,
 /// so nothing inside it changed and its spans describe a change move detection
@@ -108,38 +108,49 @@ pub fn runs(
         return;
     }
 
-    // Clamped rather than filtered: anything wholly outside this row collapses
-    // to a zero-length edge pair, which `dedup` removes for free. The ends of
-    // `at` are seeded so the first run cannot start late and the last cannot
-    // stop early — the gapless guarantee is this one line.
-    let clamp = |i: usize| i.clamp(at.start, at.end);
-    let mut edges = Vec::with_capacity((tokens.len() + spans.len()) * 2 + 2);
-    edges.push(at.start);
-    for t in tokens {
-        edges.push(clamp(t.start));
-        edges.push(clamp(t.end));
-    }
-    for s in spans {
-        edges.push(clamp(s.start));
-        edges.push(clamp(s.end));
-    }
-    edges.push(at.end);
-    edges.sort_unstable();
-    edges.dedup();
-
     let (mut ti, mut si) = (0usize, 0usize);
-    let mut cursor = edges[0];
-    for &edge in &edges[1..] {
+    let mut cursor = at.start;
+    while cursor < at.end {
+        // Anything ending at or before the cursor is behind us. Not clamped into
+        // `at`: a token that runs past the end of this row is still the token
+        // covering the cursor, and clamping it here would skip it.
         while ti < tokens.len() && tokens[ti].end <= cursor {
             ti += 1;
         }
         while si < spans.len() && spans[si].end <= cursor {
             si += 1;
         }
-        let word = spans.get(si).is_some_and(|s| s.start <= cursor);
+        // Whichever of the two actually covers the cursor, if either does.
+        let tok = tokens.get(ti).filter(|t| t.start <= cursor);
+        let spn = spans.get(si).filter(|s| s.start <= cursor);
+
+        // The next byte at which any of that changes: where a live range ends,
+        // or where a pending one begins. Every candidate is strictly past the
+        // cursor — a live range's end is, because it was not skipped, and a
+        // pending one's start is, because it is not live — so the run advances
+        // and this terminates.
+        let mut edge = at.end;
+        match tok {
+            Some(t) => edge = edge.min(t.end),
+            None => {
+                if let Some(t) = tokens.get(ti) {
+                    edge = edge.min(t.start);
+                }
+            }
+        }
+        match spn {
+            Some(s) => edge = edge.min(s.end),
+            None => {
+                if let Some(s) = spans.get(si) {
+                    edge = edge.min(s.start);
+                }
+            }
+        }
+
+        let word = spn.is_some();
         out.push(Run {
             at: cursor..edge,
-            kind: tokens.get(ti).filter(|t| t.start <= cursor).map(|t| t.kind),
+            kind: tok.map(|t| t.kind),
             surface: if word { word_surface } else { plain },
             word,
         });
@@ -239,6 +250,22 @@ mod tests {
         let mut out = vec![Run { at: 0..1, kind: None, surface: Surface::Context, word: false }];
         runs(5..5, &[tok(0, 9, Kind::Str)], &[span(0, 9)], LineKind::Context, false, &mut out);
         assert!(out.is_empty(), "the buffer was not cleared");
+    }
+
+    #[test]
+    fn a_reused_buffer_stops_allocating() {
+        // The property the sweep exists for: 50 visible rows repainted on every
+        // keystroke, and no `Vec` grown after the first frame.
+        let tokens: Vec<Token> = (0..20).map(|i| tok(i * 4, i * 4 + 3, Kind::Str)).collect();
+        let spans: Vec<Span> = (0..10).map(|i| span(i * 8 + 1, i * 8 + 5)).collect();
+        let mut out = Vec::new();
+        runs(0..80, &tokens, &spans, LineKind::Added, false, &mut out);
+        well_formed(0..80, &out);
+        let capacity = out.capacity();
+        for _ in 0..100 {
+            runs(0..80, &tokens, &spans, LineKind::Added, false, &mut out);
+        }
+        assert_eq!(out.capacity(), capacity, "the buffer grew on a repaint");
     }
 
     #[test]

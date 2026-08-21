@@ -40,6 +40,12 @@ boundary rather than taste: a `Rows` implementation returns UI elements, so its
 registry cannot be in `core`; a break point is a property of text, so its registry
 can be.
 
+There is now one `Host` and three frontends reading it, and it is the same struct
+in all three — which is what makes "not on `Host`" a real failure rather than a
+style note. `chrome.selection_bg` exists because the terminal needed a colour for
+the row the keyboard is on and a literal in a view is not a seam; no GPUI view
+draws a selection yet.
+
 `s` and `w` are the first real key bindings and are deliberately shaped like the
 last one will be — the view owns a focus handle, the binding is global, the handler is a
 method — so that when dispatch arrives they have something to attach to rather
@@ -423,6 +429,74 @@ an implementation written before wrapping existed keeps one row per line and
 behaves identically. It is also the weakest point of the seam — see
 [decisions/0017](decisions/0017-wrapping-is-more-rows-not-taller-ones.md) for why
 wrapping cannot happen before `build` and hand it to everybody free.
+
+## 9. The same presentation, in the terminal
+
+`plait-tui` has the same two registries — a `Rows` trait claimed per path and a
+`Layouts` that `s` cycles — and the split between them and `core` is where the
+extension story got sharper.
+
+The half of a presentation that has nothing to do with a UI is now a trait in
+`core`:
+
+```rust
+pub trait Present {          // plait_core::rows
+    fn claims(&self, path: &str) -> bool;
+    fn len(&self) -> usize;
+    fn build(&mut self, file: prepared::File);
+    fn rows(&self, index: usize) -> usize;              // defaulted to 1
+    fn width(&self, index: usize, seg: usize) -> usize; // defaulted to 0
+    fn files(&self) -> &[Entry];                        // defaulted to none
+}
+```
+
+A frontend's trait is that plus a `render`, and `render`'s return type is the only
+reason the frontend's trait exists at all — an `AnyElement`, a row of cells, a
+JSON payload. So the whole of the terminal's built-in unified presentation is:
+
+```rust
+#[derive(Default)]
+pub struct TextRows { flat: Flat, digits: usize }
+
+impl Present for TextRows {
+    fn claims(&self, _: &str) -> bool { true }
+    fn len(&self) -> usize { self.flat.len() }
+    fn build(&mut self, f: File) { self.flat.push(f); /* …widest number */ }
+    fn rows(&self, i: usize) -> usize { self.flat.visual_rows(i) }
+    fn width(&self, i: usize, seg: usize) -> usize { screen::width(self.flat.piece(i, seg)) }
+    fn files(&self) -> &[Entry] { self.flat.files() }
+}
+
+impl Rows for TextRows {
+    fn reflow(&mut self, cols: usize, _: &Host, w: &dyn Wrap) -> bool {
+        self.flat.reflow(self.budget(cols), w)      // the whole of what it owes wrapping
+    }
+    fn render(&self, i: usize, seg: usize, at: &Frame, pen: &mut Pen, out: &mut Vec<Run>) { … }
+}
+```
+
+`Flat` is doing the work: the rows, the wrap index, the reflow early-out, the
+`n moved · k invalid breaks` report. A presentation that holds one gets all of it,
+which is what makes an extension's `render` the only thing it has to think about.
+
+Two differences from the window's seam, and only two. `reflow` takes **columns**,
+because a terminal has no pixels — the implementation still owns the conversion to
+a text budget, because it owns the furniture it draws around the text. And
+`render` is handed a `&mut Vec<Run>` scratch buffer it must not allocate,
+because a frame is 50 rows and a scroll is a frame per keypress.
+
+### The graph's alphabet
+
+`commits::Glyphs` is a struct of `char`s, not literals in a `match`:
+
+```rust
+Commits::with_glyphs(commits, Glyphs::ascii())   // git --graph's own set
+```
+
+Nine characters — the vertical, the two dots, the crossing, the run and the four
+corners. A terminal without box drawing, a Nerd Font set and a
+one-column-per-lane experiment are all constructors, and none of them touch
+`paint`.
 
 ## What a new seam owes
 

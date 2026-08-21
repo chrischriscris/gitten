@@ -26,6 +26,11 @@ the extension host, command dispatch, the mode stack. If a keystroke can trigger
 a command, `cli/` and an extension must reach it through the same path. One
 implementation, three doors.
 
+The doors are real now — a GPUI window, a terminal and a browser — and they are
+the cheap check on this. Anything two of them need is a bug until it is in
+`core`: the row flattening, the order table, the token-versus-span merge and the
+graph's branch colours were each written twice before they were written once.
+
 ## Git
 
 `plait-git` is the acquisition layer — the only crate that talks to a repository.
@@ -175,6 +180,12 @@ cargo build --release -p plait-shell
 ./target/release/plait-shell diff    [REPO] [REVSPEC]
 ./target/release/plait-shell diff --fixtures        # read fixtures/ instead
 PLAIT_STATS=1 ./target/release/plait-shell diff     # frame/heap overlay
+
+COLS=120 ROWS=40 cargo run -q -p plait-tui --example dump --release -- \
+    diff . HEAD~2..HEAD              # one frame of the terminal views on
+                                     # stdout, per-frame timing on stderr.
+                                     # LAYOUT, WRAP, AT, FRAMES. No window
+                                     # opens, so this one is safe to just run.
 ```
 
 The overlay forces a redraw every frame so the fps number means something —
@@ -193,7 +204,9 @@ of a list and an index, so any seam with a registry gets one for free.
 
 **Never launch the app unless asked.** Build it, test it, bench it — but a window
 appearing unannounced interrupts whoever is at the keyboard. Say it's ready and
-hand over the command.
+hand over the command. The terminal frontend's `dump` example is the exception
+and exists for it — a frame on stdout interrupts nobody, so look at a colour or
+a glyph there rather than asking someone to open something.
 
 `rust-toolchain.toml` tracks the channel Zed pins. When GPUI fails with an
 unstable-feature error, that pin has drifted — go read Zed's `rust-toolchain.toml`.

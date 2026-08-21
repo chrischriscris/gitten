@@ -142,6 +142,15 @@ pub struct ChromePalette {
     pub accent: Rgb,
     pub title_bg: Rgb,
     pub status_bg: Rgb,
+    /// The row the keyboard is on.
+    ///
+    /// A background bar and not a foreground change, because the row underneath
+    /// already spends its foreground saying what it is — an added line, an
+    /// author, a lane colour — and a selection that repainted text would erase
+    /// that. Its own field and not `title_bg`: those are the same colour in the
+    /// shipped theme and mean unrelated things, and a palette where one colour
+    /// means two things is a palette a theme cannot retune.
+    pub selection_bg: Rgb,
     /// Something the app tried and could not do — a diff that failed to
     /// re-acquire, say. Its own colour and not `diff.dels_fg`: that red means
     /// "this line was removed", and a palette where one colour means two things
@@ -242,6 +251,7 @@ impl Theme {
                 accent: 0xdfa851,
                 title_bg: 0x151312,
                 status_bg: 0x131211,
+                selection_bg: 0x241f1a,
                 error: 0xd4736b,
             },
             lanes: vec![0xdfa851, 0x6f9ecf, 0xa983c9, 0x5fa8a0, 0xc97d6f, 0x8fb35e],

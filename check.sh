@@ -21,6 +21,10 @@ cargo test -q -p plait-core 2>&1 | grep -E "^test result|^error" || true
 # The browser door. Headless too — every test in it is a payload or a row
 # index, and neither needs a socket.
 cargo test -q -p plait-web 2>&1 | grep -E "^test result|^error" || true
+# The terminal door, and the only frontend whose *drawing* is tested: its screen
+# is a cell buffer, so "this row is a removal, red on dark red, with the changed
+# word lit" is an assertion and not something to go and look at.
+cargo test -q -p plait-tui 2>&1 | grep -E "^test result|^error" || true
 
 echo
 echo "── trees ───────────────────────────────────────────────"
@@ -61,3 +65,19 @@ echo
 echo "── synthetic scale ─────────────────────────────────────"
 ./fixtures/gen.sh 1000000 1000000 >/dev/null 2>&1
 cargo run -q -p plait-core --example bench --release 2>/dev/null | sed 's/^/  /'
+
+echo
+echo "── terminal frames ─────────────────────────────────────"
+# One frame of each view, drawn and thrown away: it exercises the whole path
+# from acquisition to cells without a terminal, and a panic in a presentation is
+# invisible to the unit tests only if no fixture reaches it.
+for view in commits diff; do
+  printf '%s' "  $view "
+  COLS=120 ROWS=40 cargo run -q -p plait-tui --example dump --release -- "$view" . \
+    2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | tail -1
+done
+for layout in unified side-by-side; do
+  printf '%s' "  $layout "
+  COLS=120 ROWS=40 LAYOUT=$layout cargo run -q -p plait-tui --example dump --release -- \
+    diff --fixtures 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | tail -1
+done

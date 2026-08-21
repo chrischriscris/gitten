@@ -110,7 +110,7 @@ rgb_fields! {
         "bg" = chrome.bg, "fg" = chrome.fg, "dim" = chrome.dim,
         "faint" = chrome.faint, "accent" = chrome.accent,
         "title_bg" = chrome.title_bg, "status_bg" = chrome.status_bg,
-        "error" = chrome.error;
+        "selection_bg" = chrome.selection_bg, "error" = chrome.error;
     "diff":
         "file_bg" = diff.file_bg, "file_fg" = diff.file_fg,
         "adds_fg" = diff.adds_fg, "dels_fg" = diff.dels_fg,

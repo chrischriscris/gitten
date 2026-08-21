@@ -1,6 +1,6 @@
 # Architecture
 
-Three crates. The interesting line is between the first two and the third.
+Five crates. The interesting line is between the first two and the rest.
 
 ```
                         ┌──────────────────────────────────────┐
@@ -10,20 +10,26 @@ Three crates. The interesting line is between the first two and the third.
         │               │  differ::{Histogram, Myers, hunks}   │
         ▼               │  prepared::prepare   align::align    │
 ┌───────────────┐ blobs │  intraline   markdown::lay_out       │
-│  plait-git    ├──────►│  syntax::{Lexer, Markdown, ...}      │
-│  two texts    │       │  wrap::{Word, Char, Wrapped}         │
-│  per file     │       │  theme::Theme  font::Font  host::Host │
-│  git binary   │       │                                      │
-│  (gix later)  │       └───────────┬──────────────┬───────────┘
-└───────────────┘                   │              │
-                           rows,    │              │  rows, colours
-                           colours  │              │
-                        ┌───────────▼──────┐  ┌────▼─────────────────┐
-                        │  plait-shell     │  │  examples/paint.rs   │
-                        │  GPUI window     │  │  ANSI, headless      │
-                        └──────────────────┘  └──────────────────────┘
-                                               (and a cli/, one day)
+│  plait-git    ├──────►│  rows::{Flat, Present, expand}       │
+│  two texts    │       │  runs::runs   graph::{Hues, cap}     │
+│  per file     │       │  syntax::{Lexer, Markdown, ...}      │
+│  git binary   │       │  wrap::{Word, Char, Wrapped}         │
+│  (gix later)  │       │  theme::Theme  font::Font  host::Host │
+└───────────────┘       └──┬────────┬────────┬────────┬───────┘
+                           │        │        │        │
+                     rows, │        │        │        │  rows, colours
+                   colours │        │        │        │
+              ┌────────────▼─┐ ┌────▼─────┐ ┌▼───────────┐ ┌▼──────────────┐
+              │ plait-shell  │ │plait-tui │ │ plait-web  │ │examples/paint │
+              │ GPUI window  │ │ cells,   │ │ loopback   │ │ ANSI,         │
+              │              │ │ crossterm│ │ HTTP + JS  │ │ headless      │
+              └──────────────┘ └──────────┘ └────────────┘ └───────────────┘
 ```
+
+Three real frontends and one example, and the example is still the cheapest place
+to look at a colour. Each door draws and nothing else: what a `Rows`
+implementation returns is an `AnyElement`, a row of cells or a JSON payload, and
+everything above that line is one implementation in `core`.
 
 ## plait-core
 
@@ -33,6 +39,9 @@ because it compiles in a second and its tests need no window.
 | module | what lives there |
 |---|---|
 | `lib.rs` | commit and diff parsing, `assign_lanes`, `intraline`, `replace_pairs`, `initials` |
+| `graph.rs` | which branch is which colour, the lane cap, the honest lane count |
+| `rows.rs` | a diff flattened to rows, the wrap index, the order table, the load path |
+| `runs.rs` | syntax tokens × intraline spans → one flat styled run list |
 | `differ.rs` | the `Differ` trait, Histogram/Patience/Myers, whitespace relations, the indent heuristic, move detection, hunk assembly, routing |
 | `align.rs` | which removal sits opposite which addition, for a two-column view |
 | `prepared.rs` | a diff assembled into drawable rows: clip → intraline → syntax |
@@ -45,6 +54,10 @@ because it compiles in a second and its tests need no window.
 Four examples double as the headless test bench: `bench` (timings at fixture
 scale), `shape` (topology statistics), `verify` (lane-assignment invariants),
 `paint` (the diff view in ANSI).
+
+Three of these modules exist because a third frontend was written. `rows`, `runs`
+and `graph::Hues` each had two implementations in two frontends before they had
+one here — see [terminal.md](terminal.md) for which copies are still outstanding.
 
 ## plait-git
 
@@ -66,6 +79,30 @@ cat-file --batch`.
 
 `examples/diffcheck.rs` is the headless check that the differs agree with git on
 real history, and is run by `./check.sh`.
+
+## plait-tui
+
+The terminal. A cell grid, the presentations that fill it, and escape codes.
+
+| file | what lives there |
+|---|---|
+| `screen.rs` | cells, ink, the pen, the two-buffer diff, and `print` |
+| `rows.rs` | the `Rows` seam, `Layouts`, `TextRows`, the shared row furniture |
+| `split.rs` | `SplitRows`, at half the width and with its own scroll |
+| `diff.rs` | the diff view: viewport, reflow, commands |
+| `commits.rs` | the commit list, and the graph in box drawing |
+| `term.rs` | the only module that touches `crossterm` |
+
+`examples/dump.rs` prints one frame of either view to stdout, which is how it is
+looked at without a terminal — and, because `Screen` is a `Vec<Cell>`, it is the
+one frontend whose *drawing* is unit-tested. See [terminal.md](terminal.md).
+
+## plait-web
+
+A loopback HTTP server and a page. No third-party dependencies: the server is a
+`TcpListener`, the JSON writer is a `String`. Everything above drawing runs
+natively in the process you started, so nothing needs a wasm target; the browser
+re-implements the drawing.
 
 ## plait-shell
 
@@ -131,8 +168,14 @@ Two checks, both cheap to run against a diff:
 
 Listed so nobody reads an intention as a description:
 
-- **`cli/`.** Referenced throughout as the second door. `paint.rs` currently
-  stands in for it as the proof that the boundary holds.
+- **`cli/`.** Referenced throughout as the second door. `plait-tui` and
+  `plait-web` now stand in as the proof that the boundary holds; what `cli/`
+  would still add is a non-interactive door — a diff to stdout, an exit status —
+  and `tui/examples/dump.rs` is most of it already.
+- **Any keyboard beyond scrolling, in the terminal.** `plait-tui`'s views are
+  components: every action is a method and nothing in the crate knows what a
+  keypress is. There is no `main`, no event loop and no keymap, because a keymap
+  written there is one `cli/` would have to duplicate — see the next item.
 - **Command dispatch and the mode stack.** `Host` is where they belong. `s`
   cycling the diff layout and `w` cycling the wrap are the only key bindings that
   are not `cmd-q`, and both are shaped so dispatch has something to attach to
@@ -175,8 +218,10 @@ Listed so nobody reads an intention as a description:
   has the same limit by default and lifts it with `--color-moved`\'s
   cross-file modes.
 - **`gix`.** All reads still spawn `git`.
-- **A rendering test.** Every stage up to `Rows::render` is tested headlessly and
-  `paint.rs` draws a real diff in ANSI, but nothing exercises a GPUI element tree:
+- **A rendering test, *in the shell*.** `plait-tui` has one — its screen is a
+  cell buffer, so a row's text and its per-cell colour are both assertions, and
+  82 tests exercise the real presentations. Nothing equivalent exercises a GPUI
+  element tree:
   a panic in `render`, a colliding element id or a floating element painted under
   its sibling are all found by launching. `gpui`'s `test-support` feature would
   fix it and unifies onto every build — proptest and a leak detector on a

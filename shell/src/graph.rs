@@ -11,9 +11,10 @@
 //! it looks, never what the topology is. It reads two things off the rows
 //! either side: which lanes are mid-curve, because half of a curve lives next
 //! door, and where a branch begins and ends, because that is what colour
-//! follows (see [`Hues`]) rather than the column it happens to occupy.
+//! follows (see [`plait_core::graph::Hues`]) rather than the column it happens to occupy.
 
 use gpui::*;
+use plait_core::graph::{Hues, MAX_LANES};
 use plait_core::host::Host;
 use plait_core::theme::Theme;
 use plait_core::{Commit, GraphRow};
@@ -22,12 +23,12 @@ use std::rc::Rc;
 pub const ROW_H: f32 = 22.0;
 const LANE_W: f32 = 14.0;
 
-/// Hard cap on drawn lanes. git/git reaches 280 concurrently, which is a
-/// 3,920px gutter — it pushes the commit text off the screen entirely and no
-/// human reads past a dozen lanes anyway. Everything beyond the cap collapses
-/// onto the last column, dimmed, so it reads as "there is more over here"
-/// rather than silently lying about the topology.
-const MAX_LANES: usize = 12;
+/// Which lane is which colour, how many may be drawn, and how many there really
+/// are — all three from `core`, because all three are pure functions of the
+/// topology. A terminal gutter drawn in box characters and this canvas therefore
+/// agree about which branch is amber and where the overflow starts. See
+/// `plait_core::graph`.
+pub use plait_core::graph::lane_count;
 
 /// A lane is 2px, not the 1.5px a dense list first suggests. Thinner reads as
 /// a hairline sketch rather than something you could grab, and 2px straddles
@@ -48,77 +49,14 @@ const RING: f32 = 0.45;
 /// overlap instead of abutting.
 const OVERSHOOT: f32 = 0.5;
 
-/// How many hues the wheel hands out. Not the same thing as how many colours a
-/// theme ships: this is the size of the "which branch has which slot" ledger,
-/// and the theme decides what a slot looks like. Six is the number of live
-/// branches that can be told apart at a glance.
-const LANE_HUES: usize = 6;
-
 /// Colour belongs to the *branch*, not to the column it happens to sit in —
-/// see [`Hues`]. Overflow is the exception: past the cap every lane shares one
+/// see [`plait_core::graph::Hues`]. Overflow is the exception: past the cap every lane shares one
 /// column, so they share one grey and stop pretending to be individuals.
 fn color(theme: &Theme, lane: u16, hue: u16) -> Rgba {
     if lane as usize >= MAX_LANES {
         return rgb(theme.lane_overflow);
     }
     rgb(theme.lane(hue as usize))
-}
-
-/// Hands out a colour per branch and keeps it until that branch ends.
-///
-/// Colouring by lane index is the obvious thing and it is wrong: lane 1 is
-/// recycled the moment a branch merges, so branch after unrelated branch comes
-/// out the same blue and the eye reads them as one long-running thing. So walk
-/// the history instead and hand each *new* lane the next colour on the wheel,
-/// skipping any colour a concurrently live lane already holds. Consecutive
-/// branches therefore differ even when they share a column, and neighbours
-/// never collide while six or fewer lanes are live.
-struct Hues {
-    /// Per lane slot, mirroring core's own bookkeeping.
-    of: Vec<Option<u16>>,
-    live: [u16; LANE_HUES],
-    next: u16,
-}
-
-impl Hues {
-    fn new() -> Self {
-        Self {
-            of: Vec::new(),
-            live: [0; LANE_HUES],
-            // So the first lane claimed — the trunk — comes out amber.
-            next: LANE_HUES as u16 - 1,
-        }
-    }
-
-    /// This lane's colour, taking a fresh one off the wheel if the lane is
-    /// new. Every read goes through here, so a lane can never come out blank.
-    fn claim(&mut self, lane: usize) -> u16 {
-        if self.of.len() <= lane {
-            self.of.resize(lane + 1, None);
-        }
-        if let Some(hue) = self.of[lane] {
-            return hue;
-        }
-        let n = LANE_HUES as u16;
-        // The first free colour from here round the wheel; if all six are
-        // live, take the next one anyway — a repeat beats a blank.
-        for _ in 0..n {
-            self.next = (self.next + 1) % n;
-            if self.live[self.next as usize] == 0 {
-                break;
-            }
-        }
-        self.live[self.next as usize] += 1;
-        self.of[lane] = Some(self.next);
-        self.next
-    }
-
-    /// The branch ended here; its colour goes back on the wheel.
-    fn release(&mut self, lane: usize) {
-        if let Some(hue) = self.of.get_mut(lane).and_then(Option::take) {
-            self.live[hue as usize] = self.live[hue as usize].saturating_sub(1);
-        }
-    }
 }
 
 /// The breath between the last stroke of the graph and the first letter of the
@@ -130,19 +68,6 @@ const GAP: f32 = 6.0;
 /// column.
 fn lane_x(lane: u16) -> f32 {
     (lane as usize).min(MAX_LANES - 1) as f32 * LANE_W + LANE_W / 2.0
-}
-
-/// How many lanes the topology actually uses — the honest number, uncapped,
-/// which is why it comes off the core rows and not off the draws (those are
-/// already collapsed onto the cap).
-pub fn lane_count(rows: &[GraphRow]) -> usize {
-    rows.iter()
-        .map(|r| {
-            let widest = r.through.iter().chain(&r.merges).chain(&r.forks).max().copied();
-            widest.unwrap_or(r.lane).max(r.lane) + 1
-        })
-        .max()
-        .unwrap_or(1)
 }
 
 /// A straight lane, in halves: `up` runs from the row's top edge to the dot
