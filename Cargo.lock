@@ -4834,6 +4834,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "plait-web"
+version = "0.0.0"
+dependencies = [
+ "plait-core",
+ "plait-git",
+]
+
+[[package]]
 name = "png"
 version = "0.17.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"

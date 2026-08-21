@@ -1,0 +1,229 @@
+/* Colour is never written down here.
+ *
+ * Every value comes from `--` properties the script sets from the theme the
+ * server sent, which is the same `Theme` the window draws from and has already
+ * had the contrast floor applied. A hex code in this file would be a second
+ * theme that no `plait.toml` can retune. */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  background: var(--chrome-bg);
+  color: var(--chrome-fg);
+  font-family: var(--font-family);
+  font-size: var(--font-size);
+  /* A diff is a grid of characters. Ligatures would slide `!=` and `->` off
+   * the column the line numbers and the intraline spans are measured in. */
+  font-variant-ligatures: none;
+  -webkit-font-smoothing: antialiased;
+}
+
+.spacer {
+  flex: 1;
+}
+
+/* ------------------------------------------------------------------- chrome */
+
+#title,
+#status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 10px;
+  flex: none;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+#title {
+  height: 34px;
+  background: var(--title-bg);
+  border-bottom: 1px solid var(--faint);
+}
+
+#status {
+  height: 22px;
+  background: var(--status-bg);
+  border-top: 1px solid var(--faint);
+  color: var(--dim);
+  font-size: 0.85em;
+}
+
+#label {
+  color: var(--chrome-fg);
+}
+
+#stats,
+#keys {
+  color: var(--dim);
+  font-size: 0.85em;
+}
+
+.picker {
+  font: inherit;
+  font-size: 0.85em;
+  color: var(--dim);
+  background: transparent;
+  border: 1px solid var(--faint);
+  border-radius: 3px;
+  padding: 1px 7px;
+  cursor: pointer;
+}
+
+.picker:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.error {
+  color: var(--error);
+}
+
+/* --------------------------------------------------------------- the layout */
+
+main {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+/* ----------------------------------------------------------------- the rows */
+
+#scroll {
+  position: relative;
+  flex: 1;
+  overflow-x: auto;
+  /* `scroll`, not `auto`, and it is load-bearing. The column budget is measured
+   * from `clientWidth`, and the first measurement happens before the spacer has
+   * been given a height — so with `auto` there is no vertical scrollbar yet, the
+   * budget comes out one scrollbar too wide, and the diff opens wrapped to a
+   * column no later reflow agrees with. Measured: 105 columns on load against
+   * 104 on every reflow after it. Reserving the gutter always is what makes the
+   * measurement mean the same thing every time it is taken. */
+  overflow-y: scroll;
+  outline: none;
+}
+
+#spacer {
+  /* Height only: this is what gives the scrollbar something to be a fraction
+   * of, and the reason the rows themselves are a few dozen elements however
+   * long the diff is. */
+  width: 1px;
+}
+
+#window {
+  position: absolute;
+  top: 0;
+  left: 0;
+  /* `max-content`, not `right: 0`. A row is `white-space: pre` and a diff with
+   * wrapping off has rows far wider than the window; pinning both edges makes
+   * this element exactly the container's width and there is nothing to scroll
+   * into. This is the same thing `with_horizontal_sizing_behavior(Unconstrained)`
+   * does for the window, and `min-width` is what keeps a row's background
+   * running the full width when the widest row is narrower than the viewport. */
+  min-width: 100%;
+  width: max-content;
+  /* Translated to the first visible row rather than repositioned per row, so a
+   * scroll writes one transform instead of one `top` per row. */
+  will-change: transform;
+}
+
+.row {
+  /* As wide as the widest row, so a short line's background does not stop
+   * short of one beside it. */
+  min-width: 100%;
+  height: var(--row-h);
+  line-height: var(--row-h);
+  display: flex;
+  align-items: center;
+  padding: 0 8px;
+  white-space: pre;
+}
+
+.num {
+  flex: none;
+  width: 4.5em;
+  padding-right: 0.75em;
+  text-align: right;
+  color: var(--gutter-fg);
+  /* A line number is furniture; selecting a diff should copy the diff. */
+  user-select: none;
+}
+
+.sign {
+  flex: none;
+  width: 1.5em;
+  user-select: none;
+}
+
+.text {
+  flex: 1;
+  min-width: 0;
+  white-space: pre;
+}
+
+.line.context {
+  background: var(--context-bg);
+  color: var(--context-fg);
+}
+
+.line.added {
+  background: var(--added-bg);
+  color: var(--added-fg);
+}
+
+.line.removed {
+  background: var(--removed-bg);
+  color: var(--removed-fg);
+}
+
+.line.added.moved {
+  background: var(--moved-added-bg);
+}
+
+.line.removed.moved {
+  background: var(--moved-removed-bg);
+}
+
+.row.file {
+  background: var(--file-bg);
+  color: var(--file-fg);
+  gap: 10px;
+  padding-left: 10px;
+}
+
+.row.file .adds {
+  color: var(--adds-fg);
+}
+
+.row.file .dels {
+  color: var(--dels-fg);
+}
+
+.row.hunk {
+  background: var(--hunk-bg);
+  color: var(--hunk-fg);
+  padding-left: 10px;
+}
+
+/* A row whose page has not arrived. Sized exactly like a real one so its
+ * arrival never moves anything, and dim rather than blank so a scroll that
+ * outruns the fetch reads as loading and not as an empty diff. */
+.row.pending {
+  background: var(--context-bg);
+  color: var(--faint);
+}
+
+.row.cursor {
+  box-shadow: inset 2px 0 0 0 var(--accent);
+}

@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>plait</title>
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+    <header id="title">
+      <span id="label">…</span>
+      <span class="spacer"></span>
+      <button id="wrap" class="picker" title="w — cycle where a long line breaks"></button>
+      <span id="stats"></span>
+    </header>
+    <main>
+      <div id="scroll" tabindex="0">
+        <div id="spacer"></div>
+        <div id="window"></div>
+      </div>
+    </main>
+    <footer id="status">
+      <span id="position"></span>
+      <span class="spacer"></span>
+      <span id="keys">j k · g G · ctrl-d ctrl-u · w wrap</span>
+    </footer>
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>

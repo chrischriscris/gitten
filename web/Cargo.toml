@@ -1,0 +1,16 @@
+[package]
+name = "plait-web"
+version = "0.0.0"
+edition = "2021"
+
+# The browser door. Acquisition and every shared pass run here, natively, in the
+# process you started from a terminal — so `git` still spawns, credential helpers
+# still work and nothing needs to reach a wasm target. What crosses the wire is
+# rows.
+#
+# No third-party dependencies. An HTTP server for one reader on loopback is a
+# `TcpListener` and a `Vec<u8>`; a JSON writer for types we own is a `String`.
+# Neither is worth async, and neither is worth two hundred crates.
+[dependencies]
+plait-core = { path = "../core" }
+plait-git = { path = "../git" }

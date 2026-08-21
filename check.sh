@@ -18,6 +18,9 @@ trap '[ -f "$STASH/log.txt" ] && /bin/cp -f "$STASH/log.txt" fixtures/log.txt
 
 echo "── correctness ─────────────────────────────────────────"
 cargo test -q -p plait-core 2>&1 | grep -E "^test result|^error" || true
+# The browser door. Headless too — every test in it is a payload or a row
+# index, and neither needs a socket.
+cargo test -q -p plait-web 2>&1 | grep -E "^test result|^error" || true
 
 echo
 echo "── trees ───────────────────────────────────────────────"
