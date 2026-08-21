@@ -20,13 +20,19 @@
 //! implementation, and diverges by a fraction of a percent. A drift past 1% is
 //! flagged — that is a changed answer, not a preference.
 //!
-//! **Not hunk boundaries.** Git runs `--indent-heuristic` by default, which
-//! slides a hunk to a more readable equivalent position without changing what it
-//! says. Two diffs of identical length and different hunk offsets are both
-//! correct, so comparing offsets would be measuring a preference and reporting
-//! it as a bug.
+//! **Hunk positions, exactly.** Every `@@ -a,b +c,d @@` we emit is compared
+//! against git's for the same file. This used to be skipped on the grounds that
+//! git's `--indent-heuristic` slides hunks and a different offset is still a
+//! correct diff — true before the heuristic was ported, and it hid a real bug:
+//! the port scored a position's indentation by magnitude where git compares it by
+//! sign, which slid hunks to plausible-looking places git does not put them. The
+//! line counts were identical throughout. Compare the positions.
+//!
+//! The function-name suffix is not compared: ours stops looking 400 lines above
+//! the hunk and git's does not, which is a bounded difference in a string nobody
+//! diffs.
 
-use plait_core::differ::Differs;
+use plait_core::differ::{Differs, Overrides, Whitespace};
 use plait_core::{parse_unified_diff, LineKind};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -61,18 +67,34 @@ fn main() {
     );
 
     let mut mismatches = 0;
-    for (name, flag) in
-        [("histogram", "--histogram"), ("patience", "--patience"), ("myers", "--minimal")]
-    {
+    // The whitespace rows keep `--histogram` on git's side as well: a whitespace
+    // relation is a property of how lines are compared, not of the algorithm, so
+    // comparing ours-on-histogram against git's-on-myers measures the wrong
+    // thing. That mistake cost a real half hour — it reported a two-line
+    // difference on this file and the cause was the flag list, not the code.
+    for (name, algorithm, flags, ws) in [
+        ("histogram", "histogram", &["--histogram"][..], Whitespace::Exact),
+        ("patience", "patience", &["--patience"], Whitespace::Exact),
+        ("myers", "myers", &["--minimal"], Whitespace::Exact),
+        ("ws-eol", "histogram", &["--histogram", "--ignore-space-at-eol"], Whitespace::Trailing),
+        ("ws-change", "histogram", &["--histogram", "-b"], Whitespace::Change),
+        ("ws-all", "histogram", &["--histogram", "-w"], Whitespace::All),
+    ] {
         let mut differs = Differs::builtin();
-        assert!(differs.select(name), "{name} is not registered");
+        assert!(differs.select(algorithm), "{algorithm} is not registered");
+        differs.whitespace = ws;
+        // Off for the comparison: git does not report moves in its line counts
+        // either, and a move is a presentation of the same script.
+        differs.min_moved = 0;
 
         let t = Instant::now();
         let (mut adds, mut dels, mut hunks) = (0usize, 0usize, 0usize);
+        let mut ours_ranges: Vec<(String, Vec<String>)> = Vec::new();
         for p in pairs.iter().filter(|p| !p.binary) {
             let old: Vec<&str> = p.old.iter().map(String::as_str).collect();
             let new: Vec<&str> = p.new.iter().map(String::as_str).collect();
-            let f = differs.file(&p.path, &old, &new);
+            let f = differs.file_using(&Overrides::default(), &p.path, &old, &new);
+            ours_ranges.push((p.path.clone(), ranges(&f)));
             hunks += f.hunks.len();
             for l in f.hunks.iter().flat_map(|h| &h.lines) {
                 match l.kind {
@@ -84,8 +106,39 @@ fn main() {
         }
         let ours = t.elapsed();
 
-        let (g_adds, g_dels, g_hunks, g_time) = git_diff(&repo, &revspec, flag);
-        report_worst(&repo, &revspec, flag, &differs, &pairs);
+        let (g_adds, g_dels, g_hunks, g_time, theirs) = git_diff(&repo, &revspec, flags);
+        report_worst(&repo, &revspec, flags, &differs, &pairs);
+
+        // Where the hunks are, not just how many. `ranges` drops the function
+        // suffix and keeps `@@ -a,b +c,d`.
+        let mut misplaced = 0usize;
+        for (path, ours) in &ours_ranges {
+            let g = theirs
+                .iter()
+                .find(|f| &f.path == path)
+                .map(|f| ranges(f))
+                .unwrap_or_default();
+            misplaced += ours
+                .iter()
+                .zip(g.iter())
+                .filter(|(a, b)| a != b)
+                .count()
+                + ours.len().abs_diff(g.len());
+        }
+        // Positions must match — except for myers, where they need not. A
+        // minimal script has one *length* and not one *shape*: several scripts
+        // of that length exist and ours picks a different one from git's, which
+        // the slide then places differently. The line counts agreeing is what
+        // proves both are still minimal. The anchored rows have no such freedom
+        // and are held to exact positions, which is what verifies `compact`.
+        let hunk_note = match (misplaced, name) {
+            (0, _) => String::new(),
+            (n, "myers") => format!(" · {n}/{hunks} placed differently (both minimal)"),
+            (n, _) => {
+                mismatches += 1;
+                format!(" · {n}/{hunks} hunks IN THE WRONG PLACE")
+            }
+        };
         // Myers has one correct length; the anchored ones have a range of
         // defensible ones, so only a drift past a fraction of a percent means
         // anything.
@@ -103,8 +156,9 @@ fn main() {
             format!("{drift:+} of {} — TOO FAR", g_adds + g_dels)
         };
         println!(
-            "  {name:<10} +{adds:<7} -{dels:<7} {hunks:>6}h {ours:>9.1?}  │  \
-             git {flag:<12} +{g_adds:<7} -{g_dels:<7} {g_hunks:>6}h {g_time:>9.1?}  {verdict}"
+            "  {name:<10} +{adds:<7} -{dels:<7} {hunks:>6}h {ours:>9.1?}  │  git {:<28} \
+             +{g_adds:<7} -{g_dels:<7} {g_hunks:>6}h {g_time:>9.1?}  {verdict}{hunk_note}",
+            flags.join(" "),
         );
     }
 
@@ -113,21 +167,37 @@ fn main() {
         if mismatches == 0 {
             "every algorithm agrees with git on how many lines changed"
         } else {
-            "a count outside tolerance means a changed answer, not a preference"
+            "a count or a position outside tolerance means a changed answer"
         }
     );
 }
 
 /// git's own answer, and what it cost.
-fn git_diff(repo: &Path, revspec: &str, flag: &str) -> (usize, usize, usize, Duration) {
+/// A hunk header without its function-name suffix: `@@ -41,9 +41,11 @@`.
+fn ranges(f: &plait_core::FileDiff) -> Vec<String> {
+    f.hunks
+        .iter()
+        .map(|h| {
+            let end = h.header[2..].find("@@").map(|i| i + 4).unwrap_or(h.header.len());
+            h.header[..end].to_string()
+        })
+        .collect()
+}
+
+fn git_diff(
+    repo: &Path,
+    revspec: &str,
+    flags: &[&str],
+) -> (usize, usize, usize, Duration, Vec<plait_core::FileDiff>) {
     let dir = repo.to_str().unwrap_or(".");
-    let args: Vec<&str> = if revspec.is_empty() {
-        vec!["-C", dir, "diff", "--no-ext-diff", flag, "-M", "HEAD"]
+    let mut args: Vec<&str> = if revspec.is_empty() {
+        vec!["-C", dir, "diff", "--no-ext-diff", "-M", "HEAD"]
     } else if revspec.contains("..") {
-        vec!["-C", dir, "diff", "--no-ext-diff", flag, "-M", revspec]
+        vec!["-C", dir, "diff", "--no-ext-diff", "-M", revspec]
     } else {
-        vec!["-C", dir, "show", "--no-ext-diff", flag, "-M", "--format=", revspec]
+        vec!["-C", dir, "show", "--no-ext-diff", "-M", "--format=", revspec]
     };
+    args.extend_from_slice(flags);
     let t = Instant::now();
     let out = Command::new("git").args(&args).output().expect("git");
     let elapsed = t.elapsed();
@@ -143,7 +213,7 @@ fn git_diff(repo: &Path, revspec: &str, flag: &str) -> (usize, usize, usize, Dur
             }
         }
     }
-    (adds, dels, hunks, elapsed)
+    (adds, dels, hunks, elapsed, files)
 }
 
 
@@ -152,7 +222,7 @@ fn git_diff(repo: &Path, revspec: &str, flag: &str) -> (usize, usize, usize, Dur
 fn report_worst(
     repo: &Path,
     revspec: &str,
-    flag: &str,
+    flags: &[&str],
     differs: &Differs,
     pairs: &[plait_git::Pair],
 ) {
@@ -160,13 +230,14 @@ fn report_worst(
         return;
     }
     let dir = repo.to_str().unwrap_or(".");
-    let args: Vec<&str> = if revspec.is_empty() {
-        vec!["-C", dir, "diff", "--no-ext-diff", flag, "-M", "HEAD"]
+    let mut args: Vec<&str> = if revspec.is_empty() {
+        vec!["-C", dir, "diff", "--no-ext-diff", "-M", "HEAD"]
     } else if revspec.contains("..") {
-        vec!["-C", dir, "diff", "--no-ext-diff", flag, "-M", revspec]
+        vec!["-C", dir, "diff", "--no-ext-diff", "-M", revspec]
     } else {
-        vec!["-C", dir, "show", "--no-ext-diff", flag, "-M", "--format=", revspec]
+        vec!["-C", dir, "show", "--no-ext-diff", "-M", "--format=", revspec]
     };
+    args.extend_from_slice(flags);
     let out = Command::new("git").args(&args).output().expect("git");
     let theirs = parse_unified_diff(&String::from_utf8_lossy(&out.stdout));
     let count = |f: &plait_core::FileDiff| -> usize {
@@ -180,7 +251,7 @@ fn report_worst(
     for p in pairs.iter().filter(|p| !p.binary) {
         let old: Vec<&str> = p.old.iter().map(String::as_str).collect();
         let new: Vec<&str> = p.new.iter().map(String::as_str).collect();
-        let ours = count(&differs.file(&p.path, &old, &new));
+        let ours = count(&differs.file_using(&Overrides::default(), &p.path, &old, &new));
         let theirs = theirs
             .iter()
             .find(|f| f.path == p.path || Some(f.path.as_str()) == p.old_path.as_deref())

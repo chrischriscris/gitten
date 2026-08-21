@@ -134,6 +134,21 @@ built-in is run through it. If your implementation is meant to be *minimal*, che
 it against `git diff --minimal` with `git/examples/diffcheck.rs`; a minimal script
 has exactly one length, so that is a real test and not a comparison.
 
+**Four things you do not implement**, because they are shared and would compose
+wrongly if they were not:
+
+| | |
+|---|---|
+| `Whitespace` | how much whitespace must match. Normalised before your `diff` is called, per line and length-preserving, so you never see it |
+| `differ::compact` | git's indent heuristic, sliding each change to a readable boundary |
+| `differ::hunks` | context, line numbers, `@@` headers, the function-name suffix |
+| `differ::moves` | blocks deleted here and added there, flagged on the line |
+
+All four are knobs on `Differs` (`whitespace`, `indent_heuristic`, `context`,
+`min_moved`) and all four apply to your implementation the day it is registered.
+That is the shape to preserve: a `Differ` decides which lines correspond, and
+nothing else.
+
 ## 4. A theme
 
 ```rust

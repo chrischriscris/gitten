@@ -24,15 +24,23 @@ pub enum Surface {
     Removed,
     AddedWord,
     RemovedWord,
+    /// The two halves of a block that moved. Their own surfaces because their
+    /// backgrounds are their own colours, and a token's foreground has to be
+    /// resolved against whatever it actually lands on — that is the whole reason
+    /// this enum exists.
+    MovedRemoved,
+    MovedAdded,
 }
 
 impl Surface {
-    pub const ALL: [Surface; 5] = [
+    pub const ALL: [Surface; 7] = [
         Surface::Context,
         Surface::Added,
         Surface::Removed,
         Surface::AddedWord,
         Surface::RemovedWord,
+        Surface::MovedRemoved,
+        Surface::MovedAdded,
     ];
     pub const COUNT: usize = Self::ALL.len();
 
@@ -87,6 +95,14 @@ pub struct DiffPalette {
     pub removed_bg: Rgb,
     pub removed_fg: Rgb,
     pub removed_word_bg: Rgb,
+    /// The two halves of a block that moved rather than changed.
+    ///
+    /// Blue-grey rather than a paler red and green, and that is the point: a
+    /// moved block is the one thing in a diff you are allowed to *skip*, so it
+    /// has to recede from the add/remove hues instead of joining them. The `+`
+    /// and `-` stay, so the columns still scan.
+    pub moved_removed_bg: Rgb,
+    pub moved_added_bg: Rgb,
     /// The half of a side-by-side row with no line in it.
     ///
     /// Its own colour and not `context_bg`, because those two mean opposite
@@ -205,6 +221,8 @@ impl Theme {
                 removed_bg: 0x2a1917,
                 removed_fg: 0xd4a09a,
                 removed_word_bg: 0x43201a,
+                moved_removed_bg: 0x191d28,
+                moved_added_bg: 0x1d2636,
                 absent_bg: 0x0a0908,
             },
             // Quieter than the syntax palette on purpose: this is punctuation
@@ -262,6 +280,8 @@ impl Theme {
             Surface::Removed => self.diff.removed_bg,
             Surface::AddedWord => self.diff.added_word_bg,
             Surface::RemovedWord => self.diff.removed_word_bg,
+            Surface::MovedRemoved => self.diff.moved_removed_bg,
+            Surface::MovedAdded => self.diff.moved_added_bg,
         }
     }
 
@@ -430,6 +450,7 @@ mod tests {
         t.name = "solarized-ish".into();
         t.set_syntax(Kind::Comment, Style::fg(0x93a1a1));
         t.diff.added_bg = 0x073642;
+        t.diff.moved_added_bg = 0x002b36;
         t.lanes = vec![0xb58900];
         assert_eq!(t.syntax(Kind::Comment).fg, 0x93a1a1);
         assert!(!t.syntax(Kind::Comment).italic, "the whole style is replaced");

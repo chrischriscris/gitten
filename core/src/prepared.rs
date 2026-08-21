@@ -23,6 +23,10 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Line {
     pub kind: LineKind,
+    /// Part of a block that moved rather than changed. Carried through from
+    /// [`crate::DiffLine`] untouched — the passes in here have nothing to say
+    /// about it, and the renderer needs it.
+    pub moved: bool,
     pub old_no: Option<u32>,
     pub new_no: Option<u32>,
     pub text: String,
@@ -113,6 +117,7 @@ pub fn prepare(files: &[FileDiff], hl: &dyn Highlighter, max_line_chars: usize) 
                 .enumerate()
                 .map(|(i, l)| Line {
                     kind: l.kind,
+                    moved: l.moved,
                     old_no: l.old_no,
                     new_no: l.new_no,
                     text: std::mem::take(&mut texts[i]),

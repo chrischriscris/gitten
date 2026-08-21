@@ -8,6 +8,7 @@ mod views;
 use gpui::*;
 use gpui_component::*;
 use plait_core::host::Host;
+use plait_core::differ::{Overrides, Whitespace};
 use plait_core::FileDiff;
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -36,9 +37,11 @@ plait — a git client
   REVSPEC is anything git takes:  HEAD~50..HEAD   main..feature   <sha>
   Pass --fixtures instead of REPO to read fixtures/ instead of a repository.
 
-  The title bar carries two pickers: the presentation (unified, side-by-side)
-  and the diff algorithm (histogram, patience, myers). `s` also cycles the
-  presentation. [diff] in plait.toml sets what they open on.
+  The title bar carries three pickers: the presentation (unified, side-by-side),
+  the diff algorithm (histogram, patience, myers) and how much whitespace has to
+  match (exact, trailing, change, all — git's default, --ignore-space-at-eol, -b
+  and -w). `s` also cycles the presentation. [diff] in plait.toml sets what they
+  open on, plus `context`, `moves` and `indent_heuristic`.
 
   plait.toml next to the binary (or $PLAIT_CONFIG) is re-read every time it is
   saved, and colours and font apply on the next frame — no rebuild, no relaunch.
@@ -60,7 +63,7 @@ plait — a git client
 ///
 /// `None` on `DevShell` means the source cannot be re-diffed at all — a `.diff`
 /// fixture was diffed by somebody else — and the control is drawn inert.
-type Rediff = Rc<dyn Fn(&Host, Option<&str>) -> Result<Vec<FileDiff>, String>>;
+type Rediff = Rc<dyn Fn(&Host, &Overrides) -> Result<Vec<FileDiff>, String>>;
 
 /// Which picker is open. At most one, because two open menus over a diff is two
 /// things to dismiss.
@@ -68,6 +71,7 @@ type Rediff = Rc<dyn Fn(&Host, Option<&str>) -> Result<Vec<FileDiff>, String>>;
 enum Open {
     Layout,
     Algorithm,
+    Whitespace,
 }
 
 struct DevShell {
@@ -79,10 +83,10 @@ struct DevShell {
     /// strip exists.
     diff: Option<Entity<views::diff::Diff>>,
     rediff: Option<Rediff>,
-    /// The live pick. `None` is "whatever the config selected", which is what the
-    /// control shows until somebody changes it — so the strip agrees with
-    /// `plait.toml` rather than with a copy of it taken at startup.
-    algorithm: Option<String>,
+    /// The live picks. Every field `None` means "whatever the config selected",
+    /// which is what the controls show until somebody changes one — so the strip
+    /// agrees with `plait.toml` rather than with a copy of it taken at startup.
+    over: Overrides,
     open: Option<Open>,
     /// A failed re-diff. Shown, not swallowed: the usual cause is a repository
     /// that moved under the window, and silently keeping the old rows would be a
@@ -91,26 +95,23 @@ struct DevShell {
 }
 
 impl DevShell {
-    /// Re-acquires the diff through `name` and swaps it in.
+    /// Re-acquires the diff under `next` and swaps it in.
     ///
-    /// The whole cost is one acquisition plus one `prepare` — 25–110 ms and
+    /// The whole cost is one acquisition plus one `prepare` — 40–120 ms and
     /// 8–250 ms respectively, on a click. Cheap enough not to need a spinner and
-    /// not cheap enough to do on a keystroke repeat, which is why this is a
-    /// menu and `s` is not.
-    fn set_algorithm(&mut self, name: &str, cx: &mut Context<Self>) {
+    /// not cheap enough to do on a keystroke repeat, which is why these are menus
+    /// and only the layout is bound to a key.
+    fn set_overrides(&mut self, next: Overrides, cx: &mut Context<Self>) {
         let (Some(rediff), Some(diff)) = (self.rediff.clone(), self.diff.clone()) else {
             return;
         };
-        let host = config::host(cx);
-        // Against the *effective* algorithm, not against the override: picking
-        // the one the config already selected would otherwise re-acquire and
-        // rebuild the whole diff to arrive back where it started.
-        if self.algorithm.as_deref().unwrap_or(host.differ.selected()) == name {
+        if next == self.over {
             return;
         }
-        match rediff(&host, Some(name)) {
+        let host = config::host(cx);
+        match rediff(&host, &next) {
             Ok(files) => {
-                self.algorithm = Some(name.to_string());
+                self.over = next;
                 self.error = None;
                 diff.update(cx, |d, cx| d.replace(files, &host, cx));
                 let (total, load) = {
@@ -123,7 +124,7 @@ impl DevShell {
             }
             // The old rows stay on screen, which is the right failure: they are
             // still a true diff, just not the one that was asked for.
-            Err(e) => self.error = Some(format!("{name}: {e}").into()),
+            Err(e) => self.error = Some(e.into()),
         }
         cx.notify();
     }
@@ -145,30 +146,20 @@ impl DevShell {
         cx.notify();
     }
 
-    /// The two pickers, right-aligned in the title bar. Nothing when the diff
-    /// view is not what is on screen — the commit graph has neither to choose.
+    /// The pickers, right-aligned in the title bar. Nothing when the diff view is
+    /// not what is on screen — the commit graph has none of these to choose.
+    ///
+    /// Each one is the same shape: a list of names from a registry or an enum,
+    /// and an index into it. That is why adding a presentation or an algorithm
+    /// needs no work here.
     fn strip(&self, host: &Host, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let Some(diff) = &self.diff else { return Vec::new() };
-        let names = diff.read(cx).layout_names();
-        let layout = controls::Picker::new(
-            "layout",
-            &names,
-            diff.read(cx).layout_index(),
-        );
-
-        // The configured selection until somebody picks, so the control reads
-        // back what `plait.toml` says rather than a snapshot of it.
-        let algorithms = host.differ.names();
-        let selected = self.algorithm.as_deref().unwrap_or(host.differ.selected());
-        let algorithm =
-            controls::Picker::new("algorithm", &algorithms, algorithms
-                .iter()
-                .position(|n| *n == selected)
-                .unwrap_or(0))
-                .enabled(self.rediff.is_some());
-
         let me = cx.entity().downgrade();
-        let toggle = |me: WeakEntity<Self>, which: Open| {
+
+        // `Fn(bool)` per picker rather than one shared handler: which menu is
+        // open is one field, and the closure is what knows which one it is.
+        let toggle = |which: Open| {
+            let me = me.clone();
             move |next: bool, _: &mut Window, cx: &mut App| {
                 _ = me.update(cx, |this, cx| {
                     this.open = next.then_some(which);
@@ -176,15 +167,47 @@ impl DevShell {
                 });
             }
         };
+        // Every override-driven pick is the same two lines: close, then re-diff.
+        let pick_over = |build: fn(&Overrides, usize) -> Overrides| {
+            let me = me.clone();
+            move |i: usize, _: &mut Window, cx: &mut App| {
+                _ = me.update(cx, |this, cx| {
+                    this.open = None;
+                    let next = build(&this.over, i);
+                    this.set_overrides(next, cx);
+                });
+            }
+        };
+
+        let names = diff.read(cx).layout_names();
+        let layouts = controls::Picker::new("layout", &names, diff.read(cx).layout_index());
+
+        let algorithms = host.differ.names();
+        let selected = self.over.algorithm.as_deref().unwrap_or(host.differ.selected());
+        let algorithm = controls::Picker::new(
+            "algorithm",
+            &algorithms,
+            algorithms.iter().position(|n| *n == selected).unwrap_or(0),
+        )
+        .enabled(self.rediff.is_some());
+
+        let ws_names: Vec<&str> = Whitespace::ALL.iter().map(|w| w.name()).collect();
+        let ws = self.over.whitespace.unwrap_or(host.differ.whitespace);
+        let whitespace = controls::Picker::new(
+            "whitespace",
+            &ws_names,
+            Whitespace::ALL.iter().position(|w| *w == ws).unwrap_or(0),
+        )
+        .enabled(self.rediff.is_some());
 
         vec![
             controls::picker(
                 "layout-picker",
-                &layout,
+                &layouts,
                 self.open == Some(Open::Layout),
                 &host.theme,
                 &host.font,
-                toggle(me.clone(), Open::Layout),
+                toggle(Open::Layout),
                 {
                     let me = me.clone();
                     move |i, _, cx| {
@@ -201,18 +224,34 @@ impl DevShell {
                 self.open == Some(Open::Algorithm),
                 &host.theme,
                 &host.font,
-                toggle(me.clone(), Open::Algorithm),
+                toggle(Open::Algorithm),
                 {
-                    let me = me.clone();
+                    // The registry's own order, so an extension's differ is
+                    // reachable here the day it is registered.
                     let names: Vec<String> = algorithms.iter().map(|s| s.to_string()).collect();
+                    let me = me.clone();
                     move |i, _, cx| {
                         let Some(name) = names.get(i).cloned() else { return };
                         _ = me.update(cx, |this, cx| {
                             this.open = None;
-                            this.set_algorithm(&name, cx);
+                            let next =
+                                Overrides { algorithm: Some(name), ..this.over.clone() };
+                            this.set_overrides(next, cx);
                         });
                     }
                 },
+            ),
+            controls::picker(
+                "whitespace-picker",
+                &whitespace,
+                self.open == Some(Open::Whitespace),
+                &host.theme,
+                &host.font,
+                toggle(Open::Whitespace),
+                pick_over(|over, i| Overrides {
+                    whitespace: Whitespace::ALL.get(i).copied(),
+                    ..over.clone()
+                }),
             ),
         ]
     }
@@ -354,8 +393,8 @@ fn main() {
     let rediff: Option<Rediff> = match (which.as_str(), &source) {
         ("diff", Source::Repo(repo, revspec)) => {
             let (repo, revspec) = (repo.clone(), revspec.clone());
-            Some(Rc::new(move |host: &Host, algorithm: Option<&str>| {
-                plait_git::diff(&repo, &revspec, &host.differ, algorithm)
+            Some(Rc::new(move |host: &Host, over: &Overrides| {
+                plait_git::diff(&repo, &revspec, &host.differ, over)
             }))
         }
         _ => None,
@@ -518,7 +557,7 @@ fn main() {
                     // gets no strip rather than a strip of dead controls.
                     rediff: diff_entity.as_ref().and(rediff),
                     diff: diff_entity,
-                    algorithm: None,
+                    over: Overrides::default(),
                     open: None,
                     error: None,
                 });
@@ -546,7 +585,7 @@ fn load(which: &str, source: &Source, host: &Host) -> Result<(String, Data), Str
         ("diff", Source::Repo(repo, revspec)) => {
             // The host's differs, not a default: which algorithm ran is a
             // configured choice, and this is the one place it is made.
-            let files = plait_git::diff(repo, revspec, &host.differ, None)?;
+            let files = plait_git::diff(repo, revspec, &host.differ, &Overrides::default())?;
             if files.is_empty() {
                 return Err(format!(
                     "no changes for {:?} {}",

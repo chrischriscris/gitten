@@ -28,7 +28,7 @@
 //! The OIDs are the reason to want it this way round anyway: a blob's content
 //! never changes, so a diff keyed on the pair of them is cacheable forever.
 
-use plait_core::differ::Differs;
+use plait_core::differ::{Differs, Overrides};
 use plait_core::{parse_log, Commit, FileDiff};
 use std::collections::HashMap;
 use std::io::Write;
@@ -175,12 +175,12 @@ pub fn pairs(repo: &Path, revspec: &str) -> Result<Vec<Pair>> {
 /// A diff, through whichever [`Differ`](plait_core::differ::Differ) the host
 /// routed each path to.
 ///
-/// `algorithm` overrides that routing with a live pick — the title-bar dropdown
-/// — and `None` is the configured behaviour. It is here rather than folded into
-/// `differs` because the registry belongs to the shared `Host`, which is
-/// immutable and replaced wholesale on config reload; a name is the only way to
-/// say "that registry, this choice" without building a second one and losing
-/// whatever an extension put in it.
+/// `over` carries a frontend's live picks — the title-bar dropdowns — and
+/// `Overrides::default()` is the configured behaviour. It is here rather than
+/// folded into `differs` because the registry belongs to the shared `Host`, which
+/// is immutable and replaced wholesale on config reload; names are the only way
+/// to say "that registry, these choices" without building a copy of it and losing
+/// whatever an extension put in.
 ///
 /// The frontend never learns which implementation ran, and never learns whether
 /// the content came from the object database or the working tree.
@@ -188,7 +188,7 @@ pub fn diff(
     repo: &Path,
     revspec: &str,
     differs: &Differs,
-    algorithm: Option<&str>,
+    over: &Overrides,
 ) -> Result<Vec<FileDiff>> {
     Ok(pairs(repo, revspec)?
         .iter()
@@ -200,7 +200,7 @@ pub fn diff(
             false => {
                 let old: Vec<&str> = p.old.iter().map(String::as_str).collect();
                 let new: Vec<&str> = p.new.iter().map(String::as_str).collect();
-                FileDiff { path: p.label(), ..differs.file_using(algorithm, &p.path, &old, &new) }
+                FileDiff { path: p.label(), ..differs.file_using(over, &p.path, &old, &new) }
             }
         })
         .collect())

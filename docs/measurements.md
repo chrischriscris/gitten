@@ -27,42 +27,69 @@ swaps each real fixture in and restores what was there.
 
 ### The differs, against git
 
-`git/examples/diffcheck.rs`, run for four inputs by `./check.sh`'s `differs vs
-git` section. **A minimal edit script has exactly one length, so Myers must match
-`git diff --minimal` exactly** — that is the correctness check, not a benchmark.
-Hunk *offsets* are deliberately not compared: git runs `--indent-heuristic` by
-default, which slides a hunk to an equivalent, more readable position, so the
-counts agree while the hunk count occasionally differs by one.
+`git/examples/diffcheck.rs`, six git invocations per input, four inputs, run by
+`./check.sh`'s `differs vs git` section. It compares **changed-line counts and
+every hunk position**. A minimal edit script has exactly one length, so `myers`
+must match `git diff --minimal` line for line.
 
-Changed lines, ours against git's, on this machine:
+Changed lines and hunk positions, this machine, against `git 2.51`:
 
-| input | files | old+new lines | our histogram | git `--histogram` | our myers | git `--minimal` |
-|---|---|---|---|---|---|---|
-| this repo, `HEAD~4..HEAD` | 19 | 25,587 | +1693 −46 | +1693 −46 | +1693 −46 | +1693 −46 |
-| this repo, whole history | 49 | 30,216 | +9633 −315 | +9633 −315 | +9625 −307 | +9625 −307 |
-| `cmux`, `HEAD~5..HEAD` | 36 | 622,288 | +2264 −224 | +2264 −224 | +2264 −224 | +2264 −224 |
-| `git/git`, `HEAD~5..HEAD` | 18 | 40,753 | +527 −36 | +527 −36 | +527 −36 | +527 −36 |
+| mode | git flags | counts match | positions match |
+|---|---|---|---|
+| `histogram` | `--histogram` | all four inputs | all four inputs |
+| `patience` | `--patience` | +4 in 9,938 on one input | all four inputs |
+| `myers` | `--minimal` | all four inputs | 1–4 hunks per input placed differently |
+| `trailing` | `--histogram --ignore-space-at-eol` | all four | all four |
+| `change` | `--histogram -b` | all four | all four |
+| `all` | `--histogram -w` | all four | all four |
 
-Every algorithm agrees with git on every input, except our `patience`, which is
-**+4 changed lines in 9,938** on the whole-history diff. Not a bug and not
-tolerated silently: ours is patience's *idea* — anchor only on lines appearing
-once — through the histogram machinery, where git's `--patience` takes the longest
+Five of the six rows match git's hunk positions exactly on every input, which is
+what makes them a test of the indent heuristic rather than a description of it.
+
+Two rows do not match exactly, and neither is a defect:
+
+**`patience`** is patience's *idea* — anchor only on lines appearing once —
+through the histogram machinery, where git's `--patience` takes the longest
 increasing subsequence of all unique-line matches at once. `diffcheck` flags a
 drift past 1%.
 
-Time, same inputs, ours against the `git` process it replaced. The comparison is
-unfair in git's favour on nothing and in ours on process startup, so read it as an
-order of magnitude and not as a factor:
+**`myers`** matches git's line counts everywhere and places 1–4 hunks per input
+elsewhere. A minimal script has one length but not one *shape*: several scripts of
+that length exist, ours picks a different one from git's, and the slide then places
+it differently. The counts agreeing is what proves both are still minimal. The
+anchored rows have no such freedom, which is what makes their exact positions the
+real test of the indent heuristic.
 
-| input | our histogram | our myers | `git diff --histogram` |
+**The positions column is the whole reason this check was extended**, and it
+earned itself twice in one sitting. Both bugs it found left every changed-line
+count identical:
+
+1. The indent heuristic scored a position's indentation by *magnitude* where git
+   compares it by *sign*. Plausible either way in prose; it slid hunks to places
+   git does not put them.
+2. The slide tested line equality against the real text rather than through the
+   whitespace relation, so under `-b` and `-w` it could not cross a reindented
+   line where git can. Two hunks in cmux's history.
+
+Nothing in the counts column moved for either. Comparing positions found the
+first in one run and the second in the next.
+
+Time, ours against the `git` process it replaced. Unfair to git on process
+startup and to nobody else, so read it as an order of magnitude:
+
+| input | ours, histogram | ours, `-w` | `git diff --histogram` |
 |---|---|---|---|
-| this repo, `HEAD~4..HEAD` | 1.3 ms | 1.1 ms | 15.7 ms |
-| this repo, whole history | 2.1 ms | 3.1 ms | 19.8 ms |
-| `cmux`, `HEAD~5..HEAD` | 28.6 ms | 23.5 ms | 53.0 ms |
-| `git/git`, `HEAD~5..HEAD` | 2.4 ms | 1.6 ms | 22.4 ms |
+| this repo, `HEAD~4..HEAD` | 3.2 ms | 7.4 ms | 31 ms |
+| `cmux`, `HEAD~4..HEAD` (307k lines) | 28 ms | 108 ms | 79 ms |
+| `git/git`, `HEAD~4..HEAD` | 2.0 ms | 8.4 ms | 22 ms |
 
-Acquisition is separate and is two processes regardless of file count: 25–32 ms on
-this repository, 96 ms for cmux's 622k lines. One exception worth knowing about —
+Ignoring whitespace costs 2–4× the exact relation, and all of it is the
+per-line normalisation — one `String` per line of both files. It is paid on a
+click, not on a frame, and the obvious fix if that ever changes is to hash the
+keys instead of materialising them.
+
+Acquisition is separate and is two processes regardless of file count: 45 ms on
+this repository, 125 ms for cmux's 307k lines. One exception worth knowing about —
 **a blobless partial clone fetches over the network on demand.** The first
 `HEAD~5..HEAD` in `~/Projects/git` cost **15.0 s** of `cat-file` waiting on the
 promisor remote and **42 ms** once the blobs were local. `git diff` in the same

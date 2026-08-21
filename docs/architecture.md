@@ -32,7 +32,7 @@ because it compiles in a second and its tests need no window.
 | module | what lives there |
 |---|---|
 | `lib.rs` | commit and diff parsing, `assign_lanes`, `intraline`, `replace_pairs`, `initials` |
-| `differ.rs` | the `Differ` trait, Histogram/Patience/Myers, hunk assembly, routing |
+| `differ.rs` | the `Differ` trait, Histogram/Patience/Myers, whitespace relations, the indent heuristic, move detection, hunk assembly, routing |
 | `align.rs` | which removal sits opposite which addition, for a two-column view |
 | `prepared.rs` | a diff assembled into drawable rows: clip → intraline → syntax |
 | `markdown.rs` | a `.md` diff as blocks, with the markers cut and the ranges moved |
@@ -159,9 +159,19 @@ Listed so nobody reads an intention as a description:
 - **`\ No newline at end of file`.** Content is split into lines, so a file with
   and without a trailing newline produce the same list and the distinction is
   lost. Needs a per-side flag on `Pair` and somewhere in `DiffLine` for a note.
-- **git's `--indent-heuristic`.** Ours does not slide a hunk to a more readable
-  equivalent position, so hunk offsets occasionally differ from git's by one while
-  the changed-line count does not.
+- **Semantic diffs.** The seam takes an implementation from outside `core`, so a
+  tree-sitter differ has somewhere to live. What it has nowhere to *say* is the
+  sub-line part: `Edit` is line ranges, and a tree diff's whole value is "this
+  argument was added". The pipeline already has the resolution — `Span`, from the
+  intraline pass — but that is computed independently in stage 3b, so a `Differ`
+  cannot emit it. Making semantic pay off is a change to the seam, not a new
+  implementation behind it. See
+  [decisions/0003](decisions/0003-scanner-over-tree-sitter.md) for what
+  tree-sitter measured last time it was considered.
+- **Move detection across files.** `moves` works within one file's script, so a
+  block cut from one file and pasted into another is two unrelated changes. git
+  has the same limit by default and lifts it with `--color-moved`\'s
+  cross-file modes.
 - **`gix`.** All reads still spawn `git`.
 - **A rendering test.** Every stage up to `Rows::render` is tested headlessly and
   `paint.rs` draws a real diff in ANSI, but nothing exercises a GPUI element tree:

@@ -127,6 +127,7 @@ enum Row {
     Line {
         block: Block,
         kind: LineKind,
+        moved: bool,
         old: SharedString,
         new: SharedString,
         text: SharedString,
@@ -197,6 +198,7 @@ impl Rows for MarkdownRows {
                 self.rows.push(Row::Line {
                     block,
                     kind: l.kind,
+                    moved: l.moved,
                     old: number(l.old_no),
                     new: number(l.new_no),
                     text: l.text.into(),
@@ -240,8 +242,8 @@ impl Rows for MarkdownRows {
         match &self.rows[index] {
             Row::File { path, adds, dels } => file_header(path, *adds, *dels, theme),
             Row::Hunk(header) => hunk_header(header, theme),
-            Row::Line { block, kind, old, new, text, spans, tokens } => {
-                self.line(*block, *kind, old, new, text, spans, tokens, theme)
+            Row::Line { block, kind, moved, old, new, text, spans, tokens } => {
+                self.line(*block, *kind, *moved, old, new, text, spans, tokens, theme)
             }
         }
     }
@@ -253,6 +255,7 @@ impl MarkdownRows {
         &self,
         block: Block,
         kind: LineKind,
+        moved: bool,
         old: &SharedString,
         new: &SharedString,
         text: &SharedString,
@@ -262,7 +265,7 @@ impl MarkdownRows {
     ) -> AnyElement {
         let m = &self.metrics;
         let md = &theme.markdown;
-        let (bg, fg, sign) = line_colors(kind, &theme.diff);
+        let (bg, fg, sign) = line_colors(kind, moved, &theme.diff);
 
         // The gutter is the built-in's, unchanged. Whatever the row does with the
         // text, the two line numbers and the sign have to sit where they sit on
@@ -284,7 +287,7 @@ impl MarkdownRows {
         if block.is_table() {
             let body = div().flex_none().text_color(rgb(fg)).child(
                 StyledText::new(text.clone())
-                    .with_highlights(runs(text, tokens, spans, theme, kind)),
+                    .with_highlights(runs(text, tokens, spans, theme, kind, moved)),
             );
             // The grid is structure, not content, and a separator row is nothing
             // but grid.
@@ -352,7 +355,8 @@ impl MarkdownRows {
         }
 
         let body = div().flex_none().text_color(rgb(fg)).child(
-            StyledText::new(text.clone()).with_highlights(runs(text, tokens, spans, theme, kind)),
+            StyledText::new(text.clone())
+                .with_highlights(runs(text, tokens, spans, theme, kind, moved)),
         );
         let body = match block {
             Block::Heading(level) => body.text_size(px(m.size(level))).font_weight(FontWeight::BOLD),

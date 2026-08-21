@@ -58,6 +58,7 @@
 //! up, and [`apply`] says so in its warnings rather than leaving you guessing.
 
 use gpui::{App, Global};
+use plait_core::differ::Whitespace;
 use plait_core::font::Font;
 use plait_core::host::Host;
 use plait_core::syntax::Kind;
@@ -120,6 +121,8 @@ rgb_fields! {
         "added_word_bg" = diff.added_word_bg,
         "removed_bg" = diff.removed_bg, "removed_fg" = diff.removed_fg,
         "removed_word_bg" = diff.removed_word_bg,
+        "moved_removed_bg" = diff.moved_removed_bg,
+        "moved_added_bg" = diff.moved_added_bg,
         "absent_bg" = diff.absent_bg;
     "markdown":
         "code_bar" = markdown.code_bar, "quote_bar" = markdown.quote_bar,
@@ -237,6 +240,43 @@ fn apply_diff(host: &mut Host, value: &toml::Value, warn: &mut Vec<String>) {
                     }
                 }
                 _ => warn.push("config: diff.context must be between 0 and 100".into()),
+            },
+            "whitespace" => match v.as_str().and_then(Whitespace::from_name) {
+                Some(w) if w == host.differ.whitespace => {}
+                Some(w) => {
+                    host.differ.whitespace = w;
+                    warn.push("config: diff.whitespace applies on the next launch".into());
+                }
+                None => warn.push(format!(
+                    "config: diff.whitespace must be one of {}",
+                    Whitespace::ALL.iter().map(|w| w.name()).collect::<Vec<_>>().join(", ")
+                )),
+            },
+            // A length, not a switch: the threshold is what keeps two matching
+            // `}` lines out of it, and somebody tuning that wants the number.
+            "moves" => match v.as_integer() {
+                Some(n) if (0..=1000).contains(&n) => {
+                    if n as usize != host.differ.min_moved {
+                        host.differ.min_moved = n as usize;
+                        warn.push("config: diff.moves applies on the next launch".into());
+                    }
+                }
+                _ => warn.push(
+                    "config: diff.moves must be between 0 (off) and 1000 lines".into(),
+                ),
+            },
+            "indent_heuristic" => match v.as_bool() {
+                Some(b) => {
+                    if b != host.differ.indent_heuristic {
+                        host.differ.indent_heuristic = b;
+                        warn.push(
+                            "config: diff.indent_heuristic applies on the next launch".into(),
+                        );
+                    }
+                }
+                None => {
+                    warn.push("config: diff.indent_heuristic must be true or false".into())
+                }
             },
             "layout" => match v.as_str() {
                 Some(name) if name == host.layout => {}
@@ -454,6 +494,19 @@ pub fn dump(host: &Host) -> String {
         host.differ.names().join(", ")
     ));
     out.push_str(&format!("context = {}\n", host.differ.context));
+    out.push_str(&format!(
+        "whitespace = {:?}    # {}\n",
+        host.differ.whitespace.name(),
+        Whitespace::ALL.iter().map(|w| w.name()).collect::<Vec<_>>().join(", ")
+    ));
+    out.push_str(&format!(
+        "moves = {}            # shortest block reported as moved; 0 is off\n",
+        host.differ.min_moved
+    ));
+    out.push_str(&format!(
+        "indent_heuristic = {}  # slide each change to a readable boundary, as git does\n",
+        host.differ.indent_heuristic
+    ));
     out.push_str(&format!("layout = {:?}    # unified, split\n\n", host.layout));
 
     let t = &host.theme;
@@ -600,11 +653,18 @@ mod tests {
     #[test]
     fn the_diff_table_reaches_the_host() {
         let mut h = host();
-        let warn = apply(&mut h, "[diff]\nalgorithm = \"myers\"\ncontext = 7\nlayout = \"split\"\n");
+        let warn = apply(
+            &mut h,
+            "[diff]\nalgorithm = \"myers\"\ncontext = 7\nlayout = \"split\"\n\
+             whitespace = \"all\"\nmoves = 0\nindent_heuristic = false\n",
+        );
         assert!(warn.iter().all(|w| w.contains("next launch")), "{warn:?}");
         assert_eq!(h.differ.selected(), "myers");
         assert_eq!(h.differ.context, 7);
         assert_eq!(h.layout, "split");
+        assert_eq!(h.differ.whitespace, Whitespace::All);
+        assert_eq!(h.differ.min_moved, 0);
+        assert!(!h.differ.indent_heuristic);
     }
 
     #[test]
@@ -642,10 +702,20 @@ mod tests {
     #[test]
     fn nonsense_in_the_diff_table_is_refused() {
         let mut h = host();
-        let warn = apply(&mut h, "[diff]\ncontext = -1\nlayout = \"\"\nwobble = 1\n");
+        let warn = apply(
+            &mut h,
+            "[diff]\ncontext = -1\nlayout = \"\"\nwobble = 1\n\
+             whitespace = \"sometimes\"\nmoves = -3\nindent_heuristic = \"yes\"\n",
+        );
         assert_eq!(h.differ.context, 3);
         assert_eq!(h.layout, "unified");
-        assert_eq!(warn.len(), 3, "{warn:?}");
+        assert_eq!(h.differ.whitespace, Whitespace::Exact);
+        assert_eq!(h.differ.min_moved, 3);
+        assert!(h.differ.indent_heuristic);
+        assert_eq!(warn.len(), 6, "{warn:?}");
+        // The message names the options rather than restating them here, so it
+        // cannot go stale.
+        assert!(warn.iter().any(|w| w.contains("trailing")), "{warn:?}");
     }
 
     #[test]
@@ -736,6 +806,9 @@ mod tests {
         original.font = Font { family: "Iosevka".into(), size: 15.0, monospaced: true, advance: 0.5 };
         original.differ.select("patience");
         original.differ.context = 5;
+        original.differ.whitespace = Whitespace::Change;
+        original.differ.min_moved = 8;
+        original.differ.indent_heuristic = false;
         original.layout = "split".into();
         original.theme.rebuild();
 
@@ -750,6 +823,9 @@ mod tests {
         assert_eq!(restored.font, original.font, "font did not survive");
         assert_eq!(restored.differ.selected(), "patience", "diff.algorithm did not survive");
         assert_eq!(restored.differ.context, 5, "diff.context did not survive");
+        assert_eq!(restored.differ.whitespace, Whitespace::Change);
+        assert_eq!(restored.differ.min_moved, 8);
+        assert!(!restored.differ.indent_heuristic);
         assert_eq!(restored.layout, "split", "diff.layout did not survive");
     }
 

@@ -536,6 +536,7 @@ enum Row {
     Hunk(SharedString),
     Line {
         kind: LineKind,
+        moved: bool,
         old: SharedString,
         new: SharedString,
         text: SharedString,
@@ -549,11 +550,22 @@ enum Row {
 #[derive(Default)]
 pub struct TextRows {
     rows: Vec<Row>,
+    /// How many rows are part of a block that moved, for the overlay. Reported
+    /// because move detection is otherwise invisible when it finds nothing, and
+    /// "it found nothing" and "it is switched off" look identical on screen.
+    moved: usize,
 }
 
 impl Rows for TextRows {
     fn claims(&self, _path: &str) -> bool {
         true
+    }
+
+    fn report(&self) -> String {
+        match self.moved {
+            0 => String::new(),
+            n => format!("{n} moved"),
+        }
     }
 
     fn len(&self) -> usize {
@@ -569,8 +581,10 @@ impl Rows for TextRows {
         for h in f.hunks {
             self.rows.push(Row::Hunk(h.header.into()));
             for l in h.lines {
+                self.moved += l.moved as usize;
                 self.rows.push(Row::Line {
                     kind: l.kind,
+                    moved: l.moved,
                     old: number(l.old_no),
                     new: number(l.new_no),
                     text: l.text.into(),
@@ -597,8 +611,8 @@ impl Rows for TextRows {
 
             Row::Hunk(header) => hunk_header(header, theme),
 
-            Row::Line { kind, old, new, text, spans, tokens } => {
-                let (bg, fg, sign) = line_colors(*kind, p);
+            Row::Line { kind, moved, old, new, text, spans, tokens } => {
+                let (bg, fg, sign) = line_colors(*kind, *moved, p);
                 div()
                     .flex()
                     .items_center()
@@ -611,7 +625,7 @@ impl Rows for TextRows {
                     .child(
                         div().flex_none().text_color(rgb(fg)).child(
                             StyledText::new(text.clone())
-                                .with_highlights(runs(text, tokens, spans, theme, *kind)),
+                                .with_highlights(runs(text, tokens, spans, theme, *kind, *moved)),
                         ),
                     )
                     .into_any_element()
@@ -655,17 +669,27 @@ pub(crate) fn hunk_header(header: &SharedString, theme: &Theme) -> AnyElement {
         .into_any_element()
 }
 
-/// Which background a line of `kind` is drawn on, and the surfaces a token
-/// lands on there. Shared so the two presentations cannot drift on what "added"
+/// Which background a line is drawn on, and the foreground and sign that go with
+/// it. Shared by all three presentations so they cannot drift on what "added"
 /// looks like.
+///
+/// `moved` swaps the background and nothing else. The `+` and `-` stay, so a
+/// column of signs is still scannable, and the foreground stays so a moved block
+/// reads as ordinary text — which it is. Only the hue says "you may skip this",
+/// which is how git's `--color-moved` does it too.
 pub(crate) fn line_colors(
     kind: LineKind,
+    moved: bool,
     p: &DiffPalette,
 ) -> (Rgb, Rgb, &'static str) {
-    match kind {
-        LineKind::Added => (p.added_bg, p.added_fg, "+"),
-        LineKind::Removed => (p.removed_bg, p.removed_fg, "-"),
-        LineKind::Context => (p.context_bg, p.context_fg, " "),
+    match (kind, moved) {
+        (LineKind::Added, false) => (p.added_bg, p.added_fg, "+"),
+        (LineKind::Added, true) => (p.moved_added_bg, p.added_fg, "+"),
+        (LineKind::Removed, false) => (p.removed_bg, p.removed_fg, "-"),
+        (LineKind::Removed, true) => (p.moved_removed_bg, p.removed_fg, "-"),
+        // Context is never moved: a line that did not change did not go
+        // anywhere, and `mark_moved` says so.
+        (LineKind::Context, _) => (p.context_bg, p.context_fg, " "),
     }
 }
 
@@ -691,14 +715,24 @@ pub(crate) fn runs(
     spans: &[Span],
     theme: &Theme,
     kind: LineKind,
+    moved: bool,
 ) -> Vec<(Range<usize>, HighlightStyle)> {
     // Which background each run actually lands on, so the theme can hand back a
     // foreground that reads against it. A changed word sits on a lighter
     // background than the rest of its line and needs a different answer.
-    let (plain_surface, word_surface) = match kind {
-        LineKind::Added => (Surface::Added, Surface::AddedWord),
-        LineKind::Removed => (Surface::Removed, Surface::RemovedWord),
-        LineKind::Context => (Surface::Context, Surface::Context),
+    //
+    // A moved line is the same text in a different place, so nothing inside it
+    // changed and its spans describe a change the detection just said was not
+    // one. Dropped here rather than coloured the same as the row: an invisible
+    // run is still a run to merge and shape.
+    let spans: &[Span] = if moved { &[] } else { spans };
+
+    let (plain_surface, word_surface) = match (kind, moved) {
+        (LineKind::Added, false) => (Surface::Added, Surface::AddedWord),
+        (LineKind::Added, true) => (Surface::MovedAdded, Surface::MovedAdded),
+        (LineKind::Removed, false) => (Surface::Removed, Surface::RemovedWord),
+        (LineKind::Removed, true) => (Surface::MovedRemoved, Surface::MovedRemoved),
+        (LineKind::Context, _) => (Surface::Context, Surface::Context),
     };
     let word_bg = theme.background(word_surface);
     if tokens.is_empty() && spans.is_empty() {
@@ -754,7 +788,7 @@ pub(crate) fn runs(
 mod tests {
     // By name, not a glob: `use gpui::*` in the parent shadows `#[test]` with
     // GPUI's own attribute macro and every test in here fails to expand.
-    use super::{runs, Diff, Layouts, Rows, TextRows};
+    use super::{line_colors, runs, Diff, Layouts, Rows, TextRows};
     use gpui::{div, AnyElement, FontStyle, FontWeight, HighlightStyle, IntoElement, ParentElement};
     use plait_core::host::Host;
     use plait_core::syntax::{Kind, Token};
@@ -778,7 +812,7 @@ mod tests {
     #[test]
     fn plain_text_produces_no_runs_at_all() {
         let theme = Theme::default_dark();
-        assert!(runs("nothing here", &[], &[], &theme, LineKind::Context).is_empty());
+        assert!(runs("nothing here", &[], &[], &theme, LineKind::Context, false).is_empty());
     }
 
     #[test]
@@ -788,7 +822,7 @@ mod tests {
         let theme = Theme::default_dark();
         let text = "let x = 1;";
         let out =
-            runs(text, &[tok(0, 3, Kind::Keyword)], &[Span { start: 0, end: 3 }], &theme, LineKind::Added);
+            runs(text, &[tok(0, 3, Kind::Keyword)], &[Span { start: 0, end: 3 }], &theme, LineKind::Added, false);
         well_formed(text, &out);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].0, 0..3);
@@ -803,7 +837,7 @@ mod tests {
         let theme = Theme::default_dark();
         let text = "let x = 1;";
         let out =
-            runs(text, &[tok(0, 3, Kind::Keyword)], &[Span { start: 2, end: 7 }], &theme, LineKind::Added);
+            runs(text, &[tok(0, 3, Kind::Keyword)], &[Span { start: 2, end: 7 }], &theme, LineKind::Added, false);
         well_formed(text, &out);
         let shape: Vec<_> = out
             .iter()
@@ -825,7 +859,7 @@ mod tests {
             tok(34, 42, Kind::Comment),
         ];
         let spans = vec![Span { start: 3, end: 12 }, Span { start: 28, end: 30 }];
-        let out = runs(text, &tokens, &spans, &theme, LineKind::Removed);
+        let out = runs(text, &tokens, &spans, &theme, LineKind::Removed, false);
         well_formed(text, &out);
         assert!(out
             .iter()
@@ -843,6 +877,7 @@ mod tests {
             &[Span { start: quote, end: text.len() - 1 }],
             &theme,
             LineKind::Added,
+            false,
         );
         well_formed(text, &out);
     }
@@ -861,12 +896,68 @@ mod tests {
             &[],
             &theme,
             LineKind::Context,
+            false,
         );
         well_formed(text, &out);
         assert_eq!(out[0].1.font_weight, Some(FontWeight::BOLD));
         assert_eq!(out[0].1.font_style, None);
         assert_eq!(out[1].1.font_style, Some(FontStyle::Italic));
         assert_eq!(out[1].1.font_weight, None);
+    }
+
+    #[test]
+    fn a_moved_line_is_drawn_on_its_own_background() {
+        // The point of move detection: a moved block has to recede from the
+        // add/remove hues, or there is nothing to skip.
+        let theme = Theme::default_dark();
+        let p = &theme.diff;
+        for kind in [LineKind::Added, LineKind::Removed] {
+            let (plain, _, sign) = line_colors(kind, false, p);
+            let (moved, _, moved_sign) = line_colors(kind, true, p);
+            assert_ne!(plain, moved, "{kind:?} moved and unmoved share a background");
+            assert_eq!(sign, moved_sign, "the sign column must stay scannable");
+        }
+        // Context is never moved, and asking must not change what it looks like.
+        assert_eq!(
+            line_colors(LineKind::Context, true, p),
+            line_colors(LineKind::Context, false, p)
+        );
+    }
+
+    #[test]
+    fn a_token_on_a_moved_line_is_resolved_against_that_background() {
+        // The reason `Surface` gained two variants rather than the moved
+        // background being painted under an unmoved foreground: the contrast
+        // resolver has to see the background the text actually lands on.
+        //
+        // The shipped theme's moved backgrounds sit at almost the same luminance
+        // as the ones they replace, so its greys come out identical — which is
+        // the resolver being stable, not the surfaces being ignored. A theme that
+        // moves the background properly is what shows the difference.
+        let mut theme = Theme::default_dark();
+        theme.diff.moved_removed_bg = 0xf2ede6;
+        theme.rebuild();
+        let text = "// a comment that moved";
+        let tokens = [tok(0, text.len(), Kind::Comment)];
+        let plain = runs(text, &tokens, &[], &theme, LineKind::Removed, false);
+        let moved = runs(text, &tokens, &[], &theme, LineKind::Removed, true);
+        well_formed(text, &plain);
+        well_formed(text, &moved);
+        assert_ne!(plain[0].1.color, moved[0].1.color, "the same grey on both");
+    }
+
+    #[test]
+    fn a_moved_line_lights_up_no_changed_words() {
+        // A moved line is the same text somewhere else, so a changed-word
+        // background on it would be describing a change the detection just said
+        // was not one.
+        let theme = Theme::default_dark();
+        let text = "let x = 1;";
+        let spans = [Span { start: 0, end: 3 }];
+        let out = runs(text, &[], &spans, &theme, LineKind::Added, true);
+        let unmoved = runs(text, &[], &spans, &theme, LineKind::Added, false);
+        assert!(unmoved.iter().any(|(_, s)| s.background_color.is_some()));
+        assert!(out.is_empty(), "a moved line produced runs for nothing: {out:?}");
     }
 
     #[test]
@@ -883,6 +974,7 @@ mod tests {
             &[Span { start: 10, end: text.len() }],
             &theme,
             LineKind::Added,
+            false,
         );
         well_formed(text, &out);
         let plain = out.iter().find(|(r, _)| r.start == 0).unwrap();

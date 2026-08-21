@@ -691,6 +691,9 @@ fn line(kind: LineKind, old_no: Option<usize>, new_no: Option<usize>, text: &str
         old_no: old_no.map(|n| n as u32 + 1),
         new_no: new_no.map(|n| n as u32 + 1),
         text: text.to_string(),
+        // Set afterwards by `mark_moved`, once the whole script is known: a
+        // block that moved cannot be recognised from one hunk.
+        moved: false,
     }
 }
 
@@ -745,6 +748,528 @@ fn enclosing<'a>(old: &[&'a str], from: usize) -> Option<&'a str> {
     })
 }
 
+// ------------------------------------------------------------- how lines match
+
+/// How much whitespace has to match for two lines to count as the same.
+///
+/// Not a different algorithm — a different *equivalence relation*, which is why
+/// it is a knob on [`Differs`] rather than three more implementations. Normalising
+/// is per line and length-preserving, so an edit script computed over the
+/// normalised text still addresses the original lines and the hunks show the real
+/// text. That is also what `git -w` does: a line whose only change was whitespace
+/// comes out as context, showing the version from the old file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Whitespace {
+    /// Byte for byte. git's default.
+    #[default]
+    Exact,
+    /// Trailing whitespace only. git's `--ignore-space-at-eol`.
+    Trailing,
+    /// Any run of whitespace equals any other, and trailing whitespace is gone.
+    /// git's `-b` / `--ignore-space-change`.
+    ///
+    /// Note what this does *not* do: a run collapses to one space rather than
+    /// vanishing, so `foo` and ` foo` still differ. Indentation changing from two
+    /// spaces to a tab does not.
+    Change,
+    /// All of it, anywhere. git's `-w` / `--ignore-all-space`.
+    All,
+}
+
+impl Whitespace {
+    pub const ALL: [Whitespace; 4] =
+        [Whitespace::Exact, Whitespace::Trailing, Whitespace::Change, Whitespace::All];
+
+    /// The name a config file and a picker use.
+    pub fn name(self) -> &'static str {
+        match self {
+            Whitespace::Exact => "exact",
+            Whitespace::Trailing => "trailing",
+            Whitespace::Change => "change",
+            Whitespace::All => "all",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|w| w.name() == name)
+    }
+
+    /// One line as this relation sees it. `None` means "unchanged", so the
+    /// common case allocates nothing.
+    fn key(self, line: &str) -> Option<String> {
+        match self {
+            Whitespace::Exact => None,
+            Whitespace::Trailing => Some(line.trim_end().to_string()),
+            Whitespace::All => Some(line.chars().filter(|c| !c.is_whitespace()).collect()),
+            Whitespace::Change => {
+                let mut out = String::with_capacity(line.len());
+                let mut space = false;
+                for c in line.trim_end().chars() {
+                    match c.is_whitespace() {
+                        true => space = true,
+                        false => {
+                            if space && !out.is_empty() {
+                                out.push(' ');
+                            } else if space {
+                                // A leading run still collapses to one space
+                                // rather than vanishing — `-b` keeps the fact
+                                // that the line was indented at all.
+                                out.push(' ');
+                            }
+                            space = false;
+                            out.push(c);
+                        }
+                    }
+                }
+                Some(out)
+            }
+        }
+    }
+
+    fn keys(self, lines: &[&str]) -> Option<Vec<String>> {
+        match self {
+            Whitespace::Exact => None,
+            _ => Some(lines.iter().map(|l| self.key(l).expect("not Exact")).collect()),
+        }
+    }
+}
+
+/// A frontend's live overrides of the configured behaviour.
+///
+/// Names and values rather than a second [`Differs`]: the registry belongs to the
+/// shared `Host`, is immutable, and may hold an extension's differ — building a
+/// copy of it to express "the same, but myers" would lose that. `None` on a field
+/// means "whatever was configured".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Overrides {
+    pub algorithm: Option<String>,
+    pub whitespace: Option<Whitespace>,
+}
+
+impl Overrides {
+    pub fn algorithm(name: impl Into<String>) -> Self {
+        Self { algorithm: Some(name.into()), ..Default::default() }
+    }
+}
+
+// ------------------------------------------------------------- moved blocks
+
+/// The shortest block worth calling a move.
+///
+/// Two identical lines are a coincidence — `}` and a blank line are everywhere —
+/// and reporting them as a move is noise on top of a diff that was legible
+/// without it. Git's `--color-moved=zebra` uses 3 for the same reason.
+pub const MIN_MOVED_LINES: usize = 3;
+
+/// Which removed and added lines belong to a block that moved.
+///
+/// Two bitmaps rather than a list of pairs, because the only question anyone asks
+/// is "is *this* line part of a move" — once per line, while assembling hunks.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Moves {
+    old: Vec<bool>,
+    new: Vec<bool>,
+}
+
+impl Moves {
+    /// No moves at all, and the cheap answer to every query.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        !self.old.iter().any(|b| *b) && !self.new.iter().any(|b| *b)
+    }
+
+    /// How many lines are part of some move, for a report.
+    pub fn len(&self) -> usize {
+        self.old.iter().filter(|b| **b).count() + self.new.iter().filter(|b| **b).count()
+    }
+
+    pub fn old(&self, line: usize) -> bool {
+        self.old.get(line).copied().unwrap_or(false)
+    }
+
+    pub fn new(&self, line: usize) -> bool {
+        self.new.get(line).copied().unwrap_or(false)
+    }
+}
+
+/// Blocks that were deleted here and added there, rather than changed.
+///
+/// A post-pass over the edit script, not a differ: a move is only visible once
+/// the whole script is known, and every algorithm produces the same one.
+///
+/// The rule is a run of `min` or more removed lines whose text appears, in the
+/// same order, as a run of added lines. Greedy and longest-first from each start,
+/// which is what git does — an exact optimum would be a matching problem, and the
+/// difference is not visible on a screen.
+pub fn moves(old: &[&str], new: &[&str], edits: &[Edit], min: usize) -> Moves {
+    if min == 0 {
+        return Moves::none();
+    }
+    // Only the lines the script actually touched: a moved block is by definition
+    // removed on one side and added on the other, and matching against unchanged
+    // lines would call every repeated line a move.
+    let mut removed = vec![false; old.len()];
+    let mut added = vec![false; new.len()];
+    for e in edits {
+        removed[e.old()].fill(true);
+        added[e.new()].fill(true);
+    }
+
+    // Where each added line's text can be found. Built over the added lines
+    // only, so a line that also exists unchanged elsewhere is not a candidate.
+    let mut index: HashMap<&str, Vec<u32>> = HashMap::new();
+    for (i, line) in new.iter().enumerate() {
+        if added[i] && !line.trim().is_empty() {
+            index.entry(line).or_default().push(i as u32);
+        }
+    }
+
+    let mut out = Moves { old: vec![false; old.len()], new: vec![false; new.len()] };
+    let mut taken = vec![false; new.len()];
+    let mut i = 0;
+    while i < old.len() {
+        if !removed[i] {
+            i += 1;
+            continue;
+        }
+        // The longest run starting here, over every place its first line landed.
+        let mut best = (0usize, 0usize);
+        for &start in index.get(old[i]).map(Vec::as_slice).unwrap_or(&[]) {
+            let start = start as usize;
+            let mut len = 0;
+            while i + len < old.len()
+                && start + len < new.len()
+                && removed[i + len]
+                && added[start + len]
+                && !taken[start + len]
+                && old[i + len] == new[start + len]
+            {
+                len += 1;
+            }
+            if len > best.0 {
+                best = (len, start);
+            }
+        }
+        if best.0 < min {
+            i += 1;
+            continue;
+        }
+        let (len, start) = best;
+        out.old[i..i + len].fill(true);
+        out.new[start..start + len].fill(true);
+        // Claimed, so a block deleted once and added twice marks one landing
+        // site rather than reporting the same lines as two moves.
+        taken[start..start + len].fill(true);
+        i += len;
+    }
+    out
+}
+
+/// Marks the lines of `hunks` that [`moves`] found.
+///
+/// After assembly rather than during it, so `hunks` stays a pure function of the
+/// edit script and nothing about move detection reaches it.
+pub fn mark_moved(hunks: &mut [Hunk], m: &Moves) {
+    for line in hunks.iter_mut().flat_map(|h| &mut h.lines) {
+        line.moved = match line.kind {
+            LineKind::Removed => line.old_no.is_some_and(|n| m.old(n as usize - 1)),
+            LineKind::Added => line.new_no.is_some_and(|n| m.new(n as usize - 1)),
+            LineKind::Context => false,
+        };
+    }
+}
+
+// ------------------------------------------------------- the indent heuristic
+
+/// Slides each edit to the most readable of its equivalent positions.
+///
+/// A run of changed lines can often sit in several places that describe exactly
+/// the same change: if the line leaving the top of the group equals the line
+/// entering the bottom, the whole group can shift by one and mean the same thing.
+/// Which of those positions a reader wants is not arbitrary — a hunk that starts
+/// at a function's signature reads; the same hunk starting at the previous
+/// function's closing brace does not.
+///
+/// This is git's `--indent-heuristic`, on by default there since 2.14 and ported
+/// rather than reinvented for one reason: it is the only version whose output can
+/// be *checked*. `git/examples/diffcheck.rs` compares hunk counts, and an
+/// approximation of these weights would differ from git in a way no test could
+/// call right or wrong. The constants below are xdiff's, names and values.
+pub fn compact(old: &[&str], new: &[&str], edits: &mut [Edit]) {
+    compact_with(old, new, old, new, edits)
+}
+
+/// [`compact`] where the text to *score* and the text to *compare* differ.
+///
+/// They differ whenever a [`Whitespace`] relation is in play, and conflating them
+/// is a bug in each direction. A slide is possible when the relation says the
+/// line leaving one end equals the line entering the other — so equality has to
+/// use the keys, or `-w` cannot slide across a reindented line and git can. How
+/// *readable* the result is depends on the real indentation — so scoring has to
+/// use the text, because the keys are the thing that erased it.
+pub fn compact_with(
+    old: &[&str],
+    new: &[&str],
+    old_keys: &[&str],
+    new_keys: &[&str],
+    edits: &mut [Edit],
+) {
+    for i in 0..edits.len() {
+        // The window this group may slide within: not past its neighbours, and
+        // not off either end of the file.
+        let lo = if i == 0 { 0 } else { edits[i - 1].old_end as usize };
+        let hi = match edits.get(i + 1) {
+            Some(next) => next.old_start as usize,
+            None => old.len(),
+        };
+        slide(old, new, old_keys, new_keys, &mut edits[i], lo, hi);
+    }
+}
+
+/// Shifts one edit within `lo..hi` to the best-scoring equivalent position.
+#[allow(clippy::too_many_arguments)]
+fn slide(
+    old: &[&str],
+    new: &[&str],
+    old_keys: &[&str],
+    new_keys: &[&str],
+    e: &mut Edit,
+    lo: usize,
+    hi: usize,
+) {
+    // Only one side may be empty for a slide to be meaningful. A replace has both
+    // sides moving, and git slides those in each file independently through
+    // machinery this does not have; its boundaries are pinned on both sides
+    // anyway, so the case is rare.
+    let (lines, keys, start, end) = match (e.old().len(), e.new().len()) {
+        (0, 0) => return,
+        (0, _) => (new, new_keys, e.new_start as usize, e.new_end as usize),
+        (_, 0) => (old, old_keys, e.old_start as usize, e.old_end as usize),
+        _ => return,
+    };
+    let len = end - start;
+    if len == 0 {
+        return;
+    }
+
+    // Every position the group can occupy, found by walking it as far as it will
+    // go each way: the group can shift by one whenever the line leaving one end
+    // equals the line entering the other.
+    let mut lowest = start;
+    while lowest > 0 && keys[lowest - 1] == keys[lowest + len - 1] {
+        lowest -= 1;
+    }
+    let mut highest = start;
+    while highest + len < keys.len() && keys[highest] == keys[highest + len] {
+        highest += 1;
+    }
+    // Never over a neighbouring change: two edits that overlap describe nothing,
+    // and `verify` is the only thing that would notice.
+    if e.new().is_empty() {
+        lowest = lowest.max(lo);
+        highest = highest.min(hi.saturating_sub(len));
+    }
+    if lowest >= highest {
+        return;
+    }
+    // Bounded like git's, so a group inside ten thousand identical lines does not
+    // score ten thousand positions.
+    if highest - lowest > INDENT_HEURISTIC_MAX_SLIDING {
+        return;
+    }
+
+    let mut best = (score_at(lines, lowest, len), lowest);
+    for at in lowest + 1..=highest {
+        let score = score_at(lines, at, len);
+        // `<=`, so a tie goes to the *later* position. git's, and it matters:
+        // ties are common and the two answers are visibly different.
+        if score_cmp(&score, &best.0) <= 0 {
+            best = (score, at);
+        }
+    }
+    let shift = best.1 as i64 - start as i64;
+    e.old_start = (e.old_start as i64 + shift) as u32;
+    e.old_end = (e.old_end as i64 + shift) as u32;
+    e.new_start = (e.new_start as i64 + shift) as u32;
+    e.new_end = (e.new_end as i64 + shift) as u32;
+}
+
+// xdiff's weights, names and values. Do not tune these without re-running
+// `diffcheck` — they are the reason our hunk boundaries match git's.
+const MAX_INDENT: i64 = 200;
+const MAX_BLANKS: i64 = 20;
+const INDENT_WEIGHT: i64 = 60;
+const INDENT_HEURISTIC_MAX_SLIDING: usize = 100;
+const START_OF_FILE_PENALTY: i64 = 1;
+const END_OF_FILE_PENALTY: i64 = 21;
+const TOTAL_BLANK_WEIGHT: i64 = -30;
+const POST_BLANK_WEIGHT: i64 = 6;
+const RELATIVE_INDENT_PENALTY: i64 = -4;
+const RELATIVE_INDENT_WITH_BLANK_PENALTY: i64 = 10;
+const RELATIVE_OUTDENT_PENALTY: i64 = 24;
+const RELATIVE_OUTDENT_WITH_BLANK_PENALTY: i64 = 17;
+const RELATIVE_DEDENT_PENALTY: i64 = 23;
+const RELATIVE_DEDENT_WITH_BLANK_PENALTY: i64 = 17;
+
+/// Indentation in columns, tabs to the next multiple of eight. `None` for a line
+/// that is only whitespace, which has no indentation to compare.
+///
+/// Eight rather than the four `markdown::column_indent` uses, and other
+/// whitespace characters advance nothing without ending the run: both are
+/// xdiff's, because this is the function whose answers are being checked against
+/// git's.
+fn indent_of(line: &str) -> Option<i64> {
+    let mut n = 0i64;
+    for b in line.bytes() {
+        match b {
+            b' ' => n += 1,
+            b'\t' => n += 8 - (n % 8),
+            b'\r' | b'\n' | 0x0b | 0x0c => {}
+            _ => return Some(n),
+        }
+        if n >= MAX_INDENT {
+            return Some(MAX_INDENT);
+        }
+    }
+    None
+}
+
+/// What one split point looks like to the heuristic.
+struct Measure {
+    end_of_file: bool,
+    /// The line at the split. `None` when it is blank or past the end.
+    indent: Option<i64>,
+    pre_blank: i64,
+    pre_indent: Option<i64>,
+    post_blank: i64,
+    post_indent: Option<i64>,
+}
+
+fn measure(lines: &[&str], split: usize) -> Measure {
+    let (end_of_file, indent) = match split >= lines.len() {
+        true => (true, None),
+        false => (false, indent_of(lines[split])),
+    };
+
+    let mut pre_blank = 0;
+    let mut pre_indent = None;
+    let mut i = split;
+    while i > 0 {
+        i -= 1;
+        pre_indent = indent_of(lines[i]);
+        if pre_indent.is_some() {
+            break;
+        }
+        pre_blank += 1;
+        if pre_blank == MAX_BLANKS {
+            // Far enough: treat it as flush left rather than as unknown, so a
+            // group after twenty blank lines is not scored as start-of-file.
+            pre_indent = Some(0);
+            break;
+        }
+    }
+
+    let mut post_blank = 0;
+    let mut post_indent = None;
+    let mut j = split + 1;
+    while j < lines.len() {
+        post_indent = indent_of(lines[j]);
+        if post_indent.is_some() {
+            break;
+        }
+        post_blank += 1;
+        if post_blank == MAX_BLANKS {
+            post_indent = Some(0);
+            break;
+        }
+        j += 1;
+    }
+
+    Measure { end_of_file, indent, pre_blank, pre_indent, post_blank, post_indent }
+}
+
+/// A position's badness, in the two parts git keeps separate.
+///
+/// `effective_indent` is compared by *sign* and not by magnitude — that is the
+/// part that is easy to get wrong, and getting it wrong produces slides that look
+/// plausible and disagree with git. Ported as two fields plus [`score_cmp`] for
+/// exactly that reason.
+#[derive(Default, Clone, Copy)]
+struct Score {
+    effective_indent: i64,
+    penalty: i64,
+}
+
+fn score_at(lines: &[&str], at: usize, len: usize) -> Score {
+    let mut s = Score::default();
+    add_split(&measure(lines, at), &mut s);
+    add_split(&measure(lines, at + len), &mut s);
+    s
+}
+
+fn add_split(m: &Measure, s: &mut Score) {
+    if m.pre_indent.is_none() && m.pre_blank == 0 {
+        s.penalty += START_OF_FILE_PENALTY;
+    }
+    if m.end_of_file {
+        s.penalty += END_OF_FILE_PENALTY;
+    }
+
+    // Blank lines *following* the split, counting the line at it when that line
+    // is itself blank.
+    let post_blank = match m.indent {
+        None => 1 + m.post_blank,
+        Some(_) => 0,
+    };
+    let total_blank = m.pre_blank + post_blank;
+    s.penalty += TOTAL_BLANK_WEIGHT * total_blank;
+    s.penalty += POST_BLANK_WEIGHT * post_blank;
+
+    // A blank line takes the indentation of whatever follows it, so a break
+    // before a run of blanks is judged by the code after them.
+    let indent = m.indent.or(m.post_indent);
+    let any_blanks = total_blank != 0;
+    // -1 at the end of the file, which is what makes a break there compare
+    // favourably on indent and unfavourably on penalty.
+    s.effective_indent += indent.unwrap_or(-1);
+
+    let (Some(indent), Some(pre)) = (indent, m.pre_indent) else { return };
+    if indent > pre {
+        // More indented than what came before: likely inside a block.
+        s.penalty +=
+            if any_blanks { RELATIVE_INDENT_WITH_BLANK_PENALTY } else { RELATIVE_INDENT_PENALTY };
+    } else if indent == pre {
+        // Same level. Nothing to say.
+    } else if m.post_indent.is_some_and(|post| post > indent) {
+        // Less indented, and what follows is more: this line opens a block —
+        // an `else`, or a signature. A good place to break, relatively.
+        s.penalty +=
+            if any_blanks { RELATIVE_OUTDENT_WITH_BLANK_PENALTY } else { RELATIVE_OUTDENT_PENALTY };
+    } else {
+        // Less indented and nothing opens after it: the end of a block.
+        s.penalty +=
+            if any_blanks { RELATIVE_DEDENT_WITH_BLANK_PENALTY } else { RELATIVE_DEDENT_PENALTY };
+    }
+}
+
+/// Negative when `a` is the better place to break.
+///
+/// The indent comparison is three-way and then weighted, rather than the
+/// difference being weighted: a position one column further left wins by exactly
+/// as much as one a hundred columns further left. That is git's, and it is the
+/// whole reason this is a function and not a subtraction.
+fn score_cmp(a: &Score, b: &Score) -> i64 {
+    let indents = match a.effective_indent.cmp(&b.effective_indent) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    };
+    INDENT_WEIGHT * indents + (a.penalty - b.penalty)
+}
+
 // ---------------------------------------------------------------- the registry
 
 /// Which algorithm each path gets, and how much context its hunks carry.
@@ -760,6 +1285,13 @@ pub struct Differs {
     fallback: usize,
     /// Unchanged lines shown around each change. git's default is 3.
     pub context: usize,
+    /// How much whitespace has to match for two lines to count as the same.
+    pub whitespace: Whitespace,
+    /// Shortest block reported as a move; `0` turns detection off.
+    pub min_moved: usize,
+    /// Slide each change to the most readable of its equivalent positions. On,
+    /// as it is in git.
+    pub indent_heuristic: bool,
 }
 
 impl Default for Differs {
@@ -771,7 +1303,15 @@ impl Default for Differs {
 impl Differs {
     /// The three shipped algorithms, with Histogram selected.
     pub fn builtin() -> Self {
-        let mut d = Self { impls: Vec::new(), routes: Vec::new(), fallback: 0, context: 3 };
+        let mut d = Self {
+            impls: Vec::new(),
+            routes: Vec::new(),
+            fallback: 0,
+            context: 3,
+            whitespace: Whitespace::Exact,
+            min_moved: MIN_MOVED_LINES,
+            indent_heuristic: true,
+        };
         d.register(Histogram);
         d.register(Patience);
         d.register(Myers);
@@ -854,30 +1394,62 @@ impl Differs {
     /// This is what an acquisition layer calls. It never learns which algorithm
     /// ran, which is the point.
     pub fn file(&self, path: &str, old: &[&str], new: &[&str]) -> FileDiff {
-        self.file_using(None, path, old, new)
+        self.file_using(&Overrides::default(), path, old, new)
     }
 
-    /// The same, with a runtime override of both the routes and the configured
-    /// fallback.
+    /// The same, with a frontend's live overrides applied.
     ///
-    /// `Some(name)` is a frontend's live pick — the dropdown in the title bar.
-    /// It overrides the *routes* too, deliberately: a user who asks for myers
-    /// asked for the whole diff in myers, and quietly leaving `.json` on
-    /// whatever it was routed to would make the control lie about what is on
-    /// screen. A name that is not registered falls back to the configured
+    /// `Overrides::algorithm` overrides the *routes* too, deliberately: a user
+    /// who asks for myers asked for the whole diff in myers, and quietly leaving
+    /// `.json` on whatever it was routed to would make the control lie about what
+    /// is on screen. A name that is not registered falls back to the configured
     /// behaviour rather than failing, because the caller is a click.
+    ///
+    /// The four stages, in the order they have to happen:
+    ///
+    /// 1. **Normalise**, if the whitespace relation is not exact. Per line and
+    ///    length-preserving, so everything downstream still addresses the
+    ///    original lines and the hunks show the real text.
+    /// 2. **Diff** — the seam. The implementation never learns that 1 happened.
+    /// 3. **Compact**, sliding each change to the most readable of its equivalent
+    ///    positions. Before hunk assembly, because it moves the changes and the
+    ///    hunks are drawn around wherever they end up.
+    /// 4. **Detect moves**, which needs the whole script and so cannot be step 2.
     pub fn file_using(
         &self,
-        algorithm: Option<&str>,
+        over: &Overrides,
         path: &str,
         old: &[&str],
         new: &[&str],
     ) -> FileDiff {
-        let differ = algorithm
+        let differ = over
+            .algorithm
+            .as_deref()
             .and_then(|name| self.by_name(name))
             .unwrap_or_else(|| self.for_path(path));
-        let edits = differ.diff(path, old, new);
-        FileDiff { path: path.to_string(), hunks: hunks(old, new, &edits, self.context) }
+
+        let ws = over.whitespace.unwrap_or(self.whitespace);
+        let (old_keys, new_keys) = (ws.keys(old), ws.keys(new));
+        fn borrow(v: &Option<Vec<String>>) -> Option<Vec<&str>> {
+            v.as_ref().map(|v| v.iter().map(String::as_str).collect())
+        }
+        let (ok, nk) = (borrow(&old_keys), borrow(&new_keys));
+        let (cmp_old, cmp_new) = (ok.as_deref().unwrap_or(old), nk.as_deref().unwrap_or(new));
+
+        let mut edits = differ.diff(path, cmp_old, cmp_new);
+        if self.indent_heuristic {
+            // Both: readability is scored against the text a reader will see, and
+            // whether a slide is possible at all is decided by the relation. Two
+            // hunks in cmux's history land in a different place from git's if the
+            // second half of that is skipped.
+            compact_with(old, new, cmp_old, cmp_new, &mut edits);
+        }
+        let mut hunks = hunks(old, new, &edits, self.context);
+        let m = moves(cmp_old, cmp_new, &edits, self.min_moved);
+        if !m.is_empty() {
+            mark_moved(&mut hunks, &m);
+        }
+        FileDiff { path: path.to_string(), hunks }
     }
 }
 
@@ -1398,7 +1970,7 @@ mod tests {
 
         assert_eq!(d.for_path("x.rs").name(), "reverse");
         let routed = d.file("x.rs", &old, &new);
-        let overridden = d.file_using(Some("myers"), "x.rs", &old, &new);
+        let overridden = d.file_using(&Overrides::algorithm("myers"), "x.rs", &old, &new);
         assert_ne!(
             routed.hunks[0].lines.len(),
             overridden.hunks[0].lines.len(),
@@ -1407,8 +1979,8 @@ mod tests {
 
         // An unregistered name is a click that cannot be honoured, so it falls
         // back rather than producing nothing.
-        assert_eq!(d.file_using(Some("nope"), "x.rs", &old, &new), routed);
-        assert_eq!(d.file_using(None, "x.rs", &old, &new), routed);
+        assert_eq!(d.file_using(&Overrides::algorithm("nope"), "x.rs", &old, &new), routed);
+        assert_eq!(d.file_using(&Overrides::default(), "x.rs", &old, &new), routed);
     }
 
     #[test]
@@ -1418,6 +1990,322 @@ mod tests {
         assert_eq!(d.by_name("reverse").map(|x| x.name()), Some("reverse"));
         assert_eq!(d.by_name("histogram").map(|x| x.name()), Some("histogram"));
         assert!(d.by_name("nope").is_none());
+    }
+
+    // ------------------------------------------------------------ whitespace
+
+    #[test]
+    fn each_whitespace_relation_matches_gits_definition() {
+        let key = |w: Whitespace, l: &str| w.key(l).unwrap_or_else(|| l.to_string());
+
+        // `Exact` is byte for byte and allocates nothing.
+        assert!(Whitespace::Exact.key("  a  ").is_none());
+
+        // `--ignore-space-at-eol`: the end only.
+        assert_eq!(key(Whitespace::Trailing, "  a  b   "), "  a  b");
+        assert_ne!(
+            key(Whitespace::Trailing, "  a"),
+            key(Whitespace::Trailing, "    a"),
+            "leading indent still counts"
+        );
+
+        // `-b`: any run of whitespace equals any other, trailing goes. A leading
+        // run collapses to one space rather than vanishing, so an indented line
+        // and a flush one still differ — that is git's rule and the easy one to
+        // get wrong.
+        assert_eq!(key(Whitespace::Change, "a\t \tb  "), "a b");
+        assert_eq!(key(Whitespace::Change, "  a b"), key(Whitespace::Change, "\ta\tb"));
+        assert_ne!(key(Whitespace::Change, "a"), key(Whitespace::Change, " a"));
+
+        // `-w`: all of it, anywhere.
+        assert_eq!(key(Whitespace::All, "  a \t b  "), "ab");
+        assert_eq!(key(Whitespace::All, "ab"), key(Whitespace::All, " a b "));
+
+        // A line of nothing but whitespace is blank under every relation but
+        // exact, which is what makes `git -w` treat a reindent as no change.
+        for w in [Whitespace::Trailing, Whitespace::Change, Whitespace::All] {
+            assert_eq!(key(w, "   \t "), "", "{}", w.name());
+        }
+    }
+
+    #[test]
+    fn ignoring_whitespace_makes_a_reindent_no_change_at_all() {
+        // The reason anybody reaches for `-w`. Same code, two spaces to four.
+        let old = lines("fn main() {\n  let x = 1;\n  f(x);\n}\n");
+        let new = lines("fn main() {\n    let x = 1;\n    f(x);\n}\n");
+
+        let mut d = Differs::builtin();
+        assert!(!d.file("a.rs", &old, &new).hunks.is_empty(), "exact must see it");
+
+        d.whitespace = Whitespace::All;
+        assert!(d.file("a.rs", &old, &new).hunks.is_empty(), "-w must not");
+        d.whitespace = Whitespace::Change;
+        assert!(d.file("a.rs", &old, &new).hunks.is_empty(), "-b must not either");
+        // ...and `--ignore-space-at-eol` must, because this is leading space.
+        d.whitespace = Whitespace::Trailing;
+        assert!(!d.file("a.rs", &old, &new).hunks.is_empty());
+    }
+
+    #[test]
+    fn a_whitespace_only_change_still_shows_the_real_text() {
+        // The property that makes normalising safe: it is for comparison only.
+        // The hunk shows the file's actual bytes, and the line numbers address
+        // the actual lines.
+        let old = lines("keep\n  a\nreal change\n");
+        let new = lines("keep\n    a\nreal changed\n");
+        let mut d = Differs::builtin();
+        d.whitespace = Whitespace::All;
+        d.context = 3;
+        let f = d.file("a.rs", &old, &new);
+        for l in f.hunks.iter().flat_map(|h| &h.lines) {
+            // Every line's text is a real line of a real file, never a key. A
+            // context line comes from the *old* side, which is why its `new_no`
+            // may point at bytes that differ — that is `-w` working, and it is
+            // what git prints too.
+            match l.kind {
+                LineKind::Removed | LineKind::Context => {
+                    let n = l.old_no.expect("has an old line") as usize;
+                    assert_eq!(old[n - 1], l.text, "old line {n} was normalised");
+                }
+                LineKind::Added => {
+                    let n = l.new_no.expect("has a new line") as usize;
+                    assert_eq!(new[n - 1], l.text, "new line {n} was normalised");
+                }
+            }
+        }
+        // The reindented line is context, shown as the old file had it.
+        let context: Vec<&str> = f.hunks[0]
+            .lines
+            .iter()
+            .filter(|l| l.kind == LineKind::Context)
+            .map(|l| l.text.as_str())
+            .collect();
+        assert!(context.contains(&"  a"), "{context:?}");
+    }
+
+    #[test]
+    fn a_whitespace_relation_composes_with_every_algorithm() {
+        // The reason this is a knob and not three more implementations: it has to
+        // work for an extension's differ too, which cannot know it exists.
+        let old = lines("a\n  b\nc\n");
+        let new = lines("a\n    b\nc\n");
+        for name in ["histogram", "patience", "myers"] {
+            let mut d = Differs::builtin();
+            assert!(d.select(name));
+            d.whitespace = Whitespace::All;
+            assert!(d.file("x", &old, &new).hunks.is_empty(), "{name}");
+        }
+    }
+
+    // ---------------------------------------------------------------- moves
+
+    #[test]
+    fn a_block_moved_across_a_file_is_reported_as_moved() {
+        let old = lines(
+            "fn a() {\n    one();\n    two();\n    three();\n}\n\nfn b() {\n    keep();\n}\n",
+        );
+        let new = lines(
+            "fn b() {\n    keep();\n}\n\nfn a() {\n    one();\n    two();\n    three();\n}\n",
+        );
+        let d = Differs::builtin();
+        let f = d.file("x.rs", &old, &new);
+        let lines_of = |kind: LineKind| -> Vec<&str> {
+            f.hunks
+                .iter()
+                .flat_map(|h| &h.lines)
+                .filter(|l| l.moved && l.kind == kind)
+                .map(|l| l.text.as_str())
+                .collect()
+        };
+        // *Which* block is called the mover is the differ's choice — moving the
+        // shorter one is the smaller script, and either reading is true. What
+        // must hold is that both halves are marked and they are the same text.
+        let removed = lines_of(LineKind::Removed);
+        let added = lines_of(LineKind::Added);
+        assert!(!removed.is_empty(), "no removed line was called moved");
+        assert_eq!(removed, added, "the two halves of a move must be the same lines");
+        assert!(removed.len() >= MIN_MOVED_LINES);
+        assert!(
+            f.hunks.iter().flat_map(|h| &h.lines).all(|l| !l.moved || l.kind != LineKind::Context),
+            "a context line was called moved"
+        );
+    }
+
+    #[test]
+    fn two_matching_lines_are_a_coincidence_and_not_a_move() {
+        // `}` and a blank line are everywhere. Reporting them costs the feature
+        // its whole value, which is that a moved block can be skipped.
+        let old = lines("a\n}\nb\n");
+        let new = lines("b\n}\na\n");
+        let d = Differs::builtin();
+        let f = d.file("x.rs", &old, &new);
+        assert!(f.hunks.iter().flat_map(|h| &h.lines).all(|l| !l.moved), "{f:?}");
+    }
+
+    #[test]
+    fn move_detection_can_be_turned_off() {
+        // Five lines and three: moving the three is the smaller script, so that
+        // is what the differ does and what there is to detect.
+        let old = lines("k1\nk2\nk3\nk4\nk5\nm1\nm2\nm3\n");
+        let new = lines("m1\nm2\nm3\nk1\nk2\nk3\nk4\nk5\n");
+        let mut d = Differs::builtin();
+        assert!(d.file("x", &old, &new).hunks.iter().flat_map(|h| &h.lines).any(|l| l.moved));
+        d.min_moved = 0;
+        assert!(d.file("x", &old, &new).hunks.iter().flat_map(|h| &h.lines).all(|l| !l.moved));
+    }
+
+    #[test]
+    fn a_block_deleted_once_and_added_twice_claims_one_landing() {
+        // Driven through `moves` with a hand-written script rather than a differ,
+        // because no differ would produce this shape and the property is still
+        // worth pinning: without the `taken` bitmap the same three removed lines
+        // mark six added ones, and the moved count exceeds what exists.
+        let old = lines("one\ntwo\nthree\n");
+        let new = lines("one\ntwo\nthree\none\ntwo\nthree\n");
+        let edits = vec![Edit { old_start: 0, old_end: 3, new_start: 0, new_end: 6 }];
+        let m = moves(&old, &new, &edits, 3);
+        assert_eq!(m.old.iter().filter(|b| **b).count(), 3);
+        assert_eq!(m.new.iter().filter(|b| **b).count(), 3, "two landings were claimed");
+    }
+
+    #[test]
+    fn moves_ignores_blank_lines_when_matching() {
+        // A run of blank lines is not a moved block, however long it is.
+        let old = lines("a\n\n\n\n\nb\n");
+        let new = lines("b\n\n\n\n\na\n");
+        let edits = vec![Edit {
+            old_start: 0,
+            old_end: old.len() as u32,
+            new_start: 0,
+            new_end: new.len() as u32,
+        }];
+        assert!(moves(&old, &new, &edits, 3).is_empty());
+    }
+
+    #[test]
+    fn moves_never_claims_a_line_the_script_did_not_touch() {
+        // The bug this guards: indexing over the whole file rather than the
+        // changed lines makes every repeated line in an unchanged region a move.
+        let old = lines("a\nb\nc\na\nb\nc\nchanged\n");
+        let new = lines("a\nb\nc\na\nb\nc\nCHANGED\n");
+        let d = Differs::builtin();
+        let f = d.file("x", &old, &new);
+        assert!(f.hunks.iter().flat_map(|h| &h.lines).all(|l| !l.moved), "{f:?}");
+    }
+
+    // ------------------------------------------------------ indent heuristic
+
+    #[test]
+    fn a_hunk_slides_to_the_readable_boundary() {
+        // The canonical case, and the one every diff tool is judged on: a
+        // function added before an existing one. Without the heuristic the change
+        // is attributed starting at the *previous* function's closing brace, so
+        // the hunk reads as "} + fn b() {" instead of "fn a() { ... }".
+        let old = lines("fn b() {\n    b();\n}\n");
+        let new = lines("fn a() {\n    a();\n}\n\nfn b() {\n    b();\n}\n");
+
+        let mut d = Differs::builtin();
+        d.context = 0;
+        let with = d.file("x.rs", &old, &new);
+        d.indent_heuristic = false;
+        let without = d.file("x.rs", &old, &new);
+
+        // Same amount of change either way — a slide is not a better diff, it is
+        // the same diff in a more readable place.
+        let count = |f: &FileDiff| {
+            f.hunks.iter().flat_map(|h| &h.lines).filter(|l| l.kind != LineKind::Context).count()
+        };
+        assert_eq!(count(&with), count(&without));
+
+        let added = |f: &FileDiff| -> Vec<String> {
+            f.hunks
+                .iter()
+                .flat_map(|h| &h.lines)
+                .filter(|l| l.kind == LineKind::Added)
+                .map(|l| l.text.clone())
+                .collect()
+        };
+        assert_eq!(
+            added(&with),
+            vec!["fn a() {", "    a();", "}", ""],
+            "the added block should be the new function and the blank after it"
+        );
+        // Not asserted to *differ* from the unslid answer: on this input the
+        // differ already puts the group in the right place. That the heuristic
+        // does something is what `git/examples/diffcheck.rs` measures, by
+        // comparing every hunk position against git's — five of its six rows
+        // match exactly, which is a stronger statement than any single case.
+        let _ = added(&without);
+    }
+
+    #[test]
+    fn sliding_never_changes_what_the_diff_says() {
+        // The invariant: compaction moves a group, it never resizes one, and the
+        // script must still apply. Over the awkward shapes.
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut rand = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let pool = ["", "a", "    a", "        b", "}", "    }", "fn f() {", "  # c"];
+        for case in 0..300 {
+            let (n, m) = (rand(20) as usize, rand(20) as usize);
+            let old: Vec<&str> = (0..n).map(|_| pool[rand(8) as usize]).collect();
+            let new: Vec<&str> = (0..m).map(|_| pool[rand(8) as usize]).collect();
+            let mut edits = Histogram.diff("x.rs", &old, &new);
+            let before = changed(&edits);
+            compact(&old, &new, &mut edits);
+            verify(&old, &new, &edits);
+            assert_eq!(changed(&edits), before, "case {case} resized a group");
+        }
+    }
+
+    #[test]
+    fn a_slide_uses_the_whitespace_relation_to_decide_it_can_move() {
+        // Whether a group *can* slide is the relation's question; how readable the
+        // result is, is the text's. Conflating them loses a slide git makes —
+        // under `-w` a group may cross a line that differs from it only in
+        // indentation, and comparing the real text says it may not. Two hunks in
+        // cmux's history land in the wrong place without this.
+        let old = ["a();", "  x();", "b();"];
+        let new = ["a();", "x();", "  x();", "b();"];
+        let strip = |l: &&str| -> String { l.chars().filter(|c| !c.is_whitespace()).collect() };
+        let (ok, nk): (Vec<String>, Vec<String>) =
+            (old.iter().map(strip).collect(), new.iter().map(strip).collect());
+        let (ok, nk): (Vec<&str>, Vec<&str>) = (
+            ok.iter().map(String::as_str).collect(),
+            nk.iter().map(String::as_str).collect(),
+        );
+
+        let script = Histogram.diff("x.rs", &ok, &nk);
+        let mut through_keys = script.clone();
+        let mut through_text = script.clone();
+        compact_with(&old, &new, &ok, &nk, &mut through_keys);
+        compact(&old, &new, &mut through_text);
+        verify(&ok, &nk, &through_keys);
+        verify(&ok, &nk, &through_text);
+        assert_ne!(
+            through_keys, through_text,
+            "the relation made no difference to where the group could go: {script:?}"
+        );
+    }
+
+    #[test]
+    fn a_slide_cannot_step_over_a_neighbouring_change() {
+        // Two changes with one line between them: sliding either onto the other
+        // would produce overlapping edits, which is the one thing `verify`
+        // catches and a reader never would.
+        let old: Vec<String> = (0..40).map(|i| format!("    line {i}")).collect();
+        let mut new = old.clone();
+        new.insert(10, "    inserted a".into());
+        new.insert(12, "    inserted b".into());
+        let o: Vec<&str> = old.iter().map(String::as_str).collect();
+        let n: Vec<&str> = new.iter().map(String::as_str).collect();
+        let mut edits = Histogram.diff("x.rs", &o, &n);
+        compact(&o, &n, &mut edits);
+        verify(&o, &n, &edits);
     }
 
     #[test]

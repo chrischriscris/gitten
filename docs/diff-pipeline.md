@@ -6,8 +6,11 @@ idea a window exists.
 ```
   1  acquire     plait_git::pairs                    Vec<Pair>   two texts per file
   2  diff        Differs::file                       Vec<FileDiff>
-       2a script     Differ::diff, per file       ── the seam: histogram, myers, …
-       2b hunks      differ::hunks                   context, line numbers, headers
+       2a normalise  Whitespace::keys                how much whitespace must match
+       2b script     Differ::diff, per file       ── the seam: histogram, myers, …
+       2c compact    differ::compact                 slide each change to a boundary
+       2d hunks      differ::hunks                   context, line numbers, headers
+       2e moves      differ::moves + mark_moved      deleted here, added there
   3  prepare     prepared::prepare                   Vec<prepared::File>
        3a clip        every line, to a column budget
        3b intraline   changed words, per replace-pair
@@ -104,10 +107,10 @@ pub trait Differ {
 }
 ```
 
-An implementation produces **only the edit script**. Line numbers, context lines,
-hunk headers and the `@@ … @@ fn name` suffix are `differ::hunks`, shared by every
-differ — that bookkeeping is identical for all of them, and a hunk header that
-disagrees with the lines under it is a bug that survives review.
+An implementation produces **only the edit script**. Everything else in stage 2 is
+shared, and deliberately: it is identical for every algorithm, it composes with an
+extension's, and a second copy of any of it is a hunk header that quietly
+disagrees with the lines under it.
 
 Three built-ins, all in `core` because `core` may have no dependencies and that
 is the rule rather than a preference — see
@@ -140,10 +143,98 @@ the same reason. Recursion is an explicit work stack, not the call stack: a file
 whose every anchor peels off one line recurses as deep as the file is long, which
 is a stack overflow rather than a slow load, and generated code has that shape.
 
-Correctness is checked against git rather than argued. A minimal edit script has
-exactly one length, so `myers` must match `git diff --minimal` exactly —
-`git/examples/diffcheck.rs`, run by `./check.sh`. Numbers in
-[measurements.md](measurements.md).
+Correctness is checked against git rather than argued.
+`git/examples/diffcheck.rs`, run by `./check.sh`, compares **changed-line counts
+and every hunk position** against six git invocations over four repositories.
+A minimal edit script has exactly one length, so `myers` must match `git diff
+--minimal` line for line. Numbers in [measurements.md](measurements.md).
+
+### 2a. Normalise, for a whitespace relation
+
+`Whitespace` is not a fourth algorithm, it is a different *equivalence relation*
+on lines — which is why it is a knob on `Differs` rather than three more
+implementations, and why `histogram-ignore-ws` does not exist.
+
+| | git | rule |
+|---|---|---|
+| `exact` | *(default)* | byte for byte |
+| `trailing` | `--ignore-space-at-eol` | trailing whitespace only |
+| `change` | `-b` | any run of whitespace equals any other; trailing gone |
+| `all` | `-w` | all whitespace, anywhere |
+
+Normalising is **per line and length-preserving**, so the edit script computed
+over the keys still addresses the original lines, and `hunks` is handed the real
+text. That is the whole trick, and it means every algorithm — including one
+compiled in by an extension that has never heard of this — gets it for free.
+
+One consequence, and it is git's too: a line whose only change was whitespace
+becomes *context*, and a context line is printed from the **old** file. So its
+`new_no` points at bytes that differ from what is on screen. That is `-w`
+working.
+
+`change` is the one to read twice: a run collapses to a single space rather than
+vanishing, so `foo` and ` foo` still differ. Only the *amount* is ignored.
+
+### 2c. Compact, the indent heuristic
+
+A run of changed lines can often sit in several places that say exactly the same
+thing: when the line leaving one end of the group equals the line entering the
+other, the whole group shifts by one and means the same. Which position a reader
+wants is not arbitrary — a hunk starting at a function's signature reads, and the
+same hunk starting at the previous function's closing brace does not.
+
+This is git's `--indent-heuristic`, on by default there and here, and **ported
+rather than reinvented** for one reason: it is the only version whose output can
+be checked. The weights are xdiff's, names and values.
+
+Two things about it are easy to get wrong and were:
+
+- **A position's indentation is compared by *sign*, not by magnitude.** git keeps
+  `effective_indent` and `penalty` as two numbers and compares the first with a
+  three-way compare weighted by `INDENT_WEIGHT`. Adding `INDENT_WEIGHT * indent`
+  into one score instead — which reads like the same thing — slid hunks to
+  plausible places git does not put them, with identical line counts throughout.
+  Comparing hunk *positions* in `diffcheck` is what caught it, and is why that
+  check exists.
+- **Ties go to the later position.** git's comparison is `<=`. Ties are common and
+  the two answers are visibly different.
+
+- **Whether a group *can* slide is the relation's question; how readable the
+  result is, is the text's.** A slide is possible when the line leaving one end
+  equals the line entering the other — under `-w`, "equals" means the *keys*, so a
+  group may cross a line that differs from it only in indentation. Scoring, on the
+  other hand, has to read the real text, because indentation is exactly what the
+  keys erased. Comparing the text for both loses slides git makes: two hunks in
+  cmux's history, with identical line counts, again found only by comparing
+  positions.
+
+Only a pure insertion or deletion slides. A replace has both sides moving, which
+git handles per file through machinery this does not have; its boundaries are
+pinned on both sides anyway.
+
+### 2e. Moves, after the script is known
+
+A block deleted here and added there is not a change, it is a relocation — and
+the one thing in a diff a reader is allowed to *skip*. `moves` finds them and
+`mark_moved` sets `DiffLine::moved`.
+
+A post-pass and not a differ, because a move is only visible once the whole script
+exists and every algorithm produces the same one. Three rules keep it honest:
+
+- **Only lines the script touched.** Indexing over the whole file makes every
+  repeated line in an unchanged region a move.
+- **`MIN_MOVED_LINES`, three by default.** Two matching lines are a coincidence —
+  `}` and a blank line are everywhere — and reporting them costs the feature its
+  entire value. Git's `--color-moved=zebra` uses 3 for the same reason.
+- **A landing is claimed once.** A block deleted once and added twice marks one of
+  them, or the moved-line count exceeds the number of lines that exist.
+
+`moved` is a flag beside `kind` and not a fourth `LineKind`, deliberately: a moved
+line is still an addition or a removal, and `align`, `replace_pairs` and the
+adds/dels counts all have to keep working untouched. Only the drawing cares — it
+swaps the background for `diff.moved_added_bg` or `diff.moved_removed_bg` and
+leaves the `+`/`-` alone so the sign column still scans, which is how git's
+`--color-moved` does it too.
 
 ## 3. Prepare
 
@@ -304,7 +395,11 @@ the whole thing:
 ```
 
 All three presentations draw that anatomy, share the same `runs` merge, and
-differ only in what they do with the text area. `SplitRows` draws it twice at a
+differ only in what they do with the text area. All three also take `moved`
+through the same `line_colors` and `runs`, so none of them can disagree about what
+a relocated line looks like — and a moved line's intraline spans are dropped in
+`runs` rather than drawn in the row's own colour, because they would be describing
+a change the detection just said was not one. `SplitRows` draws it twice at a
 narrower gutter, either side of a one-pixel rule, and fills the half with no line
 in it with `diff.absent_bg` — its own colour, because "unchanged" and "there is
 no line here" are opposite things and `context_bg` already means the first. `MarkdownRows`

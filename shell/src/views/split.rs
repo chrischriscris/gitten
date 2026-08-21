@@ -81,6 +81,7 @@ const SLACK: f32 = 2.0;
 /// and the right says where it is now, and after an insertion those differ.
 struct Line {
     kind: LineKind,
+    moved: bool,
     old_no: SharedString,
     new_no: SharedString,
     text: SharedString,
@@ -111,6 +112,8 @@ pub struct SplitRows {
     /// How many rows carry a pair rather than one side, for the stats overlay.
     /// A diff whose rows are almost all pairs is one this presentation suits.
     paired: usize,
+    /// Lines belonging to a block that moved — see the note on `TextRows`.
+    moved: usize,
 }
 
 impl Rows for SplitRows {
@@ -142,8 +145,10 @@ impl Rows for SplitRows {
                 // measure three times too wide and set the column for the whole
                 // diff.
                 self.widest_chars = self.widest_chars.max(l.text.chars().count());
+                self.moved += l.moved as usize;
                 self.lines.push(Line {
                     kind: l.kind,
+                    moved: l.moved,
                     old_no: number(l.old_no),
                     new_no: number(l.new_no),
                     text: l.text.into(),
@@ -179,7 +184,10 @@ impl Rows for SplitRows {
     fn report(&self) -> String {
         match self.rows.is_empty() {
             true => String::new(),
-            false => format!("split {} paired · {} cols", self.paired, self.widest_chars),
+            false => match self.moved {
+                0 => format!("split {} paired · {} cols", self.paired, self.widest_chars),
+                n => format!("split {} paired · {} cols · {n} moved", self.paired, self.widest_chars),
+            },
         }
     }
 
@@ -234,7 +242,7 @@ impl SplitRows {
                 .bg(rgb(p.absent_bg))
                 .into_any_element();
         };
-        let (bg, fg, sign) = line_colors(line.kind, p);
+        let (bg, fg, sign) = line_colors(line.kind, line.moved, p);
         let no = match column {
             Column::Old => &line.old_no,
             Column::New => &line.new_no,
@@ -256,6 +264,7 @@ impl SplitRows {
                         &line.spans,
                         theme,
                         line.kind,
+                        line.moved,
                     )),
                 ),
             )

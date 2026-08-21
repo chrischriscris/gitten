@@ -1318,6 +1318,7 @@ diff --git a/d.md b/d.md
         // A Strong token that is not wearing asterisks keeps every byte it has.
         let mut line = Line {
             kind: LineKind::Context,
+            moved: false,
             old_no: Some(1),
             new_no: Some(1),
             text: "plain strong words".into(),

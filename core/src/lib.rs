@@ -159,6 +159,14 @@ pub struct DiffLine {
     pub old_no: Option<u32>,
     pub new_no: Option<u32>,
     pub text: String,
+    /// This line is part of a block that moved rather than changed — see
+    /// [`differ::moves`](crate::differ::moves).
+    ///
+    /// A flag beside `kind` and not a fourth `LineKind`, deliberately. A moved
+    /// line is still an addition or a removal, and everything that reasons about
+    /// runs of them — [`align`](crate::align::align), `replace_pairs`, the adds
+    /// and dels counts — must keep working unchanged. Only the drawing cares.
+    pub moved: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,7 +231,15 @@ pub fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
         if kind != LineKind::Removed {
             new_no += 1;
         }
-        hunk.lines.push(DiffLine { kind, old_no: o, new_no: n, text: text.to_string() });
+        // Never moved: a `.diff` file has already been rendered by whoever
+        // produced it, and its move detection — if it had any — was colour.
+        hunk.lines.push(DiffLine {
+            kind,
+            old_no: o,
+            new_no: n,
+            text: text.to_string(),
+            moved: false,
+        });
     }
     files
 }

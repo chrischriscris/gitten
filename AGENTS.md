@@ -62,10 +62,11 @@ differs arrive as extensions. The view never calls a differ directly, and an
 implementation returns only the edit script: line numbers, context and hunk
 headers are shared.
 
-**Check a differ against git, don't argue about it.** A minimal edit script has
-exactly one length, so ours must match `git diff --minimal` exactly — and does, on
-every repository in `./check.sh`. Two bugs during this work were invisible in the
-totals and obvious in the per-file deltas.
+**Check a differ against git, don't argue about it.** `diffcheck` compares
+changed-line counts *and every hunk position* against six git invocations over
+four repositories. Three bugs so far were invisible in the totals: two showed up
+in the per-file deltas, and the third only in the positions — identical counts,
+hunks in places git does not put them. Compare the positions.
 
 Two things in histogram are wrong in the plausible direction, so read them before
 touching them: a run is scored by its **rarest** line, not its most common one,
@@ -77,6 +78,26 @@ Bound them and degrade to "this region was replaced"; a line-for-line pairing of
 generated file is not worth a visible pause and nobody was reading it. Recurse on
 an explicit stack — a file whose every anchor peels off one line is as deep as it
 is long, and generated code has that shape.
+
+**Everything except the edit script is shared.** Whitespace normalisation, the
+indent-heuristic slide, hunk assembly and move detection all live beside the trait
+and run for every implementation, including one an extension compiles in. A
+`Differ` decides which lines correspond and nothing else.
+
+Ignoring whitespace is an **equivalence relation, not an algorithm** — normalise
+per line, length-preserving, and the script still addresses the original lines
+while the hunks show the real text. That is what stops `histogram-ignore-ws` from
+having to exist.
+
+A **moved** block is deleted here and added there, and it is the one thing in a
+diff a reader may skip. Flag it beside `kind`, never as a fourth `LineKind`: it is
+still an addition or a removal, and `align`, `replace_pairs` and the adds/dels
+counts must not learn about it. Require three lines — two matching lines are a
+coincidence and `}` is everywhere.
+
+**Port git's heuristics; don't approximate them.** The indent heuristic's weights
+are xdiff's because an approximation produces boundaries no test can call right.
+Its one trap: a position's indentation is compared by *sign*, not magnitude.
 
 **Fence a code block; never indent one.** The renderer knows fences and nothing
 else, so a four-space block is prose — emphasis, links and list markers all get
