@@ -8,6 +8,7 @@
 #   ./dev dump      commits ~/Projects/git 600     one frame, no takeover
 #   ./dev check                                    everything headless
 #   ./dev config                                   a starting plait.toml
+#   ./dev bundle                                   target/plait.app, icon and all
 #
 #   ./dev --release tui diff .       when you need honest numbers
 #   PLAIT_STATS=0 ./dev tui          without the frame readout
@@ -162,6 +163,68 @@ case "$WHAT" in
     : "${ROWS:=$(tput lines 2>/dev/null || echo 40)}"
     export COLS ROWS
     exec cargo run -q -p plait-tui --example dump --release -- "$@"
+    ;;
+
+  bundle)
+    # A real `.app`. Three things a bare binary cannot have: an icon, a name in
+    # the menu bar that is not the executable's, and a window that comes to the
+    # front on its own — `cx.activate(true)` is the dev workaround for the last
+    # one and a bundle is the answer.
+    #
+    # Release always: nobody wants a debug build in /Applications, and the
+    # timings inside one are meaningless anyway.
+    FLAGS=(--release); PROFILE=release
+    build plait-shell || exit 1
+    APP="target/plait.app"
+    rm -rf "$APP" "target/plait.iconset"
+    mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" target/plait.iconset
+
+    # Rendered from the vector at every size rather than downscaled from one
+    # PNG: at 16 and 32 the difference between a re-rendered glyph and a
+    # resampled one is the whole legibility of the thing.
+    for pair in "16 16x16" "32 16x16@2x" "32 32x32" "64 32x32@2x" \
+                "128 128x128" "256 128x128@2x" "256 256x256" "512 256x256@2x" \
+                "512 512x512" "1024 512x512@2x"; do
+      set -- $pair
+      rm -rf target/.ql && mkdir -p target/.ql
+      qlmanage -t -s "$1" -o target/.ql shell/assets/icon.svg >/dev/null 2>&1
+      cp target/.ql/icon.svg.png "target/plait.iconset/icon_$2.png"
+    done
+    rm -rf target/.ql
+    iconutil -c icns target/plait.iconset -o "$APP/Contents/Resources/plait.icns"
+    rm -rf target/plait.iconset
+
+    # The executable is named `plait` inside the bundle: macOS titles the first
+    # menu with CFBundleName, and the binary being `plait-shell` is why the menu
+    # bar says so today.
+    cp "target/$PROFILE/plait-shell" "$APP/Contents/MacOS/plait"
+    cat > "$APP/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>plait</string>
+  <key>CFBundleDisplayName</key><string>plait</string>
+  <key>CFBundleExecutable</key><string>plait</string>
+  <key>CFBundleIdentifier</key><string>dev.plait.desktop</string>
+  <key>CFBundleIconFile</key><string>plait</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>0.0.0</string>
+  <key>CFBundleVersion</key><string>0</string>
+  <key>LSMinimumSystemVersion</key><string>11.0</string>
+  <!-- Without this the window is drawn at 1x and upscaled, which on a diff of
+       text is the difference between crisp and soft. -->
+  <key>NSHighResolutionCapable</key><true/>
+</dict>
+</plist>
+PLIST
+    # Ad-hoc, so Gatekeeper and the icon cache treat it as a real app rather
+    # than a folder that happens to be shaped like one. Not a substitute for a
+    # Developer ID signature when this is ever distributed.
+    codesign --force --deep --sign - "$APP" >/dev/null 2>&1 \
+      || dim "── unsigned; the icon may take a moment to appear ──"
+    dim "── $APP ─────────────────────────"
+    echo "$APP"
     ;;
 
   check)

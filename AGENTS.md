@@ -210,6 +210,7 @@ table — so a `Wrap` decides where a line breaks and nothing else.
                                     COLS, ROWS, LAYOUT, WRAP, AT, FRAMES
 ./dev check                         everything headless
 ./dev config > plait.toml           a complete, correct starting file
+./dev bundle                        target/plait.app — icon, name, a real app
 
 ./dev --release tui diff .          when you need honest numbers
 PLAIT_STATS=0 ./dev tui             without the readout
@@ -320,8 +321,13 @@ alive. `cx.on_window_closed` + `cx.quit()`. Cmd-Q is separate and equally manual
 no application menu exists, so register the action, bind the key, and set a menu
 (`on_action` + `bind_keys` + `set_menus`).
 
-A bare binary is not an `.app` bundle, so the window opens behind everything.
-`cx.activate(true)` is the dev fix; a real bundle is the shipping one.
+A bare binary is not an `.app` bundle, so the window opens behind everything,
+the menu bar is titled with the executable's name and there is no icon.
+`cx.activate(true)` is the dev fix for the first of those; `./dev bundle` is the
+answer to all three. The mark is `shell/assets/icon.svg` — three lanes of a
+commit graph weaving past each other, which is what the word means — and the
+iconset is re-rendered from the vector at every size rather than downscaled from
+one PNG, because at 16 and 32 pixels that is the whole legibility of it.
 
 Custom drawing is `canvas()` + `PathBuilder` + `window.paint_path`. Keep it
 per-row where the geometry allows and it virtualizes with the list for free.

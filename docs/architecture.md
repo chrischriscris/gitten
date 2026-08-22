@@ -186,6 +186,7 @@ GPUI. Drawing and input, and as little else as possible.
 | `config.rs` | `plait.toml`: parse, apply, watch, and the live `Host` global |
 | `session.rs` | the row you were on, so `./dev desktop` can put you back after a restart |
 | `stats.rs` | the counting allocator and the `PLAIT_STATS` overlay |
+| `assets/icon.svg` | the mark: three lanes weaving. `./dev bundle` renders the iconset from it |
 
 ## Which way data moves
 
