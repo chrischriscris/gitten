@@ -25,7 +25,7 @@ static ALLOC: stats::Counting = stats::Counting;
 
 actions!(plait, [Quit]);
 
-use views::diff::{CycleLayout, CycleWrap};
+use views::diff::{CopySelection, CycleLayout, CycleWrap, SelectAll, SelectNone};
 
 
 
@@ -442,12 +442,34 @@ fn main() {
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("s", CycleLayout, None),
             KeyBinding::new("w", CycleWrap, None),
+            // The platform's keys, not this app's: a Mac user's fingers already
+            // know these three, and a diff that copied on `y` would be a diff
+            // nobody could copy from. They are named commands in
+            // `core::command` all the same — `copy.selection`, `select.all`,
+            // `select.none` — so the day this client reads `[keys]` they are
+            // rebindable without a line changing here.
+            KeyBinding::new("cmd-c", CopySelection, None),
+            KeyBinding::new("cmd-a", SelectAll, None),
+            KeyBinding::new("escape", SelectNone, None),
         ]);
-        cx.set_menus(vec![Menu {
-            name: "plait".into(),
-            items: vec![MenuItem::action("Quit", Quit)],
-            disabled: false,
-        }]);
+        cx.set_menus(vec![
+            Menu {
+                name: "plait".into(),
+                items: vec![MenuItem::action("Quit", Quit)],
+                disabled: false,
+            },
+            // Not decoration: without an Edit menu macOS gives the window no
+            // Copy item, and the OS is entitled to be asked. The keys work
+            // either way — this is what makes them *discoverable*.
+            Menu {
+                name: "Edit".into(),
+                items: vec![
+                    MenuItem::action("Copy", CopySelection),
+                    MenuItem::action("Select All", SelectAll),
+                ],
+                disabled: false,
+            },
+        ]);
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();

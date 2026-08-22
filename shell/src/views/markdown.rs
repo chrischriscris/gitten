@@ -46,12 +46,13 @@
 //! decided at load and is a `Copy` field read out of a `Vec`.
 
 use super::diff::{
-    columns, file_header, hunk_header, line_colors, num, number, number_or_blank, runs, slice,
-    Rows, ROW_H, TEXT_CHROME,
+    column_at, columns, file_header, header_hit, hunk_header, line_colors, num, number,
+    number_or_blank, runs, selected, slice, Hit, Rows, ROW_H, PAD, TEXT_CHROME,
 };
 use gpui::*;
 use plait_core::host::Host;
 use plait_core::markdown::{lay_out, Block, Layout};
+use plait_core::select::Selected;
 use plait_core::syntax::Token;
 use plait_core::theme::{Rgb, Theme};
 use plait_core::wrap::{Wrap, Wrapped};
@@ -224,16 +225,34 @@ impl MarkdownRows {
         if block.is_table() {
             return 0;
         }
+        columns(width, TEXT_CHROME + self.furniture(block), self.size(block, host), host)
+    }
+
+    /// How many pixels of furniture sit between the sign column and the text: a
+    /// bar, some indent steps, a bullet.
+    ///
+    /// One function because two callers must agree about it — the wrap budget
+    /// above and the caret in `hit`. A table gets none of it: its grid is aligned
+    /// character by character against the rows around it, so it is drawn with the
+    /// gutter and then nothing at all.
+    fn furniture(&self, block: Block) -> f32 {
+        if block.is_table() {
+            return 0.0;
+        }
         let m = &self.metrics;
         let bar = matches!(block, Block::Quote(_) | Block::Fence | Block::Code);
         let bullet = matches!(block, Block::Bullet(_));
-        let furniture =
-            m.indent * (bar as u8 + block.depth() + bullet as u8) as f32;
-        let size = match block {
-            Block::Heading(level) => m.size(level),
+        m.indent * (bar as u8 + block.depth() + bullet as u8) as f32
+    }
+
+    /// How large this block's text is drawn. A heading is the only thing in the
+    /// app with a type size of its own, and it is why a column budget and a
+    /// caret are both per row here rather than per diff.
+    fn size(&self, block: Block, host: &Host) -> f32 {
+        match block {
+            Block::Heading(level) => self.metrics.size(level),
             _ => host.font.size,
-        };
-        columns(width, TEXT_CHROME + furniture, size, host)
+        }
     }
 }
 
@@ -335,14 +354,42 @@ impl Rows for MarkdownRows {
         }
     }
 
-    fn render(&self, index: usize, seg: usize, host: &Host) -> AnyElement {
+    /// The gutter, then this block's own furniture, then text at this block's own
+    /// size. Nothing else in the app has two type sizes in one list, which is why
+    /// this is the one presentation whose caret arithmetic is per row.
+    fn hit(&self, index: usize, seg: usize, x: f32, host: &Host) -> Option<Hit> {
+        Some(match self.rows.get(index)? {
+            Row::File { path, .. } => header_hit(path, x, host),
+            Row::Hunk(h) => header_hit(h, x, host),
+            Row::Line { block, text, .. } => {
+                let at = self.wrapped.range(index, seg, text);
+                let from = TEXT_CHROME - PAD + self.furniture(*block);
+                let off = at.start
+                    + column_at(&text[at.clone()], x - from, self.size(*block, host), host);
+                Hit { part: 0, off }
+            }
+        })
+    }
+
+    /// The source line, which is also what is drawn: the markers this
+    /// presentation replaces were taken off the text by `lay_out`, so a copy
+    /// yields what was on screen rather than a bullet nobody can see.
+    fn selectable(&self, index: usize, _part: u16) -> Option<&str> {
+        Some(match self.rows.get(index)? {
+            Row::Line { text, .. } => text.as_ref(),
+            Row::Hunk(h) => h.as_ref(),
+            Row::File { path, .. } => path.as_ref(),
+        })
+    }
+
+    fn render(&self, index: usize, seg: usize, host: &Host, sel: Option<Selected>) -> AnyElement {
         let theme = &host.theme;
         match &self.rows[index] {
-            Row::File { path, adds, dels } => file_header(path, *adds, *dels, theme),
-            Row::Hunk(header) => hunk_header(header, theme),
+            Row::File { path, adds, dels } => file_header(path, *adds, *dels, theme, sel),
+            Row::Hunk(header) => hunk_header(header, theme, sel),
             Row::Line { block, kind, moved, old, new, text, spans, tokens } => {
                 let at = self.wrapped.range(index, seg, text);
-                self.line(*block, *kind, *moved, old, new, text, at, seg, spans, tokens, theme)
+                self.line(*block, *kind, *moved, old, new, text, at, seg, spans, tokens, theme, sel)
             }
         }
     }
@@ -363,6 +410,7 @@ impl MarkdownRows {
         spans: &[Span],
         tokens: &[Token],
         theme: &Theme,
+        sel: Option<Selected>,
     ) -> AnyElement {
         let m = &self.metrics;
         let md = &theme.markdown;
@@ -398,8 +446,15 @@ impl MarkdownRows {
         // then nothing: no bar, no indent, no glyph.
         if block.is_table() {
             let body = div().flex_none().text_color(rgb(fg)).child(
-                StyledText::new(text.clone())
-                    .with_highlights(runs(at, tokens, spans, theme, kind, moved)),
+                StyledText::new(text.clone()).with_highlights(runs(
+                    at,
+                    tokens,
+                    spans,
+                    theme,
+                    kind,
+                    moved,
+                    selected(sel, 0, full.len()),
+                )),
             );
             // The grid is structure, not content, and a separator row is nothing
             // but grid.
@@ -470,8 +525,15 @@ impl MarkdownRows {
         }
 
         let body = div().flex_none().text_color(rgb(fg)).child(
-            StyledText::new(text.clone())
-                .with_highlights(runs(at, tokens, spans, theme, kind, moved)),
+            StyledText::new(text.clone()).with_highlights(runs(
+                at,
+                tokens,
+                spans,
+                theme,
+                kind,
+                moved,
+                selected(sel, 0, full.len()),
+            )),
         );
         let body = match block {
             Block::Heading(level) => body.text_size(px(m.size(level))).font_weight(FontWeight::BOLD),
@@ -489,7 +551,7 @@ impl MarkdownRows {
 mod tests {
     // By name, not a glob: `use gpui::*` in the parent shadows `#[test]`.
     use super::{MarkdownRows, Metrics, Row};
-    use crate::views::diff::{Diff, Rows, TextRows};
+    use crate::views::diff::{Diff, Rows, TextRows, PAD, TEXT_CHROME};
     use plait_core::host::Host;
     use plait_core::markdown::Block;
     use plait_core::prepared::prepare;
@@ -914,5 +976,71 @@ diff --git a/a.md b/a.md
         let r = built("diff --git a/a.md b/a.md\n");
         assert_eq!(r.len(), 1);
         assert!(r.width(0, 0) > 0);
+    }
+
+    // ------------------------------------------------------------ selection
+
+    #[test]
+    fn the_caret_follows_the_furniture_the_row_drew() {
+        // The only presentation whose text does not start at the same x on every
+        // row: a bullet, an indent step and a quote bar are real pixels, and a
+        // caret that ignored them would be a word or two off on exactly the rows
+        // a reader is most likely to select.
+        let host = Host::new();
+        let r = built(DOC);
+        let rows: Vec<(usize, Block)> = r
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, row)| match row {
+                Row::Line { block, .. } => Some((i, *block)),
+                _ => None,
+            })
+            .collect();
+        let plain = rows.iter().find(|(_, b)| matches!(b, Block::Paragraph)).unwrap().0;
+        let nested = rows.iter().filter(|(_, b)| matches!(b, Block::Bullet(_))).nth(1).unwrap().0;
+        assert!(r.furniture(Block::Paragraph) < r.furniture(Block::Bullet(1)));
+
+        // The same pixel column, two rows: the indented one starts later, so the
+        // same x is fewer characters into its text.
+        let x = TEXT_CHROME - PAD + 20.0 * host.font.size * host.font.advance;
+        let flat = r.hit(plain, 0, x, &host).unwrap().off;
+        let inset = r.hit(nested, 0, x, &host).unwrap().off;
+        assert!(inset < flat, "the indent did not move the caret: {inset} vs {flat}");
+
+        // And a click at the start of a row's own text is byte 0 of it, whatever
+        // that row drew in front of itself.
+        for (i, block) in &rows {
+            let from = TEXT_CHROME - PAD + r.furniture(*block);
+            assert_eq!(r.hit(*i, 0, from, &host).unwrap().off, 0, "row {i} {block:?}");
+        }
+    }
+
+    #[test]
+    fn a_heading_is_selected_by_the_size_it_is_drawn_at() {
+        // A `#` heading is 18px where the body is 14, so the same pixel is a
+        // different character. Measuring it at the body size is a caret that
+        // drifts further right the longer the heading is.
+        let host = Host::new();
+        let r = built(DOC);
+        let heading = r
+            .rows
+            .iter()
+            .position(|row| matches!(row, Row::Line { block: Block::Heading(_), .. }))
+            .expect("a heading");
+        let text = r.selectable(heading, 0).unwrap().to_string();
+        let end = TEXT_CHROME - PAD + text.chars().count() as f32 * r.metrics.size(1) * 0.602;
+        assert_eq!(r.hit(heading, 0, end, &host).unwrap().off, text.len());
+    }
+
+    #[test]
+    fn what_it_copies_is_what_it_drew() {
+        // The markers are off the text by the time a row holds it, so a copy
+        // yields the line as rendered rather than a bullet nobody can see.
+        let r = built(DOC);
+        let all: Vec<&str> = (0..r.len()).filter_map(|i| r.selectable(i, 0)).collect();
+        assert_eq!(all.len(), r.len(), "a row with nothing to copy");
+        assert!(all.contains(&"README.md"), "the file header is in it");
+        assert!(all.iter().any(|t| t.contains("bolder")));
     }
 }

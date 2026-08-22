@@ -8,8 +8,8 @@ and anyone can write another.
    │  plait-core                                              zero deps   │
    │  parse_log  assign_lanes  differ::{Histogram, Myers}  align  wrap    │
    │  prepared::prepare  rows::{Flat, Present, expand}  runs  markdown    │
-   │  syntax  graph::Hues  command::{Key, Keymap, Modes}  theme  font     │
-   │  host::Host — every swappable piece, in one struct                   │
+   │  syntax  graph::Hues  command::{Key, Keymap, Modes}  select  theme   │
+   │  font  host::Host — every swappable piece, in one struct             │
    └───────────────────────────────┬──────────────────────────────────────┘
    ┌───────────────────────────────┴──────────────────────────────────────┐
    │  plait-git      the only crate that talks to a repository            │
@@ -50,6 +50,7 @@ because it compiles in a second and its tests need no window.
 | `graph.rs` | which branch is which colour, the lane cap, the honest lane count |
 | `rows.rs` | a diff flattened to rows, the wrap index, the order table, the load path |
 | `runs.rs` | syntax tokens × intraline spans → one flat styled run list |
+| `select.rs` | what the mouse has selected: carets, the rows between them, and the copy |
 | `differ.rs` | the `Differ` trait, Histogram/Patience/Myers, whitespace relations, the indent heuristic, move detection, hunk assembly, routing |
 | `align.rs` | which removal sits opposite which addition, for a two-column view |
 | `prepared.rs` | a diff assembled into drawable rows: clip → intraline → syntax |

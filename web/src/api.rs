@@ -51,6 +51,7 @@ fn surface_name(s: Surface) -> &'static str {
         Surface::RemovedWord => "removedWord",
         Surface::MovedRemoved => "movedRemoved",
         Surface::MovedAdded => "movedAdded",
+        Surface::Selected => "selected",
     }
 }
 
@@ -113,6 +114,7 @@ fn theme(out: &mut String, t: &Theme) {
             field_rgb(o, f, "titleBg", c.title_bg);
             field_rgb(o, f, "statusBg", c.status_bg);
             field_rgb(o, f, "selectionBg", c.selection_bg);
+            field_rgb(o, f, "selectedBg", c.selected_bg);
             field_rgb(o, f, "error", c.error);
         });
 
@@ -132,7 +134,7 @@ fn theme(out: &mut String, t: &Theme) {
         rgb_list(o, &t.authors);
 
         // Every syntax class resolved against every background it can land on:
-        // 7 surfaces by 12 classes, computed once here because the contrast
+        // 8 surfaces by 12 classes, computed once here because the contrast
         // resolution is a handful of `powf` and the client would otherwise be
         // doing it per visible row per frame — which is the reason `Theme`
         // caches it in the first place.

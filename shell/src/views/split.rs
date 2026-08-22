@@ -47,12 +47,13 @@
 //! many rows it takes.
 
 use super::diff::{
-    columns, file_header, hunk_header, line_colors, number, number_or_blank, runs, slice, Rows,
-    ROW_H,
+    column_at, columns, file_header, header_hit, hunk_header, line_colors, number,
+    number_or_blank, runs, selected, slice, Hit, Rows, ROW_H,
 };
 use gpui::*;
 use plait_core::align::align;
 use plait_core::host::Host;
+use plait_core::select::Selected;
 use plait_core::syntax::Token;
 use plait_core::theme::Theme;
 use plait_core::wrap::{Wrap, Wrapped};
@@ -64,6 +65,17 @@ use plait_core::{LineKind, Span};
 enum Column {
     Old,
     New,
+}
+
+impl Column {
+    /// Which of the row's two texts this is, for a selection. The old side is 0
+    /// because a row with only one side has that side — see `selectable`.
+    fn part(self) -> u16 {
+        match self {
+            Column::Old => 0,
+            Column::New => 1,
+        }
+    }
 }
 
 /// Width of one column's line-number gutter. Narrower than the unified view's,
@@ -251,23 +263,83 @@ impl Rows for SplitRows {
         out
     }
 
-    fn render(&self, index: usize, seg: usize, host: &Host) -> AnyElement {
+    /// Which column the click was in, then where in that column's text — the
+    /// divider is what makes this two answers rather than one, and the reason a
+    /// [`Hit`] carries a part at all.
+    fn hit(&self, index: usize, seg: usize, x: f32, host: &Host) -> Option<Hit> {
+        match self.rows.get(index)? {
+            Row::File { path, .. } => Some(header_hit(path, x, host)),
+            Row::Hunk(h) => Some(header_hit(h, x, host)),
+            Row::Pair { old, new } => {
+                let cell = GUTTER_W + SIGN_W + self.col_px(host);
+                let (part, from) = match x < cell + RULE_W {
+                    true => (Column::Old, 0.0),
+                    false => (Column::New, cell + RULE_W),
+                };
+                let line = match part {
+                    Column::Old => *old,
+                    Column::New => *new,
+                };
+                // No line on this side at all: a lone addition opposite a hole.
+                // The caret still lands *on* the row, at nothing — which keeps a
+                // drag through the hole extending instead of freezing, and copies
+                // nothing for it because `selectable` has nothing to give.
+                let Some(line) = line else {
+                    return Some(Hit { part: part.part(), off: 0 });
+                };
+                let text = &self.lines[line as usize].text;
+                let at = self.wrapped.range(line as usize, seg, text);
+                let off = match seg < self.wrapped.rows(line as usize) {
+                    true => {
+                        at.start
+                            + column_at(
+                                &text[at.clone()],
+                                x - from - GUTTER_W - SIGN_W,
+                                host.font.size,
+                                host,
+                            )
+                    }
+                    // This side wrapped less far than the other one. The end of
+                    // its line is the honest place for the caret.
+                    false => text.len(),
+                };
+                Some(Hit { part: part.part(), off })
+            }
+        }
+    }
+
+    /// A pair row has two texts and a header has one, which it lends to both
+    /// parts: a file path is neither the old file's nor the new one's.
+    fn selectable(&self, index: usize, part: u16) -> Option<&str> {
+        match self.rows.get(index)? {
+            Row::File { path, .. } => Some(path.as_ref()),
+            Row::Hunk(h) => Some(h.as_ref()),
+            Row::Pair { old, new } => {
+                let line = match part {
+                    0 => *old,
+                    _ => *new,
+                }?;
+                Some(self.lines[line as usize].text.as_ref())
+            }
+        }
+    }
+
+    fn render(&self, index: usize, seg: usize, host: &Host, sel: Option<Selected>) -> AnyElement {
         let theme = &host.theme;
         match &self.rows[index] {
-            Row::File { path, adds, dels } => file_header(path, *adds, *dels, theme),
-            Row::Hunk(header) => hunk_header(header, theme),
+            Row::File { path, adds, dels } => file_header(path, *adds, *dels, theme, sel),
+            Row::Hunk(header) => hunk_header(header, theme, sel),
             Row::Pair { old, new } => {
                 // The column width in pixels, from the host's font rather than a
                 // constant: the face is configurable and hot-reloaded, and a
                 // stale character width is exactly what `font.advance` exists to
                 // stop being possible.
-                let col =
-                    px((self.col_chars() as f32 + SLACK) * host.font.advance * host.font.size);
+                let col = px(self.col_px(host));
                 div()
                     .flex()
                     .items_center()
                     .h(px(ROW_H))
-                    .child(self.cell(*old, seg, Column::Old, col, theme))
+                    .child(self.cell(*old, seg, Column::Old, col, theme, sel))
                     .child(
                         div()
                             .flex_none()
@@ -275,7 +347,7 @@ impl Rows for SplitRows {
                             .h(px(ROW_H))
                             .bg(rgb(theme.diff.gutter_fg)),
                     )
-                    .child(self.cell(*new, seg, Column::New, col, theme))
+                    .child(self.cell(*new, seg, Column::New, col, theme, sel))
                     .into_any_element()
             }
         }
@@ -299,6 +371,18 @@ impl SplitRows {
 
     /// One column of one row: gutter, sign, text — the built-in's anatomy at
     /// half the width, so the eye finds the same things in the same order.
+    /// How wide one column of text is, in pixels.
+    ///
+    /// From the host's font rather than a constant: the face is configurable and
+    /// hot-reloaded, and a stale character width is exactly what `font.advance`
+    /// exists to stop being possible. Shared by the drawing and the hit test so
+    /// the divider is in the same place in both — the click that lands on the
+    /// wrong side of it is the whole bug this one function prevents.
+    fn col_px(&self, host: &Host) -> f32 {
+        (self.col_chars() as f32 + SLACK) * host.font.advance * host.font.size
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn cell(
         &self,
         line: Option<u32>,
@@ -306,6 +390,7 @@ impl SplitRows {
         column: Column,
         col: Pixels,
         theme: &Theme,
+        sel: Option<Selected>,
     ) -> AnyElement {
         let p = &theme.diff;
         // Past the end of *this* side of a pair whose other side wrapped
@@ -355,12 +440,13 @@ impl SplitRows {
             .child(
                 div().flex_none().text_color(rgb(fg)).child(
                     StyledText::new(slice(&line.text, &at)).with_highlights(runs(
-                        at,
+                        at.clone(),
                         &line.tokens,
                         &line.spans,
                         theme,
                         line.kind,
                         line.moved,
+                        selected(sel, column.part(), line.text.len()),
                     )),
                 ),
             )
@@ -372,7 +458,7 @@ impl SplitRows {
 mod tests {
     // By name, not a glob: `use gpui::*` in the parent shadows `#[test]` with
     // GPUI's own attribute macro and every test in here fails to expand.
-    use super::{Row, Rows, SplitRows};
+    use super::{Column, Row, Rows, SplitRows, GUTTER_W, RULE_W, SIGN_W};
     use plait_core::host::Host;
     use plait_core::prepared::prepare;
     use plait_core::parse_unified_diff;
@@ -525,5 +611,60 @@ diff --git a/a.rs b/a.rs
         for p in ["a.rs", "b.md", "no-extension", "weird.xyz"] {
             assert!(r.claims(p));
         }
+    }
+
+    // ------------------------------------------------------------ selection
+
+    #[test]
+    fn the_divider_decides_which_column_a_click_is_in() {
+        // The one bug this presentation can have that the others cannot: a click
+        // a pixel the wrong side of the rule selects the file you were not
+        // reading. `col_px` is shared with the drawing so it cannot drift.
+        let host = Host::new();
+        let mut r = built();
+        r.reflow(900.0, &host, host.wrap.current());
+        let pair = (0..r.len()).find(|i| matches!(r.rows[*i], Row::Pair { .. })).unwrap();
+        let cell = GUTTER_W + SIGN_W + r.col_px(&host);
+
+        let left = r.hit(pair, 0, GUTTER_W + SIGN_W + 2.0, &host).unwrap();
+        assert_eq!(left.part, Column::Old.part());
+        let right = r.hit(pair, 0, cell + RULE_W + GUTTER_W + SIGN_W + 2.0, &host).unwrap();
+        assert_eq!(right.part, Column::New.part());
+        // Either side of the rule itself, and nothing in between.
+        assert_eq!(r.hit(pair, 0, cell - 1.0, &host).unwrap().part, 0);
+        assert_eq!(r.hit(pair, 0, cell + RULE_W + 1.0, &host).unwrap().part, 1);
+    }
+
+    #[test]
+    fn each_column_offers_its_own_text_and_a_hole_offers_none() {
+        // What makes a drag down one column paste that file: the other side is
+        // not a blank line, it is nothing at all.
+        let host = Host::new();
+        let mut r = built();
+        r.reflow(900.0, &host, host.wrap.current());
+        let pairs: Vec<usize> =
+            (0..r.len()).filter(|i| matches!(r.rows[*i], Row::Pair { .. })).collect();
+        let mut both = 0;
+        let mut holes = 0;
+        for i in pairs {
+            match (r.selectable(i, 0), r.selectable(i, 1)) {
+                (Some(_), Some(_)) => both += 1,
+                (None, Some(_)) | (Some(_), None) => holes += 1,
+                (None, None) => panic!("row {i} has no text on either side"),
+            }
+        }
+        // The fixture removes two lines and adds three: two replace pairs, one
+        // lone addition.
+        assert_eq!((both, holes), (4, 1));
+    }
+
+    #[test]
+    fn a_header_lends_its_text_to_both_columns() {
+        // A path is neither the old file's nor the new one's, and a selection
+        // that started in either column has to be able to include it.
+        let r = built();
+        assert_eq!(r.selectable(0, 0), Some("a.rs"));
+        assert_eq!(r.selectable(0, 1), Some("a.rs"));
+        assert_eq!(r.selectable(1, 0), r.selectable(1, 1));
     }
 }

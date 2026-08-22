@@ -243,8 +243,10 @@ to. A terminal does the same.
   this client now — see [clients.md](clients.md) — but how many rows of lead the
   cursor keeps is still a constant in `diff.rs`.
 - **`selection_bg` in the shell.** It was added to `ChromePalette` for this
-  client because a hardcoded selection colour is not a seam. No GPUI view draws a
-  selection yet.
+  client because a hardcoded selection colour is not a seam, and it means the row
+  the keyboard is on. No GPUI view draws *that* yet. The window's mouse selection
+  is a different colour and a different thing — `chrome.selected_bg`, and
+  [decisions/0018](decisions/0018-selection-is-a-model-not-a-text-element.md).
 - **Panes.** One screen at a time: `enter` on a commit opens its diff *over* the
   list and `esc` comes back. lazygit puts them side by side, and
   `Screen::span` is already the shape that would do it — nothing uses it for

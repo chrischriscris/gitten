@@ -511,21 +511,30 @@ elements rather than as runs, so they can carry their own colour.
 One `StyledText` with a run list, not an element per span:
 
 ```rust
-StyledText::new(text.clone()).with_highlights(runs(text, tokens, spans, theme, kind))
+StyledText::new(text.clone()).with_highlights(runs(at, tokens, spans, theme, kind, moved, sel))
 ```
 
-`runs` sweeps the token edges and the span edges together — both inputs are
-already sorted and internally non-overlapping — and emits one run per segment:
+`runs` sweeps the token edges, the span edges and the selection's together — all
+three inputs are already sorted and internally non-overlapping — and emits one run
+per segment:
 
 ```
   text     fn draw(&self) { ... }
   tokens   ██          ████            keyword, func
   spans        ████████████            changed words
-  runs     ├──┼─┼──────┼───┤           fg from token+surface, bg from span
+  sel            ██████████████        what the mouse is holding
+  runs     ├──┼─┼┼─────┼───┼─┤         fg from token+surface, bg from span or sel
 ```
 
 Syntax sets the foreground, intraline sets the background, and the foreground is
 resolved against whichever background it lands on — see [theming.md](theming.md).
+
+A selection outranks a changed word: both are backgrounds, only one can be drawn,
+and the reader already knows which words changed. It is a `Surface` of its own, so
+the token colours that land on it are resolved against it like any other —
+`Surface::Selected`, and
+[decisions/0018](decisions/0018-selection-is-a-model-not-a-text-element.md) for why
+it is a run and not an overlay.
 
 Rows hold `SharedString`, not `String`: `render` runs per visible row per redraw,
 so handing GPUI a `String` copies the line every frame.

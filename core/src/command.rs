@@ -465,6 +465,9 @@ impl Commands {
             ("diff.cycle-layout", "the next presentation"),
             ("diff.cycle-wrap", "the next wrap"),
             ("commits.open-diff", "the diff for this commit"),
+            ("select.all", "select the whole view"),
+            ("select.none", "drop the selection"),
+            ("copy.selection", "copy the selection"),
         ] {
             c.register(name, doc);
         }

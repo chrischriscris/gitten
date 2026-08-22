@@ -48,6 +48,8 @@ use gpui::*;
 use gpui_component::scroll::Scrollbar;
 use plait_core::host::Host;
 use plait_core::prepared::{prepare, Prepared};
+use plait_core::rows::{Ordered, RowRef};
+use plait_core::select::{self, Caret, RowId, Selected, Selection, Text as _};
 use plait_core::syntax::Token;
 use plait_core::theme::{DiffPalette, Rgb, Surface, Theme};
 use plait_core::wrap::{Wrap, Wrapped};
@@ -61,7 +63,7 @@ const GUTTER_W: f32 = 52.0;
 /// The `+`/`-` column.
 const SIGN_W: f32 = 16.0;
 /// The page padding, at each edge.
-const PAD: f32 = 16.0;
+pub(crate) const PAD: f32 = 16.0;
 
 /// Everything a text row draws besides its text: the padding at both edges, the
 /// two line-number gutters and the sign column. What the wrap budget is measured
@@ -94,6 +96,34 @@ pub(crate) fn columns(width: f32, chrome: f32, size: f32, host: &Host) -> usize 
 /// layout is linear in length and a 9.6-million-character line was measured in
 /// the wild; nobody reads past column 2000 either way.
 const MAX_LINE_CHARS: usize = 2000;
+
+/// Where a click landed inside a row: which of the row's texts, and which byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hit {
+    pub part: u16,
+    /// A byte offset into the *logical* row's text — see [`Rows::hit`].
+    pub off: usize,
+}
+
+/// Which byte of `text` a click `x` pixels into it landed on.
+///
+/// Characters, not bytes and not graphemes, and from `font.advance` rather than a
+/// measured glyph: exactly the approximation `columns` and `with_width_from_item`
+/// already make, and exact in a monospaced face. In a proportional one a caret
+/// drifts along a long line, which is the price of not shaping the text twice —
+/// and `Font::monospaced` exists to be asked when that matters.
+///
+/// **Rounds rather than truncates.** A click on the right half of a character
+/// puts the caret after it, which is what every text field does and what makes a
+/// drag include the character it started on.
+pub(crate) fn column_at(text: &str, x: f32, size: f32, host: &Host) -> usize {
+    let advance = size * host.font.advance;
+    if advance <= 0.0 || !x.is_finite() {
+        return 0;
+    }
+    let col = (x / advance).round().max(0.0) as usize;
+    text.char_indices().nth(col).map(|(i, _)| i).unwrap_or(text.len())
+}
 
 // ------------------------------------------------------------------ the seam
 
@@ -151,11 +181,44 @@ pub trait Rows {
         false
     }
 
-    fn render(&self, index: usize, seg: usize, host: &Host) -> AnyElement;
+    /// Draws one visual row. `sel` is the part of it the mouse has selected, in
+    /// the row's own byte coordinates — `None` for the overwhelming majority of
+    /// rows on the overwhelming majority of frames.
+    fn render(&self, index: usize, seg: usize, host: &Host, sel: Option<Selected>) -> AnyElement;
 
     /// Width of a visual row in characters, for `uniform_list`'s one measured
     /// row.
     fn width(&self, index: usize, seg: usize) -> usize;
+
+    /// Which text a click at `x` pixels from this row's left edge landed in, and
+    /// which byte of it.
+    ///
+    /// The frontend half of a selection, and the only half that needs pixels:
+    /// where the text starts depends on the gutters, the bars and the indents
+    /// this presentation drew in front of it, and how wide a character is depends
+    /// on the face and — in a rendered document — on the row. Nobody outside an
+    /// implementation can know either, which is why this is on the trait rather
+    /// than a division in the view.
+    ///
+    /// The offset is into the **logical** row's text, not the visual row's, so a
+    /// caret on the third row of a wrapped line is the same kind of thing as one
+    /// on an unwrapped line — see [`plait_core::select`]. `None` means the row
+    /// takes no part in a selection, and defaults to it: an extension's
+    /// presentation compiles unchanged and is simply not selectable until it says
+    /// where its text is.
+    fn hit(&self, _index: usize, _seg: usize, _x: f32, _host: &Host) -> Option<Hit> {
+        None
+    }
+
+    /// The text of one of this row's parts: what a selection over it copies.
+    ///
+    /// `None` for a part that is not there — the empty side of a two-column row,
+    /// a row that draws no text — and a copy *skips* those rather than pasting a
+    /// blank line for them. The line coordinates are the ones [`Rows::hit`]
+    /// returns offsets into.
+    fn selectable(&self, _index: usize, _part: u16) -> Option<&str> {
+        None
+    }
 
     /// Whatever this implementation wants to say on the stats overlay.
     fn report(&self) -> String {
@@ -253,40 +316,13 @@ impl Layouts {
 // will be: the view owns a focus handle, the binding is global, and the handler
 // is a method. When command dispatch and the mode stack land in `core` this
 // becomes a named command they can reach — see `docs/extending.md`.
-actions!(plait, [CycleLayout, CycleWrap]);
+actions!(plait, [CycleLayout, CycleWrap, CopySelection, SelectAll, SelectNone]);
 
-/// 8 bytes per row: which implementation owns it, where in that implementation's
-/// own storage it sits, and which of that row's wrapped lines this one is. The
-/// rows themselves are never boxed — at 700k rows that would be 700k allocations
-/// to chase on every scroll.
-///
-/// `seg` fits in the two bytes `owner` and `index` left over, so wrapping cost
-/// the order table nothing. It caps a line at 65,535 rows, which
-/// [`MAX_LINE_CHARS`] and [`MIN_WRAP_COLS`] together put out of reach by a factor
-/// of 260.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct RowRef {
-    owner: u16,
-    seg: u16,
-    index: u32,
-}
-
-impl RowRef {
-    /// The logical row this one is part of — what survives a reflow, and
-    /// therefore what a reading position is anchored to.
-    fn logical(self) -> (u16, u32) {
-        (self.owner, self.index)
-    }
-}
-
-/// An order table, and the two things computed while walking it.
-struct Ordered {
-    order: Vec<RowRef>,
-    /// Widest row, for `uniform_list`'s one measured item.
-    widest: usize,
-    /// Where the anchor's logical row landed, so a reflow keeps your place.
-    anchor: usize,
-}
+// The order table's row reference and the table itself are
+// `plait_core::rows`': 8 bytes a row, `logical()` for what survives a reflow,
+// and the same `widest`/`anchor` a walk of it computes. Only `expand` below is
+// this client's, and only because a `Rows` returns an `AnyElement` — see the
+// note there.
 
 /// Expands one entry per *logical* row into one per *visual* row.
 ///
@@ -352,6 +388,17 @@ pub struct Diff {
     /// does; one borrow per *batch* of rows, not per row.
     renderers: Rc<RefCell<Vec<Box<dyn Rows>>>>,
     order: Rc<Vec<RowRef>>,
+    /// What the mouse has selected, or nothing.
+    ///
+    /// The model is `plait_core::select` and this is the only state the window
+    /// keeps: a caret is a logical row and a byte, so it survives a reflow, and
+    /// the render path turns it into a byte range per visible row in two
+    /// comparisons. Cleared by a layout change and by a new diff, because the
+    /// rows it was anchored to are then somebody else's.
+    sel: Option<Selection>,
+    /// True between mouse-down and mouse-up, so a move extends the selection
+    /// rather than doing nothing at all.
+    dragging: bool,
     /// See the note in the commits view: uniform_list sizes its scrollable
     /// width from a single measured row, defaulting to row 0.
     widest: usize,
@@ -473,6 +520,15 @@ impl Diff {
         self.total.set(self.order.len());
         self.top.set(built.anchor);
         self.scroll_to(built.anchor);
+        // The rows are the same rows at different heights, so the selection
+        // survives — but every visual row it cached has moved, which is what
+        // `resolve` rebuilds. A drag *through* a reflow cannot happen: the width
+        // only changes when the mouse is on the window's edge.
+        if let Some(sel) = &mut self.sel {
+            if !sel.resolve(&self.order) {
+                self.sel = None;
+            }
+        }
     }
 
     /// Which presentation is loaded. Read by the tests and by anything that
@@ -609,6 +665,8 @@ impl Diff {
             measured: Rc::new(Cell::new(0.0)),
             renderers: Rc::new(RefCell::new(built.renderers)),
             order: Rc::new(built.order),
+            sel: None,
+            dragging: false,
             widest: built.widest,
             scroll: UniformListScrollHandle::new(),
             focus: None,
@@ -656,6 +714,11 @@ impl Diff {
             n => self.top.get() as f32 / n as f32,
         };
         self.current = index;
+        // Every row about to be replaced, so a selection anchored to one of them
+        // would be pointing at whatever now has its index. There is no honest
+        // way to carry a selection across two presentations of the same diff —
+        // a replace pair is one row here and two there — so it goes.
+        self.sel = None;
         let built = assemble(&self.files, host, &self.layouts, index);
         self.order = Rc::new(built.order);
         *self.renderers.borrow_mut() = built.renderers;
@@ -771,6 +834,236 @@ impl Diff {
     }
 }
 
+// -------------------------------------------------------------- the selection
+
+/// Where every row's selectable text comes from, for `plait_core::select`.
+///
+/// A wrapper rather than an impl on the vector, because the trait and the vector
+/// both belong to somebody else. Three lines is what this seam costs.
+struct Selectable<'a>(&'a [Box<dyn Rows>]);
+
+impl select::Text for Selectable<'_> {
+    fn text(&self, row: RowId, part: u16) -> Option<&str> {
+        self.0.get(row.0 as usize)?.selectable(row.1 as usize, part)
+    }
+}
+
+impl Diff {
+    /// Which row and which byte of it a point in the window landed on.
+    ///
+    /// This is the one piece of a selection that cannot be a presentation's job
+    /// and cannot be `core`'s either: `uniform_list` puts row *i* at
+    /// `origin + offset + i * ROW_H`, and this is that arithmetic run backwards
+    /// against the box and the scroll offset the list wrote during paint.
+    ///
+    /// **Not clamped to the viewport.** A drag 200 pixels below the window lands
+    /// on the row 9 further down, which exists and is exactly what should be
+    /// selected — the same as dragging past the bottom of a page in a browser.
+    /// Clamped to the *diff*, so it cannot address a row that is not there.
+    fn locate(&self, pos: Point<Pixels>, host: &Host) -> Option<(u16, Caret)> {
+        if self.order.is_empty() {
+            return None;
+        }
+        let (bounds, offset) = {
+            let s = self.scroll.0.borrow();
+            (s.base_handle.bounds(), s.base_handle.offset())
+        };
+        // Zero before the list has ever been painted, and a click cannot have
+        // happened inside something that was never drawn.
+        if bounds.size.width <= px(0.) {
+            return None;
+        }
+        let y = f32::from(pos.y - bounds.origin.y - offset.y);
+        let visual = ((y / ROW_H).floor().max(0.0) as usize).min(self.order.len() - 1);
+        let x = f32::from(pos.x - bounds.origin.x - offset.x);
+        let r = self.order[visual];
+
+        let renderers = self.renderers.borrow();
+        let rows = renderers.get(r.owner as usize)?;
+        let hit = rows.hit(r.index as usize, r.seg as usize, x, host)?;
+        // The visual rows this logical row occupies. The caret caches them so the
+        // render path never searches the order table for them, and they are free
+        // here: this row is `seg` into the run and the presentation knows how long
+        // the run is.
+        let first = visual - r.seg as usize;
+        let n = rows.rows(r.index as usize).max(1);
+        Some((hit.part, Caret { row: r.logical(), off: hit.off, at: first..first + n }))
+    }
+
+    /// A selection over one byte range of one row: what a double or a triple
+    /// click makes.
+    fn span(&self, part: u16, at: &Caret, bytes: Range<usize>) -> Selection {
+        let mut sel = Selection::new(part, Caret { off: bytes.start, ..at.clone() });
+        sel.extend(Caret { off: bytes.end, ..at.clone() });
+        sel
+    }
+
+    /// The text of one row, for a word or a whole-row selection.
+    fn row_text(&self, row: RowId, part: u16) -> Option<String> {
+        Selectable(&self.renderers.borrow()).text(row, part).map(str::to_string)
+    }
+
+    /// Mouse down: a new selection, a widened one on a repeat click, or an
+    /// extension of the existing one when shift is held.
+    ///
+    /// A press on nothing selectable *clears*, which is the whole reason a fresh
+    /// [`Selection`] is empty until something extends it: a click has to be able
+    /// to mean "no longer selected".
+    fn press(&mut self, ev: &MouseDownEvent, cx: &mut Context<Self>) {
+        let host = crate::config::host(cx);
+        let Some((part, caret)) = self.locate(ev.position, &host) else {
+            self.sel = None;
+            cx.notify();
+            return;
+        };
+        self.dragging = true;
+        // Shift extends whatever is already there, which is how a selection
+        // longer than the window gets made without a drag that has to scroll.
+        // Only within the same part: across the divider it means nothing.
+        let extend =
+            ev.modifiers.shift && self.sel.as_ref().is_some_and(|s| s.part() == part);
+        self.sel = match (extend, ev.click_count) {
+            (true, _) => {
+                let mut sel = self.sel.take().expect("extend implies a selection");
+                sel.extend(caret);
+                Some(sel)
+            }
+            // Two clicks take the word under the caret, three take the row. The
+            // classes a word is made of are `core`'s: a terminal and a window
+            // must not disagree about what `foo(bar,` is.
+            (_, 2) => {
+                let text = self.row_text(caret.row, part).unwrap_or_default();
+                Some(self.span(part, &caret, select::word_at(&text, caret.off)))
+            }
+            (_, n) if n >= 3 => {
+                let len = self.row_text(caret.row, part).map_or(0, |t| t.len());
+                Some(self.span(part, &caret, 0..len))
+            }
+            _ => Some(Selection::new(part, caret)),
+        };
+        cx.notify();
+    }
+
+    /// Mouse move with the button down: moves the free end.
+    ///
+    /// The **anchor's** part wins. A drag that crosses the divider of a
+    /// side-by-side diff stays in the column it started in and runs to that
+    /// column's edge — because the alternative is a paste with the old and the
+    /// new file interleaved, which is not a thing anybody wants.
+    fn drag(&mut self, ev: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if !self.dragging || !ev.dragging() {
+            return;
+        }
+        let host = crate::config::host(cx);
+        self.autoscroll(ev.position);
+        let Some((part, mut caret)) = self.locate(ev.position, &host) else { return };
+        let Some(sel) = &self.sel else { return };
+        if part != sel.part() {
+            // Parts are laid out left to right, so a part further along than the
+            // anchor's means the mouse is past the end of the anchor's text.
+            caret.off = match part > sel.part() {
+                true => self.row_text(caret.row, sel.part()).map_or(0, |t| t.len()),
+                false => 0,
+            };
+        }
+        if let Some(sel) = &mut self.sel {
+            sel.extend(caret);
+        }
+        cx.notify();
+    }
+
+    /// Pulls the diff along when a drag reaches an edge, a row per row of
+    /// overshoot.
+    ///
+    /// Deliberately not a clock. Holding the mouse still outside the window does
+    /// not keep scrolling, because that needs a timer running for as long as a
+    /// button is held and this needs nothing at all — and the selection already
+    /// extends past the last visible row without it, so what this buys is being
+    /// able to *see* where it got to.
+    fn autoscroll(&self, pos: Point<Pixels>) {
+        if self.order.is_empty() {
+            return;
+        }
+        let bounds = self.scroll.0.borrow().base_handle.bounds();
+        let over = if pos.y < bounds.top() {
+            pos.y - bounds.top()
+        } else if pos.y > bounds.bottom() {
+            pos.y - bounds.bottom()
+        } else {
+            return;
+        };
+        // At least one row: an overshoot of three pixels is still an overshoot,
+        // and truncating it to nothing is a drag that will not leave the edge.
+        let over = f32::from(over);
+        let by = match (over / ROW_H) as i64 {
+            0 => over.signum() as i64,
+            rows => rows,
+        };
+        let last = self.order.len() as i64 - 1;
+        let to = (self.top.get() as i64 + by).clamp(0, last) as usize;
+        self.scroll.scroll_to_item(to, ScrollStrategy::Top);
+    }
+
+    /// Whatever the mouse is holding, as text. Empty when nothing is selected.
+    pub fn selection(&self) -> String {
+        match &self.sel {
+            Some(sel) => sel.text(&self.order, &Selectable(&self.renderers.borrow())),
+            None => String::new(),
+        }
+    }
+
+    /// `copy.selection`. A no-op with nothing selected rather than a cleared
+    /// clipboard — losing what somebody copied elsewhere is worse than a key
+    /// that did nothing.
+    pub fn copy(&self, cx: &mut Context<Self>) {
+        let text = self.selection();
+        if !text.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    /// `select.all`.
+    pub fn select_all(&mut self, cx: &mut Context<Self>) {
+        self.sel = Selection::all(&self.order);
+        cx.notify();
+    }
+
+    /// `select.none`.
+    pub fn select_none(&mut self, cx: &mut Context<Self>) {
+        if self.sel.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// While a drag is live the mouse belongs to it, wherever the pointer is.
+    ///
+    /// An element's own `on_mouse_move` fires only while the pointer is inside
+    /// its box, so a selection dragged up into the title bar — or off the side of
+    /// the window — would silently stop extending halfway through. A
+    /// window-level listener has no box; it has to be registered during *paint*,
+    /// which is what the zero-height canvas is for. Registered only while
+    /// dragging, so a listener is not walked on every mouse move of every frame.
+    fn drag_probe(&self, cx: &mut Context<Self>) -> AnyElement {
+        if !self.dragging {
+            return div().into_any_element();
+        }
+        let me = cx.entity().downgrade();
+        canvas(|_, _, _| {}, move |_, _, window, _| {
+            let me = me.clone();
+            window.on_mouse_event(move |ev: &MouseMoveEvent, phase, _, cx| {
+                if phase == DispatchPhase::Bubble {
+                    _ = me.update(cx, |this, cx| this.drag(ev, cx));
+                }
+            });
+        })
+        .absolute()
+        .top_0()
+        .left_0()
+        .h(px(0.))
+        .into_any_element()
+    }
+}
+
 impl Render for Diff {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Whatever the last frame measured this view to be. Reflowing here and
@@ -782,6 +1075,10 @@ impl Render for Diff {
         let order = self.order.clone();
         let rendered = self.rendered.clone();
         let top = self.top.clone();
+        // Cloned per frame and not held behind a cell: it is two carets, the
+        // closure lives for one element tree, and every path that changes a
+        // selection notifies — so the copy in here is never the stale one.
+        let sel = self.sel.clone();
 
         // The host is read here, per batch, rather than cloned in once when the
         // view was built. That is the whole of what makes a saved config file
@@ -795,7 +1092,11 @@ impl Render for Diff {
             range
                 .map(|i| {
                     let r = order[i];
-                    renderers[r.owner as usize].render(r.index as usize, r.seg as usize, &host)
+                    // Two integer comparisons on a row with no selection, which
+                    // is every row of every frame until somebody drags.
+                    let at = sel.as_ref().and_then(|s| s.at(i, r.logical()));
+                    renderers[r.owner as usize]
+                        .render(r.index as usize, r.seg as usize, &host, at)
                 })
                 .collect()
         })
@@ -807,7 +1108,28 @@ impl Render for Diff {
         let mut root = div()
             .relative()
             .size_full()
+            // Text, because it is: the whole view is selectable, headers
+            // included, and an arrow over a wall of code says it is not.
+            .cursor_text()
+            // Down starts a selection, up ends the drag, and move extends it —
+            // but only the down needs to be on this element. Move is registered
+            // on the *window* while a drag is live, so it does not stop at the
+            // edge of the box (see `drag_probe`), and `on_mouse_up_out` is what
+            // catches a button released somewhere else entirely.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, ev: &MouseDownEvent, _, cx| this.press(ev, cx)),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, _| this.dragging = false),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, _| this.dragging = false),
+            )
             .child(list)
+            .child(self.drag_probe(cx))
             // How wide this view actually is, which is the wrap budget. A view
             // is handed its box by whatever assembled it and cannot know it
             // during `render`, so it is read off the paint pass and used on the
@@ -830,7 +1152,10 @@ impl Render for Diff {
             root = root
                 .track_focus(&focus)
                 .on_action(cx.listener(|this, _: &CycleLayout, _, cx| this.cycle_layout(cx)))
-                .on_action(cx.listener(|this, _: &CycleWrap, _, cx| this.cycle_wrap(cx)));
+                .on_action(cx.listener(|this, _: &CycleWrap, _, cx| this.cycle_wrap(cx)))
+                .on_action(cx.listener(|this, _: &CopySelection, _, cx| this.copy(cx)))
+                .on_action(cx.listener(|this, _: &SelectAll, _, cx| this.select_all(cx)))
+                .on_action(cx.listener(|this, _: &SelectNone, _, cx| this.select_none(cx)));
         }
         root
     }
@@ -958,13 +1283,46 @@ impl Rows for TextRows {
         }
     }
 
-    fn render(&self, index: usize, seg: usize, host: &Host) -> AnyElement {
+    /// The gutters and the sign column, then the text — and for a header, the
+    /// page padding and nothing else, because that is what it draws.
+    fn hit(&self, index: usize, seg: usize, x: f32, host: &Host) -> Option<Hit> {
+        Some(match self.rows.get(index)? {
+            Row::Hunk(h) => header_hit(h, x, host),
+            Row::File { path, .. } => header_hit(path, x, host),
+            Row::Line { text, .. } => {
+                let at = self.wrapped.range(index, seg, text);
+                // Rebased into the line: a caret addresses the line, and this row
+                // is one of the rows the line wrapped onto.
+                let off = at.start
+                    + column_at(
+                        &text[at.clone()],
+                        x - (TEXT_CHROME - PAD),
+                        host.font.size,
+                        host,
+                    );
+                Hit { part: 0, off }
+            }
+        })
+    }
+
+    /// One part, and it is what the row draws. A header's text is its own — a
+    /// selection dragged across three files copies their paths with them, which
+    /// is what makes the paste readable.
+    fn selectable(&self, index: usize, _part: u16) -> Option<&str> {
+        Some(match self.rows.get(index)? {
+            Row::Line { text, .. } => text.as_ref(),
+            Row::Hunk(h) => h.as_ref(),
+            Row::File { path, .. } => path.as_ref(),
+        })
+    }
+
+    fn render(&self, index: usize, seg: usize, host: &Host, sel: Option<Selected>) -> AnyElement {
         let theme = &host.theme;
         let p = &theme.diff;
         match &self.rows[index] {
-            Row::File { path, adds, dels } => file_header(path, *adds, *dels, theme),
+            Row::File { path, adds, dels } => file_header(path, *adds, *dels, theme, sel),
 
-            Row::Hunk(header) => hunk_header(header, theme),
+            Row::Hunk(header) => hunk_header(header, theme, sel),
 
             Row::Line { kind, moved, old, new, text, spans, tokens } => {
                 let (bg, fg, sign) = line_colors(*kind, *moved, p);
@@ -992,8 +1350,15 @@ impl Rows for TextRows {
                     )
                     .child(
                         div().flex_none().text_color(rgb(fg)).child(
-                            StyledText::new(piece)
-                                .with_highlights(runs(at, tokens, spans, theme, *kind, *moved)),
+                            StyledText::new(piece).with_highlights(runs(
+                                at.clone(),
+                                tokens,
+                                spans,
+                                theme,
+                                *kind,
+                                *moved,
+                                selected(sel, 0, text.len()),
+                            )),
                         ),
                     )
                     .into_any_element()
@@ -1034,6 +1399,47 @@ pub(crate) fn number_or_blank(n: &SharedString, blank: bool) -> SharedString {
     }
 }
 
+/// The bytes of a `len`-long text that a selection covers, or nothing at all
+/// when the selection is in another of the row's parts — or is not there, which
+/// is the case on nearly every row of nearly every frame.
+pub(crate) fn selected(sel: Option<Selected>, part: u16, len: usize) -> Range<usize> {
+    match sel.filter(|s| s.part() == part) {
+        Some(s) => s.range(len),
+        None => 0..0,
+    }
+}
+
+/// Where a click landed in a file or hunk header.
+///
+/// Shared for the same reason the two headers themselves are: whoever owns the
+/// lines beneath them, a header is drawn by [`file_header`] or [`hunk_header`] and
+/// its text starts at the page padding. Three presentations working that out
+/// separately is three places for the caret to be a gutter's width off.
+pub(crate) fn header_hit(text: &str, x: f32, host: &Host) -> Hit {
+    Hit { part: 0, off: column_at(text, x - PAD, host.font.size, host) }
+}
+
+/// A header's text, with whatever a selection covers lit up behind it.
+///
+/// One run and not the token sweep: a header has no syntax and no changed words,
+/// so the only thing that can be true of a stretch of it is that it is selected.
+/// The unselected case stays a bare string child — a `StyledText` on every header
+/// of every frame is a shaped line for a highlight nobody asked for.
+fn header_text(text: &SharedString, sel: Range<usize>, theme: &Theme) -> AnyElement {
+    if sel.is_empty() {
+        return text.clone().into_any_element();
+    }
+    StyledText::new(text.clone())
+        .with_highlights([(
+            sel,
+            HighlightStyle {
+                background_color: Some(rgb(theme.chrome.selected_bg).into()),
+                ..Default::default()
+            },
+        )])
+        .into_any_element()
+}
+
 /// A file's header row. Identical whichever presentation owns the lines beneath
 /// it — a `.md` file is still a file — so it is drawn here and shared.
 pub(crate) fn file_header(
@@ -1041,6 +1447,7 @@ pub(crate) fn file_header(
     adds: usize,
     dels: usize,
     theme: &Theme,
+    sel: Option<Selected>,
 ) -> AnyElement {
     let p = &theme.diff;
     div()
@@ -1050,13 +1457,21 @@ pub(crate) fn file_header(
         .h(px(ROW_H))
         .px_4()
         .bg(rgb(p.file_bg))
-        .child(div().text_color(rgb(p.file_fg)).child(path.clone()))
+        .child(
+            div()
+                .text_color(rgb(p.file_fg))
+                .child(header_text(path, selected(sel, 0, path.len()), theme)),
+        )
         .child(div().text_color(rgb(p.adds_fg)).child(format!("+{adds}")))
         .child(div().text_color(rgb(p.dels_fg)).child(format!("-{dels}")))
         .into_any_element()
 }
 
-pub(crate) fn hunk_header(header: &SharedString, theme: &Theme) -> AnyElement {
+pub(crate) fn hunk_header(
+    header: &SharedString,
+    theme: &Theme,
+    sel: Option<Selected>,
+) -> AnyElement {
     let p = &theme.diff;
     div()
         .flex()
@@ -1065,7 +1480,7 @@ pub(crate) fn hunk_header(header: &SharedString, theme: &Theme) -> AnyElement {
         .px_4()
         .bg(rgb(p.hunk_bg))
         .text_color(rgb(p.hunk_fg))
-        .child(header.clone())
+        .child(header_text(header, selected(sel, 0, header.len()), theme))
         .into_any_element()
 }
 
@@ -1103,19 +1518,24 @@ pub(crate) fn number(n: Option<u32>) -> SharedString {
     n.map(|n| SharedString::from(n.to_string())).unwrap_or_default()
 }
 
-/// Merges two independent sets of byte ranges into the one flat, sorted,
+/// Merges three independent sets of byte ranges into the one flat, sorted,
 /// non-overlapping run list `StyledText` wants: syntax tokens style the
-/// foreground, intraline spans light the background.
+/// foreground, intraline spans light the background of the words that changed,
+/// and `sel` lights the background of whatever the mouse has selected.
 ///
-/// Both inputs are already sorted and internally non-overlapping, so this is a
-/// sweep over their combined edges rather than a sort.
+/// All three arrive sorted and internally non-overlapping, so this is a sweep
+/// over their combined edges rather than a sort.
 ///
 /// `at` is the part of the line being drawn, which is the whole of it unless the
-/// line wrapped. Tokens and spans stay in *line* coordinates throughout — they
-/// belong to the line, not to one of its rows — and are clamped into `at` on the
-/// way in and rebased on the way out. Clipping them into a row's own vectors
-/// first is the other way to write this, and it is two allocations per visible
-/// row per frame for an answer the sweep already had.
+/// line wrapped. Tokens, spans and the selection stay in *line* coordinates
+/// throughout — they belong to the line, not to one of its rows — and are clamped
+/// into `at` on the way in and rebased on the way out. Clipping them into a row's
+/// own vectors first is the other way to write this, and it is two allocations per
+/// visible row per frame for an answer the sweep already had.
+///
+/// **A selection outranks a changed word.** Both are backgrounds and only one can
+/// be drawn, and the reader already knows which words changed — the thing they do
+/// not know, and are about to press a key about, is what is selected.
 pub(crate) fn runs(
     at: Range<usize>,
     tokens: &[Token],
@@ -1123,6 +1543,7 @@ pub(crate) fn runs(
     theme: &Theme,
     kind: LineKind,
     moved: bool,
+    sel: Range<usize>,
 ) -> Vec<(Range<usize>, HighlightStyle)> {
     // Which background each run actually lands on, so the theme can hand back a
     // foreground that reads against it. A changed word sits on a lighter
@@ -1142,14 +1563,16 @@ pub(crate) fn runs(
         (LineKind::Context, _) => (Surface::Context, Surface::Context),
     };
     let word_bg = theme.background(word_surface);
-    if tokens.is_empty() && spans.is_empty() {
+    let selected_bg = theme.background(Surface::Selected);
+    if tokens.is_empty() && spans.is_empty() && sel.is_empty() {
         return Vec::new();
     }
 
     // Clamped rather than filtered: anything wholly outside this row collapses
     // to a zero-length edge pair, which `dedup` removes for free.
     let clamp = |i: usize| i.clamp(at.start, at.end);
-    let mut edges = Vec::with_capacity((tokens.len() + spans.len()) * 2 + 1);
+    let sel = clamp(sel.start)..clamp(sel.end);
+    let mut edges = Vec::with_capacity((tokens.len() + spans.len()) * 2 + 3);
     for t in tokens {
         edges.push(clamp(t.start));
         edges.push(clamp(t.end));
@@ -1158,6 +1581,8 @@ pub(crate) fn runs(
         edges.push(clamp(s.start));
         edges.push(clamp(s.end));
     }
+    edges.push(sel.start);
+    edges.push(sel.end);
     edges.push(at.end);
     edges.sort_unstable();
     edges.dedup();
@@ -1172,11 +1597,20 @@ pub(crate) fn runs(
         while si < spans.len() && spans[si].end <= cursor {
             si += 1;
         }
+        let on_sel = sel.contains(&cursor);
         let on_word = spans.get(si).is_some_and(|s| s.start <= cursor);
-        let surface = if on_word { word_surface } else { plain_surface };
+        let surface = match (on_sel, on_word) {
+            (true, _) => Surface::Selected,
+            (false, true) => word_surface,
+            (false, false) => plain_surface,
+        };
         let style =
             tokens.get(ti).filter(|t| t.start <= cursor).map(|t| theme.syntax_on(t.kind, surface));
-        let bg = on_word.then(|| rgb(word_bg).into());
+        let bg = match (on_sel, on_word) {
+            (true, _) => Some(rgb(selected_bg).into()),
+            (false, true) => Some(rgb(word_bg).into()),
+            (false, false) => None,
+        };
         if style.is_some() || bg.is_some() {
             out.push((
                 cursor - at.start..edge - at.start,
@@ -1198,12 +1632,15 @@ pub(crate) fn runs(
 mod tests {
     // By name, not a glob: `use gpui::*` in the parent shadows `#[test]` with
     // GPUI's own attribute macro and every test in here fails to expand.
-    use super::{line_colors, runs, Diff, Layouts, Row, Rows, TextRows, TEXT_CHROME};
-    use gpui::{div, AnyElement, FontStyle, FontWeight, HighlightStyle, IntoElement, ParentElement};
+    use super::{line_colors, Diff, Layouts, Row, Rows, TextRows, PAD, TEXT_CHROME};
+    use gpui::{
+        div, rgb, AnyElement, FontStyle, FontWeight, HighlightStyle, IntoElement, ParentElement,
+    };
     use plait_core::host::Host;
     use plait_core::syntax::{Kind, Token};
-    use plait_core::theme::{Style, Theme};
+    use plait_core::theme::{Style, Surface, Theme};
     use plait_core::prepared::{prepare, File as PreparedFile};
+    use plait_core::select::{Caret, Selected, Selection};
     use plait_core::{parse_unified_diff, LineKind, Span};
     use std::rc::Rc;
 
@@ -1214,6 +1651,20 @@ mod tests {
     /// The whole line — what every row that did not wrap asks `runs` for.
     fn all(text: &str) -> std::ops::Range<usize> {
         0..text.len()
+    }
+
+    /// The merge with nothing selected, which is what everything below but the
+    /// selection tests is about. Shadows the real one so those tests read as they
+    /// did before a selection was a layer in it.
+    fn runs(
+        at: std::ops::Range<usize>,
+        tokens: &[Token],
+        spans: &[Span],
+        theme: &Theme,
+        kind: LineKind,
+        moved: bool,
+    ) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
+        super::runs(at, tokens, spans, theme, kind, moved, 0..0)
     }
 
     fn well_formed(text: &str, runs: &[(std::ops::Range<usize>, HighlightStyle)]) {
@@ -1406,6 +1857,189 @@ diff --git a/a.rs b/a.rs
 +    let x = 2;
 ";
 
+    // ------------------------------------------------------------ selection
+
+    /// `x` pixels for a click `col` characters into a line's text, in the
+    /// default face. Half a character in, so the rounding in [`column_at`] is
+    /// not deciding the test.
+    fn x_for(col: usize, host: &Host) -> f32 {
+        TEXT_CHROME - PAD + (col as f32 + 0.1) * host.font.size * host.font.advance
+    }
+
+    #[test]
+    fn a_click_lands_on_the_byte_under_it() {
+        let (r, host) = text_rows(SAMPLE);
+        // Row 3 is `-    let x = 1;`, stored without its sign.
+        let text = r.selectable(3, 0).expect("a line");
+        assert_eq!(text, "    let x = 1;");
+        for col in [0, 4, 7, 13] {
+            let hit = r.hit(3, 0, x_for(col, &host), &host).expect("a hit");
+            assert_eq!((hit.part, hit.off), (0, col), "column {col}");
+        }
+        // Past the end of the text clamps to the end of it rather than reaching
+        // into whatever is at that byte of the next line.
+        let hit = r.hit(3, 0, x_for(400, &host), &host).unwrap();
+        assert_eq!(hit.off, text.len());
+        // And to the left of the text — in the gutter — is the start of it.
+        let hit = r.hit(3, 0, 0.0, &host).unwrap();
+        assert_eq!(hit.off, 0);
+    }
+
+    #[test]
+    fn a_click_on_a_continuation_row_addresses_the_line_and_not_the_row() {
+        // The failure this prevents is the same one `runs` guards against from
+        // the other side: a caret in *row* coordinates would select from the
+        // start of the line every time you clicked on a wrapped one.
+        let (mut r, host) = text_rows(LONG);
+        assert!(r.reflow(width_for(40, &host), &host, host.wrap.current()));
+        let row = (0..r.len()).find(|i| r.rows(*i) > 1).expect("a wrapped line");
+        let first = r.hit(row, 0, x_for(3, &host), &host).unwrap().off;
+        let second = r.hit(row, 1, x_for(3, &host), &host).unwrap().off;
+        assert_eq!(first, 3);
+        assert!(second > 30, "the second row rebased to {second}, not into the line");
+        // And the byte it names is the byte drawn there.
+        let text = r.selectable(row, 0).unwrap();
+        let at = r.wrapped.range(row, 1, text);
+        assert_eq!(second, at.start + 3);
+    }
+
+    #[test]
+    fn a_header_is_selectable_because_a_paste_of_three_files_needs_its_paths() {
+        let (r, host) = text_rows(SAMPLE);
+        assert_eq!(r.selectable(0, 0), Some("a.rs"));
+        assert_eq!(r.selectable(1, 0), Some("@@ -1,2 +1,2 @@"));
+        // Drawn at the page padding and nowhere else, whichever presentation
+        // owns the lines beneath it.
+        let hit = r.hit(0, 0, PAD + 2.5 * host.font.size * host.font.advance, &host).unwrap();
+        assert_eq!(hit.off, 2);
+    }
+
+    #[test]
+    fn a_selection_over_three_rows_copies_the_lines_between_them() {
+        let host = Host::new();
+        let mut diff = Diff::with_layouts(parse_unified_diff(SAMPLE), &host, Layouts::builtin());
+        // Rows: the file header, the hunk header, then three lines.
+        diff.sel = Some(select(&diff, (2, 0), (4, 9)));
+        assert_eq!(diff.selection(), "fn main() {
+    let x = 1;
+    let x");
+        // The anchor is not the start: the same drag backwards is the same text.
+        diff.sel = Some(select(&diff, (4, 9), (2, 0)));
+        assert_eq!(diff.selection(), "fn main() {
+    let x = 1;
+    let x");
+    }
+
+    #[test]
+    fn a_wrapped_line_copies_once_and_without_the_break() {
+        // The window's width is not part of the text. Pasting the soft breaks
+        // back would paste the size of somebody's window into their file.
+        let host = Host::new();
+        let mut diff = Diff::with_layouts(parse_unified_diff(LONG), &host, Layouts::builtin());
+        diff.reflow(width_for(30, &host), &host);
+        let long = *diff
+            .order
+            .iter()
+            .find(|r| diff.renderers.borrow()[r.owner as usize].rows(r.index as usize) > 1)
+            .expect("a line that wrapped");
+        let whole = diff.renderers.borrow()[long.owner as usize]
+            .selectable(long.index as usize, 0)
+            .unwrap()
+            .to_string();
+        let at = diff.order.iter().position(|r| *r == long).unwrap();
+        let n = diff.renderers.borrow()[long.owner as usize].rows(long.index as usize);
+        let mut sel = Selection::new(0, Caret { row: long.logical(), off: 0, at: at..at + n });
+        sel.extend(Caret { row: long.logical(), off: whole.len(), at: at..at + n });
+        diff.sel = Some(sel);
+        assert_eq!(diff.selection(), whole);
+        assert!(!whole.is_empty());
+    }
+
+    #[test]
+    fn a_selection_survives_a_reflow_and_dies_with_a_layout_change() {
+        // The two halves of the rule: a wrap is the same diff at a different
+        // width, and a layout is a different diff of the same repository.
+        let host = Host::new();
+        let mut diff = Diff::with_layouts(parse_unified_diff(LONG), &host, Layouts::builtin());
+        diff.reflow(width_for(200, &host), &host);
+        diff.sel = Some(select(&diff, (2, 0), (3, 10)));
+        let text = diff.selection();
+
+        diff.reflow(width_for(24, &host), &host);
+        assert!(diff.sel.is_some(), "a resize threw the selection away");
+        assert_eq!(diff.selection(), text, "the same bytes, at a new width");
+
+        diff.apply_layout(1, &host);
+        assert!(diff.sel.is_none(), "the rows are somebody else's now");
+        assert_eq!(diff.selection(), "");
+    }
+
+    #[test]
+    fn selecting_everything_reaches_the_end_of_the_last_line() {
+        let host = Host::new();
+        let mut diff = Diff::with_layouts(parse_unified_diff(SAMPLE), &host, Layouts::builtin());
+        diff.sel = Selection::all(&diff.order);
+        assert_eq!(
+            diff.selection(),
+            "a.rs\n@@ -1,2 +1,2 @@\nfn main() {\n    let x = 1;\n    let x = 2;"
+        );
+    }
+
+    #[test]
+    fn nothing_selected_copies_nothing_rather_than_everything() {
+        let host = Host::new();
+        let diff = Diff::with_layouts(parse_unified_diff(SAMPLE), &host, Layouts::builtin());
+        assert!(diff.sel.is_none());
+        assert_eq!(diff.selection(), "");
+    }
+
+    #[test]
+    fn a_selected_run_carries_a_background_and_outranks_a_changed_word() {
+        // Both are backgrounds and only one can be drawn. The reader already
+        // knows which words changed; what they are about to press a key about is
+        // what is selected.
+        let theme = Theme::default_dark();
+        let text = "    let x = 1;";
+        let out = super::runs(
+            all(text),
+            &[],
+            &[Span { start: 8, end: 9 }],
+            &theme,
+            LineKind::Removed,
+            false,
+            4..11,
+        );
+        well_formed(text, &out);
+        // The sweep splits at every edge and does not coalesce, so what matters
+        // is which *bytes* carry it — not how many runs they arrived in.
+        let selected = rgb(theme.background(Surface::Selected));
+        let word = rgb(theme.background(Surface::RemovedWord));
+        let painted: Vec<usize> = out
+            .iter()
+            .filter(|(_, s)| s.background_color == Some(selected.into()))
+            .flat_map(|(r, _)| r.clone())
+            .collect();
+        assert_eq!(painted, (4..11).collect::<Vec<_>>());
+        assert!(
+            !out.iter().any(|(r, s)| r.contains(&8) && s.background_color == Some(word.into())),
+            "the changed word kept its background inside the selection"
+        );
+    }
+
+    #[test]
+    fn a_selection_is_clipped_into_the_row_that_draws_it() {
+        // Line coordinates in, row coordinates out — the same contract tokens
+        // and spans have, and the same off-by-one available to it.
+        let theme = Theme::default_dark();
+        let text = "aaaa bbbb cccc";
+        let first = super::runs(0..5, &[], &[], &theme, LineKind::Context, false, 2..12);
+        let second = super::runs(5..text.len(), &[], &[], &theme, LineKind::Context, false, 2..12);
+        assert_eq!(first.first().map(|(r, _)| r.clone()), Some(2..5));
+        assert_eq!(second.first().map(|(r, _)| r.clone()), Some(0..7));
+        // A selection that misses this row entirely leaves no runs at all.
+        assert!(super::runs(5..14, &[], &[], &theme, LineKind::Context, false, 0..2).is_empty());
+    }
+
     // ------------------------------------------------------------- wrapping
 
     /// A diff with one line far too long for any sensible window, and one that
@@ -1427,6 +2061,16 @@ diff --git a/a.rs b/a.rs
     /// whichever side of 40 the arithmetic came down on.
     fn width_for(cols: usize, host: &Host) -> f32 {
         TEXT_CHROME + (cols as f32 + 0.5) * host.font.size * host.font.advance
+    }
+
+    /// A selection between two visual rows of `diff`, at the given byte offsets.
+    /// Every row of these fixtures is one visual row, which is what lets a test
+    /// name them by index.
+    fn select(diff: &Diff, from: (usize, usize), to: (usize, usize)) -> Selection {
+        let at = |v: usize| Caret { row: diff.order[v].logical(), off: 0, at: v..v + 1 };
+        let mut sel = Selection::new(0, Caret { off: from.1, ..at(from.0) });
+        sel.extend(Caret { off: to.1, ..at(to.0) });
+        sel
     }
 
     fn text_rows(src: &str) -> (TextRows, Rc<Host>) {
@@ -1647,7 +2291,13 @@ diff --git a/a.rs b/a.rs
         fn width(&self, index: usize, _seg: usize) -> usize {
             self.rows[index].len()
         }
-        fn render(&self, index: usize, _seg: usize, _host: &Host) -> AnyElement {
+        fn render(
+            &self,
+            index: usize,
+            _seg: usize,
+            _host: &Host,
+            _sel: Option<Selected>,
+        ) -> AnyElement {
             div().child(self.rows[index].clone()).into_any_element()
         }
     }
@@ -1824,7 +2474,13 @@ diff --git a/b.md b/b.md
         fn width(&self, index: usize, _seg: usize) -> usize {
             self.rows[index].len()
         }
-        fn render(&self, index: usize, _seg: usize, _host: &Host) -> AnyElement {
+        fn render(
+            &self,
+            index: usize,
+            _seg: usize,
+            _host: &Host,
+            _sel: Option<Selected>,
+        ) -> AnyElement {
             div().child(self.rows[index].clone()).into_any_element()
         }
     }

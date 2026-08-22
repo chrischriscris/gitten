@@ -30,10 +30,18 @@ pub enum Surface {
     /// this enum exists.
     MovedRemoved,
     MovedAdded,
+    /// Text the mouse has selected.
+    ///
+    /// A surface and not a colour the frontend applies itself, because a
+    /// selection covers a comment as readily as a keyword and the whole point of
+    /// this enum is that a token's foreground is resolved against whatever it
+    /// actually lands on. Without it, `comment` on the selection background is
+    /// the one run in the diff nobody can read.
+    Selected,
 }
 
 impl Surface {
-    pub const ALL: [Surface; 7] = [
+    pub const ALL: [Surface; 8] = [
         Surface::Context,
         Surface::Added,
         Surface::Removed,
@@ -41,6 +49,7 @@ impl Surface {
         Surface::RemovedWord,
         Surface::MovedRemoved,
         Surface::MovedAdded,
+        Surface::Selected,
     ];
     pub const COUNT: usize = Self::ALL.len();
 
@@ -151,6 +160,14 @@ pub struct ChromePalette {
     /// shipped theme and mean unrelated things, and a palette where one colour
     /// means two things is a palette a theme cannot retune.
     pub selection_bg: Rgb,
+    /// The text a drag has selected.
+    ///
+    /// Its own colour and not `selection_bg`: that one is a full-width bar under
+    /// a row nobody picked out, and this one has to read as *chosen text* on top
+    /// of all six diff backgrounds at once. So it is cool where the diff palette
+    /// is warm, and brighter than any row it can land on — a selection you have
+    /// to look for is a selection you will keep re-making.
+    pub selected_bg: Rgb,
     /// Something the app tried and could not do — a diff that failed to
     /// re-acquire, say. Its own colour and not `diff.dels_fg`: that red means
     /// "this line was removed", and a palette where one colour means two things
@@ -252,6 +269,7 @@ impl Theme {
                 title_bg: 0x151312,
                 status_bg: 0x131211,
                 selection_bg: 0x241f1a,
+                selected_bg: 0x2f3b4a,
                 error: 0xd4736b,
             },
             lanes: vec![0xdfa851, 0x6f9ecf, 0xa983c9, 0x5fa8a0, 0xc97d6f, 0x8fb35e],
@@ -292,6 +310,7 @@ impl Theme {
             Surface::RemovedWord => self.diff.removed_word_bg,
             Surface::MovedRemoved => self.diff.moved_removed_bg,
             Surface::MovedAdded => self.diff.moved_added_bg,
+            Surface::Selected => self.chrome.selected_bg,
         }
     }
 

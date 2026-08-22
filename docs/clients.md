@@ -43,6 +43,7 @@ twice — and it has been three times already:
 | arguments, `--fixtures`, error strings | twice | `app::cli`, `app::acquire` |
 | `plait.toml` | once, behind GPUI | `app::config` |
 | which command a key runs | nowhere shared | `core::command` |
+| what the mouse has selected, and what copying it yields | nowhere — the window had none | `core::select` |
 
 The last two are the ones that mattered most. Before `plait-app`, the parser for
 `plait.toml` lived in `shell/src/config.rs` — so the *window* was the only client
@@ -195,9 +196,14 @@ notice a panic in a presentation.
 ## Not there yet
 
 - **`plait-shell` does not read `[keys]`.** `core::command` is built and the
-  terminal dispatches through it; the window still binds `s` and `w` with
-  `KeyBinding::new`. Porting it is a `match` on a command name — the same one
-  `plait-tui/src/main.rs` has.
+  terminal dispatches through it; the window still binds `s`, `w`, `cmd-c`,
+  `cmd-a` and `escape` with `KeyBinding::new`. Porting it is a `match` on a
+  command name — the same one `plait-tui/src/main.rs` has. `copy.selection`,
+  `select.all` and `select.none` are registered commands already, waiting for it.
+- **Only the window draws a selection.** `core::select` is shared and the
+  terminal and the browser get theirs from the thing they run inside, so neither
+  drives the model — a `plait-tui` that wanted its own would implement `hit` and
+  `selectable` on its own `Rows` and nothing else.
 - **`plait-web` has no input at all**, so the keymap reaches it only once the
   browser sends keypresses to an endpoint. It has `j`/`k`/`g`/`G` in its own
   script, which is exactly the duplication `core::command` exists to end.

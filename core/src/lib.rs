@@ -14,6 +14,7 @@ pub mod markdown;
 pub mod prepared;
 pub mod rows;
 pub mod runs;
+pub mod select;
 pub mod syntax;
 pub mod theme;
 pub mod wrap;

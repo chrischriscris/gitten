@@ -49,7 +49,9 @@ There is now one `Host` and three frontends reading it, and it is the same struc
 in all three — which is what makes "not on `Host`" a real failure rather than a
 style note. `chrome.selection_bg` exists because the terminal needed a colour for
 the row the keyboard is on and a literal in a view is not a seam; no GPUI view
-draws a selection yet.
+draws *that* yet. `chrome.selected_bg` is the other one — the text a drag
+selected — and it is a whole `Surface`, so a theme retunes the syntax colours that
+land on it rather than accepting whatever they were.
 
 `s` and `w` are the first real key bindings and are deliberately shaped like the
 last one will be — the view owns a focus handle, the binding is global, the handler is a
@@ -221,13 +223,18 @@ pub trait Rows {
     fn claims(&self, path: &str) -> bool;
     fn len(&self) -> usize;
     fn build(&mut self, file: prepared::File);
-    fn render(&self, index: usize, seg: usize, host: &Host) -> AnyElement;
+    fn render(&self, index: usize, seg: usize, host: &Host, sel: Option<Selected>) -> AnyElement;
     fn width(&self, index: usize, seg: usize) -> usize;
 
     // Wrapping. Both default, so an implementation that ignores them is exactly
     // as long as it was — see 8.
     fn rows(&self, index: usize) -> usize { 1 }
     fn reflow(&mut self, width: f32, host: &Host, wrap: &dyn Wrap) -> bool { false }
+
+    // Selection. Both default too: `hit` to `None`, which means "not
+    // selectable" — see 11.
+    fn hit(&self, index: usize, seg: usize, x: f32, host: &Host) -> Option<Hit> { None }
+    fn selectable(&self, index: usize, part: u16) -> Option<&str> { None }
 
     fn report(&self) -> String { String::new() }
 }
@@ -535,6 +542,57 @@ not have:
 What a client writes is a translation from its own platform's event to
 `command::Key` — `plait-tui`'s is `term.rs`, and it is the only file in that
 crate that imports `crossterm`. See [clients.md](clients.md).
+
+## 11. A selection your presentation takes part in
+
+```rust
+/// Where a click landed inside a row.
+pub struct Hit { pub part: u16, pub off: usize }
+
+fn hit(&self, index: usize, seg: usize, x: f32, host: &Host) -> Option<Hit>;
+fn selectable(&self, index: usize, part: u16) -> Option<&str>;
+```
+
+Two methods, and everything else about a selection is `core::select`: which rows
+lie between two carets, which bytes of each, what survives a reflow, where a word
+ends for a double-click, and what the whole thing is as a string. See
+[decisions/0018](decisions/0018-selection-is-a-model-not-a-text-element.md).
+
+**`off` is a byte offset into the *logical* row's text**, not the visual row's, so
+a caret on the third row of a wrapped line is the same kind of thing as one on a
+line that fits. Rebase it: `wrapped.range(index, seg, text).start + column_at(..)`.
+Getting this wrong selects from the start of the line every time somebody clicks a
+wrapped one.
+
+**`part` is which of the row's texts.** Almost always one, so almost always 0.
+`SplitRows` has two — the old side and the new — and a selection is fixed to the
+one its anchor landed in, so a drag never crosses the divider. Parts are laid out
+left to right, which is the only thing the view assumes about them.
+
+**`None` from `selectable` is a hole, not an empty line.** A copy skips the row
+entirely, which is what makes dragging down one column of a two-column diff paste
+that file with the gaps closed rather than a blank line per lone change.
+
+**`hit` returning `None` means the whole presentation is not selectable**, and that
+is the default — so an implementation written before any of this compiles and
+behaves exactly as it did. Opting in is the two methods above and reading `sel` in
+`render`; all three built-ins do it in about fifteen lines each, and
+`MarkdownRows` is the one to read because its text starts at a different x on
+every row.
+
+Painting it is one more layer in the run merge, not an overlay:
+
+```rust
+StyledText::new(piece).with_highlights(runs(
+    at, tokens, spans, theme, kind, moved,
+    selected(sel, /* part */ 0, text.len()),   // <- the byte range, clamped
+))
+```
+
+`column_at`, `header_hit` and `selected` are shared helpers in `views::diff`, for
+the same reason `file_header` is: a header's text starts at the page padding
+whoever owns the lines beneath it, and three presentations working that out
+separately is three places for the caret to be a gutter's width off.
 
 ## What a new seam owes
 

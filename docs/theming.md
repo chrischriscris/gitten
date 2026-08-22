@@ -9,8 +9,8 @@ pub struct Theme {
     pub name: String,
     pub min_contrast: f32,        // WCAG 2.1 ratio, the floor for token text
     syntax: [Style; 12],          // per Kind, private because it is resolved
-    pub diff: DiffPalette,        // 15 colours: the rows, the words, the furniture
-    pub chrome: ChromePalette,    // 7 colours: window, titles, status, accent
+    pub diff: DiffPalette,        // 18 colours: the rows, the words, the furniture
+    pub chrome: ChromePalette,    // 10 colours: window, titles, status, selection
     pub lanes: Vec<Rgb>,          // cycled per branch
     pub lane_overflow: Rgb,       // past the 12-lane cap
     pub authors: Vec<Rgb>,        // cycled per author name
@@ -25,15 +25,22 @@ Markdown `**word**` that only changed hue would be wrong.
 
 ## Surfaces, and why one colour per class is not enough
 
-A token is not drawn on "the background". It is drawn on one of five:
+A token is not drawn on "the background". It is drawn on one of eight:
 
 ```
-  Context      #0e0d0c   the near-black body of the file
-  Added        #16241a   an added line
-  Removed      #2a1917   a removed line
-  AddedWord    #1e3a23   a changed word inside an added line
-  RemovedWord  #43201a   a changed word inside a removed line
+  Context       #0e0d0c   the near-black body of the file
+  Added         #16241a   an added line
+  Removed       #2a1917   a removed line
+  AddedWord     #1e3a23   a changed word inside an added line
+  RemovedWord   #43201a   a changed word inside a removed line
+  MovedRemoved  #191d28   the two halves of a block that moved rather than
+  MovedAdded    #1d2636     changed — blue-grey, so they recede from the hues
+  Selected      #2f3b4a   text the mouse is holding
 ```
+
+The last one is why a selection is a surface and not a colour the view applies:
+it covers a comment as readily as a keyword, and `comment` at #615a52 on #2f3b4a
+is the one run in the diff nobody could read.
 
 The comment grey that reads as pleasantly quiet on `Context` measured **1.15:1**
 against the old changed-word background — a grey smear on green, which is how this
@@ -111,12 +118,12 @@ shell files before this existed.
 
 | group | fields |
 |---|---|
-| `diff` | `file_bg` `file_fg` `adds_fg` `dels_fg` `hunk_bg` `hunk_fg` `gutter_fg` `context_bg` `context_fg` `added_bg` `added_fg` `added_word_bg` `removed_bg` `removed_fg` `removed_word_bg` |
+| `diff` | `file_bg` `file_fg` `adds_fg` `dels_fg` `hunk_bg` `hunk_fg` `gutter_fg` `context_bg` `context_fg` `added_bg` `added_fg` `added_word_bg` `removed_bg` `removed_fg` `removed_word_bg` `moved_removed_bg` `moved_added_bg` `absent_bg` |
 | `markdown` | `code_bar` `quote_bar` `marker` `rule` (also the table grid) |
-| `chrome` | `bg` `fg` `dim` `faint` `accent` `title_bg` `status_bg` |
+| `chrome` | `bg` `fg` `dim` `faint` `accent` `title_bg` `status_bg` `selection_bg` (the row the keyboard is on) `selected_bg` (the text the mouse is holding) `error` |
 | graph | `lanes` `lane_overflow` |
 | commits | `authors` |
-| syntax | 12 `Style`s, resolved across 5 surfaces |
+| syntax | 12 `Style`s, resolved across 8 surfaces |
 
 ## Changing it without a rebuild
 
