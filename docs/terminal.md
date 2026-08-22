@@ -121,11 +121,13 @@ the text moves under them. Slicing the text instead is the obvious alternative
 and it is wrong: the tokens and the intraline spans address the *line*, so a
 slice taken before `runs` pairs styling with the wrong bytes.
 
-This is also why side-by-side differs. In the window, wrapping off makes each
-column as wide as the widest line in the diff and the scrollbar reaches it. A
-terminal has no container to be wider than itself: a column wider than half the
-screen puts the right-hand gutter off the edge. So the columns stay half the
-screen and their contents scroll.
+Side-by-side is the same thing twice, for the same reason. A terminal has no
+container to be wider than itself: a column wider than half the screen puts the
+right-hand gutter off the edge. So the columns stay half the screen and their
+contents scroll — and the window does that now too, because a column sized to the
+widest line in the diff was the right file off the right of the screen on every
+row of every file. See
+[decisions/0023](decisions/0023-the-gutter-does-not-scroll.md).
 
 **A wide character claims two cells.** Getting that wrong does not misalign one
 row, it shears every row below it, because the cursor ends up somewhere the grid

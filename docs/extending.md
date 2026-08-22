@@ -236,7 +236,8 @@ pub trait Rows {
     fn claims(&self, path: &str) -> bool;
     fn len(&self) -> usize;
     fn build(&mut self, file: prepared::File);
-    fn render(&self, index: usize, seg: usize, host: &Host, sel: Option<Selected>) -> AnyElement;
+    fn render(&self, index: usize, seg: usize, host: &Host, sel: Option<Selected>, shift: f32)
+        -> AnyElement;
     fn width(&self, index: usize, seg: usize) -> usize;
 
     // Wrapping. Both default, so an implementation that ignores them is exactly
@@ -244,9 +245,13 @@ pub trait Rows {
     fn rows(&self, index: usize) -> usize { 1 }
     fn reflow(&mut self, width: f32, host: &Host, wrap: &dyn Wrap) -> bool { false }
 
+    // Scrolling sideways. Defaults to "nothing hangs over the edge", which is
+    // true of any presentation that wraps — see 8.
+    fn overflow(&self, index: usize, seg: usize, width: f32, host: &Host) -> f32 { 0.0 }
+
     // Selection. Both default too: `hit` to `None`, which means "not
     // selectable" — see 11.
-    fn hit(&self, index: usize, seg: usize, x: f32, host: &Host) -> Option<Hit> { None }
+    fn hit(&self, index: usize, seg: usize, x: f32, host: &Host, shift: f32) -> Option<Hit> { None }
     fn selectable(&self, index: usize, part: u16) -> Option<&str> { None }
 
     fn report(&self) -> String { String::new() }
@@ -256,6 +261,16 @@ pub trait Rows {
 **`len` counts lines; `seg` says which row of one.** A wrapped line is *n* rows of
 `ROW_H` and still one entry in `len`, so the two indices are not the same thing.
 `seg` is 0 for everything that fits, which is nearly everything.
+
+**`shift` is what makes a gutter stay put.** A row is always exactly as wide as
+the viewport, so a line wider than the window is not scrolled *to* — it is drawn
+`shift` pixels to the left inside the row, and clipped there. Draw the furniture
+first and put the text in `scrolled(shift, …)`; ignore the argument and your
+presentation simply does not scroll sideways, which is the right answer for one
+that wraps. `overflow` is the other half: how far past the right edge your widest
+row reaches, which is what the view bounds the offset by. The same two numbers the
+terminal passes to `Pen::scroll`, for the same reason — see
+[decisions/0023](decisions/0023-the-gutter-does-not-scroll.md).
 
 ```rust
 Diff::with_renderers(files, host, vec![
@@ -426,10 +441,21 @@ fn reflow(&mut self, width: f32, host: &Host, wrap: &dyn Wrap) -> bool {
     }
     self.cols = cols;
     self.wrap = wrap.name();
+    if !wrap.breaks_lines() {
+        let broken = self.wrapped.total() > self.wrapped.lines();
+        self.wrapped = Wrapped::default();
+        return broken;     // nothing to scan: an unbroken table is the empty one
+    }
     self.wrapped = Wrapped::build(self.rows.iter().map(|r| (wrappable(r), cols)), wrap);
     true
 }
 ```
+
+**You are told the width even when the wrap breaks nothing**, and the cheap path
+is yours. It has to be: with wrapping off the width is still what decides how wide
+a side-by-side column is, how long a Markdown rule is and how far there is to
+scroll, and a presentation the view stopped calling answers all three from the
+window it had two resizes ago.
 
 Three things about that are the whole design:
 
@@ -563,15 +589,19 @@ crate that imports `crossterm`. See [clients.md](clients.md).
 pub struct Hit { pub part: u16, pub off: usize }
 
 // plait-shell, in pixels:
-fn hit(&self, index: usize, seg: usize, x: f32, host: &Host) -> Option<Hit>;
-// plait-tui, in columns, with the horizontal scroll already applied:
+fn hit(&self, index: usize, seg: usize, x: f32, host: &Host, shift: f32) -> Option<Hit>;
+// plait-tui, in columns:
 fn hit(&self, index: usize, seg: usize, col: usize, shift: usize) -> Option<Hit>;
 
 fn selectable(&self, index: usize, part: u16) -> Option<&str>;
 ```
 
 Two signatures and one seam: the unit is the client's — a pixel there, a cell here
-— and everything the answer feeds is shared.
+— and everything the answer feeds is shared. `x` is measured from the left edge of
+the *window* in both, and `shift` is how far the text has been scrolled under the
+furniture, so the arithmetic is the same sentence twice:
+`(x - chrome).max(0) + shift`. The `max` before the shift and not after, or a
+click on a line number lands on a byte that scrolled out of the window.
 
 Two methods, and everything else about a selection is `core::select`: which rows
 lie between two carets, which bytes of each, what survives a reflow, where a word

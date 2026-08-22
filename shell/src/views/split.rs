@@ -16,19 +16,21 @@
 //!
 //! # One column width for the whole diff
 //!
-//! One width, whatever it is, so the divider is one straight vertical line from
-//! the first row to the last. Per-file widths move the divider as you scroll, and
-//! a boundary that drifts is worse than one that is too far right.
+//! Half the window each, less the rule between them, whatever the diff holds and
+//! whatever the wrap is doing — so the divider is one straight vertical line from
+//! the first row to the last and it is in the same place in every diff. Per-file
+//! widths move the divider as you scroll, and a boundary that drifts is worse
+//! than one that is too far right.
 //!
-//! Which width depends on the wrap. **Wrapping on**, it is half the measured
-//! viewport less the gutters: everything fits, and there is nothing left to
-//! scroll to horizontally — a line too wide for a column continues on the row
-//! below, and a pair row is as tall as its taller side. **Wrapping off**, it is
-//! the widest line anywhere in the diff, wider than the window, and the
-//! horizontal scrollbar is how a 2000-character minified line is reached.
-//!
-//! Clipping the column to the window is what neither of those does, because it
-//! would lose text unified mode shows.
+//! **Wrapping on**, everything fits: a line too wide for a column continues on
+//! the row below and a pair row is as tall as its taller side. **Wrapping off**,
+//! a line runs past its column's edge and is clipped there — and reached by
+//! scrolling, which moves the text of *both* columns and leaves the two gutters
+//! and the divider where they are. That is the terminal's behaviour and the
+//! reason a column is not sized to the widest line in the diff: a column wide
+//! enough for a 2000-character minified line puts the new file off the right of
+//! the screen for every row of every file, to make one line of one of them
+//! reachable without scrolling.
 //!
 //! # Row count is not the same as unified's
 //!
@@ -47,8 +49,8 @@
 //! many rows it takes.
 
 use super::diff::{
-    column_at, columns, file_header, header_hit, hunk_header, line_colors, number,
-    number_or_blank, row_frame, runs, selected, slice, Hit, Rows, ROW_H,
+    column_at, columns, file_header, header_hit, hunk_header, into_text, line_colors, number,
+    number_or_blank, row_frame, runs, scrolled, selected, slice, Hit, Rows, PAD, ROW_H,
 };
 use gpui::*;
 use plait_core::align::align;
@@ -142,7 +144,9 @@ enum Row {
 pub struct SplitRows {
     rows: Vec<Row>,
     lines: Vec<Line>,
-    /// Widest line in the diff, in characters — the width both columns get.
+    /// Widest line in the diff, in characters. Not a width any more — a column is
+    /// half the window — but it is what says on the overlay how much of the diff
+    /// is off the right of it.
     widest_chars: usize,
     /// How many rows carry a pair rather than one side, for the stats overlay.
     /// A diff whose rows are almost all pairs is one this presentation suits.
@@ -152,13 +156,14 @@ pub struct SplitRows {
     /// Where each *line* breaks — indexed by line and not by row, because a pair
     /// row draws two of them and a context line is drawn by two columns.
     wrapped: Wrapped,
-    /// The budget one column got, the policy it was built with, and whether that
-    /// policy breaks anything. The last one is what stops a column being clipped
-    /// to the window when wrapping is off, where the horizontal scrollbar is
-    /// still how you reach a 2000-character line.
+    /// The budget one column got and the policy it was built with.
     cols: usize,
     wrap: &'static str,
-    wraps: bool,
+    /// The window, in pixels. What the columns are halves of, and therefore the
+    /// one number the divider's position and a click's column both come from —
+    /// a click that lands on the wrong side of the rule is the whole bug one
+    /// field prevents.
+    width: f32,
 }
 
 impl Rows for SplitRows {
@@ -192,12 +197,24 @@ impl Rows for SplitRows {
         let f = &host.font;
         let cols =
             columns((width - CHROME) / 2.0, SLACK * f.size * f.advance, f.size, host);
+        // The width lands whatever else is true: it is what the divider and the
+        // hit test are halves of, and a stale one puts the rule somewhere the
+        // click does not agree with. No row count depends on it, which is why it
+        // is not on its own a reason to rebuild the order table.
+        self.width = width;
         if cols == self.cols && wrap.name() == self.wrap {
             return false;
         }
         self.cols = cols;
         self.wrap = wrap.name();
-        self.wraps = wrap.breaks_lines();
+        // A wrap that breaks nothing needs no scan: the unbroken table is the
+        // default one, and building it to be told so is a pass over every line
+        // in the diff on every few characters of a resize drag.
+        if !wrap.breaks_lines() {
+            let broken = self.wrapped.total() > self.wrapped.lines();
+            self.wrapped = Wrapped::default();
+            return broken;
+        }
         self.wrapped =
             Wrapped::build(self.lines.iter().map(|l| (l.text.as_ref(), cols)), wrap);
         true
@@ -245,22 +262,39 @@ impl Rows for SplitRows {
         }
     }
 
-    /// Every pair row is the same width, because both columns are: whichever row
-    /// `uniform_list` picks to measure gives the same answer, which is one fewer
-    /// thing to get wrong than the unified view's widest-row search.
-    fn width(&self, index: usize, _seg: usize) -> usize {
+    /// The longer of a pair row's two sides, because that is the side that
+    /// decides how far there is left to scroll — both columns move together and
+    /// they are the same width, so the wider text is the bound for the row.
+    fn width(&self, index: usize, seg: usize) -> usize {
         match &self.rows[index] {
-            Row::Pair { .. } => 2 * (self.col_chars() + 8),
+            Row::Pair { old, new } => self.chars(*old, seg).max(self.chars(*new, seg)),
             Row::Hunk(h) => h.chars().count(),
             Row::File { path, .. } => path.chars().count(),
         }
+    }
+
+    /// A column's text and not the row's: what has to reach the edge of the
+    /// window is the widest line, and the window it has to reach the edge of is
+    /// one column of two.
+    fn overflow(&self, index: usize, seg: usize, width: f32, host: &Host) -> f32 {
+        let text = self.width(index, seg) as f32 * host.font.char_width();
+        let room = match &self.rows[index] {
+            Row::Pair { .. } => self.col_px(width),
+            // A header is the built-in's, drawn across the whole row behind the
+            // page padding and nothing else.
+            _ => width - 2.0 * PAD,
+        };
+        (text - room).max(0.0)
     }
 
     fn report(&self) -> String {
         if self.rows.is_empty() {
             return String::new();
         }
-        let mut out = format!("split {} paired · {} cols", self.paired, self.col_chars());
+        let mut out = format!(
+            "split {} paired · {} cols · widest {}",
+            self.paired, self.cols, self.widest_chars
+        );
         if self.moved > 0 {
             out.push_str(&format!(" · {} moved", self.moved));
         }
@@ -273,12 +307,12 @@ impl Rows for SplitRows {
     /// Which column the click was in, then where in that column's text — the
     /// divider is what makes this two answers rather than one, and the reason a
     /// [`Hit`] carries a part at all.
-    fn hit(&self, index: usize, seg: usize, x: f32, host: &Host) -> Option<Hit> {
+    fn hit(&self, index: usize, seg: usize, x: f32, host: &Host, shift: f32) -> Option<Hit> {
         match self.rows.get(index)? {
-            Row::File { path, .. } => Some(header_hit(path, x, host)),
-            Row::Hunk(h) => Some(header_hit(h, x, host)),
+            Row::File { path, .. } => Some(header_hit(path, x, host, shift)),
+            Row::Hunk(h) => Some(header_hit(h, x, host, shift)),
             Row::Pair { old, new } => {
-                let cell = GUTTER_W + SIGN_W + self.col_px(host);
+                let cell = self.cell_px(self.width);
                 let (part, from) = match x < cell + RULE_W {
                     true => (Column::Old, 0.0),
                     false => (Column::New, cell + RULE_W),
@@ -301,7 +335,7 @@ impl Rows for SplitRows {
                         at.start
                             + column_at(
                                 &text[at.clone()],
-                                x - from - GUTTER_W - SIGN_W,
+                                into_text(x, from + GUTTER_W + SIGN_W, shift),
                                 host.font.size,
                                 host,
                             )
@@ -331,20 +365,27 @@ impl Rows for SplitRows {
         }
     }
 
-    fn render(&self, index: usize, seg: usize, host: &Host, sel: Option<Selected>) -> AnyElement {
+    fn render(
+        &self,
+        index: usize,
+        seg: usize,
+        host: &Host,
+        sel: Option<Selected>,
+        shift: f32,
+    ) -> AnyElement {
         let theme = &host.theme;
         match &self.rows[index] {
-            Row::File { path, adds, dels } => file_header(path, *adds, *dels, theme, sel),
-            Row::Hunk(header) => hunk_header(header, theme, sel),
+            Row::File { path, adds, dels } => {
+                file_header(path, *adds, *dels, theme, sel, shift)
+            }
+            Row::Hunk(header) => hunk_header(header, theme, sel, shift),
             Row::Pair { old, new } => {
-                // The column width in pixels, from the host's font rather than a
-                // constant: the face is configurable and hot-reloaded, and a
-                // stale character width is exactly what `font.advance` exists to
-                // stop being possible.
-                let col = px(self.col_px(host));
+                // No pixel width for the columns: two flex halves and a fixed
+                // rule between them come out at exactly `cell_px` each, which is
+                // what the hit test measures the divider at.
                 row_frame()
                     .items_center()
-                    .child(self.cell(*old, seg, Column::Old, col, theme, sel))
+                    .child(self.cell(*old, seg, Column::Old, theme, sel, shift))
                     .child(
                         div()
                             .flex_none()
@@ -356,8 +397,7 @@ impl Rows for SplitRows {
                             // text floor is a bright seam down the window.
                             .bg(rgb(theme.diff.rule)),
                     )
-                    .child(self.cell(*new, seg, Column::New, col, theme, sel))
-                    .child(self.fill(*new, seg, theme))
+                    .child(self.cell(*new, seg, Column::New, theme, sel, shift))
                     .into_any_element()
             }
         }
@@ -365,72 +405,49 @@ impl Rows for SplitRows {
 }
 
 impl SplitRows {
-    /// How wide one column is, in characters.
+    /// How wide one column is, gutter and sign included: half of what is left of
+    /// the window after the rule.
     ///
-    /// The widest line in the diff, or the wrap budget, whichever is narrower —
-    /// so with wrapping on the two columns and the rule between them fit the
-    /// window exactly and there is nothing left to scroll to. With wrapping
-    /// *off* the budget is not a limit at all: a 2000-character line still has
-    /// to be reachable, and the horizontal scrollbar is how.
-    fn col_chars(&self) -> usize {
-        match self.wraps && self.cols > 0 {
-            true => self.widest_chars.min(self.cols),
-            false => self.widest_chars,
-        }
+    /// Shared by the drawing and the hit test so the divider is in the same place
+    /// in both — the click that lands on the wrong side of it is the whole bug
+    /// this one function prevents. The drawing gets it as two flex halves rather
+    /// than as this number, which is the same arithmetic done by the layout.
+    fn cell_px(&self, width: f32) -> f32 {
+        ((width - RULE_W) / 2.0).max(0.0)
     }
 
-    /// One column of one row: gutter, sign, text — the built-in's anatomy at
-    /// half the width, so the eye finds the same things in the same order.
-    /// How wide one column of text is, in pixels.
-    ///
-    /// From the host's font rather than a constant: the face is configurable and
-    /// hot-reloaded, and a stale character width is exactly what `font.advance`
-    /// exists to stop being possible. Shared by the drawing and the hit test so
-    /// the divider is in the same place in both — the click that lands on the
-    /// wrong side of it is the whole bug this one function prevents.
-    fn col_px(&self, host: &Host) -> f32 {
-        (self.col_chars() as f32 + SLACK) * host.font.advance * host.font.size
+    /// How wide one column's *text* is, in pixels: the column less its own gutter
+    /// and sign, which do not scroll and are not the text's to use.
+    fn col_px(&self, width: f32) -> f32 {
+        (self.cell_px(width) - GUTTER_W - SIGN_W).max(0.0)
+    }
+
+    /// How many characters one side of a pair draws on visual row `seg`, after
+    /// `trim_end` — trailing space is not ink, and a row that is all of it is a
+    /// row with nothing to scroll to.
+    fn chars(&self, line: Option<u32>, seg: usize) -> usize {
+        self.present(line, seg).map_or(0, |i| {
+            let text = &self.lines[i as usize].text;
+            text[self.wrapped.range(i as usize, seg, text)].trim_end().chars().count()
+        })
     }
 
     /// The line this side of a pair draws on visual row `seg`, if it draws one
     /// at all: absent from the pair entirely, or past the end of a side whose
-    /// opposite wrapped further. Asked by both the cell and the strip beside it,
-    /// so the two cannot disagree about which rows are holes.
+    /// opposite wrapped further. Asked by the cell and by the widest-row
+    /// measurement, so the two cannot disagree about which rows are holes.
     fn present(&self, line: Option<u32>, seg: usize) -> Option<u32> {
         line.filter(|i| seg < self.wrapped.rows(*i as usize))
     }
 
-    /// The strip between the right-hand column and the right edge of the window.
-    ///
-    /// The columns are sized to the widest line in the diff — see
-    /// [`SplitRows::col_chars`] — so a file of short lines leaves the rest of the
-    /// row unpainted, and a colour that stops short of the edge reads as a
-    /// shorter line rather than as a wider window. It continues the *new*
-    /// column, because that is the column it is beside.
-    ///
-    /// Grows rather than measures: [`row_frame`] is as wide as the window, so the
-    /// space left over after two fixed columns and the rule is exactly this, and
-    /// on a row wider than the window there is none and this is nothing.
-    fn fill(&self, line: Option<u32>, seg: usize, theme: &Theme) -> Div {
-        let bg = match self.present(line, seg) {
-            Some(i) => {
-                let line = &self.lines[i as usize];
-                line_colors(line.kind, line.moved, &theme.diff).0
-            }
-            None => theme.diff.absent_bg,
-        };
-        div().flex_grow(1.0).h(px(ROW_H)).bg(rgb(bg))
-    }
-
-    #[allow(clippy::too_many_arguments)]
     fn cell(
         &self,
         line: Option<u32>,
         seg: usize,
         column: Column,
-        col: Pixels,
         theme: &Theme,
         sel: Option<Selected>,
+        shift: f32,
     ) -> AnyElement {
         let p = &theme.diff;
         // Past the end of *this* side of a pair whose other side wrapped
@@ -440,12 +457,7 @@ impl SplitRows {
         let Some(index) = self.present(line, seg) else {
             // Nothing opposite: a flat, darker block, so a run of them reads as
             // a hole in the column rather than as unchanged content.
-            return div()
-                .flex_none()
-                .w(px(GUTTER_W + SIGN_W) + col)
-                .h(px(ROW_H))
-                .bg(rgb(p.absent_bg))
-                .into_any_element();
+            return column_frame().bg(rgb(p.absent_bg)).into_any_element();
         };
         let line = &self.lines[index as usize];
         let (bg, fg, sign) = line_colors(line.kind, line.moved, p);
@@ -456,12 +468,8 @@ impl SplitRows {
         };
         let at = self.wrapped.range(index as usize, seg, &line.text);
         let blank = seg > 0;
-        div()
-            .flex()
-            .flex_none()
+        column_frame()
             .items_center()
-            .h(px(ROW_H))
-            .w(px(GUTTER_W + SIGN_W) + col)
             .bg(rgb(bg))
             // Right-aligned, for the reason the unified view's is: a column of
             // numbers is read down, and left-aligning puts the units digits four
@@ -483,8 +491,9 @@ impl SplitRows {
                     .text_color(rgb(fg))
                     .child(if blank { " " } else { sign }),
             )
-            .child(
-                div().flex_none().text_color(rgb(fg)).child(
+            .child(scrolled(
+                shift,
+                div().text_color(rgb(fg)).child(
                     StyledText::new(slice(&line.text, &at)).with_highlights(runs(
                         at.clone(),
                         &line.tokens,
@@ -495,9 +504,21 @@ impl SplitRows {
                         selected(sel, column.part(), line.text.len()),
                     )),
                 ),
-            )
+            ))
             .into_any_element()
     }
+}
+
+/// One column of one row: half of what the rule leaves, whatever is in it.
+///
+/// `flex_1` and not a measured width, so the two columns and the rule come out at
+/// exactly the row's width however the window is dragged — and `min_w(0)`,
+/// because a flex item is otherwise no narrower than its content and a
+/// 2000-character line would push the new file off the screen. The clipping is
+/// [`scrolled`]'s, one level in: the gutter and the sign are in here too and they
+/// are the things that must not move.
+fn column_frame() -> Div {
+    div().flex().flex_1().min_w(px(0.)).h(px(ROW_H))
 }
 
 #[cfg(test)]
@@ -590,14 +611,17 @@ diff --git a/a.rs b/a.rs
     }
 
     #[test]
-    fn every_pair_row_measures_the_same_width() {
+    fn a_pair_row_measures_its_longer_side() {
+        // Both columns move together under one offset, so what bounds the scroll
+        // for a row is whichever of its two lines is longer.
         let r = built();
-        let widths: Vec<usize> = (0..r.len())
-            .filter(|i| matches!(r.rows[*i], Row::Pair { .. }))
-            .map(|i| r.width(i, 0))
-            .collect();
-        assert!(widths.windows(2).all(|w| w[0] == w[1]), "{widths:?}");
-        assert!(widths[0] > 0);
+        for i in (0..r.len()).filter(|i| matches!(r.rows[*i], Row::Pair { .. })) {
+            let Row::Pair { old, new } = r.rows[i] else { unreachable!() };
+            let of = |line: Option<u32>| {
+                line.map_or(0, |l| r.lines[l as usize].text.trim_end().chars().count())
+            };
+            assert_eq!(r.width(i, 0), of(old).max(of(new)), "row {i}");
+        }
     }
 
     /// One long removal against one short addition, so a pair row has a taller
@@ -635,20 +659,29 @@ diff --git a/a.rs b/a.rs
     }
 
     #[test]
-    fn a_column_narrows_to_the_window_when_wrapping_and_not_when_off() {
-        // Wrapping on: both columns and the rule fit, so there is nothing left
-        // to scroll to. Off: the column is the widest line in the diff, because
-        // a 2000-character line still has to be reachable.
-        let (r, host) = wrapped(LOPSIDED, 20);
-        assert_eq!(r.col_chars(), 20);
-
-        let mut off = r;
+    fn a_column_is_half_the_window_whatever_the_wrap_is_doing() {
+        // The divider does not move when the wrap changes, and a column is never
+        // sized to the widest line in the diff: what a line too long for its
+        // column gets is somewhere to be scrolled to.
+        let (mut r, host) = wrapped(LOPSIDED, 20);
         let f = &host.font;
-        let per = (20.0 + super::SLACK + 0.5) * f.size * f.advance;
-        let wrap_off = host.wrap.at(host.wrap.position("off").unwrap());
-        assert!(off.reflow(super::CHROME + 2.0 * per, &host, wrap_off));
-        assert_eq!(off.col_chars(), off.widest_chars);
-        assert!(off.widest_chars > 20);
+        let width = super::CHROME + 2.0 * (20.0 + super::SLACK + 0.5) * f.size * f.advance;
+        let half = r.cell_px(width);
+        assert_eq!(r.cols, 20);
+        let pair = (0..r.len()).find(|i| matches!(r.rows[*i], Row::Pair { .. })).unwrap();
+        // Wrapping on, every row fits its column, so there is nothing to the
+        // right of the window at all.
+        assert_eq!(r.overflow(pair, 0, width, &host), 0.0);
+
+        let off = host.wrap.at(host.wrap.position("off").unwrap());
+        assert!(r.reflow(width, &host, off), "the rows did not come back together");
+        assert_eq!(r.cell_px(width), half, "the divider moved with the wrap");
+        // And now the long side runs past its column's edge by however much of
+        // it did not fit.
+        let over = r.overflow(pair, 0, width, &host);
+        assert!(over > 0.0, "a 74-character line fits a 20-character column");
+        let text = r.widest_chars as f32 * host.font.char_width();
+        assert!((over - (text - r.col_px(width))).abs() < 0.001, "{over}");
     }
 
     #[test]
@@ -670,15 +703,15 @@ diff --git a/a.rs b/a.rs
         let mut r = built();
         r.reflow(900.0, &host, host.wrap.current());
         let pair = (0..r.len()).find(|i| matches!(r.rows[*i], Row::Pair { .. })).unwrap();
-        let cell = GUTTER_W + SIGN_W + r.col_px(&host);
+        let cell = r.cell_px(900.0);
 
-        let left = r.hit(pair, 0, GUTTER_W + SIGN_W + 2.0, &host).unwrap();
+        let left = r.hit(pair, 0, GUTTER_W + SIGN_W + 2.0, &host, 0.0).unwrap();
         assert_eq!(left.part, Column::Old.part());
-        let right = r.hit(pair, 0, cell + RULE_W + GUTTER_W + SIGN_W + 2.0, &host).unwrap();
+        let right = r.hit(pair, 0, cell + RULE_W + GUTTER_W + SIGN_W + 2.0, &host, 0.0).unwrap();
         assert_eq!(right.part, Column::New.part());
         // Either side of the rule itself, and nothing in between.
-        assert_eq!(r.hit(pair, 0, cell - 1.0, &host).unwrap().part, 0);
-        assert_eq!(r.hit(pair, 0, cell + RULE_W + 1.0, &host).unwrap().part, 1);
+        assert_eq!(r.hit(pair, 0, cell - 1.0, &host, 0.0).unwrap().part, 0);
+        assert_eq!(r.hit(pair, 0, cell + RULE_W + 1.0, &host, 0.0).unwrap().part, 1);
     }
 
     #[test]
@@ -702,6 +735,35 @@ diff --git a/a.rs b/a.rs
         // The fixture removes two lines and adds three: two replace pairs, one
         // lone addition.
         assert_eq!((both, holes), (4, 1));
+    }
+
+    #[test]
+    fn a_scroll_moves_both_columns_and_neither_gutter() {
+        // The point of the whole thing: the two gutters and the divider are where
+        // they were, and a click at the left edge of a column's text lands on the
+        // character that is drawn there rather than on the one that was before
+        // anything scrolled.
+        let host = Host::new();
+        let mut r = built();
+        r.reflow(900.0, &host, host.wrap.at(host.wrap.position("off").unwrap()));
+        let pair = (0..r.len()).find(|i| matches!(r.rows[*i], Row::Pair { .. })).unwrap();
+        let cw = host.font.char_width();
+        let shift = 4.0 * cw;
+        // A fifth of a character in, and not half: `column_at` rounds, so a
+        // click exactly on a boundary is a coin toss between two answers and
+        // neither of them is what this test is about.
+        let text = GUTTER_W + SIGN_W + 0.2 * cw;
+
+        assert_eq!(r.hit(pair, 0, text, &host, 0.0).unwrap().off, 0);
+        assert_eq!(r.hit(pair, 0, text, &host, shift).unwrap().off, 4);
+        // The right-hand column too, from its own edge, and still part 1: the
+        // divider did not move.
+        let across = r.cell_px(900.0) + RULE_W + text;
+        let right = r.hit(pair, 0, across, &host, shift).unwrap();
+        assert_eq!((right.part, right.off), (1, 4));
+        // A click on a line number is the first character there is to see, not
+        // one that scrolled out of the window.
+        assert_eq!(r.hit(pair, 0, 2.0, &host, shift).unwrap().off, 4);
     }
 
     #[test]

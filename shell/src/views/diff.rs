@@ -43,10 +43,24 @@
 //! nothing above them: no clip, no intraline, no syntax. Where a line breaks is
 //! `plait_core::wrap`, which is a registry on `Host` and has `w` and a title-bar
 //! control like everything else that is one.
+//!
+//! # Scrolling sideways
+//!
+//! With wrapping off a line wider than the window is reached by scrolling, and
+//! the line numbers, the sign column and whatever else a presentation drew in
+//! front of its text **stay where they are** while the text moves under them.
+//! That is what the terminal does with `Pen::scroll`, and it is the same thing
+//! here: a row is always exactly as wide as the viewport, the furniture is drawn
+//! first, and the text goes in a [`scrolled`] window that clips it.
+//!
+//! Which is why the offset is this view's — [`Pan`] — and not `uniform_list`'s.
+//! The list scrolls a *row*, and a row is the gutter and the text together;
+//! nothing outside it can hold one of them still. What the list keeps is the
+//! vertical axis, which is the one that has to virtualize.
 
 use gpui::*;
 use gpui::prelude::FluentBuilder as _;
-use gpui_component::scroll::Scrollbar;
+use gpui_component::scroll::{Scrollbar, ScrollbarHandle};
 use plait_core::host::Host;
 use plait_core::prepared::{prepare, Prepared};
 use plait_core::runs::surfaces;
@@ -91,8 +105,8 @@ pub(crate) const MIN_WRAP_COLS: usize = 8;
 /// From `font.advance` rather than a measured glyph, which is what that field is
 /// for and is exact in a monospaced face. In a proportional one it is an average,
 /// so a row may come out a little short or a little over — the same
-/// approximation `with_width_from_item` and the Markdown table padding already
-/// make, and the reason `Font::monospaced` exists to be asked.
+/// approximation [`Rows::overflow`] and the Markdown table padding already make,
+/// and the reason `Font::monospaced` exists to be asked.
 pub(crate) fn columns(width: f32, chrome: f32, size: f32, host: &Host) -> usize {
     let advance = size * host.font.advance;
     if advance <= 0.0 || !width.is_finite() {
@@ -116,7 +130,7 @@ pub use plait_core::select::Hit;
 /// Which byte of `text` a click `x` pixels into it landed on.
 ///
 /// Characters, not bytes and not graphemes, and from `font.advance` rather than a
-/// measured glyph: exactly the approximation `columns` and `with_width_from_item`
+/// measured glyph: exactly the approximation `columns` and [`Rows::overflow`]
 /// already make, and exact in a monospaced face. In a proportional one a caret
 /// drifts along a long line, which is the price of not shaping the text twice —
 /// and `Font::monospaced` exists to be asked when that matters.
@@ -192,14 +206,40 @@ pub trait Rows {
     /// Draws one visual row. `sel` is the part of it the mouse has selected, in
     /// the row's own byte coordinates — `None` for the overwhelming majority of
     /// rows on the overwhelming majority of frames.
-    fn render(&self, index: usize, seg: usize, host: &Host, sel: Option<Selected>) -> AnyElement;
+    ///
+    /// `shift` is how many pixels of text a horizontal scroll has pulled off the
+    /// left edge. A row is as wide as the viewport whatever it holds, so an
+    /// implementation draws its furniture at the left as usual and puts its text
+    /// in a [`scrolled`] window: the numbers stay put, the text moves. Ignoring
+    /// it draws a presentation that simply does not scroll sideways, which is the
+    /// right answer for one whose rows always fit.
+    fn render(
+        &self,
+        index: usize,
+        seg: usize,
+        host: &Host,
+        sel: Option<Selected>,
+        shift: f32,
+    ) -> AnyElement;
 
-    /// Width of a visual row in characters, for `uniform_list`'s one measured
-    /// row.
+    /// Width of a visual row in characters. What the widest-row search ranks
+    /// rows by, and therefore which row [`Rows::overflow`] is asked about.
     fn width(&self, index: usize, seg: usize) -> usize;
 
-    /// Which text a click at `x` pixels from this row's left edge landed in, and
-    /// which byte of it.
+    /// How far the text of one visual row reaches past the right edge of a
+    /// `width`-pixel window, in pixels: what bounds the horizontal scroll.
+    ///
+    /// The presentation answers because only it knows what it drew in front of
+    /// the text, how large the text is drawn and — in a two-column layout — which
+    /// window the text is even in. Zero when the row fits, which is every row of
+    /// a wrapped diff, and the default: a presentation that never overflows never
+    /// scrolls sideways and needs no code for it.
+    fn overflow(&self, _index: usize, _seg: usize, _width: f32, _host: &Host) -> f32 {
+        0.0
+    }
+
+    /// Which text a click `x` pixels into this row landed in, and which byte of
+    /// it.
     ///
     /// The frontend half of a selection, and the only half that needs pixels:
     /// where the text starts depends on the gutters, the bars and the indents
@@ -208,13 +248,26 @@ pub trait Rows {
     /// implementation can know either, which is why this is on the trait rather
     /// than a division in the view.
     ///
+    /// `x` is from the left edge of the *window*, and `shift` is how far the text
+    /// has been scrolled sideways under the furniture — so the arithmetic is the
+    /// terminal's, `(x - chrome).max(0) + shift`, and a click on a line number
+    /// lands on the first character there is to see rather than on one scrolled
+    /// out of the window.
+    ///
     /// The offset is into the **logical** row's text, not the visual row's, so a
     /// caret on the third row of a wrapped line is the same kind of thing as one
     /// on an unwrapped line — see [`plait_core::select`]. `None` means the row
     /// takes no part in a selection, and defaults to it: an extension's
     /// presentation compiles unchanged and is simply not selectable until it says
     /// where its text is.
-    fn hit(&self, _index: usize, _seg: usize, _x: f32, _host: &Host) -> Option<Hit> {
+    fn hit(
+        &self,
+        _index: usize,
+        _seg: usize,
+        _x: f32,
+        _host: &Host,
+        _shift: f32,
+    ) -> Option<Hit> {
         None
     }
 
@@ -365,6 +418,122 @@ fn expand(logical: &[RowRef], renderers: &[Box<dyn Rows>], anchor: Option<RowRef
     Ordered { order, widest: widest_at, anchor: found }
 }
 
+/// This wheel event's delta with the gesture's axis lock applied: what is left on
+/// the x axis is the text's to move, and what is left on the y axis is the list's.
+///
+/// Two rules, and both are what a browser does.
+///
+/// **A gesture has one axis for its whole life.** `OngoingScroll` is `gpui`'s own
+/// lock — the same one `div` uses for a scroll container — and it holds the axis
+/// a flick started on until the fingers lift or the deltas turn hard the other
+/// way. Without it a diagonal trackpad swipe is horizontal on some of its events
+/// and vertical on others, which is the drift that reads as the text sliding at
+/// an angle. Deciding per event instead is a coin flip fifty times a second.
+///
+/// **`shift` means "this one is horizontal"**, and it is applied *before* the
+/// lock rather than after: the delta is on the vertical axis, so a lock that saw
+/// it first would call the gesture vertical and hand it to the list. Only when
+/// the platform has not already done the swap itself, which macOS does for some
+/// mice.
+fn locked(
+    mut delta: Point<Pixels>,
+    shift: bool,
+    ongoing: &mut OngoingScroll,
+    phase: TouchPhase,
+) -> Point<Pixels> {
+    if shift && delta.x.is_zero() {
+        delta = point(delta.y, px(0.));
+    }
+    ongoing.filter(&mut delta, phase);
+    delta
+}
+
+/// How far the text has been scrolled sideways, in pixels, and how far it may go.
+///
+/// The window's `Pen::scroll`. A handle rather than a field on the view because
+/// two things write it from outside `render`: a wheel event, which arrives with
+/// no `&mut Diff` in reach of the closure that draws a row, and the scrollbar
+/// thumb, which is dragged during paint. One `Cell`, copied in and out — the
+/// shape `UniformListScrollHandle` already has for the axis it owns.
+///
+/// `at` is clamped on the way in, so every reader — the rows, the hit test, the
+/// scrollbar — sees a value that exists without having to ask.
+#[derive(Clone, Default)]
+pub struct Pan(Rc<Cell<Panned>>);
+
+#[derive(Clone, Copy, Default)]
+struct Panned {
+    at: f32,
+    max: f32,
+    /// The box the rows are drawn in, so the scrollbar knows where to put itself
+    /// and how long the thumb is. Written per frame from the list's own bounds,
+    /// which is the only element here that has any.
+    viewport: Bounds<Pixels>,
+}
+
+impl Pan {
+    /// Pixels of text off the left edge of the window.
+    pub fn at(&self) -> f32 {
+        self.0.get().at
+    }
+
+    /// Scrolls to an absolute offset. Returns whether it moved, which is what
+    /// decides a redraw: a trackpad delivers events long after the text has
+    /// stopped being able to move.
+    pub fn set(&self, at: f32) -> bool {
+        let mut s = self.0.get();
+        let at = at.clamp(0.0, s.max);
+        if at == s.at {
+            return false;
+        }
+        s.at = at;
+        self.0.set(s);
+        true
+    }
+
+    pub fn by(&self, dx: f32) -> bool {
+        self.set(self.0.get().at + dx)
+    }
+
+    /// A new bound, and a re-clamp with it: turning wrapping on, or dragging the
+    /// window wider, leaves the text scrolled to somewhere that is no longer
+    /// there.
+    pub fn set_max(&self, max: f32) {
+        let mut s = self.0.get();
+        s.max = max.max(0.0);
+        s.at = s.at.clamp(0.0, s.max);
+        self.0.set(s);
+    }
+
+    fn set_viewport(&self, viewport: Bounds<Pixels>) {
+        let mut s = self.0.get();
+        s.viewport = viewport;
+        self.0.set(s);
+    }
+}
+
+/// What the horizontal scrollbar reads and what its thumb writes. The offset is
+/// negative in `gpui`'s convention — content pulled left of its origin — and
+/// positive in ours, which is the whole of the conversion.
+impl ScrollbarHandle for Pan {
+    fn viewport_bounds(&self) -> Bounds<Pixels> {
+        self.0.get().viewport
+    }
+
+    fn offset(&self) -> Point<Pixels> {
+        point(px(-self.0.get().at), px(0.))
+    }
+
+    fn set_offset(&self, offset: Point<Pixels>) {
+        self.set(-f32::from(offset.x));
+    }
+
+    fn content_size(&self) -> Size<Pixels> {
+        let s = self.0.get();
+        size(s.viewport.size.width + px(s.max), s.viewport.size.height)
+    }
+}
+
 pub struct Diff {
     /// The parsed diff, kept so a layout change can rebuild the rows.
     ///
@@ -407,10 +576,17 @@ pub struct Diff {
     /// True between mouse-down and mouse-up, so a move extends the selection
     /// rather than doing nothing at all.
     dragging: bool,
-    /// See the note in the commits view: uniform_list sizes its scrollable
-    /// width from a single measured row, defaulting to row 0.
+    /// Index into `order` of the widest visual row: the one row the horizontal
+    /// bound is taken from, because it is the one there is furthest to scroll to.
     widest: usize,
     scroll: UniformListScrollHandle,
+    /// The horizontal axis, which is this view's and not the list's — see the
+    /// module note. Bounded from `widest` on every reflow.
+    pan: Pan,
+    /// Which axis the wheel gesture in flight belongs to. `gpui`'s own lock, kept
+    /// here because the events arrive at a window handler rather than at a scroll
+    /// container — see [`sideways`].
+    ongoing: Cell<OngoingScroll>,
     /// Absent in the headless tests, which build a `Diff` with no window and no
     /// `Context` to take a handle from. Present in the app, where it is what
     /// puts this view in the key dispatch path at all.
@@ -478,10 +654,16 @@ impl Diff {
     /// the top.
     ///
     /// Called from `render` with the width measured on the previous frame, so it
-    /// runs on a resize and on a wrap change and at no other time. Three ways
-    /// out before it does any work, in increasing cost: nothing moved, nothing
-    /// *can* move because the wrap never breaks, and no implementation's row
-    /// count actually changed.
+    /// runs on a resize and on a wrap change and at no other time. Two ways out
+    /// before it does any work, in increasing cost: nothing moved, and no
+    /// implementation's row count actually changed.
+    ///
+    /// A presentation is told the width **whatever the wrap is doing**, and the
+    /// cheap path for a wrap that never breaks lines is the implementation's —
+    /// see `TextRows::reflow`. It has to be: with wrapping off the width is still
+    /// what decides how wide a side-by-side column is, how long a Markdown rule
+    /// is, and how far there is to scroll, and a presentation told nothing
+    /// answers all three from the window it had two resizes ago.
     ///
     /// What it costs when it does run is a rescan of the text — 1–3 ms on the
     /// real fixtures and 26 ms on the 714k-line one, at 36–52 ns a line — plus a
@@ -493,49 +675,114 @@ impl Diff {
         if (width, wrap.name()) == self.applied || width <= 0.0 {
             return;
         }
-        let same_wrap = self.applied.1 == wrap.name();
         self.applied = (width, wrap.name());
-        // A wrap that never breaks has no width to be wrong about. Without this
-        // every pixel of a drag rescans the whole diff to be told nothing moved.
-        if !wrap.breaks_lines() && same_wrap {
-            return;
-        }
 
         let changed = {
             let mut rs = self.renderers.borrow_mut();
             rs.iter_mut().fold(false, |acc, r| r.reflow(width, host, wrap) | acc)
         };
-        if !changed {
+        if changed {
+            // Anchored to the logical row at the top, not to a proportion: a
+            // reflow is the same diff at a different width, so the line you were
+            // reading still exists and is the honest thing to keep still. A
+            // layout change has no such correspondence, which is why it uses a
+            // fraction instead.
+            let anchor = self.order.get(self.top.get()).copied();
+            let built = expand(&self.order, &self.renderers.borrow(), anchor);
+            let logical = self.renderers.borrow().iter().map(|r| r.len()).sum::<usize>();
+            self.order = Rc::new(built.order);
+            self.widest = built.widest;
+            self.total.set(self.order.len());
+            self.top.set(built.anchor);
+            self.scroll_to(built.anchor);
+            // After the order table, because the bound is the widest row's and
+            // that is what just moved. Said out loud when it is not zero: "the
+            // diff fits" and "there is a kilometre of it off the right of the
+            // screen" look identical until something scrolls.
+            let bound = self.bound(width, host);
+            *self.note.borrow_mut() = format!(
+                "{} · {:.0} px · {} rows / {logical} lines{}",
+                wrap.name(),
+                width,
+                self.order.len(),
+                match bound > 0.0 {
+                    true => format!(" · {bound:.0} px right"),
+                    false => String::new(),
+                }
+            )
+            .into();
+            // The rows are the same rows at different heights, so the selection
+            // survives — but every visual row it cached has moved, which is what
+            // `resolve` rebuilds. A drag *through* a reflow cannot happen: the
+            // width only changes when the mouse is on the window's edge.
+            if let Some(sel) = &mut self.sel {
+                if !sel.resolve(&self.order) {
+                    self.sel = None;
+                }
+            }
+        }
+        // Last, and on every path: the bound is a function of the width, of the
+        // wrap and of which row came out widest, and the row count changing is
+        // only one of the three.
+        self.pan.set_max(self.bound(width, host));
+    }
+
+    /// How far the text may be scrolled sideways, in pixels.
+    ///
+    /// The widest row and no other, which is the same row `expand` already found
+    /// while walking the order table: once its last character is on screen there
+    /// is nothing left anywhere in the diff to scroll to.
+    fn bound(&self, width: f32, host: &Host) -> f32 {
+        let rs = self.renderers.borrow();
+        self.order.get(self.widest).map_or(0.0, |r| {
+            rs[r.owner as usize].overflow(r.index as usize, r.seg as usize, width, host)
+        })
+    }
+
+    /// A wheel or a trackpad, sideways — and the decision about whether *this*
+    /// gesture is sideways at all.
+    ///
+    /// **A sideways gesture never reaches the list**, and that is the whole of
+    /// this method. `uniform_list` scrolls one axis, so `overflow.x` on it is
+    /// visible, and `gpui`'s scroll handler reads that as permission to use a
+    /// horizontal delta for vertical movement — the arm is
+    /// `Overflow::Scroll if !restrict_scroll_to_axis && overflow.x != Scroll => delta.x`.
+    /// With the text panning from the same event, a flick to the right came out
+    /// diagonal. So this runs in the **capture** phase and stops the event dead
+    /// when the gesture is horizontal: one component decides the axis, and the
+    /// one that decides is the one that owns the axis it decided on.
+    ///
+    /// Whether it *could* move does not come into it. A page with nothing to the
+    /// right does nothing when you swipe right; it does not start scrolling down.
+    fn wheel(&mut self, ev: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Over the rows, and not over the title bar or a dropdown above them.
+        // A capture-phase handler is registered on the window, so it is outside
+        // the hit test a bubble-phase one gets for free.
+        if !self.scroll.0.borrow().base_handle.bounds().contains(&ev.position) {
             return;
         }
-
-        // Anchored to the logical row at the top, not to a proportion: a reflow
-        // is the same diff at a different width, so the line you were reading
-        // still exists and is the honest thing to keep still. A layout change
-        // has no such correspondence, which is why it uses a fraction instead.
-        let anchor = self.order.get(self.top.get()).copied();
-        let built = expand(&self.order, &self.renderers.borrow(), anchor);
-        let logical = self.renderers.borrow().iter().map(|r| r.len()).sum::<usize>();
-        *self.note.borrow_mut() = format!(
-            "{} · {:.0} px · {} rows / {logical} lines",
-            wrap.name(),
-            width,
-            built.order.len()
-        )
-        .into();
-        self.order = Rc::new(built.order);
-        self.widest = built.widest;
-        self.total.set(self.order.len());
-        self.top.set(built.anchor);
-        self.scroll_to(built.anchor);
-        // The rows are the same rows at different heights, so the selection
-        // survives — but every visual row it cached has moved, which is what
-        // `resolve` rebuilds. A drag *through* a reflow cannot happen: the width
-        // only changes when the mouse is on the window's edge.
-        if let Some(sel) = &mut self.sel {
-            if !sel.resolve(&self.order) {
-                self.sel = None;
-            }
+        let mut ongoing = self.ongoing.get();
+        let delta = locked(
+            ev.delta.pixel_delta(window.line_height()),
+            ev.modifiers.shift,
+            &mut ongoing,
+            ev.touch_phase,
+        );
+        self.ongoing.set(ongoing);
+        if delta.x.is_zero() {
+            return;
+        }
+        // Ours *alone* only when the lock says so. A gesture that unlocked
+        // mid-flick — swipe left, then up, without lifting — carries both axes
+        // for the rest of its life, and eating it would be a diff that stops
+        // scrolling down until the fingers come off the glass.
+        if delta.y.is_zero() {
+            cx.stop_propagation();
+        }
+        // A scroll to the right moves the content left, which is further into
+        // the line: the sign is the one thing to get right in here.
+        if self.pan.by(-f32::from(delta.x)) {
+            cx.notify();
         }
     }
 
@@ -677,6 +924,8 @@ impl Diff {
             dragging: false,
             widest: built.widest,
             scroll: UniformListScrollHandle::new(),
+            pan: Pan::default(),
+            ongoing: Cell::default(),
             focus: None,
             focused: false,
             rendered: Rc::new(Cell::new(0)),
@@ -883,12 +1132,16 @@ impl Diff {
         }
         let y = f32::from(pos.y - bounds.origin.y - offset.y);
         let visual = ((y / ROW_H).floor().max(0.0) as usize).min(self.order.len() - 1);
-        let x = f32::from(pos.x - bounds.origin.x - offset.x);
+        // Not `- offset.x`, because there is none: a row is as wide as the
+        // viewport and the horizontal offset is inside it, applied to the text
+        // and not to the row. So this is a window coordinate and `hit` is handed
+        // the scroll separately — the same two numbers the terminal passes.
+        let x = f32::from(pos.x - bounds.origin.x);
         let r = self.order[visual];
 
         let renderers = self.renderers.borrow();
         let rows = renderers.get(r.owner as usize)?;
-        let hit = rows.hit(r.index as usize, r.seg as usize, x, host)?;
+        let hit = rows.hit(r.index as usize, r.seg as usize, x, host, self.pan.at())?;
         // The visual rows this logical row occupies. The caret caches them so the
         // render path never searches the order table for them, and they are free
         // here: this row is `seg` into the run and the presentation knows how long
@@ -1070,6 +1323,28 @@ impl Diff {
         .h(px(0.))
         .into_any_element()
     }
+
+    /// The same trick as [`Diff::drag_probe`], for the wheel, and for a different
+    /// reason: not to hear about events outside the box, but to hear about them
+    /// **first**. A `div`'s `on_scroll_wheel` is bubble-phase only, and the list
+    /// is a child — so by the time it fired, the list had already turned a
+    /// sideways flick into vertical scrolling. See [`Diff::wheel`].
+    fn wheel_probe(&self, cx: &mut Context<Self>) -> AnyElement {
+        let me = cx.entity().downgrade();
+        canvas(|_, _, _| {}, move |_, _, window, _| {
+            let me = me.clone();
+            window.on_mouse_event(move |ev: &ScrollWheelEvent, phase, window, cx| {
+                if phase == DispatchPhase::Capture {
+                    _ = me.update(cx, |this, cx| this.wheel(ev, window, cx));
+                }
+            });
+        })
+        .absolute()
+        .top_0()
+        .left_0()
+        .h(px(0.))
+        .into_any_element()
+    }
 }
 
 impl Render for Diff {
@@ -1087,6 +1362,14 @@ impl Render for Diff {
         // closure lives for one element tree, and every path that changes a
         // selection notifies — so the copy in here is never the stale one.
         let sel = self.sel.clone();
+        // Where the scrollbar draws itself and how long its thumb is. Last
+        // frame's box, like everything else measured here — a view is handed
+        // one and cannot ask before.
+        self.pan.set_viewport(self.scroll.0.borrow().base_handle.bounds());
+        // Read once per frame and copied into the rows, so every row of the
+        // frame is drawn at the same offset. Reading it per row would be the
+        // same number and one `Cell` load each.
+        let shift = self.pan.at();
 
         // The host is read here, per batch, rather than cloned in once when the
         // view was built. That is the whole of what makes a saved config file
@@ -1104,13 +1387,17 @@ impl Render for Diff {
                     // is every row of every frame until somebody drags.
                     let at = sel.as_ref().and_then(|s| s.at(i, r.logical()));
                     renderers[r.owner as usize]
-                        .render(r.index as usize, r.seg as usize, &host, at)
+                        .render(r.index as usize, r.seg as usize, &host, at, shift)
                 })
                 .collect()
         })
-        .with_width_from_item(Some(self.widest))
         .track_scroll(&self.scroll)
-        .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
+        // Constrained, which is the default: a row is exactly as wide as the
+        // viewport whatever it holds, and what overflows is clipped inside it by
+        // `scrolled` rather than scrolled to by the list. That is what lets the
+        // gutter stay put, and it takes the one measured row with it — the list
+        // no longer shapes a 2000-character line every frame to decide a
+        // scrollable width nothing scrolls.
         .size_full();
 
         let mut root = div()
@@ -1138,6 +1425,7 @@ impl Render for Diff {
             )
             .child(list)
             .child(self.drag_probe(cx))
+            .child(self.wheel_probe(cx))
             // How wide this view actually is, which is the wrap budget. A view
             // is handed its box by whatever assembled it and cannot know it
             // during `render`, so it is read off the paint pass and used on the
@@ -1147,8 +1435,10 @@ impl Render for Diff {
             // `[view] scrollbar`, read per frame like every other setting — the
             // terminal draws its own bar from the same flag.
             .when(crate::config::host(cx).view.scrollbar, |d| {
+                // Two handles, because there are two axes and they belong to
+                // different things now: the rows to the list, the text to `Pan`.
                 d.child(Scrollbar::vertical(&self.scroll))
-                    .child(Scrollbar::horizontal(&self.scroll))
+                    .child(Scrollbar::horizontal(&self.pan))
             });
 
         // Key dispatch runs down the focus path, so an action handler on an
@@ -1247,6 +1537,12 @@ impl Rows for TextRows {
 
     /// The whole of what a presentation owes wrapping: turn its own width into a
     /// column budget, and hand `core` the text.
+    ///
+    /// The one thing in here that is not about wrapping is the early exit for a
+    /// wrap that breaks nothing. The width still has to land — it is what bounds
+    /// the horizontal scroll — but there is nothing to scan for: an unbroken
+    /// table is the default one, and building it from 714k lines to be told so
+    /// again is 26 ms on every five characters of a resize drag.
     fn reflow(&mut self, width: f32, host: &Host, wrap: &dyn Wrap) -> bool {
         let cols = columns(width, TEXT_CHROME, host.font.size, host);
         if cols == self.cols && wrap.name() == self.wrap {
@@ -1254,6 +1550,11 @@ impl Rows for TextRows {
         }
         self.cols = cols;
         self.wrap = wrap.name();
+        if !wrap.breaks_lines() {
+            let broken = self.wrapped.total() > self.wrapped.lines();
+            self.wrapped = Wrapped::default();
+            return broken;
+        }
         self.wrapped = Wrapped::build(self.rows.iter().map(|r| (wrappable(r), cols)), wrap);
         true
     }
@@ -1295,12 +1596,22 @@ impl Rows for TextRows {
         }
     }
 
+    /// Characters of text past the window, at this presentation's one size.
+    ///
+    /// `TEXT_CHROME` and not the window's whole width, because the gutters and
+    /// the sign do not scroll: what has to reach the right edge is the text, and
+    /// the furniture in front of it is space the text never had.
+    fn overflow(&self, index: usize, seg: usize, width: f32, host: &Host) -> f32 {
+        let text = self.width(index, seg) as f32 * host.font.char_width();
+        (text - (width - TEXT_CHROME)).max(0.0)
+    }
+
     /// The gutters and the sign column, then the text — and for a header, the
     /// page padding and nothing else, because that is what it draws.
-    fn hit(&self, index: usize, seg: usize, x: f32, host: &Host) -> Option<Hit> {
+    fn hit(&self, index: usize, seg: usize, x: f32, host: &Host, shift: f32) -> Option<Hit> {
         Some(match self.rows.get(index)? {
-            Row::Hunk(h) => header_hit(h, x, host),
-            Row::File { path, .. } => header_hit(path, x, host),
+            Row::Hunk(h) => header_hit(h, x, host, shift),
+            Row::File { path, .. } => header_hit(path, x, host, shift),
             Row::Line { text, .. } => {
                 let at = self.wrapped.range(index, seg, text);
                 // Rebased into the line: a caret addresses the line, and this row
@@ -1308,7 +1619,7 @@ impl Rows for TextRows {
                 let off = at.start
                     + column_at(
                         &text[at.clone()],
-                        x - (TEXT_CHROME - PAD),
+                        into_text(x, TEXT_CHROME - PAD, shift),
                         host.font.size,
                         host,
                     );
@@ -1328,13 +1639,20 @@ impl Rows for TextRows {
         })
     }
 
-    fn render(&self, index: usize, seg: usize, host: &Host, sel: Option<Selected>) -> AnyElement {
+    fn render(
+        &self,
+        index: usize,
+        seg: usize,
+        host: &Host,
+        sel: Option<Selected>,
+        shift: f32,
+    ) -> AnyElement {
         let theme = &host.theme;
         let p = &theme.diff;
         match &self.rows[index] {
-            Row::File { path, adds, dels } => file_header(path, *adds, *dels, theme, sel),
+            Row::File { path, adds, dels } => file_header(path, *adds, *dels, theme, sel, shift),
 
-            Row::Hunk(header) => hunk_header(header, theme, sel),
+            Row::Hunk(header) => hunk_header(header, theme, sel, shift),
 
             Row::Line { kind, moved, old, new, text, spans, tokens } => {
                 let (bg, fg, sign) = line_colors(*kind, *moved, p);
@@ -1361,8 +1679,9 @@ impl Rows for TextRows {
                             .text_color(rgb(fg))
                             .child(if blank { " " } else { sign }),
                     )
-                    .child(
-                        div().flex_none().text_color(rgb(fg)).child(
+                    .child(scrolled(
+                        shift,
+                        div().text_color(rgb(fg)).child(
                             StyledText::new(piece).with_highlights(runs(
                                 at.clone(),
                                 tokens,
@@ -1373,7 +1692,7 @@ impl Rows for TextRows {
                                 selected(sel, 0, text.len()),
                             )),
                         ),
-                    )
+                    ))
                     .into_any_element()
             }
         }
@@ -1413,19 +1732,48 @@ pub(crate) fn slice(text: &SharedString, at: &Range<usize>) -> SharedString {
 /// additions read as a block rather than as a ragged margin.
 ///
 /// `min_w_full` and not a measured width, because `uniform_list` lays each
-/// visible row out as its own root against an available width of *the viewport
-/// plus however far the list is scrolled horizontally* — so 100% is "to the
-/// right edge of the window, wherever the window is scrolled to", and the fill
-/// follows the scroll for free. A *minimum*, so a line longer than the window
-/// keeps its own width: that overflow is what there is to scroll to, and
-/// clamping it here would be a diff with no horizontal scrolling.
+/// visible row out as its own root against the viewport's width — so 100% is "to
+/// the right edge of the window" and the fill costs nothing to compute. A
+/// *minimum* and not a width, because the one row the list measures to decide its
+/// item height is laid out against `MaxContent`, where a percentage has no parent
+/// width to resolve against: `w_full` there is zero, and a row of zero height is a
+/// list that draws nothing.
 ///
-/// It does not disturb `with_width_from_item`. That measurement lays its one row
-/// out against `MaxContent`, where a percentage minimum has no parent width to
-/// resolve against and drops out — so the scrollable width is still the widest
-/// row's own text, not the window's.
+/// What a line wider than the window does is *not* make the row wider — the row
+/// is the viewport, always, and the text is clipped inside it by [`scrolled`].
+/// See the module note on scrolling sideways.
 pub(crate) fn row_frame() -> Div {
     div().flex().h(px(ROW_H)).min_w_full()
+}
+
+/// The window a presentation's text is drawn in, `shift` pixels to the left of
+/// where it would otherwise start.
+///
+/// This is `Pen::scroll`: whatever the presentation drew before it — the line
+/// numbers, the sign, a quote bar, the other column — stays where it is, and the
+/// text moves under it. Two properties do the work and both are load-bearing.
+/// **`overflow_x_hidden`**, so a line pulled left is clipped at this window's
+/// edge instead of painting over the numbers it slid under; the row is not the
+/// clip, because the row is what contains the numbers. It masks the window's
+/// whole box and not only its x axis — `Style::overflow_mask` gives the same
+/// rectangle either way — so the window is exactly as tall as what it holds, and
+/// a row with something to place against its *bottom* edge, like a Markdown
+/// table's rule, passes in a `ROW_H` box of its own. And **`min_w(0)`**, because
+/// a flex item
+/// is otherwise at least as wide as its content, and a 2000-character line would
+/// make this window that wide and push the whole row past the viewport.
+///
+/// A negative margin and not a slice of the text: the syntax tokens and the
+/// intraline spans address the *line*, so cutting the string before
+/// [`runs`] pairs styling with the wrong bytes. The same reason the terminal
+/// swallows columns in the pen rather than slicing.
+pub(crate) fn scrolled(shift: f32, text: Div) -> Div {
+    div()
+        .flex()
+        .flex_grow(1.)
+        .min_w(px(0.))
+        .overflow_x_hidden()
+        .child(text.flex_none().ml(px(-shift)))
 }
 
 /// A line number, or nothing at all on a continuation row.
@@ -1452,8 +1800,21 @@ pub(crate) fn selected(sel: Option<Selected>, part: u16, len: usize) -> Range<us
 /// lines beneath them, a header is drawn by [`file_header`] or [`hunk_header`] and
 /// its text starts at the page padding. Three presentations working that out
 /// separately is three places for the caret to be a gutter's width off.
-pub(crate) fn header_hit(text: &str, x: f32, host: &Host) -> Hit {
-    Hit { part: 0, off: column_at(text, x - PAD, host.font.size, host) }
+pub(crate) fn header_hit(text: &str, x: f32, host: &Host, shift: f32) -> Hit {
+    Hit { part: 0, off: column_at(text, into_text(x, PAD, shift), host.font.size, host) }
+}
+
+/// How far into a row's text a click landed: `x` is from the left edge of the
+/// window, `chrome` is where the text starts and `shift` is how far it has been
+/// scrolled under everything in front of it.
+///
+/// The `max(0)` is **before** the shift and not after, which is the terminal's
+/// arithmetic in `TextRows::hit` and matters as soon as anything is scrolled: a
+/// click on a line number is a caret at the first character there is to *see*,
+/// not at one somewhere off the left edge, and not at a byte the row cannot
+/// address.
+pub(crate) fn into_text(x: f32, chrome: f32, shift: f32) -> f32 {
+    (x - chrome).max(0.0) + shift
 }
 
 /// A header's text, with whatever a selection covers lit up behind it.
@@ -1494,6 +1855,7 @@ pub(crate) fn file_header(
     dels: usize,
     theme: &Theme,
     sel: Option<Selected>,
+    shift: f32,
 ) -> AnyElement {
     let p = &theme.diff;
     let (dir, name) = split_path(path);
@@ -1507,13 +1869,15 @@ pub(crate) fn file_header(
         .flex_col()
         .bg(rgb(p.file_bg))
         .child(div().flex_none().h(px(1.)).bg(rgb(p.rule)))
-        .child(
+        // A path longer than the window is reached the same way a line is: it is
+        // the row's text, and the only thing in front of it is the page padding —
+        // which is why the padding is out here and the scroll is inside it.
+        .child(div().flex().flex_grow(1.0).px_4().child(scrolled(
+            shift,
             div()
                 .flex()
-                .flex_grow(1.0)
                 .items_center()
                 .gap_3()
-                .px_4()
                 .child(
                     div()
                         .flex()
@@ -1541,7 +1905,7 @@ pub(crate) fn file_header(
                 )
                 .child(div().flex_none().text_color(rgb(p.adds_fg)).child(format!("+{adds}")))
                 .child(div().flex_none().text_color(rgb(p.dels_fg)).child(format!("-{dels}"))),
-        )
+        )))
         .into_any_element()
 }
 
@@ -1588,6 +1952,7 @@ pub(crate) fn hunk_header(
     header: &SharedString,
     theme: &Theme,
     sel: Option<Selected>,
+    shift: f32,
 ) -> AnyElement {
     let p = &theme.diff;
     let (marker, _) = plait_core::hunk_parts(header);
@@ -1596,10 +1961,16 @@ pub(crate) fn hunk_header(
         .px_4()
         .bg(rgb(p.hunk_bg))
         .text_color(rgb(p.hunk_fg))
-        .child(
-            StyledText::new(header.clone())
-                .with_highlights(hunk_runs(marker.len(), selected(sel, 0, header.len()), theme)),
-        )
+        .child(scrolled(
+            shift,
+            div().child(
+                StyledText::new(header.clone()).with_highlights(hunk_runs(
+                    marker.len(),
+                    selected(sel, 0, header.len()),
+                    theme,
+                )),
+            ),
+        ))
         .into_any_element()
 }
 
@@ -1809,7 +2180,7 @@ pub(crate) fn runs(
 mod tests {
     // By name, not a glob: `use gpui::*` in the parent shadows `#[test]` with
     // GPUI's own attribute macro and every test in here fails to expand.
-    use super::{line_colors, Diff, Layouts, Row, Rows, TextRows, PAD, TEXT_CHROME};
+    use super::{line_colors, locked, Diff, Layouts, Pan, Row, Rows, TextRows, PAD, TEXT_CHROME};
     use gpui::{
         div, rgb, AnyElement, FontStyle, FontWeight, HighlightStyle, IntoElement, ParentElement,
     };
@@ -2050,15 +2421,15 @@ diff --git a/a.rs b/a.rs
         let text = r.selectable(3, 0).expect("a line");
         assert_eq!(text, "    let x = 1;");
         for col in [0, 4, 7, 13] {
-            let hit = r.hit(3, 0, x_for(col, &host), &host).expect("a hit");
+            let hit = r.hit(3, 0, x_for(col, &host), &host, 0.0).expect("a hit");
             assert_eq!((hit.part, hit.off), (0, col), "column {col}");
         }
         // Past the end of the text clamps to the end of it rather than reaching
         // into whatever is at that byte of the next line.
-        let hit = r.hit(3, 0, x_for(400, &host), &host).unwrap();
+        let hit = r.hit(3, 0, x_for(400, &host), &host, 0.0).unwrap();
         assert_eq!(hit.off, text.len());
         // And to the left of the text — in the gutter — is the start of it.
-        let hit = r.hit(3, 0, 0.0, &host).unwrap();
+        let hit = r.hit(3, 0, 0.0, &host, 0.0).unwrap();
         assert_eq!(hit.off, 0);
     }
 
@@ -2070,8 +2441,8 @@ diff --git a/a.rs b/a.rs
         let (mut r, host) = text_rows(LONG);
         assert!(r.reflow(width_for(40, &host), &host, host.wrap.current()));
         let row = (0..r.len()).find(|i| r.rows(*i) > 1).expect("a wrapped line");
-        let first = r.hit(row, 0, x_for(3, &host), &host).unwrap().off;
-        let second = r.hit(row, 1, x_for(3, &host), &host).unwrap().off;
+        let first = r.hit(row, 0, x_for(3, &host), &host, 0.0).unwrap().off;
+        let second = r.hit(row, 1, x_for(3, &host), &host, 0.0).unwrap().off;
         assert_eq!(first, 3);
         assert!(second > 30, "the second row rebased to {second}, not into the line");
         // And the byte it names is the byte drawn there.
@@ -2087,7 +2458,7 @@ diff --git a/a.rs b/a.rs
         assert_eq!(r.selectable(1, 0), Some("@@ -1,2 +1,2 @@"));
         // Drawn at the page padding and nowhere else, whichever presentation
         // owns the lines beneath it.
-        let hit = r.hit(0, 0, PAD + 2.5 * host.font.size * host.font.advance, &host).unwrap();
+        let hit = r.hit(0, 0, PAD + 2.5 * host.font.size * host.font.advance, &host, 0.0).unwrap();
         assert_eq!(hit.off, 2);
     }
 
@@ -2363,9 +2734,9 @@ diff --git a/a.rs b/a.rs
 
     #[test]
     fn no_row_is_wider_than_the_window_once_it_has_wrapped() {
-        // What replaces the horizontal scrollbar. `width` is what
-        // `with_width_from_item` measures, so this is also the assertion that
-        // nothing is left to scroll to.
+        // What replaces the horizontal scroll. `width` is what `overflow` is
+        // measured from, so this is also the assertion that nothing is left to
+        // scroll to.
         let (mut r, host) = text_rows(LONG);
         for cols in [12, 20, 40, 77] {
             r.reflow(width_for(cols, &host), &host, host.wrap.current());
@@ -2408,6 +2779,133 @@ diff --git a/a.rs b/a.rs
         // And the widest row is the whole line again, which is what the
         // horizontal scrollbar is for.
         assert!(r.width(3, 0) > 20);
+    }
+
+    // ------------------------------------------------------ scrolling sideways
+
+    #[test]
+    fn a_horizontal_scroll_moves_the_text_and_not_the_gutter() {
+        // The terminal's test of the same name, in pixels. What proves the
+        // furniture stays put is `hit`: the caret arithmetic is the only place
+        // the offset and the chrome meet, so if a click at the left edge of the
+        // text lands on the character `shift` pixels in, the numbers in front of
+        // it did not move.
+        let (r, host) = text_rows(SAMPLE);
+        let cw = host.font.char_width();
+        for col in [0, 4, 13] {
+            let plain = r.hit(3, 0, x_for(0, &host), &host, col as f32 * cw).unwrap();
+            assert_eq!((plain.part, plain.off), (0, col), "scrolled {col} characters");
+        }
+        // A click on a line number, scrolled: the first character there is to
+        // see, and never a negative offset into the line.
+        assert_eq!(r.hit(3, 0, 0.0, &host, 4.0 * cw).unwrap().off, 4);
+        assert_eq!(r.hit(3, 0, 0.0, &host, 0.0).unwrap().off, 0);
+    }
+
+    #[test]
+    fn there_is_nothing_to_scroll_to_once_it_has_wrapped() {
+        // Two claims: an unwrapped line is over the edge by exactly the part of
+        // it that does not fit, and a wrapped one is not over the edge at all.
+        let (mut r, host) = text_rows(LONG);
+        let w = width_for(40, &host);
+        let off = host.wrap.at(host.wrap.position("off").unwrap());
+        r.reflow(w, &host, off);
+        let over = r.overflow(3, 0, w, &host);
+        let text = r.width(3, 0) as f32 * host.font.char_width();
+        assert!((over - (text - (w - TEXT_CHROME))).abs() < 0.001, "{over}");
+        assert!(over > 0.0, "a 76-character line fits 40 columns");
+
+        r.reflow(w, &host, host.wrap.current());
+        for seg in 0..r.rows(3) {
+            assert_eq!(r.overflow(3, seg, w, &host), 0.0, "row 3/{seg}");
+        }
+    }
+
+    #[test]
+    fn a_gesture_keeps_the_axis_it_started_on() {
+        // The bug this exists to stop: a flick to the right that also moved the
+        // rows down, because the wheel handler and the list each decided the
+        // axis for themselves, one event at a time. One lock, one decision.
+        use gpui::{point, px, OngoingScroll, TouchPhase};
+        let mut lock = OngoingScroll::default();
+        let moved = TouchPhase::Moved;
+
+        // Sideways, and nothing on the vertical axis for the list to have.
+        let d = locked(point(px(-30.), px(0.)), false, &mut lock, TouchPhase::Started);
+        assert_eq!((d.x, d.y), (px(-30.), px(0.)));
+        // The rest of the same gesture is sideways too, however the fingers
+        // wander: this is the drift that read as the text sliding at an angle.
+        let d = locked(point(px(-12.), px(4.)), false, &mut lock, moved);
+        assert_eq!(d.y, px(0.), "a locked gesture leaked onto the other axis");
+        assert!(d.x < px(0.));
+
+        // A vertical gesture is the list's, and this hands back nothing for the
+        // text to move by — not even the sideways wobble in it.
+        let mut lock = OngoingScroll::default();
+        let d = locked(point(px(3.), px(-40.)), false, &mut lock, TouchPhase::Started);
+        assert_eq!((d.x, d.y), (px(0.), px(-40.)));
+
+        // `shift` is the platform's way of saying "this one is horizontal", and
+        // it is applied before the lock — after it, the lock has already called
+        // the gesture vertical and given it away.
+        let mut lock = OngoingScroll::default();
+        let d = locked(point(px(0.), px(-40.)), true, &mut lock, TouchPhase::Started);
+        assert_eq!((d.x, d.y), (px(-40.), px(0.)));
+    }
+
+    #[test]
+    fn the_offset_is_clamped_to_what_there_is_to_scroll() {
+        // Every reader of `Pan` — the rows, the hit test, the scrollbar thumb —
+        // takes the value as given, so this is the one place it can be wrong.
+        let pan = Pan::default();
+        assert!(!pan.set(200.0), "scrolled a diff that fits");
+        assert_eq!(pan.at(), 0.0);
+
+        pan.set_max(100.0);
+        assert!(pan.set(200.0));
+        assert_eq!(pan.at(), 100.0, "scrolled past the widest row");
+        assert!(pan.by(-1000.0));
+        assert_eq!(pan.at(), 0.0, "scrolled left of column zero");
+
+        pan.set(60.0);
+        // Wrapping turned on, or the window dragged wider: the offset it was at
+        // is no longer somewhere that exists.
+        pan.set_max(0.0);
+        assert_eq!(pan.at(), 0.0);
+    }
+
+    /// A `Diff` opened on a named wrap, which is how the host names one.
+    fn diff_wrapped(src: &str, wrap: &str) -> (Diff, Rc<Host>) {
+        let mut h = Host::new();
+        assert!(h.wrap.select(wrap), "no wrap called {wrap}");
+        let host = Rc::new(h);
+        let diff =
+            Diff::with_layouts(parse_unified_diff(src), &host, Layouts::builtin());
+        (diff, host)
+    }
+
+    #[test]
+    fn the_view_bounds_the_scroll_by_its_widest_row() {
+        // End to end: the bound comes off the row `expand` picked, so this is
+        // also the assertion that the two agree about which row that is.
+        let (mut diff, host) = diff_wrapped(LONG, "off");
+        let w = width_for(20, &host);
+        diff.reflow(w, &host);
+        let widest = diff.order[diff.widest];
+        let chars = diff.renderers.borrow()[widest.owner as usize]
+            .width(widest.index as usize, widest.seg as usize);
+        let expected = chars as f32 * host.font.char_width() - (w - TEXT_CHROME);
+        assert!((diff.bound(w, &host) - expected).abs() < 0.001, "{}", diff.bound(w, &host));
+        // The offset the reflow left is inside it, whatever it was before.
+        diff.pan.set(1e6);
+        assert_eq!(diff.pan.at(), diff.bound(w, &host));
+
+        // And a wrapped diff has nowhere left to go, which is what puts the text
+        // back at column zero the moment `w` turns wrapping on.
+        let (mut wrapped, host) = diff_wrapped(LONG, "word");
+        wrapped.reflow(w, &host);
+        assert_eq!(wrapped.bound(w, &host), 0.0, "a wrapped row hangs over the edge");
+        assert_eq!(wrapped.pan.at(), 0.0);
     }
 
     #[test]
@@ -2563,6 +3061,7 @@ diff --git a/a.rs b/a.rs
             _seg: usize,
             _host: &Host,
             _sel: Option<Selected>,
+            _shift: f32,
         ) -> AnyElement {
             div().child(self.rows[index].clone()).into_any_element()
         }
@@ -2746,6 +3245,7 @@ diff --git a/b.md b/b.md
             _seg: usize,
             _host: &Host,
             _sel: Option<Selected>,
+            _shift: f32,
         ) -> AnyElement {
             div().child(self.rows[index].clone()).into_any_element()
         }

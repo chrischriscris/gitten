@@ -59,8 +59,9 @@
 //! decided at load and is a `Copy` field read out of a `Vec`.
 
 use super::diff::{
-    column_at, columns, file_header, header_hit, hunk_header, line_colors, num, number,
-    number_or_blank, row_frame, runs, selected, slice, Hit, Rows, ROW_H, PAD, SIGN_W, TEXT_CHROME,
+    column_at, columns, file_header, header_hit, hunk_header, into_text, line_colors, num,
+    number, number_or_blank, row_frame, runs, scrolled, selected, slice, Hit, Rows, ROW_H, PAD,
+    SIGN_W, TEXT_CHROME,
 };
 use gpui::*;
 use plait_core::host::Host;
@@ -292,6 +293,24 @@ impl MarkdownRows {
         m.indent * (bar as u8 + block.depth() + bullet as u8) as f32
     }
 
+    /// How many characters one visual row actually draws, after `trim_end`:
+    /// trailing space is not ink and a row that is all of it has nothing past
+    /// the window. What [`Rows::overflow`] measures, where [`Rows::width`]'s
+    /// approximations are not good enough — a bound half a character out is a
+    /// diff you cannot scroll to the end of.
+    fn chars(&self, index: usize, seg: usize) -> usize {
+        let Some(Row::Line { text, .. }) = self.rows.get(index) else { return 0 };
+        let text = self.flowed(index).map_or(text, |f| &f.text);
+        text[self.wrapped.range(index, seg, text)].trim_end().chars().count()
+    }
+
+    /// One character of this block's text, in pixels. `Font::char_width` at the
+    /// block's own size rather than the host's, which is the whole of what makes
+    /// a heading's caret and a heading's overflow different from a paragraph's.
+    fn char_width(&self, block: Block, host: &Host) -> f32 {
+        self.size(block, host) * host.font.advance
+    }
+
     /// How large this block's text is drawn. A heading is the only thing in the
     /// app with a type size of its own, and it is why a column budget and a
     /// caret are both per row here rather than per diff.
@@ -506,7 +525,8 @@ impl Rows for MarkdownRows {
         match &self.rows[index] {
             // Indent steps cost roughly a character each, and a heading's glyphs
             // are wider than the body's — both approximations, and both only feed
-            // the one row `uniform_list` measures to size its scroll width.
+            // the widest-row contest that decides which row the horizontal bound
+            // is taken from.
             Row::Line { text, block, .. } => {
                 let scale = match block {
                     Block::Heading(l) => self.metrics.size(*l) / 14.0,
@@ -541,19 +561,43 @@ impl Rows for MarkdownRows {
         out
     }
 
+    /// A row's own furniture and a row's own type size, which is what makes this
+    /// the one presentation whose overflow is per row rather than per diff: the
+    /// same text is a fifth wider as an `#` heading and starts three indent steps
+    /// further in as a nested bullet.
+    fn overflow(&self, index: usize, seg: usize, width: f32, host: &Host) -> f32 {
+        match &self.rows[index] {
+            Row::Line { block, .. } => {
+                let text = self.chars(index, seg) as f32 * self.char_width(*block, host);
+                let room = width - TEXT_CHROME - self.furniture(*block);
+                (text - room).max(0.0)
+            }
+            // A header is the built-in's, drawn behind the page padding and
+            // nothing else.
+            _ => (self.width(index, seg) as f32 * host.font.char_width()
+                - (width - 2.0 * PAD))
+                .max(0.0),
+        }
+    }
+
     /// The gutter, then this block's own furniture, then text at this block's own
     /// size. Nothing else in the app has two type sizes in one list, which is why
     /// this is the one presentation whose caret arithmetic is per row.
-    fn hit(&self, index: usize, seg: usize, x: f32, host: &Host) -> Option<Hit> {
+    fn hit(&self, index: usize, seg: usize, x: f32, host: &Host, shift: f32) -> Option<Hit> {
         Some(match self.rows.get(index)? {
-            Row::File { path, .. } => header_hit(path, x, host),
-            Row::Hunk(h) => header_hit(h, x, host),
+            Row::File { path, .. } => header_hit(path, x, host, shift),
+            Row::Hunk(h) => header_hit(h, x, host, shift),
             Row::Line { block, text, .. } => {
                 let text = self.flowed(index).map_or(text, |f| &f.text);
                 let at = self.wrapped.range(index, seg, text);
                 let from = TEXT_CHROME - PAD + self.furniture(*block);
                 let off = at.start
-                    + column_at(&text[at.clone()], x - from, self.size(*block, host), host);
+                    + column_at(
+                        &text[at.clone()],
+                        into_text(x, from, shift),
+                        self.size(*block, host),
+                        host,
+                    );
                 Hit { part: 0, off }
             }
         })
@@ -572,18 +616,27 @@ impl Rows for MarkdownRows {
         })
     }
 
-    fn render(&self, index: usize, seg: usize, host: &Host, sel: Option<Selected>) -> AnyElement {
+    fn render(
+        &self,
+        index: usize,
+        seg: usize,
+        host: &Host,
+        sel: Option<Selected>,
+        shift: f32,
+    ) -> AnyElement {
         let theme = &host.theme;
         match &self.rows[index] {
-            Row::File { path, adds, dels } => file_header(path, *adds, *dels, theme, sel),
-            Row::Hunk(header) => hunk_header(header, theme, sel),
+            Row::File { path, adds, dels } => {
+                file_header(path, *adds, *dels, theme, sel, shift)
+            }
+            Row::Hunk(header) => hunk_header(header, theme, sel, shift),
             Row::Line { block, kind, moved, old, new, text, spans, tokens } => {
                 let (text, spans, tokens) = self.text_of(index, text, spans, tokens);
                 let at = self.wrapped.range(index, seg, text);
                 let rule = self.ruled(index, seg);
                 self.line(
                     *block, *kind, *moved, old, new, text, at, seg, spans, tokens, rule, host,
-                    sel,
+                    sel, shift,
                 )
             }
         }
@@ -608,6 +661,10 @@ impl MarkdownRows {
         rule: bool,
         host: &Host,
         sel: Option<Selected>,
+        // Pixels of text scrolled off the left. Everything this row draws in
+        // front of its text — the gutter, a quote bar, an indent, a bullet — is
+        // furniture and stays put; see `scrolled`.
+        shift: f32,
     ) -> AnyElement {
         let theme = &host.theme;
         let m = &self.metrics;
@@ -642,7 +699,7 @@ impl MarkdownRows {
         // and not the next would shear the grid, so a table gets the gutter and
         // then nothing: no bar, no indent, no glyph.
         if block.is_table() {
-            let body = div().flex_none().text_color(rgb(fg)).child(
+            let body = div().text_color(rgb(fg)).child(
                 StyledText::new(text.clone()).with_highlights(runs(
                     at,
                     tokens,
@@ -660,9 +717,8 @@ impl MarkdownRows {
             } else {
                 body
             };
-            let row = row.child(body);
             if !rule {
-                return row.into_any_element();
+                return row.child(scrolled(shift, body)).into_any_element();
             }
             // A hairline, not a row of `─`: a rule between two rows of a table is
             // not a line of the file, so drawing it as text would need a row the
@@ -672,17 +728,33 @@ impl MarkdownRows {
             // than part of the table. Absolute, so it costs the text no pixel of
             // the row's fixed height.
             let width = text.chars().count() as f32 * host.font.char_width();
+            // Inside the scrolled window and not beside it, because the rule is
+            // as wide as the grid it belongs to: it has to move with the grid,
+            // and be clipped where the grid is clipped rather than run on under
+            // the line numbers.
             return row
-                .relative()
-                .child(
+                .child(scrolled(
+                    shift,
+                    // `ROW_H` and `relative`, so the hairline's `bottom_0` is the
+                    // bottom of the *row* and not of the line of text: two table
+                    // rows are contiguous, and a rule a few pixels above the
+                    // boundary reads as floating inside one of them.
                     div()
-                        .absolute()
-                        .bottom_0()
-                        .left(px(TEXT_CHROME - PAD))
-                        .w(px(width))
-                        .h(px(1.))
-                        .bg(rgb(md.rule)),
-                )
+                        .relative()
+                        .flex()
+                        .items_center()
+                        .h(px(ROW_H))
+                        .child(body)
+                        .child(
+                            div()
+                                .absolute()
+                                .bottom_0()
+                                .left_0()
+                                .w(px(width))
+                                .h(px(1.))
+                                .bg(rgb(md.rule)),
+                        ),
+                ))
                 .into_any_element();
         }
 
@@ -696,14 +768,7 @@ impl MarkdownRows {
             // text, so it is the column exactly.
             let w = self.budget(block, self.width, host) as f32 * host.font.char_width();
             return row
-                .child(
-                    div()
-                        .flex_none()
-                        .w(px(w))
-                        .h(px(1.))
-                        .bg(rgb(md.rule))
-                        .into_any_element(),
-                )
+                .child(scrolled(shift, div().w(px(w)).h(px(1.)).bg(rgb(md.rule))))
                 .into_any_element();
         }
         if block == Block::Blank {
@@ -753,7 +818,7 @@ impl MarkdownRows {
             return row.into_any_element();
         }
 
-        let body = div().flex_none().text_color(rgb(fg)).child(
+        let body = div().text_color(rgb(fg)).child(
             StyledText::new(text.clone()).with_highlights(runs(
                 at,
                 tokens,
@@ -772,7 +837,7 @@ impl MarkdownRows {
             Block::Fence => body.text_color(rgb(md.marker)),
             _ => body,
         };
-        row.child(body).into_any_element()
+        row.child(scrolled(shift, body)).into_any_element()
     }
 }
 
@@ -992,8 +1057,8 @@ diff --git a/README.md b/README.md
     #[test]
     fn a_table_row_measures_in_columns_not_bytes() {
         // Box drawing is three bytes a glyph. Measuring a table row by `len`
-        // makes it three times too wide and it wins `with_width_from_item` for
-        // the whole diff, which scrolls sideways into empty space.
+        // makes it three times too wide and it wins the widest-row contest for
+        // the whole diff, which bounds the scroll at empty space.
         let r = built(TABLE);
         let widest = (0..r.len()).max_by_key(|i| r.width(*i, 0)).unwrap();
         let table_row = r.width(2, 0);
@@ -1164,9 +1229,9 @@ diff --git a/a.md b/a.md
 
     #[test]
     fn a_table_too_wide_for_the_window_stops_dragging_the_view_sideways_with_it() {
-        // The bug: a grid is the widest row in the diff, `with_width_from_item`
-        // picks it, and the whole view scrolls horizontally — every row of prose
-        // in it wrapped to a window it is no longer looking at.
+        // The bug: a grid is the widest row in the diff, the widest-row contest
+        // picks it, and there is a screenful to scroll sideways through — every
+        // row of prose in it wrapped to a window it is no longer looking at.
         let (r, _) = reflowed(PROSE, 30);
         let rows = grid(&r);
         assert!(rows.len() > 3, "the long row did not wrap: {rows:?}");
@@ -1264,7 +1329,7 @@ diff --git a/a.md b/a.md
         // same coordinates the copy is in.
         for seg in 0..r.rows(row) {
             let at = r.wrapped.range(row, seg, copied);
-            let hit = r.hit(row, seg, 60.0, &Host::new().into()).expect("a table row is hittable");
+            let hit = r.hit(row, seg, 60.0, &Host::new().into(), 0.0).expect("a table row is hittable");
             assert!(at.contains(&hit.off), "{:?} is outside {at:?}", hit.off);
         }
     }
@@ -1338,16 +1403,85 @@ diff --git a/a.md b/a.md
         // The same pixel column, two rows: the indented one starts later, so the
         // same x is fewer characters into its text.
         let x = TEXT_CHROME - PAD + 20.0 * host.font.size * host.font.advance;
-        let flat = r.hit(plain, 0, x, &host).unwrap().off;
-        let inset = r.hit(nested, 0, x, &host).unwrap().off;
+        let flat = r.hit(plain, 0, x, &host, 0.0).unwrap().off;
+        let inset = r.hit(nested, 0, x, &host, 0.0).unwrap().off;
         assert!(inset < flat, "the indent did not move the caret: {inset} vs {flat}");
 
         // And a click at the start of a row's own text is byte 0 of it, whatever
         // that row drew in front of itself.
         for (i, block) in &rows {
             let from = TEXT_CHROME - PAD + r.furniture(*block);
-            assert_eq!(r.hit(*i, 0, from, &host).unwrap().off, 0, "row {i} {block:?}");
+            assert_eq!(r.hit(*i, 0, from, &host, 0.0).unwrap().off, 0, "row {i} {block:?}");
         }
+    }
+
+    #[test]
+    fn a_scroll_moves_the_text_and_leaves_the_furniture() {
+        // A bullet, an indent and a quote bar are this presentation's gutter:
+        // they say what the row *is*, so they stay while its text moves. The
+        // caret is where that shows — a click at the left edge of a row's text
+        // is the character `shift` in, at that row's own size.
+        let host = Host::new();
+        let r = built(DOC);
+        let rows: Vec<(usize, Block)> = r
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, row)| match row {
+                Row::Line { block, .. } => Some((i, *block)),
+                _ => None,
+            })
+            .collect();
+        for (i, block) in &rows {
+            if r.chars(*i, 0) < 4 {
+                continue;
+            }
+            let from = TEXT_CHROME - PAD + r.furniture(*block);
+            let shift = 3.0 * r.char_width(*block, &host);
+            assert_eq!(r.hit(*i, 0, from, &host, shift).unwrap().off, 3, "row {i} {block:?}");
+            // In the gutter, scrolled: the first character on screen, and never
+            // a byte to the left of the row's own text.
+            assert_eq!(r.hit(*i, 0, 0.0, &host, shift).unwrap().off, 3, "row {i} gutter");
+        }
+    }
+
+    #[test]
+    fn overflow_is_measured_at_the_row_s_own_size_and_indent() {
+        // The reason `overflow` is per row here and per diff everywhere else. An
+        // 18px heading is a fifth wider than the same characters as body text,
+        // and a nested bullet has three fewer characters of room to start with —
+        // so one number for the whole diff is short of one row and past the end
+        // of another, and the last character of the widest line is unreachable.
+        let host = Host::new();
+        let mut r = built(DOC);
+        let off = host.wrap.at(host.wrap.position("off").unwrap());
+        let width = TEXT_CHROME + 4.0 * host.font.char_width();
+        r.reflow(width, &host, off);
+
+        let mut checked = 0;
+        for i in 0..r.len() {
+            let Row::Line { block, .. } = r.rows[i] else { continue };
+            let room = width - TEXT_CHROME - r.furniture(block);
+            let text = r.chars(i, 0) as f32 * r.char_width(block, &host);
+            assert_eq!(r.overflow(i, 0, width, &host), (text - room).max(0.0), "row {i}");
+            checked += 1;
+        }
+        assert!(checked > 6, "only {checked} rows measured");
+
+        // And the two things that make it per row, one at a time.
+        let heading = (0..r.len())
+            .find(|i| matches!(r.rows[*i], Row::Line { block: Block::Heading(_), .. }))
+            .expect("a heading");
+        let chars = r.chars(heading, 0) as f32;
+        assert!(
+            r.overflow(heading, 0, width, &host)
+                > chars * host.font.char_width() - (width - TEXT_CHROME),
+            "a heading measured at the body size"
+        );
+        assert!(
+            r.furniture(Block::Bullet(1)) > 0.0,
+            "a nested bullet costs the text nothing"
+        );
     }
 
     #[test]
@@ -1364,7 +1498,7 @@ diff --git a/a.md b/a.md
             .expect("a heading");
         let text = r.selectable(heading, 0).unwrap().to_string();
         let end = TEXT_CHROME - PAD + text.chars().count() as f32 * r.metrics.size(1) * 0.602;
-        assert_eq!(r.hit(heading, 0, end, &host).unwrap().off, text.len());
+        assert_eq!(r.hit(heading, 0, end, &host, 0.0).unwrap().off, text.len());
     }
 
     #[test]

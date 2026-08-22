@@ -336,13 +336,38 @@ hover, drag — those methods live on `StatefulInteractiveElement` and there is 
 way in without an id.
 
 `uniform_list` for anything long. It builds only visible rows and brings its own
-scrolling, so don't wrap it in another scroll container. For horizontal scrolling
-use its own `with_horizontal_sizing_behavior(Unconstrained)`, make rows `flex_none`
-(anything `overflow_hidden` clips instead of scrolling), **and** point it at the
-widest row with `with_width_from_item(Some(i))`. That last one is the trap: the
-list measures exactly ONE row to decide its scrollable width and defaults to row
-0, so a short first row means nothing scrolls no matter how long the rest are.
-Compute the widest index at load.
+scrolling, so don't wrap it in another scroll container. To scroll a *whole row*
+sideways, use its own `with_horizontal_sizing_behavior(Unconstrained)`, make rows
+`flex_none` (anything `overflow_hidden` clips instead of scrolling), **and** point
+it at the widest row with `with_width_from_item(Some(i))`. That last one is the
+trap: the list measures exactly ONE row to decide its scrollable width and
+defaults to row 0, so a short first row means nothing scrolls no matter how long
+the rest are. Compute the widest index at load.
+
+**A gutter that stays put is not that, though — it is the view's own offset.** The
+list scrolls a row, and a row is the line numbers *and* the text; nothing outside
+it can hold one of them still. So a diff row is exactly as wide as the viewport,
+the furniture is drawn first, and the text goes in a clipping window inside the
+row with a negative margin on it — which is `Pen::scroll` written in pixels, and
+the same reason: the tokens and the intraline spans address the *line*, so
+slicing the string instead pairs styling with the wrong bytes. What that costs is
+the wheel, the bound and the scrollbar; `gpui_component`'s `ScrollbarHandle` is a
+public trait, so the bar is four methods over your own `Cell` and it drags the
+thumb for you. What it buys, beyond the gutter: no `with_width_from_item`, so the
+list stops shaping a 2000-character line every frame to size a scroll nothing
+uses.
+
+**A list that scrolls one axis will happily scroll it with the other axis's
+delta.** `uniform_list` leaves `overflow.x` visible, and `div`'s scroll handler
+reads that as permission: `Overflow::Scroll if !restrict_scroll_to_axis &&
+overflow.x != Scroll => delta.x`. So a sideways flick scrolls the rows *down* —
+and with the text panning from the same event, diagonally. Whoever owns the other
+axis has to take the event away, and `on_scroll_wheel` cannot: it is bubble-phase
+and the list is a child, so it has already run. Register on the window in the
+**capture** phase, `stop_propagation` when the gesture is horizontal, and lock the
+axis for the whole gesture with `gpui::OngoingScroll` — the same lock `div` uses.
+Deciding per event is a coin flip fifty times a second, which is the drift you
+feel rather than see.
 
 **A row's background is the row's width, so give every row `min_w_full`.** A bg
 that stops after the last character is a ragged margin down a wall of additions;
@@ -353,9 +378,12 @@ horizontally* — so 100% means "to the right edge of the window, wherever the
 window is scrolled to" and the fill follows the scroll for nothing. A *minimum*,
 so a long line keeps the width there is to scroll to; and it does not disturb
 `with_width_from_item`, whose one measurement runs against `MaxContent`, where a
-percentage minimum has no parent width to resolve against and drops out. Fixed
-columns beside it (a side-by-side pair) need a `flex_grow(1.)` strip to carry the
-colour across the leftover space — it measures zero, so it costs no scroll width.
+percentage minimum has no parent width to resolve against and drops out. A row
+that draws columns rather than one run of text (a side-by-side pair) gives them
+`flex_1` and `min_w(0)` instead: two halves and a rule come out at exactly the
+row's width however the window is dragged, and without the `min_w` a flex item is
+never narrower than its content, so one long line pushes the second column off
+the screen.
 
 Closing the last window does not end the process; macOS keeps appless processes
 alive. `cx.on_window_closed` + `cx.quit()`. Cmd-Q is separate and equally manual:
