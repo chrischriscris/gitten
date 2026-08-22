@@ -1851,7 +1851,7 @@ mod tests {
 
     #[test]
     fn plain_text_produces_no_runs_at_all() {
-        let theme = Theme::default_dark();
+        let theme = Theme::dark();
         assert!(runs(0..12, &[], &[], &theme, LineKind::Context, false).is_empty());
     }
 
@@ -1859,7 +1859,7 @@ mod tests {
     fn a_token_and_a_span_over_the_same_bytes_split_into_both() {
         // `let` is a keyword and also a changed word: one run carrying a
         // foreground and a background, not two elements fighting over it.
-        let theme = Theme::default_dark();
+        let theme = Theme::dark();
         let text = "let x = 1;";
         let out =
             runs(all(text), &[tok(0, 3, Kind::Keyword)], &[Span { start: 0, end: 3 }], &theme, LineKind::Added, false);
@@ -1874,7 +1874,7 @@ mod tests {
         //  text:  let x = 1;
         //  token: ###          keyword
         //  span:    #####      changed
-        let theme = Theme::default_dark();
+        let theme = Theme::dark();
         let text = "let x = 1;";
         let out =
             runs(all(text), &[tok(0, 3, Kind::Keyword)], &[Span { start: 2, end: 7 }], &theme, LineKind::Added, false);
@@ -1888,7 +1888,7 @@ mod tests {
 
     #[test]
     fn many_tokens_and_spans_stay_sorted_and_disjoint() {
-        let theme = Theme::default_dark();
+        let theme = Theme::dark();
         let text = "fn draw(&self) { self.paint(1); } // later";
         let tokens = vec![
             tok(0, 2, Kind::Keyword),
@@ -1908,7 +1908,7 @@ mod tests {
 
     #[test]
     fn multi_byte_text_keeps_its_boundaries() {
-        let theme = Theme::default_dark();
+        let theme = Theme::dark();
         let text = "let s = \"café 😀\";";
         let quote = text.find('"').unwrap();
         let out = runs(
@@ -1926,7 +1926,7 @@ mod tests {
     fn weight_and_slant_reach_the_run_list() {
         // A Markdown `**word**` that only changed colour would be wrong, so the
         // theme's bold and italic have to survive the merge.
-        let mut theme = Theme::default_dark();
+        let mut theme = Theme::dark();
         theme.set_syntax(Kind::Strong, Style::fg(0xffffff).bold());
         theme.set_syntax(Kind::Emphasis, Style::fg(0xcccccc).italic());
         let text = "**bold** and *thin*";
@@ -1949,7 +1949,7 @@ mod tests {
     fn a_moved_line_is_drawn_on_its_own_background() {
         // The point of move detection: a moved block has to recede from the
         // add/remove hues, or there is nothing to skip.
-        let theme = Theme::default_dark();
+        let theme = Theme::dark();
         let p = &theme.diff;
         for kind in [LineKind::Added, LineKind::Removed] {
             let (plain, _, sign) = line_colors(kind, false, p);
@@ -1974,7 +1974,7 @@ mod tests {
         // as the ones they replace, so its greys come out identical — which is
         // the resolver being stable, not the surfaces being ignored. A theme that
         // moves the background properly is what shows the difference.
-        let mut theme = Theme::default_dark();
+        let mut theme = Theme::dark();
         theme.diff.moved_removed_bg = 0xf2ede6;
         theme.rebuild();
         let text = "// a comment that moved";
@@ -1991,7 +1991,7 @@ mod tests {
         // A moved line is the same text somewhere else, so a changed-word
         // background on it would be describing a change the detection just said
         // was not one.
-        let theme = Theme::default_dark();
+        let theme = Theme::dark();
         let text = "let x = 1;";
         let spans = [Span { start: 0, end: 3 }];
         let out = runs(all(text), &[], &spans, &theme, LineKind::Added, true);
@@ -2006,7 +2006,7 @@ mod tests {
         // under the changed-word background, and the comment grey measured
         // 1.15:1 against it — a smear. The run that lands on the word background
         // must not carry the same foreground as the run that does not.
-        let theme = Theme::default_dark();
+        let theme = Theme::dark();
         let text = "# Collect every check failure before exiting";
         let out = runs(
             all(text),
@@ -2172,7 +2172,7 @@ diff --git a/a.rs b/a.rs
         // Both are backgrounds and only one can be drawn. The reader already
         // knows which words changed; what they are about to press a key about is
         // what is selected.
-        let theme = Theme::default_dark();
+        let theme = Theme::dark();
         let text = "    let x = 1;";
         let out = super::runs(
             all(text),
@@ -2206,7 +2206,7 @@ diff --git a/a.rs b/a.rs
         // `header_hit` measures a click against the whole string. So the split
         // has to come out as bytes, and the declaration git appends has to carry
         // no run at all: it is already the row's own `hunk_fg`.
-        let theme = Theme::default_dark();
+        let theme = Theme::dark();
         let header = "@@ -41,9 +41,11 @@ fn dispatch() {";
         let (marker, code) = plait_core::hunk_parts(header);
         let out = super::hunk_runs(marker.len(), 0..0, &theme);
@@ -2222,7 +2222,7 @@ diff --git a/a.rs b/a.rs
     fn a_selection_across_a_hunk_header_keeps_both_of_its_colours() {
         // The case two side-by-side elements could not draw: one selection whose
         // ends live in different halves of the header.
-        let theme = Theme::default_dark();
+        let theme = Theme::dark();
         let header = "@@ -41,9 +41,11 @@ fn dispatch() {";
         let marker = plait_core::hunk_parts(header).0.len();
         let out = super::hunk_runs(marker, 5..25, &theme);
@@ -2251,7 +2251,7 @@ diff --git a/a.rs b/a.rs
         // header comes out entirely in the coordinates' colour. Which is the
         // right answer for a string that is not a hunk header: quiet, whole, and
         // not half-painted at an offset nothing chose.
-        let theme = Theme::default_dark();
+        let theme = Theme::dark();
         let header = "not a hunk header";
         let marker = plait_core::hunk_parts(header).0.len();
         assert_eq!(marker, header.len(), "the whole string is the marker");
@@ -2293,7 +2293,7 @@ diff --git a/a.rs b/a.rs
     fn a_selection_is_clipped_into_the_row_that_draws_it() {
         // Line coordinates in, row coordinates out — the same contract tokens
         // and spans have, and the same off-by-one available to it.
-        let theme = Theme::default_dark();
+        let theme = Theme::dark();
         let text = "aaaa bbbb cccc";
         let first = super::runs(0..5, &[], &[], &theme, LineKind::Context, false, 2..12);
         let second = super::runs(5..text.len(), &[], &[], &theme, LineKind::Context, false, 2..12);
@@ -2472,7 +2472,7 @@ diff --git a/a.rs b/a.rs
         // The failure this prevents: tokens are in *line* coordinates, so a
         // continuation row handed them unshifted would highlight bytes from the
         // start of the line rather than from the start of the row.
-        let theme = Theme::default_dark();
+        let theme = Theme::dark();
         let text = "let alpha = 1; let beta = 2;";
         let tokens = [tok(0, 3, Kind::Keyword), tok(15, 18, Kind::Keyword)];
         let second = text.find("let beta").unwrap();
@@ -2491,7 +2491,7 @@ diff --git a/a.rs b/a.rs
     fn a_span_straddling_a_break_is_clipped_to_each_row() {
         // A changed word the wrap cut in half has to light up on both rows, each
         // time only as far as that row goes.
-        let theme = Theme::default_dark();
+        let theme = Theme::dark();
         let text = "aaaa bbbb cccc";
         let spans = [Span { start: 2, end: 12 }];
         let first = runs(0..5, &[], &spans, &theme, LineKind::Added, false);

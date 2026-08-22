@@ -244,15 +244,15 @@ pub struct Theme {
 
 impl Default for Theme {
     fn default() -> Self {
-        Self::default_dark()
+        Self::dark()
     }
 }
 
 impl Theme {
-    /// The warm, low-contrast dark theme the app ships with. Desaturated on
+    /// The warm, low-contrast dark theme the app opens in. Desaturated on
     /// purpose: the add/remove background already says a line changed, so
     /// syntax colour is here to give the eye structure, not to compete.
-    pub fn default_dark() -> Self {
+    pub fn dark() -> Self {
         use Kind::*;
         let mut syntax = [Style::fg(0xa39c93); Kind::COUNT];
         let mut set = |k: Kind, s: Style| syntax[k.index()] = s;
@@ -270,7 +270,7 @@ impl Theme {
         set(Link, Style::fg(0x7fa2bd));
 
         Self {
-            name: "plait dark".into(),
+            name: "dark".into(),
             min_contrast: 3.5,
             min_furniture: 3.0,
             syntax,
@@ -322,6 +322,178 @@ impl Theme {
             // Muted enough to stay out of the graph's way — these sit inches
             // from the lane colours and must not be mistaken for them.
             authors: vec![0x9c8a6b, 0x6f8296, 0x8b7a96, 0x6b8f88, 0x9c7f75, 0x7d8a6b],
+            resolved: Vec::new(),
+            gutter: [0; Surface::COUNT],
+        }
+        .rebuilt()
+    }
+
+    /// The same theme on paper.
+    ///
+    /// Not an inversion — a palette that reads well on near-black inverts into a
+    /// set of pastels nothing can be drawn on. What is carried across is the
+    /// *ratios*: every background here sits the same WCAG step from its context
+    /// row as the dark theme's does, and every foreground the same step from what
+    /// it lands on, so the hierarchy a reader learns in one is the hierarchy they
+    /// get in the other. `docs/measurements.md` has the table both were built to.
+    ///
+    /// Two numbers are deliberately not carried across, and both are the same
+    /// point about a light background:
+    ///
+    /// - **The accent is 5.2:1, not 9.1:1.** Contrast against paper is darkness,
+    ///   and an amber taken to 9:1 is a brown. Loud enough to find, saturated
+    ///   enough to still be the accent.
+    /// - **`absent_bg` is 1.51:1 from the context row**, where the dark theme's
+    ///   is 1.04:1. The comparison that decides it is the one against the row
+    ///   *opposite* — 1.25:1 on an addition, in both themes — and on paper there
+    ///   is no room left above the background, so it has to come from below.
+    pub fn light() -> Self {
+        use Kind::*;
+        let mut syntax = [Style::fg(0x58524c); Kind::COUNT];
+        let mut set = |k: Kind, s: Style| syntax[k.index()] = s;
+        set(Comment, Style::fg(0x9b9186).italic());
+        set(Str, Style::fg(0x26662f));
+        set(Number, Style::fg(0x814e0c));
+        set(Keyword, Style::fg(0x734ca2));
+        set(Type, Style::fg(0x245e87));
+        set(Constant, Style::fg(0x754c16));
+        set(Func, Style::fg(0x644c0e));
+        set(Property, Style::fg(0x514c44));
+        set(Heading, Style::fg(0x2a2722).bold());
+        set(Strong, Style::fg(0x3c3730).bold());
+        set(Emphasis, Style::fg(0x474138).italic());
+        set(Link, Style::fg(0x245e87));
+
+        Self {
+            name: "light".into(),
+            min_contrast: 3.5,
+            min_furniture: 3.0,
+            syntax,
+            diff: DiffPalette {
+                file_bg: 0xe9e5dc,
+                file_fg: 0x23201c,
+                adds_fg: 0x26642f,
+                dels_fg: 0xaa3623,
+                hunk_bg: 0xf3f2ed,
+                hunk_fg: 0x4c627b,
+                gutter_fg: 0xb4afa7,
+                rule: 0xd8d0c5,
+                context_bg: 0xfaf7f1,
+                context_fg: 0x58524c,
+                added_bg: 0xdde5d7,
+                added_fg: 0x1a4520,
+                added_word_bg: 0xb8cfb5,
+                removed_bg: 0xf3e4dc,
+                removed_fg: 0x82291a,
+                removed_word_bg: 0xecd0c7,
+                // Lavender, for the reason the dark theme's are blue-grey: the
+                // two hues a diff already owns are green and red, and a moved
+                // block has to recede from both rather than join one.
+                moved_removed_bg: 0xe9e6ed,
+                moved_added_bg: 0xdcdaea,
+                absent_bg: 0xd0cbc3,
+            },
+            markdown: MarkdownPalette {
+                code_bar: 0xd3ccc0,
+                quote_bar: 0x6a97b6,
+                marker: 0x89827a,
+                rule: 0xcec5b8,
+            },
+            chrome: ChromePalette {
+                bg: 0xfaf7f1,
+                fg: 0x23201c,
+                dim: 0x89827a,
+                faint: 0xb4afa7,
+                accent: 0x9a5809,
+                title_bg: 0xf5f1eb,
+                status_bg: 0xf6f3ec,
+                border: 0xe4ded5,
+                selection_bg: 0xede4d0,
+                selected_bg: 0xaac2e4,
+                error: 0xab3623,
+            },
+            lanes: vec![0x9a5c0e, 0x2c709f, 0x7e5aaa, 0x29776e, 0xa6533b, 0x57732c],
+            lane_overflow: 0xbbb7b0,
+            authors: vec![0x8a7040, 0x577891, 0x816b99, 0x447e73, 0x95695b, 0x6a7a40],
+            resolved: Vec::new(),
+            gutter: [0; Surface::COUNT],
+        }
+        .rebuilt()
+    }
+
+    /// Cool where [`Theme::dark`] is warm, and built to the same ratios.
+    ///
+    /// It exists because "warm dark" is a taste and not a default, and because a
+    /// registry with one dark theme in it proves nothing. The one structural
+    /// difference is the moved block: blue-grey is what the *background* is here,
+    /// so a moved row that borrowed it would be invisible, and it is violet
+    /// instead. That is the whole argument for a theme being data — the hue a
+    /// colour has to avoid is a property of the theme, not of the diff.
+    pub fn slate() -> Self {
+        use Kind::*;
+        let mut syntax = [Style::fg(0x95a2ae); Kind::COUNT];
+        let mut set = |k: Kind, s: Style| syntax[k.index()] = s;
+        set(Comment, Style::fg(0x555f6c).italic());
+        set(Str, Style::fg(0x79b692));
+        set(Number, Style::fg(0xc4a377));
+        set(Keyword, Style::fg(0xb08dd1));
+        set(Type, Style::fg(0x7babcf));
+        set(Constant, Style::fg(0xd5b88a));
+        set(Func, Style::fg(0xcbd393));
+        set(Property, Style::fg(0xaab3bd));
+        set(Heading, Style::fg(0xe3e9ef).bold());
+        set(Strong, Style::fg(0xcfd8e0).bold());
+        set(Emphasis, Style::fg(0xbfc8d2).italic());
+        set(Link, Style::fg(0x78a6ca));
+
+        Self {
+            name: "slate".into(),
+            min_contrast: 3.5,
+            min_furniture: 3.0,
+            syntax,
+            diff: DiffPalette {
+                file_bg: 0x1d242b,
+                file_fg: 0xe3e9ef,
+                adds_fg: 0x39ae7a,
+                dels_fg: 0xf06671,
+                hunk_bg: 0x131820,
+                hunk_fg: 0x7d92ab,
+                gutter_fg: 0x404a54,
+                rule: 0x2a313b,
+                context_bg: 0x0f1319,
+                context_fg: 0x95a2ae,
+                added_bg: 0x152826,
+                added_fg: 0x78d2aa,
+                added_word_bg: 0x1b3d33,
+                removed_bg: 0x2c1d23,
+                removed_fg: 0xf4969d,
+                removed_word_bg: 0x42252b,
+                moved_removed_bg: 0x1e1e32,
+                moved_added_bg: 0x282542,
+                absent_bg: 0x0b0f13,
+            },
+            markdown: MarkdownPalette {
+                code_bar: 0x2c353e,
+                quote_bar: 0x36657f,
+                marker: 0x616d79,
+                rule: 0x303944,
+            },
+            chrome: ChromePalette {
+                bg: 0x0f1319,
+                fg: 0xe3e9ef,
+                dim: 0x616d79,
+                faint: 0x404a54,
+                accent: 0x77bfdf,
+                title_bg: 0x14181f,
+                status_bg: 0x13171e,
+                border: 0x212730,
+                selection_bg: 0x18252e,
+                selected_bg: 0x20405b,
+                error: 0xef6470,
+            },
+            lanes: vec![0x77bfdf, 0x66ab87, 0xaa88ca, 0x55ada7, 0xf06873, 0xa9af78],
+            lane_overflow: 0x3a444d,
+            authors: vec![0x6d94b1, 0x658b84, 0x887f9f, 0x619494, 0xa28087, 0x798f6c],
             resolved: Vec::new(),
             gutter: [0; Surface::COUNT],
         }
@@ -412,6 +584,86 @@ impl Theme {
     }
 }
 
+/// Every theme that exists, and what a picker lists.
+///
+/// A catalogue and nothing else: unlike [`Differs`](crate::differ::Differs) and
+/// [`Wraps`](crate::wrap::Wraps) it holds no selection, because a theme is the
+/// one seam whose implementation is *data the config file edits*. What is on
+/// screen is [`Host::theme`](crate::host::Host::theme) — a copy taken from here
+/// and then given whatever `plait.toml` said on top of it — and two answers to
+/// "which theme" would be one too many.
+///
+/// So a file that names a theme nobody registered is not an error: it is a theme
+/// *definition*, and the config layer registers it, which is what puts a palette
+/// somebody wrote by hand in the same menu as the shipped ones.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Themes(Vec<Theme>);
+
+impl Default for Themes {
+    fn default() -> Self {
+        Self::builtin()
+    }
+}
+
+impl Themes {
+    /// The three shipped palettes, in the order a picker shows them.
+    pub fn builtin() -> Self {
+        Self(vec![Theme::dark(), Theme::light(), Theme::slate()])
+    }
+
+    pub fn empty() -> Self {
+        Self(Vec::new())
+    }
+
+    /// Adds one, replacing any already registered under the same name — so a
+    /// built-in can be *corrected* rather than only added to, exactly as a
+    /// differ or a highlighter can. That is what a `[theme]` block naming
+    /// `"dark"` does: it is not a second dark, it is this one.
+    pub fn register(&mut self, theme: Theme) {
+        match self.0.iter().position(|t| t.name == theme.name) {
+            Some(i) => self.0[i] = theme,
+            None => self.0.push(theme),
+        }
+    }
+
+    pub fn get(&self, name: &str) -> Option<&Theme> {
+        self.0.iter().find(|t| t.name == name)
+    }
+
+    pub fn at(&self, i: usize) -> Option<&Theme> {
+        self.0.get(i)
+    }
+
+    pub fn index_of(&self, name: &str) -> Option<usize> {
+        self.0.iter().position(|t| t.name == name)
+    }
+
+    /// Every registered name, for a picker and for an error message that says
+    /// what the options actually are rather than what they were when it was
+    /// written.
+    pub fn names(&self) -> Vec<&str> {
+        self.0.iter().map(|t| t.name.as_str()).collect()
+    }
+
+    /// The one after `name`, wrapping — what a `theme.cycle` key runs. Falls to
+    /// the first when the name is not registered, which is what a theme defined
+    /// in the file and then renamed leaves behind.
+    pub fn after(&self, name: &str) -> Option<&Theme> {
+        match self.index_of(name) {
+            Some(i) => self.0.get((i + 1) % self.0.len()),
+            None => self.0.first(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// Relative luminance, WCAG 2.1.
 pub fn luminance(c: Rgb) -> f32 {
     let channel = |shift: u32| {
@@ -466,9 +718,10 @@ mod tests {
 
     #[test]
     fn every_kind_has_a_style() {
-        let t = Theme::default_dark();
-        for kind in Kind::ALL {
-            assert_ne!(t.syntax(kind).fg, 0, "{kind:?} was never set");
+        for t in Themes::builtin().0 {
+            for kind in Kind::ALL {
+                assert_ne!(t.syntax(kind).fg, 0, "{}: {kind:?} was never set", t.name);
+            }
         }
     }
 
@@ -477,16 +730,22 @@ mod tests {
         // The regression this exists for: a comment on a changed word measured
         // 1.15:1, which is a grey smear on green. Nothing may sit below the
         // theme's own floor, on any background it can be drawn on.
-        let t = Theme::default_dark();
-        for kind in Kind::ALL {
-            for surface in Surface::ALL {
-                let style = t.syntax_on(kind, surface);
-                let got = contrast(style.fg, t.background(surface));
-                assert!(
-                    got >= t.min_contrast - 0.01,
-                    "{kind:?} on {surface:?} is {got:.2}:1, floor is {:.2}",
-                    t.min_contrast
-                );
+        //
+        // Over the whole registry, and that is the point of running it there: a
+        // fourth palette cannot ship illegible, and neither can a third one
+        // somebody tuned by hand this afternoon.
+        for t in Themes::builtin().0 {
+            for kind in Kind::ALL {
+                for surface in Surface::ALL {
+                    let style = t.syntax_on(kind, surface);
+                    let got = contrast(style.fg, t.background(surface));
+                    assert!(
+                        got >= t.min_contrast - 0.01,
+                        "{}: {kind:?} on {surface:?} is {got:.2}:1, floor is {:.2}",
+                        t.name,
+                        t.min_contrast
+                    );
+                }
             }
         }
     }
@@ -494,7 +753,7 @@ mod tests {
     #[test]
     fn a_colour_that_already_reads_is_left_exactly_alone() {
         // Lifting everything would flatten the palette. Only the failures move.
-        let t = Theme::default_dark();
+        let t = Theme::dark();
         assert_eq!(t.syntax_on(Kind::Str, Surface::Context).fg, 0x9aab7d);
         assert_eq!(t.syntax_on(Kind::Heading, Surface::AddedWord).fg, 0xe8e3dc);
         // ...and the one that does not read is lifted, not replaced.
@@ -506,17 +765,53 @@ mod tests {
 
     #[test]
     fn lifting_goes_the_other_way_on_a_light_theme() {
-        let mut t = Theme::default_dark();
-        t.diff.added_word_bg = 0xf5f0e8;
-        t.set_syntax(Kind::Comment, Style::fg(0xd8d2ca));
+        // The shipped light theme, not a synthetic one: every surface in it has
+        // to sit above the luminance where `readable` turns around, and a
+        // palette with one surface on the wrong side of that line has its
+        // comments lifted *toward* the background they are drawn on.
+        let t = Theme::light();
+        let base = t.syntax(Kind::Comment).fg;
         let fg = t.syntax_on(Kind::Comment, Surface::AddedWord).fg;
-        assert!(fg < 0xd8d2ca, "dark text on a light background, got {fg:06x}");
-        assert!(contrast(fg, 0xf5f0e8) >= t.min_contrast);
+        assert!(fg < base, "text should darken on paper, got {fg:06x} from {base:06x}");
+        assert!(contrast(fg, t.background(Surface::AddedWord)) >= t.min_contrast);
+        assert!(t.syntax_on(Kind::Comment, Surface::AddedWord).italic, "style survives");
+    }
+
+    #[test]
+    fn a_theme_is_registered_by_name_and_replaced_by_it() {
+        let mut r = Themes::builtin();
+        assert_eq!(r.names(), vec!["dark", "light", "slate"]);
+        assert_eq!(r.get("light").map(|t| t.chrome.bg), Some(0xfaf7f1));
+
+        // What a `[theme]` block naming a built-in does: correct it, rather than
+        // add a second entry called the same thing.
+        let mut mine = Theme::dark();
+        mine.chrome.bg = 0x010203;
+        r.register(mine);
+        assert_eq!(r.len(), 3, "registering a known name added an entry");
+        assert_eq!(r.get("dark").map(|t| t.chrome.bg), Some(0x010203));
+
+        // And one nobody shipped is simply another theme.
+        let mut theirs = Theme::slate();
+        theirs.name = "solarized-ish".into();
+        r.register(theirs);
+        assert_eq!(r.names(), vec!["dark", "light", "slate", "solarized-ish"]);
+    }
+
+    #[test]
+    fn cycling_wraps_and_survives_a_name_nobody_registered() {
+        let r = Themes::builtin();
+        assert_eq!(r.after("dark").map(|t| t.name.as_str()), Some("light"));
+        assert_eq!(r.after("slate").map(|t| t.name.as_str()), Some("dark"));
+        // A theme defined in the file and then renamed leaves this behind, and
+        // the answer has to be a theme rather than nothing.
+        assert_eq!(r.after("gone").map(|t| t.name.as_str()), Some("dark"));
+        assert_eq!(Themes::empty().after("dark"), None);
     }
 
     #[test]
     fn raising_the_floor_is_one_field_and_a_rebuild() {
-        let mut t = Theme::default_dark();
+        let mut t = Theme::dark();
         t.min_contrast = 7.0;
         t.rebuild();
         for kind in Kind::ALL {
@@ -527,19 +822,64 @@ mod tests {
     }
 
     #[test]
+    fn a_sign_and_its_line_are_legible_on_every_row_they_can_land_on() {
+        // `line_colors` draws the `+` and the unhighlighted text of a row in
+        // one of three foregrounds, and two of those land on *two* backgrounds
+        // each — a moved addition keeps `added_fg` on `moved_added_bg`. None of
+        // it goes through `rebuild`, because none of it is a token, so this is
+        // the only thing standing between a theme and a `+` nobody can see.
+        for t in Themes::builtin().0 {
+            let d = &t.diff;
+            for (what, fg, bgs) in [
+                ("added_fg", d.added_fg, [d.added_bg, d.moved_added_bg]),
+                ("removed_fg", d.removed_fg, [d.removed_bg, d.moved_removed_bg]),
+                ("context_fg", d.context_fg, [d.context_bg, d.context_bg]),
+            ] {
+                for bg in bgs {
+                    let got = contrast(fg, bg);
+                    assert!(
+                        got >= t.min_contrast,
+                        "{}: {what} on {bg:06x} is {got:.2}:1, floor is {:.2}",
+                        t.name,
+                        t.min_contrast
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_absent_cell_is_read_against_the_row_opposite_it() {
+        // The comparison that decides `absent_bg` is never the one against a
+        // context row: on a near-black theme nothing is more than 1.08:1 darker
+        // than that, and on paper nothing is lighter. An absent cell only ever
+        // appears *beside* a change, so that is what it has to differ from —
+        // and this is the number both shipped directions were built to.
+        for t in Themes::builtin().0 {
+            let d = &t.diff;
+            for (what, bg) in [("added", d.added_bg), ("removed", d.removed_bg)] {
+                let got = contrast(d.absent_bg, bg);
+                assert!(got >= 1.15, "{}: absent is {got:.2}:1 against {what}", t.name);
+            }
+        }
+    }
+
+    #[test]
     fn a_line_number_clears_the_furniture_floor_on_every_surface() {
         // The regression this exists for: `gutter_fg` was 2.05:1 on a context
         // row and 1.60:1 on a moved one, because `rebuild` resolved syntax
         // tokens and nothing else. A line number nobody can read is a column of
         // pixels wide enough to matter and no use at all.
-        let t = Theme::default_dark();
-        for surface in Surface::ALL {
-            let got = contrast(t.gutter_on(surface), t.background(surface));
-            assert!(
-                got >= t.min_furniture - 0.01,
-                "the gutter on {surface:?} is {got:.2}:1, floor is {:.2}",
-                t.min_furniture
-            );
+        for t in Themes::builtin().0 {
+            for surface in Surface::ALL {
+                let got = contrast(t.gutter_on(surface), t.background(surface));
+                assert!(
+                    got >= t.min_furniture - 0.01,
+                    "{}: the gutter on {surface:?} is {got:.2}:1, floor is {:.2}",
+                    t.name,
+                    t.min_furniture
+                );
+            }
         }
     }
 
@@ -547,11 +887,16 @@ mod tests {
     fn furniture_recedes_further_than_body_text() {
         // Both floors exist because they are different jobs. If the furniture
         // ever came out as loud as the text it labels, one of them is wrong.
-        let t = Theme::default_dark();
-        assert!(t.min_furniture < t.min_contrast);
-        let gutter = contrast(t.gutter_on(Surface::Context), t.diff.context_bg);
-        let body = contrast(t.diff.context_fg, t.diff.context_bg);
-        assert!(gutter < body, "gutter {gutter:.2} is not quieter than text {body:.2}");
+        for t in Themes::builtin().0 {
+            assert!(t.min_furniture < t.min_contrast);
+            let gutter = contrast(t.gutter_on(Surface::Context), t.diff.context_bg);
+            let body = contrast(t.diff.context_fg, t.diff.context_bg);
+            assert!(
+                gutter < body,
+                "{}: gutter {gutter:.2} is not quieter than text {body:.2}",
+                t.name
+            );
+        }
     }
 
     #[test]
@@ -560,12 +905,13 @@ mod tests {
         // context row — invisible — while the hunk header, which matters less,
         // was the more prominent band of the two. A file boundary is the most
         // important edge in a diff.
-        let t = Theme::default_dark();
-        let file = contrast(t.diff.file_bg, t.diff.context_bg);
-        let hunk = contrast(t.diff.hunk_bg, t.diff.context_bg);
-        assert!(file > hunk, "file {file:.3} does not out-read hunk {hunk:.3}");
-        assert!(file >= 1.15, "a file header at {file:.3} is not a boundary");
-        assert_ne!(t.diff.file_bg, t.chrome.title_bg, "one colour, two meanings");
+        for t in Themes::builtin().0 {
+            let file = contrast(t.diff.file_bg, t.diff.context_bg);
+            let hunk = contrast(t.diff.hunk_bg, t.diff.context_bg);
+            assert!(file > hunk, "{}: file {file:.3} does not out-read hunk {hunk:.3}", t.name);
+            assert!(file >= 1.15, "{}: a file header at {file:.3} is not a boundary", t.name);
+            assert_ne!(t.diff.file_bg, t.chrome.title_bg, "{}: one colour, two meanings", t.name);
+        }
     }
 
     #[test]
@@ -579,7 +925,7 @@ mod tests {
     fn a_theme_can_be_rewritten_field_by_field() {
         // What an extension does: take a theme, change what it likes, hand it
         // back. Nothing here is const and nothing needs a window.
-        let mut t = Theme::default_dark();
+        let mut t = Theme::dark();
         t.name = "solarized-ish".into();
         t.set_syntax(Kind::Comment, Style::fg(0x93a1a1));
         t.diff.added_bg = 0x073642;
@@ -593,14 +939,14 @@ mod tests {
 
     #[test]
     fn author_colour_is_stable_and_in_range() {
-        let t = Theme::default_dark();
+        let t = Theme::dark();
         assert_eq!(t.author("Junio C Hamano"), t.author("Junio C Hamano"));
         assert!(t.authors.contains(&t.author("anyone at all")));
     }
 
     #[test]
     fn an_empty_palette_falls_back_instead_of_panicking() {
-        let mut t = Theme::default_dark();
+        let mut t = Theme::dark();
         t.lanes.clear();
         t.authors.clear();
         assert_eq!(t.lane(3), t.chrome.fg);

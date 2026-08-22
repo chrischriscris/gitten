@@ -171,16 +171,28 @@ nothing else.
 ## 4. A theme
 
 ```rust
-let mut theme = Theme::default_dark();
+let mut theme = Theme::dark();               // or light, or slate
+theme.name = "solarized-ish".into();
 theme.set_syntax(Kind::Comment, Style::fg(0x93a1a1).italic());
 theme.diff.added_bg = 0x073642;
 theme.min_contrast = 4.5;
-theme.rebuild();          // required after touching fields directly
-host.theme = theme;
+theme.rebuild();                             // required after touching fields directly
+
+host.themes.register(theme);                 // in the title-bar picker, and in `T`
+host.select_theme("solarized-ish");          // and on screen now
 ```
 
 Plain `0xRRGGBB` throughout, so the ANSI painter and the GPUI window read the same
-one. Details and the contrast machinery: [theming.md](theming.md).
+one. Register and select are separate because they are different claims — adding
+an option is usually what an extension meant, and it is the half that shows up in
+the menu.
+
+The registry is the only one on `Host` that holds no selection of its own: a
+theme is data the config file *edits*, so `host.theme` is the answer and
+`host.themes` is the catalogue. `plait.toml` reaches both — `[theme] name` picks
+the base, everything under it is applied on top, and the result is registered
+under that name. Details, the contrast machinery and the ratios a second palette
+has to hit: [theming.md](theming.md).
 
 ## 5. A font
 

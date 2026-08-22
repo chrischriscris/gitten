@@ -15,7 +15,7 @@ use crate::command::{Commands, Keymap};
 use crate::differ::Differs;
 use crate::font::Font;
 use crate::syntax::Highlighters;
-use crate::theme::Theme;
+use crate::theme::{Theme, Themes};
 use crate::wrap::Wraps;
 
 pub struct Host {
@@ -54,7 +54,21 @@ pub struct Host {
     /// still a command — it is in the help, and a config file can bind it.
     pub commands: Commands,
     /// Every colour the app draws.
+    ///
+    /// The active theme itself and not a name, unlike [`Host::layout`]: a
+    /// palette is data `core` fully understands, and the render path reads a
+    /// field off it per run per row per frame. Which of [`Host::themes`] it
+    /// started as is its own `name`.
     pub theme: Theme,
+    /// Every theme registered, which is what a picker lists and what
+    /// [`Host::select_theme`] chooses from.
+    ///
+    /// Beside the active one rather than holding it, because `theme` is
+    /// *edited*: `plait.toml` sets colours on top of whatever it selected, and a
+    /// registry that also owned the selection would have to decide whether the
+    /// entry or the edit is the truth. This one is the catalogue and `theme` is
+    /// the answer.
+    pub themes: Themes,
     /// The face it draws in, and the numbers derived from it. More than
     /// appearance — see [`Font`] for what depends on getting it right.
     pub font: Font,
@@ -77,8 +91,33 @@ impl Host {
             wrap: Wraps::builtin(),
             keys: Keymap::builtin(),
             commands: Commands::builtin(),
-            theme: Theme::default_dark(),
+            theme: Theme::dark(),
+            themes: Themes::builtin(),
             font: Font::default(),
+        }
+    }
+
+    /// Makes a registered theme the one on screen. False when nothing is
+    /// registered under that name, which is what a config file reports back.
+    ///
+    /// A copy, so the catalogue survives whatever is done to the theme
+    /// afterwards — the config file sets colours on top of every selection, and
+    /// picking the same theme again has to give back the palette that was
+    /// registered rather than the last edit of it.
+    pub fn select_theme(&mut self, name: &str) -> bool {
+        match self.themes.get(name) {
+            Some(theme) => {
+                self.theme = theme.clone();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The next theme in the registry, wrapping. What `theme.cycle` runs.
+    pub fn cycle_theme(&mut self) {
+        if let Some(next) = self.themes.after(&self.theme.name) {
+            self.theme = next.clone();
         }
     }
 }
@@ -97,6 +136,10 @@ mod tests {
         assert!(host.differ.select("myers"));
         host.differ.context = 6;
         assert!(host.wrap.select("char"));
+        host.themes.register(crate::theme::Theme::slate());
+        assert!(host.select_theme("light"));
+        // On top of the palette that was just selected, which is the order the
+        // config file works in too.
         host.theme.set_syntax(Kind::Heading, Style::fg(0x00ff00).bold());
         host.theme.diff.added_bg = 0x001100;
         host.font = crate::font::Font::menlo();
@@ -107,6 +150,11 @@ mod tests {
         assert_eq!(got[0][0].kind, Kind::Heading);
         assert_eq!(host.theme.syntax(Kind::Heading).fg, 0x00ff00);
         assert_eq!(host.theme.diff.added_bg, 0x001100);
+        assert_eq!(host.theme.name, "light");
+        // ...and the catalogue is untouched by any of it: `theme` is a copy, so
+        // picking `light` again gives back the palette that was registered.
+        assert_eq!(host.themes.names(), vec!["dark", "light", "slate"]);
+        assert_ne!(host.themes.get("light").unwrap().diff.added_bg, 0x001100);
         assert_eq!(host.font.family, "Menlo");
         assert_eq!(host.differ.selected(), "myers");
         assert_eq!(host.differ.context, 6);

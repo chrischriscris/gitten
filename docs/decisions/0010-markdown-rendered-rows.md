@@ -115,6 +115,14 @@ row is never widened by an added row's long cell. A hunk that shows the middle o
 a table has no header and no separator; it aligns to what is on screen, which
 beats refusing to align.
 
+The rule between two rows of a table is drawn as a **hairline and not as glyphs**,
+for the same reason wrapping produces ranges rather than lines: a row of `─` is a
+row of the list that no line of the file produced, and its blank gutter is a
+number the columns either side have to skip. So the only table rule made of text
+is the one the source wrote — the `|---|` separator — and everything between two
+rows is 1px of `markdown.rule`, as wide as the grid, under the last sub-row of a
+row. `MarkdownRows::ruled` is the whole rule and a test asks it directly.
+
 The runs and their measurements leave this pass in a `Tables`, and the reason is
 the one thing about a table that is not knowable at load: whether it fits the
 window. When it does not, the grid is laid out again at reflow — squeezed columns,

@@ -193,6 +193,8 @@ struct App {
     message: String,
     help: bool,
     quit: bool,
+    /// The theme `theme.cycle` picked, if anything has. `None` means the file's.
+    picked_theme: Option<String>,
     /// What the last frame cost, when `PLAIT_STATS` is set.
     ///
     /// Two numbers and no overlay: how long the draw took, and how many cells
@@ -228,6 +230,7 @@ impl App {
             message: String::new(),
             help: false,
             quit: false,
+            picked_theme: None,
             stats: None,
             runs: Vec::new(),
         };
@@ -293,7 +296,17 @@ impl App {
     /// all land on the next frame.
     fn reload(&mut self, path: &std::path::Path) {
         let mut next = Host::new();
-        let warnings = plait_app::config::load(&mut next, path);
+        let mut warnings = plait_app::config::load(&mut next, path);
+        // A theme cycled with a key outlives a save of the file, the way the
+        // view's own wrap and layout indices do: the file says what this opened
+        // on, and the key says what is on screen now. It loses only when the
+        // file stopped defining it.
+        if let Some(name) = self.picked_theme.clone() {
+            if !next.select_theme(&name) {
+                warnings.push(format!("the theme {name:?} is no longer registered"));
+                self.picked_theme = None;
+            }
+        }
         self.host = next;
         self.message = match warnings.is_empty() {
             true => "plait.toml reloaded".into(),
@@ -346,6 +359,14 @@ impl App {
                 self.sync_modes();
             }
             "back" => self.back(),
+            // The whole window's, so it is here and not on a screen — and the
+            // name is said, because a palette that changed without saying which
+            // one it is now leaves you cycling to find out.
+            "theme.cycle" => {
+                self.host.cycle_theme();
+                self.picked_theme = Some(self.host.theme.name.clone());
+                self.message = format!("theme: {}", self.host.theme.name);
+            }
             "commits.open-diff" => self.open_diff(),
             // Disjoint field borrows rather than moving the host out and
             // back: `Host::new()` rebuilds every theme, every registry and the

@@ -8,11 +8,12 @@
 //!
 //!   cargo run -q -p plait-core --example paint --release [ROWS] [PATH-FILTER]
 //!
-//! `WRAP_COLS=n` sets where a long line breaks, and `WRAP_COLS=0` turns wrapping
-//! off. That is the same [`Wrap`] the window uses, reached the same way: a break
-//! point is a property of text, and this is the check that nothing about the seam
-//! is shaped like GPUI. What a terminal supplies is the column count — the one
-//! thing `core` cannot know.
+//! `THEME=name` paints it in another registered palette — `dark`, `light`,
+//! `slate`, or one `plait.toml` defined. `WRAP_COLS=n` sets where a long line
+//! breaks, and `WRAP_COLS=0` turns wrapping off. That is the same [`Wrap`] the
+//! window uses, reached the same way: a break point is a property of text, and
+//! this is the check that nothing about the seam is shaped like GPUI. What a
+//! terminal supplies is the column count — the one thing `core` cannot know.
 use plait_core::host::Host;
 use plait_core::markdown::{lay_out, Block, Layout};
 use plait_core::prepared::prepare;
@@ -93,7 +94,18 @@ fn main() {
 
     // Exactly what the shell builds, and exactly the same call: the host, then
     // one prepare pass. Nothing about the assembly is re-implemented here.
-    let host = Host::new();
+    let mut host = Host::new();
+    // `THEME=light`, off the same registry the window's picker lists. A palette
+    // is the one thing in here whose only real test is looking at it, and a
+    // frame on stdout interrupts nobody.
+    if let Ok(name) = std::env::var("THEME") {
+        if !host.select_theme(&name) {
+            eprintln!(
+                "paint: no theme {name:?}; registered: {}",
+                host.themes.names().join(", ")
+            );
+        }
+    }
     let theme = &host.theme;
     let mut p = prepare(&parse_unified_diff(&raw), &host.syntax, 2000);
 

@@ -295,6 +295,10 @@ impl Keymap {
         bind(GLOBAL, "q", "quit");
         bind(GLOBAL, "ctrl-c", "quit");
         bind(GLOBAL, "?", "help");
+        // Global and not diff-only: a palette is the whole window's, and the
+        // commit graph is drawn out of the same one. Shifted, because cycling a
+        // theme is a thing done twice a month and `t` is worth more than that.
+        bind(GLOBAL, "T", "theme.cycle");
         bind(GLOBAL, "esc", "back");
 
         bind(GLOBAL, "j", "view.down");
@@ -464,6 +468,7 @@ impl Commands {
             ("diff.prev-file", "the previous file's header"),
             ("diff.cycle-layout", "the next presentation"),
             ("diff.cycle-wrap", "the next wrap"),
+            ("theme.cycle", "the next theme"),
             ("commits.open-diff", "the diff for this commit"),
             ("select.all", "select the whole view"),
             ("select.none", "drop the selection"),

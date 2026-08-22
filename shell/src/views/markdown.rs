@@ -47,7 +47,10 @@
 //!   added or removed and that is the one thing a diff may not give up.
 //! - **Furniture** for the markers that were removed: a bullet glyph, a rule,
 //!   the fence's language. `&'static str` glyphs and coloured divs, so none of
-//!   it allocates on the render path.
+//!   it allocates on the render path. The hairline between two rows of a table is
+//!   here too, and it is furniture rather than text for a structural reason: as a
+//!   row of `─` it would be a row of the list that no line of the file produced,
+//!   and the gutter's numbers have to keep adding up.
 //!
 //! # Cost
 //!
@@ -373,6 +376,28 @@ impl MarkdownRows {
         Some(&self.flows[at].1)
     }
 
+    /// Whether a hairline is drawn under this visual row: a rule *between* two
+    /// rows of a table, which is not the same thing as a border around one.
+    ///
+    /// Three ways to answer no, and each is a thing that looked wrong:
+    ///
+    /// - **The last row of a table.** There is nothing under it to be separated
+    ///   from, and a line hanging under an open-bottomed grid reads as a break in
+    ///   the document rather than as part of the table.
+    /// - **A header.** Its separator row is already a rule, and two of them a
+    ///   pixel apart is a double line.
+    /// - **Any sub-row but the last.** A squeezed cell wraps, and a rule through
+    ///   the middle of its own sentence says the row ended where it did not.
+    ///
+    /// One method rather than a condition at the call site, because it is a rule
+    /// about rows and a test can ask it directly.
+    fn ruled(&self, index: usize, seg: usize) -> bool {
+        let Some(Row::Line { block, .. }) = self.rows.get(index) else { return false };
+        *block == Block::Table
+            && seg + 1 == self.wrapped.rows(index)
+            && matches!(self.rows.get(index + 1), Some(Row::Line { block, .. }) if *block == Block::Table)
+    }
+
     /// What a row draws and what indexes it: its own text, or the grid this width
     /// re-laid it out onto.
     fn text_of<'a>(
@@ -555,8 +580,10 @@ impl Rows for MarkdownRows {
             Row::Line { block, kind, moved, old, new, text, spans, tokens } => {
                 let (text, spans, tokens) = self.text_of(index, text, spans, tokens);
                 let at = self.wrapped.range(index, seg, text);
+                let rule = self.ruled(index, seg);
                 self.line(
-                    *block, *kind, *moved, old, new, text, at, seg, spans, tokens, host, sel,
+                    *block, *kind, *moved, old, new, text, at, seg, spans, tokens, rule, host,
+                    sel,
                 )
             }
         }
@@ -577,6 +604,8 @@ impl MarkdownRows {
         seg: usize,
         spans: &[Span],
         tokens: &[Token],
+        // A hairline under this row: a table row with another one under it.
+        rule: bool,
         host: &Host,
         sel: Option<Selected>,
     ) -> AnyElement {
@@ -631,7 +660,30 @@ impl MarkdownRows {
             } else {
                 body
             };
-            return row.child(body).into_any_element();
+            let row = row.child(body);
+            if !rule {
+                return row.into_any_element();
+            }
+            // A hairline, not a row of `─`: a rule between two rows of a table is
+            // not a line of the file, so drawing it as text would need a row the
+            // gutter has to skip — and a row count is not this presentation's to
+            // change. As wide as the grid and no wider, because a rule that ran
+            // to the edge of the window would be a break in the document rather
+            // than part of the table. Absolute, so it costs the text no pixel of
+            // the row's fixed height.
+            let width = text.chars().count() as f32 * host.font.char_width();
+            return row
+                .relative()
+                .child(
+                    div()
+                        .absolute()
+                        .bottom_0()
+                        .left(px(TEXT_CHROME - PAD))
+                        .w(px(width))
+                        .h(px(1.))
+                        .bg(rgb(md.rule)),
+                )
+                .into_any_element();
         }
 
         // A rule draws no text: the dashes were the drawing, so they are replaced
@@ -1155,6 +1207,44 @@ diff --git a/a.md b/a.md
         }
         assert_eq!(tables, 3, "the fixture lost its table");
         assert!(r.flows.is_empty(), "a table nobody can read a word of was squeezed");
+    }
+
+    #[test]
+    fn a_hairline_goes_between_two_table_rows_and_nowhere_else() {
+        // The rule is drawn as pixels and not as a row of `─` glyphs, because a
+        // rule between two rows of a table is not a line of the file: as text it
+        // would need a row with no line number, and a row count is not this
+        // presentation's to change. So what it draws is a property of a row, and
+        // this is that property.
+        let src = "\
+diff --git a/a.md b/a.md
+@@ -1,4 +1,4 @@
+ | stage | detail |
+ |---|---|
+ | parse the log and assign the lanes | 466 ms |
+ | assign lanes | 301 ms |
+";
+        let (r, _) = reflowed(src, 30);
+        let rows: Vec<(usize, Block)> = (0..r.len())
+            .filter_map(|i| match &r.rows[i] {
+                Row::Line { block, .. } if block.is_table() => Some((i, *block)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows.len(), 4, "header, separator and two rows: {rows:?}");
+        let (header, sep, first, last) = (rows[0].0, rows[1].0, rows[2].0, rows[3].0);
+
+        assert!(!r.ruled(header, 0), "a header's separator row is already a rule");
+        assert_eq!(rows[1].1, Block::TableRule);
+        assert!(!r.ruled(sep, 0), "the separator row drew a second rule under itself");
+        assert!(!r.ruled(last, 0), "the last row of the table has nothing under it");
+
+        // The wrapped one: under its last sub-row, and none of the others.
+        assert!(r.rows(first) > 1, "the fixture stopped wrapping");
+        for seg in 0..r.rows(first) - 1 {
+            assert!(!r.ruled(first, seg), "a rule cut through a wrapped cell at {seg}");
+        }
+        assert!(r.ruled(first, r.rows(first) - 1), "no rule between the two rows");
     }
 
     #[test]

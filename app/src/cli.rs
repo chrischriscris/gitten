@@ -170,10 +170,11 @@ pub fn usage(binary: &str, blurb: &str, extra: &str) -> String {
   REVSPEC is anything git takes:  HEAD~50..HEAD   main..feature   <sha>
   Pass --fixtures instead of REPO to read fixtures/ instead of a repository.
 
-  plait.toml next to the binary (or $PLAIT_CONFIG) sets the theme, the font and
-  the [diff] table — the algorithm, how much whitespace has to match, how much
-  context, and what the presentation and the wrap open on. Every client reads
-  the same file. Start one with:  {binary} config > plait.toml
+  plait.toml next to the binary (or $PLAIT_CONFIG) picks the theme — dark, light
+  or slate, or one it defines itself — and sets the font and the [diff] table:
+  the algorithm, how much whitespace has to match, how much context, and what
+  the presentation and the wrap open on. Every client reads the same file.
+  Start one with:  {binary} config > plait.toml
 "
     );
     match extra.is_empty() {

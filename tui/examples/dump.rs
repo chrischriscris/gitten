@@ -7,8 +7,8 @@
 //! cargo run -q -p plait-tui --example dump -- commits --fixtures
 //! ```
 //!
-//! `COLS` and `ROWS` override the size; `LAYOUT`, `WRAP` and `AT` pick the
-//! presentation, the wrap and how far down the diff to start. `FRAMES` is how
+//! `COLS` and `ROWS` override the size; `LAYOUT`, `WRAP`, `THEME` and `AT` pick
+//! the presentation, the wrap, the palette and how far down the diff to start. `FRAMES` is how
 //! many times to repaint before printing — the average lands on stderr, so a
 //! per-frame cost is measurable without a terminal to watch. **Build with
 //! `--release` before believing it**, exactly as the window's overlay says.
@@ -60,6 +60,11 @@ fn main() {
     if let Some(name) = env("WRAP") {
         if !host.wrap.select(&name) {
             eprintln!("plait: unknown wrap {name:?}; have {}", host.wrap.names().join(", "));
+        }
+    }
+    if let Some(name) = env("THEME") {
+        if !host.select_theme(&name) {
+            eprintln!("plait: unknown theme {name:?}; have {}", host.themes.names().join(", "));
         }
     }
 

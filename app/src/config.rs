@@ -177,10 +177,7 @@ pub fn apply(host: &mut Host, text: &str) -> Vec<String> {
         apply_font(&mut host.font, font, &mut warn);
     }
     if let Some(theme) = doc.get("theme") {
-        apply_theme(&mut host.theme, theme, &mut warn);
-        // Required after touching fields directly: the resolved
-        // syntax-by-surface table is what the render path reads.
-        host.theme.rebuild();
+        apply_theme(host, theme, &mut warn);
     }
     if let Some(diff) = doc.get("diff") {
         apply_diff(host, diff, &mut warn);
@@ -402,17 +399,52 @@ fn apply_font(font: &mut Font, value: &toml::Value, warn: &mut Vec<String>) {
     }
 }
 
-fn apply_theme(theme: &mut Theme, value: &toml::Value, warn: &mut Vec<String>) {
+/// `[theme]` — which palette, and whatever is changed on top of it.
+///
+/// Two things happen here that no other table does, and both follow from a theme
+/// being the one seam whose implementation is *data*:
+///
+/// - **`name` is read first**, whatever order the file is in, because it selects
+///   the palette every other key here modifies. TOML hands a table back
+///   alphabetically, so a `name` applied in its turn would land after
+///   `[theme.diff]` and silently throw it away.
+/// - **The result is registered** under that name when it is done. A palette
+///   somebody wrote in this file is a theme, so it belongs in the same registry —
+///   and therefore the same picker — as the three that ship. Naming a built-in
+///   *corrects* that entry rather than adding a second one called the same
+///   thing, which is what makes picking it afterwards give back what the file
+///   says rather than what the binary shipped.
+fn apply_theme(host: &mut Host, value: &toml::Value, warn: &mut Vec<String>) {
     let Some(t) = value.as_table() else {
         warn.push("config: [theme] is not a table".into());
         return;
     };
+    if let Some(v) = t.get("name") {
+        match v.as_str() {
+            Some(name) if host.select_theme(name) => {}
+            Some(name) => {
+                // Unknown is not automatically wrong: a table that also sets
+                // colours is a theme being *defined*, and it is registered under
+                // this name below. One that sets nothing else has named a theme
+                // that does not exist, and then nothing in the file did anything
+                // at all — which is the only case worth a line on stderr.
+                if t.len() == 1 {
+                    warn.push(format!(
+                        "config: unknown theme {name:?} and [theme] defines none of \
+                         its own colours; registered: {}",
+                        host.themes.names().join(", ")
+                    ));
+                }
+                host.theme.name = name.to_string();
+            }
+            None => warn.push("config: theme.name must be a string".into()),
+        }
+    }
+    let theme = &mut host.theme;
     for (key, v) in t {
         match key.as_str() {
-            "name" => match v.as_str() {
-                Some(s) => theme.name = s.to_string(),
-                None => warn.push("config: theme.name must be a string".into()),
-            },
+            // Read above, before anything it is the base for.
+            "name" => {}
             "min_contrast" => match number(v) {
                 // 1.0 is "no floor at all", 21.0 is black on white. Outside that
                 // the contrast resolver has nothing to aim at.
@@ -438,6 +470,10 @@ fn apply_theme(theme: &mut Theme, value: &toml::Value, warn: &mut Vec<String>) {
             table => apply_palette(theme, table, v, warn),
         }
     }
+    // Required after touching fields directly: the resolved syntax-by-surface
+    // table is what the render path reads.
+    host.theme.rebuild();
+    host.themes.register(host.theme.clone());
 }
 
 /// One of the colour tables — `[theme.diff]`, `[theme.chrome]` and so on.
@@ -591,8 +627,16 @@ pub fn dump(host: &Host) -> String {
     ));
 
     let t = &host.theme;
+    out.push_str("# `name` picks one of the registered palettes and everything below is applied\n");
+    out.push_str("# on top of it. The result is registered under that name, so a theme edited\n");
+    out.push_str("# here is the one the picker shows — and a name nobody registered is a new\n");
+    out.push_str("# theme rather than a mistake.\n");
     out.push_str("[theme]\n");
-    out.push_str(&format!("name = {:?}\n", t.name));
+    out.push_str(&format!(
+        "name = {:?}    # {} — `T` cycles it\n",
+        t.name,
+        host.themes.names().join(", ")
+    ));
     out.push_str(&format!("min_contrast = {:?}\n", t.min_contrast));
     out.push_str(&format!("min_furniture = {:?}\n", t.min_furniture));
     out.push_str(&format!("lanes = [{}]\n", hex_list(&t.lanes)));
@@ -805,6 +849,76 @@ mod tests {
         let warn = apply(&mut h, "[theme.diff]\nadded_bg = \"#123456\"\n");
         assert!(warn.is_empty(), "{warn:?}");
         assert_eq!(h.theme.diff.added_bg, 0x123456);
+    }
+
+    #[test]
+    fn naming_a_theme_selects_the_registered_one() {
+        let mut h = host();
+        let warn = apply(&mut h, "[theme]\nname = \"light\"\n");
+        assert!(warn.is_empty(), "{warn:?}");
+        assert_eq!(h.theme.chrome.bg, plait_core::theme::Theme::light().chrome.bg);
+        assert_eq!(h.theme.name, "light");
+    }
+
+    #[test]
+    fn a_colour_lands_on_top_of_the_theme_the_file_named() {
+        // The trap this exists for: TOML hands a table back in alphabetical
+        // order, so `name` arrives *after* `[theme.diff]` and applying it in its
+        // turn would replace the palette that had just been edited. Written here
+        // in the order that fails.
+        let mut h = host();
+        let text = "[theme]\nname = \"light\"\n\n[theme.diff]\nadded_bg = \"#123456\"\n";
+        let warn = apply(&mut h, text);
+        assert!(warn.is_empty(), "{warn:?}");
+        assert_eq!(h.theme.diff.added_bg, 0x123456, "the theme overwrote the colour");
+        assert_eq!(h.theme.diff.removed_bg, plait_core::theme::Theme::light().diff.removed_bg);
+    }
+
+    #[test]
+    fn a_theme_written_in_the_file_is_registered_under_its_name() {
+        // Which is what puts it in the picker beside the shipped three: the
+        // frontend lists a registry, so a palette somebody wrote by hand has to
+        // be *in* one to be reachable at all.
+        let mut h = host();
+        let text = "[theme]\nname = \"solarized-ish\"\n\n[theme.diff]\nadded_bg = \"#073642\"\n";
+        let warn = apply(&mut h, text);
+        assert!(warn.is_empty(), "{warn:?}");
+        assert_eq!(h.themes.names(), vec!["dark", "light", "slate", "solarized-ish"]);
+        assert_eq!(h.themes.get("solarized-ish").map(|t| t.diff.added_bg), Some(0x073642));
+        // And selecting it again gives back what the file said, not the built-in
+        // it was based on.
+        h.select_theme("dark");
+        assert!(h.select_theme("solarized-ish"));
+        assert_eq!(h.theme.diff.added_bg, 0x073642);
+    }
+
+    #[test]
+    fn a_file_that_edits_a_built_in_corrects_it_rather_than_cloning_it() {
+        let mut h = host();
+        let text = "[theme]\nname = \"slate\"\n\n[theme.chrome]\naccent = \"#ff0000\"\n";
+        let warn = apply(&mut h, text);
+        assert!(warn.is_empty(), "{warn:?}");
+        assert_eq!(h.themes.names(), vec!["dark", "light", "slate"], "a fourth entry appeared");
+        assert_eq!(h.themes.get("slate").map(|t| t.chrome.accent), Some(0xff0000));
+        // The other two are untouched, which is the whole reason a pick can be
+        // trusted: `plait config` dumps every colour of the theme you are on,
+        // and that must not repaint the ones you are not.
+        assert_eq!(h.themes.get("light").map(|t| t.chrome.bg), Some(0xfaf7f1));
+    }
+
+    #[test]
+    fn a_theme_that_names_nothing_and_defines_nothing_says_so() {
+        // The only shape worth a warning: a `[theme]` table holding one unknown
+        // name changed nothing at all, and the usual cause is a typo. A table
+        // that also sets colours is a definition and is registered instead.
+        let mut h = host();
+        let warn = apply(&mut h, "[theme]\nname = \"ligth\"\n");
+        assert_eq!(warn.len(), 1, "{warn:?}");
+        assert!(warn[0].contains("unknown theme"), "{warn:?}");
+        assert!(warn[0].contains("light"), "it should name what is registered: {warn:?}");
+        let mut h = host();
+        let text = "[theme]\nname = \"ligth\"\n\n[theme.chrome]\naccent = \"#ff0000\"\n";
+        assert!(apply(&mut h, text).is_empty(), "a definition is not a typo");
     }
 
     #[test]

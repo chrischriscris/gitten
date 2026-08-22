@@ -15,6 +15,7 @@ pub use plait_app::config::{load, watch};
 use gpui::{px, App, Global, Hsla};
 use plait_core::host::Host;
 use plait_core::theme::Rgb;
+use std::path::Path;
 use std::rc::Rc;
 
 /// The current configuration, replaced wholesale on reload rather than mutated
@@ -22,6 +23,51 @@ use std::rc::Rc;
 pub struct Active(pub Rc<Host>);
 
 impl Global for Active {}
+
+/// The theme the title bar picked, if anything has.
+///
+/// Client state, and it belongs here for the same reason the diff view keeps its
+/// own layout index: `plait.toml` says what the window *opens* on, and a control
+/// in the strip says what it is showing now. The file is rebuilt from defaults on
+/// every save — that is what makes deleting a line fall back — so without
+/// somewhere outside the host to keep this, saving a colour would silently throw
+/// away the theme you are looking at.
+///
+/// `None` means the file's, which is what the picker shows until somebody
+/// touches it.
+pub struct Chosen(pub Option<String>);
+
+impl Global for Chosen {}
+
+/// Rebuilds the host from the defaults and the file, re-applies the picked theme
+/// and hands the result to every window.
+///
+/// One path for a save and for a pick, deliberately: two would be two orders in
+/// which a theme and a colour can disagree.
+///
+/// **From defaults every time**, never from the live host — otherwise deleting a
+/// line from the file would leave the old value in place and the file would stop
+/// describing what is on screen.
+pub fn reload(path: &Path, cx: &mut App) -> Vec<String> {
+    let mut next = Host::new();
+    let mut warnings = load(&mut next, path);
+    let chosen = cx.try_global::<Chosen>().and_then(|c| c.0.clone());
+    if let Some(name) = chosen {
+        if !next.select_theme(&name) {
+            // The file renamed or removed it while it was on screen. Fall back
+            // to what the file says rather than to nothing.
+            warnings.push(format!("the picked theme {name:?} is no longer registered"));
+            cx.set_global(Chosen(None));
+        }
+    }
+    let next = Rc::new(next);
+    cx.set_global(Active(next.clone()));
+    // The scrollbars live in another crate's theme, so they only follow a saved
+    // file — or a pick — if something pushes it at them.
+    sync_widgets(&next, cx);
+    cx.refresh_windows();
+    warnings
+}
 
 /// The current host.
 ///

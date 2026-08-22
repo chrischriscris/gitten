@@ -23,7 +23,7 @@ use stats::Stats;
 #[global_allocator]
 static ALLOC: stats::Counting = stats::Counting;
 
-actions!(plait, [Quit]);
+actions!(plait, [Quit, CycleTheme]);
 
 use views::diff::{CopySelection, CycleLayout, CycleWrap, SelectAll, SelectNone};
 
@@ -47,11 +47,12 @@ const BAND_H: f32 = 22.0;
 /// documented once, in `plait_app::cli::usage`, because they are the same in
 /// every client — see that function for why that is a promise and not a
 /// convenience.
-const EXTRA: &str = "  The title bar carries four pickers: the presentation (unified, side-by-side),
+const EXTRA: &str = "  The title bar carries five pickers: the presentation (unified, side-by-side),
   where a line too wide for the window breaks (off, word, char), the diff
-  algorithm (histogram, patience, myers) and how much whitespace has to match
+  algorithm (histogram, patience, myers), how much whitespace has to match
   (exact, trailing, change, all — git's default, --ignore-space-at-eol, -b and
-  -w). `s` cycles the presentation and `w` the wrap.
+  -w) and the theme (dark, light, slate, and whatever plait.toml adds). `s`
+  cycles the presentation, `w` the wrap and `T` the theme.
 
   The file is re-read every time it is saved, and colours and font apply on the
   next frame — no rebuild, no relaunch.
@@ -78,6 +79,7 @@ type Rediff = Rc<dyn Fn(&Host, &Overrides) -> Result<Vec<FileDiff>, String>>;
 /// things to dismiss.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Open {
+    Theme,
     Layout,
     Wrap,
     Algorithm,
@@ -107,6 +109,10 @@ struct DevShell {
     /// that moved under the window, and silently keeping the old rows would be a
     /// diff labelled with an algorithm that did not produce it.
     error: Option<SharedString>,
+    /// Where `plait.toml` is. Held because picking a theme goes through the same
+    /// reload a save does — see [`config::reload`] for why there is only one
+    /// path.
+    config: std::path::PathBuf,
 }
 
 impl DevShell {
@@ -164,14 +170,31 @@ impl DevShell {
         cx.notify();
     }
 
-    /// The pickers, right-aligned in the title bar. Nothing when the diff view is
-    /// not what is on screen — the commit graph has none of these to choose.
+    /// Swaps the whole palette, by name.
+    ///
+    /// Through [`config::reload`] and not by editing the host in place, because
+    /// there is no host to edit: it is an `Rc` every view is holding, replaced
+    /// wholesale precisely so nobody can see half a theme. So a pick is a
+    /// rebuild from the file with the pick applied on top — which is also what
+    /// makes it survive the next save, and what makes a colour in `plait.toml`
+    /// still count after one.
+    fn set_theme(&mut self, name: String, cx: &mut Context<Self>) {
+        cx.set_global(config::Chosen(Some(name)));
+        for w in config::reload(&self.config, cx) {
+            eprintln!("plait: {w}");
+        }
+        cx.notify();
+    }
+
+    /// The pickers, right-aligned in the title bar. The theme is always one of
+    /// them, because a palette is the window's; the other four drive the diff
+    /// view and are drawn only when that is what is on screen — the commit graph
+    /// has none of them to choose.
     ///
     /// Each one is the same shape: a list of names from a registry or an enum,
     /// and an index into it. That is why adding a presentation or an algorithm
     /// needs no work here.
     fn strip(&self, host: &Host, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let Some(diff) = &self.diff else { return Vec::new() };
         let me = cx.entity().downgrade();
 
         // `Fn(bool)` per picker rather than one shared handler: which menu is
@@ -196,6 +219,41 @@ impl DevShell {
                 });
             }
         };
+
+        // Straight off the registry in `core`, so a theme an extension registers
+        // — or one written in `plait.toml` — is in this menu without a line here
+        // changing. Outside the `diff` check below on purpose: a palette is the
+        // whole window's, and the commit graph is drawn out of the same one.
+        let theme_names = host.themes.names();
+        let themes = controls::Picker::new(
+            "theme",
+            &theme_names,
+            host.themes.index_of(&host.theme.name).unwrap_or(0),
+        );
+        let theme_picker = controls::picker(
+            "theme-picker",
+            &themes,
+            self.open == Some(Open::Theme),
+            &host.theme,
+            &host.font,
+            toggle(Open::Theme),
+            {
+                let names: Vec<String> = theme_names.iter().map(|s| s.to_string()).collect();
+                let me = me.clone();
+                move |i, _, cx| {
+                    let Some(name) = names.get(i).cloned() else { return };
+                    _ = me.update(cx, |this, cx| {
+                        this.open = None;
+                        this.set_theme(name, cx);
+                    });
+                }
+            },
+        );
+
+        // Everything below drives the diff view, so there is nothing to draw
+        // when that is not what is on screen: the commit graph gets no strip of
+        // dead controls.
+        let Some(diff) = &self.diff else { return vec![theme_picker] };
 
         let names = diff.read(cx).layout_names();
         let layouts = controls::Picker::new("layout", &names, diff.read(cx).layout_index());
@@ -293,6 +351,7 @@ impl DevShell {
                     ..over.clone()
                 }),
             ),
+            theme_picker,
         ]
     }
 }
@@ -469,10 +528,17 @@ fn main() {
     let label = SharedString::from(loaded.label.clone());
     let data = loaded.data;
 
+    // One for the action handler, one for the strip: both reload from the file,
+    // and the async task below takes the original.
+    let theme_config_path = config_path.clone();
+    let shell_config_path = config_path.clone();
+
     let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
     app.run(move |cx| {
         gpui_component::init(cx);
         cx.set_global(config::Active(host.clone()));
+        // Nothing picked yet: the file's theme is the one on screen.
+        cx.set_global(config::Chosen(None));
         // After `gpui_component::init`, which sets its own theme to Light — see
         // `config::sync_widgets`, which is the only thing standing between that
         // and a pair of light scrollbars over a near-black diff.
@@ -502,20 +568,8 @@ fn main() {
                 if !dirty.swap(false, Ordering::Relaxed) {
                     continue;
                 }
-                let warnings = cx.update(|cx| {
-                    // From defaults every time, not from the live host: otherwise
-                    // deleting a line from the file would leave the old value in
-                    // place and the file would stop describing what you see.
-                    let mut next = Host::new();
-                    let warnings = config::load(&mut next, &config_path);
-                    let next = Rc::new(next);
-                    cx.set_global(config::Active(next.clone()));
-                    // The scrollbars live in another crate's theme, so they only
-                    // follow a saved file if something pushes it at them.
-                    config::sync_widgets(&next, cx);
-                    cx.refresh_windows();
-                    warnings
-                });
+                // The same call a theme pick makes — see `config::reload`.
+                let warnings = cx.update(|cx| config::reload(&config_path, cx));
                 for w in warnings {
                     eprintln!("plait: {w}");
                 }
@@ -523,6 +577,23 @@ fn main() {
         })
         .detach();
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
+        // On the app and not on a view, because a palette is the window's and
+        // not the diff's — `s` and `w` belong to whatever is on screen, and this
+        // works on the commit graph too.
+        cx.on_action({
+            let path = theme_config_path;
+            move |_: &CycleTheme, cx: &mut App| {
+                let host = config::host(cx);
+                let Some(next) = host.themes.after(&host.theme.name).map(|t| t.name.clone())
+                else {
+                    return;
+                };
+                cx.set_global(config::Chosen(Some(next)));
+                for w in config::reload(&path, cx) {
+                    eprintln!("plait: {w}");
+                }
+            }
+        });
         // No context predicate: there is one focusable view and no mode stack
         // yet, so a binding is global and the view that has focus gets it. The
         // day there is a second pane, this is what a keymap replaces.
@@ -530,6 +601,10 @@ fn main() {
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("s", CycleLayout, None),
             KeyBinding::new("w", CycleWrap, None),
+            // Shifted, because cycling a palette is done twice a month and `t`
+            // is worth more than that. `theme.cycle` in `core::command`, so the
+            // day this client reads `[keys]` it moves with the rest of them.
+            KeyBinding::new("shift-t", CycleTheme, None),
             // The platform's keys, not this app's: a Mac user's fingers already
             // know these three, and a diff that copied on `y` would be a diff
             // nobody could copy from. They are named commands in
@@ -649,6 +724,7 @@ fn main() {
                     over: Overrides::default(),
                     open: None,
                     error: None,
+                    config: shell_config_path,
                 });
                 cx.new(|cx| Root::new(shell, window, cx))
             })

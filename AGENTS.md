@@ -209,6 +209,14 @@ a column there is nothing honest to draw, so the table is left whole and scrolle
 to. `core::markdown::flow_table` does it and `wrap::Budget::At` is how the rows it
 decided survive the wrap.
 
+And the rule *between* two rows of that table is **pixels, not glyphs**. Every
+horizontal line a table has as text is a line of the file — the `|---|` separator,
+redrawn — so an inner rule drawn the same way is a row of the list that no line
+produced, with a blank gutter the numbers either side have to skip. A row count is
+not a presentation's to change, so anything between two rows is a hairline: 1px,
+as wide as the grid and no wider, under the *last* sub-row of a row so a squeezed
+cell keeps its sentence.
+
 `off` is an entry in the registry, not a flag beside one — the pickers are a pure
 function of a registry, so that is what puts it in the menu for free. Unlike the
 layouts this registry *is* on `Host`: a break point is a property of text, so
@@ -227,7 +235,7 @@ table — so a `Wrap` decides where a line breaks and nothing else.
                                     landing back on the same row
 ./dev web     diff --fixtures       a browser tab; prints a URL, opens nothing
 ./dev dump    commits ~/src 600     one frame on stdout, timing on stderr.
-                                    COLS, ROWS, LAYOUT, WRAP, AT, FRAMES
+                                    COLS, ROWS, LAYOUT, WRAP, THEME, AT, FRAMES
 ./dev check                         everything headless
 ./dev config > plait.toml           a complete, correct starting file
 ./dev bundle                        target/plait.app — icon, name, a real app

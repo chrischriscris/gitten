@@ -511,6 +511,49 @@ language, so on their own they capture no comments and no strings at all. Both
 must be concatenated with the c and javascript queries or the oracle reports
 garbage — it did, at first, and made both languages look catastrophic.
 
+### The ratios a theme is built to
+
+```sh
+cargo run -q -p plait-core --example contrast --release          # all three
+cargo run -q -p plait-core --example contrast --release light
+```
+
+A floor keeps a palette legible; *hierarchy* is what a reader learns, and the
+hierarchy is a set of ratios rather than a set of colours. So the second and third
+palettes were ported from the first by number — pick the hue, solve for the tint
+that lands on dark's figure. Every row below is the same contrast function used on
+the render path, against that theme's own context row unless it says otherwise:
+
+| | dark | light | slate |
+|---|---|---|---|
+| `file_bg` | 1.18 | 1.18 | 1.19 |
+| `hunk_bg` | 1.05 | 1.05 | 1.05 |
+| `added_bg` | 1.20 | 1.21 | 1.21 |
+| `removed_bg` | 1.16 | 1.16 | 1.16 |
+| `added_word_bg`, against its line | 1.29 | 1.29 | 1.29 |
+| `removed_word_bg`, against its line | 1.17 | 1.18 | 1.17 |
+| `absent_bg`, against the row opposite | 1.25 | 1.25 | 1.25 |
+| `context_fg` | 7.15 | 7.20 | 7.15 |
+| `added_fg` on an addition | 8.51 | 8.49 | 8.51 |
+| `added_fg` on a *moved* addition | 8.01 | 7.96 | 8.09 |
+| `gutter_fg`, before it is lifted | 2.05 | 2.04 | 2.06 |
+| `chrome.dim` | 3.53 | 3.55 | 3.52 |
+| `chrome.accent` | 9.11 | **5.20** | 9.14 |
+
+Building them is not free and is not on any path that matters: `Theme::dark()` is
+**7 µs** release, almost all of it `rebuild` resolving 12 classes across 8
+surfaces, and `Host::new()` — which now builds four themes, three catalogued and
+one active — is **145 µs**. That is what a theme pick costs, because a pick is a
+rebuild of the host from the file. Measured with a 200-iteration loop over each
+constructor.
+
+Two numbers could not be carried across, and both are the same point about a light
+background. **The accent is 5.2:1 rather than 9.1:1** — contrast against paper is
+darkness, and an amber taken to 9:1 is a brown. **`absent_bg` is 1.51:1 from its
+context row** where dark's is 1.04:1, because on paper there is no room left above
+the background; the comparison that actually decides it — 1.25:1 against the row
+opposite — is identical in all three.
+
 ### Contrast, before the fix
 
 `contrast()` from `theme.rs` over the palette as it shipped, every token class

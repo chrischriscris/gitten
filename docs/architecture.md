@@ -56,7 +56,7 @@ because it compiles in a second and its tests need no window.
 | `prepared.rs` | a diff assembled into drawable rows: clip → intraline → syntax |
 | `markdown.rs` | a `.md` diff as blocks, with the markers cut and the ranges moved |
 | `syntax.rs` | the scanner, the language tables, the `Highlighter` trait, routing, Markdown |
-| `theme.rs` | every colour, as `0xRRGGBB` data, plus contrast resolution |
+| `theme.rs` | every colour as `0xRRGGBB` data, the three shipped palettes, contrast resolution |
 | `font.rs` | the face as data: family, size, and whether a char is a column |
 | `host.rs` | the struct that holds the swappable pieces |
 

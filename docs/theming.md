@@ -23,6 +23,62 @@ pub struct Style { pub fg: Rgb, pub bold: bool, pub italic: bool }
 Weight and slant are in `Style` because emphasis in prose is not a colour. A
 Markdown `**word**` that only changed hue would be wrong.
 
+## Three of them, and where a fourth comes from
+
+`Themes` is the registry and `host.theme` is the one on screen:
+
+```rust
+pub struct Themes(Vec<Theme>);        // dark, light, slate
+
+host.select_theme("light");           // a copy, so the registry is not edited
+host.cycle_theme();                   // what `T` runs
+host.themes.register(mine);           // replaces any entry with the same name
+host.themes.names();                  // what the picker lists
+```
+
+Unlike `Differs` and `Wraps` the registry holds **no selection**, and that is the
+one thing worth reading twice about it. A theme is the only seam whose
+implementation is *data the config file edits*: `plait.toml` sets colours on top
+of whatever it selected, so a registry that also owned the selection would have to
+decide whether the entry or the edit is the truth. The catalogue is `themes`, the
+answer is `theme`, and `theme.name` is which.
+
+The consequence is the good one: **a theme written in `plait.toml` is a theme.**
+The config layer applies the file to whatever `name` selected and then registers
+the result back under that name, so a palette somebody tuned by hand is in the
+same registry — and therefore the same title-bar menu and the same `T` — as the
+three that ship. A `name` nobody registered is a new entry rather than an error;
+a `name` that *is* registered corrects that entry rather than adding a second one
+called the same thing, exactly as registering a differ does.
+
+The three shipped are `dark` (warm, near-black), `light` (the same palette on
+paper) and `slate` (cool). Two are there to make a point the first cannot: warm
+dark is a taste and not a default, and a registry with one dark theme in it
+proves nothing about the seam.
+
+### A second palette is a port of the first, not a new one
+
+Every ratio in `light` and `slate` is `dark`'s, hue for hue: `added_bg` sits
+1.20:1 from its context row in all three, `file_bg` 1.18:1, the changed-word
+background 1.29:1 from the line it is inside, the gutter 2.05:1 before it is
+lifted. That is what makes the second theme feel like the first — a floor keeps a
+palette legible, but *hierarchy* is what a reader actually learns, and hierarchy
+is a set of ratios rather than a set of colours.
+
+```sh
+cargo run -q -p plait-core --example contrast          # every theme, every ratio
+cargo run -q -p plait-core --example contrast light
+```
+
+That is the tool the two new palettes were built with, and it is the one to run
+before adding a fourth: take dark's column as the target, pick the hue, and solve
+for the tint that lands on the number. Two ratios could not be carried across and
+both are the same point about a light background — the accent is 5.2:1 rather than
+9.1:1, because an amber taken to 9:1 against paper is a brown, and `absent_bg` is
+1.51:1 from its context row rather than 1.04:1, because on paper there is no room
+left *above* the background and the step has to come from below. The comparison
+that decides it is unchanged: 1.25:1 against the row opposite, in every theme.
+
 ## Surfaces, and why one colour per class is not enough
 
 A token is not drawn on "the background". It is drawn on one of eight:
@@ -128,7 +184,7 @@ worth more here.
 ## Writing one
 
 ```rust
-let mut theme = Theme::default_dark();
+let mut theme = Theme::dark();                                   // or light, or slate
 theme.name = "solarized-ish".into();
 theme.set_syntax(Kind::Comment, Style::fg(0x93a1a1).italic());   // rebuilds
 theme.diff.added_bg = 0x073642;
@@ -137,8 +193,13 @@ theme.min_contrast = 4.5;
 theme.lanes = vec![0xb58900, 0x268bd2, 0xd33682];                 // any length
 theme.rebuild();                                                 // after direct edits
 
-host.theme = theme;
+host.themes.register(theme);          // in the picker, and in `T`
+host.select_theme("solarized-ish");   // and on screen
 ```
+
+Register *and* select, because they are different claims: one adds a theme to the
+menu and the other says what to draw now. An extension that only registers has
+added an option, which is usually what it meant.
 
 Lane and author colours cycle, so a theme may ship three or twelve. An empty list
 falls back to chrome colours rather than panicking.
@@ -184,12 +245,26 @@ in a dependency-free crate all along.
 family = "JetBrainsMono Nerd Font Mono"
 size = 14.0
 
+[theme]
+name = "light"                  # dark, light, slate — or a name of your own
+
 [theme.diff]
-added_bg = "#16241a"
+added_bg = "#dde5d7"
 
 [theme.syntax]
-comment = "#615a52 italic"      # colour, then any of bold and italic
+comment = "#9b9186 italic"      # colour, then any of bold and italic
 ```
+
+`name` is read **before** everything under it, whatever order the file is in,
+because it selects the palette the rest is applied to — TOML hands a table back
+alphabetically, and a `name` applied in its turn would land after `[theme.diff]`
+and silently throw it away. The result is registered under that name when the
+file is done, which is what puts a theme written here in the picker beside the
+shipped ones.
+
+So there is only one case worth a warning, and it is the typo: a `[theme]` table
+holding an unknown `name` and nothing else changed nothing at all. One that also
+sets colours is a definition, and is registered rather than complained about.
 
 Two fields cannot reload live and say so when you change them:
 `font.monospaced`, because Markdown table padding rewrites the row *text* during
@@ -209,19 +284,35 @@ rewrite the file in place and cannot round-trip a function. When a colour is onl
 ever "that one, but lighter", derive it in `Theme` instead of asking the file for
 it; `rebuild` already does exactly that for every syntax colour on every surface.
 
-Implementation is `shell/src/config.rs`. It is in the shell and not in `core`
-because reading a file is I/O and `core` does none; when a `cli/` wants the same
-file it becomes its own crate. `apply` is a pure function of a string, which is
+Implementation is `app/src/config.rs`. It is there and not in `core` because
+reading a file is I/O and `core` does none, and not in a client because every
+client reads the same file. `apply` is a pure function of a string, which is
 why all of it is tested without a disk or a watcher — including a round-trip
 asserting that what `plait config` writes reads back identically, so the two
 directions cannot drift.
 
+## Changing it without touching the file
+
+The title bar has a **theme** picker — a pure function of the registry, like the
+other four — and `T` cycles the same list. Both go through the same reload a save
+does: the host is rebuilt from the defaults and the file, and then the pick is
+applied on top. One path, because two would be two orders in which a theme and a
+colour can disagree, and it is what makes a pick survive the next save the way
+the view's own layout and wrap indices do.
+
+The file still says what the window *opens* on. That is the same division as
+`[diff] layout` and `[diff] wrap`, for the same reason.
+
 ## Seeing it without a window
 
 ```
-cargo run -q -p plait-core --example paint --release 40
+cargo run -q -p plait-core --example paint    --release 40    # THEME=light
+cargo run -q -p plait-core --example contrast --release       # every ratio
+./dev dump diff --fixtures                                    # THEME=slate
 ```
 
-Prints a real diff in 24-bit ANSI from this exact theme, and a legend of all
-twelve classes. The tests do the rest: every class on every surface is asserted
-to clear the floor, so a new palette cannot ship illegible.
+`paint` prints a real diff in 24-bit ANSI from this exact theme and a legend of
+all twelve classes; `contrast` prints the numbers behind it. The tests do the
+rest, and they run over **every registered theme**: each class on each surface
+clears the floor, each sign clears it on both rows it can land on, and each file
+header out-reads its hunk headers. A new palette cannot ship illegible.
