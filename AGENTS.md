@@ -60,6 +60,33 @@ chain is a function pointer, which is what lets a config file hold it, a help
 screen list it and an extension add one. A `match` on keypresses inside a client
 is a keymap that client owns alone.
 
+## macOS first, Linux never ruled out
+
+**The Mac is the machine this is written on; Linux is the check that nothing was
+written badly.** Develop there, measure there, and fix a Mac-only bug first — but
+nothing may be *written* in a way that makes Linux impossible, and today nothing
+is. There is not one `cfg(target_os)` in the tree, no `objc`, `cocoa` or
+`core-foundation` in any `Cargo.toml`, and the terminal's clipboard is OSC 52
+rather than `pbcopy` — reached for because a terminal is often not on the machine
+the clipboard is on, and portable for free. GPUI, `gix` and the `git` binary all
+run on both. That is not luck yet, but it is cheap to keep: when the portable
+mechanism costs nothing, take it.
+
+When it costs something, the same tie-break as everywhere else — **a portable
+mechanism is never worth a worse window.** The Mac wins and the other platform
+waits. What it does *not* get to do is win by accident, in a constant nobody
+noticed, the way a hardcoded lane count would.
+
+The exceptions are honest and few, and they are exceptions rather than a
+pattern. `./dev bundle` is `sips` and `iconutil` and will never be anything else;
+an `.app` is a macOS artifact and the Linux equivalent is a different script
+nobody has asked for. The traffic lights, the application menu and the
+appless-process quit in the GPUI notes below are macOS platform facts, not layout
+choices — a Linux window has its own and GPUI hands them over. Neither is a
+licence for a third.
+
+Windows is not a target and not a promise.
+
 ## Git
 
 `plait-git` is the acquisition layer — the only crate that talks to a repository.

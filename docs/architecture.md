@@ -268,6 +268,10 @@ Listed so nobody reads an intention as a description:
 - **Extension loading.** Every seam takes an implementation today; nothing loads
   one from outside the binary yet. See [extending.md](extending.md).
 - **Writes.** No commit, push, stage or rebase. Reads only.
+- **A Linux build.** `AGENTS.md` keeps the tree portable — no `cfg(target_os)`,
+  no macOS-only crate, OSC 52 for the clipboard — but nothing has been compiled
+  or run there, so "portable" is a property of the source and not a claim about
+  a binary. `./dev bundle` is macOS-only on purpose and has no counterpart.
 - **A diff cache keyed by blob id.** Acquisition now yields the pair of object ids
   that produced a diff, and a blob never changes, so the cache is possible. It is
   not built.
