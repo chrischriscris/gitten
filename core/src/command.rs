@@ -43,6 +43,14 @@ use std::fmt;
 /// Deliberately small: what a keyboard-first app binds, and nothing else. A key
 /// with no variant here is one no client can report anyway, because each of them
 /// has to map its own platform's event onto this.
+///
+/// **The wheel is in here**, which looks like an exception and is the rule: a
+/// notch is a control every client can report, it takes modifiers the way a key
+/// does, and what it should *do* is exactly as much a matter of taste as what
+/// `j` should do. Kept out, it would be a `match` in each client deciding that
+/// the wheel scrolls — a keymap the client owned alone, with no line in
+/// `plait.toml` and no row on the help screen. A mouse *position* is another
+/// matter and is not a key: it belongs to whatever was clicked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Code {
     Char(char),
@@ -60,6 +68,8 @@ pub enum Code {
     Backspace,
     Delete,
     Esc,
+    WheelUp,
+    WheelDown,
 }
 
 impl Code {
@@ -81,6 +91,8 @@ impl Code {
             Code::Backspace => "backspace".into(),
             Code::Delete => "delete".into(),
             Code::Esc => "esc".into(),
+            Code::WheelUp => "wheelup".into(),
+            Code::WheelDown => "wheeldown".into(),
         }
     }
 
@@ -101,6 +113,8 @@ impl Code {
             "backspace" => Code::Backspace,
             "delete" | "del" => Code::Delete,
             "esc" | "escape" => Code::Esc,
+            "wheelup" => Code::WheelUp,
+            "wheeldown" => Code::WheelDown,
             _ => {
                 let mut chars = s.chars();
                 let c = chars.next()?;
@@ -309,6 +323,13 @@ impl Keymap {
         bind(GLOBAL, "pagedown", "view.page-down");
         bind(GLOBAL, "ctrl-u", "view.page-up");
         bind(GLOBAL, "pageup", "view.page-up");
+        // vi's, and the pair a wheel resolves to as well: moving the view is a
+        // different verb from moving the cursor, so it is a different command
+        // and not a modifier on `view.down`.
+        bind(GLOBAL, "ctrl-e", "view.scroll-down");
+        bind(GLOBAL, "ctrl-y", "view.scroll-up");
+        bind(GLOBAL, "wheeldown", "view.scroll-down");
+        bind(GLOBAL, "wheelup", "view.scroll-up");
         // `g`/`G` and not `gg`, so nothing in the shipped map is a prefix of
         // anything else and the whole thing resolves on one key.
         bind(GLOBAL, "g", "view.top");
@@ -460,6 +481,8 @@ impl Commands {
             ("view.up", "one row up"),
             ("view.page-down", "a screenful down"),
             ("view.page-up", "a screenful up"),
+            ("view.scroll-down", "the view down, not the cursor"),
+            ("view.scroll-up", "the view up, not the cursor"),
             ("view.top", "the first row"),
             ("view.bottom", "the last row"),
             ("view.left", "scroll the text left"),
@@ -558,6 +581,16 @@ mod tests {
         assert_eq!(k.resolve(&modes, &keys("ctrl-d")), Resolve::Run("view.page-down"));
         assert_eq!(k.resolve(&modes, &keys("G")), Resolve::Run("view.bottom"));
         assert_eq!(k.resolve(&modes, &keys("z")), Resolve::None);
+    }
+
+    #[test]
+    fn the_wheel_is_a_key_like_any_other() {
+        let k = Keymap::builtin();
+        let modes = Modes::new();
+        assert_eq!(k.resolve(&modes, &keys("wheeldown")), Resolve::Run("view.scroll-down"));
+        // Round-trips, so `./dev config` writes a line that parses back.
+        assert_eq!(Key::parse("wheelup").unwrap().to_string(), "wheelup");
+        assert_eq!(Key::parse("ctrl-wheeldown").unwrap().to_string(), "ctrl-wheeldown");
     }
 
     #[test]

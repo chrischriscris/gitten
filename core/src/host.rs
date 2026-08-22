@@ -16,6 +16,7 @@ use crate::differ::Differs;
 use crate::font::Font;
 use crate::syntax::Highlighters;
 use crate::theme::{Theme, Themes};
+use crate::view::Scrolling;
 use crate::wrap::Wraps;
 
 pub struct Host {
@@ -41,6 +42,12 @@ pub struct Host {
     /// without knowing a window exists, and a terminal frontend wants the same
     /// three. What the frontend supplies is the column count.
     pub wrap: Wraps,
+    /// How far a scroll moves and how much lead the cursor keeps.
+    ///
+    /// Two numbers rather than a registry, because there is nothing here to swap
+    /// — a scroll is arithmetic, and what varies is only how much of it. Read by
+    /// whatever runs `view.scroll-down`, so a saved file changes the next notch.
+    pub view: Scrolling,
     /// Which command each key runs, per mode.
     ///
     /// On `Host` and not in a client for the reason the whole struct exists: a
@@ -89,6 +96,7 @@ impl Host {
             differ: Differs::builtin(),
             layout: "unified".into(),
             wrap: Wraps::builtin(),
+            view: Scrolling::default(),
             keys: Keymap::builtin(),
             commands: Commands::builtin(),
             theme: Theme::dark(),

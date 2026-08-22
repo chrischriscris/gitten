@@ -51,6 +51,7 @@ because it compiles in a second and its tests need no window.
 | `rows.rs` | a diff flattened to rows, the wrap index, the order table, the load path |
 | `runs.rs` | syntax tokens × intraline spans → one flat styled run list |
 | `select.rs` | what the mouse has selected: carets, the rows between them, and the copy |
+| `view.rs` | `Viewport`: the cursor, the top row, the margin, and scrolling that is not a cursor move |
 | `differ.rs` | the `Differ` trait, Histogram/Patience/Myers, whitespace relations, the indent heuristic, move detection, hunk assembly, routing |
 | `align.rs` | which removal sits opposite which addition, for a two-column view |
 | `prepared.rs` | a diff assembled into drawable rows: clip → intraline → syntax |
@@ -64,9 +65,11 @@ Four examples double as the headless test bench: `bench` (timings at fixture
 scale), `shape` (topology statistics), `verify` (lane-assignment invariants),
 `paint` (the diff view in ANSI).
 
-Four of these modules exist because a third client was written. `rows`, `runs`
+Five of these modules exist because a third client was written. `rows`, `runs`
 and `graph::Hues` each had two implementations in two clients before they had one
-here; `command` had none, and the keymap it replaced was three `match` statements
+here, and `view` had two in the *same* client — the terminal's diff and its
+commit list, one of which had already lost the name of its own margin. `command`
+had none, and the keymap it replaced was three `match` statements
 that could not agree — see [terminal.md](terminal.md) and
 [clients.md](clients.md).
 
@@ -129,7 +132,7 @@ The terminal. A cell grid, the presentations that fill it, and escape codes.
 | `screen.rs` | cells, ink, the pen, the two-buffer diff, and `print` |
 | `rows.rs` | the `Rows` seam, `Layouts`, `TextRows`, the shared row furniture |
 | `split.rs` | `SplitRows`, at half the width and with its own scroll |
-| `diff.rs` | the diff view: viewport, reflow, commands |
+| `diff.rs` | the diff view: the order table, reflow, commands |
 | `commits.rs` | the commit list, and the graph in box drawing |
 | `help.rs` | what the keys do, as a pure function of the keymap |
 | `term.rs` | the only module that touches `crossterm` |

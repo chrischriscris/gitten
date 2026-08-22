@@ -17,6 +17,7 @@ pub mod runs;
 pub mod select;
 pub mod syntax;
 pub mod theme;
+pub mod view;
 pub mod wrap;
 
 // ---------------------------------------------------------------- commit log

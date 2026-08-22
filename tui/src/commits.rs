@@ -38,6 +38,7 @@ use crate::screen::{Ink, Pen, Screen};
 use plait_core::graph::{lane_count, Hues, MAX_LANES};
 use plait_core::host::Host;
 use plait_core::theme::{Rgb, Theme};
+use plait_core::view::Viewport;
 use plait_core::{assign_lanes, initials, Commit, GraphRow};
 
 /// Columns per lane: the glyph, then the gap a connector runs through.
@@ -165,10 +166,12 @@ pub struct Commits {
     /// in a different column on every row is a list the eye cannot scan. So the
     /// gutter is one width and it is this one.
     gutter: usize,
-    height: usize,
     cols: usize,
-    top: usize,
-    cursor: usize,
+    /// The cursor, the top row and the height. [`plait_core::view::Viewport`]
+    /// and not a pair of fields, because the diff view needs the same ones and
+    /// two copies of a scroll rule drift — this one had already lost the name of
+    /// its own margin.
+    view: Viewport,
 }
 
 impl Commits {
@@ -191,17 +194,9 @@ impl Commits {
         // wide as its own lanes, and the trunk-only rows of a busy repository
         // are the majority.
         let gutter = draws.iter().map(|d| d.lanes * LANE_W).max().unwrap_or(0);
-        Self {
-            commits,
-            draws,
-            glyphs,
-            lanes,
-            gutter,
-            height: 0,
-            cols: 0,
-            top: 0,
-            cursor: 0,
-        }
+        let mut view = Viewport::new();
+        view.set_len(commits.len());
+        Self { commits, draws, glyphs, lanes, gutter, cols: 0, view }
     }
 
     pub fn len(&self) -> usize {
@@ -213,92 +208,73 @@ impl Commits {
     }
 
     pub fn cursor(&self) -> usize {
-        self.cursor
+        self.view.cursor()
     }
 
     pub fn top(&self) -> usize {
-        self.top
+        self.view.top()
     }
 
     /// The commit under the cursor, for whatever opens a diff from it.
     pub fn current(&self) -> Option<&Commit> {
-        self.commits.get(self.cursor)
+        self.commits.get(self.view.cursor())
     }
 
     pub fn resize(&mut self, cols: usize, height: usize) {
         self.cols = cols;
-        self.height = height;
-        self.follow();
+        self.view.set_height(height);
     }
 
     pub fn move_by(&mut self, by: isize) {
-        let last = self.commits.len().saturating_sub(1);
-        self.cursor = match by.is_negative() {
-            true => self.cursor.saturating_sub(by.unsigned_abs()),
-            false => (self.cursor + by as usize).min(last),
-        };
-        self.follow();
+        self.view.move_by(by);
     }
 
     pub fn down(&mut self) {
-        self.move_by(1);
+        self.view.down();
     }
 
     pub fn up(&mut self) {
-        self.move_by(-1);
+        self.view.up();
     }
 
     pub fn page(&mut self, pages: isize) {
-        let step = self.height.saturating_sub(1).max(1) as isize;
-        self.move_by(pages * step);
+        self.view.page(pages);
+    }
+
+    /// Scrolls without moving the cursor further than it has to go. The wheel.
+    pub fn scroll_y(&mut self, by: isize) {
+        self.view.scroll_by(by);
+    }
+
+    /// How much lead the cursor keeps at the edge. `[view] scrolloff`.
+    pub fn set_scrolloff(&mut self, rows: usize) {
+        self.view.set_scrolloff(rows);
     }
 
     pub fn to_top(&mut self) {
-        self.cursor = 0;
-        self.follow();
+        self.view.to_top();
     }
 
     pub fn to_bottom(&mut self) {
-        self.cursor = self.commits.len().saturating_sub(1);
-        self.follow();
+        self.view.to_bottom();
     }
 
     /// Puts a saved row on screen, for a session restored across a restart.
     pub fn go_to(&mut self, row: usize) {
-        self.cursor = row.min(self.commits.len().saturating_sub(1));
-        self.follow();
-    }
-
-    fn follow(&mut self) {
-        if self.height == 0 {
-            self.top = self.cursor;
-            return;
-        }
-        let pad = match self.height > 2 * 3 + 1 {
-            true => 3,
-            false => 0,
-        };
-        self.top = self.top.min(self.commits.len().saturating_sub(1));
-        if self.cursor < self.top + pad {
-            self.top = self.cursor.saturating_sub(pad);
-        }
-        if self.cursor + pad > self.top + self.height.saturating_sub(1) {
-            self.top = (self.cursor + pad + 1).saturating_sub(self.height);
-        }
-        self.top = self.top.min(self.commits.len().saturating_sub(self.height));
+        self.view.go_to(row);
     }
 
     /// Draws the visible rows into `screen`, starting at row `y`.
     pub fn paint(&self, screen: &mut Screen, y: usize, host: &Host) {
         let theme = &host.theme;
         let blank = Ink::new(theme.chrome.dim, theme.chrome.bg);
-        for i in 0..self.height {
+        for i in 0..self.view.height() {
             let row = y + i;
-            let Some(index) = Some(self.top + i).filter(|n| *n < self.commits.len()) else {
+            let Some(index) = self.view.row_at(i) else {
                 screen.row(row).wash(blank);
                 continue;
             };
-            let bg = match index == self.cursor {
+            let bg = match index == self.view.cursor() {
                 true => theme.chrome.selection_bg,
                 false => theme.chrome.bg,
             };
@@ -414,7 +390,7 @@ impl Commits {
     pub fn status(&self) -> String {
         let mut out = format!(
             "{}/{} · {} lanes",
-            (self.cursor + 1).min(self.commits.len()),
+            (self.view.cursor() + 1).min(self.commits.len()),
             self.commits.len(),
             self.lanes,
         );
@@ -502,10 +478,10 @@ r\x1frrrrrrr\x1f\x1fAda Lovelace\x1f1700000100\x1fRoot\x1e";
     }
 
     fn painted(c: &Commits, host: &Host) -> Vec<String> {
-        let mut screen = Screen::new(c.cols, c.height + 2);
+        let mut screen = Screen::new(c.cols, c.view.height() + 2);
         screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
         c.paint(&mut screen, 0, host);
-        (0..c.height).map(|y| screen.row_text(y)).collect()
+        (0..c.view.height()).map(|y| screen.row_text(y)).collect()
     }
 
     #[test]

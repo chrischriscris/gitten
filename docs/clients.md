@@ -123,6 +123,14 @@ So a client writes exactly two input-shaped things:
 Everything between is shared: the modes, the chords, the config file, the
 validation, and the help screen.
 
+**The wheel goes through the same pipe.** `Code::WheelUp` and `Code::WheelDown`
+are variants of the enum `j` is, so a notch resolves to `view.scroll-down` the
+way a keypress resolves to `view.down` — rebindable, on the help screen, and the
+same name in all three clients. Kept out of `Code`, it would have been a `match`
+in each client deciding that the wheel scrolls: three keymaps nobody could
+configure, which is the exact thing this module exists to prevent. A mouse
+*position* is not a key and is not here; it belongs to whatever was clicked.
+
 ### What `Keymap` will not do
 
 **Time.** `g` followed by `g` is a chord and `g` alone is a binding, and telling
@@ -187,7 +195,8 @@ Three, all cheap:
    `TextRows` and `SplitRows`, and neither clips, diffs, highlights or wraps
    anything: they hold a `core::rows::Flat` and draw it.
 3. **The same `plait.toml` drives all three.** `./dev config > plait.toml` then
-   start any of them; a colour, a differ, a wrap and now a keybinding all apply.
+   start any of them; a colour, a differ, a wrap, a keybinding and `[view]` all
+   apply.
 
 `./dev check` runs the first two by proxy — every crate's tests, then a real frame
 of each terminal view over real history, which is the cheapest thing that would

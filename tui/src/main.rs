@@ -42,10 +42,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const EXTRA: &str = "  --ascii        draw the graph without box-drawing characters
+  --no-mouse     leave the wheel to the terminal, and drag-select with it
 
   `?` lists every key, from the same keymap `plait.toml` writes. Colours and the
   keymap are re-read every time the file is saved.
 ";
+
 
 /// How often the loop wakes to notice a saved config file.
 ///
@@ -62,6 +64,7 @@ fn main() {
         true => Glyphs::ascii(),
         false => Glyphs::default(),
     };
+    let mouse = !cli::take_switch(start.take(), "--no-mouse");
 
     let started = match start.go() {
         Ok(started) => started,
@@ -73,7 +76,7 @@ fn main() {
     // The panic hook before the terminal is touched: a panic between the two
     // would leave raw mode on with nothing to restore it.
     Term::guard();
-    let mut term = match Term::enter() {
+    let mut term = match Term::enter(mouse) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("plait-tui: could not take the terminal: {e}");
@@ -116,10 +119,22 @@ impl Screens {
         }
     }
 
+    /// A new size — and, on the same call, the margin the config file asks for.
+    ///
+    /// Both per frame, because both are a comparison when nothing changed and
+    /// because this is the one path that has the size *and* the live host. It is
+    /// what makes `[view] scrolloff` land on the next frame rather than the next
+    /// launch, like every other number in that file.
     fn resize(&mut self, cols: usize, rows: usize, host: &Host) {
         match self {
-            Screens::Commits(c) => c.resize(cols, rows),
-            Screens::Diff(d) => d.resize(cols, rows, host),
+            Screens::Commits(c) => {
+                c.set_scrolloff(host.view.scrolloff);
+                c.resize(cols, rows);
+            }
+            Screens::Diff(d) => {
+                d.set_scrolloff(host.view.scrolloff);
+                d.resize(cols, rows, host);
+            }
         }
     }
 
@@ -149,6 +164,8 @@ impl Screens {
                 "view.up" => c.up(),
                 "view.page-down" => c.page(1),
                 "view.page-up" => c.page(-1),
+                "view.scroll-down" => c.scroll_y(host.view.rows as isize),
+                "view.scroll-up" => c.scroll_y(-(host.view.rows as isize)),
                 "view.top" => c.to_top(),
                 "view.bottom" => c.to_bottom(),
                 // A commit list has nothing off the left edge to reach.
@@ -160,6 +177,8 @@ impl Screens {
                 "view.up" => d.up(),
                 "view.page-down" => d.page(1),
                 "view.page-up" => d.page(-1),
+                "view.scroll-down" => d.scroll_y(host.view.rows as isize),
+                "view.scroll-up" => d.scroll_y(-(host.view.rows as isize)),
                 "view.top" => d.to_top(),
                 "view.bottom" => d.to_bottom(),
                 "view.left" => d.scroll_x(-8),

@@ -171,7 +171,27 @@ Nothing in that file decides what a key *does*. The keymap is on `Host`, so
 actually bound because the help panel is a pure function of the registry. See
 [clients.md](clients.md) for the seam.
 
-Two things about it are decisions:
+Three things about it are decisions:
+
+**A wheel notch is a key.** `Code::WheelUp` and `Code::WheelDown` are variants of
+the same enum `j` is, so the wheel resolves through the keymap, appears on the
+`?` panel, and is rebindable in `plait.toml` — where the alternative was a
+`match` in this client deciding that the wheel scrolls, which is the keymap
+`core::command` exists to stop three clients each owning. What it runs is
+`view.scroll-down` / `view.scroll-up`, also on `ctrl-e` / `ctrl-y`, because
+moving the *view* is a different verb from moving the cursor and deserved a
+command rather than a flag on `view.down`. Where the pointer was is dropped:
+there is one scrollable thing on screen, and a coordinate nothing can route is
+one that gets routed wrong the day there are panes.
+
+**One row per event, and that is not a taste.** A terminal reports the wheel once
+per *line* of the platform's scroll delta, not once per notch — Ghostty on macOS
+sends three for one detent of a mouse — so a client that multiplies is
+multiplying a number the user already tuned in System Settings. Three rows an
+event measured as nine rows a notch here, which reads as a page. At one, plait
+scrolls at exactly the speed the terminal's own scrollback does. `[view] scroll`
+is the multiplier for anyone whose emulator sends one event per notch, where 3 is
+the usual answer.
 
 **It is idle at rest.** The loop blocks on input with a 150 ms timeout, and the
 timeout exists only so a saved `plait.toml` is noticed. Nothing redraws unless
@@ -239,9 +259,12 @@ to. A terminal does the same.
 - **`MarkdownRows`.** `core/examples/paint.rs` already draws the furniture in
   ANSI, so the terminal version is that function and a `Rows` impl — and the
   furniture itself is then a fourth thing to lift into `core`.
-- **`SCROLLOFF` in the config file.** Everything else in `plait.toml` reaches
-  this client now — see [clients.md](clients.md) — but how many rows of lead the
-  cursor keeps is still a constant in `diff.rs`.
+- **The mouse beyond the wheel.** A notch arrives as `Code::WheelUp` /
+  `WheelDown` and resolves through the keymap like any key, so `plait.toml`
+  rebinds it. A *click* is decoded and dropped: routing one means a hit test, and
+  a hit test means knowing which pane was clicked, which is the item below. Mode
+  1000 has to be on for the wheel either way, which costs drag-to-select — hold
+  `shift` (`option` on iTerm), or start with `--no-mouse`.
 - **`selection_bg` in the shell.** It was added to `ChromePalette` for this
   client because a hardcoded selection colour is not a seam, and it means the row
   the keyboard is on. No GPUI view draws *that* yet. The window's mouse selection

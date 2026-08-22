@@ -15,6 +15,18 @@
 //! framework already has" case. Cell diffing and colour are not — they are forty
 //! lines and they are how the views stay testable.
 //!
+//! # Taking the mouse takes the selection with it
+//!
+//! There is no tracking mode that reports the wheel and nothing else, so asking
+//! for a notch means asking for clicks — and an emulator that is forwarding
+//! clicks is no longer drag-selecting text with them. Every emulator worth using
+//! has the same override, `shift` (`option` on iTerm), and that is the whole of
+//! the mitigation; `--no-mouse` is the other half, for a terminal that does not.
+//!
+//! So: mode 1000 and mode 1006, and deliberately *not* 1002 or 1003. Those
+//! report motion — a packet per cell the pointer crosses, decoded and discarded,
+//! for a feature nothing here has. `EnableMouseCapture` turns on all of them.
+//!
 //! # Raw mode owns the keyboard
 //!
 //! `Ctrl-C` no longer kills the process, `Ctrl-Z` no longer suspends it and
@@ -24,7 +36,9 @@
 //! [`Term::guard`], because a raw-mode terminal left behind by a panicking
 //! process shows no echo and no newlines and looks like a hung machine.
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use crossterm::terminal;
 use plait_core::command::{Code, Key};
 use std::io::{self, BufWriter, Stdout, Write};
@@ -39,10 +53,23 @@ use std::time::Duration;
 /// on a second platform writes this function and nothing else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Input {
+    /// A keypress — and a wheel notch, which [`Code`] holds a variant for and
+    /// which therefore needs nothing here. That is the point of it arriving as a
+    /// key: what a notch does is a line in `plait.toml` like everything else,
+    /// and this enum stays a list of things that happened rather than a list of
+    /// things to do.
     Key(Key),
     /// The terminal changed size. Carries the new one, so nothing has to ask.
     Resize(usize, usize),
 }
+
+/// Button tracking (1000) and SGR encoding (1006), and nothing else.
+///
+/// 1006 because the default encoding puts the coordinates in single bytes and
+/// dies past column 223, which is a normal width for a window on a normal
+/// screen. Neither of them is 1002 or 1003; see the note at the top of the file.
+const MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1006h";
+const MOUSE_OFF: &[u8] = b"\x1b[?1006l\x1b[?1000l";
 
 /// The terminal, in the state a full-screen app needs it.
 ///
@@ -56,13 +83,20 @@ pub struct Term {
 }
 
 impl Term {
-    pub fn enter() -> io::Result<Self> {
+    /// Enters, and asks for the wheel if `mouse` is set.
+    ///
+    /// The wheel is a request and not a given because taking it takes
+    /// drag-to-select with it — see the note at the top of this file.
+    pub fn enter(mouse: bool) -> io::Result<Self> {
         terminal::enable_raw_mode()?;
         let mut out = BufWriter::new(io::stdout());
         // Alternate screen first, then hide the cursor: the other order hides
         // the cursor on the *primary* screen and leaves it hidden there if the
         // next call fails.
         out.write_all(b"\x1b[?1049h\x1b[?25l")?;
+        if mouse {
+            out.write_all(MOUSE_ON)?;
+        }
         out.flush()?;
         Ok(Self { out, entered: true })
     }
@@ -78,6 +112,11 @@ impl Term {
             return;
         }
         self.entered = false;
+        // The mouse off unconditionally: a terminal left in a tracking mode
+        // prints `<35;61;9M` at the shell every time the pointer moves, and
+        // asking whether we turned it on is one more thing to get wrong on the
+        // path that exists to leave nothing behind.
+        let _ = self.out.write_all(MOUSE_OFF);
         let _ = self.out.write_all(b"\x1b[?25h\x1b[?1049l");
         let _ = self.out.flush();
         let _ = terminal::disable_raw_mode();
@@ -94,6 +133,7 @@ impl Term {
         std::panic::set_hook(Box::new(move |info| {
             let _ = terminal::disable_raw_mode();
             let mut out = io::stdout();
+            let _ = out.write_all(MOUSE_OFF);
             let _ = out.write_all(b"\x1b[?25h\x1b[?1049l");
             let _ = out.flush();
             previous(info);
@@ -123,11 +163,11 @@ impl Term {
 
     /// The next input, or `None` if nothing arrived within `timeout`.
     ///
-    /// Anything that is not a keypress or a resize — a mouse move, a focus
-    /// change, a bracketed paste — is skipped rather than surfaced, so a caller
-    /// gets `None` on a timeout and nothing else. Key *release* events are
-    /// skipped too: terminals with the kitty protocol on report both, and acting
-    /// on each is every binding firing twice.
+    /// Anything that is not a keypress, a wheel notch or a resize — a click, a
+    /// focus change, a bracketed paste — is skipped rather than surfaced, so a
+    /// caller gets `None` on a timeout and nothing else. Key *release* events
+    /// are skipped too: terminals with the kitty protocol on report both, and
+    /// acting on each is every binding firing twice.
     pub fn poll(timeout: Duration) -> io::Result<Option<Input>> {
         if !event::poll(timeout)? {
             return Ok(None);
@@ -144,10 +184,11 @@ impl Drop for Term {
 
 /// Which events are inputs at all.
 ///
-/// Anything that is not a keypress or a resize — a mouse move, a focus change, a
-/// bracketed paste — is dropped, so a caller sees `None` for a timeout and for
-/// noise alike. Key *release* events are dropped too: terminals with the kitty
-/// protocol on report both, and acting on each is every binding firing twice.
+/// Anything that is not a keypress, a wheel notch or a resize — a click, a focus
+/// change, a bracketed paste — is dropped, so a caller sees `None` for a timeout
+/// and for noise alike. Key *release* events are dropped too: terminals with the
+/// kitty protocol on report both, and acting on each is every binding firing
+/// twice.
 ///
 /// Separate from [`Term::poll`] so it can be tested without a terminal, which is
 /// the same reason every other module in this crate can be.
@@ -155,8 +196,34 @@ fn translate_event(event: Event) -> Option<Input> {
     match event {
         Event::Resize(w, h) => Some(Input::Resize(w as usize, h as usize)),
         Event::Key(k) if k.kind != KeyEventKind::Release => translate(k),
+        Event::Mouse(m) => wheel(m),
         _ => None,
     }
+}
+
+/// A wheel notch as the key it is.
+///
+/// Where it happened is dropped, and that is not laziness: this client has one
+/// scrollable thing on screen, and a coordinate nothing can route is a
+/// coordinate that will be routed wrong the day there are panes. It comes back
+/// then, as a hit test, and not as a field nobody reads.
+///
+/// A click is dropped too. Mode 1000 reports them because there is no mode that
+/// reports only the wheel, and dropping them here is what keeps "the mouse does
+/// nothing" true rather than half-true.
+fn wheel(m: MouseEvent) -> Option<Input> {
+    let code = match m.kind {
+        MouseEventKind::ScrollUp => Code::WheelUp,
+        MouseEventKind::ScrollDown => Code::WheelDown,
+        _ => return None,
+    };
+    let mods = m.modifiers;
+    Some(Input::Key(Key::new(
+        code,
+        mods.contains(KeyModifiers::CONTROL),
+        mods.contains(KeyModifiers::ALT),
+        mods.contains(KeyModifiers::SHIFT),
+    )))
 }
 
 /// crossterm's event into `core`'s key. The whole of what this module is for.
@@ -213,6 +280,28 @@ mod tests {
             Some(Input::Key(k)) => Some(k),
             _ => None,
         }
+    }
+
+    #[test]
+    fn a_wheel_notch_becomes_a_key_and_a_click_becomes_nothing() {
+        let notch = |kind| {
+            translate_event(Event::Mouse(MouseEvent {
+                kind,
+                column: 4,
+                row: 9,
+                modifiers: KeyModifiers::NONE,
+            }))
+        };
+        let down = Some(Input::Key(Key::plain(Code::WheelDown)));
+        assert_eq!(notch(MouseEventKind::ScrollDown), down);
+        assert_eq!(notch(MouseEventKind::ScrollUp), Some(Input::Key(Key::plain(Code::WheelUp))));
+        // Mode 1000 reports these because no mode reports only the wheel.
+        assert_eq!(notch(MouseEventKind::Down(event::MouseButton::Left)), None);
+        assert_eq!(notch(MouseEventKind::Moved), None);
+        // And the whole point of it being a key: the shipped map already binds it.
+        let k = Keymap::builtin();
+        let press = [Key::plain(Code::WheelDown)];
+        assert_eq!(k.resolve(&Modes::new(), &press), Resolve::Run("view.scroll-down"));
     }
 
     #[test]

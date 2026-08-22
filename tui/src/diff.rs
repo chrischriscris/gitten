@@ -15,14 +15,13 @@
 //! would be one `cli/` would have to duplicate. When dispatch lands these are
 //! what it binds to.
 //!
-//! # Two positions, and why the cursor is the anchor
+//! # Where it is scrolled to is not this file's
 //!
-//! [`Diff::cursor`] is the row the keyboard is on; [`Diff::top`] is the first
-//! row drawn. The cursor moves and the viewport follows it, never the other way
-//! round — which is the lazygit model, and which also gives a reflow something
-//! honest to keep still: the *line you are on* still exists at a different
-//! width, so it is what a resize is anchored to. Anchoring the top row instead
-//! keeps a position you were not looking at.
+//! [`plait_core::view::Viewport`] holds the cursor and the top row and the rule
+//! relating them, because the commit list needs exactly the same pair and had
+//! its own copy. What is left here is the part that is genuinely a *diff*: the
+//! order table the rows are counted from, and the anchor a reflow keeps — the
+//! *line* the cursor is on, which exists at any width when row 4,102 does not.
 //!
 //! # What a resize costs
 //!
@@ -36,17 +35,9 @@ use crate::screen::{Ink, Screen};
 use plait_core::host::Host;
 use plait_core::rows::{expand, RowRef};
 use plait_core::runs::Run;
+use plait_core::view::Viewport;
 use plait_core::FileDiff;
 use std::time::Duration;
-
-/// How many rows of context to keep between the cursor and the edge when
-/// scrolling.
-///
-/// Three, because a cursor pinned to the last row of the screen gives you no
-/// idea what you are scrolling into — the same reason `scrolloff` exists in
-/// every editor. Not configurable yet, and it is exactly the kind of number that
-/// belongs in `plait.toml` when the terminal frontend reads one.
-const SCROLLOFF: usize = 3;
 
 pub struct Diff {
     /// The parsed diff, kept so a layout change can rebuild the rows.
@@ -82,9 +73,8 @@ pub struct Diff {
     /// not cross a column boundary compares equal here and stops.
     applied: (usize, &'static str),
     cols: usize,
-    height: usize,
-    top: usize,
-    cursor: usize,
+    /// The cursor, the top row and the height, and nothing else about them.
+    view: Viewport,
     /// Columns of text scrolled off the left edge. Only reachable with wrapping
     /// off, because with it on there is nothing off the edge to reach.
     shift: usize,
@@ -128,9 +118,7 @@ impl Diff {
             headers: Vec::new(),
             applied: (usize::MAX, ""),
             cols: 0,
-            height: 0,
-            top: 0,
-            cursor: 0,
+            view: Viewport::new(),
             shift: 0,
             intraline: Duration::ZERO,
             syntax: Duration::ZERO,
@@ -159,9 +147,9 @@ impl Diff {
         // The width has to be re-applied: the presentations are new objects and
         // have never been told how wide they are.
         self.applied = (usize::MAX, "");
-        self.cursor = ((self.order.len() as f32 * at) as usize).min(self.rows().saturating_sub(1));
+        self.view.set_len(self.order.len());
+        self.view.go_to_fraction(at);
         self.reflow(host);
-        self.follow();
     }
 
     // ------------------------------------------------------------------ layout
@@ -171,9 +159,8 @@ impl Diff {
     /// nothing did.
     pub fn resize(&mut self, cols: usize, height: usize, host: &Host) {
         self.cols = cols;
-        self.height = height;
+        self.view.set_height(height);
         self.reflow(host);
-        self.follow();
     }
 
     /// Re-expands the rows for the current width and wrap, keeping the line the
@@ -203,12 +190,13 @@ impl Diff {
         if !changed {
             return;
         }
-        let anchor = self.order.get(self.cursor).copied();
+        let anchor = self.order.get(self.view.cursor()).copied();
         let built = expand(&self.order, &self.owners, anchor);
         self.order = built.order;
         self.widest = built.widest;
         self.index_headers();
-        self.cursor = built.anchor.min(self.rows().saturating_sub(1));
+        self.view.set_len(self.order.len());
+        self.view.go_to(built.anchor);
         // A wrapped diff has nothing off the left edge to reach.
         if wrap.breaks_lines() {
             self.shift = 0;
@@ -246,53 +234,49 @@ impl Diff {
     }
 
     pub fn cursor(&self) -> usize {
-        self.cursor
+        self.view.cursor()
     }
 
     pub fn top(&self) -> usize {
-        self.top
+        self.view.top()
     }
 
     pub fn shift(&self) -> usize {
         self.shift
     }
 
-    /// Moves the cursor `by` rows, clamping at both ends.
-    ///
-    /// Signed, so one method is `j`, `k`, `Ctrl-D` and `Ctrl-U`. Clamping rather
-    /// than wrapping: a list that jumps from the last row to the first loses
-    /// your place by the whole diff.
     pub fn move_by(&mut self, by: isize) {
-        let last = self.rows().saturating_sub(1);
-        self.cursor = match by.is_negative() {
-            true => self.cursor.saturating_sub(by.unsigned_abs()),
-            false => (self.cursor + by as usize).min(last),
-        };
-        self.follow();
+        self.view.move_by(by);
     }
 
     pub fn down(&mut self) {
-        self.move_by(1);
+        self.view.down();
     }
 
     pub fn up(&mut self) {
-        self.move_by(-1);
+        self.view.up();
     }
 
-    /// A screenful, less one row of overlap so the eye has something to land on.
     pub fn page(&mut self, pages: isize) {
-        let step = self.height.saturating_sub(1).max(1) as isize;
-        self.move_by(pages * step);
+        self.view.page(pages);
+    }
+
+    /// Scrolls without moving the cursor further than it has to go. The wheel.
+    pub fn scroll_y(&mut self, by: isize) {
+        self.view.scroll_by(by);
+    }
+
+    /// How much lead the cursor keeps at the edge. `[view] scrolloff`.
+    pub fn set_scrolloff(&mut self, rows: usize) {
+        self.view.set_scrolloff(rows);
     }
 
     pub fn to_top(&mut self) {
-        self.cursor = 0;
-        self.follow();
+        self.view.to_top();
     }
 
     pub fn to_bottom(&mut self) {
-        self.cursor = self.rows().saturating_sub(1);
-        self.follow();
+        self.view.to_bottom();
     }
 
     /// Moves the cursor to the header of the next or previous file.
@@ -304,20 +288,18 @@ impl Diff {
     pub fn jump_file(&mut self, by: isize) {
         // Binary search rather than a scan: a 5,953-file diff is a realistic
         // input and this is a keypress.
+        let cursor = self.view.cursor();
         let target = match by.is_negative() {
             true => self
                 .headers
-                .partition_point(|&h| h < self.cursor)
+                .partition_point(|&h| h < cursor)
                 .checked_sub(1)
                 .and_then(|i| self.headers.get(i))
                 .copied(),
-            false => {
-                self.headers.get(self.headers.partition_point(|&h| h <= self.cursor)).copied()
-            }
+            false => self.headers.get(self.headers.partition_point(|&h| h <= cursor)).copied(),
         };
         if let Some(t) = target {
-            self.cursor = t;
-            self.follow();
+            self.view.go_to(t);
         }
     }
 
@@ -336,34 +318,6 @@ impl Diff {
             true => self.shift.saturating_sub(by.unsigned_abs()),
             false => (self.shift + by as usize).min(bound),
         };
-    }
-
-    /// Keeps the cursor on screen, with [`SCROLLOFF`] rows of lead where there
-    /// is room for it.
-    fn follow(&mut self) {
-        if self.height == 0 {
-            self.top = self.cursor;
-            return;
-        }
-        // Half a screen or less: the margin would pin the cursor to the middle
-        // and make every keypress scroll, so it is dropped rather than scaled.
-        let pad = match self.height > 2 * SCROLLOFF + 1 {
-            true => SCROLLOFF,
-            false => 0,
-        };
-        let last = self.rows().saturating_sub(1);
-        self.top = self.top.min(last);
-        if self.cursor < self.top + pad {
-            self.top = self.cursor.saturating_sub(pad);
-        }
-        let bottom = self.top + self.height.saturating_sub(1);
-        if self.cursor + pad > bottom {
-            self.top = (self.cursor + pad + 1).saturating_sub(self.height);
-        }
-        // Never scrolled past the end: a screen of blank rows below a short diff
-        // is a scroll position that says nothing.
-        let max_top = self.rows().saturating_sub(self.height);
-        self.top = self.top.min(max_top);
     }
 
     // ------------------------------------------------------------- the registries
@@ -413,7 +367,6 @@ impl Diff {
         }
         self.wrap = index;
         self.reflow(host);
-        self.follow();
     }
 
     /// Moves to the next wrap.
@@ -430,10 +383,7 @@ impl Diff {
     }
 
     fn progress(&self) -> f32 {
-        match self.order.is_empty() {
-            true => 0.0,
-            false => self.cursor as f32 / self.order.len() as f32,
-        }
+        self.view.progress()
     }
 
     // ------------------------------------------------------------------ drawing
@@ -446,14 +396,14 @@ impl Diff {
     /// frames so that drawing a row allocates nothing.
     pub fn paint(&self, screen: &mut Screen, y: usize, host: &Host, out: &mut Vec<Run>) {
         let blank = Ink::new(host.theme.chrome.dim, host.theme.chrome.bg);
-        for i in 0..self.height {
+        for i in 0..self.view.height() {
             let row = y + i;
-            match self.order.get(self.top + i) {
+            match self.view.row_at(i).and_then(|n| self.order.get(n)) {
                 Some(r) => {
                     let at = Frame {
                         host,
                         shift: self.shift,
-                        current: self.top + i == self.cursor,
+                        current: self.view.row_at(i) == Some(self.view.cursor()),
                     };
                     let mut pen = screen.row(row);
                     self.owners[r.owner as usize]
@@ -475,7 +425,7 @@ impl Diff {
     pub fn status(&self, host: &Host) -> String {
         let mut out = format!(
             "{}/{} · {} files · {} · {}",
-            (self.cursor + 1).min(self.rows()),
+            (self.view.cursor() + 1).min(self.rows()),
             self.rows(),
             self.file_count,
             self.layout_name(),

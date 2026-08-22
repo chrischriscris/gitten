@@ -182,15 +182,46 @@ pub fn apply(host: &mut Host, text: &str) -> Vec<String> {
     if let Some(diff) = doc.get("diff") {
         apply_diff(host, diff, &mut warn);
     }
+    if let Some(view) = doc.get("view") {
+        apply_view(host, view, &mut warn);
+    }
     if let Some(keys) = doc.get("keys") {
         apply_keys(host, keys, &mut warn);
     }
     for key in doc.keys() {
-        if !matches!(key.as_str(), "font" | "theme" | "diff" | "keys") {
+        if !matches!(key.as_str(), "font" | "theme" | "diff" | "view" | "keys") {
             warn.push(format!("config: unknown section [{key}]"));
         }
     }
     warn
+}
+
+/// `[view]` — how far a scroll goes, and how much lead the cursor keeps.
+///
+/// Both apply to the *next* keypress rather than on the next launch: they are
+/// read where they are used and nothing is derived from them, which is what
+/// makes tuning `scroll` a matter of saving the file and turning the wheel.
+fn apply_view(host: &mut Host, value: &toml::Value, warn: &mut Vec<String>) {
+    let Some(t) = value.as_table() else {
+        warn.push("config: [view] is not a table".into());
+        return;
+    };
+    for (key, v) in t {
+        match key.as_str() {
+            // Zero is not allowed where it would mean "the wheel does nothing":
+            // that is `"wheeldown" = ""` in `[keys]`, which says so.
+            "scroll" => match v.as_integer() {
+                Some(n) if (1..=100).contains(&n) => host.view.rows = n as usize,
+                _ => warn.push("config: view.scroll must be between 1 and 100 rows".into()),
+            },
+            // Zero *is* allowed here, and means a cursor that reaches the edge.
+            "scrolloff" => match v.as_integer() {
+                Some(n) if (0..=50).contains(&n) => host.view.scrolloff = n as usize,
+                _ => warn.push("config: view.scrolloff must be between 0 and 50 rows".into()),
+            },
+            _ => warn.push(format!("config: unknown key view.{key}")),
+        }
+    }
 }
 
 /// `[keys]` — which command each key runs.
@@ -625,6 +656,14 @@ pub fn dump(host: &Host) -> String {
         host.wrap.selected(),
         host.wrap.names().join(", ")
     ));
+
+    out.push_str("# How far a scroll goes. `scroll` is rows per notch of the wheel and per\n");
+    out.push_str("# `ctrl-e`/`ctrl-y` — one, because a terminal already reports the wheel once\n");
+    out.push_str("# per line of however fast the platform says you scrolled. `scrolloff` is the\n");
+    out.push_str("# lead the cursor keeps at the edge, and 0 lets it reach the last row.\n");
+    out.push_str("[view]\n");
+    out.push_str(&format!("scroll = {}\n", host.view.rows));
+    out.push_str(&format!("scrolloff = {}\n\n", host.view.scrolloff));
 
     let t = &host.theme;
     out.push_str("# `name` picks one of the registered palettes and everything below is applied\n");
@@ -1141,6 +1180,8 @@ mod tests {
         original.differ.indent_heuristic = false;
         original.layout = "split".into();
         original.wrap.select("char");
+        original.view.rows = 4;
+        original.view.scrolloff = 0;
         original.theme.rebuild();
 
         let text = dump(&original);
@@ -1159,6 +1200,25 @@ mod tests {
         assert!(!restored.differ.indent_heuristic);
         assert_eq!(restored.layout, "split", "diff.layout did not survive");
         assert_eq!(restored.wrap.selected(), "char", "diff.wrap did not survive");
+        assert_eq!(restored.view.rows, 4, "view.scroll did not survive");
+        assert_eq!(restored.view.scrolloff, 0, "view.scrolloff did not survive");
+    }
+
+    #[test]
+    fn the_scroll_step_is_data_and_a_bad_one_is_named() {
+        let mut h = host();
+        assert!(apply(&mut h, "[view]\nscroll = 3\nscrolloff = 0\n").is_empty());
+        assert_eq!(h.view.rows, 3);
+        // Zero lead is a cursor that reaches the last row, and is allowed.
+        assert_eq!(h.view.scrolloff, 0);
+        // A wheel that moves nothing is `"wheeldown" = ""` in [keys], not a zero
+        // here — so this is a mistake and is said so.
+        let warn = apply(&mut h, "[view]\nscroll = 0\n");
+        assert_eq!(warn.len(), 1, "{warn:?}");
+        assert!(warn[0].contains("view.scroll"), "{warn:?}");
+        assert_eq!(h.view.rows, 3, "a rejected value left the old one alone");
+        let warn = apply(&mut h, "[view]\nspeed = 3\n");
+        assert!(warn[0].contains("unknown key view.speed"), "{warn:?}");
     }
 
     #[test]
