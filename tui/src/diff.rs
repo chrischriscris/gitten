@@ -9,11 +9,18 @@
 //! # No events in here
 //!
 //! Every method is a *command*: [`Diff::down`], [`Diff::page`],
-//! [`Diff::next_file`], [`Diff::cycle_layout`]. Nothing in this file knows what
-//! a keypress is, and the keymap is not here — because command dispatch and the
-//! mode stack belong on `Host` and are not built yet, and a keymap written here
-//! would be one `cli/` would have to duplicate. When dispatch lands these are
-//! what it binds to.
+//! [`Diff::jump_file`], [`Diff::cycle_layout`]. Nothing in this file knows what
+//! a keypress is, and the keymap is not here — because a keymap written here
+//! would be one `cli/` would have to duplicate. `main.rs` resolves a key to a
+//! command name through `core::command` and calls the method it names.
+//!
+//! The mouse is the same rule with one more step. [`Diff::press`],
+//! [`Diff::drag`] and [`Diff::release`] take a column and a row of the *body*
+//! and no event type at all: the assembly owns the title bar and the status
+//! line, so it subtracts them, and what arrives here is already a place in this
+//! view. Below that, which text and which byte is the presentation's — see
+//! [`crate::rows::Rows::hit`] — and everything a selection *means* is
+//! [`plait_core::select`], shared with the window.
 //!
 //! # Where it is scrolled to is not this file's
 //!
@@ -32,9 +39,11 @@
 
 use crate::rows::{assemble, Frame, Layouts, Rows};
 use crate::screen::{Ink, Screen};
+use crate::scrollbar::{self, Bar};
 use plait_core::host::Host;
 use plait_core::rows::{expand, RowRef};
 use plait_core::runs::Run;
+use plait_core::select::{self, Caret, RowId, Selection, Text as _};
 use plait_core::view::Viewport;
 use plait_core::FileDiff;
 use std::time::Duration;
@@ -81,6 +90,32 @@ pub struct Diff {
     intraline: Duration,
     syntax: Duration,
     file_count: usize,
+    /// What the mouse has selected, or nothing.
+    ///
+    /// The model is [`plait_core::select`] and this is the only state this view
+    /// keeps for it: which rows are covered, what a wrapped line copies and where
+    /// a word ends are all answers about a *diff* and are `core`'s, shared with
+    /// the window.
+    sel: Option<Selection>,
+    /// True between a press and a release on the text, so a motion event that
+    /// belongs to nothing does not extend a selection made minutes ago.
+    dragging: bool,
+    /// Where in the scrollbar's thumb it was taken hold of, while it is held.
+    grabbed: Option<usize>,
+    bar: Bar,
+}
+
+/// Where every row's selectable text comes from, for [`plait_core::select`].
+///
+/// A wrapper rather than an impl on the vector, because the trait and the vector
+/// both belong to somebody else. Three lines is what this seam costs — the same
+/// three the window pays.
+struct Selectable<'a>(&'a [Box<dyn Rows>]);
+
+impl select::Text for Selectable<'_> {
+    fn text(&self, row: RowId, part: u16) -> Option<&str> {
+        self.0.get(row.0 as usize)?.selectable(row.1 as usize, part)
+    }
 }
 
 impl Diff {
@@ -123,6 +158,10 @@ impl Diff {
             intraline: Duration::ZERO,
             syntax: Duration::ZERO,
             file_count: 0,
+            sel: None,
+            dragging: false,
+            grabbed: None,
+            bar: Bar::default(),
         };
         view.rebuild(host, 0.0);
         view
@@ -136,6 +175,10 @@ impl Diff {
     /// A reflow *does* have that correspondence, which is why it anchors on the
     /// cursor's logical row instead.
     fn rebuild(&mut self, host: &Host, at: f32) {
+        // The rows are about to be somebody else's, so a selection anchored to
+        // one of them has nowhere to go: `resolve` would say so and there is no
+        // honest repair, because a layout change has no row correspondence.
+        self.sel = None;
         self.owners = self.layouts.build(self.current, host);
         let built = assemble(&self.files, host, &mut self.owners);
         self.order = built.ordered.order;
@@ -197,6 +240,11 @@ impl Diff {
         self.index_headers();
         self.view.set_len(self.order.len());
         self.view.go_to(built.anchor);
+        // Every caret caches the visual rows its line occupies, and a reflow
+        // moved all of them. Dropped rather than repaired when the row is gone.
+        if self.sel.as_mut().is_some_and(|s| !s.resolve(&self.order)) {
+            self.sel = None;
+        }
         // A wrapped diff has nothing off the left edge to reach.
         if wrap.breaks_lines() {
             self.shift = 0;
@@ -320,6 +368,201 @@ impl Diff {
         };
     }
 
+    // ---------------------------------------------------------------- the mouse
+
+    /// The glyphs the scrollbar is drawn with. `--ascii`, or an extension.
+    pub fn set_bar(&mut self, bar: Bar) {
+        self.bar = bar;
+    }
+
+    /// Which row and which byte of it a cell of the body is over.
+    ///
+    /// The one piece of a selection that is neither `core`'s nor a
+    /// presentation's: `core` does not know how tall the body is and a
+    /// presentation does not know where it starts. Everything below that — which
+    /// text, which byte — is [`Rows::hit`], because only the presentation knows
+    /// what it drew in front of its text.
+    fn locate(&self, col: usize, visual: usize) -> Option<(u16, Caret)> {
+        let r = *self.order.get(visual)?;
+        let rows = self.owners.get(r.owner as usize)?;
+        let hit = rows.hit(r.index as usize, r.seg as usize, col, self.shift)?;
+        // The visual rows this logical row occupies. The caret caches them so the
+        // render path never searches the order table, and they are free here:
+        // this row is `seg` into the run and the presentation knows how long the
+        // run is.
+        let first = visual - r.seg as usize;
+        let n = rows.rows(r.index as usize).max(1);
+        Some((hit.part, Caret { row: r.logical(), off: hit.off, at: first..first + n }))
+    }
+
+    /// A caret for the *free* end of a drag, which is one character further on
+    /// than the caret for a click.
+    ///
+    /// A cell has no right half to round away from, so pressing on a character
+    /// and dragging right would otherwise select up to but not including the
+    /// character under the pointer — off by one, all the way along, and visible.
+    /// Backwards it is the other way round, so the direction is asked first.
+    fn head(&self, col: usize, visual: usize) -> Option<(u16, Caret)> {
+        let (part, caret) = self.locate(col, visual)?;
+        let anchor = self.sel.as_ref()?.anchor();
+        match (caret.at.start, caret.off) >= (anchor.at.start, anchor.off) {
+            true => self.locate(col + 1, visual).or(Some((part, caret))),
+            false => Some((part, caret)),
+        }
+    }
+
+    /// A press in the body: the cursor moves there, and a selection starts.
+    ///
+    /// `row` is a row of the body, not of the terminal — whoever assembles the
+    /// screen owns the title bar and the status line and subtracts them. `clicks`
+    /// is 2 for a word and 3 for a whole row; `extend` is shift, which moves the
+    /// free end of what is already selected rather than starting again.
+    ///
+    /// A press on nothing selectable *clears*, which is the whole reason a fresh
+    /// [`Selection`] is empty until something extends it: a click has to be able
+    /// to mean "no longer selected".
+    pub fn press(&mut self, col: usize, row: usize, clicks: u8, extend: bool, host: &Host) {
+        if scrollbar::hit(col, self.cols, &self.view, host) {
+            let row = row.min(self.view.height().saturating_sub(1));
+            self.grabbed = Some(scrollbar::grab(&mut self.view, host, row));
+            return;
+        }
+        let Some(visual) = self.view.row_at(row) else {
+            self.sel = None;
+            return;
+        };
+        // The cursor follows the mouse: a click is a place, and everything a key
+        // does next — copy, jump, open — acts on the row the cursor is on.
+        self.view.go_to(visual);
+        let Some((part, caret)) = self.locate(col, visual) else {
+            self.sel = None;
+            return;
+        };
+        self.dragging = true;
+        let extend = extend && self.sel.as_ref().is_some_and(|s| s.part() == part);
+        // Before the selection is taken out of `self`: the free end of a shift
+        // click is one character further on than the caret, and which way that
+        // is depends on the anchor that is still in there.
+        let head = extend.then(|| self.head(col, visual)).flatten().map(|(_, c)| c);
+        self.sel = match (extend, clicks) {
+            (true, _) => {
+                let mut sel = self.sel.take().expect("extend implies a selection");
+                sel.extend(head.unwrap_or(caret));
+                Some(sel)
+            }
+            // Two clicks take the word under the caret, three take the row. What
+            // a word is made of is `core`'s: a terminal and a window must not
+            // disagree about what `foo(bar,` is.
+            (_, 2) => {
+                let text = self.row_text(caret.row, part).unwrap_or_default();
+                Some(span(part, &caret, select::word_at(&text, caret.off)))
+            }
+            (_, n) if n >= 3 => {
+                let len = self.row_text(caret.row, part).map_or(0, |t| t.len());
+                Some(span(part, &caret, 0..len))
+            }
+            _ => Some(Selection::new(part, caret)),
+        };
+    }
+
+    /// The pointer moved with the button down: the free end follows it.
+    ///
+    /// `row` is signed because a drag does not stop at the edge of the body — a
+    /// row above it scrolls up by that much and keeps selecting, which is what
+    /// dragging past the top of a page does everywhere else. Deliberately not a
+    /// clock: holding the pointer still outside the body does not keep scrolling,
+    /// because that needs a timer and this needs nothing.
+    ///
+    /// The **anchor's** part wins. A drag that crosses the divider of a
+    /// side-by-side diff stays in the column it started in and runs to that
+    /// column's edge, because the alternative is a paste with the old and the new
+    /// file interleaved.
+    pub fn drag(&mut self, col: usize, row: isize, host: &Host) {
+        if let Some(grabbed) = self.grabbed {
+            scrollbar::drag(&mut self.view, host, row.max(0) as usize, grabbed);
+            return;
+        }
+        if !self.dragging {
+            return;
+        }
+        let height = self.view.height() as isize;
+        let row = match row {
+            r if r < 0 => {
+                self.view.scroll_by(r);
+                0
+            }
+            r if r >= height => {
+                self.view.scroll_by(r - height + 1);
+                height.saturating_sub(1).max(0)
+            }
+            r => r,
+        };
+        let Some(visual) = self.view.row_at(row as usize) else { return };
+        let Some((part, mut caret)) = self.head(col, visual) else { return };
+        let Some(sel) = &self.sel else { return };
+        if part != sel.part() {
+            // Parts are laid out left to right, so a part further along than the
+            // anchor's means the pointer is past the end of the anchor's text.
+            caret.off = match part > sel.part() {
+                true => self.row_text(caret.row, sel.part()).map_or(0, |t| t.len()),
+                false => 0,
+            };
+        }
+        if let Some(sel) = &mut self.sel {
+            sel.extend(caret);
+        }
+    }
+
+    /// The button came up, wherever it came up. Ends a drag and lets go of the
+    /// scrollbar; the selection itself stays, because that is what it is for.
+    pub fn release(&mut self) {
+        self.dragging = false;
+        self.grabbed = None;
+    }
+
+    /// The text of one row, for a word or a whole-row selection.
+    fn row_text(&self, row: RowId, part: u16) -> Option<String> {
+        Selectable(&self.owners).text(row, part).map(str::to_string)
+    }
+
+    /// Whatever the mouse is holding, as text. Empty when nothing is selected.
+    pub fn selection(&self) -> String {
+        match &self.sel {
+            Some(sel) => sel.text(&self.order, &Selectable(&self.owners)),
+            None => String::new(),
+        }
+    }
+
+    /// What `copy.selection` copies: the selection, or the row the cursor is on
+    /// when there is none.
+    ///
+    /// The fallback is the point. A keyboard-first client where the copy key does
+    /// nothing until you have used the mouse is a client that does not copy, and
+    /// "this line" is the only other thing the key could sensibly mean.
+    pub fn copy_text(&self) -> String {
+        let text = self.selection();
+        if !text.is_empty() {
+            return text;
+        }
+        let src = Selectable(&self.owners);
+        self.order
+            .get(self.view.cursor())
+            .and_then(|r| src.text(r.logical(), 0))
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// `select.all`.
+    pub fn select_all(&mut self) {
+        self.sel = Selection::all(&self.order);
+    }
+
+    /// `select.none`. Says whether there was anything to drop, so `esc` can fall
+    /// through to whatever it means next.
+    pub fn select_none(&mut self) -> bool {
+        self.sel.take().is_some()
+    }
+
     // ------------------------------------------------------------- the registries
 
     pub fn layout_names(&self) -> Vec<&'static str> {
@@ -398,12 +641,15 @@ impl Diff {
         let blank = Ink::new(host.theme.chrome.dim, host.theme.chrome.bg);
         for i in 0..self.view.height() {
             let row = y + i;
-            match self.view.row_at(i).and_then(|n| self.order.get(n)) {
-                Some(r) => {
+            match self.view.row_at(i).and_then(|n| self.order.get(n).map(|r| (n, *r))) {
+                Some((n, r)) => {
                     let at = Frame {
                         host,
                         shift: self.shift,
-                        current: self.view.row_at(i) == Some(self.view.cursor()),
+                        current: n == self.view.cursor(),
+                        // Two integer comparisons per visible row, and no search
+                        // of the order table: see `plait_core::select::Caret::at`.
+                        sel: self.sel.as_ref().and_then(|s| s.at(n, r.logical())),
                     };
                     let mut pen = screen.row(row);
                     self.owners[r.owner as usize]
@@ -415,6 +661,9 @@ impl Diff {
                 None => screen.row(row).wash(blank),
             }
         }
+        // Last, and over the rows rather than beside them: a row's colour still
+        // runs to the right edge underneath it.
+        scrollbar::paint(screen, self.bar, self.cols.saturating_sub(1), y, &self.view, host);
     }
 
     /// One line describing what is on screen, for whatever draws a status bar.
@@ -446,6 +695,14 @@ impl Diff {
     pub fn timings(&self) -> (Duration, Duration) {
         (self.intraline, self.syntax)
     }
+}
+
+/// A selection over one byte range of one row: what a double or a triple click
+/// makes.
+fn span(part: u16, at: &Caret, bytes: std::ops::Range<usize>) -> Selection {
+    let mut sel = Selection::new(part, Caret { off: bytes.start, ..at.clone() });
+    sel.extend(Caret { off: bytes.end, ..at.clone() });
+    sel
 }
 
 #[cfg(test)]
@@ -730,6 +987,170 @@ mod tests {
         host.layout = "nonexistent".into();
         let d = Diff::new(diff(4), &host);
         assert_eq!(d.layout_index(), 0);
+    }
+
+    // ------------------------------------------------------------------- mouse
+
+    /// Three lines of one file, so a drag has somewhere to go.
+    fn text_diff() -> Vec<FileDiff> {
+        parse_unified_diff(
+            "diff --git a/a.rs b/a.rs\n@@ -1,3 +1,3 @@\n one two\n three four\n five six\n",
+        )
+    }
+
+    #[test]
+    fn a_click_moves_the_cursor_and_a_drag_selects_the_text_between() {
+        let (mut d, host) = view(text_diff(), 40, 20);
+        // Rows: 0 file, 1 hunk, 2..5 the lines. The text starts at column 8.
+        d.press(12, 2, 1, false, &host);
+        assert_eq!(d.cursor(), 2, "the cursor did not follow the click");
+        // Down to the middle of the next line: `two\nthree` — and the character
+        // under the pointer is included, which is the thing a cell grid gets
+        // wrong by default.
+        d.drag(12, 3, &host);
+        d.release();
+        assert_eq!(d.selection(), "two\nthree");
+    }
+
+    #[test]
+    fn a_drag_backwards_selects_the_same_text_as_a_drag_forwards() {
+        let (mut d, host) = view(text_diff(), 40, 20);
+        d.press(12, 2, 1, false, &host);
+        d.drag(16, 2, &host);
+        let forwards = d.selection();
+        assert_eq!(forwards, "two");
+        d.press(16, 2, 1, false, &host);
+        d.drag(12, 2, &host);
+        assert_eq!(d.selection(), forwards, "the anchor is not the start");
+    }
+
+    #[test]
+    fn two_clicks_take_a_word_and_three_take_the_row() {
+        let (mut d, host) = view(text_diff(), 40, 20);
+        d.press(10, 2, 2, false, &host);
+        assert_eq!(d.selection(), "one");
+        d.press(10, 2, 3, false, &host);
+        assert_eq!(d.selection(), "one two");
+    }
+
+    #[test]
+    fn shift_extends_what_is_already_selected() {
+        let (mut d, host) = view(text_diff(), 40, 20);
+        d.press(8, 2, 1, false, &host);
+        d.press(11, 3, 1, true, &host);
+        assert_eq!(d.selection(), "one two\nthre");
+    }
+
+    #[test]
+    fn a_press_on_nothing_selectable_clears_the_selection() {
+        let (mut d, host) = view(text_diff(), 40, 20);
+        d.press(10, 2, 2, false, &host);
+        assert!(!d.selection().is_empty());
+        // Past the end of a three-line diff: there is no row there.
+        d.press(10, 15, 1, false, &host);
+        assert_eq!(d.selection(), "");
+    }
+
+    #[test]
+    fn a_drag_past_the_bottom_scrolls_and_keeps_selecting() {
+        let (mut d, host) = view(diff(60), 40, 10);
+        d.press(10, 1, 1, false, &host);
+        let before = d.top();
+        d.drag(10, 14, &host);
+        assert!(d.top() > before, "the view did not follow the drag");
+        assert!(d.selection().lines().count() > 5, "{:?}", d.selection());
+        // ...and back up above the top.
+        d.drag(10, -20, &host);
+        assert_eq!(d.top(), 0);
+    }
+
+    #[test]
+    fn copying_with_nothing_selected_copies_the_row_the_cursor_is_on() {
+        // The fallback that makes `y` worth binding at all.
+        let (mut d, host) = view(text_diff(), 40, 20);
+        d.move_by(3);
+        assert_eq!(d.copy_text(), "three four");
+        d.press(10, 2, 2, false, &host);
+        assert_eq!(d.copy_text(), "one", "a selection wins over the cursor");
+    }
+
+    #[test]
+    fn a_click_selects_nothing_and_a_gesture_that_does_is_what_copy_on_select_sees() {
+        // The rule the whole feature rests on: `selection` is what the mouse
+        // holds and is empty after a click, so pointing at a line does not
+        // clobber the clipboard. `copy_text` is the key's fallback and is not.
+        let (mut d, host) = view(text_diff(), 40, 20);
+        d.press(12, 2, 1, false, &host);
+        d.release();
+        assert_eq!(d.selection(), "");
+        assert_eq!(d.copy_text(), "one two");
+        // A drag does select, and so does a double click without one.
+        d.press(12, 2, 1, false, &host);
+        d.drag(16, 2, &host);
+        d.release();
+        assert_eq!(d.selection(), "two");
+        d.press(9, 3, 2, false, &host);
+        d.release();
+        assert_eq!(d.selection(), "three");
+    }
+
+    #[test]
+    fn select_all_takes_the_whole_diff_and_none_gives_it_back() {
+        let (mut d, _) = view(text_diff(), 40, 20);
+        d.select_all();
+        let all = d.selection();
+        assert!(all.starts_with("a.rs"), "{all:?}");
+        assert!(all.ends_with("five six"), "{all:?}");
+        assert!(d.select_none());
+        assert_eq!(d.selection(), "");
+        assert!(!d.select_none(), "there was nothing left to drop");
+    }
+
+    #[test]
+    fn a_selection_survives_a_reflow_and_not_a_layout_change() {
+        // A reflow moves every visual row and the carets cache them, so this is
+        // the one place a stale selection would highlight the wrong line.
+        let long = format!(
+            "diff --git a/a.rs b/a.rs\n@@ -1,1 +1,1 @@\n{}",
+            (0..12).map(|i| format!(" line {i} {}\n", "padding ".repeat(6))).collect::<String>()
+        );
+        let (mut d, host) = view(parse_unified_diff(&long), 100, 20);
+        d.press(10, 6, 3, false, &host);
+        let before = d.selection();
+        assert!(!before.is_empty());
+        d.resize(40, 20, &host);
+        assert_eq!(d.selection(), before, "the selection followed the wrong line");
+        d.cycle_layout(&host);
+        assert_eq!(d.selection(), "", "a selection outlived the rows it was on");
+    }
+
+    #[test]
+    fn a_click_on_the_scrollbar_scrolls_and_does_not_select() {
+        let (mut d, host) = view(diff(200), 40, 10);
+        // The last column, half way down the track.
+        d.press(39, 5, 1, false, &host);
+        assert!(d.top() > 0, "the bar did not take the click");
+        assert_eq!(d.selection(), "", "the bar started a selection");
+        assert_eq!(d.cursor(), d.cursor().min(d.rows()));
+        d.drag(39, 9, &host);
+        assert_eq!(d.top(), d.rows() - 10, "the end of the track is the end of the list");
+        d.release();
+        // Once released, the bar is not holding the pointer any more.
+        let top = d.top();
+        d.drag(39, 0, &host);
+        assert_eq!(d.top(), top);
+    }
+
+    #[test]
+    fn the_scrollbar_is_only_where_the_config_file_says_it_is() {
+        let mut host = Host::new();
+        host.view.scrollbar = false;
+        let mut d = Diff::new(diff(200), &host);
+        d.resize(40, 10, &host);
+        d.press(39, 5, 1, false, &host);
+        assert_eq!(d.top(), 0, "a bar that is not drawn took a click");
+        // ...and the click reached the text instead.
+        assert_eq!(d.cursor(), 5);
     }
 
     #[test]

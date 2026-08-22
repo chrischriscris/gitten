@@ -185,11 +185,14 @@ pub fn apply(host: &mut Host, text: &str) -> Vec<String> {
     if let Some(view) = doc.get("view") {
         apply_view(host, view, &mut warn);
     }
+    if let Some(mouse) = doc.get("mouse") {
+        apply_mouse(host, mouse, &mut warn);
+    }
     if let Some(keys) = doc.get("keys") {
         apply_keys(host, keys, &mut warn);
     }
     for key in doc.keys() {
-        if !matches!(key.as_str(), "font" | "theme" | "diff" | "view" | "keys") {
+        if !matches!(key.as_str(), "font" | "theme" | "diff" | "view" | "mouse" | "keys") {
             warn.push(format!("config: unknown section [{key}]"));
         }
     }
@@ -219,7 +222,33 @@ fn apply_view(host: &mut Host, value: &toml::Value, warn: &mut Vec<String>) {
                 Some(n) if (0..=50).contains(&n) => host.view.scrolloff = n as usize,
                 _ => warn.push("config: view.scrolloff must be between 0 and 50 rows".into()),
             },
+            // A bool and not a width: what it looks like is the client's, and a
+            // number here would be a terminal's cell in a window's pixels.
+            "scrollbar" => match v.as_bool() {
+                Some(on) => host.view.scrollbar = on,
+                None => warn.push("config: view.scrollbar must be true or false".into()),
+            },
             _ => warn.push(format!("config: unknown key view.{key}")),
+        }
+    }
+}
+
+/// `[mouse]` — what the mouse does besides move the cursor.
+///
+/// Read where it is used, like `[view]`, so saving the file changes the next
+/// drag rather than the next launch.
+fn apply_mouse(host: &mut Host, value: &toml::Value, warn: &mut Vec<String>) {
+    let Some(t) = value.as_table() else {
+        warn.push("config: [mouse] is not a table".into());
+        return;
+    };
+    for (key, v) in t {
+        match key.as_str() {
+            "copy_on_select" => match v.as_bool() {
+                Some(on) => host.mouse.copy_on_select = on,
+                None => warn.push("config: mouse.copy_on_select must be true or false".into()),
+            },
+            _ => warn.push(format!("config: unknown key mouse.{key}")),
         }
     }
 }
@@ -661,9 +690,18 @@ pub fn dump(host: &Host) -> String {
     out.push_str("# `ctrl-e`/`ctrl-y` — one, because a terminal already reports the wheel once\n");
     out.push_str("# per line of however fast the platform says you scrolled. `scrolloff` is the\n");
     out.push_str("# lead the cursor keeps at the edge, and 0 lets it reach the last row.\n");
+    out.push_str("# `scrollbar` draws one beside a list too long to fit, and nothing when it fits.\n");
     out.push_str("[view]\n");
     out.push_str(&format!("scroll = {}\n", host.view.rows));
-    out.push_str(&format!("scrolloff = {}\n\n", host.view.scrolloff));
+    out.push_str(&format!("scrolloff = {}\n", host.view.scrolloff));
+    out.push_str(&format!("scrollbar = {}\n\n", host.view.scrollbar));
+
+    out.push_str("# In the terminal, finishing a drag puts it on the clipboard, the way that\n");
+    out.push_str("# terminal's own selection would — plait took the drag, so it owes you the\n");
+    out.push_str("# copy. A click is a cursor move and never copies; `y` copies either way. The\n");
+    out.push_str("# window has the platform's own cmd-c and ignores this.\n");
+    out.push_str("[mouse]\n");
+    out.push_str(&format!("copy_on_select = {}\n\n", host.mouse.copy_on_select));
 
     let t = &host.theme;
     out.push_str("# `name` picks one of the registered palettes and everything below is applied\n");
@@ -1182,6 +1220,8 @@ mod tests {
         original.wrap.select("char");
         original.view.rows = 4;
         original.view.scrolloff = 0;
+        original.view.scrollbar = false;
+        original.mouse.copy_on_select = false;
         original.theme.rebuild();
 
         let text = dump(&original);
@@ -1202,6 +1242,8 @@ mod tests {
         assert_eq!(restored.wrap.selected(), "char", "diff.wrap did not survive");
         assert_eq!(restored.view.rows, 4, "view.scroll did not survive");
         assert_eq!(restored.view.scrolloff, 0, "view.scrolloff did not survive");
+        assert!(!restored.view.scrollbar, "view.scrollbar did not survive");
+        assert!(!restored.mouse.copy_on_select, "mouse.copy_on_select did not survive");
     }
 
     #[test]
@@ -1217,6 +1259,17 @@ mod tests {
         assert_eq!(warn.len(), 1, "{warn:?}");
         assert!(warn[0].contains("view.scroll"), "{warn:?}");
         assert_eq!(h.view.rows, 3, "a rejected value left the old one alone");
+        assert!(apply(&mut h, "[view]\nscrollbar = false\n").is_empty());
+        assert!(!h.view.scrollbar);
+        let warn = apply(&mut h, "[view]\nscrollbar = 3\n");
+        assert!(warn[0].contains("view.scrollbar"), "{warn:?}");
+        assert!(apply(&mut h, "[mouse]\ncopy_on_select = false\n").is_empty());
+        assert!(!h.mouse.copy_on_select);
+        let warn = apply(&mut h, "[mouse]\ncopy_on_select = \"yes\"\n");
+        assert!(warn[0].contains("mouse.copy_on_select"), "{warn:?}");
+        assert!(!h.mouse.copy_on_select, "a rejected value left the old one alone");
+        let warn = apply(&mut h, "[mouse]\nspeed = 3\n");
+        assert!(warn[0].contains("unknown key mouse.speed"), "{warn:?}");
         let warn = apply(&mut h, "[view]\nspeed = 3\n");
         assert!(warn[0].contains("unknown key view.speed"), "{warn:?}");
     }

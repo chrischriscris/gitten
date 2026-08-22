@@ -51,7 +51,7 @@ because it compiles in a second and its tests need no window.
 | `rows.rs` | a diff flattened to rows, the wrap index, the order table, the load path |
 | `runs.rs` | syntax tokens × intraline spans → one flat styled run list |
 | `select.rs` | what the mouse has selected: carets, the rows between them, and the copy |
-| `view.rs` | `Viewport`: the cursor, the top row, the margin, and scrolling that is not a cursor move |
+| `view.rs` | `Viewport`: the cursor, the top row, the margin, scrolling that is not a cursor move, and where a scrollbar's thumb goes |
 | `differ.rs` | the `Differ` trait, Histogram/Patience/Myers, whitespace relations, the indent heuristic, move detection, hunk assembly, routing |
 | `align.rs` | which removal sits opposite which addition, for a two-column view |
 | `prepared.rs` | a diff assembled into drawable rows: clip → intraline → syntax |

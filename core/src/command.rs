@@ -336,6 +336,11 @@ impl Keymap {
         bind(GLOBAL, "home", "view.top");
         bind(GLOBAL, "G", "view.bottom");
         bind(GLOBAL, "end", "view.bottom");
+        // The mouse's keyboard half. `y` is vi's yank and lazygit's copy, and
+        // the pair below it is what a client with no selection of its own
+        // ignores — a command nothing handles is a key that does nothing.
+        bind(GLOBAL, "y", "copy.selection");
+        bind(GLOBAL, "ctrl-a", "select.all");
         bind(GLOBAL, "h", "view.left");
         bind(GLOBAL, "left", "view.left");
         bind(GLOBAL, "l", "view.right");
@@ -495,7 +500,7 @@ impl Commands {
             ("commits.open-diff", "the diff for this commit"),
             ("select.all", "select the whole view"),
             ("select.none", "drop the selection"),
-            ("copy.selection", "copy the selection"),
+            ("copy.selection", "copy the selection, or the row the cursor is on"),
         ] {
             c.register(name, doc);
         }

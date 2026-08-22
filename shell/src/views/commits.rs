@@ -1,5 +1,6 @@
 use crate::graph;
 use gpui::*;
+use gpui::prelude::FluentBuilder as _;
 use gpui_component::scroll::Scrollbar;
 use plait_core::host::Host;
 use plait_core::{assign_lanes, initials, Commit};
@@ -104,7 +105,7 @@ impl Commits {
 }
 
 impl Render for Commits {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let data = self.data.clone();
         let rendered = self.rendered.clone();
         let top = self.top.clone();
@@ -127,12 +128,18 @@ impl Render for Commits {
         .p_4();
 
         // The scrollbar overlays the list, so the container must be positioned.
+        // `[view] scrollbar` is read per frame like every other setting: the
+        // terminal draws its own bar from the same flag, and a knob that means
+        // two things in two clients is a knob nobody trusts.
+        let bars = crate::config::host(cx).view.scrollbar;
         div()
             .relative()
             .size_full()
             .child(list)
-            .child(Scrollbar::vertical(&self.scroll))
-            .child(Scrollbar::horizontal(&self.scroll))
+            .when(bars, |d| {
+                d.child(Scrollbar::vertical(&self.scroll))
+                    .child(Scrollbar::horizontal(&self.scroll))
+            })
     }
 }
 

@@ -45,6 +45,7 @@
 //! control like everything else that is one.
 
 use gpui::*;
+use gpui::prelude::FluentBuilder as _;
 use gpui_component::scroll::Scrollbar;
 use plait_core::host::Host;
 use plait_core::prepared::{prepare, Prepared};
@@ -106,13 +107,11 @@ pub(crate) fn columns(width: f32, chrome: f32, size: f32, host: &Host) -> usize 
 /// the wild; nobody reads past column 2000 either way.
 const MAX_LINE_CHARS: usize = 2000;
 
-/// Where a click landed inside a row: which of the row's texts, and which byte.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Hit {
-    pub part: u16,
-    /// A byte offset into the *logical* row's text — see [`Rows::hit`].
-    pub off: usize,
-}
+/// Where a click landed inside a row — see [`Rows::hit`].
+///
+/// `core`'s, since the terminal asks its presentations the same question in
+/// cells and got the same answer back.
+pub use plait_core::select::Hit;
 
 /// Which byte of `text` a click `x` pixels into it landed on.
 ///
@@ -1145,8 +1144,12 @@ impl Render for Diff {
             // frame after — the same one-frame trade every measured layout
             // makes. Zero height, so it takes part in nothing.
             .child(self.probe(cx))
-            .child(Scrollbar::vertical(&self.scroll))
-            .child(Scrollbar::horizontal(&self.scroll));
+            // `[view] scrollbar`, read per frame like every other setting — the
+            // terminal draws its own bar from the same flag.
+            .when(crate::config::host(cx).view.scrollbar, |d| {
+                d.child(Scrollbar::vertical(&self.scroll))
+                    .child(Scrollbar::horizontal(&self.scroll))
+            });
 
         // Key dispatch runs down the focus path, so an action handler on an
         // element nothing has focused is never reached. Taking focus on the

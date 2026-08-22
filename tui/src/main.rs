@@ -35,14 +35,16 @@ use plait_tui::commits::{Commits, Glyphs};
 use plait_tui::diff::Diff;
 use plait_tui::help;
 use plait_tui::screen::{Ink, Pen, Screen};
-use plait_tui::term::{Input, Term};
+use plait_tui::scrollbar::Bar;
+use plait_tui::term::{Input, Mouse, MouseKind, Term};
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const EXTRA: &str = "  --ascii        draw the graph without box-drawing characters
-  --no-mouse     leave the wheel to the terminal, and drag-select with it
+const EXTRA: &str = "  --ascii        draw the graph and the scrollbar without box-drawing
+  --no-mouse     leave the mouse to the terminal: no wheel, no click, and the
+                 emulator's own drag-to-select instead of plait's
 
   `?` lists every key, from the same keymap `plait.toml` writes. Colours and the
   keymap are re-read every time the file is saved.
@@ -55,6 +57,15 @@ const EXTRA: &str = "  --ascii        draw the graph without box-drawing charact
 /// flag rather than plumbing a channel is what the GPUI client does too, for the
 /// same reason. It costs one `poll` syscall per interval and no redraw.
 const TICK: Duration = Duration::from_millis(150);
+
+/// Longest gap between two presses that still counts as a double click.
+///
+/// A terminal reports a press and nothing else — there is no `click_count` in
+/// the protocol the way there is in every window system — so the count is ours
+/// to keep. 400 ms is what macOS, GTK and Windows all default to within 100 ms of,
+/// and the same cell has to be hit twice: a double click that moved is two
+/// clicks, which is what makes a fast drag-then-click not select a word.
+const DOUBLE: Duration = Duration::from_millis(400);
 
 fn main() {
     let mut start = Startup::new("plait-tui", View::Commits)
@@ -152,6 +163,67 @@ impl Screens {
         }
     }
 
+    /// A press in the body, at `row` rows down it.
+    ///
+    /// The count and the modifier arrive as scalars rather than as an event
+    /// type, which is what keeps the views free of `term` — a view takes
+    /// already-hit-tested numbers exactly as it takes already-loaded data.
+    fn press(&mut self, col: usize, row: usize, clicks: u8, extend: bool, host: &Host) {
+        match self {
+            Screens::Commits(c) => c.press(col, row, extend, host),
+            Screens::Diff(d) => d.press(col, row, clicks, extend, host),
+        }
+    }
+
+    /// The pointer moved with the button down. `row` is signed: a row above the
+    /// body is negative and scrolls it.
+    fn drag(&mut self, col: usize, row: isize, host: &Host) {
+        match self {
+            Screens::Commits(c) => c.drag(row, host),
+            Screens::Diff(d) => d.drag(col, row, host),
+        }
+    }
+
+    fn release(&mut self) {
+        match self {
+            Screens::Commits(c) => c.release(),
+            Screens::Diff(d) => d.release(),
+        }
+    }
+
+    /// What `copy.selection` copies here: the selection, or the row the cursor is
+    /// on when there is none.
+    fn copy_text(&self) -> String {
+        match self {
+            Screens::Commits(c) => c.copy_text(),
+            Screens::Diff(d) => d.copy_text(),
+        }
+    }
+
+    /// What the *mouse* has selected, and nothing else. Empty after a click, so
+    /// copy-on-select can tell a gesture that selected something from one that
+    /// only moved the cursor.
+    fn selection(&self) -> String {
+        match self {
+            Screens::Commits(c) => c.selection(),
+            Screens::Diff(d) => d.selection(),
+        }
+    }
+
+    fn select_all(&mut self) {
+        match self {
+            Screens::Commits(c) => c.select_all(),
+            Screens::Diff(d) => d.select_all(),
+        }
+    }
+
+    fn select_none(&mut self) -> bool {
+        match self {
+            Screens::Commits(c) => c.select_none(),
+            Screens::Diff(d) => d.select_none(),
+        }
+    }
+
     /// Runs a command, or says it does not know it.
     ///
     /// The `view.*` half is the same list for both screens and is what makes
@@ -224,6 +296,19 @@ struct App {
     stats: Option<(Duration, usize)>,
     /// The run-list buffer, owned across frames so drawing allocates nothing.
     runs: Vec<Run>,
+    /// The glyphs the scrollbar is drawn with, so a diff opened from the commit
+    /// list is drawn with the same ones. `--ascii`.
+    bar: Bar,
+    /// Text a command asked to be put on the clipboard, handed to the terminal
+    /// at the top of the next loop.
+    ///
+    /// Deferred rather than copied where it is produced, because writing it is a
+    /// [`Term`] call and dispatch has views and a host and deliberately no
+    /// terminal — the same reason acquisition is in `main` and not in a view.
+    copy: Option<String>,
+    /// The last press, for counting a double click: when, and in which cell.
+    clicked: Option<(Instant, usize, usize)>,
+    clicks: u8,
 }
 
 impl App {
@@ -234,9 +319,21 @@ impl App {
         };
         let label = started.loaded.label.clone();
         let host = started.host;
+        let bar = match glyphs == Glyphs::ascii() {
+            true => Bar::ascii(),
+            false => Bar::default(),
+        };
         let screen = match started.loaded.data {
-            Data::Commits(commits) => Screens::Commits(Commits::with_glyphs(commits, glyphs)),
-            Data::Diff(files) => Screens::Diff(Diff::new(files, &host)),
+            Data::Commits(commits) => {
+                let mut list = Commits::with_glyphs(commits, glyphs);
+                list.set_bar(bar);
+                Screens::Commits(list)
+            }
+            Data::Diff(files) => {
+                let mut diff = Diff::new(files, &host);
+                diff.set_bar(bar);
+                Screens::Diff(diff)
+            }
         };
         let mut app = Self {
             host,
@@ -252,6 +349,10 @@ impl App {
             picked_theme: None,
             stats: None,
             runs: Vec::new(),
+            bar,
+            copy: None,
+            clicked: None,
+            clicks: 0,
         };
         app.sync_modes();
         app
@@ -282,6 +383,15 @@ impl App {
                 size = now;
                 self.screen.resize(size.0, size.1);
             }
+            // Before the frame, so the message a copy leaves is on the status
+            // line of the frame that follows it — OSC 52 has no reply to read,
+            // so saying what happened is the only feedback there is.
+            if let Some(text) = self.copy.take() {
+                self.message = match term.copy(&text) {
+                    Ok(()) => copied(&text),
+                    Err(e) => format!("could not copy: {e}"),
+                };
+            }
             let t = Instant::now();
             self.draw();
             let cells = self.screen.flush(term.out())?;
@@ -291,6 +401,7 @@ impl App {
 
             match Term::poll(TICK)? {
                 Some(Input::Key(key)) => self.press(key),
+                Some(Input::Mouse(m)) => self.mouse(m),
                 Some(Input::Resize(w, h)) => {
                     size = (w, h);
                     self.screen.resize(w, h);
@@ -366,6 +477,85 @@ impl App {
         }
     }
 
+    /// One mouse event.
+    ///
+    /// The whole of the routing, and it is short for the same reason [`press`]
+    /// is: the rows this file owns are the title bar and the status line, so
+    /// what is left is "which row of the body" and the view does the rest. The
+    /// day there are panes, this is the function that grows a hit test and
+    /// nothing else does.
+    fn mouse(&mut self, m: Mouse) {
+        let (_, h) = self.screen.size();
+        // The help panel is drawn over the body, so a click that reached a view
+        // through it would act on a row it is hiding.
+        if h < 3 || self.help {
+            return;
+        }
+        let body = 1..h - 1;
+        // Signed, and not clamped: a drag above the body is a negative row and
+        // scrolls it, which is what dragging past the top of a page does.
+        let row = m.row as isize - body.start as isize;
+        match m.kind {
+            MouseKind::Down => {
+                if !body.contains(&m.row) {
+                    return;
+                }
+                self.message.clear();
+                let clicks = self.count(m.col, m.row);
+                // Disjoint field borrows, as everywhere else in this file: the
+                // host is read while a screen is written, and moving it out and
+                // back would rebuild every theme and every registry per click.
+                let Self { stack, host, .. } = self;
+                let Some(screen) = stack.last_mut() else { return };
+                screen.press(m.col, row as usize, clicks, m.shift, host);
+                // Two clicks on a commit open it, which is the one gesture a
+                // terminal has for "go in" besides the key that already does.
+                if clicks == 2 && matches!(self.stack.last(), Some(Screens::Commits(_))) {
+                    self.open_diff();
+                }
+            }
+            MouseKind::Drag => {
+                let Self { stack, host, .. } = self;
+                if let Some(screen) = stack.last_mut() {
+                    screen.drag(m.col, row, host);
+                }
+            }
+            MouseKind::Up => {
+                if let Some(screen) = self.stack.last_mut() {
+                    screen.release();
+                }
+                // Copy-on-select, and this is the only place it can be: a
+                // selection is finished when the button comes up, and writing
+                // one to the terminal per motion event would be an escape
+                // sequence per cell the pointer crossed.
+                if self.host.mouse.copy_on_select {
+                    let text = self.stack.last().map(Screens::selection).unwrap_or_default();
+                    if !text.is_empty() {
+                        self.copy = Some(text);
+                    }
+                }
+            }
+        }
+    }
+
+    /// How many times this cell has been clicked in quick succession.
+    ///
+    /// Ours to count because the protocol does not carry it — see [`DOUBLE`].
+    /// Capped at three: nothing means more than a row, and an uncapped counter
+    /// would make a fourth click mean something a third did not.
+    fn count(&mut self, col: usize, row: usize) -> u8 {
+        let now = Instant::now();
+        let again = self
+            .clicked
+            .is_some_and(|(at, c, r)| (c, r) == (col, row) && now.duration_since(at) < DOUBLE);
+        self.clicks = match again {
+            true => (self.clicks + 1).min(3),
+            false => 1,
+        };
+        self.clicked = Some((now, col, row));
+        self.clicks
+    }
+
     /// A command name into an effect.
     ///
     /// The client's own commands first, then the screen's. That order is what
@@ -387,6 +577,26 @@ impl App {
                 self.message = format!("theme: {}", self.host.theme.name);
             }
             "commits.open-diff" => self.open_diff(),
+            // The clipboard is the terminal's, not this process's — see
+            // `Term::copy`. Held until the loop, which is the one place that has
+            // a terminal to write to.
+            "copy.selection" => {
+                let text = self.stack.last().map(Screens::copy_text).unwrap_or_default();
+                match text.is_empty() {
+                    true => self.message = "nothing to copy".into(),
+                    false => self.copy = Some(text),
+                }
+            }
+            "select.all" => {
+                if let Some(screen) = self.stack.last_mut() {
+                    screen.select_all();
+                }
+            }
+            "select.none" => {
+                if let Some(screen) = self.stack.last_mut() {
+                    screen.select_none();
+                }
+            }
             // Disjoint field borrows rather than moving the host out and
             // back: `Host::new()` rebuilds every theme, every registry and the
             // whole resolved contrast table, and doing that per keypress is a
@@ -410,8 +620,14 @@ impl App {
     /// you started with is not a quit, and a client that vanished on it would be
     /// a client you could not trust the key in.
     fn back(&mut self) {
+        // Innermost first, and a selection is inside a screen: `esc` drops what
+        // the mouse is holding before it leaves the diff the mouse was holding
+        // it in. One key, one direction, no order to remember.
         if self.help {
             self.help = false;
+        } else if self.stack.last_mut().is_some_and(Screens::select_none) {
+            // There was a selection and it is gone; that is the whole of this
+            // `esc`, and the screen underneath stays where it is.
         } else if self.stack.len() > 1 {
             self.stack.pop();
             let (w, h) = self.screen.size();
@@ -446,6 +662,7 @@ impl App {
                     Data::Diff(files) => files,
                     Data::Commits(_) => return,
                 }, &self.host);
+                diff.set_bar(self.bar);
                 let (w, h) = self.screen.size();
                 diff.resize(w, h.saturating_sub(2), &self.host);
                 self.stack.push(Screens::Diff(diff));
@@ -517,6 +734,16 @@ impl App {
         if self.help {
             help::paint(&mut self.screen, 1, body, &self.host, &self.modes);
         }
+    }
+}
+
+/// What to say on the status line after a copy.
+///
+/// Lines and not bytes, because a selection is measured in what you can see.
+fn copied(text: &str) -> String {
+    match text.lines().count() {
+        1 => "copied 1 line".into(),
+        n => format!("copied {n} lines"),
     }
 }
 

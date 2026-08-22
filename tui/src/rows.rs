@@ -35,9 +35,11 @@ use plait_core::host::Host;
 use plait_core::prepared::File;
 use plait_core::rows::{Entry, Flat, Present, Row};
 use plait_core::runs::{runs, Run};
-use plait_core::theme::{DiffPalette, Rgb, Theme};
+use plait_core::select::{Hit, Selected};
+use plait_core::theme::{DiffPalette, Rgb, Style, Surface, Theme};
 use plait_core::wrap::Wrap;
 use plait_core::LineKind;
+use std::ops::Range;
 
 /// Everything a row needs to know beyond which row it is.
 ///
@@ -56,11 +58,25 @@ pub struct Frame<'a> {
     /// Whether this row is the one the keyboard is on. Drawn as a background
     /// bar in `theme.chrome.selection_bg`.
     pub current: bool,
+    /// Which bytes of this row the *mouse* has selected, in the row's own
+    /// coordinates — `None` for nearly every row on nearly every frame.
+    ///
+    /// A different thing from `current` and a different colour: that one is a
+    /// bar under the row the keyboard is on, and this one is chosen text. The
+    /// model behind it is [`plait_core::select`], shared with the window, so a
+    /// wrapped line copies once in both.
+    pub sel: Option<Selected>,
 }
 
 impl<'a> Frame<'a> {
     pub fn new(host: &'a Host) -> Self {
-        Self { host, shift: 0, current: false }
+        Self { host, shift: 0, current: false, sel: None }
+    }
+
+    /// The selection over one of this row's texts, or `None` if the selection is
+    /// in another. What a presentation drawing two columns asks per column.
+    pub fn part(&self, part: u16) -> Option<Selected> {
+        self.sel.filter(|s| s.part() == part)
     }
 
     pub fn theme(&self) -> &Theme {
@@ -94,6 +110,35 @@ pub trait Rows: Present {
     /// cleared by [`runs`]. Handing it in rather than allocating one is the
     /// difference between one allocation per visible row per frame and none.
     fn render(&self, index: usize, seg: usize, at: &Frame, pen: &mut Pen, out: &mut Vec<Run>);
+
+    /// Which text a click `col` columns into this row landed in, and which byte.
+    ///
+    /// The frontend half of a selection, and the only half that needs to know
+    /// what was drawn: where the text starts depends on the gutters and the signs
+    /// this presentation put in front of it, and `shift` is how far it has been
+    /// scrolled sideways under them. Nobody outside an implementation can know
+    /// either, which is why this is on the trait rather than a subtraction in the
+    /// view.
+    ///
+    /// The offset is into the **logical** row's text, not the visual row's, so a
+    /// caret on the third row of a wrapped line is the same kind of thing as one
+    /// on an unwrapped line — see [`plait_core::select`]. `None` means the row
+    /// takes no part in a selection, and defaults to it: an extension's
+    /// presentation compiles unchanged and is simply not selectable until it says
+    /// where its text is.
+    fn hit(&self, _index: usize, _seg: usize, _col: usize, _shift: usize) -> Option<Hit> {
+        None
+    }
+
+    /// The text of one of this row's parts: what a selection over it copies.
+    ///
+    /// `None` for a part that is not there — the empty side of a two-column row,
+    /// a row that draws no text — and a copy *skips* those rather than pasting a
+    /// blank line for them. The coordinates are the ones [`Rows::hit`] returns
+    /// offsets into.
+    fn selectable(&self, _index: usize, _part: u16) -> Option<&str> {
+        None
+    }
 
     /// Whatever this implementation wants to say on the status line.
     fn report(&self) -> String {
@@ -189,13 +234,17 @@ impl Layouts {
 
 // ------------------------------------------------------------ shared furniture
 
+/// Columns a header's text is indented by. One space, and the number a hit test
+/// has to subtract — shared so the caret and the glyph cannot disagree.
+pub const HEADER_PAD: usize = 1;
+
 /// A file's header row, drawn identically whichever presentation owns the lines
 /// beneath it — a `.md` file is still a file.
 pub fn file_header(path: &str, adds: usize, dels: usize, at: &Frame, pen: &mut Pen) {
     let p = &at.theme().diff;
     let bg = row_bg(p.file_bg, at);
-    pen.put(" ", Ink::new(p.file_fg, bg));
-    pen.put(path, Ink::new(p.file_fg, bg).bold());
+    pen.fill(HEADER_PAD, ' ', Ink::new(p.file_fg, bg));
+    selected_text(path, Ink::new(p.file_fg, bg).bold(), at.part(0), at.theme(), pen);
     pen.put("  ", Ink::new(p.file_fg, bg));
     pen.put(&format!("+{adds}"), Ink::new(p.adds_fg, bg));
     pen.put(" ", Ink::new(p.file_fg, bg));
@@ -206,9 +255,71 @@ pub fn file_header(path: &str, adds: usize, dels: usize, at: &Frame, pen: &mut P
 pub fn hunk_header(header: &str, at: &Frame, pen: &mut Pen) {
     let p = &at.theme().diff;
     let bg = row_bg(p.hunk_bg, at);
-    pen.put(" ", Ink::new(p.hunk_fg, bg));
-    pen.put(header, Ink::new(p.hunk_fg, bg));
+    pen.fill(HEADER_PAD, ' ', Ink::new(p.hunk_fg, bg));
+    selected_text(header, Ink::new(p.hunk_fg, bg), at.part(0), at.theme(), pen);
     pen.wash(Ink::new(p.hunk_fg, bg));
+}
+
+/// Where a click landed in a file or hunk header.
+///
+/// Shared for the same reason the headers themselves are: whoever owns the lines
+/// beneath them, a header is drawn by [`file_header`] or [`hunk_header`] and its
+/// text starts at [`HEADER_PAD`]. Two presentations working that out separately
+/// is two places for the caret to be a column off.
+pub fn header_hit(text: &str, col: usize) -> Hit {
+    Hit { part: 0, off: col_at(text, col.saturating_sub(HEADER_PAD)) }
+}
+
+/// Which byte of `text` is drawn in column `col` of it.
+///
+/// Columns and not characters, so a caret lands where the pointer is on a line of
+/// CJK — the same measure [`screen::cols`] gives the grid, run backwards. Past
+/// the end is the end: a click in the blank beyond a short line selects to the
+/// end of it, which is what a drag across a ragged block of text has to do.
+///
+/// **Lands on the character the pointer is over**, not on the nearest boundary.
+/// A cell is a cell and there is no right half of one to round away from; a drag
+/// that includes the character it started on is [`crate::diff::Diff`]'s doing,
+/// because only it knows which way the drag is going.
+pub fn col_at(text: &str, col: usize) -> usize {
+    let mut at = 0;
+    for (i, c) in text.char_indices() {
+        if at >= col {
+            return i;
+        }
+        at += screen::cols(c);
+    }
+    text.len()
+}
+
+/// Writes text with whatever a selection covers of it lit up behind it.
+///
+/// For the rows that have no runs to speak of — a file path, a hunk header. A
+/// line of a diff goes through [`text_run`] instead, which has tokens and changed
+/// words to keep as well.
+pub fn selected_text(
+    text: &str,
+    ink: Ink,
+    sel: Option<Selected>,
+    theme: &Theme,
+    pen: &mut Pen,
+) {
+    let Some(range) = selection(sel, text.len()) else {
+        pen.put(text, ink);
+        return;
+    };
+    let on = ink.on(theme.background(Surface::Selected));
+    pen.put(&text[..range.start], ink);
+    pen.put(&text[range.clone()], on);
+    pen.put(&text[range.end..], ink);
+}
+
+/// The bytes of a text `len` long that are selected, or `None` when none are.
+///
+/// Empty is `None` and not `0..0`: a zero-length highlight is a colour change
+/// nobody asked for, and every caller would otherwise have to check.
+fn selection(sel: Option<Selected>, len: usize) -> Option<Range<usize>> {
+    sel.map(|s| s.range(len)).filter(|r| !r.is_empty())
 }
 
 /// The background a row actually draws on: its own, or the selection bar.
@@ -254,28 +365,71 @@ pub fn text_run(
     theme: &Theme,
     row_ink: Ink,
     shift: usize,
+    sel: Option<Selected>,
     pen: &mut Pen,
     out: &mut Vec<Run>,
 ) {
     runs(span, &line.tokens, &line.spans, line.kind, line.moved, out);
     pen.scroll(shift);
+    // Bytes of the *line*, which is what the runs address too — a wrapped row
+    // draws its own slice of both.
+    let sel = selection(sel, line.text.len());
     for run in out.iter() {
-        // A selected row keeps its own background: the bar is the cursor, and a
-        // changed word inside it is still worth seeing, so the word background
-        // is only suppressed when the row already has one of its own.
-        let bg = match run.word {
-            true => theme.background(run.surface),
-            false => row_ink.bg,
+        // A run is cut into at most three pieces by the selection, and nearly
+        // always into one: the loop below runs on every visible row of every
+        // frame, so the unselected case must not cost a comparison per byte.
+        let (a, b) = match &sel {
+            Some(s) => (
+                s.start.clamp(run.at.start, run.at.end),
+                s.end.clamp(run.at.start, run.at.end),
+            ),
+            None => (run.at.end, run.at.end),
         };
-        let style = match run.kind {
-            Some(kind) => theme.syntax_on(kind, run.surface),
-            // Text no highlighter claimed keeps the row's own foreground rather
-            // than a syntax colour it was never given.
-            None => plait_core::theme::Style { fg: row_ink.fg, bold: false, italic: false },
-        };
-        pen.put(&line.text[run.at.clone()], Ink::styled(style, bg));
+        piece(line, run, run.at.start..a, false, theme, row_ink, pen);
+        piece(line, run, a..b, true, theme, row_ink, pen);
+        piece(line, run, b..run.at.end, false, theme, row_ink, pen);
     }
     pen.wash(row_ink);
+}
+
+/// One stretch of a run, selected or not.
+///
+/// Selected text is resolved against [`Surface::Selected`] and not merely given
+/// a different background: a comment's grey was chosen to recede on a dark
+/// removal, and left alone on the selection's own colour it disappears. That is
+/// `core`'s contrast table doing what it is for, and the window resolves the same
+/// way.
+fn piece(
+    line: &plait_core::prepared::Line,
+    run: &Run,
+    at: Range<usize>,
+    on: bool,
+    theme: &Theme,
+    row_ink: Ink,
+    pen: &mut Pen,
+) {
+    if at.is_empty() {
+        return;
+    }
+    let surface = match on {
+        true => Surface::Selected,
+        false => run.surface,
+    };
+    // A selected row keeps its own background: the bar is the cursor, and a
+    // changed word inside it is still worth seeing, so the word background is
+    // only suppressed when the row already has one of its own.
+    let bg = match (on, run.word) {
+        (true, _) => theme.background(Surface::Selected),
+        (false, true) => theme.background(run.surface),
+        (false, false) => row_ink.bg,
+    };
+    let style = match run.kind {
+        Some(kind) => theme.syntax_on(kind, surface),
+        // Text no highlighter claimed keeps the row's own foreground rather
+        // than a syntax colour it was never given.
+        None => Style { fg: row_ink.fg, bold: false, italic: false },
+    };
+    pen.put(&line.text[at], Ink::styled(style, bg));
 }
 
 // -------------------------------------------------------------- the built-in
@@ -414,9 +568,33 @@ impl Rows for TextRows {
                 pen.put(if blank { " " } else { sign }, row_ink);
                 pen.put(" ", row_ink);
 
-                text_run(l, self.flat.range(index, seg), theme, row_ink, at.shift, pen, out);
+                let span = self.flat.range(index, seg);
+                text_run(l, span, theme, row_ink, at.shift, at.part(0), pen, out);
             }
         }
+    }
+
+    fn hit(&self, index: usize, seg: usize, col: usize, shift: usize) -> Option<Hit> {
+        match self.flat.get(index)? {
+            Row::File { path, .. } => Some(header_hit(path, col)),
+            Row::Hunk(header) => Some(header_hit(header, col)),
+            Row::Line(l) => {
+                // Before the text is a click in the gutter, which is a caret at
+                // the start of the line and not nothing: dragging from a line
+                // number is how a whole line gets selected.
+                let text = col.saturating_sub(self.chrome()) + shift;
+                let span = self.flat.range(index, seg);
+                let at = col_at(&l.text[span.clone()], text);
+                Some(Hit { part: 0, off: span.start + at })
+            }
+        }
+    }
+
+    fn selectable(&self, index: usize, part: u16) -> Option<&str> {
+        if part != 0 {
+            return None;
+        }
+        Some(self.flat.get(index)?.text())
     }
 }
 
@@ -485,6 +663,17 @@ diff --git a/a.rs b/a.rs
         }
 
         fn paint(&mut self, shift: usize, current: Option<usize>) {
+            self.paint_sel(shift, current, None);
+        }
+
+        /// The same, with a selection over the whole diff resolved against the
+        /// order table — what a drag produces, without a drag.
+        fn paint_sel(
+            &mut self,
+            shift: usize,
+            current: Option<usize>,
+            sel: Option<&plait_core::select::Selection>,
+        ) {
             let ink = Ink::new(self.host.theme.chrome.fg, self.host.theme.chrome.bg);
             self.screen.clear(ink);
             let mut out = Vec::new();
@@ -493,6 +682,7 @@ diff --git a/a.rs b/a.rs
                     host: &self.host,
                     shift,
                     current: current == Some(y),
+                    sel: sel.and_then(|s| s.at(y, r.logical())),
                 };
                 let mut pen = self.screen.row(y);
                 self.owners[r.owner as usize]
@@ -576,6 +766,81 @@ diff --git a/a.rs b/a.rs
         assert_eq!(h.screen.ink(0, 3).unwrap().bg, bar, "the gutter was left out");
         assert_eq!(h.screen.ink(39, 3).unwrap().bg, bar, "it stopped at the text");
         assert_ne!(h.screen.ink(0, 4).unwrap().bg, bar, "it leaked downwards");
+    }
+
+    #[test]
+    fn a_click_lands_on_the_byte_under_it_and_the_gutter_is_the_start_of_the_line() {
+        let h = Harness::new(DIFF, 40, "unified");
+        let rows = &h.owners[0];
+        // Row 3 is `- let x = 1;`, drawn after ` 2    - `: the chrome is 8
+        // columns, so column 12 is the `x`.
+        let hit = rows.hit(3, 0, 12, 0).expect("a line is selectable");
+        assert_eq!((hit.part, hit.off), (0, 4));
+        assert_eq!(&rows.selectable(3, 0).unwrap()[hit.off..], "x = 1;");
+        // Anywhere in the gutter is the start of the line, so a drag from a line
+        // number selects the whole of it rather than nothing.
+        assert_eq!(rows.hit(3, 0, 1, 0).unwrap().off, 0);
+        // Past the end of a short line is the end of it.
+        assert_eq!(rows.hit(3, 0, 99, 0).unwrap().off, "let x = 1;".len());
+        // A header is selectable too, and its text starts one column in.
+        assert_eq!(rows.hit(0, 0, 1, 0).unwrap().off, 0);
+        assert_eq!(rows.selectable(0, 0), Some("a.rs"));
+    }
+
+    #[test]
+    fn a_click_follows_the_text_when_it_is_scrolled_sideways() {
+        let mut h = Harness::new(DIFF, 40, "unified");
+        h.reflow(40, &Off);
+        // The same cell, with four columns swallowed: four bytes further in.
+        let plain = h.owners[0].hit(3, 0, 12, 0).unwrap().off;
+        let shifted = h.owners[0].hit(3, 0, 12, 4).unwrap().off;
+        assert_eq!(shifted, plain + 4);
+    }
+
+    #[test]
+    fn a_selection_is_painted_on_the_bytes_it_covers_and_no_others() {
+        use plait_core::select::{Caret, Selection};
+        let mut h = Harness::new(DIFF, 40, "unified");
+        // `let x = 1;` on row 3: select `x = 1`.
+        let mut sel = Selection::new(0, Caret::new((0, 3), 4, 3));
+        sel.extend(Caret::new((0, 3), 9, 3));
+        h.paint_sel(0, None, Some(&sel));
+        let bg = h.host.theme.background(Surface::Selected);
+        let x = (0..40).find(|x| h.screen.char_at(*x, 3) == Some('x')).unwrap();
+        assert_eq!(h.screen.ink(x, 3).unwrap().bg, bg);
+        assert_eq!(h.screen.ink(x + 4, 3).unwrap().bg, bg, "the last selected byte");
+        assert_ne!(h.screen.ink(x - 1, 3).unwrap().bg, bg, "it started early");
+        assert_ne!(h.screen.ink(x + 5, 3).unwrap().bg, bg, "it ran past the end");
+        // The row it is not on keeps its own colour.
+        assert_eq!(h.screen.ink(x, 4).unwrap().bg, h.host.theme.diff.added_bg);
+    }
+
+    #[test]
+    fn a_selected_word_keeps_the_word_highlight_it_landed_on() {
+        // Both are backgrounds and only one can win. The selection does, because
+        // it is the thing that just moved — but the row's changed word is still
+        // read against the *selected* surface, not left in a colour chosen for a
+        // removal it is no longer drawn on.
+        use plait_core::select::{Caret, Selection};
+        let mut h = Harness::new(DIFF, 40, "unified");
+        let mut sel = Selection::new(0, Caret::new((0, 3), 0, 3));
+        sel.extend(Caret::new((0, 3), 10, 3));
+        h.paint_sel(0, None, Some(&sel));
+        let bg = h.host.theme.background(Surface::Selected);
+        let one = (0..40).find(|x| h.screen.char_at(*x, 3) == Some('1')).unwrap();
+        assert_eq!(h.screen.ink(one, 3).unwrap().bg, bg, "the changed word kept its own");
+    }
+
+    #[test]
+    fn a_header_lights_up_under_a_selection_too() {
+        use plait_core::select::{Caret, Selection};
+        let mut h = Harness::new(DIFF, 40, "unified");
+        let mut sel = Selection::new(0, Caret::new((0, 0), 0, 0));
+        sel.extend(Caret::new((0, 0), 4, 0));
+        h.paint_sel(0, None, Some(&sel));
+        let bg = h.host.theme.background(Surface::Selected);
+        assert_eq!(h.screen.ink(1, 0).unwrap().bg, bg, "the path was not lit");
+        assert_ne!(h.screen.ink(6, 0).unwrap().bg, bg, "the +1 -1 was");
     }
 
     #[test]

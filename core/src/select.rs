@@ -46,9 +46,65 @@
 use crate::rows::RowRef;
 use std::ops::Range;
 
+/// What the mouse does besides select. `[mouse]` in `plait.toml`.
+///
+/// One field, and it is here rather than beside the renderer because it is a
+/// question about a *selection* — what finishing one means — and a client that
+/// answered it with a literal would be a client nobody could change it in.
+///
+/// **A client it does not apply to ignores it**, the same way one that cannot
+/// `quit` ignores `quit`: the window's own `cmd-c` works, because nothing there
+/// took the platform's copy away, and a desktop app that rewrote the clipboard
+/// on every drag would be breaking a convention rather than restoring one. This
+/// is the terminal's knob for the terminal's problem, in the file every client
+/// reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mousing {
+    /// Whether finishing a selection with the mouse puts it on the clipboard.
+    ///
+    /// **On**, because a terminal that has taken the drag has taken
+    /// select-then-`cmd-c` with it, and giving nothing back for it is the worst
+    /// of both. X11 has had this since 1987 and every terminal on it still does
+    /// it; what is different here is only that the clipboard is reached by
+    /// asking the emulator (OSC 52) rather than by owning a selection on a
+    /// display server.
+    ///
+    /// A **drag** copies and a **click** does not, which is the whole of the
+    /// rule: a click is a cursor move and copying on one would clobber the
+    /// clipboard every time you pointed at something. A double or a triple click
+    /// is a selection and does copy.
+    ///
+    /// Off for anyone who wants the clipboard to change only when they say so —
+    /// the copy key still works, and so does the emulator's own drag with
+    /// `shift` held.
+    pub copy_on_select: bool,
+}
+
+impl Default for Mousing {
+    fn default() -> Self {
+        Self { copy_on_select: true }
+    }
+}
+
 /// A logical row, the way [`RowRef::logical`] names one: which presentation owns
 /// it, and where in that presentation's own storage it sits.
 pub type RowId = (u16, u32);
+
+/// Where a click landed inside a row: which of the row's texts, and which byte.
+///
+/// The answer a presentation gives when it is asked to hit-test itself, and the
+/// one piece of a selection that needs a frontend at all — a pixel in a window,
+/// a cell in a terminal. It is *here* rather than beside either of them because
+/// both were about to define the same pair, and a caret built from two different
+/// spellings of it is a caret that only one door can carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hit {
+    pub part: u16,
+    /// A byte offset into the **logical** row's text, not the visual row's — so
+    /// a caret on the third row of a wrapped line is the same kind of thing as
+    /// one on an unwrapped line.
+    pub off: usize,
+}
 
 /// One end of a selection.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -30,6 +30,8 @@
 //! cursor is pushed to the near edge and stops there — vim's behaviour, arrived
 //! at from the same constraint.
 
+use std::ops::Range;
+
 /// Rows of context kept between the cursor and the edge when it moves.
 ///
 /// Three, because a cursor pinned to the last row gives you no idea what you are
@@ -59,11 +61,19 @@ pub struct Scrolling {
     pub rows: usize,
     /// Rows of lead kept between the cursor and the edge. See [`SCROLLOFF`].
     pub scrolloff: usize,
+    /// Whether to draw a scrollbar beside a list longer than its viewport.
+    ///
+    /// Data and not a registry, because there is nothing to choose *between*: a
+    /// client draws one or it does not. What it looks like is the client's, and
+    /// [`Viewport::thumb`] is the part that must not be — a thumb that reached
+    /// the bottom before the list did would say the wrong thing in three doors
+    /// instead of one.
+    pub scrollbar: bool,
 }
 
 impl Default for Scrolling {
     fn default() -> Self {
-        Self { rows: 1, scrolloff: SCROLLOFF }
+        Self { rows: 1, scrolloff: SCROLLOFF, scrollbar: true }
     }
 }
 
@@ -222,11 +232,22 @@ impl Viewport {
     /// ends of the list, where there is nothing beyond the edge to preview and
     /// the margin would just make the first and last rows unreachable.
     pub fn scroll_by(&mut self, by: isize) {
-        let max_top = self.max_top();
-        self.top = match by.is_negative() {
+        let to = match by.is_negative() {
             true => self.top.saturating_sub(by.unsigned_abs()),
-            false => (self.top + by as usize).min(max_top),
+            false => self.top.saturating_add(by as usize),
         };
+        self.scroll_to(to);
+    }
+
+    /// Scrolls so that row `top` is the first one drawn.
+    ///
+    /// What a dragged scrollbar thumb calls, and what [`scroll_by`](Self::scroll_by)
+    /// is written in terms of — a drag is a *position* and a wheel notch is a
+    /// delta, and only one of them can be expressed as the other without the
+    /// clamping drifting.
+    pub fn scroll_to(&mut self, top: usize) {
+        let max_top = self.max_top();
+        self.top = top.min(max_top);
         let last = self.len.saturating_sub(1);
         let pad = self.pad();
         let low = match self.top == 0 {
@@ -240,6 +261,68 @@ impl Viewport {
         // `low` first, so a viewport shorter than twice the margin cannot invert
         // the two and panic in `clamp`.
         self.cursor = self.cursor.clamp(low.min(high), high.max(low)).min(last);
+    }
+
+    // ----------------------------------------------------------- the scrollbar
+
+    /// Which cells of a `track`-cell scrollbar the thumb covers, or `None` when
+    /// there is nothing to scroll.
+    ///
+    /// Here rather than in a client because a scrollbar is *arithmetic about a
+    /// list* and only its glyphs are a UI — three doors would otherwise each
+    /// decide for themselves whether a thumb reaching the bottom means the last
+    /// row is visible, and two of them would be wrong.
+    ///
+    /// Two properties, and both are load-bearing. The thumb is **never shorter
+    /// than one cell**, so a 714k-row diff still has something to grab. And it
+    /// touches the end of the track **exactly** when the list is scrolled to the
+    /// end — which is why the position is measured against
+    /// [`max_top`](Self::max_top) and the free travel rather than against the
+    /// row count: proportional-to-`len` leaves a thumb short of the bottom on a
+    /// list scrolled all the way down, which reads as "there is more" when there
+    /// is not.
+    ///
+    /// `None` and not an empty range: a list shorter than its viewport has no
+    /// scrollbar at all, and a track drawn with the thumb filling it is furniture
+    /// that says nothing.
+    pub fn thumb(&self, track: usize) -> Option<Range<usize>> {
+        let max_top = self.max_top();
+        if track == 0 || max_top == 0 {
+            return None;
+        }
+        let len = self.thumb_len(track);
+        let travel = track - len;
+        let start = match travel {
+            0 => 0,
+            _ => (self.top * travel + max_top / 2) / max_top,
+        };
+        Some(start..start + len)
+    }
+
+    /// The `top` that puts the thumb's first cell at `cell` of a `track`-cell
+    /// scrollbar: [`thumb`](Self::thumb) run backwards, for a drag.
+    ///
+    /// Run backwards rather than approximated, so that grabbing a thumb and
+    /// putting it back where it was leaves the list where it was — a scrollbar
+    /// that drifts by a row per drag is one nobody uses twice.
+    pub fn top_at(&self, cell: usize, track: usize) -> usize {
+        let max_top = self.max_top();
+        if track == 0 || max_top == 0 {
+            return 0;
+        }
+        let travel = track - self.thumb_len(track);
+        match travel {
+            0 => 0,
+            _ => ((cell.min(travel) * max_top) + travel / 2) / travel,
+        }
+    }
+
+    /// How many cells of `track` the thumb takes: its share of the list, never
+    /// nothing and never the whole track — a thumb with nowhere to travel cannot
+    /// say where you are.
+    fn thumb_len(&self, track: usize) -> usize {
+        let share = (self.height * track).div_ceil(self.len.max(1));
+        share.clamp(1, track.saturating_sub(1).max(1))
     }
 
     /// Keeps the cursor on screen, with [`SCROLLOFF`] rows of lead where there
@@ -424,6 +507,73 @@ mod tests {
         v.go_to_fraction(1.0);
         assert_eq!(v.cursor(), 99, "rounded down, not one past the end");
         assert!((v.progress() - 0.99).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_scrollbar_thumb_is_proportional_and_never_disappears() {
+        let v = view(100, 20);
+        // A fifth of the list is on screen, so a fifth of a 20-cell track.
+        assert_eq!(v.thumb(20), Some(0..4));
+        // A 714k-row diff still has something to grab.
+        let big = view(714_000, 40);
+        let thumb = big.thumb(38).expect("a scrollable list");
+        assert_eq!(thumb.len(), 1);
+    }
+
+    #[test]
+    fn a_thumb_touches_the_bottom_exactly_when_the_list_does() {
+        // The property proportional-to-`len` gets wrong: with 20 of 100 rows on
+        // screen the last row is reached at top 80, and a thumb still short of
+        // the end there says there is more when there is not.
+        let mut v = view(100, 20);
+        v.to_bottom();
+        assert_eq!(v.top(), 80);
+        let thumb = v.thumb(20).unwrap();
+        assert_eq!(thumb.end, 20, "the thumb stopped short of the end");
+        v.to_top();
+        assert_eq!(v.thumb(20).unwrap().start, 0);
+    }
+
+    #[test]
+    fn a_list_that_fits_has_no_thumb_at_all() {
+        assert_eq!(view(10, 20).thumb(20), None);
+        assert_eq!(view(100, 20).thumb(0), None, "no track, no thumb");
+        assert_eq!(Viewport::new().thumb(20), None);
+    }
+
+    #[test]
+    fn dragging_a_thumb_back_where_it_was_leaves_the_list_where_it_was() {
+        // What `top_at` being the exact inverse buys: a scrollbar that does not
+        // drift by a row every time it is grabbed.
+        let mut v = view(1000, 25);
+        for top in [0, 1, 137, 500, 974, 975] {
+            v.scroll_to(top);
+            let cell = v.thumb(25).unwrap().start;
+            // Several tops share a cell on a short track, so the round trip is
+            // through the *thumb* and not through the row: put it back and it
+            // lands on the same cell.
+            let mut back = v;
+            back.scroll_to(v.top_at(cell, 25));
+            assert_eq!(back.thumb(25).unwrap().start, cell, "the thumb moved at top {top}");
+        }
+    }
+
+    #[test]
+    fn a_thumb_dragged_past_either_end_clamps_rather_than_wrapping() {
+        let v = view(1000, 25);
+        assert_eq!(v.top_at(0, 25), 0);
+        assert_eq!(v.top_at(9999, 25), 975, "past the end of the track");
+    }
+
+    #[test]
+    fn scrolling_to_a_row_is_the_same_as_scrolling_by_the_difference() {
+        let mut a = view(100, 20);
+        let mut b = a;
+        a.scroll_by(7);
+        b.scroll_to(7);
+        assert_eq!(a, b);
+        a.scroll_to(9999);
+        assert_eq!(a.top(), 80, "past the end of the list");
     }
 
     #[test]

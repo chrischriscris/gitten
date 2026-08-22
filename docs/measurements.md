@@ -381,11 +381,20 @@ that it does not depend on the size of the diff: it is 50 rows either way.
 
 | view | rows | load | frame |
 |---|---|---|---|
-| `pr30683.diff`, unified | 740,383 | 421 ms | 12 µs |
-| `pr30683.diff`, side-by-side | 973,394 | 476 ms | 13 µs |
-| `md.diff`, unified | 74,467 | 118 ms | 10 µs |
-| `md.diff`, side-by-side | 90,963 | 103 ms | 12 µs |
-| `git/git`, 82k commits | — | 138 ms | 26 µs |
+| `pr30683.diff`, unified | 740,383 | 473 ms | 15 µs |
+| `pr30683.diff`, side-by-side | 973,394 | 532 ms | 16 µs |
+| `md.diff`, unified | 74,467 | 110 ms | 12 µs |
+| `md.diff`, side-by-side | 90,963 | 117 ms | 14 µs |
+| `git/git`, 82k commits | — | 156 ms | 28 µs |
+
+Re-measured at `FRAMES=200` when the mouse landed
+([decisions/0022](decisions/0022-the-mouse-in-a-terminal.md)); the first run of
+the table read 2–3 µs lower on the same fixtures and the same sizes, and none of
+that is the scrollbar or the selection. Building with `Scrolling::scrollbar`
+defaulted to `false` — so no `Screen::over` runs at all — measures 15 µs, 12 µs
+and 29 µs on the three rows above, which is the same number back inside the
+noise. A bar is 40 cells and a selection is `Selection::at` per visible row, two
+integer comparisons against a cached range; neither is a function of the diff.
 
 Ten times the rows costs nothing per frame, which is the point. The 12 µs is 40
 rows × the run merge × a memcpy into the cell buffer, and nothing in it

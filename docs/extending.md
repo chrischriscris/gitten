@@ -50,8 +50,9 @@ in all three — which is what makes "not on `Host`" a real failure rather than 
 style note. `chrome.selection_bg` exists because the terminal needed a colour for
 the row the keyboard is on and a literal in a view is not a seam; no GPUI view
 draws *that* yet. `chrome.selected_bg` is the other one — the text a drag
-selected — and it is a whole `Surface`, so a theme retunes the syntax colours that
-land on it rather than accepting whatever they were.
+selected, and the commits a drag covered — and it is a whole `Surface`, so a theme
+retunes the syntax colours that land on it rather than accepting whatever they
+were.
 
 `s` and `w` are the first real key bindings and are deliberately shaped like the
 last one will be — the view owns a focus handle, the binding is global, the handler is a
@@ -558,12 +559,19 @@ crate that imports `crossterm`. See [clients.md](clients.md).
 ## 11. A selection your presentation takes part in
 
 ```rust
-/// Where a click landed inside a row.
+/// Where a click landed inside a row. `core::select`, because two doors ask it.
 pub struct Hit { pub part: u16, pub off: usize }
 
+// plait-shell, in pixels:
 fn hit(&self, index: usize, seg: usize, x: f32, host: &Host) -> Option<Hit>;
+// plait-tui, in columns, with the horizontal scroll already applied:
+fn hit(&self, index: usize, seg: usize, col: usize, shift: usize) -> Option<Hit>;
+
 fn selectable(&self, index: usize, part: u16) -> Option<&str>;
 ```
+
+Two signatures and one seam: the unit is the client's — a pixel there, a cell here
+— and everything the answer feeds is shared.
 
 Two methods, and everything else about a selection is `core::select`: which rows
 lie between two carets, which bytes of each, what survives a reflow, where a word
@@ -604,7 +612,14 @@ StyledText::new(piece).with_highlights(runs(
 `column_at`, `header_hit` and `selected` are shared helpers in `views::diff`, for
 the same reason `file_header` is: a header's text starts at the page padding
 whoever owns the lines beneath it, and three presentations working that out
-separately is three places for the caret to be a gutter's width off.
+separately is three places for the caret to be a gutter's width off. The terminal
+has the same three under the same names in `plait_tui::rows`, measured in columns
+— `col_at`, `header_hit`, `selected_text` — and its painting is a background on a
+run rather than a highlight on a `StyledText`:
+
+```rust
+text_run(line, span, theme, row_ink, at.shift, at.part(0), pen, out);
+```
 
 ## What a new seam owes
 

@@ -16,6 +16,7 @@ use crate::differ::Differs;
 use crate::font::Font;
 use crate::syntax::Highlighters;
 use crate::theme::{Theme, Themes};
+use crate::select::Mousing;
 use crate::view::Scrolling;
 use crate::wrap::Wraps;
 
@@ -48,6 +49,12 @@ pub struct Host {
     /// — a scroll is arithmetic, and what varies is only how much of it. Read by
     /// whatever runs `view.scroll-down`, so a saved file changes the next notch.
     pub view: Scrolling,
+    /// What the mouse does besides select — today, whether a drag copies.
+    ///
+    /// Its own field and not part of [`Scrolling`]: one is about where a list is
+    /// and the other is about what a gesture means, and a config section that
+    /// mixes the two is one nobody can guess the shape of.
+    pub mouse: Mousing,
     /// Which command each key runs, per mode.
     ///
     /// On `Host` and not in a client for the reason the whole struct exists: a
@@ -97,6 +104,7 @@ impl Host {
             layout: "unified".into(),
             wrap: Wraps::builtin(),
             view: Scrolling::default(),
+            mouse: Mousing::default(),
             keys: Keymap::builtin(),
             commands: Commands::builtin(),
             theme: Theme::dark(),

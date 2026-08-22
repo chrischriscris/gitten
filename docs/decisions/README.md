@@ -46,6 +46,7 @@ rather than nine.
 | [0019](0019-the-strip-is-the-titlebar.md) | The window has no titlebar of its own |
 | [0020](0020-furniture-has-its-own-floor.md) | Furniture has a lower contrast floor than text |
 | [0021](0021-themes-are-a-registry.md) | A theme is a registered palette, and the config file writes one |
+| [0022](0022-the-mouse-in-a-terminal.md) | A notch is a key, a button is a place |
 
 **0011 is deliberately absent.** It was a rendered-Markdown reader that was built,
 looked at, judged broken and parked in a `git stash` rather than deleted. The

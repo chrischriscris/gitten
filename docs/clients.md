@@ -44,6 +44,7 @@ twice — and it has been three times already:
 | `plait.toml` | once, behind GPUI | `app::config` |
 | which command a key runs | nowhere shared | `core::command` |
 | what the mouse has selected, and what copying it yields | nowhere — the window had none | `core::select` |
+| where a scrollbar's thumb goes | nowhere — no client drew one | `core::view` |
 
 The last two are the ones that mattered most. Before `plait-app`, the parser for
 `plait.toml` lived in `shell/src/config.rs` — so the *window* was the only client
@@ -129,7 +130,8 @@ way a keypress resolves to `view.down` — rebindable, on the help screen, and t
 same name in all three clients. Kept out of `Code`, it would have been a `match`
 in each client deciding that the wheel scrolls: three keymaps nobody could
 configure, which is the exact thing this module exists to prevent. A mouse
-*position* is not a key and is not here; it belongs to whatever was clicked.
+*position* is not a key and is not here; it belongs to whatever was clicked, and
+`plait-tui/src/main.rs` is what a client routing one looks like.
 
 ### What `Keymap` will not do
 
@@ -209,10 +211,11 @@ notice a panic in a presentation.
   `cmd-a` and `escape` with `KeyBinding::new`. Porting it is a `match` on a
   command name — the same one `plait-tui/src/main.rs` has. `copy.selection`,
   `select.all` and `select.none` are registered commands already, waiting for it.
-- **Only the window draws a selection.** `core::select` is shared and the
-  terminal and the browser get theirs from the thing they run inside, so neither
-  drives the model — a `plait-tui` that wanted its own would implement `hit` and
-  `selectable` on its own `Rows` and nothing else.
+- **`plait-web` has no selection of its own**, and does not need one: a browser
+  selects text for free. The window and the terminal both drive `core::select`,
+  and the terminal's half of it turned out to be exactly what this entry
+  predicted — `hit` and `selectable` on its own `Rows`, and nothing else. See
+  [decisions/0022](decisions/0022-the-mouse-in-a-terminal.md).
 - **`plait-web` has no input at all**, so the keymap reaches it only once the
   browser sends keypresses to an endpoint. It has `j`/`k`/`g`/`G` in its own
   script, which is exactly the duplication `core::command` exists to end.

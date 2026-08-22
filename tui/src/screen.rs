@@ -309,6 +309,30 @@ impl Screen {
         (0..self.h).map(|y| self.row_text(y)).collect::<Vec<_>>().join("\n")
     }
 
+    /// Draws one character over whatever is already in a cell, keeping that
+    /// cell's background.
+    ///
+    /// What a scrollbar is: furniture that sits *on* the rows rather than beside
+    /// them, so a removal's red runs to the edge underneath it exactly as it does
+    /// everywhere else. A pen cannot do this — it writes a whole [`Ink`], and a
+    /// scrollbar drawn with one would punch a column of chrome-coloured holes
+    /// down a wall of colour.
+    ///
+    /// Out of range writes nothing, and a continuation cell takes the character
+    /// anyway: half a wide glyph is already lost the moment something is drawn
+    /// over the other half, and leaving `\0` on screen would be worse.
+    pub fn over(&mut self, x: usize, y: usize, ch: char, fg: Rgb) {
+        if x >= self.w || y >= self.h {
+            return;
+        }
+        let cell = &mut self.back[y * self.w + x];
+        cell.ch = ch;
+        cell.ink.fg = fg;
+        cell.ink.bold = false;
+        cell.ink.italic = false;
+        cell.ink.underline = false;
+    }
+
     /// The ink of one cell, for a test that cares about colour rather than text.
     pub fn ink(&self, x: usize, y: usize) -> Option<Ink> {
         (x < self.w && y < self.h).then(|| self.back[y * self.w + x].ink)
@@ -760,6 +784,21 @@ mod tests {
         assert!(text.contains("two"));
         assert!(!text.contains("\x1b[1;1H"), "a printable dump moved the cursor");
         assert_eq!(text.matches("\x1b[0m\n").count(), 2, "a row did not reset: {text:?}");
+    }
+
+    #[test]
+    fn drawing_over_a_cell_keeps_the_background_it_landed_on() {
+        // The scrollbar's whole trick: a row's colour still runs to the edge.
+        let mut s = screen(6, 2);
+        s.row(0).wash(Ink::new(FG, 0x330000));
+        s.over(5, 0, '\u{2588}', 0xabcdef);
+        assert_eq!(s.char_at(5, 0), Some('\u{2588}'));
+        assert_eq!(s.ink(5, 0).unwrap().bg, 0x330000, "it repainted the row");
+        assert_eq!(s.ink(5, 0).unwrap().fg, 0xabcdef);
+        // Off the grid is a no-op rather than a panic: a bar is drawn from a
+        // height the caller worked out, and an off-by-one is a bug to see.
+        s.over(99, 0, 'x', FG);
+        s.over(0, 99, 'x', FG);
     }
 
     #[test]

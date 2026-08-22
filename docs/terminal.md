@@ -28,6 +28,9 @@ version.
   graph::MAX_LANES, lane_count
   command::*     a key → a command name            → a platform event → Key,
                                                      and a match on the name
+  select::*      carets, rows, words, the copy,     → where a click landed, and
+                 what finishing a drag means         a background on a run
+  view::Viewport top, cursor, and the thumb         → glyphs for the scrollbar
   app::config    plait.toml, watched                how a reload reaches a view
   app::cli       the arguments, the usage           its own flags
   app::acquire   a view of a source → data
@@ -171,7 +174,7 @@ Nothing in that file decides what a key *does*. The keymap is on `Host`, so
 actually bound because the help panel is a pure function of the registry. See
 [clients.md](clients.md) for the seam.
 
-Three things about it are decisions:
+Four things about it are decisions:
 
 **A wheel notch is a key.** `Code::WheelUp` and `Code::WheelDown` are variants of
 the same enum `j` is, so the wheel resolves through the keymap, appears on the
@@ -183,6 +186,12 @@ moving the *view* is a different verb from moving the cursor and deserved a
 command rather than a flag on `view.down`. Where the pointer was is dropped:
 there is one scrollable thing on screen, and a coordinate nothing can route is
 one that gets routed wrong the day there are panes.
+
+**A button is not a key**, for the same reason and pointing the other way: a
+position cannot be a line in `plait.toml`, because a config file cannot hold a
+hit test. So it arrives as an `Input::Mouse` and this file routes it — see
+[the mouse](#the-mouse) above, and
+[decisions/0022](decisions/0022-the-mouse-in-a-terminal.md).
 
 **One row per event, and that is not a taste.** A terminal reports the wheel once
 per *line* of the platform's scroll delta, not once per notch — Ghostty on macOS
@@ -198,6 +207,86 @@ timeout exists only so a saved `plait.toml` is noticed. Nothing redraws unless
 something happened — the property GPUI gives the window for free, arrived at here
 on purpose.
 
+## The mouse
+
+A notch is a key and a button is a place, and that split is the whole design —
+see [decisions/0022](decisions/0022-the-mouse-in-a-terminal.md).
+
+```text
+  wheel   ──► Code::WheelUp/Down ──► Keymap ──► "view.scroll-up"   rebindable
+  button  ──► Input::Mouse ──► main: which row of the body ──► a view's method
+```
+
+`main.rs` owns two rows — the title bar and the status line — so all it does is
+subtract them and hand the rest down. Everything below that is the view's,
+because only a presentation knows where its own text starts:
+
+| what | where |
+|---|---|
+| which visual row a cell is over | `Diff::locate`, from the viewport |
+| which text and which byte | `Rows::hit`, per presentation, in columns |
+| which rows lie between two carets, and what they copy | `core::select` |
+| how many times you clicked | `main.rs`, against a 400 ms clock |
+| whether finishing one copies it | `[mouse] copy_on_select`, read per gesture |
+
+**A click moves the cursor**, so the keyboard carries on from where the pointer
+left off — `enter` on the commit you just clicked, `y` on the line you just
+pointed at. **A drag selects**, and past the top or the bottom of the body it
+scrolls by the overshoot and keeps going. **Two clicks take a word and three take
+the row**, with `core::select::word_at` deciding what a word is, because a
+terminal and a window must not disagree about `foo(bar,`. Two clicks in the
+commit list open the diff.
+
+Three things about it are worth knowing:
+
+**A cell has no right half.** A window rounds a click to the nearest character
+boundary, which is what makes a drag include the character it started on. There
+is nothing to round here, so the *head* of a drag is taken one column further on
+than a click would be — `Diff::head`, and the direction is asked first so a
+backwards drag is not off by one the other way.
+
+**The commit list selects rows, not bytes.** A commit row is a sha, initials, a
+graph and a subject in fixed columns, and a graph is not a thing anybody pastes.
+So a drag there takes whole commits and `y` yields `sha subject` per line. The
+diff selects bytes, because a diff is text.
+
+**Finishing a selection copies it.** `[mouse] copy_on_select`, on by default,
+because taking the drag took select-then-`cmd-c` with it and the app owes that
+back — X11 terminals have worked this way since 1987. A **drag** copies and a
+**click** does not: a click is a cursor move, and a clipboard that changed
+whenever you pointed at a line is one you cannot keep anything in. A double or a
+triple click is a selection and does copy. `y` copies either way, and copies the
+row the cursor is on when nothing is selected.
+
+Once per gesture, on the button coming up — a write per motion event would be an
+escape sequence per cell the pointer crossed. The status line says `copied 3
+lines`, which is the only feedback there is.
+
+**Copying is OSC 52**, not `pbcopy` and not a clipboard crate: a terminal is
+frequently not on the machine the clipboard is on, and OSC 52 is the one
+mechanism that follows the session rather than the process. `cmd-c` and
+`ctrl-shift-c` cannot be used for this — the emulator eats them before the pty,
+and what they copy is the *emulator's* selection, which is empty while plait
+holds the mouse. The cost is that an emulator without OSC 52 copies nothing and
+cannot say so — there is no reply. tmux needs `set-clipboard on`, which is its
+3.x default.
+
+## The scrollbar
+
+One column at the right-hand edge, drawn **over** the rows rather than beside
+them, so a removal's red still reaches the edge underneath it. Reserving a column
+instead costs a reflow: one column fewer is a different wrap, a different row
+count and therefore a different scrollbar.
+
+Where the thumb goes is `Viewport::thumb` and is `core`'s, because it is
+arithmetic about a list — and it has the property the obvious version misses: the
+thumb touches the end of the track **exactly** when the last row is on screen.
+Proportional-to-`len` leaves it short of the bottom on a list scrolled all the way
+down, which reads as "there is more" when there is not. It is never shorter than
+one cell, so 714k rows still have something to grab, and there is no bar at all
+on a list that fits. `[view] scrollbar = false` turns it off; `--ascii` draws it
+as `|` and `#`.
+
 **`enter` opens a diff and `esc` comes back**, as a *stack of screens* rather
 than a pane. The acquisition is in `main`, not in the view: a view takes
 already-loaded data and never learns what a repository is, which is the same rule
@@ -211,11 +300,15 @@ per-visible-row and independent of the diff, which is the whole claim:
 
 | fixture | rows | load | frame |
 |---|---|---|---|
-| `pr30683.diff` | 740,383 | 421 ms | 12 µs |
-| `pr30683.diff`, side-by-side | 973,394 | 476 ms | 13 µs |
-| `md.diff` | 74,467 | 118 ms | 10 µs |
-| `md.diff`, side-by-side | 90,963 | 103 ms | 12 µs |
-| `git/git`, 82k commits | — | 138 ms | 26 µs |
+| `pr30683.diff` | 740,383 | 473 ms | 15 µs |
+| `pr30683.diff`, side-by-side | 973,394 | 532 ms | 16 µs |
+| `md.diff` | 74,467 | 110 ms | 12 µs |
+| `md.diff`, side-by-side | 90,963 | 117 ms | 14 µs |
+| `git/git`, 82k commits | — | 156 ms | 28 µs |
+
+The scrollbar and the selection are inside those and are not measurable in them:
+turning the bar off entirely moves the first row by less than the noise between
+two runs. See [measurements.md](measurements.md).
 
 ```sh
 ./dev dump diff --fixtures
@@ -259,17 +352,15 @@ to. A terminal does the same.
 - **`MarkdownRows`.** `core/examples/paint.rs` already draws the furniture in
   ANSI, so the terminal version is that function and a `Rows` impl — and the
   furniture itself is then a fourth thing to lift into `core`.
-- **The mouse beyond the wheel.** A notch arrives as `Code::WheelUp` /
-  `WheelDown` and resolves through the keymap like any key, so `plait.toml`
-  rebinds it. A *click* is decoded and dropped: routing one means a hit test, and
-  a hit test means knowing which pane was clicked, which is the item below. Mode
-  1000 has to be on for the wheel either way, which costs drag-to-select — hold
-  `shift` (`option` on iTerm), or start with `--no-mouse`.
 - **`selection_bg` in the shell.** It was added to `ChromePalette` for this
   client because a hardcoded selection colour is not a seam, and it means the row
-  the keyboard is on. No GPUI view draws *that* yet. The window's mouse selection
-  is a different colour and a different thing — `chrome.selected_bg`, and
+  the keyboard is on. No GPUI view draws *that* yet. The mouse selection is
+  `chrome.selected_bg` and both clients now draw *that* —
   [decisions/0018](decisions/0018-selection-is-a-model-not-a-text-element.md).
+- **A drag does not autoscroll on a clock.** Holding the pointer outside the body
+  scrolls by the overshoot once, per event, and stops when the pointer stops. A
+  timer would fix it and a timer is a thing to own; the selection extends past
+  the last visible row without one either way.
 - **Panes.** One screen at a time: `enter` on a commit opens its diff *over* the
   list and `esc` comes back. lazygit puts them side by side, and
   `Screen::span` is already the shape that would do it — nothing uses it for

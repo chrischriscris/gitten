@@ -15,17 +15,22 @@
 //! framework already has" case. Cell diffing and colour are not — they are forty
 //! lines and they are how the views stay testable.
 //!
-//! # Taking the mouse takes the selection with it
+//! # Taking the mouse takes the terminal's selection with it
 //!
 //! There is no tracking mode that reports the wheel and nothing else, so asking
 //! for a notch means asking for clicks — and an emulator that is forwarding
-//! clicks is no longer drag-selecting text with them. Every emulator worth using
-//! has the same override, `shift` (`option` on iTerm), and that is the whole of
-//! the mitigation; `--no-mouse` is the other half, for a terminal that does not.
+//! clicks is no longer drag-selecting text with them. plait therefore has to
+//! *have* a selection of its own, which it does: [`Input::Mouse`] routes to a
+//! view, the model is `plait_core::select` and `y` copies. The emulator's own
+//! override is still there for the times you want the whole screen rather than a
+//! diff — `shift` (`option` on iTerm) — and `--no-mouse` is the other half, for a
+//! terminal that has neither.
 //!
-//! So: mode 1000 and mode 1006, and deliberately *not* 1002 or 1003. Those
-//! report motion — a packet per cell the pointer crosses, decoded and discarded,
-//! for a feature nothing here has. `EnableMouseCapture` turns on all of them.
+//! So: mode 1000, mode 1002 and mode 1006, and deliberately *not* 1003. 1002
+//! reports motion **only while a button is held**, which is a drag and is the
+//! feature; 1003 reports every cell the pointer crosses over an idle screen,
+//! which is a packet per cell for nothing. `EnableMouseCapture` turns on all of
+//! them, which is why the modes are written out here.
 //!
 //! # Raw mode owns the keyboard
 //!
@@ -37,7 +42,8 @@
 //! process shows no echo and no newlines and looks like a hung machine.
 
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use crossterm::terminal;
 use plait_core::command::{Code, Key};
@@ -59,17 +65,54 @@ pub enum Input {
     /// and this enum stays a list of things that happened rather than a list of
     /// things to do.
     Key(Key),
+    /// A button, a drag or a release, and where it happened.
+    ///
+    /// Not a [`Key`], and that is the line `core::command` draws: a wheel notch
+    /// is a control with no coordinate and resolves through the keymap, and a
+    /// click is a *position* and belongs to whatever was under it. Routing one is
+    /// a hit test, which is the assembly's job and then a view's.
+    Mouse(Mouse),
     /// The terminal changed size. Carries the new one, so nothing has to ask.
     Resize(usize, usize),
 }
 
-/// Button tracking (1000) and SGR encoding (1006), and nothing else.
+/// What the pointer did, in cells of the terminal.
+///
+/// Plain data with no crossterm in it, so the assembly can route one and the
+/// views can be tested against one without a terminal — the same boundary
+/// [`Key`] crosses at this file's edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mouse {
+    pub kind: MouseKind,
+    /// Zero-based, from the top-left of the terminal — not of any view. Whoever
+    /// assembled the screen owns the title bar and subtracts it.
+    pub col: usize,
+    pub row: usize,
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+}
+
+/// The three things a button can be doing.
+///
+/// Only the left button is reported. The middle one is paste on X11 and the
+/// right one is a context menu nothing here has, and a client that swallowed
+/// either would be taking a gesture from the emulator and doing nothing with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseKind {
+    Down,
+    /// Motion with the button held. Mode 1002, and the reason it is on.
+    Drag,
+    Up,
+}
+
+/// Button tracking (1000), drag tracking (1002) and SGR encoding (1006).
 ///
 /// 1006 because the default encoding puts the coordinates in single bytes and
 /// dies past column 223, which is a normal width for a window on a normal
-/// screen. Neither of them is 1002 or 1003; see the note at the top of the file.
-const MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1006h";
-const MOUSE_OFF: &[u8] = b"\x1b[?1006l\x1b[?1000l";
+/// screen. Not 1003; see the note at the top of the file.
+const MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+const MOUSE_OFF: &[u8] = b"\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 
 /// The terminal, in the state a full-screen app needs it.
 ///
@@ -140,6 +183,31 @@ impl Term {
         }));
     }
 
+    /// Puts `text` on the system clipboard, through the terminal.
+    ///
+    /// **OSC 52**, and not `pbcopy` or a clipboard crate. A terminal is often not
+    /// on the machine the clipboard is on — over ssh, in a container, inside tmux
+    /// — and OSC 52 is the one mechanism that follows the *session* rather than
+    /// the process: the emulator at the near end does the copying. It also costs
+    /// no dependency and no subprocess, and this crate has two dependencies on
+    /// purpose.
+    ///
+    /// The cost, and it is real: an emulator that does not implement it, or that
+    /// has it turned off for safety, copies nothing and says nothing — there is
+    /// no reply to read. kitty, Ghostty, WezTerm, foot, Alacritty and iTerm2 all
+    /// do; Terminal.app does not. tmux needs `set -g set-clipboard on`, which is
+    /// its default in 3.x, and passes it through to the emulator.
+    ///
+    /// `c` is the selection: the clipboard proper, rather than X11's primary.
+    pub fn copy(&mut self, text: &str) -> io::Result<()> {
+        self.out.write_all(b"\x1b]52;c;")?;
+        self.out.write_all(base64(text.as_bytes()).as_bytes())?;
+        // BEL and not ST, because it is the terminator every emulator that
+        // implements this understands, including the ones that predate ST.
+        self.out.write_all(b"\x07")?;
+        self.out.flush()
+    }
+
     /// Where a [`Screen`](crate::screen::Screen) flushes to.
     pub fn out(&mut self) -> &mut impl Write {
         &mut self.out
@@ -163,11 +231,11 @@ impl Term {
 
     /// The next input, or `None` if nothing arrived within `timeout`.
     ///
-    /// Anything that is not a keypress, a wheel notch or a resize — a click, a
-    /// focus change, a bracketed paste — is skipped rather than surfaced, so a
-    /// caller gets `None` on a timeout and nothing else. Key *release* events
-    /// are skipped too: terminals with the kitty protocol on report both, and
-    /// acting on each is every binding firing twice.
+    /// Anything that is not a keypress, a wheel notch, a left button or a resize
+    /// — a focus change, a bracketed paste, the right button — is skipped rather
+    /// than surfaced, so a caller gets `None` on a timeout and nothing else. Key
+    /// *release* events are skipped too: terminals with the kitty protocol on
+    /// report both, and acting on each is every binding firing twice.
     pub fn poll(timeout: Duration) -> io::Result<Option<Input>> {
         if !event::poll(timeout)? {
             return Ok(None);
@@ -182,13 +250,40 @@ impl Drop for Term {
     }
 }
 
+/// Standard base64, which is what OSC 52 carries.
+///
+/// Twenty lines rather than a dependency: this is the whole of what a clipboard
+/// write needs, the alphabet has not changed since 1987, and the alternative is
+/// pulling a crate into the client whose dependency list is a stated design
+/// constraint.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+        for i in 0..4 {
+            // A chunk of one encodes two characters and a chunk of two encodes
+            // three; the rest is padding, which is not optional here — an
+            // emulator decoding a truncated group drops the last character.
+            let c = match i <= chunk.len() {
+                true => ALPHABET[(n >> (18 - 6 * i)) as usize & 0x3f] as char,
+                false => '=',
+            };
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Which events are inputs at all.
 ///
-/// Anything that is not a keypress, a wheel notch or a resize — a click, a focus
-/// change, a bracketed paste — is dropped, so a caller sees `None` for a timeout
-/// and for noise alike. Key *release* events are dropped too: terminals with the
-/// kitty protocol on report both, and acting on each is every binding firing
-/// twice.
+/// Anything that is not a keypress, a wheel notch, a left button or a resize — a
+/// focus change, a bracketed paste, a horizontal wheel — is dropped, so a caller
+/// sees `None` for a timeout and for noise alike. Key *release* events are
+/// dropped too: terminals with the kitty protocol on report both, and acting on
+/// each is every binding firing twice.
 ///
 /// Separate from [`Term::poll`] so it can be tested without a terminal, which is
 /// the same reason every other module in this crate can be.
@@ -196,34 +291,51 @@ fn translate_event(event: Event) -> Option<Input> {
     match event {
         Event::Resize(w, h) => Some(Input::Resize(w as usize, h as usize)),
         Event::Key(k) if k.kind != KeyEventKind::Release => translate(k),
-        Event::Mouse(m) => wheel(m),
+        Event::Mouse(m) => mouse(m),
         _ => None,
     }
 }
 
-/// A wheel notch as the key it is.
+/// A mouse event as the two different things it can be.
 ///
-/// Where it happened is dropped, and that is not laziness: this client has one
-/// scrollable thing on screen, and a coordinate nothing can route is a
-/// coordinate that will be routed wrong the day there are panes. It comes back
-/// then, as a hit test, and not as a field nobody reads.
+/// **A wheel notch is a key.** It has no coordinate anything needs — there is one
+/// scrollable thing under the pointer and the view already knows which — so it
+/// resolves through the keymap like `j`, appears on the `?` panel and is
+/// rebindable in `plait.toml`. See [`Code::WheelUp`].
 ///
-/// A click is dropped too. Mode 1000 reports them because there is no mode that
-/// reports only the wheel, and dropping them here is what keeps "the mouse does
-/// nothing" true rather than half-true.
-fn wheel(m: MouseEvent) -> Option<Input> {
-    let code = match m.kind {
-        MouseEventKind::ScrollUp => Code::WheelUp,
-        MouseEventKind::ScrollDown => Code::WheelDown,
-        _ => return None,
-    };
+/// **A button is a position**, and a position cannot be a key: `plait.toml`
+/// cannot hold a hit test. So it leaves here as an [`Input::Mouse`] and whoever
+/// assembled the screen decides which view it landed in.
+///
+/// Horizontal wheel events and the middle and right buttons are dropped rather
+/// than guessed at, exactly as an unmapped key is.
+fn mouse(m: MouseEvent) -> Option<Input> {
     let mods = m.modifiers;
-    Some(Input::Key(Key::new(
-        code,
+    let (ctrl, alt, shift) = (
         mods.contains(KeyModifiers::CONTROL),
         mods.contains(KeyModifiers::ALT),
         mods.contains(KeyModifiers::SHIFT),
-    )))
+    );
+    let kind = match m.kind {
+        MouseEventKind::ScrollUp => {
+            return Some(Input::Key(Key::new(Code::WheelUp, ctrl, alt, shift)))
+        }
+        MouseEventKind::ScrollDown => {
+            return Some(Input::Key(Key::new(Code::WheelDown, ctrl, alt, shift)))
+        }
+        MouseEventKind::Down(MouseButton::Left) => MouseKind::Down,
+        MouseEventKind::Drag(MouseButton::Left) => MouseKind::Drag,
+        MouseEventKind::Up(MouseButton::Left) => MouseKind::Up,
+        _ => return None,
+    };
+    Some(Input::Mouse(Mouse {
+        kind,
+        col: m.column as usize,
+        row: m.row as usize,
+        ctrl,
+        alt,
+        shift,
+    }))
 }
 
 /// crossterm's event into `core`'s key. The whole of what this module is for.
@@ -282,26 +394,69 @@ mod tests {
         }
     }
 
+    fn at(kind: MouseEventKind, mods: KeyModifiers) -> Option<Input> {
+        translate_event(Event::Mouse(MouseEvent { kind, column: 4, row: 9, modifiers: mods }))
+    }
+
     #[test]
-    fn a_wheel_notch_becomes_a_key_and_a_click_becomes_nothing() {
-        let notch = |kind| {
-            translate_event(Event::Mouse(MouseEvent {
-                kind,
-                column: 4,
-                row: 9,
-                modifiers: KeyModifiers::NONE,
-            }))
-        };
+    fn a_wheel_notch_becomes_a_key_and_keeps_no_coordinate() {
+        let notch = |kind| at(kind, KeyModifiers::NONE);
         let down = Some(Input::Key(Key::plain(Code::WheelDown)));
         assert_eq!(notch(MouseEventKind::ScrollDown), down);
         assert_eq!(notch(MouseEventKind::ScrollUp), Some(Input::Key(Key::plain(Code::WheelUp))));
-        // Mode 1000 reports these because no mode reports only the wheel.
-        assert_eq!(notch(MouseEventKind::Down(event::MouseButton::Left)), None);
-        assert_eq!(notch(MouseEventKind::Moved), None);
+        // A horizontal wheel is unmapped, exactly as an unmapped key is.
+        assert_eq!(notch(MouseEventKind::ScrollLeft), None);
         // And the whole point of it being a key: the shipped map already binds it.
         let k = Keymap::builtin();
         let press = [Key::plain(Code::WheelDown)];
         assert_eq!(k.resolve(&Modes::new(), &press), Resolve::Run("view.scroll-down"));
+    }
+
+    #[test]
+    fn a_button_becomes_a_position_and_the_other_buttons_do_not() {
+        // The line this module draws: a notch is a key and a click is a place,
+        // because `plait.toml` cannot hold a hit test.
+        let left = event::MouseButton::Left;
+        let down = at(MouseEventKind::Down(left), KeyModifiers::SHIFT);
+        assert_eq!(
+            down,
+            Some(Input::Mouse(Mouse {
+                kind: MouseKind::Down,
+                col: 4,
+                row: 9,
+                ctrl: false,
+                alt: false,
+                shift: true,
+            }))
+        );
+        let kind = |e| match at(e, KeyModifiers::NONE) {
+            Some(Input::Mouse(m)) => Some(m.kind),
+            _ => None,
+        };
+        assert_eq!(kind(MouseEventKind::Drag(left)), Some(MouseKind::Drag));
+        assert_eq!(kind(MouseEventKind::Up(left)), Some(MouseKind::Up));
+        // Motion with nothing held: mode 1002 does not report it and mode 1003
+        // is not on, so this is noise either way.
+        assert_eq!(kind(MouseEventKind::Moved), None);
+        // The middle button is paste on X11 and the right one is a menu nothing
+        // here has. Swallowing either takes a gesture and gives nothing back.
+        assert_eq!(kind(MouseEventKind::Down(event::MouseButton::Middle)), None);
+        assert_eq!(kind(MouseEventKind::Down(event::MouseButton::Right)), None);
+    }
+
+    #[test]
+    fn base64_is_the_one_in_the_rfc() {
+        // The vectors from RFC 4648, because a clipboard that pastes almost the
+        // right thing is worse than one that pastes nothing.
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foob"), "Zm9vYg==");
+        assert_eq!(base64(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+        // A line of a diff is not ASCII in general.
+        assert_eq!(base64("héllo — wörld".as_bytes()), "aMOpbGxvIOKAlCB3w7ZybGQ=");
     }
 
     #[test]

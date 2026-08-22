@@ -35,6 +35,7 @@
 //! joined.
 
 use crate::screen::{Ink, Pen, Screen};
+use crate::scrollbar::{self, Bar};
 use plait_core::graph::{lane_count, Hues, MAX_LANES};
 use plait_core::host::Host;
 use plait_core::theme::{Rgb, Theme};
@@ -172,6 +173,24 @@ pub struct Commits {
     /// two copies of a scroll rule drift — this one had already lost the name of
     /// its own margin.
     view: Viewport,
+    bar: Bar,
+    /// The anchor and the free end of a dragged range, while there is one.
+    ///
+    /// A **range of rows** and not a range of bytes, which is where this view
+    /// legitimately differs from the diff: a commit row is a sha, a name, a graph
+    /// and a subject drawn in fixed columns, and half of that is furniture nobody
+    /// wants pasted. So the unit of selection is the commit, and
+    /// [`Commits::selection`] decides what a commit copies as.
+    ///
+    /// `None` means "just the row the cursor is on", which is what makes the copy
+    /// key useful before the mouse has been touched at all. Held here rather than
+    /// read off the cursor, because the wheel moves the cursor when it has to and
+    /// a selection that grew while you scrolled is one you would paste without
+    /// meaning to. A keyboard *move* clears it outright, for the same reason.
+    sel: Option<(usize, usize)>,
+    dragging: bool,
+    /// Where in the scrollbar's thumb it was taken hold of, while it is held.
+    grabbed: Option<usize>,
 }
 
 impl Commits {
@@ -196,7 +215,19 @@ impl Commits {
         let gutter = draws.iter().map(|d| d.lanes * LANE_W).max().unwrap_or(0);
         let mut view = Viewport::new();
         view.set_len(commits.len());
-        Self { commits, draws, glyphs, lanes, gutter, cols: 0, view }
+        Self {
+            commits,
+            draws,
+            glyphs,
+            lanes,
+            gutter,
+            cols: 0,
+            view,
+            bar: Bar::default(),
+            sel: None,
+            dragging: false,
+            grabbed: None,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -226,18 +257,20 @@ impl Commits {
     }
 
     pub fn move_by(&mut self, by: isize) {
+        self.sel = None;
         self.view.move_by(by);
     }
 
     pub fn down(&mut self) {
-        self.view.down();
+        self.move_by(1);
     }
 
     pub fn up(&mut self) {
-        self.view.up();
+        self.move_by(-1);
     }
 
     pub fn page(&mut self, pages: isize) {
+        self.sel = None;
         self.view.page(pages);
     }
 
@@ -252,35 +285,172 @@ impl Commits {
     }
 
     pub fn to_top(&mut self) {
+        self.sel = None;
         self.view.to_top();
     }
 
     pub fn to_bottom(&mut self) {
+        self.sel = None;
         self.view.to_bottom();
     }
 
     /// Puts a saved row on screen, for a session restored across a restart.
     pub fn go_to(&mut self, row: usize) {
+        self.sel = None;
         self.view.go_to(row);
+    }
+
+    // ---------------------------------------------------------------- the mouse
+
+    /// The glyphs the scrollbar is drawn with. `--ascii`, or an extension.
+    pub fn set_bar(&mut self, bar: Bar) {
+        self.bar = bar;
+    }
+
+    /// Which commits are selected: the drag's range, or the row the cursor is on.
+    ///
+    /// Never empty on a non-empty list, which is what makes `y` copy this commit
+    /// before anything has been dragged.
+    pub fn selected(&self) -> std::ops::Range<usize> {
+        if self.commits.is_empty() {
+            return 0..0;
+        }
+        let cursor = self.view.cursor();
+        let (a, b) = self.sel.unwrap_or((cursor, cursor));
+        a.min(b)..a.max(b) + 1
+    }
+
+    /// A press in the list: the cursor moves there, and a range starts.
+    ///
+    /// `row` is a row of the body, and `extend` is shift — which moves the free
+    /// end of the range rather than starting a new one, so a range longer than
+    /// the screen needs no drag that has to scroll.
+    pub fn press(&mut self, col: usize, row: usize, extend: bool, host: &Host) {
+        if scrollbar::hit(col, self.cols, &self.view, host) {
+            let row = row.min(self.view.height().saturating_sub(1));
+            self.grabbed = Some(scrollbar::grab(&mut self.view, host, row));
+            return;
+        }
+        let Some(index) = self.view.row_at(row) else { return };
+        let anchor = match (extend, self.sel) {
+            (true, Some((a, _))) => a,
+            _ => index,
+        };
+        self.view.go_to(index);
+        self.sel = Some((anchor, index));
+        self.dragging = true;
+    }
+
+    /// The pointer moved with the button down. A row above or below the body
+    /// scrolls by the overshoot and keeps selecting, exactly as in the diff.
+    pub fn drag(&mut self, row: isize, host: &Host) {
+        if let Some(grabbed) = self.grabbed {
+            scrollbar::drag(&mut self.view, host, row.max(0) as usize, grabbed);
+            return;
+        }
+        if !self.dragging {
+            return;
+        }
+        let height = self.view.height() as isize;
+        let row = match row {
+            r if r < 0 => {
+                self.view.scroll_by(r);
+                0
+            }
+            r if r >= height => {
+                self.view.scroll_by(r - height + 1);
+                height.saturating_sub(1).max(0)
+            }
+            r => r,
+        };
+        let Some(index) = self.view.row_at(row as usize) else { return };
+        // The cursor follows the free end, so the row a command would act on is
+        // the row the pointer is over.
+        self.view.go_to(index);
+        self.sel = Some((self.sel.map_or(index, |(a, _)| a), index));
+    }
+
+    pub fn release(&mut self) {
+        self.dragging = false;
+        self.grabbed = None;
+    }
+
+    /// `select.all`.
+    pub fn select_all(&mut self) {
+        if self.commits.is_empty() {
+            return;
+        }
+        self.view.go_to(self.commits.len() - 1);
+        self.sel = Some((0, self.commits.len() - 1));
+    }
+
+    /// `select.none`. Says whether there was a range to drop, so `esc` can fall
+    /// through to whatever it means next — the cursor's own row is not a range
+    /// and there is nothing to clear when that is all there is.
+    pub fn select_none(&mut self) -> bool {
+        self.sel.take().is_some()
+    }
+
+    /// What the *mouse* has selected, and nothing else.
+    ///
+    /// Empty for a click, which is the rule copy-on-select rests on: a click is a
+    /// cursor move, and a clipboard that changed every time you pointed at a
+    /// commit would be a clipboard you could not keep anything in. A drag across
+    /// two rows is a selection; a press and a release on one row is not.
+    pub fn selection(&self) -> String {
+        match self.sel {
+            Some((a, b)) if a != b => self.lines(self.selected()),
+            _ => String::new(),
+        }
+    }
+
+    /// What `copy.selection` copies: the dragged range, or the commit the cursor
+    /// is on when there is none.
+    ///
+    /// The fallback is the point of binding the key at all — "copy this commit"
+    /// is the thing you want nine times out of ten, and it should not need the
+    /// mouse.
+    pub fn copy_text(&self) -> String {
+        self.lines(self.selected())
+    }
+
+    /// One line per commit: the sha and the subject, and neither the graph nor
+    /// the initials — a column of box drawing is not a thing anybody pastes, and
+    /// the two fields left are the ones that name the commit to git and to a
+    /// person.
+    fn lines(&self, rows: std::ops::Range<usize>) -> String {
+        self.commits[rows.start..rows.end.min(self.commits.len())]
+            .iter()
+            .map(|c| format!("{} {}", c.short, c.subject))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Draws the visible rows into `screen`, starting at row `y`.
     pub fn paint(&self, screen: &mut Screen, y: usize, host: &Host) {
         let theme = &host.theme;
         let blank = Ink::new(theme.chrome.dim, theme.chrome.bg);
+        // A range of one is the cursor and nothing more, so a click looks exactly
+        // like a keypress and only a real drag lights up.
+        let selected = match self.sel {
+            Some(_) => self.selected(),
+            None => 0..0,
+        };
         for i in 0..self.view.height() {
             let row = y + i;
             let Some(index) = self.view.row_at(i) else {
                 screen.row(row).wash(blank);
                 continue;
             };
-            let bg = match index == self.view.cursor() {
-                true => theme.chrome.selection_bg,
-                false => theme.chrome.bg,
+            let bg = match (index == self.view.cursor(), selected.contains(&index)) {
+                (true, _) => theme.chrome.selection_bg,
+                (false, true) => theme.chrome.selected_bg,
+                (false, false) => theme.chrome.bg,
             };
             let mut pen = screen.row(row);
             self.row(&mut pen, index, bg, theme);
         }
+        scrollbar::paint(screen, self.bar, self.cols.saturating_sub(1), y, &self.view, host);
     }
 
     /// lazygit's order — sha, author, graph, subject — because the graph is the
@@ -482,6 +652,108 @@ r\x1frrrrrrr\x1f\x1fAda Lovelace\x1f1700000100\x1fRoot\x1e";
         screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
         c.paint(&mut screen, 0, host);
         (0..c.view.height()).map(|y| screen.row_text(y)).collect()
+    }
+
+    /// A list long enough to scroll, so the scrollbar has something to say.
+    fn many(n: usize) -> String {
+        (0..n)
+            .map(|i| {
+                let parent = match i + 1 < n {
+                    true => format!("c{}", i + 1),
+                    false => String::new(),
+                };
+                format!(
+                    "c{i}\x1fc{i:06}\x1f{parent}\x1fAda Lovelace\x1f17000000{i:02}\x1fCommit {i}\x1e"
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_click_moves_the_cursor_and_a_drag_selects_the_commits_between() {
+        let (mut c, host) = view(LOG, 60, 4);
+        c.press(20, 2, false, &host);
+        assert_eq!(c.cursor(), 2);
+        // A click selects nothing — so copy-on-select does not fire on one —
+        // but the copy key still has a commit to act on.
+        assert_eq!(c.selection(), "");
+        assert_eq!(c.copy_text(), "bbbbbbb On a branch");
+        c.drag(0, &host);
+        c.release();
+        assert_eq!(c.selected(), 0..3);
+        assert_eq!(
+            c.selection(),
+            "mmmmmmm Merge branch\naaaaaaa On the trunk\nbbbbbbb On a branch"
+        );
+    }
+
+    #[test]
+    fn the_wheel_keeps_a_dragged_range_and_a_keyboard_move_drops_it() {
+        // The wheel drags the cursor along when it has to, so a range read off
+        // the cursor would silently grow while you were only looking around.
+        let (mut c, host) = view(&many(50), 60, 6);
+        c.press(20, 0, false, &host);
+        c.drag(2, &host);
+        let range = c.selected();
+        assert_eq!(range, 0..3);
+        c.scroll_y(20);
+        assert_eq!(c.selected(), range, "scrolling changed what would be copied");
+    }
+
+    #[test]
+    fn a_keyboard_move_drops_a_dragged_range_rather_than_growing_it() {
+        // Otherwise scrolling after a drag silently extends what `y` would copy.
+        let (mut c, host) = view(LOG, 60, 4);
+        c.press(20, 0, false, &host);
+        c.drag(2, &host);
+        assert_eq!(c.selected().len(), 3);
+        c.down();
+        assert_eq!(c.selected().len(), 1);
+        assert_eq!(c.selection(), "", "a range outlived the keypress that dropped it");
+        assert_eq!(c.copy_text(), "rrrrrrr Root");
+    }
+
+    #[test]
+    fn a_selected_range_is_lit_and_a_single_click_looks_like_a_keypress() {
+        let (mut c, host) = view(LOG, 60, 4);
+        c.press(20, 0, false, &host);
+        let mut screen = Screen::new(c.cols, 4);
+        screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
+        c.paint(&mut screen, 0, &host);
+        assert_eq!(screen.ink(0, 0).unwrap().bg, host.theme.chrome.selection_bg);
+        assert_eq!(screen.ink(0, 1).unwrap().bg, host.theme.chrome.bg, "one row lit two");
+        // Now a real drag: the rows behind the cursor take the selected colour.
+        c.drag(2, &host);
+        c.paint(&mut screen, 0, &host);
+        assert_eq!(screen.ink(0, 1).unwrap().bg, host.theme.chrome.selected_bg);
+        assert_eq!(screen.ink(0, 2).unwrap().bg, host.theme.chrome.selection_bg, "the cursor");
+    }
+
+    #[test]
+    fn select_all_takes_every_commit_and_none_gives_them_back() {
+        let (mut c, _) = view(LOG, 60, 4);
+        c.select_all();
+        assert_eq!(c.selected(), 0..4);
+        assert!(c.select_none());
+        assert_eq!(c.selected(), 3..4, "the cursor is still a selection of one");
+        assert!(!c.select_none());
+    }
+
+    #[test]
+    fn the_scrollbar_takes_a_click_and_the_list_does_not() {
+        let (mut c, host) = view(&many(200), 60, 10);
+        c.press(59, 9, false, &host);
+        assert_eq!(c.top(), 190, "the end of the track is the end of the list");
+        assert_eq!(c.cursor(), c.cursor().min(199));
+        c.drag(0, &host);
+        assert_eq!(c.top(), 0);
+        c.release();
+        // And it is drawn where it was clicked.
+        let mut screen = Screen::new(60, 10);
+        screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
+        c.paint(&mut screen, 0, &host);
+        assert_eq!(screen.char_at(59, 0), Some('█'));
+        assert_eq!(screen.char_at(59, 9), Some('│'));
     }
 
     #[test]

@@ -37,7 +37,10 @@
 //! side; the shorter one runs out of text partway down and draws `absent_bg` for
 //! the rest, which is the same thing it already draws opposite a lone addition.
 
-use crate::rows::{digits, file_header, hunk_header, line_colors, number, row_bg, text_run, Frame, Rows};
+use crate::rows::{
+    col_at, digits, file_header, header_hit, hunk_header, line_colors, number, row_bg, text_run,
+    Frame, Rows,
+};
 use crate::screen::{self, Ink, Pen};
 use crate::MIN_WRAP_COLS;
 use plait_core::align::align;
@@ -45,6 +48,7 @@ use plait_core::host::Host;
 use plait_core::prepared::{File, Line};
 use plait_core::rows::{Entry, Present};
 use plait_core::runs::Run;
+use plait_core::select::Hit;
 use plait_core::wrap::{Wrap, Wrapped};
 use plait_core::LineKind;
 
@@ -57,6 +61,18 @@ use plait_core::LineKind;
 enum Column {
     Old,
     New,
+}
+
+impl Column {
+    /// Which of the row's two texts this column draws, for a selection. The old
+    /// side is 0 because a row with only one side has that side — see
+    /// [`SplitRows::selectable`].
+    fn part(self) -> u16 {
+        match self {
+            Column::Old => 0,
+            Column::New => 1,
+        }
+    }
 }
 
 /// The rule between the columns. A single box-drawing character, so it joins up
@@ -107,10 +123,15 @@ impl SplitRows {
         self.digits.max(2)
     }
 
+    /// What one side draws before its text: a gutter, a space, a sign, a space.
+    fn side_chrome(&self) -> usize {
+        self.gutter() + 3
+    }
+
     /// Everything drawn besides the two columns of text: a gutter, a space, a
     /// sign and a space on each side, and the rule between them.
     pub fn chrome(&self) -> usize {
-        2 * (self.gutter() + 3) + screen::width(RULE)
+        2 * self.side_chrome() + screen::width(RULE)
     }
 
     /// How wide one column's text is. Half of what is left, which is what makes
@@ -165,7 +186,7 @@ impl SplitRows {
         pen.put(if seg > 0 { " " } else { sign }, row_ink);
         pen.put(" ", row_ink);
         let span = self.wrapped.range(index as usize, seg, &l.text);
-        text_run(l, span, theme, row_ink, at.shift, pen, out);
+        text_run(l, span, theme, row_ink, at.shift, at.part(column.part()), pen, out);
     }
 }
 
@@ -278,6 +299,67 @@ impl Rows for SplitRows {
         out
     }
 
+    /// Which side of the rule the pointer is on, and which byte of that side's
+    /// line it is over.
+    ///
+    /// The column width is the one the last reflow settled on rather than the pen's,
+    /// because a hit test has no pen — they differ only by the odd column an odd
+    /// terminal width leaves over, which `render` washes at the right-hand edge and
+    /// which no text is drawn in.
+    fn hit(&self, index: usize, seg: usize, col: usize, shift: usize) -> Option<Hit> {
+        match self.rows.get(index)? {
+            Row::File { path, .. } => Some(header_hit(path, col)),
+            Row::Hunk(h) => Some(header_hit(h, col)),
+            Row::Pair { old, new } => {
+                let side = self.side_chrome() + self.cols;
+                let (column, from) = match col < side + screen::width(RULE) {
+                    true => (Column::Old, 0),
+                    false => (Column::New, side + screen::width(RULE)),
+                };
+                let line = match column {
+                    Column::Old => *old,
+                    Column::New => *new,
+                };
+                // No line on this side at all: a lone addition opposite a hole.
+                // The caret still lands *on* the row, at nothing — which keeps a
+                // drag through the hole extending instead of freezing, and copies
+                // nothing for it because `selectable` has nothing to give.
+                let Some(line) = line else {
+                    return Some(Hit { part: column.part(), off: 0 });
+                };
+                let text = &self.lines[line as usize].text;
+                let at = self.wrapped.range(line as usize, seg, text);
+                let off = match seg < self.wrapped.rows(line as usize) {
+                    true => {
+                        let within =
+                            col.saturating_sub(from + self.side_chrome()) + shift;
+                        at.start + col_at(&text[at.clone()], within)
+                    }
+                    // This side wrapped less far than the other one. The end of
+                    // its line is the honest place for the caret.
+                    false => text.len(),
+                };
+                Some(Hit { part: column.part(), off })
+            }
+        }
+    }
+
+    /// A pair row has two texts and a header has one, which it lends to both
+    /// parts: a file path is neither the old file's nor the new one's.
+    fn selectable(&self, index: usize, part: u16) -> Option<&str> {
+        match self.rows.get(index)? {
+            Row::File { path, .. } => Some(path.as_ref()),
+            Row::Hunk(h) => Some(h.as_ref()),
+            Row::Pair { old, new } => {
+                let line = match part {
+                    0 => *old,
+                    _ => *new,
+                }?;
+                Some(self.lines[line as usize].text.as_ref())
+            }
+        }
+    }
+
     fn render(&self, index: usize, seg: usize, at: &Frame, pen: &mut Pen, out: &mut Vec<Run>) {
         match self.rows.get(index) {
             Some(Row::File { path, adds, dels }) => file_header(path, *adds, *dels, at, pen),
@@ -353,13 +435,37 @@ diff --git a/a.rs b/a.rs
             self.screen.clear(ink);
             let mut out = Vec::new();
             for (y, r) in self.order.iter().enumerate() {
-                let at = Frame { host: &self.host, shift, current: false };
+                let at = Frame { host: &self.host, shift, current: false, sel: None };
                 let mut pen = self.screen.row(y);
                 self.owners[r.owner as usize]
                     .render(r.index as usize, r.seg as usize, &at, &mut pen, &mut out);
             }
             (0..self.order.len()).map(|y| self.screen.row_text(y)).collect()
         }
+    }
+
+    #[test]
+    fn a_click_lands_in_the_column_it_is_over_and_selects_that_side_only() {
+        let h = Harness::new(DIFF, 60, &Word);
+        let rows = &h.owners[0];
+        // Row 3 is the pair `-let x = 1;` / `+let x = 2;`. The left column's text
+        // starts after its gutter and sign; the right one is past the rule.
+        let split = h.owners[0]
+            .hit(3, 0, 5, 0)
+            .expect("the old side is selectable");
+        assert_eq!(split.part, 0);
+        assert_eq!(rows.selectable(3, 0), Some("let x = 1;"));
+        let right = rows.hit(3, 0, h.cols - 5, 0).unwrap();
+        assert_eq!(right.part, 1, "the pointer was past the rule");
+        assert_eq!(rows.selectable(3, 1), Some("let x = 2;"));
+        // A row with nothing opposite: the caret still lands on it, so a drag
+        // through the hole keeps going, and it copies nothing.
+        let hole = rows.hit(4, 0, 5, 0).unwrap();
+        assert_eq!(hole.part, 0);
+        assert_eq!(rows.selectable(4, 0), None, "a hole had text to copy");
+        assert_eq!(rows.selectable(4, 1), Some("let z = 3;"));
+        // A header belongs to both columns: a path is neither file's.
+        assert_eq!(rows.selectable(0, 0), rows.selectable(0, 1));
     }
 
     #[test]
