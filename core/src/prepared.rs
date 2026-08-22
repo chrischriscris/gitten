@@ -71,12 +71,28 @@ impl Prepared {
 /// Clipping happens *before* both passes, so their output can only ever describe
 /// text that will actually be drawn.
 pub fn clip(s: &str, max_chars: usize) -> String {
-    let n = s.chars().count();
-    if n <= max_chars {
+    // A character is one to four bytes, so a line that fits the budget in
+    // bytes fits it in characters too — and the count below is a full decode
+    // walk that nearly every line of a real diff should never pay.
+    if s.len() <= max_chars {
         return s.to_string();
     }
-    let head: String = s.chars().take(max_chars).collect();
-    format!("{head}  … {} more chars", n - max_chars)
+    // Past the cheap check the count is still the arbiter, because byte
+    // length overshoots for multibyte text. One walk produces both the total
+    // and where the head ends, so the head is sliced rather than collected.
+    let mut n = 0;
+    let mut head_end = None;
+    for (i, _) in s.char_indices() {
+        if n == max_chars {
+            head_end = Some(i);
+        }
+        n += 1;
+    }
+    let head_end = match head_end {
+        Some(i) => i,
+        None => return s.to_string(),
+    };
+    format!("{}  … {} more chars", &s[..head_end], n - max_chars)
 }
 
 pub fn prepare(files: &[FileDiff], hl: &dyn Highlighter, max_line_chars: usize) -> Prepared {
@@ -210,5 +226,21 @@ index 1111111..2222222 100644
         let p = prepare(&parse_unified_diff(raw), &hl, 2000);
         let first = &p.files[0].hunks[0].lines[0];
         assert_eq!(first.tokens[0].kind, Kind::Heading, "markdown routing was lost");
+    }
+
+    #[test]
+    fn clipping_is_counted_in_characters_not_bytes() {
+        // The byte-length fast path must not change what comes out: multibyte
+        // text can overshoot in bytes while fitting in characters, and the
+        // suffix always names characters.
+        let wide = "\u{4e2d}".repeat(60); // three bytes each, 180 bytes total
+        assert_eq!(clip(&wide, 60), wide, "fits in characters despite the byte length");
+        assert_eq!(clip(&wide, 10), format!("{}  … {} more chars", &wide[..30], 50));
+
+        let ascii = "x".repeat(100);
+        assert_eq!(clip(&ascii, 100), ascii);
+        assert_eq!(clip(&ascii, 99), format!("{}  … 1 more chars", &ascii[..99]));
+        assert_eq!(clip("", 10), "");
+        assert_eq!(clip("éé", 0), "  … 2 more chars");
     }
 }
