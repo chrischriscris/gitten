@@ -115,6 +115,13 @@ row is never widened by an added row's long cell. A hunk that shows the middle o
 a table has no header and no separator; it aligns to what is on screen, which
 beats refusing to align.
 
+The runs and their measurements leave this pass in a `Tables`, and the reason is
+the one thing about a table that is not knowable at load: whether it fits the
+window. When it does not, the grid is laid out again at reflow — squeezed columns,
+cells wrapped inside them — off the same runs and the same measurements, because
+re-deriving "which rows are one table" at the other end is a second answer to it
+and two answers drift. See `docs/decisions/0017` and stage 4c of the pipeline.
+
 **The sharp edge, and it drew blood.** `for_each_side` hands a *context* row to its
 caller twice, because a context row belongs to both sides. The token pass does not
 care — it assigns `out[row]`, and assigning twice is assigning once. This pass

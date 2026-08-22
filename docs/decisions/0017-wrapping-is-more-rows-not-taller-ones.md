@@ -84,7 +84,9 @@ Splitting into lines is simpler to render and wrong in three places:
   against an addition whose intraline spans were computed against a different
   line. Highlighted words corresponding to nothing on screen.
 - `MarkdownRows` classifies blocks and strips markers per line. A continuation of
-  `# heading` is prose, a continuation of a table row shears the grid.
+  `# heading` is prose, a continuation of a table row shears the grid — which is
+  why a table too wide for the window is laid out again rather than broken; see
+  *a grid is laid out again, not broken* below.
 - The gutter shows both line numbers and they have to keep adding up.
   `docs/extending.md` calls this "row count is not yours to change" and a test
   asserts `MarkdownRows` and `TextRows` agree; splitting lines breaks the count
@@ -172,3 +174,27 @@ measuring so it costs no scroll width.
 **The overlay's row count had to become live.** Wrapping changes how many rows
 exist on every resize, and a number taken at load describes the diff as it was
 one window ago.
+
+## A grid is laid out again, not broken
+
+A Markdown table is aligned character by character with the rows around it, so
+every answer wrapping has for a long line is wrong for it. Breaking at the column
+shears the grid. Not breaking at all makes the table the widest row in the diff,
+`with_width_from_item` picks it, and the *whole view* scrolls sideways — hundreds
+of rows of prose wrapped to a window they are no longer looking at, which is the
+bug that prompted this section. Truncating the cell hides content with no way to
+reach it.
+
+So the grid is re-laid-out to the budget instead — columns squeezed by
+water-filling, cells wrapped inside them, one row becoming as many rows as its
+tallest cell needs. `core::markdown::flow_table` does it at reflow, because the
+width is the only part of a table's layout the load pass cannot know, and
+`wrap::Budget::At` is what carries the rows it decided into the same flat table
+every other row's rows live in. The alternative — a second table of table rows,
+beside `Wrapped` — is two answers to "how many rows is this line", and the whole
+reason this file exists is that there is exactly one.
+
+The floor is deliberate. Three columns cost ten characters of pipes and padding
+before a letter is drawn, so below one character a column the table is left whole
+and scrolled to: a grid with no room to draw a word in is worse than one you have
+to scroll.

@@ -23,8 +23,18 @@
 //!
 //! This is also the only presentation whose column budget differs per row, and
 //! [`MarkdownRows::budget`] is why: a bar, three levels of indent and a bullet
-//! are real pixels, an 18px heading in a 14px body holds a fifth fewer
-//! characters, and a table must not break at all.
+//! are real pixels, and an 18px heading in a 14px body holds a fifth fewer
+//! characters.
+//!
+//! A table is the exception to all of it. Its grid is aligned character by
+//! character with the rows around it, so a break at a column shears it — and not
+//! breaking it makes it the widest row in the diff, which drags the whole view
+//! into a horizontal scroll. So a grid too wide for the window is *laid out
+//! again* at the width there is: columns squeezed, cells wrapped inside them, one
+//! row becoming as many rows as its tallest cell needs. That is
+//! [`MarkdownRows::reflow_tables`] over `core`'s `flow_table`, and the rows it
+//! decides reach `Wrapped` as `Budget::At` — the same flat table every other
+//! row's rows are in.
 //!
 //! Within that, three devices do the work:
 //!
@@ -51,12 +61,12 @@ use super::diff::{
 };
 use gpui::*;
 use plait_core::host::Host;
-use plait_core::markdown::{lay_out, Block, Layout};
+use plait_core::markdown::{flow_table, lay_out_tables, Block, Grid, Layout, TableRow};
 use plait_core::select::Selected;
 use plait_core::syntax::Token;
 use plait_core::runs::surfaces;
 use plait_core::theme::Rgb;
-use plait_core::wrap::{Wrap, Wrapped};
+use plait_core::wrap::{Break, Budget, Wrap, Wrapped};
 use plait_core::{LineKind, Span};
 
 /// How a rendered markdown row is proportioned. A struct rather than constants
@@ -184,6 +194,31 @@ pub struct MarkdownRows {
     /// rule and a rule has to be as wide as the text it replaces — and the
     /// alternative is a constant, which was 320 pixels regardless of the window.
     width: f32,
+    /// Which rows are in a table, and which table: `(row, grid)`, ascending by
+    /// row. Sparse, because a table is 1–2.5% of the rows of a diff and a `run`
+    /// field on every row of a 714k-line one is 2.8 MB to answer "no".
+    tables: Vec<(u32, u32)>,
+    /// What each of those tables was aligned to at load: the width every column
+    /// wants, and which way its cells sit. One per run, so a handful.
+    grids: Vec<Grid>,
+    /// The table rows whose grid does not fit the current width, re-laid out onto
+    /// one that does — `(row, flowed)`, ascending. Empty at any width where every
+    /// table fits, and with wrapping off.
+    flows: Vec<(u32, Flowed)>,
+}
+
+/// One table row re-laid-out to the window: the sub-rows of its grid laid end to
+/// end, and everything that indexes them.
+///
+/// The shell's copy of [`plait_core::markdown::FlowRow`], and it exists for one
+/// reason: `SharedString`. A row is sliced per visible row per frame through the
+/// same `slice` every other row uses, and that is a refcount bump on a
+/// `SharedString` and a `to_string` on a `String`.
+struct Flowed {
+    text: SharedString,
+    breaks: Vec<Break>,
+    spans: Vec<Span>,
+    tokens: Vec<Token>,
 }
 
 impl Default for MarkdownRows {
@@ -209,6 +244,9 @@ impl MarkdownRows {
             budgets: Vec::new(),
             wrap: "",
             width: 0.0,
+            tables: Vec::new(),
+            grids: Vec::new(),
+            flows: Vec::new(),
         }
     }
 
@@ -225,13 +263,12 @@ impl MarkdownRows {
     ///   is 14, so the same row holds a fifth fewer characters. Nothing else in
     ///   the app has two type sizes in one list.
     ///
-    /// A table gets 0, which [`Wrapped`] reads as "never break this". Its grid is
-    /// aligned character by character with the rows above and below it, and a
-    /// break shears it — the same reason `align_tables` measures per run.
+    /// A table's budget is the width its *grid* has to fit, and not a column its
+    /// text may be broken at: a grid is aligned character by character with the
+    /// rows above and below it, so it is re-laid-out by
+    /// [`flow_table`] — cells wrapped inside their own columns — or drawn whole
+    /// and scrolled to. See [`MarkdownRows::reflow_tables`].
     fn budget(&self, block: Block, width: f32, host: &Host) -> usize {
-        if block.is_table() {
-            return 0;
-        }
         columns(width, TEXT_CHROME + self.furniture(block), self.size(block, host), host)
     }
 
@@ -261,6 +298,95 @@ impl MarkdownRows {
             _ => host.font.size,
         }
     }
+
+    /// Re-lays every table whose grid does not fit `width`, and forgets the ones
+    /// that do.
+    ///
+    /// The one part of a table's layout that is the window's business. Which rows
+    /// are one table, what its columns are and how wide each wants to be were all
+    /// settled at load by `lay_out_tables`; how many of those columns' characters
+    /// there is room for is not knowable until here, and changes on every drag
+    /// that crosses one.
+    ///
+    /// Runs per reflow over the tables and not over the rows, which is the whole
+    /// reason `tables` is sparse: a diff with no table in it does no work here at
+    /// any width.
+    fn reflow_tables(&mut self, width: f32, host: &Host, wrap: &dyn Wrap) {
+        self.flows.clear();
+        if self.tables.is_empty() {
+            return;
+        }
+        // One budget for every table, because a table row draws no furniture and
+        // no heading: the grid gets the whole column.
+        let cols = self.budget(Block::Table, width, host);
+        // Two vectors and not a `filter_map` into one: what comes back is one
+        // flowed row per row passed in, so a row silently dropped on the way in
+        // would attach every flow after it to the wrong row.
+        let mut run: Vec<TableRow> = Vec::new();
+        let mut of: Vec<u32> = Vec::new();
+        let mut i = 0;
+        while i < self.tables.len() {
+            let grid = self.tables[i].1;
+            let start = i;
+            while i < self.tables.len() && self.tables[i].1 == grid {
+                i += 1;
+            }
+            run.clear();
+            of.clear();
+            for (r, _) in &self.tables[start..i] {
+                let Row::Line { block, text, spans, tokens, .. } = &self.rows[*r as usize] else {
+                    continue;
+                };
+                of.push(*r);
+                run.push(TableRow { text: text.as_ref(), block: *block, tokens, spans });
+            }
+            let Some(flowed) = flow_table(
+                &run,
+                &self.grids[grid as usize],
+                cols,
+                &self.metrics.layout,
+                wrap,
+            ) else {
+                continue;
+            };
+            for (row, f) in of.iter().zip(flowed) {
+                self.flows.push((
+                    *row,
+                    Flowed {
+                        text: f.text.into(),
+                        breaks: f.breaks,
+                        spans: f.spans,
+                        tokens: f.tokens,
+                    },
+                ));
+            }
+        }
+    }
+
+    /// The re-laid-out grid for a row, if this width needed one.
+    ///
+    /// A binary search and not a field on the row: this is asked once per visible
+    /// row per frame over a list that holds a handful of entries, and the
+    /// alternative costs four bytes on every row of every diff to say "no".
+    fn flowed(&self, index: usize) -> Option<&Flowed> {
+        let at = self.flows.binary_search_by_key(&(index as u32), |(r, _)| *r).ok()?;
+        Some(&self.flows[at].1)
+    }
+
+    /// What a row draws and what indexes it: its own text, or the grid this width
+    /// re-laid it out onto.
+    fn text_of<'a>(
+        &'a self,
+        index: usize,
+        text: &'a SharedString,
+        spans: &'a [Span],
+        tokens: &'a [Token],
+    ) -> (&'a SharedString, &'a [Span], &'a [Token]) {
+        match self.flowed(index) {
+            Some(f) => (&f.text, &f.spans, &f.tokens),
+            None => (text, spans, tokens),
+        }
+    }
 }
 
 impl Rows for MarkdownRows {
@@ -288,17 +414,28 @@ impl Rows for MarkdownRows {
         self.budgets = budgets;
         self.wrap = wrap.name();
         self.width = width;
-        self.wrapped = Wrapped::build(
-            self.rows.iter().map(|r| match r {
-                Row::Line { block, text, .. } => {
-                    (text.as_ref(), self.budget(*block, width, host))
-                }
+        // Before the wrap and not inside it: a table that no longer fits comes
+        // out of this with its rows already decided, and what `Wrapped` does with
+        // it is keep them.
+        self.reflow_tables(width, host, wrap);
+        let wrapped = Wrapped::build_with(
+            self.rows.iter().enumerate().map(|(i, r)| match r {
+                Row::Line { block, text, .. } => match self.flowed(i) {
+                    Some(f) => (f.text.as_ref(), Budget::At(&f.breaks)),
+                    // A grid that fits, or one nothing could be done with, is
+                    // drawn whole: a break at a column shears it.
+                    None if block.is_table() => (text.as_ref(), Budget::Cols(0)),
+                    None => {
+                        (text.as_ref(), Budget::Cols(self.budget(*block, width, host)))
+                    }
+                },
                 // A header is drawn by the built-in's own function at the built-in's
                 // own width, and a path is not prose. One row, always.
-                _ => ("", 0),
+                _ => ("", Budget::Cols(0)),
             }),
             wrap,
         );
+        self.wrapped = wrapped;
         true
     }
 
@@ -313,8 +450,15 @@ impl Rows for MarkdownRows {
             // Per hunk, because that is the largest unit whose block structure is
             // knowable: a fence opened in one hunk and closed in another has
             // everything between them missing from the diff entirely.
-            let blocks = lay_out(&mut h.lines, &self.metrics.layout);
+            let (blocks, tables) = lay_out_tables(&mut h.lines, &self.metrics.layout);
             self.laid_out += blocks.len();
+            // The grids come along because the window's width is not known here
+            // and a grid too wide for it has to be laid out again — off the same
+            // runs and the same measurements, or the second answer disagrees with
+            // the first. Rebased onto this presentation's own row numbering.
+            let (row, grid) = (self.rows.len() as u32, self.grids.len() as u32);
+            self.grids.extend(tables.grids);
+            self.tables.extend(tables.of_line.iter().map(|(l, g)| (row + l, grid + g)));
             for (l, block) in h.lines.into_iter().zip(blocks) {
                 if !self.blocks.contains(&block) {
                     self.blocks.push(block);
@@ -343,6 +487,11 @@ impl Rows for MarkdownRows {
                     Block::Heading(l) => self.metrics.size(*l) / 14.0,
                     _ => 1.0,
                 };
+                // The re-laid-out grid, when there is one: a table that was
+                // squeezed to fit is exactly as wide as the budget, and measuring
+                // the one it was squeezed out of would leave the whole list
+                // scrolling sideways for a row nothing draws.
+                let text = self.flowed(index).map_or(text, |f| &f.text);
                 // `chars`, not `len`: a table row is full of three-byte box
                 // drawing and would otherwise measure three times too wide and
                 // win the widest-row contest for the whole diff.
@@ -356,10 +505,15 @@ impl Rows for MarkdownRows {
 
     fn report(&self) -> String {
         if self.laid_out == 0 {
-            String::new()
-        } else {
-            format!("markdown {} rows", self.laid_out)
+            return String::new();
         }
+        let mut out = format!("markdown {} rows", self.laid_out);
+        // Only when it happened. A table that fits is the common case and saying
+        // "0 squeezed" on every diff is noise on a line that is read at a glance.
+        if !self.flows.is_empty() {
+            out.push_str(&format!(" · {} table rows squeezed", self.flows.len()));
+        }
+        out
     }
 
     /// The gutter, then this block's own furniture, then text at this block's own
@@ -370,6 +524,7 @@ impl Rows for MarkdownRows {
             Row::File { path, .. } => header_hit(path, x, host),
             Row::Hunk(h) => header_hit(h, x, host),
             Row::Line { block, text, .. } => {
+                let text = self.flowed(index).map_or(text, |f| &f.text);
                 let at = self.wrapped.range(index, seg, text);
                 let from = TEXT_CHROME - PAD + self.furniture(*block);
                 let off = at.start
@@ -384,7 +539,9 @@ impl Rows for MarkdownRows {
     /// yields what was on screen rather than a bullet nobody can see.
     fn selectable(&self, index: usize, _part: u16) -> Option<&str> {
         Some(match self.rows.get(index)? {
-            Row::Line { text, .. } => text.as_ref(),
+            // The flowed grid, when there is one, because that is what is on
+            // screen — and what `hit` returned offsets into.
+            Row::Line { text, .. } => self.flowed(index).map_or(text, |f| &f.text).as_ref(),
             Row::Hunk(h) => h.as_ref(),
             Row::File { path, .. } => path.as_ref(),
         })
@@ -396,6 +553,7 @@ impl Rows for MarkdownRows {
             Row::File { path, adds, dels } => file_header(path, *adds, *dels, theme, sel),
             Row::Hunk(header) => hunk_header(header, theme, sel),
             Row::Line { block, kind, moved, old, new, text, spans, tokens } => {
+                let (text, spans, tokens) = self.text_of(index, text, spans, tokens);
                 let at = self.wrapped.range(index, seg, text);
                 self.line(
                     *block, *kind, *moved, old, new, text, at, seg, spans, tokens, host, sel,
@@ -936,11 +1094,55 @@ diff --git a/a.md b/a.md
         }
     }
 
+    /// Every table row of a reflowed document, as `(row, visual row, text)`.
+    fn grid(r: &MarkdownRows) -> Vec<(usize, usize, String)> {
+        let mut out = Vec::new();
+        for i in 0..r.len() {
+            let Row::Line { block, text, spans, tokens, .. } = &r.rows[i] else { continue };
+            if !block.is_table() {
+                continue;
+            }
+            let (t, _, _) = r.text_of(i, text, spans, tokens);
+            for seg in 0..r.rows(i) {
+                out.push((i, seg, t[r.wrapped.range(i, seg, t)].to_string()));
+            }
+        }
+        out
+    }
+
     #[test]
-    fn a_table_never_wraps_however_narrow_the_window() {
-        // Its grid is aligned character by character against the rows above and
-        // below, so a break shears it. `budget` returns 0 and `Wrapped` reads
-        // that as "leave this line alone".
+    fn a_table_too_wide_for_the_window_stops_dragging_the_view_sideways_with_it() {
+        // The bug: a grid is the widest row in the diff, `with_width_from_item`
+        // picks it, and the whole view scrolls horizontally — every row of prose
+        // in it wrapped to a window it is no longer looking at.
+        let (r, _) = reflowed(PROSE, 30);
+        let rows = grid(&r);
+        assert!(rows.len() > 3, "the long row did not wrap: {rows:?}");
+        for i in 0..r.len() {
+            for seg in 0..r.rows(i) {
+                // The two the measure adds for the padding it approximates; see
+                // `width`.
+                assert!(r.width(i, seg) <= 32, "row {i}.{seg} measured {}", r.width(i, seg));
+            }
+        }
+        // And it is still a grid: the same pipes in the same columns, whichever
+        // row and whichever sub-row.
+        let pipes = |t: &str| -> Vec<usize> {
+            t.chars().enumerate().filter(|(_, c)| "│├┤┼".contains(*c)).map(|(i, _)| i).collect()
+        };
+        let first = pipes(&rows[0].2);
+        assert_eq!(first.len(), 4, "three columns is four boundaries: {:?}", rows[0].2);
+        for (i, seg, t) in &rows {
+            assert_eq!(pipes(t), first, "row {i}.{seg} sheared the grid: {t:?}");
+        }
+    }
+
+    #[test]
+    fn a_table_with_no_room_for_a_character_a_column_is_drawn_whole() {
+        // Squeezing has a floor: three columns cost ten characters of pipes and
+        // padding before a letter is drawn, and a grid made of nothing but grid
+        // is worse than a grid you scroll to. So it is left alone, exactly as it
+        // was before there was anything else to do — `Budget::Cols(0)`.
         let (r, _) = reflowed(PROSE, 12);
         let mut tables = 0;
         for i in 0..r.len() {
@@ -952,6 +1154,29 @@ diff --git a/a.md b/a.md
             }
         }
         assert_eq!(tables, 3, "the fixture lost its table");
+        assert!(r.flows.is_empty(), "a table nobody can read a word of was squeezed");
+    }
+
+    #[test]
+    fn a_copy_of_a_squeezed_table_yields_its_rows_and_not_one_long_one() {
+        // The flowed text is what a copy takes, so the newline between its
+        // sub-rows is load-bearing: without it three rows of a grid paste as one
+        // 90-character line that was never on the screen.
+        let (r, _) = reflowed(PROSE, 30);
+        let (row, _, _) = *grid(&r).iter().find(|(i, ..)| r.rows(*i) > 1).expect("a wrapped row");
+        let copied = r.selectable(row, 0).expect("a table row copies");
+        let lines: Vec<&str> = copied.split('\n').collect();
+        assert_eq!(lines.len(), r.rows(row), "{copied:?}");
+        for line in &lines {
+            assert_eq!(line.chars().count(), 30, "{line:?} is not the grid");
+        }
+        // And a caret still lands inside the sub-row it was clicked on, in the
+        // same coordinates the copy is in.
+        for seg in 0..r.rows(row) {
+            let at = r.wrapped.range(row, seg, copied);
+            let hit = r.hit(row, seg, 60.0, &Host::new().into()).expect("a table row is hittable");
+            assert!(at.contains(&hit.off), "{:?} is outside {at:?}", hit.off);
+        }
     }
 
     #[test]

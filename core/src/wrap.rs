@@ -58,6 +58,30 @@ impl Break {
     }
 }
 
+/// Where one line's rows come from.
+///
+/// Two answers, because not every line is text a policy can be asked about. A
+/// Markdown table row arrives already laid out into a grid — cells wrapped
+/// inside their own columns by [`markdown::flow_table`](crate::markdown::flow_table),
+/// which knows what a column is and a [`Wrap`] cannot — and what it needs is for
+/// those rows to be *kept*, not recomputed at a budget that would shear them.
+#[derive(Debug, Clone, Copy)]
+pub enum Budget<'a> {
+    /// Break wherever the selected [`Wrap`] says, given this many columns. Zero
+    /// never breaks, which is what a line that has to be drawn whole asks for.
+    Cols(usize),
+    /// Break exactly here, whatever the policy. Validated like any other breaks:
+    /// the caller laying a line out itself is not the caller being trusted with
+    /// the render path.
+    At(&'a [Break]),
+}
+
+impl From<usize> for Budget<'_> {
+    fn from(cols: usize) -> Self {
+        Budget::Cols(cols)
+    }
+}
+
 /// Where a line breaks. The seam.
 ///
 /// An implementation is a pure function of one line and a column budget. It gets
@@ -345,17 +369,37 @@ impl Wrapped {
     /// Passing the budget in per line is what stops that presentation having to
     /// implement its own wrap.
     ///
-    /// A budget of 0 means "never break this line" — what a table row wants,
-    /// where a break would shear a grid that lines up character by character
-    /// with the rows above and below it.
+    /// A budget of 0 means "never break this line" — what a row whose text is a
+    /// grid asks for when the grid fits, since a break at a column would shear
+    /// it. When it does *not* fit, that row comes back through
+    /// [`build_with`](Self::build_with) with the breaks its own layout decided.
     pub fn build<'a>(lines: impl Iterator<Item = (&'a str, usize)>, wrap: &dyn Wrap) -> Self {
+        Self::build_with(lines.map(|(text, cols)| (text, Budget::Cols(cols))), wrap)
+    }
+
+    /// The same, for a presentation that lays some of its own lines out.
+    ///
+    /// One extra case: a line may arrive with its breaks already decided — a
+    /// Markdown table row, whose rows are the rows of a grid and not of a policy.
+    /// It is here and not in a second table beside this one because everything
+    /// downstream asks *this* for a row count and a range, and two answers to
+    /// that question is the bug the flat table exists to make impossible.
+    pub fn build_with<'a>(
+        lines: impl Iterator<Item = (&'a str, Budget<'a>)>,
+        wrap: &dyn Wrap,
+    ) -> Self {
         let mut out = Self { breaks: Vec::new(), at: vec![0], rejected: 0 };
         let mut scratch = Vec::new();
-        for (text, cols) in lines {
-            if cols > 0 && !text.is_empty() {
-                scratch.clear();
-                wrap.breaks(text, cols, &mut scratch);
-                out.take(text, &scratch);
+        for (text, budget) in lines {
+            match budget {
+                Budget::Cols(cols) => {
+                    if cols > 0 && !text.is_empty() {
+                        scratch.clear();
+                        wrap.breaks(text, cols, &mut scratch);
+                        out.take(text, &scratch);
+                    }
+                }
+                Budget::At(breaks) => out.take(text, breaks),
             }
             out.at.push(out.breaks.len() as u32);
         }
@@ -536,6 +580,25 @@ mod tests {
         let t = Wrapped::build(std::iter::once(("", 10)), &Word);
         assert_eq!(t.rows(0), 1);
         assert_eq!(t.range(0, 0, ""), 0..0);
+    }
+
+    #[test]
+    fn breaks_a_caller_decided_are_kept_and_still_validated() {
+        // What a Markdown table row arrives with: rows a grid decided, which no
+        // policy would have found — and which are checked exactly as hard.
+        let text = "one\ntwo\nthree";
+        let at = [Break { end: 3, next: 4 }, Break { end: 7, next: 8 }];
+        let t = Wrapped::build_with(std::iter::once((text, Budget::At(&at))), &Off);
+        assert_eq!(t.rows(0), 3, "the caller's rows were not kept");
+        let rows: Vec<&str> = (0..3).map(|r| &text[t.range(0, r, text)]).collect();
+        assert_eq!(rows, vec!["one", "two", "three"], "the newline was drawn");
+        assert_eq!(t.rejected(), 0);
+
+        // And a caller is not trusted any further than a wrap is.
+        let bad = [Break { end: 99, next: 99 }];
+        let t = Wrapped::build_with(std::iter::once((text, Budget::At(&bad))), &Off);
+        assert_eq!(t.rows(0), 1);
+        assert_eq!(t.rejected(), 1);
     }
 
     #[test]

@@ -349,7 +349,10 @@ clip ordering in 3a exists to prevent, with the same kind of test pinning it.
 
 Tables are the exception to "per line": a cell has to line up with the rows around
 it, so column widths are measured per *run* of table rows and per hunk side, then
-every row of that run is rewritten once to the grid. Padding is an insertion, so
+every row of that run is rewritten once to the grid. The widths each run was
+measured to come back out of `lay_out_tables` in a `Tables`, because one thing
+about a table is not knowable here — whether it fits the window. See *the grid and
+the window* in stage 4c. Padding is an insertion, so
 tables use the general piecewise remap rather than the deletion-only in-place one
 — worth it for 1–2.5% of rows, not worth it for all of them. It only lines up in a
 monospaced face, which is what `Layout::monospaced()` is the frontend asserting.
@@ -432,11 +435,45 @@ Not per diff, because `MarkdownRows` draws a bar, up to three levels of indent
 and a bullet in front of its text, and draws a heading at 18px where the body is
 14. Two rows of the same width hold different numbers of characters, and passing
 the budget in per line is what stops that presentation needing a wrap of its own.
-A table passes 0, which `Wrapped` reads as *never break this line* — its grid is
-aligned character by character against the rows above and below it.
+A table passes the width its *grid* has to fit, and is never broken at it: see
+below.
 
 Headers do not wrap. A file header is a path plus `+N -N`, which is not one
 string to slice.
+
+### The grid and the window
+
+A table row is the one row whose text is a *layout*, so it is the one row that
+cannot be broken at a column: the second half of row three would land under the
+first half of row four, in a column that means something else. What happens
+instead is that the grid is laid out again — `markdown::flow_table`, at reflow,
+because the width is the only part of a table's layout `lay_out` cannot know:
+
+- **The columns are squeezed by water-filling, not in proportion.** A column that
+  already fits its share keeps the width it asked for; what is left is split
+  between the ones that do not, repeatedly, because settling one raises the share
+  for the rest. Proportional shrinking takes the `Yes` out of a three-character
+  column to save a paragraph four characters it will not notice.
+- **A cell wraps through the selected `Wrap`.** A cell is prose and an extension's
+  policy is what breaks prose everywhere else in the diff. So `off` squeezes
+  nothing — the reader asked to scroll — and `char` breaks a cell mid-word.
+- **A row becomes as many rows as its tallest cell needs**, which is the same
+  answer prose gets and keeps `uniform_list`'s fixed row height. Its sub-rows come
+  back as one string joined by newlines, and `wrap::Budget::At` puts them in the
+  same flat table every other row's rows are in — one answer to "how many rows is
+  this", not two.
+- **There is a floor.** Three columns cost ten characters of pipes and padding
+  before a letter is drawn; below one character a column there is nothing honest
+  to draw, so the table is left whole and the view scrolls to it.
+
+Tokens and spans are carried onto the new text *clipped to each piece*, so a
+`**phrase**` broken across two sub-rows is two ranges. One range spanning them
+would paint everything in between — the pipes, the padding and the whole of the
+next column.
+
+Cost: **~1.1 µs a table row per reflow**, so nothing on any real diff and 2.3 ms
+on a synthetic 2,000-row all-table one. It runs off the sparse table of which rows
+are in a grid, so a diff with no table in it does no work here at any width.
 
 Cost: **36–52 ns a line**, so 0.9–3.0 ms on the real fixtures and 26 ms on the
 714k-line one. Rows added depends on the budget and not on the fixture: 1.00–1.02×

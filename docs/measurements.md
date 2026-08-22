@@ -243,6 +243,33 @@ run) that these are proportions rather than figures:
 | derive the cuts from the tokens | +2.1 ms | ~28% |
 | drain the text, remap the ranges | +2.6 ms | ~35% |
 
+### Fitting a table to the window
+
+`markdown::flow_table` — squeezed columns, cells wrapped inside them — is the
+other half of that pass, and the half that runs at *reflow* rather than at load,
+because the width is the only part of a table's layout the load pass cannot know.
+`md.diff` through `MarkdownRows`, release, 73,557 rows of which 908 are table rows
+in 214 grids:
+
+| budget | reflow | table rows re-laid out |
+|---|---|---|
+| 400 cols | 3.3 ms | 0 |
+| 150 cols | 4.3 ms | 364 |
+| 120 cols | 4.5 ms | 457 |
+| 100 cols | 4.7 ms | 540 |
+| 80 cols | 4.6 ms | 601 |
+
+So the flow is **1.0–1.4 ms** on top of a 3.3 ms wrap of the whole diff, at
+**2–3 µs a re-laid-out row** — a third more expensive than a reflow without it,
+and a third of a frame at 73k rows. The 400-column row is the floor and the thing
+to keep: a table that fits costs one comparison, and a diff with no table in it
+does no work here at any width, because this runs off the sparse list of which
+rows are in a grid rather than over the rows.
+
+**40% of the table rows in a real prose corpus do not fit 150 columns**, which is
+the number that says this is not an edge case. Before it existed, one of them made
+the whole 73k-row view scroll sideways.
+
 ### The two Markdown shapes
 
 Every other diff fixture here is code. Prose is a different distribution, and the

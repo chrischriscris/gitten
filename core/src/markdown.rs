@@ -44,7 +44,8 @@ use crate::syntax::{
     column_indent, fence_marker, for_each_side, heading_level, is_break, is_setext, list_marker,
     Kind, Token,
 };
-use crate::LineKind;
+use crate::wrap::{Break, Wrap, Wrapped};
+use crate::{LineKind, Span};
 use std::ops::Range;
 
 /// What a line is, structurally. One per row, computed per hunk side.
@@ -171,7 +172,7 @@ impl Layout {
 /// How a table column is aligned, from its separator row: `:-:` centres, `-:`
 /// goes right. Left when the separator says nothing, or is not in this hunk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum Align {
+pub enum Align {
     #[default]
     Left,
     Center,
@@ -189,6 +190,15 @@ enum Align {
 /// not the other all the time, and classifying the interleaved rows as one
 /// document would have a removed ``` closing an added one.
 pub fn lay_out(lines: &mut [Line], layout: &Layout) -> Vec<Block> {
+    lay_out_tables(lines, layout).0
+}
+
+/// [`lay_out`], and also the table grids it measured.
+///
+/// For the one caller that has something to do with them: a frontend that knows
+/// how wide the window is, and has found a grid wider than it — see
+/// [`flow_table`]. Everything else wants [`lay_out`] and the [`Block`]s.
+pub fn lay_out_tables(lines: &mut [Line], layout: &Layout) -> (Vec<Block>, Tables) {
     let mut blocks = vec![Block::Paragraph; lines.len()];
     let kinds: Vec<LineKind> = lines.iter().map(|l| l.kind).collect();
 
@@ -232,18 +242,47 @@ pub fn lay_out(lines: &mut [Line], layout: &Layout) -> Vec<Block> {
     // the added rows of a table are two different tables and must not be measured
     // against each other, or a column widens on one side because the other side
     // has a long cell in it.
-    if layout.monospaced && blocks.iter().any(|b| b.is_table()) {
-        align_tables(lines, &blocks, &kinds, layout);
-    }
-    blocks
+    let tables = match layout.monospaced && blocks.iter().any(|b| b.is_table()) {
+        true => align_tables(lines, &blocks, &kinds, layout),
+        false => Tables::default(),
+    };
+    (blocks, tables)
 }
 
 // -------------------------------------------------------------------- tables
 
-/// One table's measured columns.
-struct Grid {
-    widths: Vec<usize>,
-    aligns: Vec<Align>,
+/// One table's measured columns: how wide each one wants to be, and which way
+/// its cells sit in it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Grid {
+    /// Widest cell in each column, in characters.
+    pub widths: Vec<usize>,
+    /// From the separator row, when the hunk contains one.
+    pub aligns: Vec<Align>,
+}
+
+impl Grid {
+    /// How wide the whole grid is, in characters: a pipe at each edge and one
+    /// between every pair of columns, and a space either side of every cell.
+    pub fn width(&self) -> usize {
+        self.widths.iter().sum::<usize>() + 3 * self.widths.len() + 1
+    }
+}
+
+/// The tables in one hunk: what each was aligned to, and which lines are in it.
+///
+/// Empty for the hunks that contain no table, which is most of them. It exists
+/// so the grid can be laid out a second time at a width `lay_out` cannot know —
+/// see [`flow_table`]. Re-deriving the grouping there would be a second answer to
+/// "which rows are one table", and two answers drifting apart is a column
+/// measured against the wrong neighbours.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Tables {
+    /// One per run of table rows, in the order the runs were met.
+    pub grids: Vec<Grid>,
+    /// `(line, grid)` for every line that is in a measured table, ascending by
+    /// line. Sparse because a table is 1–2.5% of the rows of a diff.
+    pub of_line: Vec<(u32, u32)>,
 }
 
 /// Aligns every table in the hunk to its own columns.
@@ -261,7 +300,12 @@ struct Grid {
 /// `of_row` records which grid each row belongs to, and because the added side is
 /// visited last it wins for context rows — which is the same rule the token pass
 /// follows for the same reason.
-fn align_tables(lines: &mut [Line], blocks: &[Block], kinds: &[LineKind], layout: &Layout) {
+fn align_tables(
+    lines: &mut [Line],
+    blocks: &[Block],
+    kinds: &[LineKind],
+    layout: &Layout,
+) -> Tables {
     let mut grids: Vec<Grid> = Vec::new();
     let mut of_row: Vec<Option<usize>> = vec![None; lines.len()];
 
@@ -290,8 +334,11 @@ fn align_tables(lines: &mut [Line], blocks: &[Block], kinds: &[LineKind], layout
     });
 
     let mut cells: Vec<Range<usize>> = Vec::new();
+    let mut of_line: Vec<(u32, u32)> = Vec::with_capacity(of_row.len() / 32);
     for (r, grid) in of_row.iter().enumerate() {
-        let Some(grid) = grid.map(|g| &grids[g]) else { continue };
+        let Some(g) = *grid else { continue };
+        of_line.push((r as u32, g as u32));
+        let grid = &grids[g];
         if blocks[r] == Block::TableRule {
             rule_row(&mut lines[r], &grid.widths, layout);
         } else {
@@ -299,6 +346,7 @@ fn align_tables(lines: &mut [Line], blocks: &[Block], kinds: &[LineKind], layout
             grid_row(&mut lines[r], &cells, grid, layout);
         }
     }
+    Tables { grids, of_line }
 }
 
 /// Column widths and alignments for one run. `None` when the run is nothing but
@@ -424,6 +472,13 @@ fn grid_row(line: &mut Line, cells: &[Range<usize>], grid: &Grid, layout: &Layou
 /// longer there. Nothing is lost that a reader wanted — a separator row differing
 /// between two revisions says nothing the columns either side of it do not.
 fn rule_row(line: &mut Line, widths: &[usize], layout: &Layout) {
+    line.text = rule_text(widths, layout);
+    line.tokens.clear();
+    line.spans.clear();
+}
+
+/// The rule itself, which [`flow_table`] draws again at the widths it settled on.
+fn rule_text(widths: &[usize], layout: &Layout) -> String {
     let g = &layout.table;
     let mut out = String::with_capacity(widths.iter().sum::<usize>() + widths.len() * 8);
     out.push_str(g.end.0);
@@ -433,9 +488,7 @@ fn rule_row(line: &mut Line, widths: &[usize], layout: &Layout) {
         }
         out.push_str(if k + 1 == widths.len() { g.end.1 } else { g.cross });
     }
-    line.text = out;
-    line.tokens.clear();
-    line.spans.clear();
+    out
 }
 
 /// Moves tokens and spans onto a rewritten line.
@@ -474,6 +527,293 @@ fn remap(line: &mut Line, map: &[(Range<usize>, usize)], new_len: usize) {
         s.end = at(s.end);
     }
     line.spans.retain(|s| s.start < s.end);
+}
+
+// ------------------------------------------------- fitting a grid to a window
+
+/// One row of a table run as the frontend holds it: the gridded text it is
+/// drawing, and the ranges that index it.
+///
+/// Borrowed, because this runs per resize over every table on the screen: a flow
+/// that copied its input would allocate twice for every row it kept.
+#[derive(Debug, Clone, Copy)]
+pub struct TableRow<'a> {
+    pub text: &'a str,
+    pub block: Block,
+    pub tokens: &'a [Token],
+    pub spans: &'a [Span],
+}
+
+/// What one row becomes when its grid has to fit a budget: every sub-row laid end
+/// to end, and the breaks that partition them.
+///
+/// One string and not a `Vec<String>`, for the reason
+/// [`Wrapped`](crate::wrap::Wrapped) is one table and not a `Vec<Vec<Break>>`:
+/// the rows of a wrapped line are ranges into the line everywhere else in the
+/// pipeline, and a table row three rows tall is either that same shape or a
+/// second one for a renderer to get wrong.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FlowRow {
+    /// Every sub-row, each exactly as wide as the new grid, joined by newlines —
+    /// so a range out of `Wrapped` is one row of the table and nothing else.
+    ///
+    /// The newline is the one in the whole pipeline: a line of a diff has none.
+    /// It is here because this text is also what a *copy* of the row yields, and
+    /// three rows of a grid run together into one 90-character line is not what
+    /// was on the screen. The breaks drop it, exactly as word wrap drops the
+    /// space it broke on, so nothing ever draws it.
+    pub text: String,
+    /// Where the sub-rows end, and where the next begins: the newline between
+    /// them falls in the gap and is not drawn.
+    pub breaks: Vec<Break>,
+    /// The row's tokens, moved onto `text` — and *split*, because a token whose
+    /// text wrapped covers two pieces that are no longer next to each other.
+    pub tokens: Vec<Token>,
+    /// The row's intraline spans, the same way.
+    pub spans: Vec<Span>,
+}
+
+/// Re-lays gridded table rows onto a grid that fits `cols` columns, wrapping each
+/// cell inside its own column.
+///
+/// `run` is the rows that share `grid` — a whole run of them or any part of one,
+/// since the widths come from the grid and not from what is passed in. One flowed
+/// row comes back per row passed in, in the same order.
+///
+/// The width is the one part of a table's layout that depends on the window, so
+/// it is the one part that cannot happen at load: which rows are one table, what
+/// its columns are and how wide each wants to be were all settled by
+/// [`lay_out_tables`] and arrive in [`Tables`].
+///
+/// **A wrapped table is more rows, not a truncated one.** Squeezing the columns
+/// alone does not fit a paragraph into 40 characters, and cutting the cell off
+/// hides content with no way to reach it — so a row becomes as many rows as its
+/// tallest cell needs, which is the same answer `docs/decisions/0017` gives for
+/// prose and keeps `uniform_list`'s fixed row height.
+///
+/// `None` when there is nothing to do, or nothing that can be done: the grid
+/// already fits, the face is not monospaced so there is no grid to begin with,
+/// the wrap is `off` so a cell cannot be broken and scrolling is the honest
+/// answer, or the budget is narrower than the pipes and padding themselves.
+pub fn flow_table(
+    run: &[TableRow],
+    grid: &Grid,
+    cols: usize,
+    layout: &Layout,
+    wrap: &dyn Wrap,
+) -> Option<Vec<FlowRow>> {
+    if !layout.monospaced || !wrap.breaks_lines() || grid.width() <= cols {
+        return None;
+    }
+    let widths = squeeze(&grid.widths, cols)?;
+    let mut cells: Vec<Range<usize>> = Vec::new();
+    let mut pieces: Vec<Vec<Range<usize>>> = Vec::new();
+    let mut out = Vec::with_capacity(run.len());
+    for row in run {
+        out.push(match row.block {
+            // A separator row is nothing but grid, so it is drawn again at the
+            // widths that were settled on — the same regeneration `rule_row`
+            // does at load, for the same reason: its dashes were punctuation
+            // about to be replaced.
+            Block::TableRule => {
+                FlowRow { text: rule_text(&widths, layout), ..Default::default() }
+            }
+            _ => flow_row(row, &widths, grid, layout, wrap, &mut cells, &mut pieces),
+        });
+    }
+    Some(out)
+}
+
+/// One data row onto the narrower grid.
+fn flow_row(
+    row: &TableRow,
+    widths: &[usize],
+    grid: &Grid,
+    layout: &Layout,
+    wrap: &dyn Wrap,
+    cells: &mut Vec<Range<usize>>,
+    pieces: &mut Vec<Vec<Range<usize>>>,
+) -> FlowRow {
+    grid_cells(row.text, layout, cells);
+    // Grown and cleared per column rather than `pieces.clear()`, which drops the
+    // buffers themselves — this runs on every row of every table on every drag
+    // that crosses a character.
+    if pieces.len() < widths.len() {
+        pieces.resize(widths.len(), Vec::new());
+    }
+    for (k, w) in widths.iter().enumerate() {
+        pieces[k].clear();
+        let cell = cells.get(k).cloned().unwrap_or(0..0);
+        break_cell(&row.text[cell.clone()], cell.start, *w, wrap, &mut pieces[k]);
+    }
+    let pieces = &pieces[..widths.len()];
+    // As tall as the cell that needed the most rows, and never zero: a row of
+    // empty cells is still a row of the table.
+    let tall = pieces.iter().map(|p| p.len()).max().unwrap_or(1).max(1);
+
+    let g = &layout.table;
+    let mut out = FlowRow {
+        text: String::with_capacity(tall * (widths.iter().sum::<usize>() + widths.len() * 8)),
+        ..Default::default()
+    };
+    for r in 0..tall {
+        // Between the sub-rows, not after them: the last one ends where the text
+        // does, and a break there is a row with nothing in it.
+        if r > 0 {
+            let end = out.text.len() as u32;
+            out.text.push('\n');
+            out.breaks.push(Break { end, next: out.text.len() as u32 });
+        }
+        out.text.push_str(g.vertical);
+        for (k, w) in widths.iter().enumerate() {
+            // A column this row has no cell for still gets drawn, empty — a
+            // ragged table is normal by hand and a row that stopped early would
+            // break the grid below it.
+            let piece = pieces[k].get(r).cloned().unwrap_or(0..0);
+            let content = &row.text[piece.clone()];
+            let pad = w.saturating_sub(content.chars().count());
+            let (before, after) = match grid.aligns.get(k).copied().unwrap_or_default() {
+                Align::Left => (0, pad),
+                Align::Right => (pad, 0),
+                Align::Center => (pad / 2, pad - pad / 2),
+            };
+            out.text.push(' ');
+            for _ in 0..before {
+                out.text.push(' ');
+            }
+            carry(row, &piece, out.text.len(), &mut out.tokens, &mut out.spans);
+            out.text.push_str(content);
+            for _ in 0..after {
+                out.text.push(' ');
+            }
+            out.text.push(' ');
+            out.text.push_str(g.vertical);
+        }
+    }
+    out
+}
+
+/// One cell's content, broken into the pieces that fit `cols` columns, in the
+/// coordinates of the row it came out of.
+///
+/// Through the same [`Wrapped`](crate::wrap::Wrapped) a line goes through, and
+/// deliberately not by hand: what breaks prose everywhere else in the diff is
+/// whichever [`Wrap`] is selected, an extension's included, and a table cell is
+/// prose. It also means the validation is the same validation.
+fn break_cell(
+    cell: &str,
+    at: usize,
+    cols: usize,
+    wrap: &dyn Wrap,
+    out: &mut Vec<Range<usize>>,
+) {
+    let wrapped = Wrapped::build(std::iter::once((cell, cols.max(1))), wrap);
+    out.extend((0..wrapped.rows(0)).map(|r| {
+        let p = wrapped.range(0, r, cell);
+        at + p.start..at + p.end
+    }));
+}
+
+/// Copies the tokens and spans covering one piece of the old text onto where that
+/// piece landed, clipped to it.
+///
+/// Clipped, not moved: a `**phrase**` whose text wrapped is two pieces on two
+/// rows now, and one range spanning them would paint everything between — the
+/// rest of the row's columns included. Two ranges is what it is.
+fn carry(
+    row: &TableRow,
+    piece: &Range<usize>,
+    at: usize,
+    tokens: &mut Vec<Token>,
+    spans: &mut Vec<Span>,
+) {
+    let clip = |from: usize, to: usize| -> Option<Range<usize>> {
+        let (start, end) = (from.max(piece.start), to.min(piece.end));
+        (start < end).then(|| at + (start - piece.start)..at + (end - piece.start))
+    };
+    for t in row.tokens {
+        if let Some(r) = clip(t.start, t.end) {
+            tokens.push(Token { start: r.start, end: r.end, ..*t });
+        }
+    }
+    for s in row.spans {
+        if let Some(r) = clip(s.start, s.end) {
+            spans.push(Span { start: r.start, end: r.end });
+        }
+    }
+}
+
+/// Column widths that fit `cols`, from the widths the content wants.
+///
+/// **Water-filling, not proportional.** Shrinking every column by the same
+/// fraction takes the `Yes` out of a three-character column to save a paragraph
+/// four characters it will not notice. So every column that already fits its
+/// share keeps the width it wants, and what is left over is split between the
+/// ones that do not — repeatedly, because settling one raises the share for the
+/// rest.
+///
+/// `None` when the pipes and the padding are already wider than the budget, or
+/// when what is left will not give every column a character. A table with no
+/// room to draw a word of is worse than a table you have to scroll.
+fn squeeze(natural: &[usize], cols: usize) -> Option<Vec<usize>> {
+    let n = natural.len();
+    let available = cols.checked_sub(3 * n + 1)?;
+    if n == 0 || available < n {
+        return None;
+    }
+    let mut widths = vec![0usize; n];
+    let mut fixed = vec![false; n];
+    loop {
+        let free: Vec<usize> = (0..n).filter(|&k| !fixed[k]).collect();
+        if free.is_empty() {
+            return Some(widths);
+        }
+        let spent: usize = (0..n).filter(|&k| fixed[k]).map(|k| widths[k]).sum();
+        // At least 1: a column settles for no more than its share, so the budget
+        // left over is never less than one character for each column left.
+        let share = (available - spent) / free.len();
+        let mut settled = false;
+        for &k in &free {
+            if natural[k] <= share {
+                widths[k] = natural[k];
+                fixed[k] = true;
+                settled = true;
+            }
+        }
+        if !settled {
+            // Nothing left fits its share, so the share is what they all get.
+            // The remainder goes to the widest of them, because that is where
+            // another character does the most good.
+            let mut order = free;
+            order.sort_by_key(|&k| std::cmp::Reverse(natural[k]));
+            let mut rest = available - spent;
+            for (i, &k) in order.iter().enumerate() {
+                widths[k] = rest / (order.len() - i);
+                rest -= widths[k];
+            }
+            return Some(widths);
+        }
+    }
+}
+
+/// Content ranges of a *gridded* row's cells — the job [`split_cells`] does on
+/// source markdown, done on the text [`grid_row`] wrote.
+///
+/// Two differences, both of which are why it is a second function. The boundary
+/// is the configured glyph and not a pipe; and there is no escape to honour,
+/// because whatever `\|` meant in the source is inside a cell by now. A cell
+/// whose *content* holds the glyph itself splits wrongly, which is the same
+/// class of thing as `split_cells` and a table drawing its own box glyphs.
+fn grid_cells(text: &str, layout: &Layout, out: &mut Vec<Range<usize>>) {
+    out.clear();
+    let v = layout.table.vertical;
+    let Some(open) = text.find(v) else { return };
+    let mut from = open + v.len();
+    while let Some(i) = text[from..].find(v) {
+        let end = from + i;
+        out.push(trimmed_range(text, from..end));
+        from = end + v.len();
+    }
 }
 
 /// One line's structural role. `fence` carries across lines and is the reason
@@ -824,6 +1164,49 @@ mod tests {
         (blocks, lines)
     }
 
+    /// The same, and the tables it measured — for the flow, which is what a
+    /// window too narrow for a grid asks for.
+    fn run_tables(body: &str) -> (Vec<Block>, Vec<Line>, Tables) {
+        let raw = format!("diff --git a/d.md b/d.md\n@@ -1,1 +1,1 @@\n{body}");
+        let hl = Highlighters::builtin();
+        let mut p = prepare(&parse_unified_diff(&raw), &hl, 2000);
+        let mut lines = std::mem::take(&mut p.files[0].hunks[0].lines);
+        let (blocks, tables) = lay_out_tables(&mut lines, &Layout::monospaced());
+        (blocks, lines, tables)
+    }
+
+    /// Flows the one table in `body` at `cols`, and returns the rows it drew:
+    /// every sub-row of every row, in order.
+    fn flowed(body: &str, cols: usize) -> Vec<String> {
+        let (blocks, lines, tables) = run_tables(body);
+        let run: Vec<TableRow> = (0..lines.len())
+            .filter(|i| blocks[*i].is_table())
+            .map(|i| TableRow {
+                text: &lines[i].text,
+                block: blocks[i],
+                tokens: &lines[i].tokens,
+                spans: &lines[i].spans,
+            })
+            .collect();
+        let grid = &tables.grids[0];
+        let Some(flow) = flow_table(&run, grid, cols, &Layout::monospaced(), &crate::wrap::Word)
+        else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for f in &flow {
+            let w = Wrapped::build_with(
+                std::iter::once((f.text.as_str(), crate::wrap::Budget::At(&f.breaks))),
+                &crate::wrap::Word,
+            );
+            for r in 0..w.rows(0) {
+                out.push(f.text[w.range(0, r, &f.text)].to_string());
+            }
+        }
+        out
+    }
+
+    /// One context line, which every side sees.
     /// One context line, which every side sees.
     fn one(text: &str) -> (Block, Line) {
         let (mut b, mut l) = run(&format!(" {text}\n"));
@@ -1332,4 +1715,164 @@ diff --git a/d.md b/d.md
         assert_eq!(line.text, "plain strong words");
         assert_eq!(&line.text[line.tokens[0].range()], "strong");
     }
+
+    // ------------------------------------------- fitting a grid to a window
+
+    /// Two columns, one of them a paragraph. 61 characters of grid.
+    const WIDE: &str = "\
+ | Resource | Why |
+ |---|---|
+ | ECR repository | push target for the build, and a rollback tag |
+ | Security group | ingress 3000 from the ALB only |
+";
+
+    #[test]
+    fn a_grid_wider_than_the_window_is_squeezed_to_fit_it() {
+        // The bug this exists for: a table is the widest row in the diff, so
+        // `with_width_from_item` picks it and the *whole* view scrolls sideways —
+        // 852 rows of prose dragged along by one row of a table.
+        let (_, _, tables) = run_tables(WIDE);
+        assert!(tables.grids[0].width() > 44, "the fixture stopped being too wide");
+        let rows = flowed(WIDE, 44);
+        assert!(!rows.is_empty(), "nothing was flowed");
+        for row in &rows {
+            assert_eq!(row.chars().count(), 44, "a row of the grid is not the budget: {row:?}");
+        }
+    }
+
+    #[test]
+    fn every_row_of_a_squeezed_table_puts_its_pipes_in_the_same_place() {
+        // The whole point of keeping the grid: a column that lines up with the
+        // rows above and below it. A sub-row that put its own pipes wherever its
+        // text ended would be a wrapped line, not a table.
+        let rows = flowed(WIDE, 44);
+        let pipes = |row: &String| -> Vec<usize> {
+            row.chars().enumerate().filter(|(_, c)| "│├┤┼".contains(*c)).map(|(i, _)| i).collect()
+        };
+        let first = pipes(&rows[0]);
+        assert_eq!(first.len(), 3, "two columns is three boundaries: {:?}", rows[0]);
+        for row in &rows {
+            assert_eq!(pipes(row), first, "{row:?} sheared the grid");
+        }
+    }
+
+    #[test]
+    fn a_squeezed_cell_wraps_rather_than_losing_its_text() {
+        // More rows, not a truncated one: everything the cell said is still on
+        // the screen, which is the difference between this and an ellipsis.
+        let rows = flowed(WIDE, 44);
+        let drawn: String = rows.join(" ");
+        for word in "push target for the build, and a rollback tag".split(' ') {
+            assert!(drawn.contains(word), "{word:?} was dropped: {drawn}");
+        }
+        // And it needed the rows to say it: a 44-column grid cannot hold that
+        // cell in one.
+        assert!(rows.len() > 4, "four rows means nothing wrapped: {rows:?}");
+    }
+
+    #[test]
+    fn the_narrow_column_keeps_its_width_and_the_wide_one_gives() {
+        // Water-filling, not proportional. `Resource` wants 14 and gets it; the
+        // paragraph beside it gives up what has to be given up.
+        let widths = squeeze(&[14, 44], 44).expect("a two-column table fits in 44");
+        assert_eq!(widths[0], 14, "the narrow column was shrunk too: {widths:?}");
+        assert_eq!(widths.iter().sum::<usize>(), 44 - 7, "the budget was not spent");
+    }
+
+    #[test]
+    fn a_column_that_fits_is_never_widened_to_fill_the_row() {
+        // The other direction of the same rule: squeezing is not stretching, and
+        // a table narrower than the window keeps the shape it was written in.
+        assert_eq!(squeeze(&[3, 4], 40), Some(vec![3, 4]));
+    }
+
+    #[test]
+    fn a_grid_that_fits_is_left_exactly_as_it_was() {
+        // Nothing to do, and saying so is what keeps a table one row: the flow is
+        // asked on every resize and most tables fit.
+        assert!(flowed(WIDE, 200).is_empty(), "a table that fits was rebuilt");
+    }
+
+    #[test]
+    fn wrapping_off_scrolls_rather_than_squeezing() {
+        // `off` is the reader saying they would rather scroll. A cell cannot be
+        // broken without breaking it, so there is nothing honest to do here.
+        let (blocks, lines, tables) = run_tables(WIDE);
+        let run: Vec<TableRow> = (0..lines.len())
+            .filter(|i| blocks[*i].is_table())
+            .map(|i| TableRow {
+                text: &lines[i].text,
+                block: blocks[i],
+                tokens: &lines[i].tokens,
+                spans: &lines[i].spans,
+            })
+            .collect();
+        let off = flow_table(&run, &tables.grids[0], 20, &Layout::monospaced(), &crate::wrap::Off);
+        assert!(off.is_none(), "wrapping off squeezed a table anyway");
+    }
+
+    #[test]
+    fn a_budget_with_no_room_for_a_character_a_column_gives_up() {
+        // Three columns cost ten characters of pipes and padding before a letter
+        // is drawn. A grid of nothing but grid is worse than one you scroll.
+        assert_eq!(squeeze(&[8, 8, 8], 12), None);
+        assert_eq!(squeeze(&[8, 8, 8], 8), None);
+        // And one character a column is where it starts saying yes.
+        assert_eq!(squeeze(&[8, 8, 8], 13), Some(vec![1, 1, 1]));
+    }
+
+    #[test]
+    fn the_separator_is_drawn_again_at_the_widths_that_were_settled_on() {
+        // It is the one row whose text is generated rather than trimmed, at load
+        // and here: a rule sized to a column it no longer has is the grid
+        // visibly not lining up.
+        let rows = flowed(WIDE, 44);
+        let rule = rows.iter().find(|r| r.starts_with('├')).expect("a separator row");
+        assert_eq!(rule.chars().count(), 44);
+        assert!(rule.chars().all(|c| "├─┼┤".contains(c)), "{rule:?}");
+    }
+
+    #[test]
+    fn a_token_that_wrapped_is_two_tokens_and_neither_covers_the_gap() {
+        // A `**phrase**` broken across two sub-rows is two ranges. One range
+        // spanning them would paint everything in between — the pipes, the
+        // padding and the whole of the other column.
+        let body = " | k | a very **emphatic phrase** here |\n |---|---|\n";
+        let (blocks, lines, tables) = run_tables(body);
+        let run: Vec<TableRow> = (0..lines.len())
+            .filter(|i| blocks[*i].is_table())
+            .map(|i| TableRow {
+                text: &lines[i].text,
+                block: blocks[i],
+                tokens: &lines[i].tokens,
+                spans: &lines[i].spans,
+            })
+            .collect();
+        let flow =
+            flow_table(&run, &tables.grids[0], 22, &Layout::monospaced(), &crate::wrap::Word)
+                .expect("22 columns is too narrow for that cell");
+        let row = &flow[0];
+        let strong: Vec<&str> = row
+            .tokens
+            .iter()
+            .filter(|t| t.kind == Kind::Strong)
+            .map(|t| &row.text[t.start..t.end])
+            .collect();
+        assert_eq!(strong, vec!["emphatic", "phrase"], "in {:?}", row.text);
+    }
+
+    #[test]
+    fn a_row_with_fewer_cells_than_the_table_still_draws_the_grid() {
+        // Ragged tables are normal by hand, and a short row that stopped early
+        // would break the grid under it — the same rule `grid_row` follows.
+        let body = " | a | b | c |\n |---|---|---|\n | only one cell that is quite long |\n";
+        let rows = flowed(body, 26);
+        assert!(!rows.is_empty(), "nothing was flowed");
+        for row in &rows {
+            assert_eq!(row.chars().count(), 26, "{row:?}");
+            // Three columns is four boundaries, on the short row too.
+            assert_eq!(row.chars().filter(|c| "│├┤┼".contains(*c)).count(), 4, "{row:?}");
+        }
+    }
+
 }

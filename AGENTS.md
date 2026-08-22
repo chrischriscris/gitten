@@ -197,6 +197,18 @@ line, not per diff** — a bullet, an indent and an 18px heading each cost
 characters, and one number for the whole diff is what makes a presentation write
 its own wrap.
 
+**A grid is not prose, so it is not broken — it is laid out again.** A Markdown
+table wider than the window has its columns *squeezed* and its cells wrapped
+inside them, at reflow, because the width is the one part of a table's layout the
+load pass cannot know. Breaking a table row at a column instead is the obvious
+thing and it shears the grid: the second half of row three lands under the first
+half of row four, in a column that means something else. Squeezing is
+water-filling and not proportional — a column that already fits keeps what it
+wants, and the paragraph beside it gives — and it has a floor: below one character
+a column there is nothing honest to draw, so the table is left whole and scrolled
+to. `core::markdown::flow_table` does it and `wrap::Budget::At` is how the rows it
+decided survive the wrap.
+
 `off` is an entry in the registry, not a flag beside one — the pickers are a pure
 function of a registry, so that is what puts it in the menu for free. Unlike the
 layouts this registry *is* on `Host`: a break point is a property of text, so
