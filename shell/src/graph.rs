@@ -39,8 +39,12 @@ const STROKE: f32 = 2.0;
 /// scrolling. The band is a shade under half the radius, which keeps it at
 /// roughly STROKE — a node looks drawn with the same pen as the lines feeding
 /// it — while the hole opens up as the radius grows.
-const DOT_R: f32 = 4.5;
-const MERGE_R: f32 = 5.5;
+///
+/// Whole pixels, for the reason [`STROKE`] is 2: a lane centre lands on 7, so a
+/// radius of 4.5 put the node's edges on 2.5 and 11.5 and the one deliberately
+/// crisp thing in the gutter had a soft dot sitting on it.
+const DOT_R: f32 = 4.0;
+const MERGE_R: f32 = 5.0;
 const RING: f32 = 0.45;
 
 /// Curve halves butt into each other on the row boundary. Two antialiased butt

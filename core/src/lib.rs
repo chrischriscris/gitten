@@ -250,6 +250,28 @@ pub fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
     files
 }
 
+/// A hunk header split into the coordinates and the code around them:
+/// `("@@ -41,9 +41,11 @@", "fn dispatch() {")`.
+///
+/// Here rather than in a renderer because every client draws this string and the
+/// split is the same everywhere: the numbers are furniture — the same kind of
+/// thing a line number is, and drawn in the same colour — while the enclosing
+/// declaration git appends is the half a reader actually wants. Drawn as one run
+/// they read as equally important, which they are not.
+///
+/// The whole header goes in the first half when there is no second `@@`, so a
+/// caller never has to check.
+pub fn hunk_parts(header: &str) -> (&str, &str) {
+    // The second `@@`, not the first: a filename in the tail cannot be confused
+    // for the marker, because the marker is always the closing one of a pair.
+    let Some(end) = header.find("@@").and_then(|a| {
+        header[a + 2..].find("@@").map(|b| a + 2 + b + 2)
+    }) else {
+        return (header, "");
+    };
+    (&header[..end], header[end..].trim_start())
+}
+
 /// `@@ -41,9 +41,11 @@ ...` -> (41, 41)
 fn parse_hunk_header(line: &str) -> (u32, u32) {
     let mut old = 0;
@@ -448,6 +470,22 @@ mod tests {
             timestamp: 0,
             subject: "s".into(),
         }
+    }
+
+    #[test]
+    fn a_hunk_header_splits_into_coordinates_and_code() {
+        let (marker, code) = hunk_parts("@@ -41,9 +41,11 @@ fn dispatch() {");
+        assert_eq!(marker, "@@ -41,9 +41,11 @@");
+        assert_eq!(code, "fn dispatch() {");
+        // No tail: every client draws the whole thing rather than checking.
+        assert_eq!(hunk_parts("@@ -1 +1 @@"), ("@@ -1 +1 @@", ""));
+        // A tail that itself contains the marker still splits at the pair.
+        let (marker, code) = hunk_parts("@@ -1 +1 @@ fn f() { // @@ here");
+        assert_eq!(marker, "@@ -1 +1 @@");
+        assert_eq!(code, "fn f() { // @@ here");
+        // Not a header at all: legible, not a panic.
+        assert_eq!(hunk_parts(""), ("", ""));
+        assert_eq!(hunk_parts("nonsense"), ("nonsense", ""));
     }
 
     #[test]

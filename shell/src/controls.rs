@@ -104,8 +104,12 @@ pub fn picker(
     on_pick: impl Fn(usize, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
     let c = &theme.chrome;
+    // Disabled draws the *label* faint and the *value* at what an enabled label
+    // gets, rather than putting both on `faint`: that measures 1.95:1 on the
+    // title bar, so "dim and inert rather than removed" was in practice removed —
+    // and a control still has to say what it is on to be worth leaving there.
     let dim = if p.enabled { c.dim } else { c.faint };
-    let fg = if p.enabled { c.fg } else { c.faint };
+    let fg = if p.enabled { c.fg } else { c.dim };
 
     // Shared with the list, which dismisses on an outside click.
     let toggle = Rc::new(on_toggle);
@@ -126,6 +130,11 @@ pub fn picker(
         .h(px(H))
         .px_2()
         .rounded(px(3.))
+        // A border, because the fill cannot do this job: closed, the trigger was
+        // `title_bg` on `title_bg`, so four controls were sixty characters of
+        // dim text that only became controls when the mouse was already on one.
+        .border_1()
+        .border_color(rgb(if open { c.faint } else { c.border }))
         .bg(rgb(if open { c.status_bg } else { c.title_bg }))
         .child(div().text_color(rgb(dim)).child(p.label))
         .child(div().text_color(rgb(fg)).child(p.value()))

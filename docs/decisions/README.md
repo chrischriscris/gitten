@@ -43,6 +43,8 @@ rather than nine.
 | [0016](0016-whitespace-moves-and-the-indent-heuristic.md) | Three more kinds of diff, none of them an algorithm |
 | [0017](0017-wrapping-is-more-rows-not-taller-ones.md) | Wrapping is more rows, not taller ones |
 | [0018](0018-selection-is-a-model-not-a-text-element.md) | A selection is a model, not a text element |
+| [0019](0019-the-strip-is-the-titlebar.md) | The window has no titlebar of its own |
+| [0020](0020-furniture-has-its-own-floor.md) | Furniture has a lower contrast floor than text |
 
 **0011 is deliberately absent.** It was a rendered-Markdown reader that was built,
 looked at, judged broken and parked in a `git stash` rather than deleted. The

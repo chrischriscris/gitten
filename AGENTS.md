@@ -139,6 +139,14 @@ coincidence and `}` is everywhere.
 are xdiff's because an approximation produces boundaries no test can call right.
 Its one trap: a position's indentation is compared by *sign*, not magnitude.
 
+**Two contrast floors, because reading and glancing are different.** `min_contrast`
+3.5 for token text, `min_furniture` 3.0 for line numbers and hunk coordinates —
+resolved through the same `readable` against the same `Surface`, because a single
+literal drawn on five row backgrounds measured 2.05:1 on context and 1.60:1 on a
+moved line. And a *hairline* has no floor at all: `chrome.border` and `diff.rule`
+exist because nothing in a near-black palette is more than ~1.2:1 from anything
+else, so a tint cannot carry an edge and one pixel can.
+
 **Fence a code block; never indent one.** The renderer knows fences and nothing
 else, so a four-space block is prose — emphasis, links and list markers all get
 interpreted inside it. `#` was the worst of it: a `# comment` trailing an
@@ -320,6 +328,27 @@ Closing the last window does not end the process; macOS keeps appless processes
 alive. `cx.on_window_closed` + `cx.quit()`. Cmd-Q is separate and equally manual:
 no application menu exists, so register the action, bind the key, and set a menu
 (`on_action` + `bind_keys` + `set_menus`).
+
+**The window has no titlebar of its own.** `WindowOptions::default()` leaves
+`appears_transparent: false`, which is an opaque system titlebar — titled with the
+executable's name, because `title` is `None` — stacked on whatever strip the app
+draws itself. Two title bars. So: transparent, set the title anyway (Mission
+Control and the Window menu read it), and `traffic_light_position` at `(10, 10)`,
+because macOS uses that inset above *and* below the 12px button to size the band
+and 32 is what comes out. Leave `app_owns_titlebar_drag` false and the platform
+still moves the window from the empty part of the strip.
+
+**Another library's theme is not ours.** `gpui_component::init` sets its theme to
+*Light*, and the two scrollbars are the only widgets from it this app uses — so
+they painted a light track and an accent thumb over a near-black diff until
+something pushed our palette at them. Two writes per colour, because it reads the
+track off `ThemeColor` and the thumb off `ThemeTokens`, and `Theme::sync_base` is
+what actually reaches the layer that paints: setting the fields alone does
+nothing. `config::sync_widgets`, on startup and on every reload.
+
+**A column of numbers is right-aligned.** Line numbers were `w(52).child(n)`,
+which puts the units digit of `9` and of `1234` four characters apart — the one
+thing the eye does with that column is run down it. `justify_end` and a pad.
 
 A bare binary is not an `.app` bundle, so the window opens behind everything,
 the menu bar is titled with the executable's name and there is no icon.

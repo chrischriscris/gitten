@@ -29,6 +29,20 @@ use views::diff::{CopySelection, CycleLayout, CycleWrap, SelectAll, SelectNone};
 
 
 
+/// The title strip, which is also the window's titlebar — see the note on
+/// [`window_options`]. Tall enough to hold the traffic lights with the same air
+/// above and below them, which is what makes it read as one band rather than as
+/// a toolbar bolted under a titlebar.
+const TITLE_H: f32 = 32.0;
+/// Where the traffic lights start, and therefore how much room they need. macOS
+/// draws three 12px buttons with ~8px between them, so they end around 62; the
+/// title begins after them.
+const LIGHTS_X: f32 = 10.0;
+const LIGHTS_W: f32 = 72.0;
+/// The error band under the title bar. Shorter than a title bar because it is
+/// one sentence, and it is only there when something failed.
+const BAND_H: f32 = 22.0;
+
 /// What only this client has. The two views, the arguments and `plait.toml` are
 /// documented once, in `plait_app::cli::usage`, because they are the same in
 /// every client — see that function for why that is a promise and not a
@@ -71,7 +85,12 @@ enum Open {
 }
 
 struct DevShell {
-    title: SharedString,
+    /// The three parts of the title, drawn as three colours rather than one
+    /// string: which app, which view, which repository. The window's own title —
+    /// what macOS shows in Mission Control and the window menu — is set once in
+    /// [`window_options`] and is not this.
+    which: &'static str,
+    label: SharedString,
     view: AnyView,
     stats: Option<Stats>,
     /// The diff view, when that is what is on screen. Held so the control strip
@@ -299,6 +318,12 @@ impl Render for DevShell {
         let strip = self.strip(&host, cx);
         let error = self.error.clone();
 
+        // The title is three things, so it is drawn as three: the app bright, the
+        // view dim, the repository dimmer and shrinkable. One grey run of text
+        // said none of that, and the separators are punctuation rather than
+        // content — `faint` is where punctuation belongs.
+        let dot = || div().flex_none().text_color(rgb(c.faint)).child("·");
+
         div()
             .size_full()
             .v_flex()
@@ -315,20 +340,71 @@ impl Render for DevShell {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .h(px(32.))
-                    .px_4()
+                    .h(px(TITLE_H))
+                    // The window has no titlebar of its own any more, so the
+                    // traffic lights are drawn *into* this strip and the title
+                    // has to start after them.
+                    .pl(px(LIGHTS_W))
+                    .pr_3()
                     .bg(rgb(c.title_bg))
+                    .border_b_1()
+                    .border_color(rgb(c.border))
                     .text_color(rgb(c.dim))
-                    .child(div().flex_none().child(self.title.clone()))
-                    .children(
-                        error.map(|e| div().flex_none().text_color(rgb(c.error)).child(e)),
+                    .child(div().flex_none().text_color(rgb(c.fg)).child("plait"))
+                    .child(dot())
+                    .child(div().flex_none().child(self.which))
+                    .child(dot())
+                    // The one thing in the strip that is allowed to shrink, and
+                    // everything else is `flex_none`. A repository is the part of
+                    // a title a reader can reconstruct; a picker pushed off the
+                    // right edge — which is what a strip of `flex_none` children
+                    // and no `min_w_0` did — is a control that no longer exists.
+                    .child(
+                        div()
+                            .flex_shrink(1.0)
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            // From the *start*: the label is a path and a
+                            // revspec, and `…/git HEAD~2..HEAD` is the half worth
+                            // keeping.
+                            .text_ellipsis_start()
+                            .child(self.label.clone()),
                     )
+                    .children(cfg!(debug_assertions).then(|| {
+                        // One word and not the sentence this used to be — "DEBUG
+                        // BUILD — timings meaningless, use --release" was fifty
+                        // characters of a strip that has four controls in it, and
+                        // the sentence belongs beside the numbers it is about,
+                        // which is the stats overlay. No chip behind it either:
+                        // every surface in this palette is within 1.05:1 of every
+                        // other, so a filled chip is a rectangle nobody sees, and
+                        // the accent alone is unmistakable.
+                        div().flex_none().text_color(rgb(c.accent)).child("debug")
+                    }))
                     // Pushes the controls to the right edge and takes the clicks
                     // that land between them, so a stray click on the title bar
                     // does not fall through to whatever is under it.
                     .child(div().flex_grow(1.0))
                     .children(strip),
             )
+            // Its own band and not a word in the title bar, where it was: an
+            // error is a whole sentence, the strip is already four controls and a
+            // path, and `flex_none` on both meant a long one pushed the pickers
+            // off the window rather than wrapping or truncating.
+            .children(error.map(|e| {
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .h(px(BAND_H))
+                    .px_4()
+                    .bg(rgb(c.status_bg))
+                    .border_b_1()
+                    .border_color(rgb(c.border))
+                    .text_color(rgb(c.error))
+                    .child(div().min_w_0().truncate().child(e))
+            }))
             .child(div().flex_grow(1.0).overflow_hidden().child(self.view.clone()))
             .children(overlay.map(|(frames, rows, heap, load)| {
                 div()
@@ -338,6 +414,8 @@ impl Render for DevShell {
                     .py_2()
                     .gap_1()
                     .bg(rgb(c.status_bg))
+                    .border_t_1()
+                    .border_color(rgb(c.border))
                     .text_color(rgb(c.dim))
                     .child(
                         div()
@@ -387,12 +465,18 @@ fn main() {
     };
 
     let title = SharedString::from(started_title(which, &loaded.label));
+    let which_name = which.name();
+    let label = SharedString::from(loaded.label.clone());
     let data = loaded.data;
 
     let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
     app.run(move |cx| {
         gpui_component::init(cx);
         cx.set_global(config::Active(host.clone()));
+        // After `gpui_component::init`, which sets its own theme to Light — see
+        // `config::sync_widgets`, which is the only thing standing between that
+        // and a pair of light scrollbars over a near-black diff.
+        config::sync_widgets(&host, cx);
 
         // Re-read the file whenever it is written, and hand the result to every
         // window. The watcher's callback runs on its own thread, so it only sets
@@ -424,7 +508,11 @@ fn main() {
                     // place and the file would stop describing what you see.
                     let mut next = Host::new();
                     let warnings = config::load(&mut next, &config_path);
-                    cx.set_global(config::Active(Rc::new(next)));
+                    let next = Rc::new(next);
+                    cx.set_global(config::Active(next.clone()));
+                    // The scrollbars live in another crate's theme, so they only
+                    // follow a saved file if something pushes it at them.
+                    config::sync_widgets(&next, cx);
                     cx.refresh_windows();
                     warnings
                 });
@@ -478,7 +566,7 @@ fn main() {
         .detach();
 
         cx.spawn(async move |cx| {
-            cx.open_window(WindowOptions::default(), move |window, cx| {
+            cx.open_window(window_options(title), move |window, cx| {
                 // Where the last run of this exact command left off. Restored
                 // before the first frame so you never see row 0 flash past.
                 let resume = session::restore(&session_key, &session_path);
@@ -550,7 +638,8 @@ fn main() {
                 }
                 let stats = stats::enabled().then(|| Stats::new(rendered, total, note, load));
                 let shell = cx.new(|_| DevShell {
-                    title,
+                    which: which_name,
+                    label,
                     view,
                     stats,
                     // Only where there is something to drive: the commit graph
@@ -570,15 +659,45 @@ fn main() {
     });
 }
 
-/// The window title: the client, the view, and what was loaded.
+/// The window's own title — what macOS shows in Mission Control, the Window menu
+/// and the tab bar. Not what is drawn in the strip: that is three separate
+/// colours in [`DevShell::render`], because "plait", the view and the repository
+/// are three different kinds of thing and one grey run of text says so about
+/// none of them.
 ///
 /// `Started::title` is the shared one; this exists because the window is opened
 /// after the `Started` has been taken apart, and reassembling it to ask would be
 /// sillier than the two lines.
 fn started_title(view: View, label: &str) -> String {
-    let build = match cfg!(debug_assertions) {
-        true => "  ·  DEBUG BUILD — timings meaningless, use --release",
-        false => "",
-    };
-    format!("plait · {} · {label}{build}", view.name())
+    format!("plait · {} · {label}", view.name())
+}
+
+/// The window, and the one decision in it worth writing down: **there is no
+/// system titlebar.**
+///
+/// `WindowOptions::default()` leaves `appears_transparent: false`, which is an
+/// opaque macOS titlebar — in system grey, titled with the executable's name
+/// because `title` was never set — stacked directly on top of this app's own
+/// 32-pixel strip. Two title bars, one of them nobody wrote.
+///
+/// So the strip *is* the titlebar. `traffic_light_position` is the inset of the
+/// close button, and macOS uses that same inset above and below it to size the
+/// band, so `(10, 10)` on a 12px button is a 32px titlebar — exactly
+/// [`TITLE_H`], which is why the lights sit centred in the strip rather than
+/// floating in it. Dragging still belongs to the platform: `app_owns_titlebar_drag`
+/// stays false, so the empty part of the strip moves the window for free.
+///
+/// A minimum size, because there is no useful window narrower than its own
+/// gutters — the diff view's wrap budget bottoms out at eight characters and
+/// says so, and this is the other end of the same argument.
+fn window_options(title: SharedString) -> WindowOptions {
+    WindowOptions {
+        titlebar: Some(TitlebarOptions {
+            title: Some(title),
+            appears_transparent: true,
+            traffic_light_position: Some(point(px(LIGHTS_X), px((TITLE_H - 12.0) / 2.0))),
+        }),
+        window_min_size: Some(size(px(560.), px(320.))),
+        ..Default::default()
+    }
 }

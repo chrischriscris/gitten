@@ -138,16 +138,24 @@ impl Render for Commits {
 
 
 
-/// Wide enough for an eleven-character sha and a space after it. Fixed, unlike
-/// the graph: the eye scans this column vertically, so it has to be a column.
-const SHA_W: f32 = 90.0;
-const WHO_W: f32 = 26.0;
+/// The sha and the initials columns, in *characters*.
+///
+/// Twelve, because `%h` is seven in a young repository and eleven in git/git,
+/// plus the air after it. In pixels rather than characters these were 90 and 26,
+/// which is 10.7 and 3.1 in the shipped face — so an eleven-character sha
+/// overflowed its own column by two pixels while the comment above it said
+/// eleven — and 5 and 1.4 at the 18px `font.size` the config file will happily
+/// give you. Fixed columns, unlike the graph: the eye scans these vertically, so
+/// they have to *be* columns.
+const SHA_CHARS: f32 = 12.0;
+const WHO_CHARS: f32 = 3.0;
 
 /// lazygit's order — sha, author, graph, subject — and lazygit's spacing: the
 /// subject follows its own row's graph immediately, so a commit on the trunk
 /// reads from the left instead of starting behind the widest merge in the
 /// repository.
 fn row(c: &Commit, who: &Who, d: &graph::Draw, host: &Rc<Host>) -> AnyElement {
+    let ch = host.font.char_width();
     div()
         .flex()
         .items_center()
@@ -155,11 +163,17 @@ fn row(c: &Commit, who: &Who, d: &graph::Draw, host: &Rc<Host>) -> AnyElement {
         .child(
             div()
                 .flex_none()
-                .w(px(SHA_W))
+                .w(px(SHA_CHARS * ch))
                 .text_color(rgb(host.theme.chrome.dim))
                 .child(c.short.clone()),
         )
-        .child(div().flex_none().w(px(WHO_W)).text_color(who.color).child(who.initials.clone()))
+        .child(
+            div()
+                .flex_none()
+                .w(px(WHO_CHARS * ch))
+                .text_color(who.color)
+                .child(who.initials.clone()),
+        )
         .child(graph::row_canvas(d.clone(), host.clone()))
         .child(div().flex_none().child(c.subject.clone()))
         .into_any_element()

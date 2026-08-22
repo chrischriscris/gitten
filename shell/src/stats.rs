@@ -106,8 +106,16 @@ impl Stats {
         let p50 = v[count / 2].max(0.001);
         let p99 = v[count * 99 / 100];
         let best = v[0];
+        // The sentence the title bar used to carry, moved to the numbers it is
+        // about: a chip up there says which build this is, and this says what
+        // that means. A debug binary is a different, much slower one and its
+        // frame times mean nothing.
+        let build = match cfg!(debug_assertions) {
+            true => "   · debug build, not a timing",
+            false => "",
+        };
         format!(
-            "{:>3.0} fps    frame p50 {p50:>5.2}ms   p99 {p99:>5.2}ms   best {best:>5.2}ms",
+            "{:>3.0} fps    frame p50 {p50:>5.2}ms   p99 {p99:>5.2}ms   best {best:>5.2}ms{build}",
             1000.0 / p50
         )
     }

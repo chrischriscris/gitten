@@ -506,6 +506,48 @@ The floor is now asserted for every class on every surface by
 `every_token_is_legible_on_every_surface` in `theme.rs`, so this table cannot
 regress silently.
 
+### Chrome and furniture, before the fix
+
+Same function, one layer out: `contrast()` over the palette as it shipped, for the
+things that are *not* token text. Reproduce any row with
+`plait_core::theme::contrast(a, b)`.
+
+The furniture — one hex literal, drawn on five row backgrounds:
+
+| | context | added | removed | moved_added | moved_removed |
+|---|---|---|---|---|---|
+| `gutter_fg` `#4a4540` | **2.05** | 1.70 | 1.77 | **1.60** | 1.78 |
+| resolved at `min_furniture` 3.0 | 3.31 | 3.10 | 3.23 | 3.27 | 3.23 |
+| what it resolves to | `#686460` | `#706c68` | `#706c68` | `#777470` | `#706c68` |
+
+The blend is 24 steps, so a resolved value overshoots the floor by up to a fifth of
+a step — 3.31 where 3.0 was asked for. That is [0009](decisions/0009-contrast-resolution.md)'s
+algorithm unchanged, and the reason the numbers are not all 3.00.
+
+The surfaces, against a context row — every one of them a boundary somebody has to
+see:
+
+| | before | after |
+|---|---|---|
+| `diff.file_bg` | **1.048** — and the same value as `chrome.title_bg` | 1.176, plus a `diff.rule` hairline |
+| `diff.hunk_bg` | 1.089 — *more* prominent than the file header above it | 1.051 |
+| `chrome.title_bg` | 1.048 | 1.048, plus a `chrome.border` hairline |
+| `chrome.status_bg` | 1.038 | 1.038, plus a hairline |
+
+That is the whole argument for [0019](decisions/0019-the-strip-is-the-titlebar.md)
+and the hairlines: nothing in a near-black palette is more than about 1.2:1 from
+anything else, so a tint cannot carry an edge and a pixel can. `absent_bg` is the
+case that proves it — pure black is 1.082:1 against a context row, so no value at
+all would have made a "hole" read against the body of the file. What it actually
+reads against is the *changed row opposite*, which is the only place it appears:
+1.25:1 against an addition, 1.20:1 against a removal.
+
+Two floors are asserted rather than tabulated —
+`every_token_is_legible_on_every_surface` and
+`a_line_number_clears_the_furniture_floor_on_every_surface` in `theme.rs`, plus
+`a_file_header_is_a_step_and_a_hunk_header_is_not` for the hierarchy — so none of
+this can regress silently.
+
 ### Intraline pair similarity
 
 Dice coefficient over tokens, `2·LCS / (len_a + len_b)`, for every pair

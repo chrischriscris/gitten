@@ -47,14 +47,14 @@
 
 use super::diff::{
     column_at, columns, file_header, header_hit, hunk_header, line_colors, num, number,
-    number_or_blank, runs, selected, slice, Hit, Rows, ROW_H, PAD, TEXT_CHROME,
+    number_or_blank, runs, selected, slice, Hit, Rows, ROW_H, PAD, SIGN_W, TEXT_CHROME,
 };
 use gpui::*;
 use plait_core::host::Host;
 use plait_core::markdown::{lay_out, Block, Layout};
 use plait_core::select::Selected;
 use plait_core::syntax::Token;
-use plait_core::theme::{Rgb, Theme};
+use plait_core::theme::{Rgb, Surface};
 use plait_core::wrap::{Wrap, Wrapped};
 use plait_core::{LineKind, Span};
 
@@ -178,6 +178,11 @@ pub struct MarkdownRows {
     /// built it.
     budgets: Vec<usize>,
     wrap: &'static str,
+    /// The width the budgets were computed for, kept so a row can ask what its
+    /// own column is. Only one thing needs it — a thematic break is drawn as a
+    /// rule and a rule has to be as wide as the text it replaces — and the
+    /// alternative is a constant, which was 320 pixels regardless of the window.
+    width: f32,
 }
 
 impl Default for MarkdownRows {
@@ -202,6 +207,7 @@ impl MarkdownRows {
             blocks: Vec::new(),
             budgets: Vec::new(),
             wrap: "",
+            width: 0.0,
         }
     }
 
@@ -280,6 +286,7 @@ impl Rows for MarkdownRows {
         }
         self.budgets = budgets;
         self.wrap = wrap.name();
+        self.width = width;
         self.wrapped = Wrapped::build(
             self.rows.iter().map(|r| match r {
                 Row::Line { block, text, .. } => {
@@ -389,7 +396,9 @@ impl Rows for MarkdownRows {
             Row::Hunk(header) => hunk_header(header, theme, sel),
             Row::Line { block, kind, moved, old, new, text, spans, tokens } => {
                 let at = self.wrapped.range(index, seg, text);
-                self.line(*block, *kind, *moved, old, new, text, at, seg, spans, tokens, theme, sel)
+                self.line(
+                    *block, *kind, *moved, old, new, text, at, seg, spans, tokens, host, sel,
+                )
             }
         }
     }
@@ -409,12 +418,14 @@ impl MarkdownRows {
         seg: usize,
         spans: &[Span],
         tokens: &[Token],
-        theme: &Theme,
+        host: &Host,
         sel: Option<Selected>,
     ) -> AnyElement {
+        let theme = &host.theme;
         let m = &self.metrics;
         let md = &theme.markdown;
         let (bg, fg, sign) = line_colors(kind, moved, &theme.diff);
+        let surface = Surface::of(kind, moved).0;
         // A continuation of a wrapped line: the same furniture, so a wrapped
         // bullet stays indented under its own text and a wrapped quote keeps its
         // bar, and no number and no sign, as everywhere else.
@@ -430,12 +441,12 @@ impl MarkdownRows {
             .h(px(ROW_H))
             .px_4()
             .bg(rgb(bg))
-            .child(num(number_or_blank(old, blank), theme.diff.gutter_fg))
-            .child(num(number_or_blank(new, blank), theme.diff.gutter_fg))
+            .child(num(number_or_blank(old, blank), theme.gutter_on(surface)))
+            .child(num(number_or_blank(new, blank), theme.gutter_on(surface)))
             .child(
                 div()
                     .flex_none()
-                    .w(px(16.))
+                    .w(px(SIGN_W))
                     .text_color(rgb(fg))
                     .child(if blank { " " } else { sign }),
             );
@@ -469,14 +480,19 @@ impl MarkdownRows {
         // A rule draws no text: the dashes were the drawing, so they are replaced
         // by the thing they were drawing.
         if block == Block::Rule {
+            // As wide as the text it stands in for, which is the row's own wrap
+            // budget: this used to be 320 pixels whatever the window was doing,
+            // so a break was a stub in a wide window and an overhang in a narrow
+            // one. The budget is already net of everything drawn in front of the
+            // text, so it is the column exactly.
+            let w = self.budget(block, self.width, host) as f32 * host.font.char_width();
             return row
                 .child(
                     div()
                         .flex_none()
-                        .w(px(320.))
+                        .w(px(w))
                         .h(px(1.))
                         .bg(rgb(md.rule))
-                        .ml(px(m.indent))
                         .into_any_element(),
                 )
                 .into_any_element();
@@ -485,8 +501,12 @@ impl MarkdownRows {
             return row.into_any_element();
         }
 
+        // Full row height, so a fenced block of nine lines is one rule nine rows
+        // long. At `ROW_H - 6` it was a 16-pixel dash with a 6-pixel gap above
+        // and below, which is a ladder rather than a bar — and grouping a run of
+        // rows is the whole job.
         let bar = |color: Rgb| {
-            div().flex_none().w(px(m.bar)).h(px(ROW_H - 6.0)).mr(px(m.indent - m.bar)).bg(rgb(color))
+            div().flex_none().w(px(m.bar)).h(px(ROW_H)).mr(px(m.indent - m.bar)).bg(rgb(color))
         };
 
         let row = match block {

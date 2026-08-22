@@ -97,13 +97,14 @@ rgb_fields! {
         "bg" = chrome.bg, "fg" = chrome.fg, "dim" = chrome.dim,
         "faint" = chrome.faint, "accent" = chrome.accent,
         "title_bg" = chrome.title_bg, "status_bg" = chrome.status_bg,
+        "border" = chrome.border,
         "selection_bg" = chrome.selection_bg,
         "selected_bg" = chrome.selected_bg, "error" = chrome.error;
     "diff":
         "file_bg" = diff.file_bg, "file_fg" = diff.file_fg,
         "adds_fg" = diff.adds_fg, "dels_fg" = diff.dels_fg,
         "hunk_bg" = diff.hunk_bg, "hunk_fg" = diff.hunk_fg,
-        "gutter_fg" = diff.gutter_fg,
+        "gutter_fg" = diff.gutter_fg, "rule" = diff.rule,
         "context_bg" = diff.context_bg, "context_fg" = diff.context_fg,
         "added_bg" = diff.added_bg, "added_fg" = diff.added_fg,
         "added_word_bg" = diff.added_word_bg,
@@ -418,6 +419,13 @@ fn apply_theme(theme: &mut Theme, value: &toml::Value, warn: &mut Vec<String>) {
                 Some(n) if (1.0..=21.0).contains(&n) => theme.min_contrast = n,
                 _ => warn.push("config: theme.min_contrast must be between 1 and 21".into()),
             },
+            // The same range, and a separate number because it is a separate
+            // job: this one is the floor for line numbers and hunk coordinates,
+            // which are glanced at rather than read. See `Theme::min_furniture`.
+            "min_furniture" => match number(v) {
+                Some(n) if (1.0..=21.0).contains(&n) => theme.min_furniture = n,
+                _ => warn.push("config: theme.min_furniture must be between 1 and 21".into()),
+            },
             "lanes" => match colors(v, warn, "theme.lanes") {
                 Some(c) if !c.is_empty() => theme.lanes = c,
                 _ => warn.push("config: theme.lanes must be a non-empty list".into()),
@@ -586,6 +594,7 @@ pub fn dump(host: &Host) -> String {
     out.push_str("[theme]\n");
     out.push_str(&format!("name = {:?}\n", t.name));
     out.push_str(&format!("min_contrast = {:?}\n", t.min_contrast));
+    out.push_str(&format!("min_furniture = {:?}\n", t.min_furniture));
     out.push_str(&format!("lanes = [{}]\n", hex_list(&t.lanes)));
     out.push_str(&format!("authors = [{}]\n", hex_list(&t.authors)));
 

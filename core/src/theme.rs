@@ -41,6 +41,27 @@ pub enum Surface {
 }
 
 impl Surface {
+    /// The surface a line of `kind` sits on, and the surface its changed words
+    /// sit on.
+    ///
+    /// Here rather than in a renderer because three presentations and two
+    /// frontends ask the same question, and a client that answered it itself
+    /// would be a client whose changed words are resolved against a background
+    /// they are not drawn on. A moved line has no word surface of its own — the
+    /// detection just said nothing inside it changed.
+    pub fn of(kind: crate::LineKind, moved: bool) -> (Surface, Surface) {
+        use crate::LineKind::*;
+        match (kind, moved) {
+            (Added, false) => (Surface::Added, Surface::AddedWord),
+            (Added, true) => (Surface::MovedAdded, Surface::MovedAdded),
+            (Removed, false) => (Surface::Removed, Surface::RemovedWord),
+            (Removed, true) => (Surface::MovedRemoved, Surface::MovedRemoved),
+            // Context is never moved: a line that did not change did not go
+            // anywhere, and `mark_moved` says so.
+            (Context, _) => (Surface::Context, Surface::Context),
+        }
+    }
+
     pub const ALL: [Surface; 8] = [
         Surface::Context,
         Surface::Added,
@@ -94,8 +115,22 @@ pub struct DiffPalette {
     pub adds_fg: Rgb,
     pub dels_fg: Rgb,
     pub hunk_bg: Rgb,
+    /// The part of a hunk header that is *not* the `@@ … @@` — the enclosing
+    /// function git puts after it, which is the half worth reading. The markers
+    /// themselves are drawn in the gutter's colour, because a coordinate is
+    /// furniture in exactly the way a line number is.
     pub hunk_fg: Rgb,
+    /// Line numbers, and the base for every furniture colour resolved against a
+    /// row background — see [`Theme::gutter_on`], which is what is actually
+    /// drawn.
     pub gutter_fg: Rgb,
+    /// A hairline *inside* a diff: the rule between the two halves of a
+    /// side-by-side row, and the one above a file header.
+    ///
+    /// Its own colour and not `gutter_fg`, which it was: that one has to stay
+    /// legible as text against five different row backgrounds, and a 1px rule
+    /// held to a text floor is a bright line down the middle of the window.
+    pub rule: Rgb,
     pub context_bg: Rgb,
     pub context_fg: Rgb,
     pub added_bg: Rgb,
@@ -116,8 +151,14 @@ pub struct DiffPalette {
     ///
     /// Its own colour and not `context_bg`, because those two mean opposite
     /// things: context is a line that did not change, and this is the absence of
-    /// a line. Flatter and darker than every other row background, so a run of
-    /// them reads as a hole in the column rather than as content.
+    /// a line.
+    ///
+    /// The comparison that decides the value is not the one against a context
+    /// row — on a near-black theme *nothing* is more than 1.08:1 darker than
+    /// that, so darkness alone could never carry it. It is the comparison
+    /// against the row **opposite**, which is the only place an absent cell ever
+    /// appears: 1.25:1 against an addition and 1.20:1 against a removal, which
+    /// is the same step the changed rows themselves get against context.
     pub absent_bg: Rgb,
 }
 
@@ -151,6 +192,14 @@ pub struct ChromePalette {
     pub accent: Rgb,
     pub title_bg: Rgb,
     pub status_bg: Rgb,
+    /// The hairline between one chrome surface and the next.
+    ///
+    /// Needed because the surfaces cannot carry the boundary themselves: `bg`,
+    /// `title_bg` and `status_bg` are within 1.05:1 of each other in the shipped
+    /// theme — a tint that quiet is invisible as an edge, and one loud enough to
+    /// be seen would be three competing panels instead of one dark window. A rule
+    /// is one pixel and reads at any tint.
+    pub border: Rgb,
     /// The row the keyboard is on.
     ///
     /// A background bar and not a foreground change, because the row underneath
@@ -183,6 +232,17 @@ pub struct Theme {
     /// recede, so the shipped themes sit at 3.5 — legible, still quiet. A colour
     /// that already clears the floor is never touched.
     pub min_contrast: f32,
+    /// Contrast floor for the furniture — line numbers and the hunk markers —
+    /// against whatever row background they land on.
+    ///
+    /// Lower than [`Theme::min_contrast`] on purpose, and it is the difference
+    /// between reading and glancing: body text is read continuously and takes
+    /// the 3.5 floor, whereas a line number is looked up once and should recede
+    /// the rest of the time. 3.0 is the WCAG floor for non-body text, and it is
+    /// what stops the previous state of this: `gutter_fg` measured **2.05:1** on
+    /// a context row and **1.60:1** on a moved one, because the resolution ran
+    /// for syntax tokens and nothing else.
+    pub min_furniture: f32,
     /// Indexed by [`Kind::index`], not matched: the render path does this per
     /// token run.
     syntax: [Style; Kind::COUNT],
@@ -198,6 +258,9 @@ pub struct Theme {
     /// Resolving costs a handful of `powf` per entry and `render` asks for one of
     /// these per run per visible row per frame, so it is computed once.
     resolved: Vec<Style>,
+    /// `diff.gutter_fg` resolved against every [`Surface`], for the same reason
+    /// and by the same code. Indexed by [`Surface::index`].
+    gutter: [Rgb; Surface::COUNT],
 }
 
 impl Default for Theme {
@@ -230,15 +293,17 @@ impl Theme {
         Self {
             name: "plait dark".into(),
             min_contrast: 3.5,
+            min_furniture: 3.0,
             syntax,
             diff: DiffPalette {
-                file_bg: 0x151312,
+                file_bg: 0x231e1a,
                 file_fg: 0xe8e3dc,
                 adds_fg: 0x6fbf73,
                 dels_fg: 0xd4736b,
-                hunk_bg: 0x14181d,
+                hunk_bg: 0x111417,
                 hunk_fg: 0x7d8fa8,
                 gutter_fg: 0x4a4540,
+                rule: 0x332c28,
                 context_bg: 0x0e0d0c,
                 context_fg: 0xa39c93,
                 added_bg: 0x16241a,
@@ -249,7 +314,7 @@ impl Theme {
                 removed_word_bg: 0x43201a,
                 moved_removed_bg: 0x191d28,
                 moved_added_bg: 0x1d2636,
-                absent_bg: 0x0a0908,
+                absent_bg: 0x070605,
             },
             // Quieter than the syntax palette on purpose: this is punctuation
             // the reader should be able to ignore, standing in for punctuation
@@ -268,6 +333,7 @@ impl Theme {
                 accent: 0xdfa851,
                 title_bg: 0x151312,
                 status_bg: 0x131211,
+                border: 0x282320,
                 selection_bg: 0x241f1a,
                 selected_bg: 0x2f3b4a,
                 error: 0xd4736b,
@@ -278,6 +344,7 @@ impl Theme {
             // from the lane colours and must not be mistaken for them.
             authors: vec![0x9c8a6b, 0x6f8296, 0x8b7a96, 0x6b8f88, 0x9c7f75, 0x7d8a6b],
             resolved: Vec::new(),
+            gutter: [0; Surface::COUNT],
         }
         .rebuilt()
     }
@@ -293,6 +360,11 @@ impl Theme {
                 self.resolved[kind.index() * Surface::COUNT + surface.index()] =
                     Style { fg: readable(base.fg, bg, self.min_contrast), ..base };
             }
+        }
+        for surface in Surface::ALL {
+            let bg = self.background(surface);
+            self.gutter[surface.index()] =
+                readable(self.diff.gutter_fg, bg, self.min_furniture);
         }
     }
 
@@ -319,6 +391,17 @@ impl Theme {
     #[inline]
     pub fn syntax_on(&self, kind: Kind, surface: Surface) -> Style {
         self.resolved[kind.index() * Surface::COUNT + surface.index()]
+    }
+
+    /// The colour to draw a line number in on `surface`. One index; the contrast
+    /// work happened in [`Theme::rebuild`].
+    ///
+    /// Per surface and not one value, for the reason [`Surface`] exists at all: a
+    /// grey that recedes politely on a near-black context row is 1.6:1 on the
+    /// blue-grey of a moved block, and the number stops being there.
+    #[inline]
+    pub fn gutter_on(&self, surface: Surface) -> Rgb {
+        self.gutter[surface.index()]
     }
 
     #[inline]
@@ -462,6 +545,65 @@ mod tests {
                 assert!(contrast(t.syntax_on(kind, surface).fg, t.background(surface)) >= 6.99);
             }
         }
+    }
+
+    #[test]
+    fn a_line_number_clears_the_furniture_floor_on_every_surface() {
+        // The regression this exists for: `gutter_fg` was 2.05:1 on a context
+        // row and 1.60:1 on a moved one, because `rebuild` resolved syntax
+        // tokens and nothing else. A line number nobody can read is a column of
+        // pixels wide enough to matter and no use at all.
+        let t = Theme::default_dark();
+        for surface in Surface::ALL {
+            let got = contrast(t.gutter_on(surface), t.background(surface));
+            assert!(
+                got >= t.min_furniture - 0.01,
+                "the gutter on {surface:?} is {got:.2}:1, floor is {:.2}",
+                t.min_furniture
+            );
+        }
+    }
+
+    #[test]
+    fn furniture_recedes_further_than_body_text() {
+        // Both floors exist because they are different jobs. If the furniture
+        // ever came out as loud as the text it labels, one of them is wrong.
+        let t = Theme::default_dark();
+        assert!(t.min_furniture < t.min_contrast);
+        let gutter = contrast(t.gutter_on(Surface::Context), t.diff.context_bg);
+        let body = contrast(t.diff.context_fg, t.diff.context_bg);
+        assert!(gutter < body, "gutter {gutter:.2} is not quieter than text {body:.2}");
+    }
+
+    #[test]
+    fn a_file_header_is_a_step_and_a_hunk_header_is_not() {
+        // The hierarchy this fixes was inverted: `file_bg` was 1.048:1 against a
+        // context row — invisible — while the hunk header, which matters less,
+        // was the more prominent band of the two. A file boundary is the most
+        // important edge in a diff.
+        let t = Theme::default_dark();
+        let file = contrast(t.diff.file_bg, t.diff.context_bg);
+        let hunk = contrast(t.diff.hunk_bg, t.diff.context_bg);
+        assert!(file > hunk, "file {file:.3} does not out-read hunk {hunk:.3}");
+        assert!(file >= 1.15, "a file header at {file:.3} is not a boundary");
+        assert_ne!(t.diff.file_bg, t.chrome.title_bg, "one colour, two meanings");
+    }
+
+    #[test]
+    fn a_surface_is_decided_once_for_every_client() {
+        use crate::LineKind;
+        assert_eq!(
+            Surface::of(LineKind::Added, false),
+            (Surface::Added, Surface::AddedWord)
+        );
+        // A moved line's words are drawn on the row's own surface: the detection
+        // just said nothing inside it changed.
+        assert_eq!(
+            Surface::of(LineKind::Removed, true),
+            (Surface::MovedRemoved, Surface::MovedRemoved)
+        );
+        let (plain, word) = Surface::of(LineKind::Context, false);
+        assert_eq!(plain, word);
     }
 
     #[test]

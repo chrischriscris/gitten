@@ -55,7 +55,7 @@ use plait_core::align::align;
 use plait_core::host::Host;
 use plait_core::select::Selected;
 use plait_core::syntax::Token;
-use plait_core::theme::Theme;
+use plait_core::theme::{Surface, Theme};
 use plait_core::wrap::{Wrap, Wrapped};
 use plait_core::{LineKind, Span};
 
@@ -78,10 +78,16 @@ impl Column {
     }
 }
 
-/// Width of one column's line-number gutter. Narrower than the unified view's,
-/// because there is one of them per column rather than two side by side, and the
-/// two together may not cost more than the text they are labelling.
-const GUTTER_W: f32 = 44.0;
+/// Width of one column's line-number gutter, including the air after the digits.
+/// Narrower than the unified view's, because there is one of them per column
+/// rather than two side by side, and the two together may not cost more than the
+/// text they are labelling — but not so narrow that a five-digit line number in a
+/// right-aligned column runs into the sign beside it, which 44 was.
+const GUTTER_W: f32 = 52.0;
+/// The air between the last digit and the sign column. The unified view's number,
+/// because the two presentations are the same anatomy at two widths and a reader
+/// switching with `s` should find the columns where they were.
+const GUTTER_PAD: f32 = 8.0;
 /// The `+`/`-` column. Redundant with the background and kept anyway: colour is
 /// not the only channel, and the eye finds a column of signs faster than it
 /// distinguishes two dark backgrounds.
@@ -345,7 +351,11 @@ impl Rows for SplitRows {
                             .flex_none()
                             .w(px(RULE_W))
                             .h(px(ROW_H))
-                            .bg(rgb(theme.diff.gutter_fg)),
+                            // `diff.rule` and not `gutter_fg`, which this was:
+                            // that colour has to stay legible as *text* on five
+                            // row backgrounds, and a full-height line held to a
+                            // text floor is a bright seam down the window.
+                            .bg(rgb(theme.diff.rule)),
                     )
                     .child(self.cell(*new, seg, Column::New, col, theme, sel))
                     .into_any_element()
@@ -409,6 +419,7 @@ impl SplitRows {
         };
         let line = &self.lines[index as usize];
         let (bg, fg, sign) = line_colors(line.kind, line.moved, p);
+        let gutter = theme.gutter_on(Surface::of(line.kind, line.moved).0);
         let no = match column {
             Column::Old => &line.old_no,
             Column::New => &line.new_no,
@@ -422,12 +433,17 @@ impl SplitRows {
             .h(px(ROW_H))
             .w(px(GUTTER_W + SIGN_W) + col)
             .bg(rgb(bg))
+            // Right-aligned, for the reason the unified view's is: a column of
+            // numbers is read down, and left-aligning puts the units digits four
+            // characters apart.
             .child(
                 div()
+                    .flex()
                     .flex_none()
+                    .justify_end()
                     .w(px(GUTTER_W))
-                    .pl_2()
-                    .text_color(rgb(p.gutter_fg))
+                    .pr(px(GUTTER_PAD))
+                    .text_color(rgb(gutter))
                     .child(number_or_blank(no, blank)),
             )
             .child(

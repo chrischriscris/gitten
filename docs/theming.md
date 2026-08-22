@@ -76,6 +76,44 @@ the line. Both halves are [decisions/0009](decisions/0009-contrast-resolution.md
 Themes therefore only have to be *tasteful*. They never enumerate a colour per
 surface; the floor guarantees the rest.
 
+## Two floors, because reading and glancing are different jobs
+
+`min_contrast` is for text that is read: token colour, 3.5. `min_furniture` is for
+text that is *looked up* — line numbers, the `@@ -41,9 +41,11 @@` half of a hunk
+header — and it is **3.0**, the WCAG floor for anything that is not body copy.
+
+It exists because the resolution above ran for syntax tokens and nothing else, and
+the furniture was measured at **2.05:1** on a context row and **1.60:1** on a moved
+one. A line number nobody can read is a column wide enough to matter and no use at
+all. Same machinery, same `readable`, one more table:
+
+```rust
+theme.gutter_on(Surface::MovedAdded)     // one index, no maths
+```
+
+Which surface a row is, incidentally, is not a renderer's decision either:
+
+```rust
+Surface::of(kind, moved)   // -> (the row's surface, its changed-words' surface)
+```
+
+Three presentations and two frontends ask that question, and a client that
+answered it locally would be resolving a token against a background it is not
+drawn on.
+
+## What a hairline is for
+
+Three colours in the palette are never text and never a surface — `chrome.border`,
+`diff.rule` and the Markdown bars. They exist because a *tint* cannot carry an
+edge in a dark theme: `chrome.bg`, `title_bg` and `status_bg` are within **1.05:1**
+of each other, which is invisible as a boundary, and pulling them apart far enough
+to see would make the window three competing panels. One pixel reads at any tint.
+
+`diff.rule` is separate from `gutter_fg` for the reason every split field in here
+is separate: that colour has to clear a *text* floor against five row backgrounds,
+and a full-height line held to a text floor is a bright seam down the middle of
+the window. It was that colour once.
+
 ## Cost, and where it is paid
 
 `readable` costs six `powf` per call and `render` asks for a style per run per
@@ -118,12 +156,17 @@ shell files before this existed.
 
 | group | fields |
 |---|---|
-| `diff` | `file_bg` `file_fg` `adds_fg` `dels_fg` `hunk_bg` `hunk_fg` `gutter_fg` `context_bg` `context_fg` `added_bg` `added_fg` `added_word_bg` `removed_bg` `removed_fg` `removed_word_bg` `moved_removed_bg` `moved_added_bg` `absent_bg` |
+| `diff` | `file_bg` `file_fg` `adds_fg` `dels_fg` `hunk_bg` `hunk_fg` `gutter_fg` `rule` `context_bg` `context_fg` `added_bg` `added_fg` `added_word_bg` `removed_bg` `removed_fg` `removed_word_bg` `moved_removed_bg` `moved_added_bg` `absent_bg` |
 | `markdown` | `code_bar` `quote_bar` `marker` `rule` (also the table grid) |
-| `chrome` | `bg` `fg` `dim` `faint` `accent` `title_bg` `status_bg` `selection_bg` (the row the keyboard is on) `selected_bg` (the text the mouse is holding) `error` |
+| `chrome` | `bg` `fg` `dim` `faint` `accent` `title_bg` `status_bg` `border` `selection_bg` (the row the keyboard is on) `selected_bg` (the text the mouse is holding) `error` |
 | graph | `lanes` `lane_overflow` |
 | commits | `authors` |
 | syntax | 12 `Style`s, resolved across 8 surfaces |
+| furniture | `gutter_fg`, resolved across the same 8 |
+
+One colour never means two things, which is why the list is long: `file_bg` and
+`title_bg` were the same value, and a theme cannot retune a file header without
+moving its own title bar.
 
 ## Changing it without a rebuild
 

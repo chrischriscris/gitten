@@ -59,9 +59,17 @@ use std::ops::Range;
 use std::rc::Rc;
 
 pub(crate) const ROW_H: f32 = 22.0;
-const GUTTER_W: f32 = 52.0;
+/// One line-number column, including the air after the digits.
+///
+/// 56 and not 52 because the digits are right-aligned now and the air is part of
+/// the column: 48 pixels of digits is six of them in the shipped face, which is
+/// a million-line file, and 8 pixels of gap is what stops a number touching the
+/// next column.
+const GUTTER_W: f32 = 56.0;
+/// The air between the last digit of a gutter and whatever is next to it.
+const GUTTER_PAD: f32 = 8.0;
 /// The `+`/`-` column.
-const SIGN_W: f32 = 16.0;
+pub(crate) const SIGN_W: f32 = 16.0;
 /// The page padding, at each edge.
 pub(crate) const PAD: f32 = 16.0;
 
@@ -1326,6 +1334,9 @@ impl Rows for TextRows {
 
             Row::Line { kind, moved, old, new, text, spans, tokens } => {
                 let (bg, fg, sign) = line_colors(*kind, *moved, p);
+                // Which background this row's furniture lands on, so the line
+                // numbers are resolved against it — see `Theme::gutter_on`.
+                let gutter = theme.gutter_on(Surface::of(*kind, *moved).0);
                 let at = self.wrapped.range(index, seg, text);
                 let piece = slice(text, &at);
                 // A continuation carries no number and no sign. The background
@@ -1339,8 +1350,8 @@ impl Rows for TextRows {
                     .h(px(ROW_H))
                     .px(px(PAD))
                     .bg(rgb(bg))
-                    .child(num(number_or_blank(old, blank), p.gutter_fg))
-                    .child(num(number_or_blank(new, blank), p.gutter_fg))
+                    .child(num(number_or_blank(old, blank), gutter))
+                    .child(num(number_or_blank(new, blank), gutter))
                     .child(
                         div()
                             .flex_none()
@@ -1442,6 +1453,15 @@ fn header_text(text: &SharedString, sel: Range<usize>, theme: &Theme) -> AnyElem
 
 /// A file's header row. Identical whichever presentation owns the lines beneath
 /// it — a `.md` file is still a file — so it is drawn here and shared.
+///
+/// Two things carry the boundary, because the background alone could not: a rule
+/// along the top, and a `file_bg` that is now a real step off a context row
+/// rather than the 1.048:1 it was. This is the most important edge in a diff and
+/// it was invisible.
+///
+/// The **directory recedes and the file name does not**. A forty-file diff is
+/// scanned by name, and `src/views/` is the same eleven characters on most of
+/// them; drawn at one weight the names are the part that has to be hunted for.
 pub(crate) fn file_header(
     path: &SharedString,
     adds: usize,
@@ -1450,29 +1470,103 @@ pub(crate) fn file_header(
     sel: Option<Selected>,
 ) -> AnyElement {
     let p = &theme.diff;
+    let (dir, name) = split_path(path);
+    // One range over the whole path, split between the two elements below.
+    let sel = selected(sel, 0, path.len());
+    let cut = dir.as_ref().map_or(0, |d| d.len());
     div()
+        // A column, so the rule is part of the row's own 22 pixels rather than
+        // added to them: every row in this list is exactly `ROW_H` tall and the
+        // list is what makes 714k of them scroll.
         .flex()
-        .items_center()
-        .gap_3()
+        .flex_col()
         .h(px(ROW_H))
-        .px_4()
         .bg(rgb(p.file_bg))
+        .child(div().flex_none().h(px(1.)).bg(rgb(p.rule)))
         .child(
             div()
-                .text_color(rgb(p.file_fg))
-                .child(header_text(path, selected(sel, 0, path.len()), theme)),
+                .flex()
+                .flex_grow(1.0)
+                .items_center()
+                .gap_3()
+                .px_4()
+                .child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .children(dir.map(|d| {
+                            // The furniture colour, resolved against the header's
+                            // own background rather than a row's — a header is not
+                            // a `Surface`, and `gutter_fg` raw is 1.7:1 on it.
+                            // Twice a frame at most: one header per file.
+                            let fg = plait_core::theme::readable(
+                                p.gutter_fg,
+                                p.file_bg,
+                                theme.min_furniture,
+                            );
+                            let at = clipped(&sel, 0..cut);
+                            div().flex_none().text_color(rgb(fg)).child(header_text(&d, at, theme))
+                        }))
+                        .child(
+                            div().flex_none().text_color(rgb(p.file_fg)).child(header_text(
+                                &name,
+                                clipped(&sel, cut..path.len()),
+                                theme,
+                            )),
+                        ),
+                )
+                .child(div().flex_none().text_color(rgb(p.adds_fg)).child(format!("+{adds}")))
+                .child(div().flex_none().text_color(rgb(p.dels_fg)).child(format!("-{dels}"))),
         )
-        .child(div().text_color(rgb(p.adds_fg)).child(format!("+{adds}")))
-        .child(div().text_color(rgb(p.dels_fg)).child(format!("-{dels}")))
         .into_any_element()
 }
 
+/// The part of `sel` that falls inside `at`, rebased to the start of it.
+///
+/// A file header draws its path as two elements — the directory dim, the name
+/// bright — and a selection knows nothing about where that boundary is: it is one
+/// range over the whole path, because that is the one string `header_hit` measures
+/// a click against. So each element takes the slice of it that it actually covers.
+/// Empty for the common case, which is a selection somewhere else entirely.
+fn clipped(sel: &Range<usize>, at: Range<usize>) -> Range<usize> {
+    let clamp = |i: usize| i.clamp(at.start, at.end) - at.start;
+    clamp(sel.start)..clamp(sel.end)
+}
+
+/// `src/views/diff.rs` -> (`src/views/`, `diff.rs`). `None` for a bare name.
+///
+/// Allocates, and is allowed to: a header is one row per *file*, so at most a
+/// couple are ever on screen, where a line is one of fifty. Doing it at load
+/// instead would put two more `SharedString`s on every `Row::File` in three
+/// presentations to save two allocations a frame.
+fn split_path(path: &SharedString) -> (Option<SharedString>, SharedString) {
+    match path.rfind('/') {
+        Some(i) => (
+            Some(SharedString::from(path[..=i].to_string())),
+            SharedString::from(path[i + 1..].to_string()),
+        ),
+        None => (None, path.clone()),
+    }
+}
+
+/// A hunk's header row: `@@ -41,9 +41,11 @@ fn dispatch() {`.
+///
+/// Drawn as two things, because it is two things — the split is
+/// [`plait_core::hunk_parts`], so every client agrees where it is. The
+/// coordinates are furniture and take the gutter's colour, which is what they
+/// are: a line number with a range around it. The declaration git appends is the
+/// half a reader wants, and keeps `hunk_fg`.
+///
+/// The band itself recedes now. It used to be the more prominent of the two
+/// headers, which had the hierarchy backwards: a hunk is a place inside a file,
+/// and the file is the boundary that matters.
 pub(crate) fn hunk_header(
     header: &SharedString,
     theme: &Theme,
     sel: Option<Selected>,
 ) -> AnyElement {
     let p = &theme.diff;
+    let (marker, _) = plait_core::hunk_parts(header);
     div()
         .flex()
         .items_center()
@@ -1480,8 +1574,54 @@ pub(crate) fn hunk_header(
         .px_4()
         .bg(rgb(p.hunk_bg))
         .text_color(rgb(p.hunk_fg))
-        .child(header_text(header, selected(sel, 0, header.len()), theme))
+        .child(
+            StyledText::new(header.clone())
+                .with_highlights(hunk_runs(marker.len(), selected(sel, 0, header.len()), theme)),
+        )
         .into_any_element()
+}
+
+/// The two colours of a hunk header, and whatever a selection covers, as one run
+/// list.
+///
+/// **One `StyledText` over the whole string**, not two elements side by side,
+/// which is how the two-tone version started: `header_hit` maps a click to a byte
+/// offset in that one string measured from the page padding, so any gap between
+/// two elements puts the caret characters off for everything after it — and a
+/// selection spanning the boundary would be two highlights that have to agree
+/// about where it is.
+///
+/// The declaration git appends gets no run at all: it is the row's own
+/// `hunk_fg`, and a run that repeats the default is a run to merge for nothing.
+fn hunk_runs(
+    marker: usize,
+    sel: Range<usize>,
+    theme: &Theme,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    let fg = theme.gutter_on(Surface::Context);
+    let bg = theme.chrome.selected_bg;
+    // Four edges at most, so this is a sort of four rather than a sweep.
+    let mut edges = vec![0, marker, sel.start, sel.end];
+    edges.sort_unstable();
+    edges.dedup();
+    let mut out = Vec::with_capacity(edges.len());
+    for w in edges.windows(2) {
+        let (start, end) = (w[0], w[1]);
+        let in_marker = start < marker;
+        let in_sel = sel.contains(&start);
+        if !in_marker && !in_sel {
+            continue;
+        }
+        out.push((
+            start..end,
+            HighlightStyle {
+                color: in_marker.then(|| rgb(fg).into()),
+                background_color: in_sel.then(|| rgb(bg).into()),
+                ..Default::default()
+            },
+        ));
+    }
+    out
 }
 
 /// Which background a line is drawn on, and the foreground and sign that go with
@@ -1508,8 +1648,26 @@ pub(crate) fn line_colors(
     }
 }
 
+/// One line-number column.
+///
+/// **Right-aligned**, which is the whole reason this is a flex row and not a
+/// `div` with text in it. A column of left-aligned numbers puts the units digit
+/// of `9` and of `1234` four characters apart, so the one thing the eye does with
+/// this column — run down it — is the one thing it cannot do. Every diff tool
+/// aligns it the other way.
+///
+/// `fg` comes from [`Theme::gutter_on`] and not from `diff.gutter_fg` directly,
+/// because a number is drawn on whatever background its line has and that grey
+/// is 2.05:1 on a context row and 1.60:1 on a moved one.
 pub(crate) fn num(n: SharedString, fg: Rgb) -> Div {
-    div().flex_none().w(px(GUTTER_W)).text_color(rgb(fg)).child(n)
+    div()
+        .flex()
+        .flex_none()
+        .justify_end()
+        .w(px(GUTTER_W))
+        .pr(px(GUTTER_PAD))
+        .text_color(rgb(fg))
+        .child(n)
 }
 
 /// Line numbers are drawn, so they are formatted once at load rather than on
@@ -1555,13 +1713,10 @@ pub(crate) fn runs(
     // run is still a run to merge and shape.
     let spans: &[Span] = if moved { &[] } else { spans };
 
-    let (plain_surface, word_surface) = match (kind, moved) {
-        (LineKind::Added, false) => (Surface::Added, Surface::AddedWord),
-        (LineKind::Added, true) => (Surface::MovedAdded, Surface::MovedAdded),
-        (LineKind::Removed, false) => (Surface::Removed, Surface::RemovedWord),
-        (LineKind::Removed, true) => (Surface::MovedRemoved, Surface::MovedRemoved),
-        (LineKind::Context, _) => (Surface::Context, Surface::Context),
-    };
+    // In `core`, because the split view, the Markdown rows and a terminal
+    // frontend all have to resolve a token against the same background this
+    // does — see `Surface::of`.
+    let (plain_surface, word_surface) = Surface::of(kind, moved);
     let word_bg = theme.background(word_surface);
     let selected_bg = theme.background(Surface::Selected);
     if tokens.is_empty() && spans.is_empty() && sel.is_empty() {
