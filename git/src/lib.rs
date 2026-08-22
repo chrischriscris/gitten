@@ -148,15 +148,32 @@ pub fn pairs(repo: &Path, revspec: &str) -> Result<Vec<Pair>> {
             }
         }
     }
-    let blobs = cat_file(repo, &wanted)?;
+
+    // The working-tree pair wants blobs *and* a status, and the two are
+    // independent — status reads the index and the working tree, cat-file
+    // fetches OIDs the diff has already named — so they run side by side and
+    // an open of uncommitted work pays one spawn floor instead of two. Nothing
+    // is shared between them but `repo`, which neither mutates. Both errors
+    // still surface with `cat-file`'s first, exactly as when they ran in
+    // sequence, and a panic in either is resumed rather than swallowed because
+    // both calls used to be inline.
+    let (blobs, loose) = if revspec.is_empty() {
+        std::thread::scope(|s| {
+            let loose = s.spawn(|| untracked(repo));
+            let blobs = cat_file(repo, &wanted);
+            (blobs, loose.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+        })
+    } else {
+        (cat_file(repo, &wanted), Ok(Vec::new()))
+    };
+    let blobs = blobs?;
 
     let mut out = Vec::with_capacity(changes.len());
     // Untracked files first, so they read as new before the modifications —
     // `git status` lists them last and that is the wrong way round for a diff,
     // where the thing you just created is the thing you are looking for.
-    if revspec.is_empty() {
-        out.extend(untracked(repo)?);
-    }
+    // Fetching them early changed when they arrive, not where they land.
+    out.extend(loose?);
     for c in changes {
         // The two sides read a null OID differently, and conflating them is a
         // silent, plausible-looking bug: an added file whose old side falls back

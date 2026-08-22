@@ -20,6 +20,53 @@ use std::sync::Arc;
 use std::time::Duration;
 use stats::Stats;
 
+/// Startup-stage timestamps on stderr, behind `PLAIT_START_LOG=1`.
+///
+/// Time-to-first-frame hides between stages nobody measures: acquisition and
+/// the config were timed, the GPUI window path never was, so a slow launch
+/// could not be attributed to anything. Every mark prints cumulative
+/// milliseconds since the top of [`main`] and the step since the previous
+/// mark, which is what makes a jittery macOS launch readable — three runs of
+/// one number mean nothing; three runs of a table do.
+///
+/// Off by default, and the off path is one relaxed load per mark across about
+/// a dozen marks in a launch. The first mark also pins `T0`, so nothing before
+/// it is miscounted.
+mod start {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    static T0: OnceLock<Instant> = OnceLock::new();
+    static LAST_US: AtomicU64 = AtomicU64::new(0);
+
+    pub fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("PLAIT_START_LOG").is_some_and(|v| v != "0"))
+    }
+
+    /// Pins the epoch. Later than process start by exec and dyld, which no
+    /// user-space code here can move.
+    pub fn begin(now: Instant) {
+        _ = T0.set(now);
+    }
+
+    pub fn mark(stage: &str) {
+        if !on() {
+            return;
+        }
+        let now = Instant::now();
+        let t0 = *T0.get_or_init(|| now);
+        let us = now.duration_since(t0).as_micros() as u64;
+        let prev = LAST_US.swap(us, Relaxed);
+        eprintln!(
+            "[start] {:>8.3}ms  (+{:>8.3}ms)  {stage}",
+            us as f64 / 1e3,
+            (us - prev) as f64 / 1e3,
+        );
+    }
+}
+
 #[global_allocator]
 static ALLOC: stats::Counting = stats::Counting;
 
@@ -113,6 +160,9 @@ struct DevShell {
     /// reload a save does — see [`config::reload`] for why there is only one
     /// path.
     config: std::path::PathBuf,
+    /// Startup logging, and nothing else: whether [`start::mark`] has already
+    /// stamped the first render. One bool read per frame afterwards.
+    first_render: Cell<bool>,
 }
 
 impl DevShell {
@@ -358,6 +408,11 @@ impl DevShell {
 
 impl Render for DevShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // One-shot: the first render of the shell is the first frame being
+        // assembled, which is the end of what a startup measurement covers.
+        if !self.first_render.replace(true) {
+            start::mark("first render");
+        }
         let overlay = self.stats.as_mut().map(|s| {
             s.tick();
             (s.frames(), s.rows(), s.heap(), s.load.clone())
@@ -490,6 +545,8 @@ impl Render for DevShell {
 }
 
 fn main() {
+    start::begin(std::time::Instant::now());
+    start::mark("main enter");
     // Arguments, `plait.toml`, `--help`, `plait config` and acquisition, all of
     // it shared with every other client — see `plait_app`. What is left in this
     // file is a window.
@@ -501,6 +558,7 @@ fn main() {
         Ok(started) => started,
         Err(exit) => exit.finish(),
     };
+    start::mark("startup done (args + plait.toml + acquire)");
     let Started { view: which, source, host, loaded, config: config_path } = started;
     let host = Rc::new(host);
 
@@ -534,7 +592,9 @@ fn main() {
     let shell_config_path = config_path.clone();
 
     let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
+    start::mark("gpui application up; entering run");
     app.run(move |cx| {
+        start::mark("app.run enter");
         gpui_component::init(cx);
         cx.set_global(config::Active(host.clone()));
         // Nothing picked yet: the file's theme is the one on screen.
@@ -543,6 +603,7 @@ fn main() {
         // `config::sync_widgets`, which is the only thing standing between that
         // and a pair of light scrollbars over a near-black diff.
         config::sync_widgets(&host, cx);
+        start::mark("run setup through widget theme sync");
 
         // Re-read the file whenever it is written, and hand the result to every
         // window. The watcher's callback runs on its own thread, so it only sets
@@ -615,6 +676,147 @@ fn main() {
             KeyBinding::new("cmd-a", SelectAll, None),
             KeyBinding::new("escape", SelectNone, None),
         ]);
+
+        // Open the window here and now, not from a spawned task: the task only
+        // ran at the executor's next pump, which put a scheduling hop between
+        // this body and the first frame for no benefit — and every registration
+        // above is in place before any event can be delivered, because none are
+        // delivered until this closure yields.
+        start::mark("opening window");
+        cx.open_window(window_options(title), move |window, cx| {
+            start::mark("window callback enter");
+            // Where the last run of this exact command left off. Restored
+            // before the first frame so you never see row 0 flash past.
+            let resume = session::restore(&session_key, &session_path);
+            start::mark("session restored");
+            let mut diff_entity: Option<Entity<views::diff::Diff>> = None;
+            #[allow(clippy::type_complexity)]
+            let (view, rendered, top, total, note, load): (
+                AnyView,
+                Rc<Cell<usize>>,
+                Rc<Cell<usize>>,
+                Rc<Cell<usize>>,
+                Rc<std::cell::RefCell<SharedString>>,
+                String,
+            ) = match data {
+                Data::Commits(commits) => {
+                    let h = host.clone();
+                    let e = cx.new(|_| views::commits::Commits::new(commits, h));
+                    let v = e.read(cx);
+                    if let Some(r) = &resume {
+                        v.scroll_to(r.top);
+                    }
+                    (
+                        e.clone().into(),
+                        v.rendered.clone(),
+                        v.top.clone(),
+                        // The commit graph has a fixed row count: one per
+                        // commit, and nothing reflows it.
+                        Rc::new(Cell::new(v.total())),
+                        Rc::new(std::cell::RefCell::new(SharedString::default())),
+                        v.load.clone(),
+                    )
+                }
+                Data::Diff(files) => {
+                    let h = host.clone();
+                    let e = cx.new(|cx| views::diff::Diff::new(files, h, cx));
+                    diff_entity = Some(e.clone());
+                    let v = e.read(cx);
+                    if let Some(r) = &resume {
+                        v.scroll_to(r.top);
+                    }
+                    (
+                        e.clone().into(),
+                        v.rendered.clone(),
+                        v.top.clone(),
+                        v.total.clone(),
+                        v.note.clone(),
+                        v.load.clone(),
+                    )
+                }
+            };
+            start::mark("view built");
+
+            // First-paint evidence, and only when logging: the views count
+            // rows as the list builds them (see `rendered`), so the counter
+            // going non-zero is the first frame actually carrying content.
+            // Polled at 5 ms rather than hooked into a render — a paint has
+            // no callback, and this task dies as soon as it fires.
+            if start::on() {
+                let drawn = rendered.clone();
+                cx.spawn(async move |cx| {
+                    loop {
+                        cx.background_executor().timer(Duration::from_millis(5)).await;
+                        let n = drawn.get();
+                        if n > 0 {
+                            start::mark(&format!("first rows drawn ({n})"));
+                            break;
+                        }
+                    }
+                })
+                .detach();
+            }
+
+            // Persist as you scroll, so any kind of death keeps the position:
+            // `dev.sh` kills the process, and nothing runs on the way out.
+            // Only on change, so an idle window writes nothing at all.
+            {
+                let (key, path) = (session_key.clone(), session_path.clone());
+                let start = resume.map(|r| r.top).unwrap_or(0);
+                cx.spawn(async move |cx: &mut AsyncApp| {
+                    let mut last = start;
+                    loop {
+                        cx.background_executor().timer(Duration::from_millis(400)).await;
+                        let now = top.get();
+                        if now != last {
+                            last = now;
+                            session::save(&session::Session { key: key.clone(), top: now }, &path);
+                        }
+                    }
+                })
+                .detach();
+            }
+            let stats = stats::enabled().then(|| Stats::new(rendered, total, note, load));
+            let shell = cx.new(|_| DevShell {
+                which: which_name,
+                label,
+                view,
+                stats,
+                // Only where there is something to drive: the commit graph
+                // gets no strip rather than a strip of dead controls.
+                rediff: diff_entity.as_ref().and(rediff),
+                diff: diff_entity,
+                over: Overrides::default(),
+                open: None,
+                error: None,
+                config: shell_config_path,
+                first_render: Cell::new(false),
+            });
+            cx.new(|cx| Root::new(shell, window, cx))
+        })
+        .expect("failed to open window");
+        start::mark("open_window returned");
+        cx.activate(true);
+
+        // Closing the last window must end the process — macOS keeps an
+        // appless process alive otherwise.
+        cx.on_window_closed(|cx, _| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
+
+        // Last, not first: these two are the platform round trips of this
+        // closure — ~20 ms measured between them, the single largest thing
+        // here — and nothing on screen needs either. The cost is a first
+        // touch, not a property of one call: whichever platform API runs
+        // first after setup absorbs it (it moved with `set_menus`, then with
+        // `on_window_closed`, as they were reordered), so both go *after* the
+        // window rather than paying it on the way to frame zero. No event is
+        // delivered to keys, menus or actions until this closure returns and
+        // the event loop starts, so registering after the window exists races
+        // nothing; the bar just fills in while frame zero paints.
         cx.set_menus(vec![
             Menu {
                 name: "plait".into(),
@@ -633,105 +835,7 @@ fn main() {
                 disabled: false,
             },
         ]);
-        cx.on_window_closed(|cx, _| {
-            if cx.windows().is_empty() {
-                cx.quit();
-            }
-        })
-        .detach();
-
-        cx.spawn(async move |cx| {
-            cx.open_window(window_options(title), move |window, cx| {
-                // Where the last run of this exact command left off. Restored
-                // before the first frame so you never see row 0 flash past.
-                let resume = session::restore(&session_key, &session_path);
-                let mut diff_entity: Option<Entity<views::diff::Diff>> = None;
-                #[allow(clippy::type_complexity)]
-                let (view, rendered, top, total, note, load): (
-                    AnyView,
-                    Rc<Cell<usize>>,
-                    Rc<Cell<usize>>,
-                    Rc<Cell<usize>>,
-                    Rc<std::cell::RefCell<SharedString>>,
-                    String,
-                ) = match data {
-                    Data::Commits(commits) => {
-                        let h = host.clone();
-                        let e = cx.new(|_| views::commits::Commits::new(commits, h));
-                        let v = e.read(cx);
-                        if let Some(r) = &resume {
-                            v.scroll_to(r.top);
-                        }
-                        (
-                            e.clone().into(),
-                            v.rendered.clone(),
-                            v.top.clone(),
-                            // The commit graph has a fixed row count: one per
-                            // commit, and nothing reflows it.
-                            Rc::new(Cell::new(v.total())),
-                            Rc::new(std::cell::RefCell::new(SharedString::default())),
-                            v.load.clone(),
-                        )
-                    }
-                    Data::Diff(files) => {
-                        let h = host.clone();
-                        let e = cx.new(|cx| views::diff::Diff::new(files, h, cx));
-                        diff_entity = Some(e.clone());
-                        let v = e.read(cx);
-                        if let Some(r) = &resume {
-                            v.scroll_to(r.top);
-                        }
-                        (
-                            e.clone().into(),
-                            v.rendered.clone(),
-                            v.top.clone(),
-                            v.total.clone(),
-                            v.note.clone(),
-                            v.load.clone(),
-                        )
-                    }
-                };
-
-                // Persist as you scroll, so any kind of death keeps the position:
-                // `dev.sh` kills the process, and nothing runs on the way out.
-                // Only on change, so an idle window writes nothing at all.
-                {
-                    let (key, path) = (session_key.clone(), session_path.clone());
-                    let start = resume.map(|r| r.top).unwrap_or(0);
-                    cx.spawn(async move |cx: &mut AsyncApp| {
-                        let mut last = start;
-                        loop {
-                            cx.background_executor().timer(Duration::from_millis(400)).await;
-                            let now = top.get();
-                            if now != last {
-                                last = now;
-                                session::save(&session::Session { key: key.clone(), top: now }, &path);
-                            }
-                        }
-                    })
-                    .detach();
-                }
-                let stats = stats::enabled().then(|| Stats::new(rendered, total, note, load));
-                let shell = cx.new(|_| DevShell {
-                    which: which_name,
-                    label,
-                    view,
-                    stats,
-                    // Only where there is something to drive: the commit graph
-                    // gets no strip rather than a strip of dead controls.
-                    rediff: diff_entity.as_ref().and(rediff),
-                    diff: diff_entity,
-                    over: Overrides::default(),
-                    open: None,
-                    error: None,
-                    config: shell_config_path,
-                });
-                cx.new(|cx| Root::new(shell, window, cx))
-            })
-            .expect("failed to open window");
-            cx.update(|cx| cx.activate(true));
-        })
-        .detach();
+        start::mark("menus + close handler registered");
     });
 }
 
