@@ -1345,10 +1345,8 @@ impl Rows for TextRows {
                 // what says it is not a line of its own — every real line has at
                 // least one number, so there is nothing to confuse it with.
                 let blank = seg > 0;
-                div()
-                    .flex()
+                row_frame()
                     .items_center()
-                    .h(px(ROW_H))
                     .px(px(PAD))
                     .bg(rgb(bg))
                     .child(num(number_or_blank(old, blank), gutter))
@@ -1401,6 +1399,30 @@ pub(crate) fn slice(text: &SharedString, at: &Range<usize>) -> SharedString {
         true => text.clone(),
         false => SharedString::from(text[at.clone()].to_string()),
     }
+}
+
+/// The frame every row in the list is drawn in: exactly [`ROW_H`] tall, and
+/// never narrower than the window.
+///
+/// The width is what makes a row's background the *row's* — a line's colour runs
+/// to the right edge of the view instead of stopping after its last character,
+/// which is what every diff viewer worth reading does and what makes a run of
+/// additions read as a block rather than as a ragged margin.
+///
+/// `min_w_full` and not a measured width, because `uniform_list` lays each
+/// visible row out as its own root against an available width of *the viewport
+/// plus however far the list is scrolled horizontally* — so 100% is "to the
+/// right edge of the window, wherever the window is scrolled to", and the fill
+/// follows the scroll for free. A *minimum*, so a line longer than the window
+/// keeps its own width: that overflow is what there is to scroll to, and
+/// clamping it here would be a diff with no horizontal scrolling.
+///
+/// It does not disturb `with_width_from_item`. That measurement lays its one row
+/// out against `MaxContent`, where a percentage minimum has no parent width to
+/// resolve against and drops out — so the scrollable width is still the widest
+/// row's own text, not the window's.
+pub(crate) fn row_frame() -> Div {
+    div().flex().h(px(ROW_H)).min_w_full()
 }
 
 /// A line number, or nothing at all on a continuation row.
@@ -1475,13 +1497,11 @@ pub(crate) fn file_header(
     // One range over the whole path, split between the two elements below.
     let sel = selected(sel, 0, path.len());
     let cut = dir.as_ref().map_or(0, |d| d.len());
-    div()
+    row_frame()
         // A column, so the rule is part of the row's own 22 pixels rather than
         // added to them: every row in this list is exactly `ROW_H` tall and the
         // list is what makes 714k of them scroll.
-        .flex()
         .flex_col()
-        .h(px(ROW_H))
         .bg(rgb(p.file_bg))
         .child(div().flex_none().h(px(1.)).bg(rgb(p.rule)))
         .child(
@@ -1568,10 +1588,8 @@ pub(crate) fn hunk_header(
 ) -> AnyElement {
     let p = &theme.diff;
     let (marker, _) = plait_core::hunk_parts(header);
-    div()
-        .flex()
+    row_frame()
         .items_center()
-        .h(px(ROW_H))
         .px_4()
         .bg(rgb(p.hunk_bg))
         .text_color(rgb(p.hunk_fg))

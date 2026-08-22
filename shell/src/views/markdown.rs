@@ -47,7 +47,7 @@
 
 use super::diff::{
     column_at, columns, file_header, header_hit, hunk_header, line_colors, num, number,
-    number_or_blank, runs, selected, slice, Hit, Rows, ROW_H, PAD, SIGN_W, TEXT_CHROME,
+    number_or_blank, row_frame, runs, selected, slice, Hit, Rows, ROW_H, PAD, SIGN_W, TEXT_CHROME,
 };
 use gpui::*;
 use plait_core::host::Host;
@@ -436,10 +436,8 @@ impl MarkdownRows {
         // The gutter is the built-in's, unchanged. Whatever the row does with the
         // text, the two line numbers and the sign have to sit where they sit on
         // every other row of the diff or the eye loses the column.
-        let row = div()
-            .flex()
+        let row = row_frame()
             .items_center()
-            .h(px(ROW_H))
             .px_4()
             .bg(rgb(bg))
             .child(num(number_or_blank(old, blank), theme.gutter_on(surface)))

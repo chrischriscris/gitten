@@ -324,6 +324,19 @@ list measures exactly ONE row to decide its scrollable width and defaults to row
 0, so a short first row means nothing scrolls no matter how long the rest are.
 Compute the widest index at load.
 
+**A row's background is the row's width, so give every row `min_w_full`.** A bg
+that stops after the last character is a ragged margin down a wall of additions;
+Bitbucket, GitHub and git's own pager all run the colour to the edge. `min_w_full`
+is what does it, because `uniform_list` lays each visible row out as its own root
+against an available width of *the viewport plus however far it is scrolled
+horizontally* — so 100% means "to the right edge of the window, wherever the
+window is scrolled to" and the fill follows the scroll for nothing. A *minimum*,
+so a long line keeps the width there is to scroll to; and it does not disturb
+`with_width_from_item`, whose one measurement runs against `MaxContent`, where a
+percentage minimum has no parent width to resolve against and drops out. Fixed
+columns beside it (a side-by-side pair) need a `flex_grow(1.)` strip to carry the
+colour across the leftover space — it measures zero, so it costs no scroll width.
+
 Closing the last window does not end the process; macOS keeps appless processes
 alive. `cx.on_window_closed` + `cx.quit()`. Cmd-Q is separate and equally manual:
 no application menu exists, so register the action, bind the key, and set a menu

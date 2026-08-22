@@ -48,7 +48,7 @@
 
 use super::diff::{
     column_at, columns, file_header, header_hit, hunk_header, line_colors, number,
-    number_or_blank, runs, selected, slice, Hit, Rows, ROW_H,
+    number_or_blank, row_frame, runs, selected, slice, Hit, Rows, ROW_H,
 };
 use gpui::*;
 use plait_core::align::align;
@@ -342,10 +342,8 @@ impl Rows for SplitRows {
                 // stale character width is exactly what `font.advance` exists to
                 // stop being possible.
                 let col = px(self.col_px(host));
-                div()
-                    .flex()
+                row_frame()
                     .items_center()
-                    .h(px(ROW_H))
                     .child(self.cell(*old, seg, Column::Old, col, theme, sel))
                     .child(
                         div()
@@ -359,6 +357,7 @@ impl Rows for SplitRows {
                             .bg(rgb(theme.diff.rule)),
                     )
                     .child(self.cell(*new, seg, Column::New, col, theme, sel))
+                    .child(self.fill(*new, seg, theme))
                     .into_any_element()
             }
         }
@@ -393,6 +392,36 @@ impl SplitRows {
         (self.col_chars() as f32 + SLACK) * host.font.advance * host.font.size
     }
 
+    /// The line this side of a pair draws on visual row `seg`, if it draws one
+    /// at all: absent from the pair entirely, or past the end of a side whose
+    /// opposite wrapped further. Asked by both the cell and the strip beside it,
+    /// so the two cannot disagree about which rows are holes.
+    fn present(&self, line: Option<u32>, seg: usize) -> Option<u32> {
+        line.filter(|i| seg < self.wrapped.rows(*i as usize))
+    }
+
+    /// The strip between the right-hand column and the right edge of the window.
+    ///
+    /// The columns are sized to the widest line in the diff — see
+    /// [`SplitRows::col_chars`] — so a file of short lines leaves the rest of the
+    /// row unpainted, and a colour that stops short of the edge reads as a
+    /// shorter line rather than as a wider window. It continues the *new*
+    /// column, because that is the column it is beside.
+    ///
+    /// Grows rather than measures: [`row_frame`] is as wide as the window, so the
+    /// space left over after two fixed columns and the rule is exactly this, and
+    /// on a row wider than the window there is none and this is nothing.
+    fn fill(&self, line: Option<u32>, seg: usize, theme: &Theme) -> Div {
+        let bg = match self.present(line, seg) {
+            Some(i) => {
+                let line = &self.lines[i as usize];
+                line_colors(line.kind, line.moved, &theme.diff).0
+            }
+            None => theme.diff.absent_bg,
+        };
+        div().flex_grow(1.0).h(px(ROW_H)).bg(rgb(bg))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn cell(
         &self,
@@ -408,7 +437,7 @@ impl SplitRows {
         // further. The same hole as no line at all, and the same colour: the
         // alternative is a bare row of `context_bg` under a wrapped removal,
         // which reads as an unchanged line that is not there.
-        let Some(index) = line.filter(|i| seg < self.wrapped.rows(*i as usize)) else {
+        let Some(index) = self.present(line, seg) else {
             // Nothing opposite: a flat, darker block, so a run of them reads as
             // a hole in the column rather than as unchanged content.
             return div()
