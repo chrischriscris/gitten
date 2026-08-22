@@ -54,7 +54,8 @@ use plait_core::host::Host;
 use plait_core::markdown::{lay_out, Block, Layout};
 use plait_core::select::Selected;
 use plait_core::syntax::Token;
-use plait_core::theme::{Rgb, Surface};
+use plait_core::runs::surfaces;
+use plait_core::theme::Rgb;
 use plait_core::wrap::{Wrap, Wrapped};
 use plait_core::{LineKind, Span};
 
@@ -425,7 +426,7 @@ impl MarkdownRows {
         let m = &self.metrics;
         let md = &theme.markdown;
         let (bg, fg, sign) = line_colors(kind, moved, &theme.diff);
-        let surface = Surface::of(kind, moved).0;
+        let surface = surfaces(kind, moved).0;
         // A continuation of a wrapped line: the same furniture, so a wrapped
         // bullet stays indented under its own text and a wrapped quote keeps its
         // bar, and no number and no sign, as everywhere else.

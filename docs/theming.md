@@ -94,7 +94,7 @@ theme.gutter_on(Surface::MovedAdded)     // one index, no maths
 Which surface a row is, incidentally, is not a renderer's decision either:
 
 ```rust
-Surface::of(kind, moved)   // -> (the row's surface, its changed-words' surface)
+runs::surfaces(kind, moved)   // -> (the row's surface, its changed-words' surface)
 ```
 
 Three presentations and two frontends ask that question, and a client that

@@ -174,14 +174,12 @@ fn main() {
 
 /// git's own answer, and what it cost.
 /// A hunk header without its function-name suffix: `@@ -41,9 +41,11 @@`.
+///
+/// `core`'s split, not a second copy of it: this had its own two-line version of
+/// the same scan, which is one place for the two to disagree about what a header
+/// is — and this comparison is the thing that decides whether a differ is right.
 fn ranges(f: &plait_core::FileDiff) -> Vec<String> {
-    f.hunks
-        .iter()
-        .map(|h| {
-            let end = h.header[2..].find("@@").map(|i| i + 4).unwrap_or(h.header.len());
-            h.header[..end].to_string()
-        })
-        .collect()
+    f.hunks.iter().map(|h| plait_core::hunk_parts(&h.header).0.to_string()).collect()
 }
 
 fn git_diff(

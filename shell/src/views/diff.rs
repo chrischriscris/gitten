@@ -48,6 +48,7 @@ use gpui::*;
 use gpui_component::scroll::Scrollbar;
 use plait_core::host::Host;
 use plait_core::prepared::{prepare, Prepared};
+use plait_core::runs::surfaces;
 use plait_core::rows::{Ordered, RowRef};
 use plait_core::select::{self, Caret, RowId, Selected, Selection, Text as _};
 use plait_core::syntax::Token;
@@ -1336,7 +1337,7 @@ impl Rows for TextRows {
                 let (bg, fg, sign) = line_colors(*kind, *moved, p);
                 // Which background this row's furniture lands on, so the line
                 // numbers are resolved against it — see `Theme::gutter_on`.
-                let gutter = theme.gutter_on(Surface::of(*kind, *moved).0);
+                let gutter = theme.gutter_on(surfaces(*kind, *moved).0);
                 let at = self.wrapped.range(index, seg, text);
                 let piece = slice(text, &at);
                 // A continuation carries no number and no sign. The background
@@ -1713,10 +1714,10 @@ pub(crate) fn runs(
     // run is still a run to merge and shape.
     let spans: &[Span] = if moved { &[] } else { spans };
 
-    // In `core`, because the split view, the Markdown rows and a terminal
-    // frontend all have to resolve a token against the same background this
-    // does — see `Surface::of`.
-    let (plain_surface, word_surface) = Surface::of(kind, moved);
+    // `core`'s, because the split view, the Markdown rows and the terminal
+    // frontend resolve a token against the same background this does — see
+    // `plait_core::runs::surfaces`, which the terminal has always used.
+    let (plain_surface, word_surface) = surfaces(kind, moved);
     let word_bg = theme.background(word_surface);
     let selected_bg = theme.background(Surface::Selected);
     if tokens.is_empty() && spans.is_empty() && sel.is_empty() {
@@ -2179,6 +2180,95 @@ diff --git a/a.rs b/a.rs
             !out.iter().any(|(r, s)| r.contains(&8) && s.background_color == Some(word.into())),
             "the changed word kept its background inside the selection"
         );
+    }
+
+    #[test]
+    fn a_hunk_header_paints_its_coordinates_and_leaves_its_code_alone() {
+        // The two-tone header is one `StyledText` with runs, not two elements —
+        // `header_hit` measures a click against the whole string. So the split
+        // has to come out as bytes, and the declaration git appends has to carry
+        // no run at all: it is already the row's own `hunk_fg`.
+        let theme = Theme::default_dark();
+        let header = "@@ -41,9 +41,11 @@ fn dispatch() {";
+        let (marker, code) = plait_core::hunk_parts(header);
+        let out = super::hunk_runs(marker.len(), 0..0, &theme);
+        well_formed(header, &out);
+        assert_eq!(out.len(), 1, "one run: the coordinates");
+        assert_eq!(out[0].0, 0..marker.len());
+        assert_eq!(out[0].1.color, Some(rgb(theme.gutter_on(Surface::Context)).into()));
+        assert!(out[0].1.background_color.is_none());
+        assert!(!code.is_empty() && out.iter().all(|(r, _)| r.end <= marker.len()));
+    }
+
+    #[test]
+    fn a_selection_across_a_hunk_header_keeps_both_of_its_colours() {
+        // The case two side-by-side elements could not draw: one selection whose
+        // ends live in different halves of the header.
+        let theme = Theme::default_dark();
+        let header = "@@ -41,9 +41,11 @@ fn dispatch() {";
+        let marker = plait_core::hunk_parts(header).0.len();
+        let out = super::hunk_runs(marker, 5..25, &theme);
+        well_formed(header, &out);
+        let bg = rgb(theme.chrome.selected_bg);
+        let painted: Vec<usize> = out
+            .iter()
+            .filter(|(_, st)| st.background_color == Some(bg.into()))
+            .flat_map(|(r, _)| r.clone())
+            .collect();
+        assert_eq!(painted, (5..25).collect::<Vec<_>>(), "the selection, exactly");
+        // ...and the coordinates are still the coordinates inside it.
+        let fg = rgb(theme.gutter_on(Surface::Context));
+        let coloured: Vec<usize> = out
+            .iter()
+            .filter(|(_, st)| st.color == Some(fg.into()))
+            .flat_map(|(r, _)| r.clone())
+            .collect();
+        assert_eq!(coloured, (0..marker).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_header_with_no_coordinates_is_all_coordinates() {
+        // `hunk_parts` hands the whole string back when there is no `@@` pair —
+        // it is the *tail* that may be missing, not the head — so a malformed
+        // header comes out entirely in the coordinates' colour. Which is the
+        // right answer for a string that is not a hunk header: quiet, whole, and
+        // not half-painted at an offset nothing chose.
+        let theme = Theme::default_dark();
+        let header = "not a hunk header";
+        let marker = plait_core::hunk_parts(header).0.len();
+        assert_eq!(marker, header.len(), "the whole string is the marker");
+        let out = super::hunk_runs(marker, 0..0, &theme);
+        well_formed(header, &out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, 0..header.len());
+        // A zero-length marker — the one case with nothing to colour — is a
+        // selection background and nothing else, rather than an empty run.
+        let out = super::hunk_runs(0, 2..6, &theme);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, 2..6);
+        assert!(out[0].1.color.is_none(), "no coordinates to colour");
+        assert!(super::hunk_runs(0, 0..0, &theme).is_empty(), "nothing at all");
+    }
+
+    #[test]
+    fn a_paths_selection_is_split_between_its_directory_and_its_name() {
+        // The file header draws `src/views/` and `diff.rs` as two elements, and
+        // the selection is one range over the whole path. Each element takes the
+        // part of it that it actually covers, rebased to its own start.
+        let cut = "src/views/".len();
+        let len = "src/views/diff.rs".len();
+        // A selection over the whole path.
+        assert_eq!(super::clipped(&(0..len), 0..cut), 0..cut);
+        assert_eq!(super::clipped(&(0..len), cut..len), 0..len - cut);
+        // One that straddles the boundary: three bytes of directory, four of name.
+        let sel = cut - 3..cut + 4;
+        assert_eq!(super::clipped(&sel, 0..cut), cut - 3..cut);
+        assert_eq!(super::clipped(&sel, cut..len), 0..4);
+        // One that misses each side entirely is empty, not inverted.
+        assert!(super::clipped(&(0..2), cut..len).is_empty());
+        assert!(super::clipped(&(cut + 1..len), 0..cut).is_empty());
+        // Nothing selected at all, which is nearly every header of every frame.
+        assert!(super::clipped(&(0..0), cut..len).is_empty());
     }
 
     #[test]

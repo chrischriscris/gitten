@@ -41,27 +41,6 @@ pub enum Surface {
 }
 
 impl Surface {
-    /// The surface a line of `kind` sits on, and the surface its changed words
-    /// sit on.
-    ///
-    /// Here rather than in a renderer because three presentations and two
-    /// frontends ask the same question, and a client that answered it itself
-    /// would be a client whose changed words are resolved against a background
-    /// they are not drawn on. A moved line has no word surface of its own — the
-    /// detection just said nothing inside it changed.
-    pub fn of(kind: crate::LineKind, moved: bool) -> (Surface, Surface) {
-        use crate::LineKind::*;
-        match (kind, moved) {
-            (Added, false) => (Surface::Added, Surface::AddedWord),
-            (Added, true) => (Surface::MovedAdded, Surface::MovedAdded),
-            (Removed, false) => (Surface::Removed, Surface::RemovedWord),
-            (Removed, true) => (Surface::MovedRemoved, Surface::MovedRemoved),
-            // Context is never moved: a line that did not change did not go
-            // anywhere, and `mark_moved` says so.
-            (Context, _) => (Surface::Context, Surface::Context),
-        }
-    }
-
     pub const ALL: [Surface; 8] = [
         Surface::Context,
         Surface::Added,
@@ -587,23 +566,6 @@ mod tests {
         assert!(file > hunk, "file {file:.3} does not out-read hunk {hunk:.3}");
         assert!(file >= 1.15, "a file header at {file:.3} is not a boundary");
         assert_ne!(t.diff.file_bg, t.chrome.title_bg, "one colour, two meanings");
-    }
-
-    #[test]
-    fn a_surface_is_decided_once_for_every_client() {
-        use crate::LineKind;
-        assert_eq!(
-            Surface::of(LineKind::Added, false),
-            (Surface::Added, Surface::AddedWord)
-        );
-        // A moved line's words are drawn on the row's own surface: the detection
-        // just said nothing inside it changed.
-        assert_eq!(
-            Surface::of(LineKind::Removed, true),
-            (Surface::MovedRemoved, Surface::MovedRemoved)
-        );
-        let (plain, word) = Surface::of(LineKind::Context, false);
-        assert_eq!(plain, word);
     }
 
     #[test]

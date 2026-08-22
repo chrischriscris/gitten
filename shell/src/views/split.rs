@@ -55,7 +55,8 @@ use plait_core::align::align;
 use plait_core::host::Host;
 use plait_core::select::Selected;
 use plait_core::syntax::Token;
-use plait_core::theme::{Surface, Theme};
+use plait_core::runs::surfaces;
+use plait_core::theme::Theme;
 use plait_core::wrap::{Wrap, Wrapped};
 use plait_core::{LineKind, Span};
 
@@ -419,7 +420,7 @@ impl SplitRows {
         };
         let line = &self.lines[index as usize];
         let (bg, fg, sign) = line_colors(line.kind, line.moved, p);
-        let gutter = theme.gutter_on(Surface::of(line.kind, line.moved).0);
+        let gutter = theme.gutter_on(surfaces(line.kind, line.moved).0);
         let no = match column {
             Column::Old => &line.old_no,
             Column::New => &line.new_no,
