@@ -11,6 +11,7 @@ use gpui::*;
 use gpui_component::*;
 use plait_app::acquire::Data;
 use plait_app::cli::{Source, View};
+use plait_app::jobs::{Event as JobEvent, Generation, Job, Runner, Submitter};
 use plait_app::{Started, Startup};
 use plait_core::command::{chord_string, Code, Key, Modes, Resolve};
 use plait_core::differ::{Overrides, Whitespace};
@@ -153,14 +154,14 @@ enum Open {
 enum Screen {
     Commits {
         view: Entity<views::commits::Commits>,
+        source: Source,
+        generation: Generation,
         label: String,
     },
-    /// A diff, and where its rows came from: `None` for a `.diff` fixture,
-    /// which cannot be re-acquired, and the revision for anything a repository
-    /// produced — including a commit opened from the list below it.
     Diff {
         view: Entity<views::diff::Diff>,
-        source: Option<String>,
+        source: Source,
+        generation: Generation,
         label: String,
     },
 }
@@ -185,6 +186,68 @@ impl Screen {
         match self {
             Screen::Commits { label, .. } => label.clone(),
             Screen::Diff { label, .. } => label.clone(),
+        }
+    }
+
+    fn source(&self) -> &Source {
+        match self {
+            Screen::Commits { source, .. } | Screen::Diff { source, .. } => source,
+        }
+    }
+
+    fn generation(&self) -> Generation {
+        match self {
+            Screen::Commits { generation, .. } | Screen::Diff { generation, .. } => *generation,
+        }
+    }
+
+    fn view_kind(&self) -> View {
+        match self {
+            Screen::Commits { .. } => View::Commits,
+            Screen::Diff { .. } => View::Diff,
+        }
+    }
+
+    fn replace(
+        &mut self,
+        loaded: plait_app::acquire::Loaded,
+        generation: Generation,
+        host: &Host,
+        cx: &mut App,
+    ) -> Result<(), String> {
+        match (self, loaded.data) {
+            (
+                Screen::Commits {
+                    view,
+                    label,
+                    generation: loaded_generation,
+                    ..
+                },
+                Data::Commits(commits),
+            ) => {
+                view.update(cx, |view, cx| {
+                    view.replace(commits, host);
+                    cx.notify();
+                });
+                *label = loaded.label;
+                *loaded_generation = generation;
+                Ok(())
+            }
+            (
+                Screen::Diff {
+                    view,
+                    label,
+                    generation: loaded_generation,
+                    ..
+                },
+                Data::Diff(files),
+            ) => {
+                view.update(cx, |view, cx| view.replace(files, host, cx));
+                *label = loaded.label;
+                *loaded_generation = generation;
+                Ok(())
+            }
+            _ => Err("re-acquisition returned the wrong view".into()),
         }
     }
 
@@ -274,6 +337,10 @@ struct DevShell {
     /// every acquisition. `None` for a fixture, which has no repository behind
     /// it — and the key then says so, which is what an unbound key does too.
     repo: Option<(std::path::PathBuf, plait_git::Handle)>,
+    jobs: Runner,
+    submitter: Submitter,
+    generation: Generation,
+    running: Option<String>,
     /// The live picks. Every field `None` means "whatever the config selected",
     /// which is what the controls show until somebody changes one — so the strip
     /// agrees with `plait.toml` rather than with a copy of it taken at startup.
@@ -384,6 +451,75 @@ impl DevShell {
         self.notice = Some(message.into());
     }
 
+    /// The one queue future built-ins and compiled-in extensions share.
+    #[allow(dead_code)]
+    fn submit(&self, job: Box<dyn Job>) -> Result<(), Box<dyn Job>> {
+        self.submitter.submit(job)
+    }
+
+    fn drain_jobs(&mut self, cx: &mut Context<Self>) {
+        let mut changed = false;
+        while let Some(event) = self.jobs.try_next() {
+            changed = true;
+            match event {
+                JobEvent::Started { name } => {
+                    self.running = Some(format!("running {name}"));
+                    self.error = None;
+                }
+                JobEvent::Finished {
+                    outcome: Err(error),
+                    ..
+                } => {
+                    self.running = None;
+                    self.error = Some(error.into());
+                }
+                JobEvent::Finished {
+                    outcome: Ok(generation),
+                    ..
+                } => {
+                    self.running = None;
+                    if generation > self.generation {
+                        self.generation = generation;
+                        self.refresh_active(cx);
+                    }
+                }
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    fn refresh_active(&mut self, cx: &mut Context<Self>) {
+        let Some(screen) = self.active() else { return };
+        if screen.generation() >= self.generation || matches!(screen.source(), Source::Fixtures) {
+            return;
+        }
+        let (view, source) = (screen.view_kind(), screen.source().clone());
+        let Some((_, repo)) = self.repo.as_ref() else {
+            return;
+        };
+        let host = config::host(cx);
+        match plait_app::acquire::reacquire(view, &source, &host, Some(repo.as_ref()), &self.over) {
+            Ok(loaded) => {
+                // Re-check at the write itself. This remains correct if
+                // acquisition becomes asynchronous later.
+                let generation = self.generation;
+                let Some(screen) = self.stack.last_mut() else {
+                    return;
+                };
+                if screen.generation() >= generation {
+                    return;
+                }
+                match screen.replace(loaded, generation, &host, cx) {
+                    Ok(()) => self.error = None,
+                    Err(error) => self.error = Some(error.into()),
+                }
+            }
+            Err(error) => self.error = Some(error.into()),
+        }
+    }
+
     /// One of the platform's menu actions: named dispatch through
     /// [`DevShell::run_command`], with the pending chord cleared first — a menu
     /// item is an intervening event, and a chord is a promise about what is on
@@ -404,11 +540,12 @@ impl DevShell {
             return;
         };
         let (view, revision) = match self.active() {
-            Some(Screen::Diff { view, source, .. }) => (view.clone(), source.clone()),
+            Some(Screen::Diff {
+                view,
+                source: Source::Repo { arg, .. },
+                ..
+            }) => (view.clone(), arg.clone()),
             _ => return,
-        };
-        let Some(revision) = revision else {
-            return;
         };
         if next == self.over {
             return;
@@ -568,6 +705,7 @@ impl DevShell {
             // strip's name, the live modes — comes back out of it below.
             self.stack.pop();
             self.sync_modes();
+            self.refresh_active(cx);
         }
     }
 
@@ -612,7 +750,8 @@ impl DevShell {
                 self.error = None;
                 let screen = Screen::Diff {
                     view,
-                    source: Some(commit.sha.clone()),
+                    source,
+                    generation: self.generation,
                     label: format!(
                         "{} {}",
                         &commit.sha[..commit.sha.len().min(8)],
@@ -909,7 +1048,7 @@ impl DevShell {
             &algorithms,
             algorithms.iter().position(|n| *n == selected).unwrap_or(0),
         )
-        .enabled(self.rediff.is_some() && source.is_some());
+        .enabled(self.rediff.is_some() && matches!(source, Source::Repo { .. }));
 
         let ws_names: Vec<&str> = Whitespace::ALL.iter().map(|w| w.name()).collect();
         let ws = self.over.whitespace.unwrap_or(host.differ.whitespace);
@@ -918,7 +1057,7 @@ impl DevShell {
             &ws_names,
             Whitespace::ALL.iter().position(|w| *w == ws).unwrap_or(0),
         )
-        .enabled(self.rediff.is_some() && source.is_some());
+        .enabled(self.rediff.is_some() && matches!(source, Source::Repo { .. }));
 
         vec![
             controls::picker(
@@ -1036,6 +1175,7 @@ impl Render for DevShell {
         let strip = self.strip(&host, cx);
         let error = self.error.clone();
         let notice = self.notice.clone();
+        let running = self.running.clone();
 
         // The title is three things, so it is drawn as three: the app bright, the
         // view dim, the repository dimmer and shrinkable. One grey run of text
@@ -1161,6 +1301,7 @@ impl Render for DevShell {
             .children(
                 error
                     .map(|e| band(&c, e, c.error))
+                    .or_else(|| running.map(|n| band(&c, SharedString::from(n), c.dim)))
                     .or_else(|| notice.map(|n| band(&c, SharedString::from(n), c.dim))),
             )
             .child(div().flex_grow(1.0).overflow_hidden().child(view))
@@ -1373,6 +1514,8 @@ fn main() {
                         (
                             Screen::Commits {
                                 view: e,
+                                source: source.clone(),
+                                generation: Generation::default(),
                                 label: label.clone(),
                             },
                             v.rendered.clone(),
@@ -1394,10 +1537,8 @@ fn main() {
                         (
                             Screen::Diff {
                                 view: e.clone(),
-                                source: match (&which, &source) {
-                                    (View::Diff, Source::Repo { arg, .. }) => Some(arg.clone()),
-                                    _ => None,
-                                },
+                                source: source.clone(),
+                                generation: Generation::default(),
                                 label: label.clone(),
                             },
                             v.rendered.clone(),
@@ -1460,12 +1601,18 @@ fn main() {
                 }
                 let stats = stats::enabled().then(|| Stats::new(rendered, total, note, load));
                 let focus = cx.focus_handle();
+                let jobs = Runner::new();
+                let submitter = jobs.submitter();
                 let shell = cx.new(|_| DevShell {
                     which: which_name,
                     stack: initial_screens,
                     stats,
                     rediff,
                     repo,
+                    jobs,
+                    submitter,
+                    generation: Generation::default(),
+                    running: None,
                     over: Overrides::default(),
                     open: None,
                     error: None,
@@ -1485,6 +1632,18 @@ fn main() {
                     shell.update(cx, |shell, _| {
                         shell.sync_modes();
                     });
+                }
+                {
+                    let shell = shell.downgrade();
+                    cx.spawn(async move |cx: &mut AsyncApp| loop {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(50))
+                            .await;
+                        if shell.update(cx, |shell, cx| shell.drain_jobs(cx)).is_err() {
+                            break;
+                        }
+                    })
+                    .detach();
                 }
                 cx.new(|cx| Root::new(shell, window, cx))
             },
@@ -1597,6 +1756,8 @@ mod tests {
     use super::{DevShell, Open, Screen};
     use crate::views::commits::Commits;
     use gpui::{AppContext as _, TestAppContext};
+    use plait_app::cli::Source;
+    use plait_app::jobs::{Generation, Runner};
     use plait_core::command::{Key, Modes};
     use plait_core::host::Host;
     use std::cell::Cell;
@@ -1607,15 +1768,22 @@ mod tests {
     fn shell(which: Option<Open>, cx: &mut TestAppContext) -> gpui::Entity<DevShell> {
         cx.new(|cx| {
             let commits = cx.new(|_| Commits::new(Vec::new(), Rc::new(Host::new())));
+            let jobs = Runner::new();
             DevShell {
                 which: "commits",
                 stack: vec![Screen::Commits {
                     view: commits,
+                    source: Source::Fixtures,
+                    generation: Generation::default(),
                     label: "repo".into(),
                 }],
                 stats: None,
                 rediff: None,
                 repo: None,
+                submitter: jobs.submitter(),
+                jobs,
+                generation: Generation::default(),
+                running: None,
                 over: Default::default(),
                 open: which,
                 error: None,
@@ -1665,6 +1833,8 @@ mod tests {
             let commits = cx.new(|_| Commits::new(Vec::new(), Rc::new(Host::new())));
             s.stack.push(Screen::Commits {
                 view: commits,
+                source: Source::Fixtures,
+                generation: Generation::default(),
                 label: "second".into(),
             });
         });

@@ -241,62 +241,9 @@ impl Commits {
 
 impl Commits {
     pub fn new(commits: Vec<Commit>, host: Rc<Host>) -> Self {
-        let t = std::time::Instant::now();
-        let rows = assign_lanes(&commits);
-        let t_lanes = t.elapsed();
-
-        let t = std::time::Instant::now();
-        let draws = graph::row_draws(&commits, &rows);
-        let lanes = graph::lane_count(&rows);
-        let t_draws = t.elapsed();
-
-        let who: Vec<Who> = commits
-            .iter()
-            .map(|c| Who {
-                initials: initials(&c.author).into(),
-                color: rgb(host.theme.author(&c.author)),
-            })
-            .collect();
-
-        // The widest row is no longer just the longest subject: every row's
-        // graph is only as wide as its own lanes, so a short message behind a
-        // wide graph can still out-reach a long one on the trunk.
-        //
-        // One character's width comes from the host's font rather than a constant
-        // measured on whatever the font used to be. It only picks which row
-        // `uniform_list` measures, so an approximation is fine — and it is
-        // meaningless for a proportional face, which is the honest reason a
-        // long subject may then win over a wide graph.
-        let char_w = host.font.char_width();
-        let widest = draws
-            .iter()
-            .zip(&commits)
-            .map(|(d, c)| graph::row_width(d) + c.subject.len() as f32 * char_w)
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.total_cmp(b))
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-
-        let load = format!(
-            "{} commits · {} lanes · lanes {:.0?} draws {:.0?}",
-            commits.len(),
-            lanes,
-            t_lanes,
-            t_draws
-        );
-        eprintln!("{load}");
-
+        let (data, load) = build_data(commits, &host);
         Self {
-            data: Rc::new(Data {
-                lines: commits
-                    .iter()
-                    .map(|c| format!("{} {}", c.short, c.subject))
-                    .collect(),
-                commits,
-                draws,
-                who,
-                widest,
-            }),
+            data,
             scroll: UniformListScrollHandle::new(),
             view: Rc::new(Cell::new(Viewport::new())),
             synced: Rc::new(Cell::new(0.0)),
@@ -307,6 +254,43 @@ impl Commits {
         }
     }
 
+    /// Replaces repository data while keeping semantic commit anchors.
+    pub fn replace(&mut self, commits: Vec<Commit>, host: &Host) {
+        self.reconcile(host);
+        let old = self.view.get();
+        let cursor_sha = self.data.commits.get(old.cursor()).map(|c| c.sha.clone());
+        let top_sha = self.data.commits.get(old.top()).map(|c| c.sha.clone());
+        let old_cursor = old.cursor();
+        let old_top = old.top();
+        let (data, load) = build_data(commits, host);
+        let cursor = cursor_sha
+            .as_deref()
+            .and_then(|sha| data.commits.iter().position(|c| c.sha == sha))
+            .unwrap_or(old_cursor);
+        let top = top_sha
+            .as_deref()
+            .and_then(|sha| data.commits.iter().position(|c| c.sha == sha))
+            .unwrap_or(old_top);
+        self.data = data;
+        self.load = load;
+
+        let mut view = old;
+        view.set_len(self.data.commits.len());
+        view.scroll_to(top);
+        view.go_to(cursor);
+        self.view.set(view);
+        if self.data.commits.is_empty() {
+            self.pending_scroll.cancel();
+            let mut state = self.scroll.0.borrow_mut();
+            state.deferred_scroll_to_item = None;
+            state.base_handle.set_offset(point(px(0.0), px(0.0)));
+            self.synced.set(0.0);
+            self.top.set(0);
+        } else {
+            self.defer_show(view);
+        }
+    }
+
     /// Puts the keyboard on a row, as a restore does: the row at the top of the
     /// viewport when you left it, which is where the cursor belongs too.
     pub fn go_to(&self, row: usize, host: &Host) {
@@ -314,6 +298,67 @@ impl Commits {
         v.go_to(row);
         self.view.set(v);
     }
+}
+
+fn build_data(commits: Vec<Commit>, host: &Host) -> (Rc<Data>, String) {
+    let t = std::time::Instant::now();
+    let rows = assign_lanes(&commits);
+    let t_lanes = t.elapsed();
+
+    let t = std::time::Instant::now();
+    let draws = graph::row_draws(&commits, &rows);
+    let lanes = graph::lane_count(&rows);
+    let t_draws = t.elapsed();
+
+    let who: Vec<Who> = commits
+        .iter()
+        .map(|c| Who {
+            initials: initials(&c.author).into(),
+            color: rgb(host.theme.author(&c.author)),
+        })
+        .collect();
+
+    // The widest row is no longer just the longest subject: every row's
+    // graph is only as wide as its own lanes, so a short message behind a
+    // wide graph can still out-reach a long one on the trunk.
+    //
+    // One character's width comes from the host's font rather than a constant
+    // measured on whatever the font used to be. It only picks which row
+    // `uniform_list` measures, so an approximation is fine — and it is
+    // meaningless for a proportional face, which is the honest reason a
+    // long subject may then win over a wide graph.
+    let char_w = host.font.char_width();
+    let widest = draws
+        .iter()
+        .zip(&commits)
+        .map(|(d, c)| graph::row_width(d) + c.subject.len() as f32 * char_w)
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.total_cmp(b))
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+
+    let load = format!(
+        "{} commits · {} lanes · lanes {:.0?} draws {:.0?}",
+        commits.len(),
+        lanes,
+        t_lanes,
+        t_draws
+    );
+    eprintln!("{load}");
+
+    (
+        Rc::new(Data {
+            lines: commits
+                .iter()
+                .map(|c| format!("{} {}", c.short, c.subject))
+                .collect(),
+            commits,
+            draws,
+            who,
+            widest,
+        }),
+        load,
+    )
 }
 
 impl Render for Commits {
@@ -540,6 +585,44 @@ mod tests {
         let mut v = c.view.get();
         v.set_height(30);
         assert_eq!((v.cursor(), v.top()), (40, 35));
+    }
+
+    #[test]
+    fn replacement_follows_commit_identity_across_insertions() {
+        let host = Rc::new(Host::new());
+        let mut c = Commits::new(commits(30), host.clone());
+        with_height(&mut c, 10);
+        let selected = c.data.commits[12].sha.clone();
+        let visible = c.data.commits[8].sha.clone();
+        let mut view = c.view.get();
+        view.scroll_to(8);
+        view.go_to(12);
+        c.view.set(view);
+
+        let mut refreshed = vec![commit(99)];
+        refreshed.extend(commits(30));
+        c.replace(refreshed, &host);
+
+        let view = c.view.get();
+        assert_eq!(c.data.commits[view.cursor()].sha, selected);
+        assert_eq!(c.data.commits[view.top()].sha, visible);
+    }
+
+    #[test]
+    fn replacement_clamps_missing_anchors_and_accepts_empty_history() {
+        let host = Rc::new(Host::new());
+        let mut c = Commits::new(commits(30), host.clone());
+        with_height(&mut c, 10);
+        let mut view = c.view.get();
+        view.go_to(25);
+        c.view.set(view);
+
+        c.replace(commits(3), &host);
+        assert_eq!(c.view.get().cursor(), 2);
+        c.replace(Vec::new(), &host);
+        assert_eq!(c.total(), 0);
+        assert_eq!((c.view.get().cursor(), c.view.get().top()), (0, 0));
+        assert!(c.scroll.0.borrow().deferred_scroll_to_item.is_none());
     }
 
     #[test]

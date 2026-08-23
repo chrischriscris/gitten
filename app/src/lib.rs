@@ -54,6 +54,7 @@
 pub mod acquire;
 pub mod cli;
 pub mod config;
+pub mod jobs;
 
 use cli::{Request, Source, View};
 use plait_core::host::Host;

@@ -81,6 +81,31 @@ pub fn acquire(
     host: &Host,
     repo: Option<&dyn Repo>,
 ) -> Result<Loaded, String> {
+    acquire_with(view, source, host, repo, &Overrides::default(), false)
+}
+
+/// Re-acquires an already-open view after repository state changed.
+///
+/// Unlike startup, an empty answer is valid: a successful write may have made
+/// the working tree clean or removed the last commit matching a temporary view.
+pub fn reacquire(
+    view: View,
+    source: &Source,
+    host: &Host,
+    repo: Option<&dyn Repo>,
+    overrides: &Overrides,
+) -> Result<Loaded, String> {
+    acquire_with(view, source, host, repo, overrides, true)
+}
+
+fn acquire_with(
+    view: View,
+    source: &Source,
+    host: &Host,
+    repo: Option<&dyn Repo>,
+    overrides: &Overrides,
+    allow_empty: bool,
+) -> Result<Loaded, String> {
     match (view, source) {
         (View::Diff, Source::Repo { path, arg }) => {
             let repo = repo_else(path, repo)?;
@@ -92,8 +117,8 @@ pub fn acquire(
             // this call.
             std::thread::scope(|s| {
                 let title = s.spawn(|| describe(repo, arg));
-                let files = plait_git::diff(repo, arg, &host.differ, &Overrides::default())?;
-                if files.is_empty() {
+                let files = plait_git::diff(repo, arg, &host.differ, overrides)?;
+                if files.is_empty() && !allow_empty {
                     let what = match arg.is_empty() {
                         true => "(working tree)",
                         false => arg.as_str(),
@@ -127,7 +152,7 @@ pub fn acquire(
             std::thread::scope(|s| {
                 let title = s.spawn(|| repo.describe());
                 let commits = repo.log(arg.parse().unwrap_or(5000))?;
-                if commits.is_empty() {
+                if commits.is_empty() && !allow_empty {
                     return Err(format!("no commits in {}", path.display()));
                 }
                 Ok(Loaded {
@@ -191,6 +216,8 @@ mod tests {
         label: &'static str,
     }
 
+    struct Empty;
+
     impl Default for Fake {
         fn default() -> Self {
             Self {
@@ -248,6 +275,24 @@ mod tests {
 
         fn describe(&self) -> String {
             self.label.into()
+        }
+    }
+
+    impl Repo for Empty {
+        fn log(&self, _limit: usize) -> plait_git::Result<Vec<Commit>> {
+            Ok(Vec::new())
+        }
+
+        fn pairs(&self, _revspec: &str) -> plait_git::Result<Vec<Pair>> {
+            Ok(Vec::new())
+        }
+
+        fn status(&self) -> plait_git::Result<Status> {
+            Ok(Status::default())
+        }
+
+        fn describe(&self) -> String {
+            "empty".into()
         }
     }
 
@@ -388,6 +433,26 @@ mod tests {
         };
         let err = acquire(View::Commits, &source, &Host::new(), None).unwrap_err();
         assert!(err.contains("no repository opened"), "{err}");
+    }
+
+    #[test]
+    fn refresh_accepts_empty_commits_and_diffs_that_startup_rejects() {
+        let source = Source::Repo {
+            path: PathBuf::from("/nonexistent"),
+            arg: String::new(),
+        };
+        for view in [View::Commits, View::Diff] {
+            assert!(acquire(view, &source, &Host::new(), Some(&Empty)).is_err());
+            let loaded = reacquire(
+                view,
+                &source,
+                &Host::new(),
+                Some(&Empty),
+                &Overrides::default(),
+            )
+            .expect("an empty refresh is valid");
+            assert!(loaded.data.is_empty());
+        }
     }
 
     #[test]

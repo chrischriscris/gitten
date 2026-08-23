@@ -1087,6 +1087,10 @@ impl Diff {
     /// same way a layout change rebuilds them; the only difference is that the
     /// `FileDiff`s underneath are new ones.
     pub fn replace(&mut self, files: Vec<FileDiff>, host: &Host, cx: &mut Context<Self>) {
+        self.reconcile(host);
+        if self.files.as_slice() == files.as_slice() {
+            return;
+        }
         self.swap(files, host);
         cx.notify();
     }
@@ -1094,8 +1098,39 @@ impl Diff {
     /// The half of [`Diff::replace`] that needs no window, and therefore the
     /// half with tests.
     fn swap(&mut self, files: Vec<FileDiff>, host: &Host) {
+        let old = self.view.get();
+        let cursor = old.cursor();
+        let top = old.top();
+        let pan = self.pan.at();
         self.files = Rc::new(files);
-        self.apply_layout(self.current, host);
+        self.sel = None;
+        self.dragging = false;
+        let (built, headers) = assemble(&self.files, host, &self.layouts, self.current);
+        self.order = Rc::new(built.order);
+        *self.renderers.borrow_mut() = built.renderers;
+        self.widest = built.widest;
+        self.headers = Rc::new(headers);
+        self.load = built.load;
+        self.total.set(self.order.len());
+        self.applied = (0.0, "");
+
+        let mut view = old;
+        view.set_len(self.order.len());
+        view.go_to(cursor);
+        view.scroll_to(top);
+        self.view.set(view);
+        self.pan.set_max(self.bound(self.measured.get(), host));
+        self.pan.set(pan);
+        if self.order.is_empty() {
+            self.pending_scroll.cancel();
+            let mut state = self.scroll.0.borrow_mut();
+            state.deferred_scroll_to_item = None;
+            state.base_handle.set_offset(point(px(0.0), px(0.0)));
+            self.synced.set(0.0);
+            self.top.set(0);
+        } else {
+            self.defer_show(view);
+        }
     }
 
     /// Puts a saved row back at the top of the viewport, with the keyboard on
@@ -3850,16 +3885,33 @@ diff --git a/b.md b/b.md
         let mut diff = Diff::with_layouts(parse_unified_diff(SAMPLE), &host, Layouts::builtin());
         diff.apply_layout(1, &host);
         assert_eq!(diff.layout(), "split");
+        let mut view = diff.view.get();
+        view.set_len(diff.total());
+        view.go_to(diff.total().saturating_sub(1));
+        diff.view.set(view);
+        diff.sel = Some(select(&diff, (0, 0), (1, 0)));
+        diff.dragging = true;
+        diff.pan.set_max(100.0);
+        diff.pan.set(50.0);
 
         diff.swap(parse_unified_diff(TWO_FILES), &host);
         assert_eq!(diff.layout(), "split", "the swap reset the presentation");
         assert!(diff.load.contains("2 files"), "{}", diff.load);
         assert!(diff.load.contains("split"), "{}", diff.load);
+        assert!(
+            diff.cursor() < diff.total(),
+            "the old cursor was not clamped"
+        );
+        assert!(diff.sel.is_none(), "old rows kept a stale selection");
+        assert!(!diff.dragging, "replacement kept a stale mouse drag");
 
         // And an empty diff is a swap too — a revspec whose changes vanished.
         diff.swap(Vec::new(), &host);
         assert_eq!(diff.total(), 0);
         assert_eq!(diff.layout(), "split");
+        assert_eq!((diff.cursor(), diff.view.get().top()), (0, 0));
+        assert_eq!(diff.pan.at(), 0.0);
+        assert!(diff.scroll.0.borrow().deferred_scroll_to_item.is_none());
     }
 
     #[test]
