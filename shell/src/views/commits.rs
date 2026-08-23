@@ -48,14 +48,31 @@ pub struct Commits {
 }
 
 impl Commits {
-    /// Puts a saved row back at the top of the viewport. Clamped — see the diff
-    /// view's note.
-    pub fn scroll_to(&self, row: usize) {
+    /// The viewport model with everything live folded in: the list's length,
+    /// the height last measured, and `[view] scrolloff` as the file has it
+    /// *now* — see the diff view's `live_view`.
+    fn live_view(&self, host: &Host) -> Viewport {
+        let mut v = self.view.get();
+        v.set_len(self.data.commits.len());
+        v.set_height(self.rendered.get());
+        v.set_scrolloff(host.view.scrolloff);
+        v
+    }
+
+    /// Puts a saved row back at the top of the viewport. Clamped — see the
+    /// diff view's note: the model is filled in first, because a restore lands
+    /// on a view that has never been laid out and must not clamp a saved row
+    /// against a list it believes is empty.
+    pub fn scroll_to(&self, row: usize, host: &Host) {
         if self.data.commits.is_empty() {
             return;
         }
-        self.scroll
-            .scroll_to_item(row.min(self.data.commits.len() - 1), ScrollStrategy::Top);
+        let row = row.min(self.data.commits.len() - 1);
+        let mut v = self.live_view(host);
+        v.scroll_to(row);
+        self.view.set(v);
+        self.top.set(v.top());
+        self.scroll.scroll_to_item(row, ScrollStrategy::Top);
     }
 
     pub fn total(&self) -> usize {
@@ -84,7 +101,7 @@ impl Commits {
     /// Moves the list by `dy` pixels — the wheel, whose command resolves through
     /// `[keys]` but whose delta is pixels. The cursor comes along when pushed
     /// off screen, exactly as [`Viewport::scroll_by`] does in the terminal.
-    pub fn scroll_pixels(&mut self, dy: f32) -> bool {
+    pub fn scroll_pixels(&mut self, dy: f32, host: &Host) -> bool {
         let (offset, max) = {
             let s = self.scroll.0.borrow();
             (s.base_handle.offset(), s.base_handle.max_offset())
@@ -98,10 +115,8 @@ impl Commits {
             .borrow()
             .base_handle
             .set_offset(point(offset.x, px(y)));
-        let mut v = self.view.get();
-        v.set_height(self.rendered.get());
+        let mut v = self.live_view(host);
         v.scroll_to((-y / graph::ROW_H).round().max(0.0) as usize);
-        v.set_len(self.data.commits.len());
         self.view.set(v);
         self.synced.set(y);
         true
@@ -111,19 +126,17 @@ impl Commits {
     /// without touching anything else, and the next key should act on what is on
     /// screen now. [`Commits::synced`] separates "the list moved under us" from
     /// "we moved the list" — see the diff view's `reconcile`.
-    fn reconcile(&mut self) {
+    pub fn reconcile(&mut self, host: &Host) {
         let shown_y = f32::from(self.scroll.0.borrow().base_handle.offset().y);
         if (shown_y - self.synced.get()).abs() < 0.5 {
             return;
         }
         self.synced.set(shown_y);
         let shown = (-shown_y / graph::ROW_H).round().max(0.0) as usize;
-        let mut v = self.view.get();
+        let mut v = self.live_view(host);
         if v.top() == shown {
             return;
         }
-        v.set_height(self.rendered.get());
-        v.set_len(self.data.commits.len());
         v.scroll_to(shown);
         self.view.set(v);
     }
@@ -135,10 +148,8 @@ impl Commits {
     /// False is "not one of mine", and the caller says so: an unknown command
     /// that resolves is worth naming rather than swallowing.
     pub fn run_view(&mut self, command: &str, host: &Host) -> bool {
-        self.reconcile();
-        let mut v = self.view.get();
-        v.set_len(self.data.commits.len());
-        v.set_height(self.rendered.get());
+        self.reconcile(host);
+        let mut v = self.live_view(host);
         match command {
             "view.down" => v.down(),
             "view.up" => v.up(),
@@ -259,9 +270,8 @@ impl Commits {
 
     /// Puts the keyboard on a row, as a restore does: the row at the top of the
     /// viewport when you left it, which is where the cursor belongs too.
-    pub fn go_to(&self, row: usize) {
-        let mut v = self.view.get();
-        v.set_len(self.data.commits.len());
+    pub fn go_to(&self, row: usize, host: &Host) {
+        let mut v = self.live_view(host);
         v.go_to(row);
         self.view.set(v);
     }
@@ -450,5 +460,80 @@ mod tests {
         // which here is nothing: no selection model over a graph yet.
         assert!(!c.select_all());
         assert!(!c.select_none());
+    }
+
+    #[test]
+    fn a_fresh_viewport_restores_a_saved_row_without_preseeding() {
+        // The startup path on this screen too: a view constructed, a saved row
+        // handed over, nothing measured yet.
+        let mut host = Host::new();
+        host.view.scrolloff = 5;
+        let host = Rc::new(host);
+        let c = Commits::new(commits(100), host.clone());
+        assert_eq!(c.view.get().len(), 0);
+
+        c.scroll_to(40, &host);
+        c.go_to(40, &host);
+        let v = c.view.get();
+        assert_eq!(v.cursor(), 40, "the keyboard came back where it left off");
+        assert_eq!(v.top(), 40);
+        assert_eq!(v.len(), 100);
+        // First real height settles with the file's margin above the cursor,
+        // not the built-in's.
+        let mut v = c.view.get();
+        v.set_height(30);
+        assert_eq!((v.cursor(), v.top()), (40, 35));
+    }
+
+    #[test]
+    fn key_navigation_uses_the_live_scrolloff() {
+        let build = |scrolloff: usize| -> (Commits, Rc<Host>) {
+            let mut h = Host::new();
+            h.view.scrolloff = scrolloff;
+            let host = Rc::new(h);
+            let mut c = Commits::new(commits(100), host.clone());
+            with_height(&mut c, 20);
+            (c, host)
+        };
+        let (mut tight, tight_host) = build(3);
+        let (mut loose, loose_host) = build(8);
+        for _ in 0..16 {
+            tight.run_view("view.down", &tight_host);
+            loose.run_view("view.down", &loose_host);
+        }
+        assert_eq!(tight.view.get().cursor(), loose.view.get().cursor());
+        assert_eq!(tight.top.get(), 0, "a three-row margin holds at cursor 16");
+        assert!(loose.top.get() > 0, "an eight-row margin scrolled already");
+    }
+
+    #[test]
+    fn a_thumb_drag_is_reconciled_before_anything_reads_the_cursor() {
+        // What `commits.open-diff` reads through `current`, and what
+        // `copy.selection` falls back to: both mean the commit being *looked
+        // at*, so a scrollbar drag has to be met first.
+        let host = Rc::new(Host::new());
+        let mut c = Commits::new(commits(100), host.clone());
+        with_height(&mut c, 20);
+        // Ten rows of drag, written straight into the handle the way a paint
+        // pass writes it: −220 px at 22 px a row.
+        c.scroll
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(gpui::point(gpui::px(0.), gpui::px(-220.)));
+        assert_eq!(c.view.get().cursor(), 0, "the stale cursor is the bug");
+
+        c.reconcile(&host);
+        let v = c.view.get();
+        assert_eq!(v.top(), 10);
+        assert_eq!(v.cursor(), 13, "top ten plus the three-row margin");
+        // And the commit under that cursor is the one open/copy now name.
+        let text = c.cursor_text();
+        assert!(text.contains("abc0013"), "{text:?}");
+        assert_eq!(c.current().map(|cm| cm.short.as_str()), Some("abc0013"));
+
+        // Meeting the list twice is not moving it twice.
+        c.reconcile(&host);
+        assert_eq!((c.view.get().top(), c.view.get().cursor()), (10, 13));
     }
 }

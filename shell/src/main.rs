@@ -229,11 +229,13 @@ impl Screen {
         }
     }
 
-    /// The wheel's smooth path: pixels into the list, whatever screen it is.
-    fn scroll_pixels(&self, dy: f32, cx: &mut App) -> bool {
+    /// The wheel's smooth path: pixels into the list, in the direction the
+    /// resolved command says and at whatever `[view] scroll` multiplies them
+    /// by. The host rides along because the viewport's margin is live.
+    fn scroll_pixels(&self, dy: f32, host: &Host, cx: &mut App) -> bool {
         match self {
-            Screen::Commits { view, .. } => view.update(cx, |v, _| v.scroll_pixels(dy)),
-            Screen::Diff { view, .. } => view.update(cx, |v, _| v.scroll_pixels(dy)),
+            Screen::Commits { view, .. } => view.update(cx, |v, _| v.scroll_pixels(dy, host)),
+            Screen::Diff { view, .. } => view.update(cx, |v, _| v.scroll_pixels(dy, host)),
         }
     }
 
@@ -258,12 +260,11 @@ impl Screen {
 }
 
 struct DevShell {
-    /// The three parts of the title, drawn as three colours rather than one
-    /// string: which app, which view, which repository. The window's own title —
-    /// what macOS shows in Mission Control and the window menu — is set once in
-    /// [`window_options`] and is not this.
+    /// The app half of the title, drawn bright: which program this is. Which
+    /// *view* it is showing is the active screen's to say — see
+    /// [`DevShell::active_view`] — because a commit list that opened a diff
+    /// under the cursor is a diff on screen, whatever launched the window.
     which: &'static str,
-    view: AnyView,
     stack: Vec<Screen>,
     stats: Option<Stats>,
     /// How to fetch the diff again with a different algorithm. `None` for a
@@ -322,6 +323,24 @@ impl DevShell {
         self.stack.last()
     }
 
+    /// What is drawn: the active screen's own view. Derived from the stack
+    /// every time, never stored beside it — a second copy of an `AnyView` was
+    /// exactly how the strip once kept saying "commits" over a diff, and two
+    /// sources of truth disagree precisely when it matters.
+    fn active_view(&self) -> AnyView {
+        self.active()
+            .expect("the bottom screen is never popped")
+            .any()
+    }
+
+    /// The view name the title strip shows: the active screen's mode — which
+    /// is also the name `[keys]` groups its bindings under. Falls back to what
+    /// launched the window only if there were no screens at all, which does
+    /// not happen; the fallback keeps the type honest rather than the UI.
+    fn active_view_name(&self) -> &'static str {
+        self.active().map_or(self.which, Screen::mode)
+    }
+
     /// Rebuilds the mode stack from what is on screen, and drops any chord that
     /// was pending against the previous arrangement. Called on every change of
     /// screen or help state — the places [`Modes`] can change.
@@ -353,6 +372,15 @@ impl DevShell {
 
     fn set_notice(&mut self, message: impl Into<String>) {
         self.notice = Some(message.into());
+    }
+
+    /// One of the platform's menu actions: named dispatch through
+    /// [`DevShell::run_command`], with the pending chord cleared first — a menu
+    /// item is an intervening event, and a chord is a promise about what is on
+    /// screen that survives none of them.
+    fn native(&mut self, command: &str, cx: &mut Context<Self>) {
+        self.pending.clear();
+        self.run_command(command, cx);
     }
 
     /// Re-acquires the diff under `next` and swaps it in.
@@ -514,10 +542,10 @@ impl DevShell {
             }
         }
         if self.stack.len() > 1 {
+            // The stack is the source of truth; dropping the top *is* the
+            // change. Everything derived from it — the view on screen, the
+            // strip's name, the live modes — comes back out of it below.
             self.stack.pop();
-            if let Some(screen) = self.active() {
-                self.view = screen.any();
-            }
             self.sync_modes();
         }
     }
@@ -531,6 +559,12 @@ impl DevShell {
             self.set_notice("no commit selected");
             return;
         };
+        let view = view.clone();
+        let host = config::host(cx);
+        // Meet the list where it actually is: a scrollbar drag moved the offset
+        // without moving the cursor, and "open this commit" means the one being
+        // *looked at*.
+        view.update(cx, |v, _| v.reconcile(&host));
         let Some(commit) = view.read(cx).current().cloned() else {
             return;
         };
@@ -538,7 +572,6 @@ impl DevShell {
             self.set_notice("a fixture has no repository to diff against");
             return;
         };
-        let host = config::host(cx);
         let source = Source::Repo {
             path,
             arg: commit.sha.clone(),
@@ -553,6 +586,9 @@ impl DevShell {
                 // picks start from there too — a stale override would be a strip
                 // describing an algorithm that did not produce this screen.
                 self.over = Overrides::default();
+                // A success says so: an error left up here would be describing
+                // an open that already worked.
+                self.error = None;
                 let screen = Screen::Diff {
                     view,
                     source: Some(commit.sha.clone()),
@@ -562,10 +598,9 @@ impl DevShell {
                         commit.subject
                     ),
                 };
+                // Pushed, and that is the whole of it — the view, the title's
+                // middle word and the modes are all read back off the stack.
                 self.stack.push(screen);
-                if let Some(screen) = self.active() {
-                    self.view = screen.any();
-                }
                 self.sync_modes();
             }
             Err(e) => self.error = Some(e.into()),
@@ -576,12 +611,18 @@ impl DevShell {
     /// clipboard is the window system's here — [`Context::write_to_clipboard`]
     /// — which is why this lives beside dispatch and not in a view.
     fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        let host = config::host(cx);
         match self.active() {
             Some(Screen::Diff { view, .. }) => {
                 let view = view.clone();
+                // The row the copy falls back to is the cursor's, so the drag
+                // has to be met where it left the list first.
+                view.update(cx, |d, _| d.reconcile(&host));
                 view.update(cx, |d, cx| d.copy(cx));
             }
             Some(Screen::Commits { view, .. }) => {
+                let view = view.clone();
+                view.update(cx, |v, _| v.reconcile(&host));
                 let text = view.read(cx).cursor_text();
                 if !text.is_empty() {
                     cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -635,6 +676,22 @@ impl DevShell {
         cx.notify();
     }
 
+    /// The pixels the smooth path feeds the list for a resolved wheel command.
+    ///
+    /// The **command** signs them, not the finger: a finger-flick away from you
+    /// is positive, but `wheelup = "view.scroll-down"` means that flick scrolls
+    /// *down* — so the resolved name flips it. `[view] scroll` multiplies. Any
+    /// other command — a page, an extension's — is `None` here and goes through
+    /// named dispatch instead; unbinding does nothing at all, exactly like a key.
+    fn smooth_pixels(command: &str, dy: f32, rows: usize) -> Option<f32> {
+        let px = dy.abs() * rows as f32;
+        match command {
+            "view.scroll-up" => Some(px),
+            "view.scroll-down" => Some(-px),
+            _ => None,
+        }
+    }
+
     /// One wheel event, wherever it rolled.
     ///
     /// Two rules, both inherited from the probe this replaced: the gesture has
@@ -650,10 +707,17 @@ impl DevShell {
     /// ships (`view.scroll-down`) moves the list by the event's own pixels,
     /// which is what keeps a trackpad smooth.
     fn on_wheel(&mut self, ev: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
-        // Help is up. It occludes the rows below it — clicks included — and a
-        // wheel that scrolled what it hides would be a hole in exactly the same
-        // place.
-        if self.help {
+        // A wheel notch is an intervening event wherever it lands: a chord
+        // half-typed when the fingers touch the wheel is not half-typed any
+        // more. The same rule the focus and host checks apply, one line each.
+        self.pending.clear();
+        // Help is up, or a picker menu: both occlude the rows below them —
+        // clicks included — so the shell swallows the event rather than
+        // scrolling what cannot be seen or acting behind what is on top. The
+        // axis lock is simply left as it stands; the gesture's axis belongs to
+        // whatever is under the pointer once this one ends.
+        if self.help || self.open.is_some() {
+            cx.stop_propagation();
             return;
         }
         // Over the rows, and not over the title bar or a dropdown above them. A
@@ -680,7 +744,13 @@ impl DevShell {
         if !delta.x.is_zero() {
             moved |= screen.pan_pixels(-f32::from(delta.x), cx);
         }
-        // The vertical axis belongs to the keymap.
+        // The vertical axis belongs to the keymap. What resolved decides *both*
+        // halves of the motion: which way the list moves comes from the command
+        // — `wheelup = "view.scroll-down"` really does scroll down — and how
+        // far is the event's own pixels at `[view] scroll`'s multiplier, which
+        // is what keeps a trackpad smooth. Any other command still dispatches
+        // by name through the one path; an unbound or half-typed chord does
+        // nothing, exactly like a key.
         if !delta.y.is_zero() {
             let host = self.fresh_host(cx);
             let key = Key::new(
@@ -692,20 +762,19 @@ impl DevShell {
                 ev.modifiers.alt,
                 false,
             );
-            match host.keys.resolve(&self.modes, &[key]) {
-                Resolve::Run("view.scroll-up" | "view.scroll-down") => {
-                    // The smooth path: the *command* came from `[keys]`; how far
-                    // comes from the finger.
-                    moved |= screen.scroll_pixels(f32::from(delta.y), cx);
+            // Unbound or half-typed: the wheel does nothing, which is what an
+            // unbound key does too.
+            if let Resolve::Run(name) = host.keys.resolve(&self.modes, &[key]) {
+                let name = name.to_string();
+                match Self::smooth_pixels(&name, f32::from(delta.y), host.view.rows) {
+                    // The smooth path: the command came from `[keys]`, the
+                    // distance from the finger.
+                    Some(px) => moved |= screen.scroll_pixels(px, &host, cx),
+                    _ => {
+                        self.notice = None;
+                        self.run_command(&name, cx);
+                    }
                 }
-                Resolve::Run(name) => {
-                    let name = name.to_string();
-                    self.notice = None;
-                    self.run_command(&name, cx);
-                }
-                // Unbound or waiting on a chord: the wheel does nothing, which
-                // is what an unbound key does too.
-                _ => {}
             }
         }
         // Ours either way. A gesture that unlocked mid-flick carries both axes
@@ -932,6 +1001,12 @@ impl Render for DevShell {
         let host = config::host(cx);
         let c = host.theme.chrome;
         let f = &host.font;
+        // Derived, not stored: what is on screen and what it is called are both
+        // read back off the stack here, so opening a diff over the list and
+        // coming back move the strip's middle word without a single line of
+        // bookkeeping — and cannot fail to.
+        let view = self.active_view();
+        let which = self.active_view_name();
         let strip = self.strip(&host, cx);
         let error = self.error.clone();
         let notice = self.notice.clone();
@@ -951,29 +1026,26 @@ impl Render for DevShell {
             window.focus(&self.focus, cx);
             self.focused = Some(self.focus.clone());
         }
-        let mut root =
-            div()
-                .id("shell")
-                .size_full()
-                .v_flex()
-                .bg(rgb(c.bg))
-                .text_color(rgb(c.fg))
-                // From the host, not a constant: `text_sm` was `rems(0.875)` — 14px —
-                // and the family was hardcoded here while three other things
-                // depended on which font it was.
-                .text_size(px(f.size))
-                .font_family(f.family.clone())
-                .track_focus(&self.focus)
-                .capture_key_down(cx.listener(Self::on_key))
-                // The menu's three adapters. Each calls the same named dispatch a
-                // key resolves to — see the note on the `actions!` above.
-                .on_action(cx.listener(|this, _: &Quit, _, cx| this.run_command("quit", cx)))
-                .on_action(cx.listener(|this, _: &CopySelection, _, cx| {
-                    this.run_command("copy.selection", cx)
-                }))
-                .on_action(
-                    cx.listener(|this, _: &SelectAll, _, cx| this.run_command("select.all", cx)),
-                );
+        let mut root = div()
+            .id("shell")
+            .size_full()
+            .v_flex()
+            .bg(rgb(c.bg))
+            .text_color(rgb(c.fg))
+            // From the host, not a constant: `text_sm` was `rems(0.875)` — 14px —
+            // and the family was hardcoded here while three other things
+            // depended on which font it was.
+            .text_size(px(f.size))
+            .font_family(f.family.clone())
+            .track_focus(&self.focus)
+            .capture_key_down(cx.listener(Self::on_key))
+            // The menu's three adapters. Each calls the same named dispatch a
+            // key resolves to — see the note on the `actions!` above.
+            .on_action(cx.listener(|this, _: &Quit, _, cx| this.native("quit", cx)))
+            .on_action(
+                cx.listener(|this, _: &CopySelection, _, cx| this.native("copy.selection", cx)),
+            )
+            .on_action(cx.listener(|this, _: &SelectAll, _, cx| this.native("select.all", cx)));
 
         // The wheel, heard first: capture phase on a paint-time probe, the same
         // trick the diff view's old one used, moved up to where the mode stack
@@ -1018,7 +1090,7 @@ impl Render for DevShell {
                     .text_color(rgb(c.dim))
                     .child(div().flex_none().text_color(rgb(c.fg)).child("plait"))
                     .child(dot())
-                    .child(div().flex_none().child(self.which))
+                    .child(div().flex_none().child(which))
                     .child(dot())
                     // The one thing in the strip that is allowed to shrink, and
                     // everything else is `flex_none`. A repository is the part of
@@ -1065,12 +1137,7 @@ impl Render for DevShell {
                     .map(|e| band(&c, e, c.error))
                     .or_else(|| notice.map(|n| band(&c, SharedString::from(n), c.dim))),
             )
-            .child(
-                div()
-                    .flex_grow(1.0)
-                    .overflow_hidden()
-                    .child(self.view.clone()),
-            )
+            .child(div().flex_grow(1.0).overflow_hidden().child(view))
             .children(overlay.map(|(frames, rows, heap, load)| {
                 div()
                     .flex_none()
@@ -1265,8 +1332,12 @@ fn main() {
                         let e = cx.new(|_| views::commits::Commits::new(commits, host.clone()));
                         let v = e.read(cx);
                         if let Some(r) = &resume {
-                            v.scroll_to(r.top);
-                            v.go_to(r.top);
+                            // The viewport model is filled in before either
+                            // call, so a saved row clamps against a list that
+                            // exists and a margin from the live file — see
+                            // `Commits::scroll_to`.
+                            v.scroll_to(r.top, &host);
+                            v.go_to(r.top, &host);
                         }
                         (
                             Screen::Commits {
@@ -1286,8 +1357,8 @@ fn main() {
                         let e = cx.new(|cx| views::diff::Diff::new(files, host.clone(), cx));
                         let v = e.read(cx);
                         if let Some(r) = &resume {
-                            v.scroll_to(r.top);
-                            v.go_to(r.top);
+                            v.scroll_to(r.top, &host);
+                            v.go_to(r.top, &host);
                         }
                         (
                             Screen::Diff {
@@ -1306,8 +1377,7 @@ fn main() {
                         )
                     }
                 };
-                let initial_view = screen.any();
-                let screens = vec![screen];
+                let initial_screens = vec![screen];
                 start::mark("view built");
 
                 // First-paint evidence, and only when logging: the views count
@@ -1361,8 +1431,7 @@ fn main() {
                 let focus = cx.focus_handle();
                 let shell = cx.new(|_| DevShell {
                     which: which_name,
-                    view: initial_view,
-                    stack: screens,
+                    stack: initial_screens,
                     stats,
                     rediff,
                     repo,
@@ -1489,5 +1558,43 @@ fn window_options(title: SharedString) -> WindowOptions {
         }),
         window_min_size: Some(size(px(560.), px(320.))),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DevShell;
+
+    #[test]
+    fn the_wheel_follows_the_resolved_command_not_the_finger() {
+        // A flick away from the user is positive; what it *does* is whatever
+        // `[keys]` resolved to. The shipped binding signs it one way…
+        assert_eq!(
+            DevShell::smooth_pixels("view.scroll-up", 40.0, 1),
+            Some(40.0)
+        );
+        assert_eq!(
+            DevShell::smooth_pixels("view.scroll-down", 40.0, 1),
+            Some(-40.0)
+        );
+        // …and a rebound `wheelup = "view.scroll-down"` sends the very same
+        // flick the other way — the finger's own sign never leaks through.
+        assert_eq!(
+            DevShell::smooth_pixels("view.scroll-down", -40.0, 1),
+            Some(-40.0)
+        );
+    }
+
+    #[test]
+    fn the_scroll_setting_multiplies_and_other_commands_dispatch_by_name() {
+        // `[view] scroll` scales the finger's pixels…
+        assert_eq!(
+            DevShell::smooth_pixels("view.scroll-up", -12.5, 4),
+            Some(50.0)
+        );
+        // …and everything else — a page, an extension's command — keeps the
+        // event's pixels out of it and goes through named dispatch instead.
+        assert_eq!(DevShell::smooth_pixels("view.page-down", 30.0, 1), None);
+        assert_eq!(DevShell::smooth_pixels("blame.toggle", 30.0, 1), None);
     }
 }

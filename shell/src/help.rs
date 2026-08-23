@@ -68,11 +68,16 @@ pub fn overlay(host: &Host, modes: &plait_core::command::Modes) -> AnyElement {
                     .text_color(rgb(c.dim))
                     // The heading, and why there is no second list of keys in
                     // it: every chord below came out of the same map this panel
-                    // resolves presses against.
+                    // resolves presses against. The close hint is *live* keys
+                    // for `help` — through the same walk that decides what a
+                    // press means right now — because a key an inner mode takes
+                    // over would close nothing, and naming a dead key here is
+                    // the one lie a panel of keys must never tell. No live key,
+                    // no hint.
                     .child(div().flex_none().pb_2().text_color(rgb(c.accent)).child(
                         SharedString::from(format!(
                             "keys{}",
-                            match host.keys.keys_for("help").first() {
+                            match host.keys.live_keys_for("help", modes).first() {
                                 Some(k) => format!("  ·  {k} closes"),
                                 None => String::new(),
                             }

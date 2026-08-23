@@ -548,10 +548,7 @@ impl SplitRows {
             // Nothing opposite: a flat, darker block, so a run of them reads as
             // a hole in the column rather than as unchanged content. The
             // keyboard's bar runs across it too, so the cursor reads as one bar.
-            let bg = match current {
-                true => theme.chrome.selection_bg,
-                false => p.absent_bg,
-            };
+            let bg = super::diff::row_background(current, p.absent_bg, theme);
             return cell_frame(width)
                 .debug_selector(move || format!("cell-{}-{row}", column.name()))
                 .bg(rgb(bg))
@@ -560,10 +557,7 @@ impl SplitRows {
         let line = &self.lines[index as usize];
         let (bg, fg, sign) = line_colors(line.kind, line.moved, p);
         // The keyboard's row, on this side and on the other: one bar, not two.
-        let bg = match current {
-            true => theme.chrome.selection_bg,
-            false => bg,
-        };
+        let bg = super::diff::row_background(current, bg, theme);
         let gutter = theme.gutter_on(surfaces(line.kind, line.moved).0);
         let no = match column {
             Column::Old => line.old_no,

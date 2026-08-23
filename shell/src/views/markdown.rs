@@ -740,6 +740,7 @@ impl Rows for MarkdownRows {
                     spans,
                     tokens,
                     rule,
+                    current,
                     host,
                     sel,
                     shift,
@@ -770,6 +771,9 @@ impl MarkdownRows {
         tokens: &[Token],
         // A hairline under this row: a table row with another one under it.
         rule: bool,
+        // Whether the keyboard is on this row: the one bar every presentation
+        // paints, prose or not — see `row_background`.
+        current: bool,
         host: &Host,
         sel: Option<Selected>,
         // Pixels of text scrolled off the left. Everything this row draws in
@@ -781,6 +785,10 @@ impl MarkdownRows {
         let m = &self.metrics;
         let md = &theme.markdown;
         let (bg, fg, sign) = line_colors(kind, moved, &theme.diff);
+        // The keyboard's row, on prose exactly as on source: the same helper
+        // every presentation goes through, so a paragraph cannot be the one row
+        // that hides the cursor.
+        let bg = super::diff::row_background(current, bg, theme);
         let surface = surfaces(kind, moved).0;
         // A continuation of a wrapped line: the same furniture, so a wrapped
         // bullet stays indented under its own text and a wrapped quote keeps its
@@ -1251,6 +1259,23 @@ diff --git a/README.md b/README.md
             table_row < 40,
             "a 25-column table row measured {table_row}; widest row is {widest}"
         );
+    }
+
+    #[test]
+    fn every_row_draws_with_the_cursor_bar_on_it() {
+        // The bar over prose goes through the same `row_background` helper the
+        // source rows use; this walks every row shape in the document —
+        // headings, blanks, bullets, fences, tables, rules — with the keyboard
+        // on it and off it, so no branch of `line` can quietly skip the bar.
+        let host = Host::new();
+        let r = built(DOC);
+        assert!((0..r.len()).any(|i| r.rows(i) > 0));
+        for i in 0..r.len() {
+            for seg in 0..r.rows(i) {
+                let _ = r.render(i, seg, &host, None, true, 0.0);
+                let _ = r.render(i, seg, &host, None, false, 0.0);
+            }
+        }
     }
 
     #[test]

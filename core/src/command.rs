@@ -462,6 +462,50 @@ impl Keymap {
             .collect()
     }
 
+    /// Whether anything typed so far as `chord` could still reach a binding in
+    /// mode `at` of `active`: an inner mode that binds the chord exactly, or a
+    /// longer chord starting with it, or a prefix of it, answers first or keeps
+    /// the keys waiting — the three ways [`resolve`] never arrives here.
+    ///
+    /// This is [`prefix_conflict`](Self::prefix_conflict) across modes instead
+    /// of within one, which is why the same relation appears: a conflict inside
+    /// a mode is refused at `bind` time, but between modes it is the whole
+    /// point — it is how a mode overrides the globals it inherits.
+    fn shadowed(&self, active: &[String], at: usize, chord: &[Key]) -> bool {
+        active[at + 1..].iter().any(|inner| {
+            self.bindings.iter().any(|o| {
+                o.mode == *inner && (o.chord.starts_with(chord) || chord.starts_with(&o.chord))
+            })
+        })
+    }
+
+    /// The chords that run `command` **right now**, with `modes` active.
+    ///
+    /// [`keys_for`](Self::keys_for) lists everything ever bound; this walks the
+    /// modes the way [`resolve`] does, innermost first, and drops every chord an
+    /// inner mode shadows. What a close hint is written from: naming a key that
+    /// would not fire is worse than naming none.
+    pub fn live_keys_for(&self, command: &str, modes: &Modes) -> Vec<String> {
+        let active = modes.as_slice();
+        let mut out: Vec<String> = Vec::new();
+        for (at, mode) in active.iter().enumerate().rev() {
+            for b in self
+                .bindings
+                .iter()
+                .filter(|b| b.mode == *mode && b.command == command)
+            {
+                if self.shadowed(active, at, &b.chord) {
+                    continue;
+                }
+                let spelled = chord_string(&b.chord);
+                if !out.contains(&spelled) {
+                    out.push(spelled);
+                }
+            }
+        }
+        out
+    }
+
     /// What the help screen shows with `modes` active: which key runs what,
     /// **now**.
     ///
@@ -474,12 +518,18 @@ impl Keymap {
     /// innermost-first walk, so a key listed here is a key that would actually
     /// fire.
     pub fn help(&self, commands: &Commands, modes: &Modes) -> Vec<HelpRow> {
+        let active = modes.as_slice();
         let mut out = Vec::new();
-        for mode in modes.as_slice() {
+        for (at, mode) in active.iter().enumerate() {
             // Grouped by command, in the order this map holds them, so a config
             // file's own order survives into the help. A command bound to several
             // keys is one row with them joined, because that is one thing you can
             // do and not three.
+            //
+            // A chord an inner mode shadows is left out entirely: a key listed
+            // here that would not fire is a lie in the one place that exists to
+            // stop you guessing — and if every chord of a command is shadowed,
+            // the command has no row and its mode may have no heading.
             let mut seen: Vec<&str> = Vec::new();
             let mut rows: Vec<HelpRow> = Vec::new();
             for b in self.bindings().iter().filter(|b| b.mode == *mode) {
@@ -491,9 +541,13 @@ impl Keymap {
                     .bindings()
                     .iter()
                     .filter(|o| o.mode == *mode && o.command == b.command)
+                    .filter(|o| !self.shadowed(active, at, &o.chord))
                     .map(|o| chord_string(&o.chord))
                     .collect::<Vec<_>>()
                     .join(" / ");
+                if all.is_empty() {
+                    continue;
+                }
                 let doc = commands
                     .get(&b.command)
                     .map(|c| c.doc.clone())
@@ -967,6 +1021,126 @@ mod tests {
         assert!(shown(&k, &c, &Modes::new())
             .iter()
             .any(|r| r.contains("show blame beside the diff")));
+    }
+
+    #[test]
+    fn an_inner_mode_shadows_an_outer_binding_out_of_the_projection() {
+        // `?` is bound globally, and a mode that binds it too answers first —
+        // resolve says so, so the help has to agree or it lists a key that
+        // does nothing.
+        let mut k = Keymap::empty();
+        k.bind(GLOBAL, "?", "help").unwrap();
+        k.bind(GLOBAL, "y", "copy.selection").unwrap();
+        k.bind(GLOBAL, "h", "view.left").unwrap();
+        let mut c = Commands::builtin();
+        c.register("diff.where", "where am I");
+        k.bind("diff", "?", "diff.where").unwrap();
+        // A chord is shadowed by an inner *prefix* as well: typing `y` waits
+        // for the mode's second key and never reaches the global binding.
+        k.bind("diff", "y n", "diff.next").unwrap();
+        c.register("diff.next", "the next one");
+
+        let mut modes = Modes::new();
+        modes.push("diff");
+        let rows = shown(&k, &c, &modes);
+
+        // The global rows are gone; the mode's own are there.
+        let global = rows.iter().position(|r| r == "[global]").unwrap();
+        let diff = rows.iter().position(|r| r == "[diff]").unwrap();
+        assert!(
+            !rows[global..diff].iter().any(|r| r.contains("leave")),
+            "a shadowed key was still projected: {rows:?}"
+        );
+        assert!(
+            rows[global..diff]
+                .iter()
+                .any(|r| r.contains("scroll the text left")),
+            "an unshadowed global row must survive beside the shadowed ones"
+        );
+        assert!(
+            !rows[..global].iter().any(|r| !r.is_empty()),
+            "nothing is projected before the outermost mode"
+        );
+        assert!(rows[diff..].iter().any(|r| r.contains("where am I")));
+
+        // ...and without the mode pushed, nothing was shadowed.
+        assert_eq!(shown(&k, &c, &Modes::new()).len(), rows.len() - 2);
+    }
+
+    #[test]
+    fn a_chord_shadowed_by_a_shorter_inner_binding_leaves_too() {
+        // The other direction of the same relation: the mode binds the prefix,
+        // the globals bind the chord. Typing `g` fires the mode's command
+        // before `g g` can ever complete.
+        let mut k = Keymap::empty();
+        k.bind(GLOBAL, "g g", "view.top").unwrap();
+        k.bind("diff", "g", "goto.line").unwrap();
+        let mut c = Commands::builtin();
+        c.register("goto.line", "a line by number");
+
+        let mut modes = Modes::new();
+        modes.push("diff");
+        let rows = shown(&k, &c, &modes);
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.contains("the first row") || r.contains("g g")),
+            "the two-key chord survived its own prefix: {rows:?}"
+        );
+        assert!(rows.iter().any(|r| r.contains("a line by number")));
+    }
+
+    #[test]
+    fn a_fully_shadowed_command_takes_its_row_and_heading_with_it() {
+        let mut k = Keymap::builtin();
+        k.bind("diff", "?", "help").unwrap(); // rebinds the only `?`
+        let mut modes = Modes::new();
+        modes.push("diff");
+        let rows = shown(&k, &Commands::builtin(), &modes);
+        // `show the keys` still appears — from the *diff* row now, which is the
+        // one that would fire — but `q`'s twin below it did not move.
+        assert!(rows.iter().filter(|r| r.contains("show the keys")).count() == 1);
+
+        // Every global binding shadowed: the heading goes with them.
+        let mut all = Keymap::builtin();
+        for b in Keymap::builtin().bindings() {
+            if b.mode == GLOBAL {
+                let chord = chord_string(&b.chord);
+                all.bind("diff", &chord, "diff.take")
+                    .expect("shipped chords are single keys and do not collide");
+            }
+        }
+        let rows = shown(&all, &Commands::builtin(), &modes);
+        assert!(
+            !rows.iter().any(|r| r == "[global]"),
+            "nothing under it fires any more: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn the_live_keys_for_a_command_follow_the_modes() {
+        // What a close hint is written from: with help open, the key that
+        // closes it is whatever runs `help` through the modes actually live.
+        let k = Keymap::builtin();
+        assert_eq!(k.live_keys_for("help", &Modes::new()), vec!["?"]);
+
+        let mut open = Modes::new();
+        open.push("help");
+        assert_eq!(
+            k.live_keys_for("help", &open),
+            vec!["?"],
+            "help itself binds nothing"
+        );
+
+        // A mode that takes `?` over leaves the hint nothing to say.
+        let mut k = Keymap::builtin();
+        k.bind("diff", "?", "diff.cycle-layout").unwrap();
+        let mut in_diff = Modes::new();
+        in_diff.push("diff");
+        in_diff.push("help");
+        assert!(k.live_keys_for("help", &in_diff).is_empty());
+        // And the same map outside the mode still names it.
+        assert_eq!(k.live_keys_for("help", &Modes::new()), vec!["?"]);
     }
 
     #[test]
