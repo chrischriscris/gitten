@@ -1,0 +1,16 @@
+#!/bin/sh
+# Formatting and lints gate the commit, not CI. A red ✗ ten minutes after
+# pushing is a commit that already happened; this is the same two commands CI
+# runs, evaluated while the change is still yours to fix.
+#
+# Wired once per clone:
+#
+#   git config core.hooksPath .githooks
+#
+# Warm cache this costs about a second; cold, rustup installs whatever
+# rust-toolchain.toml declares on first use. To commit through a red gate
+# deliberately, say so: git commit --no-verify.
+set -e
+cd "$(git rev-parse --show-toplevel)"
+cargo fmt --check
+cargo clippy -q --workspace --all-targets -- -D warnings

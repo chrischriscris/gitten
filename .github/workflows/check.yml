@@ -1,14 +1,16 @@
 # Everything that can be checked without opening a window — the CI half of
 # ./check.sh. Two jobs, deliberately small:
 #
-#   test   — the portable part of check.sh's correctness section. Core has no
-#            dependencies at all, web's tests are payloads and row indexes, and
-#            tui's screen is a cell buffer.
-#   linux  — "nothing may be *written* in a way that makes Linux impossible."
-#            GPUI compiles there today; this keeps that true. Its native headers
-#            also make this the cheap place to run shell's headless GPUI tests.
+#   test  — the correctness section of check.sh verbatim. Every one of these
+#           crates is headless by design: core has no dependencies at all,
+#           web's tests are payloads and row indexes, tui's screen is a cell
+#           buffer. Ubuntu because it is cheap, and green here doubles as the
+#           Linux canary for every crate but the window.
+#   lint  — formatting and clippy, the same two commands ./.githooks/pre-commit
+#           runs before a commit exists. Clippy type-checks the whole
+#           workspace, so this is also the Linux canary that the old plain
+#           `cargo check` job provided; see decision 0025.
 #
-# What is deliberately absent, and why, is decision 0024.
 name: check
 
 on:
@@ -34,7 +36,7 @@ jobs:
       - run: cargo test -q --locked -p plait-web
       - run: cargo test -q --locked -p plait-tui
 
-  linux:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -48,5 +50,5 @@ jobs:
             libxkbcommon-dev libxkbcommon-x11-0 \
             libwayland-dev libudev-dev libvulkan-dev
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace --all-targets --locked
-      - run: cargo test -q --locked -p plait-shell
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings

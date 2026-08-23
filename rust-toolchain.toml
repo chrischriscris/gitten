@@ -4,3 +4,6 @@
 [toolchain]
 channel = "1.97.1"
 profile = "minimal"
+# Minimal ships without these two, and both are gates now (decision 0025):
+# `./.githooks/pre-commit` and CI run them against exactly this pin.
+components = ["rustfmt", "clippy"]
