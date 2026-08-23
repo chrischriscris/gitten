@@ -24,6 +24,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # CI artifacts are never debugged. Omitting line tables makes both caches
+  # smaller without changing assertions, overflow checks or clippy.
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
 
 jobs:
   test:
@@ -35,24 +39,35 @@ jobs:
         with:
           fetch-depth: 3
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -q --locked -p plait-core
-      - run: cargo test -q --locked -p plait-app
-      - run: cargo test -q --locked -p plait-web
-      - run: cargo test -q --locked -p plait-tui
+        id: cache
+      # One Cargo process compiles independent clients in parallel. An exact
+      # cache hit contains every locked source, so it need not update indexes.
+      - run: >-
+          cargo test -q --locked
+          -p plait-core -p plait-app -p plait-web -p plait-tui
+        env:
+          CARGO_NET_OFFLINE: ${{ steps.cache.outputs.cache-hit }}
 
   lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - run: cargo fmt --check
+      - uses: Swatinem/rust-cache@v2
+        id: cache
       # The set Zed's own install script hands a Linux builder: gpui needs the
-      # headers even to compile, and blade wants vulkan present.
-      - run: |
+      # headers even to compile, and blade wants vulkan present. Cached
+      # dependencies are already compiled; provision these only when Cargo has
+      # work that can consult them.
+      - if: steps.cache.outputs.cache-hit != 'true'
+        name: Install Linux build dependencies
+        run: |
           sudo apt-get update
           sudo apt-get install -y \
             fontconfig libfontconfig1-dev \
             libxcb1-dev libxcb-util-dev \
             libxkbcommon-dev libxkbcommon-x11-0 \
             libwayland-dev libudev-dev libvulkan-dev
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        env:
+          CARGO_NET_OFFLINE: ${{ steps.cache.outputs.cache-hit }}
