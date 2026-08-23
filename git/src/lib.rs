@@ -340,11 +340,21 @@ impl Repo for Binary {
         // forty thousand entries nobody reads. `!` records are still parsed if
         // git sends them, so a caller that asks git itself pays nothing extra.
         //
+        // `--renames` keeps this model stable when a user's `status.renames`
+        // config disables detection: callers need one rename with both paths,
+        // not an unrelated deletion and addition.
+        //
         // Bytes throughout: paths carry no encoding guarantee and the model
         // keeps them raw, so there is no decode here to get wrong.
         let raw = run(
             &self.root,
-            &["status", "--porcelain=v2", "-z", "--untracked-files=all"],
+            &[
+                "status",
+                "--porcelain=v2",
+                "-z",
+                "--untracked-files=all",
+                "--renames",
+            ],
         )?;
         Ok(parse_status(&raw))
     }
@@ -1080,13 +1090,15 @@ mod tests {
     /// set up itself: identity (no ambient user), signing off (a machine with
     /// `commit.gpgsign` must not fail these), and the local-file protocol
     /// (submodules over a path, which modern git disables by default).
-    const SCRATCH_CONFIG: [&str; 6] = [
+    const SCRATCH_CONFIG: [&str; 8] = [
         "-c",
         "user.email=t@t",
         "-c",
         "user.name=t",
         "-c",
         "commit.gpgsign=false",
+        "-c",
+        "status.renames=true",
     ];
 
     impl Scratch {
