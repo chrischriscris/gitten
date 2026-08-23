@@ -17,6 +17,7 @@ which numbers those decisions rest on, and the diagrams.
 | [commit-graph.md](commit-graph.md) | lane assignment, hues, the cap, the drawing |
 | [terminal.md](terminal.md) | the terminal frontend, and what writing it moved into `core` |
 | [extending.md](extending.md) | every seam, with a worked example each |
+| [roadmap.md](roadmap.md) | build order from viewer to product, one block at a time |
 
 ## Decisions
 
