@@ -35,6 +35,7 @@
 //! [`prepared`](crate::prepared).
 
 use std::ops::Range;
+use std::sync::Arc;
 
 /// One break: where the row being drawn ends, and where the next one starts.
 ///
@@ -92,7 +93,9 @@ impl From<usize> for Budget<'_> {
 /// text: the frontend has already turned pixels into columns by the time this is
 /// called, which is what lets the same implementation serve the window, a
 /// terminal and a test.
-pub trait Wrap {
+/// Implementations are thread-safe so the whole configured [`Host`](crate::host::Host)
+/// remains cheaply cloneable for background work.
+pub trait Wrap: Send + Sync {
     fn name(&self) -> &'static str;
 
     /// Whether this implementation ever breaks anything.
@@ -252,8 +255,9 @@ impl Wrap for Word {
 /// select by name, and ask for the names so an error message and a menu both
 /// describe what is actually there rather than what was there when they were
 /// written.
+#[derive(Clone)]
 pub struct Wraps {
-    impls: Vec<Box<dyn Wrap>>,
+    impls: Vec<Arc<dyn Wrap>>,
     selected: usize,
 }
 
@@ -285,8 +289,8 @@ impl Wraps {
     /// built-in can be corrected rather than only added to.
     pub fn register(&mut self, wrap: impl Wrap + 'static) {
         match self.impls.iter().position(|w| w.name() == wrap.name()) {
-            Some(i) => self.impls[i] = Box::new(wrap),
-            None => self.impls.push(Box::new(wrap)),
+            Some(i) => self.impls[i] = Arc::new(wrap),
+            None => self.impls.push(Arc::new(wrap)),
         }
     }
 

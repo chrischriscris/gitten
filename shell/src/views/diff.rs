@@ -123,6 +123,13 @@ pub(crate) fn columns(width: f32, chrome: f32, size: f32, host: &Host) -> usize 
 /// the wild; nobody reads past column 2000 either way.
 const MAX_LINE_CHARS: usize = 2000;
 
+/// The expensive client-independent half of building diff rows. Exposed to the
+/// shell so repository refresh can run clipping, intraline and syntax work on
+/// its background load task before GPUI applies the result.
+pub(crate) fn prepare_files(files: &[FileDiff], host: &Host) -> Prepared {
+    prepare(files, &host.syntax, MAX_LINE_CHARS)
+}
+
 /// Where a click landed inside a row — see [`Rows::hit`].
 ///
 /// `core`'s, since the terminal asks its presentations the same question in
@@ -1091,13 +1098,37 @@ impl Diff {
         if self.files.as_slice() == files.as_slice() {
             return;
         }
-        self.swap(files, host);
+        let prepared = prepare_files(&files, host);
+        self.swap_prepared(files, prepared, host);
+        cx.notify();
+    }
+
+    /// [`Diff::replace`] with the pure preparation already completed off the
+    /// GPUI thread by a pane refresh.
+    pub(crate) fn replace_prepared(
+        &mut self,
+        files: Vec<FileDiff>,
+        prepared: Prepared,
+        host: &Host,
+        cx: &mut Context<Self>,
+    ) {
+        self.reconcile(host);
+        if self.files.as_slice() == files.as_slice() {
+            return;
+        }
+        self.swap_prepared(files, prepared, host);
         cx.notify();
     }
 
     /// The half of [`Diff::replace`] that needs no window, and therefore the
     /// half with tests.
+    #[cfg(test)]
     fn swap(&mut self, files: Vec<FileDiff>, host: &Host) {
+        let prepared = prepare_files(&files, host);
+        self.swap_prepared(files, prepared, host);
+    }
+
+    fn swap_prepared(&mut self, files: Vec<FileDiff>, prepared: Prepared, host: &Host) {
         let old = self.view.get();
         let cursor = old.cursor();
         let top = old.top();
@@ -1105,7 +1136,7 @@ impl Diff {
         self.files = Rc::new(files);
         self.sel = None;
         self.dragging = false;
-        let (built, headers) = assemble(&self.files, host, &self.layouts, self.current);
+        let (built, headers) = assemble_prepared(prepared, host, &self.layouts, self.current);
         self.order = Rc::new(built.order);
         *self.renderers.borrow_mut() = built.renderers;
         self.widest = built.widest;
@@ -1312,6 +1343,15 @@ fn assemble(
     layouts: &Layouts,
     current: usize,
 ) -> (Built, Vec<usize>) {
+    assemble_prepared(prepare_files(files, host), host, layouts, current)
+}
+
+fn assemble_prepared(
+    prepared: Prepared,
+    host: &Host,
+    layouts: &Layouts,
+    current: usize,
+) -> (Built, Vec<usize>) {
     let t = std::time::Instant::now();
     let mut renderers = match layouts.0.get(current) {
         Some(layout) => (layout.build)(host),
@@ -1332,7 +1372,7 @@ fn assemble(
         files: prepared,
         intraline,
         syntax,
-    } = prepare(files, &host.syntax, MAX_LINE_CHARS);
+    } = prepared;
     let file_count = prepared.len();
 
     for f in prepared {

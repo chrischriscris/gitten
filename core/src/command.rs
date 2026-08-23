@@ -372,6 +372,9 @@ impl Keymap {
         // move them without teaching a client another keymap.
         bind("input", "enter", "input.accept");
         bind("input", "esc", "input.cancel");
+
+        bind("panes", "ctrl-j", "pane.next");
+        bind("panes", "ctrl-k", "pane.prev");
         k
     }
 
@@ -713,6 +716,8 @@ impl Commands {
             ("commits.open-diff", "the diff for this commit"),
             ("input.accept", "accept the text"),
             ("input.cancel", "discard the text"),
+            ("pane.next", "focus the next pane"),
+            ("pane.prev", "focus the previous pane"),
             ("select.all", "select the whole view"),
             ("select.none", "drop the selection"),
             (

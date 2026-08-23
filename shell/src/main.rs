@@ -4,13 +4,14 @@ mod dispatch;
 mod graph;
 mod help;
 mod input;
+mod panes;
 mod session;
 mod stats;
 mod views;
 
 use gpui::*;
 use gpui_component::*;
-use plait_app::acquire::Data;
+use plait_app::acquire::{Data, Loaded};
 use plait_app::cli::{Source, View};
 use plait_app::jobs::{Event as JobEvent, Generation, Job, Runner, Submitter};
 use plait_app::{Started, Startup};
@@ -20,7 +21,7 @@ use plait_core::host::Host;
 use plait_core::theme::Rgb;
 use plait_core::FileDiff;
 use stats::Stats;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -144,7 +145,84 @@ enum Open {
     Whitespace,
 }
 
-/// What is on screen. A stack, so `esc` goes back to where you came from.
+type RefreshValue = Box<dyn std::any::Any + Send>;
+type ApplyRefresh = dyn FnOnce(RefreshValue, &Host, &mut App) -> Result<(), String>;
+
+/// A pane-owned refresh split at the thread boundary: pure blocking load, then
+/// GPUI apply. The shell schedules both halves without knowing the tenant's data
+/// type, which is what lets a files or extension pane refresh without joining a
+/// central acquisition enum.
+struct Refresh {
+    generation: Generation,
+    load: Box<dyn FnOnce() -> Result<RefreshValue, String> + Send>,
+    apply: Box<ApplyRefresh>,
+}
+
+impl Refresh {
+    fn new<T: Send + 'static>(
+        generation: Generation,
+        load: impl FnOnce() -> Result<T, String> + Send + 'static,
+        apply: impl FnOnce(T, &Host, &mut App) -> Result<(), String> + 'static,
+    ) -> Self {
+        Self {
+            generation,
+            load: Box::new(move || load().map(|value| Box::new(value) as RefreshValue)),
+            apply: Box::new(move |value, host, cx| {
+                let value = value
+                    .downcast::<T>()
+                    .map_err(|_| "pane refresh returned the wrong data type".to_string())?;
+                apply(*value, host, cx)
+            }),
+        }
+    }
+}
+
+/// One pane tenant, independent of how the shell lays panes out.
+///
+/// Built-ins and compiled-in extensions enter through the same object-safe
+/// seam. Only drawing, local command behavior and optional repository refresh
+/// live here; stable naming, placement and focus belong to [`panes::Panes`].
+trait Pane {
+    fn any(&self) -> AnyView;
+    fn mode(&self) -> &'static str;
+    fn label(&self) -> String;
+
+    /// A tenant-owned repository refresh. The load half must contain every
+    /// blocking operation; the apply half is the only half allowed to touch a
+    /// GPUI entity. A pane not backed by the current repository returns `None`.
+    fn refresh(
+        &self,
+        _generation: Generation,
+        _host: &Host,
+        _overrides: &Overrides,
+        _repo: plait_git::Handle,
+    ) -> Option<Refresh> {
+        None
+    }
+
+    fn list_bounds(&self, _cx: &App) -> Bounds<Pixels> {
+        Bounds::default()
+    }
+
+    fn pan_pixels(&self, _dx: f32, _cx: &App) -> bool {
+        false
+    }
+
+    fn run(&self, _command: &str, _host: &Host, _cx: &mut App) -> bool {
+        false
+    }
+
+    fn scroll_pixels(&self, _dy: f32, _host: &Host, _cx: &mut App) -> bool {
+        false
+    }
+
+    fn select(&self, _all: bool, _cx: &mut App) -> bool {
+        false
+    }
+}
+
+/// One pane tenant. Built-ins keep repository metadata beside their typed GPUI
+/// view; extensions enter through [`Screen::Custom`].
 ///
 /// **This is the typed adapter between dispatch and drawing.** [`Modes`] name
 /// what is live, [`Keymap::resolve`] names what a key meant, and the match on
@@ -156,22 +234,52 @@ enum Screen {
     Commits {
         view: Entity<views::commits::Commits>,
         source: Source,
-        generation: Generation,
-        label: String,
+        generation: Rc<Cell<Generation>>,
+        label: Rc<RefCell<String>>,
     },
     Diff {
         view: Entity<views::diff::Diff>,
         source: Source,
-        generation: Generation,
-        label: String,
+        generation: Rc<Cell<Generation>>,
+        label: Rc<RefCell<String>>,
     },
+    Custom(Rc<dyn Pane>),
 }
 
 impl Screen {
+    fn commits(
+        view: Entity<views::commits::Commits>,
+        source: Source,
+        generation: Generation,
+        label: impl Into<String>,
+    ) -> Self {
+        Self::Commits {
+            view,
+            source,
+            generation: Rc::new(Cell::new(generation)),
+            label: Rc::new(RefCell::new(label.into())),
+        }
+    }
+
+    fn diff(
+        view: Entity<views::diff::Diff>,
+        source: Source,
+        generation: Generation,
+        label: impl Into<String>,
+    ) -> Self {
+        Self::Diff {
+            view,
+            source,
+            generation: Rc::new(Cell::new(generation)),
+            label: Rc::new(RefCell::new(label.into())),
+        }
+    }
+
     fn any(&self) -> AnyView {
         match self {
             Screen::Commits { view, .. } => view.clone().into(),
             Screen::Diff { view, .. } => view.clone().into(),
+            Screen::Custom(pane) => pane.any(),
         }
     }
 
@@ -180,75 +288,118 @@ impl Screen {
         match self {
             Screen::Commits { .. } => "commits",
             Screen::Diff { .. } => "diff",
+            Screen::Custom(pane) => pane.mode(),
         }
     }
 
     fn label(&self) -> String {
         match self {
-            Screen::Commits { label, .. } => label.clone(),
-            Screen::Diff { label, .. } => label.clone(),
+            Screen::Commits { label, .. } | Screen::Diff { label, .. } => label.borrow().clone(),
+            Screen::Custom(pane) => pane.label(),
         }
     }
 
-    fn source(&self) -> &Source {
-        match self {
-            Screen::Commits { source, .. } | Screen::Diff { source, .. } => source,
-        }
-    }
-
-    fn generation(&self) -> Generation {
-        match self {
-            Screen::Commits { generation, .. } | Screen::Diff { generation, .. } => *generation,
-        }
-    }
-
-    fn view_kind(&self) -> View {
-        match self {
-            Screen::Commits { .. } => View::Commits,
-            Screen::Diff { .. } => View::Diff,
-        }
-    }
-
-    fn replace(
-        &mut self,
-        loaded: plait_app::acquire::Loaded,
-        generation: Generation,
+    fn refresh(
+        &self,
+        target: Generation,
         host: &Host,
-        cx: &mut App,
-    ) -> Result<(), String> {
-        match (self, loaded.data) {
-            (
-                Screen::Commits {
-                    view,
-                    label,
-                    generation: loaded_generation,
-                    ..
-                },
-                Data::Commits(commits),
-            ) => {
-                view.update(cx, |view, cx| {
-                    view.replace(commits, host);
-                    cx.notify();
-                });
-                *label = loaded.label;
-                *loaded_generation = generation;
-                Ok(())
+        overrides: &Overrides,
+        repo: plait_git::Handle,
+    ) -> Option<Refresh> {
+        match self {
+            Screen::Commits {
+                view,
+                source,
+                generation,
+                label,
+            } => {
+                if generation.get() >= target || matches!(source, Source::Fixtures) {
+                    return None;
+                }
+                let source = source.clone();
+                let load_host = host.clone();
+                let view = view.clone();
+                let generation = generation.clone();
+                let label = label.clone();
+                Some(Refresh::new(
+                    target,
+                    move || {
+                        let loaded = plait_app::acquire::reacquire(
+                            View::Commits,
+                            &source,
+                            &load_host,
+                            Some(repo.as_ref()),
+                            &Overrides::default(),
+                        )?;
+                        let Data::Commits(commits) = loaded.data else {
+                            return Err("re-acquisition returned the wrong view".into());
+                        };
+                        Ok((loaded.label, views::commits::prepare(commits, &load_host)))
+                    },
+                    move |(next_label, prepared): (String, views::commits::Prepared), host, cx| {
+                        if generation.get() >= target {
+                            return Ok(());
+                        }
+                        view.update(cx, |view, cx| {
+                            view.replace_prepared(prepared, host);
+                            cx.notify();
+                        });
+                        label.replace(next_label);
+                        generation.set(target);
+                        Ok(())
+                    },
+                ))
             }
-            (
-                Screen::Diff {
-                    view,
-                    label,
-                    generation: loaded_generation,
-                    ..
-                },
-                Data::Diff(files),
-            ) => {
-                view.update(cx, |view, cx| view.replace(files, host, cx));
-                *label = loaded.label;
-                *loaded_generation = generation;
-                Ok(())
+            Screen::Diff {
+                view,
+                source,
+                generation,
+                label,
+            } => {
+                if generation.get() >= target || matches!(source, Source::Fixtures) {
+                    return None;
+                }
+                let source = source.clone();
+                let load_host = host.clone();
+                let overrides = overrides.clone();
+                let view = view.clone();
+                let generation = generation.clone();
+                let label = label.clone();
+                Some(Refresh::new(
+                    target,
+                    move || {
+                        let loaded = plait_app::acquire::reacquire(
+                            View::Diff,
+                            &source,
+                            &load_host,
+                            Some(repo.as_ref()),
+                            &overrides,
+                        )?;
+                        let Data::Diff(files) = &loaded.data else {
+                            return Err("re-acquisition returned the wrong view".into());
+                        };
+                        let prepared = views::diff::prepare_files(files, &load_host);
+                        Ok((loaded, prepared))
+                    },
+                    move |(loaded, prepared): (Loaded, plait_core::prepared::Prepared),
+                          host,
+                          cx| {
+                        if generation.get() >= target {
+                            return Ok(());
+                        }
+                        let Data::Diff(files) = loaded.data else {
+                            return Err("re-acquisition returned the wrong view".into());
+                        };
+                        view.update(cx, |view, cx| {
+                            view.replace_prepared(files, prepared, host, cx)
+                        });
+                        label.replace(loaded.label);
+                        generation.set(target);
+                        Ok(())
+                    },
+                ))
             }
-            _ => Err("re-acquisition returned the wrong view".into()),
+            Screen::Custom(pane) => pane.refresh(target, host, overrides, repo),
         }
     }
 
@@ -257,6 +408,7 @@ impl Screen {
         match self {
             Screen::Commits { view, .. } => view.read(cx).list_bounds(),
             Screen::Diff { view, .. } => view.read(cx).list_bounds(),
+            Screen::Custom(pane) => pane.list_bounds(cx),
         }
     }
 
@@ -267,6 +419,7 @@ impl Screen {
         match self {
             Screen::Commits { view, .. } => view.read(cx).pan_pixels(dx),
             Screen::Diff { view, .. } => view.read(cx).pan_pixels(dx),
+            Screen::Custom(pane) => pane.pan_pixels(dx, cx),
         }
     }
 
@@ -290,6 +443,7 @@ impl Screen {
                 }
                 known
             }),
+            Screen::Custom(pane) => pane.run(command, host, cx),
         }
     }
 
@@ -300,6 +454,7 @@ impl Screen {
         match self {
             Screen::Commits { view, .. } => view.update(cx, |v, _| v.scroll_pixels(dy, host)),
             Screen::Diff { view, .. } => view.update(cx, |v, _| v.scroll_pixels(dy, host)),
+            Screen::Custom(pane) => pane.scroll_pixels(dy, host, cx),
         }
     }
 
@@ -319,17 +474,23 @@ impl Screen {
                 }
                 false => d.select_none(cx),
             }),
+            Screen::Custom(pane) => pane.select(all, cx),
         }
+    }
+
+    fn custom(pane: impl Pane + 'static) -> Self {
+        Self::Custom(Rc::new(pane))
     }
 }
 
 struct DevShell {
     /// The app half of the title, drawn bright: which program this is. Which
-    /// *view* it is showing is the active screen's to say — see
-    /// [`DevShell::active_view`] — because a commit list that opened a diff
-    /// under the cursor is a diff on screen, whatever launched the window.
+    /// *view* it is showing is the focused pane's to say, because a commit list
+    /// that opened a diff is still a diff while that pane owns the keyboard.
     which: &'static str,
-    stack: Vec<Screen>,
+    /// Stable names make this a registry: reopening a diff replaces the `diff`
+    /// tenant instead of appending a duplicate pane.
+    panes: panes::Panes<Screen>,
     stats: Option<Stats>,
     /// How to fetch the diff again with a different algorithm. `None` for a
     /// `.diff` fixture, where there is no repository behind the rows at all.
@@ -341,6 +502,12 @@ struct DevShell {
     jobs: Runner,
     submitter: Submitter,
     generation: Generation,
+    /// The newest refresh batch and the work still outstanding in it. Older
+    /// batches may finish later; their generation keeps them from changing this
+    /// batch's status or replacing newer pane data.
+    refresh_id: u64,
+    refresh_pending: usize,
+    refresh_error: Option<String>,
     running: Option<String>,
     /// The one native text field over the active screen, if a command is
     /// gathering input. Consumers subscribe to its accepted/cancelled event.
@@ -365,8 +532,9 @@ struct DevShell {
     /// Startup logging, and nothing else: whether [`start::mark`] has already
     /// stamped the first render. One bool read per frame afterwards.
     first_render: Cell<bool>,
-    /// Which modes' bindings are live, innermost last: the screen's, then help
-    /// over it. Rebuilt by [`DevShell::sync_modes`] whenever either changes.
+    /// Which modes' bindings are live, innermost last: the pane container, the
+    /// focused tenant, then input or help over it. Rebuilt by
+    /// [`DevShell::sync_modes`] whenever any of those changes.
     modes: Modes,
     /// Keys typed so far that have not resolved. Empty almost always; a chord
     /// is what puts something in it. One entry per press, and every entry
@@ -396,17 +564,7 @@ struct DevShell {
 impl DevShell {
     /// The screen commands act on.
     fn active(&self) -> Option<&Screen> {
-        self.stack.last()
-    }
-
-    /// What is drawn: the active screen's own view. Derived from the stack
-    /// every time, never stored beside it — a second copy of an `AnyView` was
-    /// exactly how the strip once kept saying "commits" over a diff, and two
-    /// sources of truth disagree precisely when it matters.
-    fn active_view(&self) -> AnyView {
-        self.active()
-            .expect("the bottom screen is never popped")
-            .any()
+        Some(self.panes.focused())
     }
 
     /// The view name the title strip shows: the active screen's mode — which
@@ -417,15 +575,18 @@ impl DevShell {
         self.active().map_or(self.which, Screen::mode)
     }
 
-    /// Rebuilds the mode stack from what is on screen, and drops whatever was
+    /// Rebuilds the mode stack from what is focused, and drops whatever was
     /// pending against the previous arrangement: any half-typed chord, and any
-    /// open picker — a menu belongs to the screen it was opened over, and one
-    /// left standing after the screen changes is invisible but still in
+    /// open picker — a menu belongs to the pane it was opened over, and one
+    /// left standing after focus changes is invisible but still in
     /// `self.open`, where [`DevShell::on_wheel`] swallows for it forever.
-    /// Called on every change of screen or help state — the places
+    /// Called on every change of pane focus or help state — the places
     /// [`Modes`] can change.
     fn sync_modes(&mut self) {
         self.modes = Modes::new();
+        if self.panes.len() > 1 {
+            self.modes.push(panes::MODE);
+        }
         if let Some(screen) = self.active() {
             self.modes.push(screen.mode());
         }
@@ -479,6 +640,19 @@ impl DevShell {
         cx.notify();
     }
 
+    /// The one registration path built-ins and compiled-in extensions share.
+    #[allow(dead_code)]
+    fn register_pane(
+        &mut self,
+        name: impl Into<String>,
+        pane: impl Pane + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.panes.register(name, Screen::custom(pane));
+        self.sync_modes();
+        cx.notify();
+    }
+
     /// The one queue future built-ins and compiled-in extensions share.
     #[allow(dead_code)]
     fn submit(&self, job: Box<dyn Job>) -> Result<(), Box<dyn Job>> {
@@ -498,6 +672,7 @@ impl DevShell {
                     outcome: Err(error),
                     ..
                 } => {
+                    self.invalidate_refresh();
                     self.running = None;
                     self.error = Some(error.into());
                 }
@@ -508,7 +683,7 @@ impl DevShell {
                     self.running = None;
                     if generation > self.generation {
                         self.generation = generation;
-                        self.refresh_active(cx);
+                        self.refresh_stale(cx);
                     }
                 }
             }
@@ -518,34 +693,78 @@ impl DevShell {
         }
     }
 
-    fn refresh_active(&mut self, cx: &mut Context<Self>) {
-        let Some(screen) = self.active() else { return };
-        if screen.generation() >= self.generation || matches!(screen.source(), Source::Fixtures) {
-            return;
-        }
-        let (view, source) = (screen.view_kind(), screen.source().clone());
-        let Some((_, repo)) = self.repo.as_ref() else {
+    fn refresh_stale(&mut self, cx: &mut Context<Self>) {
+        let Some((_, repo)) = self.repo.as_ref().cloned() else {
             return;
         };
+        self.invalidate_refresh();
+        let refresh_id = self.refresh_id;
         let host = config::host(cx);
-        match plait_app::acquire::reacquire(view, &source, &host, Some(repo.as_ref()), &self.over) {
-            Ok(loaded) => {
-                // Re-check at the write itself. This remains correct if
-                // acquisition becomes asynchronous later.
-                let generation = self.generation;
-                let Some(screen) = self.stack.last_mut() else {
-                    return;
-                };
-                if screen.generation() >= generation {
-                    return;
-                }
-                match screen.replace(loaded, generation, &host, cx) {
-                    Ok(()) => self.error = None,
-                    Err(error) => self.error = Some(error.into()),
-                }
-            }
-            Err(error) => self.error = Some(error.into()),
+        let target = self.generation;
+        let refreshes: Vec<Refresh> = self
+            .panes
+            .iter()
+            .filter_map(|screen| screen.refresh(target, &host, &self.over, repo.clone()))
+            .collect();
+        if refreshes.is_empty() {
+            return;
         }
+
+        self.refresh_pending = refreshes.len();
+        self.refresh_error = None;
+        for refresh in refreshes {
+            let Refresh {
+                generation,
+                load,
+                apply,
+            } = refresh;
+            let loaded = cx.background_spawn(async move { load() });
+            cx.spawn(async move |shell, cx: &mut AsyncApp| {
+                let result = loaded.await;
+                _ = shell.update(cx, move |shell, cx| {
+                    let result = if refresh_id != shell.refresh_id || generation < shell.generation
+                    {
+                        Ok(())
+                    } else {
+                        result.and_then(|value| {
+                            let host = config::host(cx);
+                            apply(value, &host, cx)
+                        })
+                    };
+                    shell.finish_refresh(refresh_id, result, cx);
+                });
+            })
+            .detach();
+        }
+    }
+
+    fn finish_refresh(
+        &mut self,
+        refresh_id: u64,
+        result: Result<(), String>,
+        cx: &mut Context<Self>,
+    ) {
+        if refresh_id != self.refresh_id {
+            return;
+        }
+        if let Err(error) = result {
+            self.refresh_error.get_or_insert(error);
+        }
+        self.refresh_pending = self.refresh_pending.saturating_sub(1);
+        if self.refresh_pending == 0 {
+            if self.error.is_none() {
+                self.error = self.refresh_error.take().map(Into::into);
+            } else {
+                self.refresh_error = None;
+            }
+        }
+        cx.notify();
+    }
+
+    fn invalidate_refresh(&mut self) {
+        self.refresh_id = self.refresh_id.saturating_add(1);
+        self.refresh_pending = 0;
+        self.refresh_error = None;
     }
 
     /// One of the platform's menu actions: named dispatch through
@@ -581,6 +800,7 @@ impl DevShell {
         let host = config::host(cx);
         match rediff(&host, &next, &revision) {
             Ok(files) => {
+                self.invalidate_refresh();
                 self.over = next;
                 self.error = None;
                 view.update(cx, |d, cx| d.replace(files, &host, cx));
@@ -669,6 +889,8 @@ impl DevShell {
             "theme.cycle" => self.cycle_theme(cx),
             "input.accept" => self.close_input(true, cx),
             "input.cancel" => self.close_input(false, cx),
+            "pane.next" => self.cycle_pane(1, cx),
+            "pane.prev" => self.cycle_pane(-1, cx),
             "commits.open-diff" => self.open_diff(cx),
             "copy.selection" => self.copy_selection(cx),
             // Both are answered by whichever screen is up; a commit graph has no
@@ -703,16 +925,16 @@ impl DevShell {
         cx.notify();
     }
 
-    /// Closes the help, or the picker over it, or leaves the innermost screen.
+    /// Closes the help, the picker over it, or the focused secondary pane.
     ///
     /// One key for all of it, because all of it is "get me out of this" — and
     /// **innermost first**, or a picker left open after its screen is popped
     /// keeps occluding nothing: invisible, but still in `self.open`, where
     /// [`DevShell::on_wheel`] swallows every event for it forever. So an open
     /// menu is the whole of this `esc`: closed, pending dropped with it, no
-    /// selection cleared and no screen popped. A selection is inside a screen,
-    /// so it goes next; the first screen is never popped at all — `esc` on the
-    /// thing you started with is not a quit.
+    /// selection cleared and no pane closed. A selection is inside a pane, so
+    /// it goes next; the root pane is never closed at all — `esc` on the thing
+    /// you started with is not a quit.
     fn back(&mut self, cx: &mut Context<Self>) {
         if self.help {
             self.help = false;
@@ -737,17 +959,27 @@ impl DevShell {
                 return;
             }
         }
-        if self.stack.len() > 1 {
-            // The stack is the source of truth; dropping the top *is* the
-            // change. Everything derived from it — the view on screen, the
-            // strip's name, the live modes — comes back out of it below.
-            self.stack.pop();
+        if self.panes.close_focused().is_some() {
             self.sync_modes();
-            self.refresh_active(cx);
+            cx.notify();
         }
     }
 
-    /// Opens the diff of the commit under the cursor, on top of the list.
+    fn focus_pane(&mut self, at: usize, cx: &mut Context<Self>) {
+        if self.panes.focus(at) {
+            self.sync_modes();
+            cx.notify();
+        }
+    }
+
+    fn cycle_pane(&mut self, by: isize, cx: &mut Context<Self>) {
+        if self.panes.cycle(by) {
+            self.sync_modes();
+            cx.notify();
+        }
+    }
+
+    /// Opens the diff of the commit under the cursor in its registered pane.
     ///
     /// The I/O is here and not in the view — the same rule the terminal follows:
     /// a view takes already-loaded data and never learns what a repository is.
@@ -786,19 +1018,19 @@ impl DevShell {
                 // A success says so: an error left up here would be describing
                 // an open that already worked.
                 self.error = None;
-                let screen = Screen::Diff {
+                let screen = Screen::diff(
                     view,
                     source,
-                    generation: self.generation,
-                    label: format!(
+                    self.generation,
+                    format!(
                         "{} {}",
                         &commit.sha[..commit.sha.len().min(8)],
                         commit.subject
                     ),
-                };
-                // Pushed, and that is the whole of it — the view, the title's
-                // middle word and the modes are all read back off the stack.
-                self.stack.push(screen);
+                );
+                // Stable registration replaces an older diff tenant rather
+                // than growing a second copy of the same panel.
+                self.panes.register("diff", screen);
                 self.sync_modes();
             }
             Err(e) => self.error = Some(e.into()),
@@ -831,6 +1063,9 @@ impl DevShell {
                 if !text.is_empty() {
                     cx.write_to_clipboard(ClipboardItem::new_string(text));
                 }
+            }
+            Some(Screen::Custom(pane)) => {
+                pane.run("copy.selection", &host, cx);
             }
             None => {}
         }
@@ -940,16 +1175,19 @@ impl DevShell {
         if self.help || self.open.is_some() {
             return;
         }
-        // Over the rows, and not over the title bar or a dropdown above them. A
-        // capture-phase handler is registered on the window, so it is outside
-        // the hit test a bubble-phase one gets for free.
-        let screen = match self.active() {
-            Some(screen) => screen.clone(),
-            None => return,
-        };
-        if !screen.list_bounds(cx).contains(&ev.position) {
+        // Over one pane's rows, and not over the title bar or a dropdown above
+        // them. Focus it before resolving the wheel: otherwise an unfocused
+        // pane's native list scroller would become a second, unconfigured input
+        // path when this capture handler stood aside.
+        let Some(at) = self
+            .panes
+            .iter()
+            .position(|screen| screen.list_bounds(cx).contains(&ev.position))
+        else {
             return;
-        }
+        };
+        self.focus_pane(at, cx);
+        let screen = self.panes.focused().clone();
         let mut ongoing = self.ongoing.get();
         let delta = views::diff::locked(
             ev.delta.pixel_delta(window.line_height()),
@@ -1221,16 +1459,43 @@ impl Render for DevShell {
         let host = config::host(cx);
         let c = host.theme.chrome;
         let f = &host.font;
-        // Derived, not stored: what is on screen and what it is called are both
-        // read back off the stack here, so opening a diff over the list and
-        // coming back move the strip's middle word without a single line of
-        // bookkeeping — and cannot fail to.
-        let view = self.active_view();
+        // Every registered tenant gets an equal vertical share. The wrapper is
+        // the focus ring and the click target; the view inside still measures
+        // its own box, so neither diff wrapping nor list virtualization learns
+        // that panes exist.
+        let focused_pane = self.panes.focused_index();
+        let pane_views = self
+            .panes
+            .iter()
+            .enumerate()
+            .map(|(at, screen)| {
+                let focused = at == focused_pane;
+                div()
+                    .id(("pane", at))
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .border_1()
+                    .border_color(rgb(match focused {
+                        true => c.accent,
+                        false => c.border,
+                    }))
+                    .debug_selector(move || format!("pane-{at}"))
+                    .capture_any_mouse_down(
+                        cx.listener(move |this, _, _, cx| this.focus_pane(at, cx)),
+                    )
+                    .child(screen.any())
+            })
+            .collect::<Vec<_>>();
         let which = self.active_view_name();
         let strip = self.strip(&host, cx);
         let error = self.error.clone();
         let notice = self.notice.clone();
-        let running = self.running.clone();
+        let running = self
+            .running
+            .clone()
+            .or_else(|| (self.refresh_pending > 0).then(|| "refreshing repository".to_string()));
         let input = self.input.clone();
 
         // The title is three things, so it is drawn as three: the app bright, the
@@ -1364,7 +1629,7 @@ impl Render for DevShell {
                     .or_else(|| running.map(|n| band(&c, SharedString::from(n), c.dim)))
                     .or_else(|| notice.map(|n| band(&c, SharedString::from(n), c.dim))),
             )
-            .child(div().flex_grow(1.0).overflow_hidden().child(view))
+            .child(div().min_h_0().flex_grow(1.0).v_flex().children(pane_views))
             .children(input)
             // The menu itself is deferred at priority 1. Its transparent
             // priority-0 backdrop blocks the rest of the window without
@@ -1574,12 +1839,12 @@ fn main() {
                             v.go_to(r.top, &host);
                         }
                         (
-                            Screen::Commits {
-                                view: e,
-                                source: source.clone(),
-                                generation: Generation::default(),
-                                label: label.clone(),
-                            },
+                            Screen::commits(
+                                e,
+                                source.clone(),
+                                Generation::default(),
+                                label.clone(),
+                            ),
                             v.rendered.clone(),
                             // The commit graph has a fixed row count: one per
                             // commit, and nothing reflows it.
@@ -1597,12 +1862,12 @@ fn main() {
                             v.go_to(r.top, &host);
                         }
                         (
-                            Screen::Diff {
-                                view: e.clone(),
-                                source: source.clone(),
-                                generation: Generation::default(),
-                                label: label.clone(),
-                            },
+                            Screen::diff(
+                                e.clone(),
+                                source.clone(),
+                                Generation::default(),
+                                label.clone(),
+                            ),
                             v.rendered.clone(),
                             v.top.clone(),
                             v.total.clone(),
@@ -1611,7 +1876,7 @@ fn main() {
                         )
                     }
                 };
-                let initial_screens = vec![screen];
+                let initial_panes = panes::Panes::new(which_name, screen);
                 start::mark("view built");
 
                 // First-paint evidence, and only when logging: the views count
@@ -1667,13 +1932,16 @@ fn main() {
                 let submitter = jobs.submitter();
                 let shell = cx.new(|_| DevShell {
                     which: which_name,
-                    stack: initial_screens,
+                    panes: initial_panes,
                     stats,
                     rediff,
                     repo,
                     jobs,
                     submitter,
                     generation: Generation::default(),
+                    refresh_id: 0,
+                    refresh_pending: 0,
+                    refresh_error: None,
                     running: None,
                     input: None,
                     over: Overrides::default(),
@@ -1816,15 +2084,139 @@ fn window_options(title: SharedString) -> WindowOptions {
 
 #[cfg(test)]
 mod tests {
-    use super::{input, DevShell, Open, Screen};
+    use super::{config, input, panes, DevShell, Open, Pane, Refresh, Screen};
     use crate::views::commits::Commits;
     use gpui::{AppContext as _, TestAppContext};
     use plait_app::cli::Source;
-    use plait_app::jobs::{Generation, Runner};
-    use plait_core::command::{Key, Modes};
+    use plait_app::jobs::{Event as JobEvent, Generation, Job, Runner};
+    use plait_core::command::{Code, Key, Keymap, Modes, Resolve};
     use plait_core::host::Host;
+    use plait_core::status::Status;
+    use plait_core::Commit;
+    use plait_git::{Pair, Repo};
     use std::cell::Cell;
+    use std::path::PathBuf;
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    struct ExtensionPane {
+        view: gpui::Entity<Commits>,
+        ran: Rc<Cell<bool>>,
+        generation: Rc<Cell<Generation>>,
+    }
+
+    impl Pane for ExtensionPane {
+        fn any(&self) -> gpui::AnyView {
+            self.view.clone().into()
+        }
+
+        fn mode(&self) -> &'static str {
+            "extension"
+        }
+
+        fn label(&self) -> String {
+            "extension pane".into()
+        }
+
+        fn refresh(
+            &self,
+            target: Generation,
+            _: &Host,
+            _: &plait_core::differ::Overrides,
+            repo: plait_git::Handle,
+        ) -> Option<Refresh> {
+            if self.generation.get() >= target {
+                return None;
+            }
+            let generation = self.generation.clone();
+            Some(Refresh::new(
+                target,
+                move || {
+                    repo.status()?;
+                    Ok("extension-owned data".to_string())
+                },
+                move |value: String, _, _| {
+                    assert_eq!(value, "extension-owned data");
+                    generation.set(target);
+                    Ok(())
+                },
+            ))
+        }
+
+        fn run(&self, command: &str, _: &Host, _: &mut gpui::App) -> bool {
+            if command != "extension.toggle" {
+                return false;
+            }
+            self.ran.set(true);
+            true
+        }
+    }
+
+    struct Succeed;
+
+    impl Job for Succeed {
+        fn name(&self) -> &str {
+            "succeed"
+        }
+
+        fn run(self: Box<Self>) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn successful_generation() -> Generation {
+        let runner = Runner::new();
+        runner
+            .submitter()
+            .submit(Box::new(Succeed))
+            .unwrap_or_else(|_| panic!("runner rejected a job"));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            while let Some(event) = runner.try_next() {
+                if let JobEvent::Finished {
+                    outcome: Ok(generation),
+                    ..
+                } = event
+                {
+                    return generation;
+                }
+            }
+            assert!(Instant::now() < deadline, "job did not finish");
+            std::thread::yield_now();
+        }
+    }
+
+    struct RefreshRepo {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Repo for RefreshRepo {
+        fn log(&self, _: usize) -> plait_git::Result<Vec<Commit>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![Commit {
+                sha: "1".into(),
+                short: "1".into(),
+                parents: Box::from(&[][..]),
+                author: "test".into(),
+                timestamp: 0,
+                subject: "refreshed".into(),
+            }])
+        }
+
+        fn pairs(&self, _: &str) -> plait_git::Result<Vec<Pair>> {
+            Ok(Vec::new())
+        }
+
+        fn status(&self) -> plait_git::Result<Status> {
+            Ok(Status::default())
+        }
+
+        fn describe(&self) -> String {
+            "refreshed".into()
+        }
+    }
 
     /// A shell on one commits screen, with whatever picker is named open and
     /// one key of a chord half-typed — the state `esc` meets most often.
@@ -1834,18 +2226,19 @@ mod tests {
             let jobs = Runner::new();
             DevShell {
                 which: "commits",
-                stack: vec![Screen::Commits {
-                    view: commits,
-                    source: Source::Fixtures,
-                    generation: Generation::default(),
-                    label: "repo".into(),
-                }],
+                panes: panes::Panes::new(
+                    "commits",
+                    Screen::commits(commits, Source::Fixtures, Generation::default(), "repo"),
+                ),
                 stats: None,
                 rediff: None,
                 repo: None,
                 submitter: jobs.submitter(),
                 jobs,
                 generation: Generation::default(),
+                refresh_id: 0,
+                refresh_pending: 0,
+                refresh_error: None,
                 running: None,
                 input: None,
                 over: Default::default(),
@@ -1882,35 +2275,242 @@ mod tests {
                     s.pending.is_empty(),
                     "{which:?}: the half-typed chord survived"
                 );
-                assert_eq!(s.stack.len(), 1, "{which:?}: esc popped the screen too");
+                assert_eq!(s.panes.len(), 1, "{which:?}: esc closed the pane too");
                 assert!(!s.help, "{which:?}: esc reached past the menu");
             });
         }
     }
 
     #[gpui::test]
-    fn esc_without_a_picker_still_leaves_the_screen_the_innermost_exit(cx: &mut TestAppContext) {
-        // The control: nothing open, two screens stacked — back pops to the
-        // first and no further.
+    fn esc_without_a_picker_closes_only_the_focused_secondary_pane(cx: &mut TestAppContext) {
+        // The control: nothing open, two panes — back closes the focused
+        // secondary and never closes the root.
         let shell = shell(None, cx);
         shell.update(cx, |s, cx| {
             let commits = cx.new(|_| Commits::new(Vec::new(), Rc::new(Host::new())));
-            s.stack.push(Screen::Commits {
-                view: commits,
-                source: Source::Fixtures,
-                generation: Generation::default(),
-                label: "second".into(),
-            });
+            s.panes.register(
+                "second",
+                Screen::commits(commits, Source::Fixtures, Generation::default(), "second"),
+            );
+            s.sync_modes();
         });
-        assert_eq!(shell.read_with(cx, |s, _| s.stack.len()), 2);
+        assert_eq!(shell.read_with(cx, |s, _| s.panes.len()), 2);
         shell.update(cx, |s, cx| s.back(cx));
         shell.read_with(cx, |s, _| {
-            assert_eq!(s.stack.len(), 1, "the top screen was not popped");
+            assert_eq!(s.panes.len(), 1, "the secondary pane was not closed");
             assert!(s.open.is_none());
         });
         // And on the last screen esc stops: it was never a quit.
         shell.update(cx, |s, cx| s.back(cx));
-        shell.read_with(cx, |s, _| assert_eq!(s.stack.len(), 1));
+        shell.read_with(cx, |s, _| assert_eq!(s.panes.len(), 1));
+    }
+
+    #[gpui::test]
+    fn pane_commands_move_focus_and_rebuild_the_effective_modes(cx: &mut TestAppContext) {
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, cx| {
+            let commits = cx.new(|_| Commits::new(Vec::new(), Rc::new(Host::new())));
+            shell.panes.register(
+                "second",
+                Screen::commits(commits, Source::Fixtures, Generation::default(), "second"),
+            );
+            shell.sync_modes();
+        });
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.active_label().as_ref(), "second");
+            assert_eq!(shell.modes.top(), "commits");
+        });
+
+        shell.update(cx, |shell, cx| shell.run_command("pane.prev", cx));
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.active_label().as_ref(), "repo");
+            assert_eq!(shell.modes.as_slice(), &["global", panes::MODE, "commits"]);
+            let mut keys = Keymap::builtin();
+            keys.bind("commits", "ctrl-j", "view.down").unwrap();
+            assert_eq!(
+                keys.resolve(
+                    &shell.modes,
+                    &[Key::new(Code::Char('j'), true, false, false)]
+                ),
+                Resolve::Run("view.down"),
+                "the focused tenant did not override the pane container"
+            );
+        });
+
+        shell.update(cx, |shell, cx| shell.run_command("pane.next", cx));
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.active_label().as_ref(), "second");
+            assert_eq!(shell.panes.focused_index(), 1);
+        });
+    }
+
+    #[gpui::test]
+    fn a_compiled_in_extension_registers_a_pane_without_a_screen_variant(cx: &mut TestAppContext) {
+        let shell = shell(None, cx);
+        let view = cx.new(|_| Commits::new(Vec::new(), Rc::new(Host::new())));
+        let ran = Rc::new(Cell::new(false));
+        let refreshed = Rc::new(Cell::new(Generation::default()));
+        let target = successful_generation();
+        shell.update(cx, |shell, cx| {
+            cx.set_global(config::Active(Rc::new(Host::new())));
+            shell.register_pane(
+                "extension",
+                ExtensionPane {
+                    view,
+                    ran: ran.clone(),
+                    generation: refreshed.clone(),
+                },
+                cx,
+            );
+            shell.run_command("extension.toggle", cx);
+            shell.repo = Some((
+                PathBuf::from("/fake"),
+                Arc::new(RefreshRepo {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                }),
+            ));
+            shell.generation = target;
+            shell.refresh_stale(cx);
+        });
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.active_label().as_ref(), "extension pane");
+            assert_eq!(shell.active_view_name(), "extension");
+            assert_eq!(shell.panes.len(), 2);
+        });
+        assert!(ran.get(), "the extension's command did not reach its pane");
+        assert_eq!(refreshed.get(), target);
+    }
+
+    #[gpui::test]
+    fn one_generation_refreshes_every_visible_repository_pane(cx: &mut TestAppContext) {
+        let shell = shell(None, cx);
+        let generation = successful_generation();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let path = PathBuf::from("/fake");
+        let source = Source::Repo {
+            path: path.clone(),
+            arg: "1".into(),
+        };
+        shell.update(cx, |shell, cx| {
+            let root = cx.new(|_| Commits::new(Vec::new(), Rc::new(Host::new())));
+            shell.panes = panes::Panes::new(
+                "commits",
+                Screen::commits(root, source.clone(), Generation::default(), "stale root"),
+            );
+            let second = cx.new(|_| Commits::new(Vec::new(), Rc::new(Host::new())));
+            shell.panes.register(
+                "second",
+                Screen::commits(second, source.clone(), Generation::default(), "stale"),
+            );
+            shell.repo = Some((
+                path,
+                Arc::new(RefreshRepo {
+                    calls: calls.clone(),
+                }),
+            ));
+            shell.generation = generation;
+            shell.running = Some("running next write".into());
+            cx.set_global(config::Active(Rc::new(Host::new())));
+            shell.refresh_stale(cx);
+        });
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "repository refresh blocked the GPUI update"
+        );
+        cx.run_until_parked();
+
+        shell.read_with(cx, |shell, cx| {
+            for pane in shell.panes.iter() {
+                let Screen::Commits {
+                    view,
+                    generation: pane_generation,
+                    ..
+                } = pane
+                else {
+                    panic!("test registered only commit panes");
+                };
+                assert_eq!(view.read(cx).total(), 1);
+                assert_eq!(pane_generation.get(), generation);
+            }
+            assert!(shell.error.is_none());
+            assert_eq!(shell.refresh_pending, 0);
+            assert_eq!(shell.running.as_deref(), Some("running next write"));
+        });
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[gpui::test]
+    fn two_registered_panes_are_stacked_into_equal_nonzero_boxes(cx: &mut TestAppContext) {
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, cx| {
+            let commits = cx.new(|_| Commits::new(Vec::new(), Rc::new(Host::new())));
+            shell.panes.register(
+                "second",
+                Screen::commits(commits, Source::Fixtures, Generation::default(), "second"),
+            );
+            shell.sync_modes();
+        });
+        let observed = shell.clone();
+        let handle = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_global(config::Active(Rc::new(Host::new())));
+            cx.open_window(
+                gpui::WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds {
+                        origin: Default::default(),
+                        size: gpui::size(gpui::px(800.0), gpui::px(600.0)),
+                    })),
+                    ..Default::default()
+                },
+                move |_, _| shell,
+            )
+            .unwrap()
+        });
+        let mut cx = gpui::VisualTestContext::from_window(handle.into(), cx);
+        cx.run_until_parked();
+        let first = cx.debug_bounds("pane-0").expect("first pane was not drawn");
+        let second = cx
+            .debug_bounds("pane-1")
+            .expect("second pane was not drawn");
+
+        assert!(first.size.height > gpui::px(0.0));
+        assert!(second.size.height > gpui::px(0.0));
+        assert_eq!(first.origin.x, second.origin.x);
+        assert_eq!(first.size.width, second.size.width);
+        assert_eq!(first.bottom(), second.top());
+        assert!(
+            (f32::from(first.size.height) - f32::from(second.size.height)).abs() < 1.0,
+            "pane heights differ: {} and {}",
+            first.size.height,
+            second.size.height
+        );
+
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: first.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.0), gpui::px(1.0))),
+            ..Default::default()
+        });
+        assert_eq!(
+            observed.read_with(&cx, |shell, _| shell.panes.focused_index()),
+            0
+        );
+        cx.simulate_click(second.center(), gpui::Modifiers::default());
+        assert_eq!(
+            observed.read_with(&cx, |shell, _| shell.panes.focused_index()),
+            1
+        );
+        cx.simulate_click(first.center(), gpui::Modifiers::default());
+        assert_eq!(
+            observed.read_with(&cx, |shell, _| shell.panes.focused_index()),
+            0
+        );
+        cx.simulate_keystrokes("ctrl-j");
+        assert_eq!(
+            observed.read_with(&cx, |shell, _| shell.panes.focused_index()),
+            1
+        );
     }
 
     #[gpui::test]

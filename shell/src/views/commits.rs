@@ -30,6 +30,14 @@ struct Data {
     lines: Vec<String>,
 }
 
+/// Repository data with every view-independent graph and row derivation already
+/// completed. Pane refresh builds this on the background executor; applying it
+/// only restores semantic viewport anchors and swaps one `Rc`.
+pub(crate) struct Prepared {
+    data: Data,
+    load: String,
+}
+
 pub struct Commits {
     data: Rc<Data>,
     scroll: UniformListScrollHandle,
@@ -241,9 +249,9 @@ impl Commits {
 
 impl Commits {
     pub fn new(commits: Vec<Commit>, host: Rc<Host>) -> Self {
-        let (data, load) = build_data(commits, &host);
+        let Prepared { data, load } = prepare(commits, &host);
         Self {
-            data,
+            data: Rc::new(data),
             scroll: UniformListScrollHandle::new(),
             view: Rc::new(Cell::new(Viewport::new())),
             synced: Rc::new(Cell::new(0.0)),
@@ -255,14 +263,20 @@ impl Commits {
     }
 
     /// Replaces repository data while keeping semantic commit anchors.
+    #[cfg(test)]
     pub fn replace(&mut self, commits: Vec<Commit>, host: &Host) {
+        let prepared = prepare(commits, host);
+        self.replace_prepared(prepared, host);
+    }
+
+    pub(crate) fn replace_prepared(&mut self, prepared: Prepared, host: &Host) {
         self.reconcile(host);
         let old = self.view.get();
         let cursor_sha = self.data.commits.get(old.cursor()).map(|c| c.sha.clone());
         let top_sha = self.data.commits.get(old.top()).map(|c| c.sha.clone());
         let old_cursor = old.cursor();
         let old_top = old.top();
-        let (data, load) = build_data(commits, host);
+        let Prepared { data, load } = prepared;
         let cursor = cursor_sha
             .as_deref()
             .and_then(|sha| data.commits.iter().position(|c| c.sha == sha))
@@ -271,7 +285,7 @@ impl Commits {
             .as_deref()
             .and_then(|sha| data.commits.iter().position(|c| c.sha == sha))
             .unwrap_or(old_top);
-        self.data = data;
+        self.data = Rc::new(data);
         self.load = load;
 
         let mut view = old;
@@ -300,7 +314,7 @@ impl Commits {
     }
 }
 
-fn build_data(commits: Vec<Commit>, host: &Host) -> (Rc<Data>, String) {
+pub(crate) fn prepare(commits: Vec<Commit>, host: &Host) -> Prepared {
     let t = std::time::Instant::now();
     let rows = assign_lanes(&commits);
     let t_lanes = t.elapsed();
@@ -346,8 +360,8 @@ fn build_data(commits: Vec<Commit>, host: &Host) -> (Rc<Data>, String) {
     );
     eprintln!("{load}");
 
-    (
-        Rc::new(Data {
+    Prepared {
+        data: Data {
             lines: commits
                 .iter()
                 .map(|c| format!("{} {}", c.short, c.subject))
@@ -356,9 +370,9 @@ fn build_data(commits: Vec<Commit>, host: &Host) -> (Rc<Data>, String) {
             draws,
             who,
             widest,
-        }),
+        },
         load,
-    )
+    }
 }
 
 impl Render for Commits {
