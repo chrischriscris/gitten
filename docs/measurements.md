@@ -427,7 +427,7 @@ Peak RSS read off `/usr/bin/time -l target/release/examples/bench`.
 
 | stage | main | branch | Δ |
 |---|---|---|---|
-| parse `log.txt`, 1M commits | 272 ms | 302 ms | **+11.1 %** |
+| parse `log.txt`, 1M commits | 263 ms | 286 ms | **+8.7 %** |
 | assign lanes | 195 ms | 189 ms | −2.7 % |
 | intraline, 142,858 replace-pairs | 372 ms | 374 ms | noise |
 | syntax highlighting | 292 ms | 286 ms | noise |
@@ -441,13 +441,39 @@ runs spread under half a megabyte. Most of the win is line text — a loaded dif
 held each line as several independent heap strings, and now holds one buffer per
 distinct text with counts beside it.
 
-The parse regression is the pass's one deliberate trade. Authors are interned
-through a `HashMap<&str, Arc<str>>` keyed on the borrowed field — one copy per
-distinct author instead of one per commit — so a million commits pay a SipHash
-of the name apiece, and on this fixture hashing costs ~30 ns a commit more than
-cloning did. Most of it would buy itself back with a cheaper hasher in that one
-map: `core` takes no dependencies, but a fifteen-line FNV `Hasher` is std-only.
-Recorded as follow-up, not smuggled in here.
+Re-checked in a second sitting before merge — same machine, same fixtures,
+independent A/B against the same base vintage. Peak RSS reproduced to the
+megabyte; `align` −32 % and wrap −9 %. Parse came in higher than the table:
++10–12 % against main, so read that row as the low edge of what reproduces and
+the trade as ~+11 %.
+
+The parse regression is the pass's one deliberate trade, and it took three
+measurements to attribute correctly. The first cut read +11 % and looked like
+the intern map's hashing; a cheaper hasher (`FxHasher`, `core::parse_log`) was
+tried against that and is kept — hashing short names with SipHash was the
+obviously wasteful half — but an A/B either side of it measures no separable
+end-to-end effect: the two sit within run noise. What survived attribution:
+deleting the map entirely changes nothing — **a mapless variant parses at the
+same speed** — which moves the cost to where it actually lives: `Arc<str>`
+construction itself. In among
+`parse_log`'s other allocations an author-sized `Arc` runs ~25 ns a commit
+against ~14 for `String::to_string`, and that price is the representation this
+pass exists to buy: one shared buffer per distinct name instead of one heap
+string per commit, plus sixteen fewer bytes of `Commit` per row — tens of MB on
+a million-commit history, nothing on seven authors. The escape hatch, if the
+time ever matters more than the memory, is reverting `Commit.author` to
+`String`; measured here so whoever pulls it knows what each side costs.
+
+| parse variant (1M-commit fixture) | ms |
+|---|---|
+| `String::to_string` per commit (`main`) | 239 |
+| `Arc<str>`, interned through a hash map | 268 |
+| `Arc<str>`, no map | 272 |
+
+Measured outside the workspace with the real `parse_log` on the real fixture,
+three interleaved rounds a side — the micro-benchmark that first "explained"
+the gap (a loop doing nothing but the author construction) undershot it 3×,
+which is exactly why attribution ran on the real function.
 
 `align` and wrap got faster for free. Both walk spans and line text, and both
 moved from owned `String`s to compact `u32` ranges beside one buffer — better

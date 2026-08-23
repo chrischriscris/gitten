@@ -5,6 +5,7 @@
 //! something in here needs to know what a window is, the boundary is gone.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 
 pub mod align;
@@ -43,14 +44,53 @@ pub struct Commit {
 /// Parses the output of `fixtures/dump.sh` (see that script for the format).
 /// Fields are \x1f-separated, records \x1e-separated — control characters git
 /// will never emit inside a subject, so there is nothing to escape.
+/// The hash behind the author intern map: rustc's own Fx construction, a
+/// rotate-xor-multiply over eight-byte chunks. `HashMap`'s default SipHash
+/// cost more per lookup than the rest of the interning put together on short
+/// names — measured at about a third of `parse_log`'s regression before this
+/// replaced it. Not cryptographic, and it does not need to be: a collision
+/// only costs a probe, because the map compares the real bytes either way.
+/// The 0xff terminator keeps `"ab" + "c"` and `"abc"` apart in one stream, as
+/// `str`'s default hash does.
+#[derive(Default)]
+struct FxHasher {
+    hash: u64,
+}
+
+const FX_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+
+impl Hasher for FxHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut buf = [0u8; 8];
+            buf[..chunk.len()].copy_from_slice(chunk);
+            self.hash =
+                (self.hash.rotate_left(5) ^ u64::from_le_bytes(buf)).wrapping_mul(FX_SEED);
+        }
+    }
+    fn write_u8(&mut self, b: u8) {
+        self.hash = (self.hash.rotate_left(5) ^ u64::from(b)).wrapping_mul(FX_SEED);
+    }
+    // `str`'s default hash walks `write` then `write_u8(0xff)` — the same
+    // stream this type would produce, so no override needed.
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+}
+
 pub fn parse_log(raw: &str) -> Vec<Commit> {
     // Counting separators first costs one byte scan and buys a right-sized
     // vector: at 100k commits the growth path was re-copying the whole list
     // several times over.
     let mut out = Vec::with_capacity(raw.bytes().filter(|b| *b == b'\x1e').count() + 1);
     // Interned on the borrowed field: a repeat costs one hash lookup and no
-    // allocation, and the keys borrow `raw`, which lives past the loop.
-    let mut authors: HashMap<&str, Arc<str>> = HashMap::new();
+    // allocation, and the keys borrow `raw`, which lives past the loop. Hashed
+    // with [`FxHasher`] — see there for why the default hasher lost money —
+    // and sized for a real history up front: growing this table mid-parse
+    // rehashed everything parsed so far, twice, on the way to a few thousand
+    // authors.
+    let mut authors: HashMap<&str, Arc<str>, BuildHasherDefault<FxHasher>> =
+        HashMap::with_capacity_and_hasher(4096, BuildHasherDefault::default());
     for rec in raw.split('\u{1e}') {
         let rec = rec.trim();
         if rec.is_empty() {
