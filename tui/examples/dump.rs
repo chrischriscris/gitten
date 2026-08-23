@@ -84,7 +84,7 @@ fn main() {
                 repo => {
                     let spec = rest.unwrap_or_default();
                     match plait_git::diff(
-                        &PathBuf::from(repo),
+                        plait_git::open(&PathBuf::from(repo)).as_ref(),
                         &spec,
                         &host.differ,
                         &Default::default(),
@@ -122,7 +122,7 @@ fn main() {
                 "--fixtures" => plait_core::parse_log(&read("fixtures/log.txt")),
                 repo => {
                     let limit = rest.and_then(|n| n.parse().ok()).unwrap_or(5000);
-                    match plait_git::log(&PathBuf::from(repo), limit) {
+                    match plait_git::open(&PathBuf::from(repo)).log(limit) {
                         Ok(c) => c,
                         Err(e) => {
                             eprintln!("plait: {e}");

@@ -17,6 +17,7 @@ use crate::cli::{Source, View};
 use plait_core::differ::Overrides;
 use plait_core::host::Host;
 use plait_core::{Commit, FileDiff};
+use plait_git::Repo;
 use std::path::Path;
 
 /// Where the fixtures live, for a client that wants to say so in an error.
@@ -63,22 +64,35 @@ pub fn read_fixture(path: &str) -> String {
 
 /// Acquires the data for one view of one source.
 ///
+/// The repository comes in, injected: every read goes through the caller's
+/// [`Repo`] handle and this function never opens one itself. That is what
+/// makes it testable without a repository at all — a fake in — and what lets a
+/// client keep one handle alive across every acquisition it makes. `None` for
+/// a `Source::Repo` is an error rather than an open, because inventing a
+/// handle here would quietly defeat the one a client is holding.
+///
 /// Errors are strings a client prints beside its usage, because every one of
 /// them is something the person typing can fix: a path that is not a
 /// repository, a revspec with nothing in it, a fixture that has not been
 /// generated.
-pub fn acquire(view: View, source: &Source, host: &Host) -> Result<Loaded, String> {
+pub fn acquire(
+    view: View,
+    source: &Source,
+    host: &Host,
+    repo: Option<&dyn Repo>,
+) -> Result<Loaded, String> {
     match (view, source) {
         (View::Diff, Source::Repo { path, arg }) => {
+            let repo = repo_else(path, repo)?;
             // The label is one more `git` process and the last thing anyone is
             // waiting for, so it runs *beside* acquisition rather than behind
             // it: one spawn floor (~7ms) off every repository open. `describe`
             // is infallible, so joining it afterwards is all the coordination
-            // there is — and a scope thread borrows `path` for exactly as long
-            // as this call.
+            // there is — and a scope thread borrows for exactly as long as
+            // this call.
             std::thread::scope(|s| {
-                let title = s.spawn(|| describe(path, arg));
-                let files = plait_git::diff(path, arg, &host.differ, &Overrides::default())?;
+                let title = s.spawn(|| describe(repo, arg));
+                let files = plait_git::diff(repo, arg, &host.differ, &Overrides::default())?;
                 if files.is_empty() {
                     let what = match arg.is_empty() {
                         true => "(working tree)",
@@ -107,11 +121,12 @@ pub fn acquire(view: View, source: &Source, host: &Host) -> Result<Loaded, Strin
             })
         }
         (View::Commits, Source::Repo { path, arg }) => {
+            let repo = repo_else(path, repo)?;
             // Beside, not behind: the same overlap the diff view has, because
             // the graph waits on `git log` either way.
             std::thread::scope(|s| {
-                let title = s.spawn(|| plait_git::describe(path));
-                let commits = plait_git::log(path, arg.parse().unwrap_or(5000))?;
+                let title = s.spawn(|| repo.describe());
+                let commits = repo.log(arg.parse().unwrap_or(5000))?;
                 if commits.is_empty() {
                     return Err(format!("no commits in {}", path.display()));
                 }
@@ -147,16 +162,98 @@ fn joined(title: std::thread::ScopedJoinHandle<'_, String>) -> String {
         .unwrap_or_else(|p| std::panic::resume_unwind(p))
 }
 
-fn describe(repo: &Path, revspec: &str) -> String {
-    format!("{} {revspec}", plait_git::describe(repo))
-        .trim()
-        .into()
+/// The injected handle, or an error naming what was asked for.
+///
+/// The only way through is a handle the caller holds; there is no fallback
+/// open here, or a client's own handle would be silently ignored whenever a
+/// path happened to be present.
+fn repo_else<'a>(path: &Path, repo: Option<&'a dyn Repo>) -> Result<&'a dyn Repo, String> {
+    repo.ok_or_else(|| format!("no repository opened for {}", path.display()))
+}
+
+fn describe(repo: &dyn Repo, revspec: &str) -> String {
+    format!("{} {revspec}", repo.describe()).trim().into()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use plait_core::status::Status;
+    use plait_git::{Handle, Pair};
     use std::path::PathBuf;
+    use std::sync::Arc;
+
+    /// A repository that exists only as this struct. Every assertion these
+    /// tests make lands on data it produced, which is what proves acquisition
+    /// goes through the injected handle and never around it.
+    struct Fake {
+        label: &'static str,
+    }
+
+    impl Default for Fake {
+        fn default() -> Self {
+            Self {
+                label: "fake (main)",
+            }
+        }
+    }
+
+    fn commit(sha: &str) -> Commit {
+        Commit {
+            sha: sha.into(),
+            short: sha.into(),
+            parents: Box::from(&[][..]),
+            author: "fake".into(),
+            timestamp: 0,
+            subject: "from the fake".into(),
+        }
+    }
+
+    impl Repo for Fake {
+        fn log(&self, limit: usize) -> plait_git::Result<Vec<Commit>> {
+            // Honours the limit, so a caller's argument is observable.
+            Ok((0..limit.min(2))
+                .map(|i| commit(&format!("f{i}")))
+                .collect())
+        }
+
+        fn pairs(&self, _revspec: &str) -> plait_git::Result<Vec<Pair>> {
+            // Two changes separated by ten shared lines: narrow context keeps
+            // them as two hunks, wide context merges them into one — which is
+            // what makes the host's configured context observable through
+            // acquisition without any repository at all.
+            let mut old: Vec<Arc<str>> = vec!["changed here".into()];
+            let mut new: Vec<Arc<str>> = vec!["CHANGED HERE".into()];
+            for i in 0..10 {
+                let line: Arc<str> = format!("shared {i}").into();
+                old.push(Arc::clone(&line));
+                new.push(line);
+            }
+            old.push("and there".into());
+            new.push("AND THERE".into());
+            Ok(vec![Pair {
+                path: "fake.txt".into(),
+                old_path: None,
+                status: 'M',
+                old,
+                new,
+                binary: false,
+            }])
+        }
+
+        fn status(&self) -> plait_git::Result<Status> {
+            Ok(Status::default())
+        }
+
+        fn describe(&self) -> String {
+            self.label.into()
+        }
+    }
+
+    /// A real handle against a path, for the tests that want actual git.
+    fn real(path: &str) -> Handle {
+        plait_git::open(Path::new(path))
+    }
 
     fn here() -> Source {
         Source::Repo {
@@ -166,9 +263,67 @@ mod tests {
     }
 
     #[test]
+    fn an_injected_repo_is_the_one_asked() {
+        // `/nonexistent` cannot be read by anything; if this succeeds, every
+        // byte of it came from the fake.
+        let source = Source::Repo {
+            path: PathBuf::from("/nonexistent"),
+            arg: "3".into(),
+        };
+        let loaded = acquire(View::Commits, &source, &Host::new(), Some(&Fake::default()))
+            .expect("the fake has history");
+        let Data::Commits(commits) = loaded.data else {
+            panic!("a commits view loads commits");
+        };
+        assert_eq!(commits.len(), 2, "the fake honours the parsed limit");
+        // The commits view labels with the repository alone; only a diff
+        // names its revspec.
+        assert_eq!(loaded.label, "fake (main)");
+    }
+
+    #[test]
+    fn the_injected_repos_pairs_are_diffed_by_the_configured_differ() {
+        // Same fake pairs twice, two context settings: only the host's differ
+        // can be responsible for the hunk counts differing.
+        let count = |context: usize| {
+            let mut host = Host::new();
+            host.differ.context = context;
+            let loaded = acquire(
+                View::Diff,
+                &Source::Repo {
+                    path: PathBuf::from("/nonexistent"),
+                    arg: String::new(),
+                },
+                &host,
+                Some(&Fake::default()),
+            )
+            .unwrap();
+            let Data::Diff(files) = loaded.data else {
+                panic!("a diff view loads files");
+            };
+            assert_eq!(files[0].path, "fake.txt");
+            files[0].hunks.len()
+        };
+        assert_eq!(count(1), 2, "narrow context keeps two hunks apart");
+        assert_eq!(count(12), 1, "wide context merges them");
+    }
+
+    #[test]
+    fn a_repo_source_without_a_handle_is_an_error_and_not_an_open() {
+        let source = Source::Repo {
+            path: PathBuf::from("."),
+            arg: String::new(),
+        };
+        let err = acquire(View::Commits, &source, &Host::new(), None).unwrap_err();
+        assert!(err.contains("no repository opened"), "{err}");
+    }
+
+    #[test]
     fn a_diff_of_this_repository_arrives_as_parsed_files() {
         let host = Host::new();
-        let loaded = acquire(View::Diff, &here(), &host).expect("this repo has history");
+        let repo = real(".");
+        let loaded = acquire(View::Diff, &here(), &host, Some(repo.as_ref()))
+            .expect("this repo has history");
         assert!(!loaded.data.is_empty());
         assert!(matches!(loaded.data, Data::Diff(_)));
         assert!(!loaded.label.is_empty(), "a title bar has nothing to say");
@@ -181,10 +336,11 @@ mod tests {
         let mut host = Host::new();
         assert!(host.differ.select("myers"));
         host.differ.context = 1;
-        let a = acquire(View::Diff, &here(), &host).unwrap();
+        let repo = real(".");
+        let a = acquire(View::Diff, &here(), &host, Some(repo.as_ref())).unwrap();
         let mut other = Host::new();
         other.differ.context = 12;
-        let b = acquire(View::Diff, &here(), &other).unwrap();
+        let b = acquire(View::Diff, &here(), &other, Some(repo.as_ref())).unwrap();
         let hunks = |l: &Loaded| match &l.data {
             Data::Diff(f) => f.iter().map(|f| f.hunks.len()).sum::<usize>(),
             _ => 0,
@@ -198,12 +354,13 @@ mod tests {
     #[test]
     fn a_path_that_is_not_a_repository_is_a_message_and_not_a_panic() {
         let host = Host::new();
+        let repo = real("/nonexistent");
         let source = Source::Repo {
             path: PathBuf::from("/nonexistent"),
             arg: String::new(),
         };
-        assert!(acquire(View::Commits, &source, &host).is_err());
-        assert!(acquire(View::Diff, &source, &host).is_err());
+        assert!(acquire(View::Commits, &source, &host, Some(repo.as_ref())).is_err());
+        assert!(acquire(View::Diff, &source, &host, Some(repo.as_ref())).is_err());
     }
 
     #[test]
@@ -215,7 +372,7 @@ mod tests {
             path: PathBuf::from("."),
             arg: "HEAD..HEAD".into(),
         };
-        let err = acquire(View::Diff, &source, &host).unwrap_err();
+        let err = acquire(View::Diff, &source, &host, Some(real(".").as_ref())).unwrap_err();
         assert!(err.contains("HEAD..HEAD"), "{err}");
     }
 
@@ -224,7 +381,7 @@ mod tests {
         // Only meaningful from a directory without fixtures, so assert on the
         // shape of the message rather than on whether this run has them.
         let host = Host::new();
-        if let Err(e) = acquire(View::Diff, &Source::Fixtures, &host) {
+        if let Err(e) = acquire(View::Diff, &Source::Fixtures, &host, None) {
             assert!(e.contains("fixtures/"), "{e}");
             assert!(
                 e.contains("./fixtures/"),
@@ -240,7 +397,7 @@ mod tests {
             path: PathBuf::from("."),
             arg: "3".into(),
         };
-        let loaded = acquire(View::Commits, &source, &host).unwrap();
+        let loaded = acquire(View::Commits, &source, &host, Some(real(".").as_ref())).unwrap();
         assert_eq!(loaded.data.len(), 3);
     }
 }

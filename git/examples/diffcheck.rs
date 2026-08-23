@@ -44,7 +44,7 @@ fn main() {
     let revspec = args.next().unwrap_or_default();
 
     let t = Instant::now();
-    let pairs = match plait_git::pairs(&repo, &revspec) {
+    let pairs = match plait_git::open(&repo).pairs(&revspec) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("{e}");

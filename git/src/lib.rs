@@ -6,6 +6,21 @@
 //! permanently, because shelling out is what gets hooks, credential helpers and
 //! `.gitconfig` semantics exactly right.
 //!
+//! # One surface: [`Repo`]
+//!
+//! Free functions grew here first because there was nothing to hide behind.
+//! Now every read goes through the [`Repo`] trait, held as a shared
+//! [`Handle`], and the binary-backed implementation is private: an
+//! implementation may be this subprocess, gix later, or a test's fake, and no
+//! caller can tell which ran. That is also what makes the reads swappable per
+//! repository rather than per process — one handle each, opened once, kept for
+//! the life of a client.
+//!
+//! Diff *assembly* is deliberately not on the trait. [`diff`] turns whatever
+//! any implementation's `pairs` into `FileDiff`s through the configured
+//! differ registry, and no `Repo` may substitute its own algorithm — see that
+//! function for why.
+//!
 //! # Why this fetches file contents rather than a diff
 //!
 //! `git diff` will happily hand over a finished unified diff, and this crate
@@ -29,9 +44,13 @@
 //! never changes, so a diff keyed on the pair of them is cacheable forever.
 
 use plait_core::differ::{Differs, Overrides};
+use plait_core::status::{
+    Change, ConflictEntry, ConflictKind, Kind, PathBytes, StagedEntry, Status, Submodule,
+    UnstagedEntry, UntrackedEntry,
+};
 use plait_core::{parse_log, Commit, FileDiff};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -66,23 +85,274 @@ fn run(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
-/// Commit history, newest first.
+// ------------------------------------------------------------------- the seam
+
+/// One repository, as everything behind a client sees it.
 ///
-/// `--topo-order` is not optional: lane assignment assumes it, and without it
-/// branches interleave and the graph is drawn wrong.
-pub fn log(repo: &Path, limit: usize) -> Result<Vec<Commit>> {
-    let n = limit.to_string();
-    let bytes = run(
-        repo,
-        &[
-            "log",
-            "--topo-order",
-            "-n",
-            &n,
-            &format!("--format={LOG_FORMAT}"),
-        ],
-    )?;
-    Ok(parse_log(&String::from_utf8_lossy(&bytes)))
+/// Reads only, for now — writes become verbs on this same trait when they
+/// exist, which is the point of having it. Nothing here hands out a path or a
+/// process, so an implementation can be this crate's subprocess, gix, or a
+/// test's fake, and no frontend is ever the wiser.
+///
+/// Object-safe on purpose, and never generic over its implementation: callers
+/// hold a [`Handle`] — a reference — so one opened repository serves every
+/// view, reload and re-acquire a client makes without threading a concrete
+/// type through all of them.
+pub trait Repo: Send + Sync {
+    /// Commit history, newest first.
+    ///
+    /// `--topo-order` is not optional: lane assignment assumes it, and without
+    /// it branches interleave and the graph is drawn wrong.
+    fn log(&self, limit: usize) -> Result<Vec<Commit>>;
+
+    /// Every changed file for `revspec`, as the two versions of its content.
+    ///
+    /// `revspec` is anything git accepts — `HEAD~50..HEAD`, a single sha,
+    /// `main..feature`. Empty means the working tree against HEAD, with
+    /// untracked files included; a revspec compares two commits, and neither
+    /// has untracked files in it.
+    fn pairs(&self, revspec: &str) -> Result<Vec<Pair>>;
+
+    /// The working tree against HEAD and the index: staged, unstaged,
+    /// untracked and conflicted, each list its own answer. See
+    /// [`plait_core::status`] for the model and why the four are separate.
+    fn status(&self) -> Result<Status>;
+
+    /// A short label for the window title.
+    ///
+    /// Infallible: a repository whose branch cannot be read still has a name.
+    fn describe(&self) -> String;
+}
+
+/// A shared handle to one opened repository.
+///
+/// What callers actually hold. Cheap to clone — a refcount bump — and usable
+/// from any thread, which is what lets acquisition overlap its own pieces
+/// internally while a client treats the whole thing as one value.
+pub type Handle = Arc<dyn Repo>;
+
+/// Opens a repository through this crate's binary-backed implementation.
+///
+/// Infallible on purpose: opening runs nothing, so a directory that is not a
+/// repository fails at the first read, in the same words it always failed
+/// there. An eager check would put another process on the road to the first
+/// frame to learn something the first read says anyway.
+pub fn open(root: &Path) -> Handle {
+    Arc::new(Binary {
+        root: root.to_path_buf(),
+    })
+}
+
+/// The shipped implementation: the `git` binary.
+///
+/// Private on purpose. It is *an* answer to [`Repo`], not the surface; the day
+/// gix takes over the reads, this type dies or shrinks and nothing outside the
+/// crate notices.
+struct Binary {
+    root: PathBuf,
+}
+
+impl Repo for Binary {
+    fn log(&self, limit: usize) -> Result<Vec<Commit>> {
+        let n = limit.to_string();
+        let bytes = run(
+            &self.root,
+            &[
+                "log",
+                "--topo-order",
+                "-n",
+                &n,
+                &format!("--format={LOG_FORMAT}"),
+            ],
+        )?;
+        Ok(parse_log(&String::from_utf8_lossy(&bytes)))
+    }
+
+    fn pairs(&self, revspec: &str) -> Result<Vec<Pair>> {
+        // `-z` for NUL-separated paths, because a path may contain anything a
+        // filesystem allows and git otherwise quotes and escapes it. `-M` so a
+        // rename arrives as one file with two names instead of a delete and an
+        // add of an identical blob.
+        //
+        // `--abbrev=64` is load-bearing and looks like a no-op: `--raw` abbreviates
+        // OIDs by default, and `cat-file --batch` echoes back the *full* OID in its
+        // response header, so an abbreviated request cannot be matched to its
+        // answer. 64 is clamped to whatever the repository's hash length actually
+        // is, which makes this right for SHA-256 repositories too.
+        const RAW: [&str; 5] = ["--raw", "-z", "-M", "--abbrev=64", "--no-ext-diff"];
+        let raw = if revspec.is_empty() {
+            run(&self.root, &[&["diff"], &RAW[..], &["HEAD"]].concat())?
+        } else if revspec.contains("..") {
+            run(&self.root, &[&["diff"], &RAW[..], &[revspec]].concat())?
+        } else {
+            // A bare revision means "what did this commit change".
+            run(
+                &self.root,
+                &[&["show"], &RAW[..], &["--format=", revspec]].concat(),
+            )?
+        };
+
+        let changes = parse_raw(&String::from_utf8_lossy(&raw));
+
+        // Every blob the whole diff needs, fetched by one `cat-file --batch` —
+        // but held one file at a time. The batch answers strictly in request
+        // order (it reads one OID and writes one answer before reading the
+        // next), and requests go out in pair order, old side then new, so the
+        // answers can be pulled back per file as each [`Pair`] is built instead
+        // of parking every old+new blob of the diff in a map until the last one.
+        // On a thousand-file diff that map was tens of MB of pure peak overlap.
+        // A duplicate OID costs a second read rather than a second copy, which is
+        // the trade the map made implicitly.
+        let mut wanted: Vec<&str> = Vec::with_capacity(changes.len() * 2);
+        for c in &changes {
+            for (mode, oid) in [(&c.old_mode, &c.old_oid), (&c.new_mode, &c.new_oid)] {
+                if fetchable(mode, oid) {
+                    wanted.push(oid);
+                }
+            }
+        }
+
+        // The working-tree pair wants blobs *and* a status, and the two are
+        // independent — status reads the index and the working tree, the batch
+        // fetches OIDs the diff has already named — so they run side by side and
+        // an open of uncommitted work pays one spawn floor instead of two. Nothing
+        // is shared between them but this handle's root, and neither touches what
+        // the other reads. The stream's errors surface first, as `cat-file`'s did
+        // when both ran in sequence: a failure to start comes back before any
+        // answer is read, and the first failed answer below comes back before
+        // status is asked for. A panic in either is resumed rather than swallowed
+        // because both calls used to be inline.
+        let (blobs, loose) = if revspec.is_empty() {
+            std::thread::scope(|s| {
+                let loose = s.spawn(|| self.status());
+                let blobs = BlobStream::start(&self.root, &wanted);
+                (
+                    blobs,
+                    loose
+                        .join()
+                        .unwrap_or_else(|p| std::panic::resume_unwind(p)),
+                )
+            })
+        } else {
+            (
+                BlobStream::start(&self.root, &wanted),
+                Ok(Status::default()),
+            )
+        };
+        let mut blobs = blobs?;
+
+        let mut out = Vec::with_capacity(changes.len());
+        // Untracked files first, so they read as new before the modifications —
+        // `git status` lists them last and that is the wrong way round for a diff,
+        // where the thing you just created is the thing you are looking for.
+        // Fetching them early changed when they arrive, not where they land.
+        out.extend(
+            loose?
+                .untracked
+                .iter()
+                .filter_map(|e| loose_pair(e, &self.root)),
+        );
+        for c in changes {
+            // Both sides pull in request order — old, then new — which is what
+            // keeps this loop aligned with the stream.
+            //
+            // The two sides also read a null OID differently, and conflating them
+            // is a silent, plausible-looking bug: an added file whose old side
+            // falls back to the working tree diffs against itself and shows no
+            // change at all. The old side has no fallback: a null OID there means
+            // the file did not exist, and reading the tree for it would diff an
+            // added file against itself. On the new side a null OID is the
+            // ordinary case of a working-tree diff — what the file says now is on
+            // disk and nowhere else.
+            let fetched_old = if fetchable(&c.old_mode, &c.old_oid) {
+                blobs.answer()?
+            } else {
+                None
+            };
+            let fetched_new = if fetchable(&c.new_mode, &c.new_oid) {
+                blobs.answer()?
+            } else {
+                None
+            };
+            let old = RawChange::synthetic(&c.old_mode, &c.old_oid).or(fetched_old);
+            let new = RawChange::synthetic(&c.new_mode, &c.new_oid)
+                .or(fetched_new)
+                .or_else(|| new_side(&c.new_oid, &self.root, &c.path));
+            let binary = old.as_ref().is_some_and(|b| is_binary(b))
+                || new.as_ref().is_some_and(|b| is_binary(b));
+            out.push(Pair {
+                path: c.path,
+                old_path: c.old_path,
+                status: c.status,
+                old: if binary {
+                    Vec::new()
+                } else {
+                    lines(old.as_deref().unwrap_or_default())
+                },
+                new: if binary {
+                    Vec::new()
+                } else {
+                    lines(new.as_deref().unwrap_or_default())
+                },
+                binary,
+            });
+        }
+        blobs.finish()?;
+        Ok(out)
+    }
+
+    fn status(&self) -> Result<Status> {
+        // `--porcelain=v2` and not v1: v2 gives each side of the index/worktree
+        // split its own letter, renames carrying their old name, conflicts as
+        // records of their own, and a mode per column — which is what tells a
+        // symlink from a submodule without statting anything. v1 folded all of
+        // that into two letters and lost it.
+        //
+        // `-z` for NUL-separated records, for the reason `--raw -z` has it: a
+        // path may contain anything a filesystem allows — spaces, quotes,
+        // newlines — and git otherwise quotes and escapes it.
+        //
+        // `--untracked-files=all` expands an untracked directory into the files
+        // inside it, which is what both a diff and a panel want; a directory is
+        // not something to show a line of text for. It respects `.gitignore`,
+        // and ignored files stay unrequested — `target/` alone would arrive as
+        // forty thousand entries nobody reads. `!` records are still parsed if
+        // git sends them, so a caller that asks git itself pays nothing extra.
+        //
+        // Bytes throughout: paths carry no encoding guarantee and the model
+        // keeps them raw, so there is no decode here to get wrong.
+        let raw = run(
+            &self.root,
+            &["status", "--porcelain=v2", "-z", "--untracked-files=all"],
+        )?;
+        Ok(parse_status(&raw))
+    }
+
+    fn describe(&self) -> String {
+        // Canonicalised first: `file_name()` of `.` is `None`, and `.` is what every
+        // client is given by default — so without this the commonest invocation of
+        // all produces a label with the repository's name missing from it.
+        let named = self
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| self.root.clone());
+        let name = named
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let branch = run(&self.root, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .ok()
+            .map(|b| String::from_utf8_lossy(&b).trim().to_string())
+            .unwrap_or_default();
+        // `name (branch)` and not `name · branch`: a client puts this after its own
+        // name and view, so a third middle dot in one line of chrome reads as four
+        // things of equal weight when it is one repository on one branch.
+        if branch.is_empty() {
+            name
+        } else {
+            format!("{name} ({branch})")
+        }
+    }
 }
 
 // ------------------------------------------------------------------- the pair
@@ -120,204 +390,6 @@ impl Pair {
     }
 }
 
-/// Every changed file for `revspec`, as the two versions of its content.
-///
-/// `revspec` is anything git accepts — `HEAD~50..HEAD`, a single sha,
-/// `main..feature`. Empty means the working tree against HEAD.
-pub fn pairs(repo: &Path, revspec: &str) -> Result<Vec<Pair>> {
-    // `-z` for NUL-separated paths, because a path may contain anything a
-    // filesystem allows and git otherwise quotes and escapes it. `-M` so a
-    // rename arrives as one file with two names instead of a delete and an add
-    // of an identical blob.
-    //
-    // `--abbrev=64` is load-bearing and looks like a no-op: `--raw` abbreviates
-    // OIDs by default, and `cat-file --batch` echoes back the *full* OID in its
-    // response header, so an abbreviated request cannot be matched to its
-    // answer. 64 is clamped to whatever the repository's hash length actually
-    // is, which makes this right for SHA-256 repositories too.
-    const RAW: [&str; 5] = ["--raw", "-z", "-M", "--abbrev=64", "--no-ext-diff"];
-    let raw = if revspec.is_empty() {
-        run(repo, &[&["diff"], &RAW[..], &["HEAD"]].concat())?
-    } else if revspec.contains("..") {
-        run(repo, &[&["diff"], &RAW[..], &[revspec]].concat())?
-    } else {
-        // A bare revision means "what did this commit change".
-        run(
-            repo,
-            &[&["show"], &RAW[..], &["--format=", revspec]].concat(),
-        )?
-    };
-
-    let changes = parse_raw(&String::from_utf8_lossy(&raw));
-
-    // Every blob the whole diff needs, fetched by one `cat-file --batch` —
-    // but held one file at a time. The batch answers strictly in request
-    // order (it reads one OID and writes one answer before reading the
-    // next), and requests go out in pair order, old side then new, so the
-    // answers can be pulled back per file as each [`Pair`] is built instead
-    // of parking every old+new blob of the diff in a map until the last one.
-    // On a thousand-file diff that map was tens of MB of pure peak overlap.
-    // A duplicate OID costs a second read rather than a second copy, which is
-    // the trade the map made implicitly.
-    let mut wanted: Vec<&str> = Vec::with_capacity(changes.len() * 2);
-    for c in &changes {
-        for (mode, oid) in [(&c.old_mode, &c.old_oid), (&c.new_mode, &c.new_oid)] {
-            if fetchable(mode, oid) {
-                wanted.push(oid);
-            }
-        }
-    }
-
-    // The working-tree pair wants blobs *and* a status, and the two are
-    // independent — status reads the index and the working tree, the batch
-    // fetches OIDs the diff has already named — so they run side by side and
-    // an open of uncommitted work pays one spawn floor instead of two. Nothing
-    // is shared between them but `repo`, and neither touches what the other
-    // reads. The stream's errors surface first, as `cat-file`'s did when both
-    // ran in sequence: a failure to start comes back before any answer is read,
-    // and the first failed answer below comes back before `loose` is asked for.
-    // A panic in either is resumed rather than swallowed because both calls
-    // used to be inline.
-    let (blobs, loose) = if revspec.is_empty() {
-        std::thread::scope(|s| {
-            let loose = s.spawn(|| untracked(repo));
-            let blobs = BlobStream::start(repo, &wanted);
-            (
-                blobs,
-                loose
-                    .join()
-                    .unwrap_or_else(|p| std::panic::resume_unwind(p)),
-            )
-        })
-    } else {
-        (BlobStream::start(repo, &wanted), Ok(Vec::new()))
-    };
-    let mut blobs = blobs?;
-
-    let mut out = Vec::with_capacity(changes.len());
-    // Untracked files first, so they read as new before the modifications —
-    // `git status` lists them last and that is the wrong way round for a diff,
-    // where the thing you just created is the thing you are looking for.
-    // Fetching them early changed when they arrive, not where they land.
-    out.extend(loose?);
-    for c in changes {
-        // Both sides pull in request order — old, then new — which is what
-        // keeps this loop aligned with the stream.
-        //
-        // The two sides also read a null OID differently, and conflating them
-        // is a silent, plausible-looking bug: an added file whose old side
-        // falls back to the working tree diffs against itself and shows no
-        // change at all. The old side has no fallback: a null OID there means
-        // the file did not exist, and reading the tree for it would diff an
-        // added file against itself. On the new side a null OID is the
-        // ordinary case of a working-tree diff — what the file says now is on
-        // disk and nowhere else.
-        let fetched_old = if fetchable(&c.old_mode, &c.old_oid) {
-            blobs.answer()?
-        } else {
-            None
-        };
-        let fetched_new = if fetchable(&c.new_mode, &c.new_oid) {
-            blobs.answer()?
-        } else {
-            None
-        };
-        let old = Change::synthetic(&c.old_mode, &c.old_oid).or(fetched_old);
-        let new = Change::synthetic(&c.new_mode, &c.new_oid)
-            .or(fetched_new)
-            .or_else(|| new_side(&c.new_oid, repo, &c.path));
-        let binary = old.as_ref().is_some_and(|b| is_binary(b))
-            || new.as_ref().is_some_and(|b| is_binary(b));
-        out.push(Pair {
-            path: c.path,
-            old_path: c.old_path,
-            status: c.status,
-            old: if binary {
-                Vec::new()
-            } else {
-                lines(old.as_deref().unwrap_or_default())
-            },
-            new: if binary {
-                Vec::new()
-            } else {
-                lines(new.as_deref().unwrap_or_default())
-            },
-            binary,
-        });
-    }
-    blobs.finish()?;
-    Ok(out)
-}
-
-/// Every untracked file, as a pair with nothing on its old side.
-///
-/// **`git diff` cannot see these and never will.** It compares the index and the
-/// working tree against a commit, and an untracked file is in none of the three
-/// — so there is nothing for it to diff. `git status` is the only command that
-/// knows they exist, which is why every client that shows them (lazygit, `gh`,
-/// every GUI) asks it separately. Without this, "show me my uncommitted work"
-/// silently omits every file you just created, which on a real branch is most of
-/// what you are looking for.
-///
-/// Only for the working tree. A revspec compares two commits and neither of them
-/// has untracked files in it, so asking would be meaningless.
-///
-/// Three things it gets right that the obvious version does not:
-///
-/// - **Ignored files stay out.** `--untracked-files=all` respects `.gitignore`,
-///   which is what stops `target/` arriving as forty thousand additions.
-/// - **A directory is expanded.** `git status` collapses an untracked directory
-///   to `dir/` by default; `all` lists the files inside it, which is what a diff
-///   wants.
-/// - **A binary file says so** rather than becoming a screenful of NULs, through
-///   the same [`is_binary`] test the tracked side uses.
-fn untracked(repo: &Path) -> Result<Vec<Pair>> {
-    // `-z` for NUL-separated paths, for the reason `--raw -z` has it: a path may
-    // contain anything a filesystem allows, and git otherwise quotes and escapes
-    // it. `--no-renames` because a rename needs an old side and these have none.
-    let raw = run(
-        repo,
-        &[
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=all",
-            "--no-renames",
-        ],
-    )?;
-    let text = String::from_utf8_lossy(&raw);
-
-    let mut out = Vec::new();
-    for record in text.split('\0') {
-        // `XY path`: two status letters, a space, then the path. Anything that
-        // is not `??` is a tracked change and `git diff --raw` already had it.
-        let Some(path) = record.strip_prefix("?? ") else {
-            continue;
-        };
-        if path.is_empty() {
-            continue;
-        }
-        // Unreadable is skipped rather than an error: a broken symlink, a socket
-        // and a file deleted between the two git calls are all untracked, and
-        // none of them is worth refusing to show the rest of the diff over.
-        let Ok(content) = std::fs::read(repo.join(path)) else {
-            continue;
-        };
-        let binary = is_binary(&content);
-        out.push(Pair {
-            path: path.to_string(),
-            old_path: None,
-            // The same letter `git diff --raw` uses for a file that was added,
-            // so nothing downstream has to learn that untracked is a category.
-            status: 'A',
-            old: Vec::new(),
-            new: if binary { Vec::new() } else { lines(&content) },
-            binary,
-        });
-    }
-    Ok(out)
-}
-
 /// A diff, through whichever [`Differ`](plait_core::differ::Differ) the host
 /// routed each path to.
 ///
@@ -328,15 +400,23 @@ fn untracked(repo: &Path) -> Result<Vec<Pair>> {
 /// to say "that registry, these choices" without building a copy of it and losing
 /// whatever an extension put in.
 ///
+/// A free function over *any* [`Repo`], and deliberately not a method on the
+/// trait: which lines correspond is decided by the configured registry and only
+/// by it. A `Repo` implementation that answered with its own diff would make
+/// `[diff] algorithm` a lie in every client at once, and rule 1 with it — the
+/// differ an extension registers must be reachable through the same call. This
+/// runs after acquisition, outside the trait, where no implementation can reach.
+///
 /// The frontend never learns which implementation ran, and never learns whether
 /// the content came from the object database or the working tree.
 pub fn diff(
-    repo: &Path,
+    repo: &dyn Repo,
     revspec: &str,
     differs: &Differs,
     over: &Overrides,
 ) -> Result<Vec<FileDiff>> {
-    Ok(pairs(repo, revspec)?
+    Ok(repo
+        .pairs(revspec)?
         .iter()
         .map(|p| match p.binary {
             // Modelled as a file with no hunks rather than skipped: the diff
@@ -354,28 +434,251 @@ pub fn diff(
         .collect())
 }
 
-/// A short label for the window title.
-pub fn describe(repo: &Path) -> String {
-    // Canonicalised first: `file_name()` of `.` is `None`, and `.` is what every
-    // client is given by default — so without this the commonest invocation of
-    // all produces a label with the repository's name missing from it.
-    let named = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
-    let name = named
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let branch = run(repo, &["rev-parse", "--abbrev-ref", "HEAD"])
-        .ok()
-        .map(|b| String::from_utf8_lossy(&b).trim().to_string())
-        .unwrap_or_default();
-    // `name (branch)` and not `name · branch`: a client puts this after its own
-    // name and view, so a third middle dot in one line of chrome reads as four
-    // things of equal weight when it is one repository on one branch.
-    if branch.is_empty() {
-        name
-    } else {
-        format!("{name} ({branch})")
+// -------------------------------------------------------------------- status
+
+/// `git status --porcelain=v2 -z`, parsed into the model in
+/// [`plait_core::status`](plait_core::status).
+///
+/// The grammar, as git emits it under `-z`: records separated by NUL, fixed
+/// fields separated by spaces, and the path — which may contain spaces,
+/// quotes and newlines — ending at the record's NUL. Renames carry their old
+/// name as one more NUL-delimited field after the path:
+///
+/// ```text
+/// 1 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>\0
+/// 2 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <X><score> <path>\0<origPath>\0
+/// u <XY> <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path>\0
+/// ? <path>\0          ! <path>\0
+/// ```
+///
+/// One ordinary record can feed **two** lists — edited, staged and edited
+/// again is `1 MM`, staged *and* unstaged for the same path — and a conflicted
+/// path feeds neither, because its truth lives in three index stages no single
+/// X or Y could name.
+fn parse_status(raw: &[u8]) -> Status {
+    let mut out = Status::default();
+    let mut records = raw.split(|b| *b == 0).filter(|r| !r.is_empty());
+    while let Some(rec) = records.next() {
+        if rec.starts_with(b"1 ") {
+            ordinary(rec, &mut out);
+        } else if rec.starts_with(b"2 ") {
+            // The old name is the next field, taken whether this record parses
+            // or not: skipping a broken one must not leave the cursor sitting
+            // on somebody else's path, or one bad record corrupts two.
+            let old = records.next();
+            renamed(rec, old, &mut out);
+        } else if rec.starts_with(b"u ") {
+            unmerged(rec, &mut out);
+        } else if rec.starts_with(b"?") || rec.starts_with(b"!") {
+            loose(rec, &mut out);
+        }
+        // Anything else — a truncated tail, a header from a flag nobody asked
+        // for — is skipped rather than guessed at, the same rule `parse_raw`
+        // sets for `--raw`.
     }
+    out
+}
+
+/// The fixed fields of one record and the path that ends it.
+///
+/// Everything before the path is space-separated and none of it contains a
+/// space — two-letter codes, octal modes, hex hashes, a score glued to its
+/// letter — so splitting exactly `fixed` times leaves the whole path as the
+/// final piece, spaces and newlines intact. Fewer fields than that is a
+/// malformed record: `None`, skip it.
+fn fields(rec: &[u8], fixed: usize) -> Option<(Vec<&[u8]>, &[u8])> {
+    let mut parts = rec.splitn(fixed, |b| *b == b' ');
+    let head: Vec<&[u8]> = (&mut parts).take(fixed - 1).collect();
+    let path = parts.next()?;
+    if head.len() != fixed - 1 || path.is_empty() {
+        return None;
+    }
+    Some((head, path))
+}
+
+/// One letter of an `XY` pair: `None` when that side is unchanged, a
+/// [`Change`] when it names one, and no third shape — an unrecognised letter
+/// makes the record malformed rather than guessed at.
+fn change(letter: u8) -> Option<Option<Change>> {
+    Some(match letter {
+        b'.' => None,
+        b'A' => Some(Change::Added),
+        b'M' => Some(Change::Modified),
+        b'D' => Some(Change::Deleted),
+        b'T' => Some(Change::TypeChanged),
+        b'R' => Some(Change::Renamed),
+        b'C' => Some(Change::Copied),
+        _ => return None,
+    })
+}
+
+/// Both letters of an `XY` field, or nothing when either is unreadable.
+fn xy(field: &[u8]) -> Option<(Option<Change>, Option<Change>)> {
+    if field.len() != 2 {
+        return None;
+    }
+    Some((change(field[0])?, change(field[1])?))
+}
+
+/// The mode bytes as mode text, for [`Kind::from_git_mode`].
+fn mode(field: &[u8]) -> Kind {
+    Kind::from_git_mode(std::str::from_utf8(field).unwrap_or(""))
+}
+
+/// The submodule state field: `N...` when the entry is not a submodule, else
+/// `S<C><M><U>` with each flag a letter or a dot.
+///
+/// Anything shorter or stranger parses as "no flags claimed" — a state nobody
+/// has seen yet is not a reason to drop the entry, and [`Kind`] still says
+/// whether the path is a submodule from its mode.
+fn submodule_state(field: &[u8]) -> Submodule {
+    if field.first() != Some(&b'S') || field.len() < 4 {
+        return Submodule::default();
+    }
+    Submodule {
+        commit_changed: field[1] == b'C',
+        modified: field[2] == b'M',
+        untracked: field[3] == b'U',
+    }
+}
+
+/// An ordinary (`1`) record: one path, one X, one Y.
+fn ordinary(rec: &[u8], out: &mut Status) {
+    // tag XY sub mH mI mW hH hI path — eight fields, then the path.
+    let Some((f, path)) = fields(rec, 9) else {
+        return;
+    };
+    let Some((x, y)) = xy(f[1]) else { return };
+    let sub = submodule_state(f[2]);
+    if let Some(c) = x {
+        out.staged.push(StagedEntry {
+            path: PathBytes::from_bytes(path),
+            change: c,
+            old_path: None,
+            kind: mode(f[4]), // mI — the mode recorded in the index
+            submodule: sub,
+        });
+    }
+    if let Some(c) = y {
+        out.unstaged.push(UnstagedEntry {
+            path: PathBytes::from_bytes(path),
+            change: c,
+            kind: mode(f[5]), // mW — the mode found in the working tree
+            submodule: sub,
+        });
+    }
+}
+
+/// A rename/copy (`2`) record, whose old name arrived as its own field.
+fn renamed(rec: &[u8], old: Option<&[u8]>, out: &mut Status) {
+    // tag XY sub mH mI mW hH hI <X><score> path — nine fields, then the path.
+    let Some((f, path)) = fields(rec, 10) else {
+        return;
+    };
+    let Some((x, y)) = xy(f[1]) else { return };
+    let sub = submodule_state(f[2]);
+    // Whether an old name exists is decided by what X says, and a record
+    // without its second field still shows — labelled by the new name only,
+    // which is more honest than dropping a change that happened.
+    let old_path = match x {
+        Some(Change::Renamed | Change::Copied) => old.map(PathBytes::from_bytes),
+        _ => None,
+    };
+    if let Some(c) = x {
+        out.staged.push(StagedEntry {
+            path: PathBytes::from_bytes(path),
+            change: c,
+            old_path,
+            kind: mode(f[4]),
+            submodule: sub,
+        });
+    }
+    if let Some(c) = y {
+        out.unstaged.push(UnstagedEntry {
+            path: PathBytes::from_bytes(path),
+            change: c,
+            kind: mode(f[5]),
+            submodule: sub,
+        });
+    }
+}
+
+/// An unmerged (`u`) record: a merge left all three stages behind.
+fn unmerged(rec: &[u8], out: &mut Status) {
+    // tag XY sub m1 m2 m3 mW h1 h2 h3 path — ten fields, then the path.
+    let Some((f, path)) = fields(rec, 11) else {
+        return;
+    };
+    let Some(state) = conflict_kind(f[1]) else {
+        return;
+    };
+    out.conflicts.push(ConflictEntry {
+        path: PathBytes::from_bytes(path),
+        state,
+        kind: mode(f[6]), // mW — what the working tree holds right now
+        submodule: submodule_state(f[2]),
+    });
+}
+
+/// The seven disagreements a merge can leave, keyed by the XY git prints.
+fn conflict_kind(xy: &[u8]) -> Option<ConflictKind> {
+    Some(match xy {
+        b"DD" => ConflictKind::BothDeleted,
+        b"AU" => ConflictKind::AddedByUs,
+        b"UD" => ConflictKind::DeletedByThem,
+        b"UA" => ConflictKind::AddedByThem,
+        b"DU" => ConflictKind::DeletedByUs,
+        b"AA" => ConflictKind::BothAdded,
+        b"UU" => ConflictKind::BothModified,
+        _ => return None,
+    })
+}
+
+/// A `?` untracked or `!` ignored record: tag glued to the path.
+fn loose(rec: &[u8], out: &mut Status) {
+    let path = &rec[1..];
+    // Exactly one space separates tag from path, and only one is trimmed: the
+    // path may begin with a space itself, and trimming twice renames it.
+    let path = match path.strip_prefix(b" ") {
+        Some(rest) => rest,
+        None => path,
+    };
+    if path.is_empty() {
+        return;
+    }
+    if rec[0] == b'?' {
+        out.untracked.push(UntrackedEntry {
+            path: PathBytes::from_bytes(path),
+        });
+    } else {
+        out.ignored.push(PathBytes::from_bytes(path));
+    }
+}
+
+/// One untracked entry as a [`Pair`] with nothing opposite it.
+///
+/// **`git diff` cannot see these and never will** — see [`Status::untracked`]
+/// in `core` for why the status pass is what sources them.
+fn loose_pair(entry: &UntrackedEntry, root: &Path) -> Option<Pair> {
+    // Joined through the lossy spelling, which is the portable way to turn
+    // bytes into something `Path` accepts. A path that only misbehaves past
+    // its first bad byte was already unreadable here before the status model
+    // existed; the entry keeps the true bytes for whoever displays or stages
+    // it, and an unreadable file skips rather than fails — a broken symlink, a
+    // socket and a file deleted between the two git calls are all untracked,
+    // and none of them is worth refusing to show the rest of the diff over.
+    let content = std::fs::read(root.join(entry.path.to_string_lossy().as_ref())).ok()?;
+    let binary = is_binary(&content);
+    Some(Pair {
+        path: entry.path.to_string_lossy().into_owned(),
+        old_path: None,
+        // The same letter `git diff --raw` uses for a file that was added, so
+        // nothing downstream has to learn that untracked is a category.
+        status: 'A',
+        old: Vec::new(),
+        new: if binary { Vec::new() } else { lines(&content) },
+        binary,
+    })
 }
 
 // ------------------------------------------------------------------- internals
@@ -390,7 +693,7 @@ const GITLINK: &str = "160000";
 
 /// One `--raw` record, before its blobs have been fetched.
 #[derive(Debug, PartialEq, Eq)]
-struct Change {
+struct RawChange {
     path: String,
     old_path: Option<String>,
     status: char,
@@ -400,7 +703,7 @@ struct Change {
     new_oid: String,
 }
 
-impl Change {
+impl RawChange {
     /// What one side's content is, when it is not a blob to be fetched.
     fn synthetic(mode: &str, oid: &str) -> Option<Vec<u8>> {
         if mode != GITLINK {
@@ -424,7 +727,7 @@ impl Change {
 /// NUL-terminated, and a rename or copy carries two of them. Anything that does
 /// not start with `:` is skipped rather than guessed at — `git show` prefixes a
 /// commit header that `--format=` does not always suppress.
-fn parse_raw(raw: &str) -> Vec<Change> {
+fn parse_raw(raw: &str) -> Vec<RawChange> {
     let mut out = Vec::new();
     let mut fields = raw.split('\0').peekable();
     while let Some(meta) = fields.next() {
@@ -449,7 +752,7 @@ fn parse_raw(raw: &str) -> Vec<Change> {
             },
             _ => (None, first.to_string()),
         };
-        out.push(Change {
+        out.push(RawChange {
             path,
             old_path,
             status,
@@ -462,7 +765,7 @@ fn parse_raw(raw: &str) -> Vec<Change> {
     out
 }
 
-/// Whether one side of a [`Change`] has a blob on the wire: not a gitlink,
+/// Whether one side of a [`RawChange`] has a blob on the wire: not a gitlink,
 /// whose OID is a *commit* in another repository and gets "missing" back, and
 /// not a null OID, which means "not in the object database". The exact
 /// predicate that builds the request list, asked again while consuming so the
@@ -665,9 +968,9 @@ fn lines(content: &[u8]) -> Vec<Arc<str>> {
 mod tests {
     use super::*;
 
-    /// A throwaway repository, because untracked files are the one thing that
-    /// cannot be tested against a canned `--raw` string: they are defined by
-    /// *not* being in git, so only a real working tree has any.
+    /// A throwaway repository, because untracked files and conflicts are the
+    /// things that cannot be tested against a canned string: they exist only
+    /// relative to a real working tree.
     struct Scratch(std::path::PathBuf);
 
     impl Scratch {
@@ -681,10 +984,23 @@ mod tests {
         }
 
         fn git(&self, args: &[&str]) {
+            // Submodules over a local path need the file protocol allowed,
+            // which every modern git disables by default; harmless everywhere
+            // else, so it rides along on all of these.
             let out = Command::new("git")
                 .arg("-C")
                 .arg(&self.0)
-                .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+                .args([
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "user.name=t",
+                    // Submodules over a local path need the file protocol
+                    // allowed, which every modern git disables by default;
+                    // harmless everywhere else.
+                    "-c",
+                    "protocol.file.allow=always",
+                ])
                 .args(args)
                 .output()
                 .expect("git runs");
@@ -695,12 +1011,28 @@ mod tests {
             );
         }
 
+        /// For the calls whose *failure* is the point — a conflicted merge
+        /// exits nonzero and leaves the state the test wants.
+        fn git_failing(&self, args: &[&str]) {
+            let _ = Command::new("git")
+                .arg("-C")
+                .arg(&self.0)
+                .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+                .args(args)
+                .output()
+                .expect("git runs");
+        }
+
         fn write(&self, path: &str, content: &[u8]) {
             let at = self.0.join(path);
             if let Some(parent) = at.parent() {
                 std::fs::create_dir_all(parent).expect("a parent");
             }
             std::fs::write(at, content).expect("a file");
+        }
+
+        fn open(&self) -> Handle {
+            open(&self.0)
         }
     }
 
@@ -731,7 +1063,7 @@ mod tests {
         r.write("tracked.txt", b"one\nCHANGED\n");
         r.write("new.txt", b"brand new\nsecond\n");
 
-        let got = pairs(&r.0, "").expect("a working tree diff");
+        let got = r.open().pairs("").expect("a working tree diff");
         assert_eq!(
             paths(&got),
             vec!["new.txt", "tracked.txt"],
@@ -758,7 +1090,7 @@ mod tests {
         r.write("skip/junk.txt", b"noise\n");
         r.write("kept.txt", b"yes\n");
 
-        assert_eq!(paths(&pairs(&r.0, "").unwrap()), vec!["kept.txt"]);
+        assert_eq!(paths(&r.open().pairs("").unwrap()), vec!["kept.txt"]);
     }
 
     #[test]
@@ -772,21 +1104,20 @@ mod tests {
         r.git(&["commit", "-qm", "init"]);
         r.write("a/b/c.txt", b"buried\n");
 
-        assert_eq!(paths(&pairs(&r.0, "").unwrap()), vec!["a/b/c.txt"]);
+        assert_eq!(paths(&r.open().pairs("").unwrap()), vec!["a/b/c.txt"]);
     }
 
     #[test]
     fn a_path_with_a_space_survives_because_the_records_are_nul_separated() {
-        // `git status` *quotes* such a path in its normal output. `-z` is what
-        // stops it, and without it the pair would be named `"has space.txt"`
-        // — quotes included — and the file read would fail.
+        // `git status` *quotes* such a path without `-z`. With it the pair is
+        // named exactly, and the file read succeeds.
         let r = Scratch::new("spaced");
         r.write("seed.txt", b"x\n");
         r.git(&["add", "-A"]);
         r.git(&["commit", "-qm", "init"]);
         r.write("has space.txt", b"spaced\n");
 
-        let got = pairs(&r.0, "").unwrap();
+        let got = r.open().pairs("").unwrap();
         assert_eq!(paths(&got), vec!["has space.txt"]);
         assert_eq!(strs(&got[0].new), ["spaced"]);
     }
@@ -799,7 +1130,7 @@ mod tests {
         r.git(&["commit", "-qm", "init"]);
         r.write("blob.png", b"\x89PNG\x00\x00rest");
 
-        let got = pairs(&r.0, "").unwrap();
+        let got = r.open().pairs("").unwrap();
         assert_eq!(paths(&got), vec!["blob.png"]);
         assert!(got[0].binary);
         assert!(got[0].new.is_empty(), "a binary carries no lines");
@@ -819,9 +1150,10 @@ mod tests {
         r.git(&["commit", "-qm", "second"]);
         r.write("loose.txt", b"not in history\n");
 
-        assert_eq!(paths(&pairs(&r.0, "HEAD~1..HEAD").unwrap()), vec!["a.txt"]);
+        let g = r.open();
+        assert_eq!(paths(&g.pairs("HEAD~1..HEAD").unwrap()), vec!["a.txt"]);
         assert!(
-            paths(&pairs(&r.0, "").unwrap()).contains(&"loose.txt"),
+            paths(&g.pairs("").unwrap()).contains(&"loose.txt"),
             "the working tree has it"
         );
     }
@@ -846,18 +1178,437 @@ mod tests {
         r.git(&["add", "-A"]);
         r.git(&["commit", "-qm", "second"]);
 
-        let got = pairs(&r.0, "HEAD~1..HEAD").unwrap();
+        let got = r.open().pairs("HEAD~1..HEAD").unwrap();
         assert_eq!(paths(&got), vec!["a.txt", "b.txt", "c.txt", "d.txt"]);
         let new: Vec<_> = got.iter().map(|p| p.new.join("\n")).collect();
         assert_eq!(new, vec!["A", "B", "same bytes", "same bytes"]);
     }
+
+    // ------------------------------------------------------------------ status
+
+    #[test]
+    fn a_clean_tree_is_an_empty_status() {
+        let r = Scratch::new("clean");
+        r.write("seed.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+
+        let s = r.open().status().unwrap();
+        assert!(s.is_empty(), "{s:?}");
+        // And every list individually, because `is_empty` could be lying.
+        assert!(s.staged.is_empty() && s.unstaged.is_empty());
+        assert!(s.untracked.is_empty() && s.conflicts.is_empty() && s.ignored.is_empty());
+    }
+
+    #[test]
+    fn staged_and_unstaged_are_separate_answers_about_one_file() {
+        // Edited, staged, edited again: porcelain v1 had two letters for this;
+        // the model has two lists, and this is why they are lists and not one.
+        let r = Scratch::new("both-sides");
+        r.write("f.txt", b"original\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        r.write("f.txt", b"staged version\n");
+        r.git(&["add", "f.txt"]);
+        r.write("f.txt", b"staged version\nand more\n");
+
+        let s = r.open().status().unwrap();
+        assert_eq!(
+            s.staged
+                .iter()
+                .map(|e| e.path.to_string())
+                .collect::<Vec<_>>(),
+            vec!["f.txt"],
+            "the index has its own opinion"
+        );
+        assert_eq!(s.staged[0].change, Change::Modified);
+        assert_eq!(
+            s.unstaged
+                .iter()
+                .map(|e| e.path.to_string())
+                .collect::<Vec<_>>(),
+            vec!["f.txt"],
+            "so does the working tree"
+        );
+        assert!(s.untracked.is_empty());
+    }
+
+    #[test]
+    fn a_staged_rename_reports_its_old_name() {
+        let r = Scratch::new("mv");
+        r.write("before.txt", b"contents\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        r.git(&["mv", "before.txt", "after.txt"]);
+
+        let s = r.open().status().unwrap();
+        assert_eq!(s.staged.len(), 1);
+        let e = &s.staged[0];
+        assert_eq!(e.change, Change::Renamed);
+        assert_eq!(e.path.as_bytes(), b"after.txt");
+        assert_eq!(
+            e.old_path.as_ref().map(|p| p.as_bytes()),
+            Some(b"before.txt".as_slice()),
+            "the name it had travels with it"
+        );
+    }
+
+    #[test]
+    fn a_merge_conflict_lists_itself_as_conflicted_and_nowhere_else() {
+        let r = Scratch::new("conflict");
+        r.write("shared.txt", b"base\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        r.git(&["checkout", "-qb", "other"]);
+        r.write("shared.txt", b"theirs\n");
+        r.git(&["commit", "-qam", "theirs"]);
+        r.git(&["checkout", "-q", "main"]);
+        r.write("shared.txt", b"ours\n");
+        r.git(&["commit", "-qam", "ours"]);
+        r.git_failing(&["merge", "other"]);
+
+        let s = r.open().status().unwrap();
+        assert_eq!(s.conflicts.len(), 1);
+        let c = &s.conflicts[0];
+        assert_eq!(c.path.as_bytes(), b"shared.txt");
+        assert_eq!(c.state, ConflictKind::BothModified);
+        assert_eq!(c.kind, Kind::File);
+        assert!(
+            s.staged.is_empty() && s.unstaged.is_empty(),
+            "a conflicted path is not also staged or unstaged: its truth lives \
+             in three index stages no single letter could name"
+        );
+    }
+
+    #[test]
+    fn untracked_and_ignored_land_in_their_own_lists() {
+        let r = Scratch::new("sorting");
+        r.write(".gitignore", b"junk/\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        r.write("loose.txt", b"x\n");
+        r.write("junk/cache.tmp", b"y\n");
+
+        let s = r.open().status().unwrap();
+        assert_eq!(
+            s.untracked
+                .iter()
+                .map(|e| e.path.to_string())
+                .collect::<Vec<_>>(),
+            vec!["loose.txt"]
+        );
+        assert!(
+            s.ignored.is_empty(),
+            "plait does not ask git for ignored files — target/ would be forty \
+             thousand entries nobody reads"
+        );
+    }
+
+    #[test]
+    fn a_submodule_reads_as_one_with_its_flags() {
+        // An upstream with two commits, borrowed at the older one and then
+        // moved forward with a dirty file inside: the parent should see a
+        // submodule whose commit changed and whose content was edited.
+        let up = Scratch::new("sub-upstream");
+        up.write("f.txt", b"one\n");
+        up.git(&["add", "-A"]);
+        up.git(&["commit", "-qm", "one"]);
+        up.write("f.txt", b"one\ntwo\n");
+        up.git(&["commit", "-qam", "two"]);
+        let older = String::from_utf8(
+            Command::new("git")
+                .arg("-C")
+                .arg(&up.0)
+                .args(["rev-parse", "HEAD~1"])
+                .output()
+                .expect("rev-parse")
+                .stdout,
+        )
+        .unwrap();
+
+        let r = Scratch::new("sub-parent");
+        r.write("base.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        r.git(&[
+            "submodule",
+            "add",
+            "-q",
+            &format!("{}", up.0.display()),
+            "kid",
+        ]);
+        r.git(&["commit", "-qm", "borrow"]);
+        // Move the borrow forward and dirty what is inside it.
+        r.git(&["-C", "kid", "checkout", "-q", older.trim()]);
+        r.write("kid/f.txt", b"one\ntwo\nthree\n");
+
+        let s = r.open().status().unwrap();
+        assert_eq!(s.unstaged.len(), 1, "{s:?}");
+        let e = &s.unstaged[0];
+        assert_eq!(e.path.as_bytes(), b"kid");
+        assert_eq!(
+            e.kind,
+            Kind::Submodule,
+            "mode 160000, not something to read"
+        );
+        assert!(e.submodule.commit_changed, "the borrowed commit moved");
+        assert!(e.submodule.modified, "a file inside it was edited");
+        assert!(!e.submodule.untracked);
+    }
+
+    #[test]
+    fn an_ordinary_record_lands_on_the_side_that_changed() {
+        let mut s = Status::default();
+        ordinary(b"1 M. N... 100644 100644 100644 aa bb tracked.txt", &mut s);
+        assert!(s.unstaged.is_empty(), "the dot side says nothing changed");
+        assert_eq!(s.staged[0].change, Change::Modified);
+
+        s = Status::default();
+        ordinary(b"1 .D N... 100644 100644 000000 aa cc deleted.txt", &mut s);
+        assert!(s.staged.is_empty());
+        assert_eq!(s.unstaged[0].change, Change::Deleted);
+
+        s = Status::default();
+        ordinary(b"1 AM N... 100644 100644 100644 00 bb new.txt", &mut s);
+        assert_eq!(s.staged[0].change, Change::Added);
+        assert_eq!(s.unstaged[0].change, Change::Modified);
+    }
+
+    #[test]
+    fn kinds_come_from_the_mode_of_their_own_column() {
+        // A path the index records as a symlink and the working tree replaced
+        // with a plain file: each entry reads the mode of the side it
+        // describes, never the other one's.
+        let mut s = Status::default();
+        ordinary(b"1 MM N... 120000 120000 100644 aa bb link", &mut s);
+        assert_eq!(
+            s.staged[0].kind,
+            Kind::Symlink,
+            "the index still records it"
+        );
+        assert_eq!(s.unstaged[0].kind, Kind::File, "the worktree replaced it");
+    }
+
+    #[test]
+    fn a_rename_carries_its_old_name_across_the_field_boundary() {
+        // Straight off a real run, NULs made visible: the old name arrives as
+        // the NEXT nul-delimited field, after the path.
+        let raw = b"2 R. N... 100644 100644 100644 aa bb R100 renamed file.txt\0spaced name.txt";
+        let s = parse_status(raw);
+        assert_eq!(s.staged.len(), 1);
+        assert_eq!(s.staged[0].change, Change::Renamed);
+        assert_eq!(s.staged[0].path.as_bytes(), b"renamed file.txt".as_slice());
+        assert_eq!(
+            s.staged[0].old_path.as_ref().map(|p| p.as_bytes()),
+            Some(b"spaced name.txt".as_slice())
+        );
+    }
+
+    #[test]
+    fn a_copy_is_not_quietly_called_a_rename() {
+        let raw = b"2 C. N... 100644 100644 100644 aa bb C075 copy.txt\0origin.txt";
+        let s = parse_status(raw);
+        assert_eq!(s.staged[0].change, Change::Copied);
+        assert_eq!(
+            s.staged[0].old_path.as_ref().map(|p| p.as_bytes()),
+            Some(b"origin.txt".as_slice())
+        );
+    }
+
+    #[test]
+    fn one_rename_can_also_be_modified_in_the_worktree() {
+        // `RM`: renamed in the index and further edited outside it. One record,
+        // two lists — the shape v1 could not say.
+        let old: &[u8] = b"old name.txt";
+        let mut raw = b"2 RM N... 100644 100644 100644 aa bb R100 new name.txt".to_vec();
+        raw.push(0);
+        raw.extend_from_slice(old);
+        let s = parse_status(&raw);
+        assert_eq!(s.staged.len(), 1);
+        assert_eq!(s.unstaged.len(), 1);
+        assert_eq!(s.unstaged[0].change, Change::Modified);
+        assert_eq!(
+            s.staged[0].old_path.as_ref().map(PathBytes::as_bytes),
+            Some(old)
+        );
+    }
+
+    #[test]
+    fn an_unmerged_record_names_how_the_sides_disagree() {
+        // Both forms observed in the wild: the classic both-modified, and a
+        // both-added where neither side ever had the file before.
+        let raw = b"\
+            u UU N... 100644 100644 100644 100644 h1 h2 h3 shared.txt\0\
+            u AA N... 000000 100644 100644 100644 h1 h2 h3 new.txt\0\
+            u DU N... 100644 000000 100644 100644 h1 h2 h3 theirs-deleted.txt\0";
+        let s = parse_status(raw);
+        assert_eq!(
+            s.conflicts.iter().map(|c| c.state).collect::<Vec<_>>(),
+            vec![
+                ConflictKind::BothModified,
+                ConflictKind::BothAdded,
+                ConflictKind::DeletedByUs,
+            ]
+        );
+        assert!(s.staged.is_empty() && s.unstaged.is_empty());
+        assert_eq!(s.conflicts[1].kind, Kind::File);
+    }
+
+    #[test]
+    fn untracked_and_ignored_records_land_apart() {
+        let raw = b"? loose.txt\0? spaced out.txt\0! junk/cache.tmp\0";
+        let s = parse_status(raw);
+        assert_eq!(
+            s.untracked
+                .iter()
+                .map(|e| e.path.as_bytes())
+                .collect::<Vec<_>>(),
+            [b"loose.txt".as_slice(), b"spaced out.txt".as_slice()]
+        );
+        assert_eq!(s.ignored.len(), 1);
+        assert_eq!(s.ignored[0].as_bytes(), b"junk/cache.tmp");
+    }
+
+    #[test]
+    fn a_malformed_record_is_skipped_without_eating_the_next_one() {
+        // Every way the stream can go wrong — an unknown tag, short records, a
+        // bad XY pair, an unknown conflict code, an empty path — and one good
+        // record behind all of them, which must still arrive.
+        //
+        // A rename with no second field is not in this list, deliberately: by
+        // protocol the next field after any `2` record *is* its old name, so a
+        // truncated read there is indistinguishable from a rename whose old
+        // name simply arrived. See the alignment test below for how that is
+        // survived.
+        let raw = b"\
+            # some header nobody asked for\0\
+            1 XZ N... 100644 100644 100644 aa bb broken.txt\0\
+            1 M.\0\
+            u ZZ N... 100644 100644 100644 100644 h1 h2 h3 weird.txt\0\
+            1 M. N...\0\
+            1 M. N... 100644 100644 100644 aa bb good.txt\0";
+        let s = parse_status(raw);
+        assert_eq!(s.staged.len(), 1);
+        assert_eq!(s.staged[0].path.as_bytes(), b"good.txt");
+        assert!(s.unstaged.is_empty() && s.conflicts.is_empty());
+    }
+
+    #[test]
+    fn a_rename_missing_its_old_name_still_shows() {
+        // The second field never arrived (a truncated read). Dropping the whole
+        // change would hide work; showing it under the new name alone loses
+        // nothing but the old label.
+        let raw = b"2 R. N... 100644 100644 100644 aa bb R100 lonely.txt";
+        let s = parse_status(raw);
+        assert_eq!(s.staged.len(), 1);
+        assert_eq!(s.staged[0].path.as_bytes(), b"lonely.txt");
+        assert_eq!(s.staged[0].old_path, None);
+    }
+
+    #[test]
+    fn a_rename_consumes_its_old_name_even_when_the_record_is_broken() {
+        // The alignment trap: the old name is taken before the record parses,
+        // so a malformed rename cannot leave the cursor sitting on somebody
+        // else's path and corrupt two entries instead of zero.
+        let mut raw = b"2 XZ N... bad bad bad aa bb R99 x\0old-name".to_vec();
+        raw.push(0);
+        raw.extend_from_slice(b"1 M. N... 100644 100644 100644 aa bb next.txt");
+        raw.push(0);
+        let s = parse_status(&raw);
+        assert_eq!(
+            s.staged
+                .iter()
+                .map(|e| e.path.to_string())
+                .collect::<Vec<_>>(),
+            vec!["next.txt"],
+            "exactly the records that make sense, nothing shifted by one"
+        );
+    }
+
+    #[test]
+    fn spaces_and_newlines_in_paths_arrive_whole() {
+        // The reason for `-z`: a path may contain anything a filesystem allows,
+        // including a newline, and only NUL ends it.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"? dir with spaces/a very long name.txt");
+        raw.push(0);
+        raw.extend_from_slice(b"? multi\nline.txt");
+        raw.push(0);
+        let s = parse_status(&raw);
+        assert_eq!(
+            s.untracked
+                .iter()
+                .map(|e| e.path.as_bytes())
+                .collect::<Vec<_>>(),
+            [
+                b"dir with spaces/a very long name.txt".as_slice(),
+                b"multi\nline.txt".as_slice(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_non_utf8_path_arrives_byte_for_byte() {
+        // Latin-1 é. Decoding lossily here would rename somebody's file; the
+        // model keeps what git said and displays later, on its own terms.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"? caf\xe9.txt");
+        raw.push(0);
+        let s = parse_status(&raw);
+        assert_eq!(s.untracked[0].path.as_bytes(), b"caf\xe9.txt".as_slice());
+        // Display stays lossy rather than failing — never refuse a repository
+        // over one byte.
+        assert!(s.untracked[0].path.to_string().contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn submodule_flags_come_from_the_state_field() {
+        // S<C><M><U>, letters or dots, as git prints them; N means not a
+        // submodule and claims no flags.
+        let mut s = Status::default();
+        ordinary(b"1 .M SCMU 160000 160000 160000 aa bb kid", &mut s);
+        let sub = s.unstaged[0].submodule;
+        assert!(sub.commit_changed && sub.modified && sub.untracked);
+
+        s = Status::default();
+        ordinary(b"1 A. S... 000000 160000 160000 00 bb kid", &mut s);
+        assert_eq!(s.staged[0].kind, Kind::Submodule);
+        assert_eq!(
+            s.staged[0].submodule,
+            Submodule::default(),
+            "a clean borrow claims nothing"
+        );
+
+        s = Status::default();
+        ordinary(b"1 .M N... 100644 100644 100644 aa bb plain.txt", &mut s);
+        assert_eq!(s.unstaged[0].submodule, Submodule::default());
+
+        // A state field shorter than the documented four characters claims no
+        // flags either — a future git may change the spelling; kind survives.
+        s = Status::default();
+        ordinary(b"1 .M S 160000 160000 160000 aa bb odd", &mut s);
+        assert_eq!(s.unstaged[0].kind, Kind::Submodule);
+        assert_eq!(s.unstaged[0].submodule, Submodule::default());
+    }
+
+    #[test]
+    fn an_empty_or_header_only_stream_is_an_empty_status() {
+        assert_eq!(parse_status(b""), Status::default());
+        assert_eq!(parse_status(b"\0\0"), Status::default());
+        assert_eq!(
+            parse_status(b"# branch.oid abc\0# branch.head main\0"),
+            Status::default()
+        );
+    }
+
+    // ------------------------------------------------------- raw-record parsing
 
     #[test]
     fn a_modified_file_is_one_record() {
         let raw = ":100644 100644 aaa bbb M\0src/main.rs\0";
         assert_eq!(
             parse_raw(raw),
-            vec![Change {
+            vec![RawChange {
                 path: "src/main.rs".into(),
                 old_path: None,
                 status: 'M',
@@ -918,7 +1669,7 @@ mod tests {
     }
 
     #[test]
-    fn a_path_with_a_space_survives() {
+    fn a_raw_path_with_a_space_survives() {
         // The whole reason for `-z`. Splitting the metadata on whitespace is
         // safe only because the path is not in it.
         let raw = ":100644 100644 a b M\0dir with spaces/a file.rs\0";
@@ -933,18 +1684,27 @@ mod tests {
         let raw = ":160000 160000 34cbf180d 5697db813 M\0ghostty\0";
         let c = &parse_raw(raw)[0];
         assert_eq!(c.old_mode, "160000");
-        let old = Change::synthetic(&c.old_mode, &c.old_oid).expect("a gitlink is synthetic");
-        let new = Change::synthetic(&c.new_mode, &c.new_oid).unwrap();
+        let old = RawChange::synthetic(&c.old_mode, &c.old_oid).expect("a gitlink is synthetic");
+        let new = RawChange::synthetic(&c.new_mode, &c.new_oid).unwrap();
         assert_eq!(strs(&lines(&old)), ["Subproject commit 34cbf180d"]);
         assert_eq!(strs(&lines(&new)), ["Subproject commit 5697db813"]);
 
         // An added submodule has no old side at all.
         assert_eq!(
-            Change::synthetic("160000", &"0".repeat(40)),
+            RawChange::synthetic("160000", &"0".repeat(40)),
             Some(Vec::new())
         );
         // And an ordinary file is not synthetic, so it goes to `cat-file`.
-        assert_eq!(Change::synthetic("100644", "aaa"), None);
+        assert_eq!(RawChange::synthetic("100644", "aaa"), None);
+    }
+
+    #[test]
+    fn a_gitlink_is_never_fetched_from_the_object_database() {
+        // The exact predicate that builds the batch request and consumes its
+        // answers; a gitlink or a null OID there would desynchronise the pair.
+        assert!(fetchable("100644", "abc123"));
+        assert!(!fetchable("160000", "34cbf180d"));
+        assert!(!fetchable("100644", &"0".repeat(40)));
     }
 
     #[test]

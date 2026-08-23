@@ -585,6 +585,7 @@ fn main() {
         host,
         loaded,
         config: config_path,
+        repo,
     } = started;
     let host = Rc::new(host);
 
@@ -596,13 +597,17 @@ fn main() {
     // How to fetch the diff again with a different algorithm. Built here, where
     // the source is known, so nothing downstream has to learn what a repository
     // is. `None` for a `.diff` fixture and for the commit graph — neither has an
-    // algorithm to choose, and the control says so by being inert.
+    // algorithm to choose, and the control says so by being inert. The handle is
+    // the one the startup opened: re-acquiring goes through the same repository,
+    // not a fresh path per click.
     let rediff: Option<Rediff> = match (which, &source) {
-        (View::Diff, Source::Repo { path, arg }) => {
-            let (repo, revspec) = (path.clone(), arg.clone());
-            Some(Rc::new(move |host: &Host, over: &Overrides| {
-                plait_git::diff(&repo, &revspec, &host.differ, over)
-            }))
+        (View::Diff, Source::Repo { arg, .. }) => {
+            let revspec = arg.clone();
+            repo.map(|repo| {
+                Rc::new(move |host: &Host, over: &Overrides| {
+                    plait_git::diff(repo.as_ref(), &revspec, &host.differ, over)
+                }) as Rediff
+            })
         }
         _ => None,
     };

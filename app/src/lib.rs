@@ -97,6 +97,16 @@ pub struct Started {
     pub loaded: acquire::Loaded,
     /// Where the config file was found, for a client that wants to watch it.
     pub config: std::path::PathBuf,
+    /// One handle for every read this client makes, opened once and held for
+    /// the process.
+    ///
+    /// Persistent on purpose: a re-acquire — a different algorithm from a
+    /// control, a commit's diff opened off the graph — goes through this same
+    /// handle rather than through a fresh one per call, so whatever an
+    /// implementation amortises across calls survives the call. `None` for
+    /// `--fixtures`, which has no repository behind it; a client hands it back
+    /// to [`acquire::acquire`] unchanged, and tests hand in their own.
+    pub repo: Option<plait_git::Handle>,
 }
 
 impl Started {
@@ -270,7 +280,16 @@ impl Startup {
             Request::Help => unreachable!("returned above"),
         };
 
-        match acquire::acquire(view, &source, &host) {
+        // One handle for every read this client makes. Opening runs nothing,
+        // so a directory that is not a repository fails at the first read —
+        // in the same words it always failed there — and nothing is put on
+        // the road to the first frame to learn that early.
+        let repo = match &source {
+            Source::Repo { path, .. } => Some(plait_git::open(path)),
+            Source::Fixtures => None,
+        };
+
+        match acquire::acquire(view, &source, &host, repo.as_deref()) {
             Ok(loaded) => {
                 clock.stage("acquired");
                 Ok(Started {
@@ -279,6 +298,7 @@ impl Startup {
                     host,
                     loaded,
                     config: path,
+                    repo,
                 })
             }
             Err(e) => Err(Exit::Failed(format!(
@@ -341,6 +361,11 @@ mod tests {
         assert!(started.session_key().starts_with("diff:"));
         // The host is the configured one, not `Host::new()` handed back.
         assert!(!started.host.differ.selected().is_empty());
+        // The handle survives the startup, for every read after this one.
+        assert!(
+            started.repo.is_some(),
+            "a repository source keeps its handle"
+        );
     }
 
     #[test]
