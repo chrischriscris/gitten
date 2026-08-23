@@ -1,0 +1,53 @@
+# Everything that can be checked without opening a window — the CI half of
+# ./check.sh. Two jobs, deliberately small:
+#
+#   test   — the correctness section of check.sh verbatim. Every one of these
+#            crates is headless by design: core has no dependencies at all,
+#            web's tests are payloads and row indexes, tui's screen is a cell
+#            buffer. Ubuntu because it is cheap, and green here doubles as the
+#            Linux canary for every crate but the window.
+#   linux  — "nothing may be *written* in a way that makes Linux impossible."
+#            GPUI compiles there today; this keeps that true. Compile only —
+#            drawing needs a display, so tests live in `test`.
+#
+# What is deliberately absent, and why, is decision 0024.
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -q --locked -p plait-core
+      - run: cargo test -q --locked -p plait-app
+      - run: cargo test -q --locked -p plait-web
+      - run: cargo test -q --locked -p plait-tui
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The set Zed's own install script hands a Linux builder: gpui needs the
+      # headers even to compile, and blade wants vulkan present.
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            fontconfig libfontconfig1-dev \
+            libxcb1-dev libxcb-util-dev \
+            libxkbcommon-dev libxkbcommon-x11-0 \
+            libwayland-dev libudev-dev libvulkan-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets --locked
