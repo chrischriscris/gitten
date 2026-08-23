@@ -3,6 +3,7 @@ mod controls;
 mod dispatch;
 mod graph;
 mod help;
+mod input;
 mod session;
 mod stats;
 mod views;
@@ -341,6 +342,9 @@ struct DevShell {
     submitter: Submitter,
     generation: Generation,
     running: Option<String>,
+    /// The one native text field over the active screen, if a command is
+    /// gathering input. Consumers subscribe to its accepted/cancelled event.
+    input: Option<Entity<input::Input>>,
     /// The live picks. Every field `None` means "whatever the config selected",
     /// which is what the controls show until somebody changes one — so the strip
     /// agrees with `plait.toml` rather than with a copy of it taken at startup.
@@ -425,6 +429,9 @@ impl DevShell {
         if let Some(screen) = self.active() {
             self.modes.push(screen.mode());
         }
+        if self.input.is_some() {
+            self.modes.push(input::MODE);
+        }
         if self.help {
             self.modes.push("help");
         }
@@ -449,6 +456,27 @@ impl DevShell {
 
     fn set_notice(&mut self, message: impl Into<String>) {
         self.notice = Some(message.into());
+    }
+
+    #[allow(dead_code)]
+    fn open_input(&mut self, input: Entity<input::Input>, cx: &mut Context<Self>) {
+        if let Some(previous) = self.input.replace(input) {
+            previous.update(cx, |input, cx| input.cancel(cx));
+        }
+        self.sync_modes();
+        cx.notify();
+    }
+
+    fn close_input(&mut self, accept: bool, cx: &mut Context<Self>) {
+        let Some(input) = self.input.take() else {
+            return;
+        };
+        input.update(cx, |input, cx| match accept {
+            true => input.accept(cx),
+            false => input.cancel(cx),
+        });
+        self.sync_modes();
+        cx.notify();
     }
 
     /// The one queue future built-ins and compiled-in extensions share.
@@ -639,13 +667,19 @@ impl DevShell {
             }
             "back" => self.back(cx),
             "theme.cycle" => self.cycle_theme(cx),
+            "input.accept" => self.close_input(true, cx),
+            "input.cancel" => self.close_input(false, cx),
             "commits.open-diff" => self.open_diff(cx),
             "copy.selection" => self.copy_selection(cx),
             // Both are answered by whichever screen is up; a commit graph has no
             // selection yet, and a command nothing handles there is inert — the
             // same answer an unbound key gives.
             "select.all" | "select.none" => {
-                if let Some(screen) = self.active() {
+                if let Some(input) = self.input.clone() {
+                    input.update(cx, |input, cx| {
+                        input.select_all_text(command == "select.all", cx)
+                    });
+                } else if let Some(screen) = self.active() {
                     screen.select(command == "select.all", cx);
                 }
             }
@@ -689,6 +723,10 @@ impl DevShell {
             // The theme's as much a picker as the rest: same key, same exit.
             self.pending.clear();
             cx.notify();
+            return;
+        }
+        if self.input.is_some() {
+            self.close_input(false, cx);
             return;
         }
         if let Some(screen) = self.active() {
@@ -771,6 +809,12 @@ impl DevShell {
     /// clipboard is the window system's here — [`Context::write_to_clipboard`]
     /// — which is why this lives beside dispatch and not in a view.
     fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        if let Some(input) = self.input.as_ref() {
+            if let Some(text) = input.read(cx).selected_text() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            return;
+        }
         let host = config::host(cx);
         match self.active() {
             Some(Screen::Diff { view, .. }) => {
@@ -816,7 +860,11 @@ impl DevShell {
         // One candidate list per press, handed over whole: which spelling runs
         // is the map's decision, made against the chord at once.
         let typed: Vec<&[Key]> = self.pending.iter().map(Vec::as_slice).collect();
-        match host.keys.resolve_any(&self.modes, &typed) {
+        let resolved = match self.input.is_some() {
+            true => host.keys.resolve_mode_any(input::MODE, &typed),
+            false => host.keys.resolve_any(&self.modes, &typed),
+        };
+        match resolved {
             Resolve::Pending => {}
             Resolve::Run(name) => {
                 let name = name.to_string();
@@ -828,6 +876,13 @@ impl DevShell {
                 return;
             }
             Resolve::None => {
+                if self.input.is_some() {
+                    // Not an app command in this mode, so it is text-field
+                    // mechanics or text for the platform input handler. Let it
+                    // continue down the focus path untouched.
+                    self.pending.clear();
+                    return;
+                }
                 // Named by the spellings as they were typed — the insert when
                 // there was one, the key underneath when there was not.
                 let shown: Vec<Key> = self.pending.iter().map(|c| c[0]).collect();
@@ -1176,6 +1231,7 @@ impl Render for DevShell {
         let error = self.error.clone();
         let notice = self.notice.clone();
         let running = self.running.clone();
+        let input = self.input.clone();
 
         // The title is three things, so it is drawn as three: the app bright, the
         // view dim, the repository dimmer and shrinkable. One grey run of text
@@ -1188,9 +1244,13 @@ impl Render for DevShell {
         // and resolved *before* anything nested can give it a private meaning.
         // Taking focus on the first frame is what puts this element on the
         // dispatch path at all.
-        if self.focused.is_none() {
-            window.focus(&self.focus, cx);
-            self.focused = Some(self.focus.clone());
+        let desired_focus = input
+            .as_ref()
+            .map(|input| input.read(cx).focus_handle())
+            .unwrap_or_else(|| self.focus.clone());
+        if self.focused.as_ref() != Some(&desired_focus) {
+            window.focus(&desired_focus, cx);
+            self.focused = Some(desired_focus);
         }
         let mut root = div()
             .id("shell")
@@ -1305,6 +1365,7 @@ impl Render for DevShell {
                     .or_else(|| notice.map(|n| band(&c, SharedString::from(n), c.dim))),
             )
             .child(div().flex_grow(1.0).overflow_hidden().child(view))
+            .children(input)
             // The menu itself is deferred at priority 1. Its transparent
             // priority-0 backdrop blocks the rest of the window without
             // covering the menu, so capture can leave overlay wheel ownership
@@ -1418,6 +1479,7 @@ fn main() {
     app.run(move |cx| {
         start::mark("app.run enter");
         gpui_component::init(cx);
+        input::bind_keys(cx);
         cx.set_global(config::Active(host.clone()));
         // Nothing picked yet: the file's theme is the one on screen.
         cx.set_global(config::Chosen(None));
@@ -1613,6 +1675,7 @@ fn main() {
                     submitter,
                     generation: Generation::default(),
                     running: None,
+                    input: None,
                     over: Overrides::default(),
                     open: None,
                     error: None,
@@ -1753,7 +1816,7 @@ fn window_options(title: SharedString) -> WindowOptions {
 
 #[cfg(test)]
 mod tests {
-    use super::{DevShell, Open, Screen};
+    use super::{input, DevShell, Open, Screen};
     use crate::views::commits::Commits;
     use gpui::{AppContext as _, TestAppContext};
     use plait_app::cli::Source;
@@ -1784,6 +1847,7 @@ mod tests {
                 jobs,
                 generation: Generation::default(),
                 running: None,
+                input: None,
                 over: Default::default(),
                 open: which,
                 error: None,
@@ -1847,6 +1911,28 @@ mod tests {
         // And on the last screen esc stops: it was never a quit.
         shell.update(cx, |s, cx| s.back(cx));
         shell.read_with(cx, |s, _| assert_eq!(s.stack.len(), 1));
+    }
+
+    #[gpui::test]
+    fn native_input_owns_the_innermost_mode_until_it_closes(cx: &mut TestAppContext) {
+        let shell = shell(None, cx);
+        let input = cx.new(|cx| input::Input::new("message", "type", "draft", cx));
+        shell.update(cx, |shell, cx| shell.open_input(input.clone(), cx));
+        assert_eq!(
+            shell.read_with(cx, |shell, _| shell.modes.top().to_string()),
+            input::MODE
+        );
+        shell.update(cx, |shell, cx| shell.run_command("select.all", cx));
+        assert_eq!(
+            input.read_with(cx, |input, _| input.selected_text()),
+            Some("draft".into())
+        );
+
+        shell.update(cx, |shell, cx| shell.run_command("input.cancel", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.input.is_none());
+            assert_eq!(shell.modes.top(), "commits");
+        });
     }
 
     #[test]

@@ -4878,6 +4878,7 @@ dependencies = [
  "plait-app",
  "plait-core",
  "plait-git",
+ "unicode-segmentation",
 ]
 
 [[package]]

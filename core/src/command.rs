@@ -366,6 +366,12 @@ impl Keymap {
         bind("diff", "backtab", "diff.prev-file");
 
         bind("commits", "enter", "commits.open-diff");
+
+        // Text itself belongs to the platform input service. These are the two
+        // transitions around it, kept as named commands so a config file can
+        // move them without teaching a client another keymap.
+        bind("input", "enter", "input.accept");
+        bind("input", "esc", "input.cancel");
         k
     }
 
@@ -470,6 +476,24 @@ impl Keymap {
         if pending.is_empty() || pending.iter().any(|alts| alts.is_empty()) {
             return Resolve::None;
         }
+        for mode in modes.as_slice().iter().rev() {
+            let resolved = self.resolve_mode_any(mode, pending);
+            if resolved != Resolve::None {
+                return resolved;
+            }
+        }
+        Resolve::None
+    }
+
+    /// Resolves against exactly one mode, without inheriting [`GLOBAL`].
+    ///
+    /// A native text field needs this distinction: `j` is text while the field
+    /// is focused, not the global `view.down`, while an explicit binding in
+    /// `[keys.input]` still has to win before the platform inserts anything.
+    pub fn resolve_mode_any<'a>(&'a self, mode: &str, pending: &[&[Key]]) -> Resolve<'a> {
+        if pending.is_empty() || pending.iter().any(|alts| alts.is_empty()) {
+            return Resolve::None;
+        }
         let matches = |chord: &[Key]| {
             chord.len() == pending.len()
                 && chord.iter().zip(pending).all(|(k, alts)| alts.contains(k))
@@ -478,22 +502,20 @@ impl Keymap {
             chord.len() > pending.len()
                 && chord.iter().zip(pending).all(|(k, alts)| alts.contains(k))
         };
-        for mode in modes.as_slice().iter().rev() {
-            if let Some(b) = self
-                .bindings
-                .iter()
-                .rev()
-                .find(|b| b.mode == *mode && matches(&b.chord))
-            {
-                return Resolve::Run(&b.command);
-            }
-            if self
-                .bindings
-                .iter()
-                .any(|b| b.mode == *mode && prefixes(&b.chord))
-            {
-                return Resolve::Pending;
-            }
+        if let Some(b) = self
+            .bindings
+            .iter()
+            .rev()
+            .find(|b| b.mode == mode && matches(&b.chord))
+        {
+            return Resolve::Run(&b.command);
+        }
+        if self
+            .bindings
+            .iter()
+            .any(|b| b.mode == mode && prefixes(&b.chord))
+        {
+            return Resolve::Pending;
         }
         Resolve::None
     }
@@ -689,6 +711,8 @@ impl Commands {
             ("diff.cycle-wrap", "the next wrap"),
             ("theme.cycle", "the next theme"),
             ("commits.open-diff", "the diff for this commit"),
+            ("input.accept", "accept the text"),
+            ("input.cancel", "discard the text"),
             ("select.all", "select the whole view"),
             ("select.none", "drop the selection"),
             (
@@ -804,6 +828,19 @@ mod tests {
         );
         assert_eq!(k.resolve(&modes, &keys("G")), Resolve::Run("view.bottom"));
         assert_eq!(k.resolve(&modes, &keys("z")), Resolve::None);
+    }
+
+    #[test]
+    fn exact_mode_resolution_does_not_turn_text_into_global_commands() {
+        let k = Keymap::builtin();
+        assert_eq!(
+            k.resolve_mode_any("input", &[&[Key::char('j')]]),
+            Resolve::None
+        );
+        assert_eq!(
+            k.resolve_mode_any("input", &[&[Key::plain(Code::Enter)]]),
+            Resolve::Run("input.accept")
+        );
     }
 
     #[test]
