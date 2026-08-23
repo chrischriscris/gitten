@@ -29,11 +29,11 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      # Full history, not the default depth-1 clone: the acquisition tests use
-      # this repository as their fixture and diff HEAD~1..HEAD.
+      # The acquisition tests use this repository as their fixture: three
+      # commits for the commit-limit test, including HEAD~1 for diff tests.
       - uses: actions/checkout@v5
         with:
-          fetch-depth: 0
+          fetch-depth: 3
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -q --locked -p plait-core
       - run: cargo test -q --locked -p plait-app
