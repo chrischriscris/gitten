@@ -63,6 +63,11 @@ impl Commits {
     /// diff view's note: the model is filled in first, because a restore lands
     /// on a view that has never been laid out and must not clamp a saved row
     /// against a list it believes is empty.
+    ///
+    /// Strict, like the diff view's: the non-strict strategy skips a row that
+    /// is already inside the initial viewport, which is exactly where a saved
+    /// row near the top of the graph lands — GPUI would stay at row zero while
+    /// everything else claims the restore worked.
     pub fn scroll_to(&self, row: usize, host: &Host) {
         if self.data.commits.is_empty() {
             return;
@@ -72,7 +77,7 @@ impl Commits {
         v.scroll_to(row);
         self.view.set(v);
         self.top.set(v.top());
-        self.scroll.scroll_to_item(row, ScrollStrategy::Top);
+        self.scroll.scroll_to_item_strict(row, ScrollStrategy::Top);
     }
 
     pub fn total(&self) -> usize {
@@ -169,10 +174,13 @@ impl Commits {
     }
 
     /// Puts row `v.top()` at the top of the viewport, exactly. Direct offset
-    /// arithmetic rather than `scroll_to_item`, whose non-strict strategy would
-    /// skip scrolling for a row already on screen — see the diff view's `show`.
+    /// arithmetic rather than a deferred request — this runs against geometry
+    /// the list has already measured — and it cancels anything still parked in
+    /// the handle, so a restore's pending request cannot override a command
+    /// that has since moved the list. See the diff view's `show`.
     fn show(&self, v: Viewport) {
         let target = v.top();
+        self.scroll.0.borrow_mut().deferred_scroll_to_item = None;
         let s = self.scroll.0.borrow();
         let cur = s.base_handle.offset();
         let y = -(target as f32 * graph::ROW_H).clamp(0.0, f32::from(s.base_handle.max_offset().y));
@@ -483,6 +491,36 @@ mod tests {
         let mut v = c.view.get();
         v.set_height(30);
         assert_eq!((v.cursor(), v.top()), (40, 35));
+    }
+
+    #[test]
+    fn a_restored_row_inside_the_first_screen_still_moves_the_list() {
+        // The non-strict strategy skips any row already inside the initial
+        // viewport — which is where a saved row near the top of the graph
+        // lands — so GPUI would open at row zero while everything else claimed
+        // the restore worked. The parked request has to be strict.
+        let host = Rc::new(Host::new());
+        let mut c = Commits::new(commits(100), host.clone());
+        c.scroll_to(5, &host);
+
+        let request = c
+            .scroll
+            .0
+            .borrow()
+            .deferred_scroll_to_item
+            .expect("no request was parked");
+        assert_eq!(request.item_index, 5);
+        assert_eq!(request.strategy, gpui::ScrollStrategy::Top);
+        assert!(request.scroll_strict, "visible-in-range is exactly the bug");
+        assert_eq!(c.view.get().top(), 5, "and the model says so too");
+
+        // A command before the list lays out cancels the parked request rather
+        // than being overridden by it.
+        assert!(c.run_view("view.down", &host));
+        assert!(
+            c.scroll.0.borrow().deferred_scroll_to_item.is_none(),
+            "a command left a stale deferred scroll behind it"
+        );
     }
 
     #[test]

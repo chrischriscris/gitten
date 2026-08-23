@@ -297,11 +297,16 @@ struct DevShell {
     /// Which modes' bindings are live, innermost last: the screen's, then help
     /// over it. Rebuilt by [`DevShell::sync_modes`] whenever either changes.
     modes: Modes,
-    /// Keys typed so far that have not resolved. Empty almost always; a chord is
-    /// what puts something in it. Reset on every change of host, mode, focus,
-    /// picker, help or screen — a pending chord is a promise about what is on
-    /// screen, and none of those promises survive a change of any of it.
-    pending: Vec<Key>,
+    /// Keys typed so far that have not resolved. Empty almost always; a chord
+    /// is what puts something in it. One entry per press, and every entry
+    /// carries **every spelling** that press could mean
+    /// ([`dispatch::translate`]) — which of them runs is the keymap's
+    /// `resolve_any` decision, made against the whole chord at once, so a
+    /// half-typed `ß`/alt-s stays alive as both. Reset on every change of
+    /// host, mode, focus, picker, help or screen — a pending chord is a
+    /// promise about what is on screen, and none of those promises survive a
+    /// change of any of it.
+    pending: Vec<Vec<Key>>,
     help: bool,
     /// The window's one focusable element: this shell itself. Key events reach a
     /// listener through the focus path, so something has to hold focus, and one
@@ -341,9 +346,13 @@ impl DevShell {
         self.active().map_or(self.which, Screen::mode)
     }
 
-    /// Rebuilds the mode stack from what is on screen, and drops any chord that
-    /// was pending against the previous arrangement. Called on every change of
-    /// screen or help state — the places [`Modes`] can change.
+    /// Rebuilds the mode stack from what is on screen, and drops whatever was
+    /// pending against the previous arrangement: any half-typed chord, and any
+    /// open picker — a menu belongs to the screen it was opened over, and one
+    /// left standing after the screen changes is invisible but still in
+    /// `self.open`, where [`DevShell::on_wheel`] swallows for it forever.
+    /// Called on every change of screen or help state — the places
+    /// [`Modes`] can change.
     fn sync_modes(&mut self) {
         self.modes = Modes::new();
         if let Some(screen) = self.active() {
@@ -353,6 +362,7 @@ impl DevShell {
             self.modes.push("help");
         }
         self.pending.clear();
+        self.open = None;
     }
 
     /// The live host, and the chord reset that goes with it when the file has
@@ -522,15 +532,26 @@ impl DevShell {
         cx.notify();
     }
 
-    /// Closes the help, or leaves the innermost screen.
+    /// Closes the help, or the picker over it, or leaves the innermost screen.
     ///
-    /// One key for both, because both are "get me out of this". A selection is
-    /// inside a screen, so it goes first; the first screen is never popped —
-    /// `esc` on the thing you started with is not a quit.
+    /// One key for all of it, because all of it is "get me out of this" — and
+    /// **innermost first**, or a picker left open after its screen is popped
+    /// keeps occluding nothing: invisible, but still in `self.open`, where
+    /// [`DevShell::on_wheel`] swallows every event for it forever. So an open
+    /// menu is the whole of this `esc`: closed, pending dropped with it, no
+    /// selection cleared and no screen popped. A selection is inside a screen,
+    /// so it goes next; the first screen is never popped at all — `esc` on the
+    /// thing you started with is not a quit.
     fn back(&mut self, cx: &mut Context<Self>) {
         if self.help {
             self.help = false;
             self.sync_modes();
+            return;
+        }
+        if self.open.take().is_some() {
+            // The theme's as much a picker as the rest: same key, same exit.
+            self.pending.clear();
+            cx.notify();
             return;
         }
         if let Some(screen) = self.active() {
@@ -647,12 +668,16 @@ impl DevShell {
             self.focused = now_focused;
             self.pending.clear();
         }
-        let Some(key) = dispatch::translate(&ev.keystroke) else {
+        let candidates = dispatch::translate(&ev.keystroke);
+        if candidates.is_empty() {
             return;
-        };
+        }
         let host = self.fresh_host(cx);
-        self.pending.push(key);
-        match host.keys.resolve(&self.modes, &self.pending) {
+        self.pending.push(candidates);
+        // One candidate list per press, handed over whole: which spelling runs
+        // is the map's decision, made against the chord at once.
+        let typed: Vec<&[Key]> = self.pending.iter().map(Vec::as_slice).collect();
+        match host.keys.resolve_any(&self.modes, &typed) {
             Resolve::Pending => {}
             Resolve::Run(name) => {
                 let name = name.to_string();
@@ -664,7 +689,10 @@ impl DevShell {
                 return;
             }
             Resolve::None => {
-                let unknown = chord_string(&self.pending);
+                // Named by the spellings as they were typed — the insert when
+                // there was one, the key underneath when there was not.
+                let shown: Vec<Key> = self.pending.iter().map(|c| c[0]).collect();
+                let unknown = chord_string(&shown);
                 self.pending.clear();
                 // Said, not swallowed: a key that does nothing and a key that is
                 // not bound look identical, and only one of them is worth
@@ -1563,7 +1591,90 @@ fn window_options(title: SharedString) -> WindowOptions {
 
 #[cfg(test)]
 mod tests {
-    use super::DevShell;
+    use super::{DevShell, Open, Screen};
+    use crate::views::commits::Commits;
+    use gpui::{AppContext as _, TestAppContext};
+    use plait_core::command::{Key, Modes};
+    use plait_core::host::Host;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    /// A shell on one commits screen, with whatever picker is named open and
+    /// one key of a chord half-typed — the state `esc` meets most often.
+    fn shell(which: Option<Open>, cx: &mut TestAppContext) -> gpui::Entity<DevShell> {
+        cx.new(|cx| {
+            let commits = cx.new(|_| Commits::new(Vec::new(), Rc::new(Host::new())));
+            DevShell {
+                which: "commits",
+                stack: vec![Screen::Commits {
+                    view: commits,
+                    label: "repo".into(),
+                }],
+                stats: None,
+                rediff: None,
+                repo: None,
+                over: Default::default(),
+                open: which,
+                error: None,
+                notice: None,
+                config: std::path::PathBuf::new(),
+                first_render: Cell::new(false),
+                modes: Modes::new(),
+                pending: vec![vec![Key::char('g')]],
+                help: false,
+                focus: cx.focus_handle(),
+                focused: None,
+                seen_host: None,
+                ongoing: Cell::default(),
+            }
+        })
+    }
+
+    #[gpui::test]
+    fn esc_closes_any_open_picker_and_touches_nothing_else(cx: &mut TestAppContext) {
+        for which in [
+            Open::Theme,
+            Open::Layout,
+            Open::Wrap,
+            Open::Algorithm,
+            Open::Whitespace,
+        ] {
+            let shell = shell(Some(which), cx);
+            shell.update(cx, |s, cx| s.back(cx));
+            shell.read_with(cx, |s, _| {
+                assert!(s.open.is_none(), "{which:?} stayed open");
+                assert!(
+                    s.pending.is_empty(),
+                    "{which:?}: the half-typed chord survived"
+                );
+                assert_eq!(s.stack.len(), 1, "{which:?}: esc popped the screen too");
+                assert!(!s.help, "{which:?}: esc reached past the menu");
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn esc_without_a_picker_still_leaves_the_screen_the_innermost_exit(cx: &mut TestAppContext) {
+        // The control: nothing open, two screens stacked — back pops to the
+        // first and no further.
+        let shell = shell(None, cx);
+        shell.update(cx, |s, cx| {
+            let commits = cx.new(|_| Commits::new(Vec::new(), Rc::new(Host::new())));
+            s.stack.push(Screen::Commits {
+                view: commits,
+                label: "second".into(),
+            });
+        });
+        assert_eq!(shell.read_with(cx, |s, _| s.stack.len()), 2);
+        shell.update(cx, |s, cx| s.back(cx));
+        shell.read_with(cx, |s, _| {
+            assert_eq!(s.stack.len(), 1, "the top screen was not popped");
+            assert!(s.open.is_none());
+        });
+        // And on the last screen esc stops: it was never a quit.
+        shell.update(cx, |s, cx| s.back(cx));
+        shell.read_with(cx, |s, _| assert_eq!(s.stack.len(), 1));
+    }
 
     #[test]
     fn the_wheel_follows_the_resolved_command_not_the_finger() {

@@ -15,16 +15,27 @@
 //!   so the shift goes back where every other client has it: into the char.
 //! - **A keystroke carries two characters**: `key`, the physical key's own
 //!   name, and `key_char`, the character the press would have inserted. On a
-//!   non-US layout these part ways — `?` typed on a German keyboard arrives as
-//!   key `´` with insert `?`, and a binding written `?` must follow the insert.
-//!   GPUI matches a differing insert against a target with **control only**
-//!   held ([`Keystroke::should_match`]: shift is already inside the character,
-//!   and alt was part of composing it), so the same modifiers survive here.
-//!   When the two spellings agree — an unshifted letter, a plain symbol — the
-//!   physical path keeps its own semantics, alt and all, exactly as GPUI falls
-//!   back to it. An insert that is not one character is IME composition state:
-//!   nothing is invented from it, and if the physical half is no single
-//!   character either, the press translates to nothing.
+//!   non-US layout these part ways — option-s on a German keyboard arrives as
+//!   key `s` with insert `ß` — and GPUI answers for *each binding* whether it
+//!   matches either spelling ([`Keystroke::should_match`]: a differing insert
+//!   is matched with control alone, because shift lives inside the character
+//!   and alt went into composing it; failing that, the physical key matches
+//!   with its full modifiers). So one press can mean two keys, and which of
+//!   them fires is the keymap's decision, not this file's: [`translate`]
+//!   returns **every** spelling, logical first, and the keymap's
+//!   `resolve_any` matches each binding against any of them. Choosing
+//!   one here would hardcode a binding that may not exist — a plain
+//!   `ß` map would never see alt-s, an alt-s map would never see `ß`,
+//!   and mode precedence would be answered before it was consulted.
+//!
+//!   When the two spellings agree — an unshifted letter, a plain symbol — there
+//!   is nothing to choose and one candidate comes back, carrying its own
+//!   modifiers exactly as GPUI's physical fallback compares them. A shifted
+//!   letter keeps only its capital: shift cannot ride on a character anywhere
+//!   in this map, so no second candidate is invented from the physical half.
+//!   An insert that is not one character is IME composition state: nothing is
+//!   invented from it, and if the physical half is no single character either,
+//!   the press translates to nothing.
 //! - **A shifted symbol arrives as the symbol**: `?` is key `"?"` with `shift`
 //!   *cleared*, because macOS reports the shifted character as the key. Left
 //!   alone that would bind `shift-?` and never fire; [`Key::new`] would drop
@@ -37,20 +48,24 @@
 use gpui::Keystroke;
 use plait_core::command::{Code, Key};
 
-/// One GPUI keystroke as a [`Key`], or `None` for anything no client can bind:
-/// the platform modifier, function keys, and lone modifiers (which GPUI
-/// synthesizes for binding matching and never delivers here).
-pub fn translate(k: &Keystroke) -> Option<Key> {
+/// Every key one GPUI keystroke could mean, in the order GPUI's own matcher
+/// would try them — or empty for anything no client can bind: the platform
+/// modifier, function keys, and lone modifiers (which GPUI synthesizes for
+/// binding matching and never delivers here).
+///
+/// Most presses carry exactly one spelling. A press whose insert differs from
+/// its physical key carries two; see the module note for why both survive and
+/// `plait_core::command::Keymap::resolve_any` for who decides between them.
+pub fn translate(k: &Keystroke) -> Vec<Key> {
     // Cmd-c means copy to the OS, whatever `plait.toml` says. See the module
     // note: the menu adapters own these, and translating them too would be a
     // command that fires twice.
     if k.modifiers.platform || k.modifiers.function {
-        return None;
+        return Vec::new();
     }
     // The two characters a keystroke carries. The insert matters only when it
     // differs from the physical spelling — that difference is exactly the case
-    // the layout broke, and the insert is the half every layout shares. Named
-    // keys below ignore both halves entirely.
+    // the layout broke. Named keys below ignore both halves entirely.
     let physical = sole(&k.key);
     let inserted = k
         .key_char
@@ -72,7 +87,7 @@ pub fn translate(k: &Keystroke) -> Option<Key> {
         // and the shift goes no further — a terminal folds it into the code the
         // same way, so `[keys]` says `backtab` and nothing else.
         "tab" if k.modifiers.shift => {
-            return Some(Key::plain(Code::BackTab));
+            return vec![Key::plain(Code::BackTab)];
         }
         "tab" => Code::Tab,
         "backspace" => Code::Backspace,
@@ -82,30 +97,57 @@ pub fn translate(k: &Keystroke) -> Option<Key> {
         "esc" | "escape" => Code::Esc,
         // Everything the named arms above did not take, decided entirely by
         // the two characters computed before the match.
-        _ => {
-            let c = inserted.or(physical)?;
-            // Capitals are folded wherever they came from — the insert of a
-            // shifted letter already *is* the capital, and a shift-flagged
-            // physical letter becomes one here, which is both what the other
-            // clients report and what the shipped map binds.
-            Code::Char(
-                match inserted.is_none() && k.modifiers.shift && c.is_ascii_lowercase() {
-                    true => c.to_ascii_uppercase(),
-                    false => c,
-                },
-            )
+        _ => return characters(physical, inserted, &k.modifiers),
+    };
+    // A named key is its name: a binding on it is a binding on the key, and
+    // the modifiers held are the modifiers spelled.
+    vec![Key::new(
+        code,
+        k.modifiers.control,
+        k.modifiers.alt,
+        k.modifiers.shift,
+    )]
+}
+
+/// The candidates of a press that is about a *character*: the insert, the
+/// physical key, or both.
+///
+/// The logical candidate keeps only the modifiers GPUI matches a differing
+/// insert against — control, because ctrl-a is still a command and not a
+/// character anybody typed; shift is already inside the character and alt went
+/// into composing it. The physical candidate then falls back exactly as
+/// GPUI's own comparison does, with every modifier it was pressed with —
+/// unless shift was among them, which no character in this map can hold: the
+/// candidate would come back unshifted and fire a binding GPUI would never
+/// fire, so where the capital is not already the character there is nothing to
+/// fall back *to*.
+fn characters(physical: Option<char>, inserted: Option<char>, mods: &gpui::Modifiers) -> Vec<Key> {
+    let Some(c) = inserted.or(physical) else {
+        return Vec::new();
+    };
+    match inserted.is_some() {
+        true => {
+            let mut out = vec![Key::new(Code::Char(c), mods.control, false, false)];
+            // The physical half answers only when this map could still hold a
+            // binding it would match: shift cannot ride on a character.
+            if !mods.shift {
+                if let Some(p) = physical {
+                    out.push(Key::new(Code::Char(p), mods.control, mods.alt, false));
+                }
+            }
+            out
         }
-    };
-    // Modifiers that survive a character which arrived through the insert are
-    // GPUI's own matching rule: control still means "command", while shift is
-    // inside the character and alt went into composing it. Everything else —
-    // named keys, and characters read off the physical key — keeps what was
-    // actually held.
-    let (ctrl, alt, shift) = match inserted.is_some() {
-        true => (k.modifiers.control, false, false),
-        false => (k.modifiers.control, k.modifiers.alt, k.modifiers.shift),
-    };
-    Some(Key::new(code, ctrl, alt, shift))
+        false => {
+            // Capitals are folded wherever they came from — a shift-flagged
+            // physical letter becomes one, which is both what the other
+            // clients report and what the shipped map binds.
+            let c = match mods.shift && c.is_ascii_lowercase() {
+                true => c.to_ascii_uppercase(),
+                false => c,
+            };
+            vec![Key::new(Code::Char(c), mods.control, mods.alt, mods.shift)]
+        }
+    }
 }
 
 /// The one character of `s`, or nothing: multi-character strings are IME
@@ -125,7 +167,8 @@ mod tests {
     use gpui::Modifiers;
     use plait_core::command::{Keymap, Modes, Resolve};
 
-    fn key(key: &str, m: Modifiers) -> Option<Key> {
+    /// Every spelling of a keystroke.
+    fn key(key: &str, m: Modifiers) -> Vec<Key> {
         translate(&Keystroke {
             modifiers: m,
             key: key.into(),
@@ -134,7 +177,7 @@ mod tests {
     }
 
     /// A keystroke as a real keyboard delivers it: physical name and insert.
-    fn typed(key: &str, insert: Option<&str>, m: Modifiers) -> Option<Key> {
+    fn typed(key: &str, insert: Option<&str>, m: Modifiers) -> Vec<Key> {
         translate(&Keystroke {
             modifiers: m,
             key: key.into(),
@@ -156,10 +199,11 @@ mod tests {
         m
     }
 
+    /// The one spelling of an unambiguous press.
     fn t(spelling: &str, mods: &str) -> String {
-        key(spelling, plain(mods))
-            .expect("nothing came back")
-            .to_string()
+        let got = key(spelling, plain(mods));
+        assert_eq!(got.len(), 1, "{spelling} meant {got:?}");
+        got[0].to_string()
     }
 
     /// How GPUI spells a key on a Mac, for the round-trip below.
@@ -193,15 +237,20 @@ mod tests {
                 continue;
             }
             checked += 1;
-            let got = key(&spelling(want.code), modifiers_of(want))
-                .unwrap_or_else(|| panic!("{} did not translate", spelling(want.code)));
-            assert_eq!(&got, want);
+            let got = key(&spelling(want.code), modifiers_of(want));
+            assert_eq!(
+                got.len(),
+                1,
+                "{} came back with several spellings",
+                spelling(want.code)
+            );
+            assert_eq!(&got[0], want);
             // Resolved in its own mode — `diff.*` keys are not global, and that
             // is the point of them.
             let mut modes = Modes::new();
             modes.push(b.mode.as_str());
             assert_eq!(
-                k.resolve(&modes, &[got]),
+                k.resolve(&modes, &[*want]),
                 Resolve::Run(&b.command),
                 "{} did not resolve",
                 b.command
@@ -233,9 +282,9 @@ mod tests {
     fn a_shifted_symbol_arrives_as_itself() {
         // macOS reports the shifted character as the key; the flag is cleared.
         // A binding on "?" must fire, and one on "shift-?" must not exist twice.
-        let got = key("?", plain("shift")).unwrap();
-        assert_eq!(got, Key::char('?'));
-        assert!(!got.shift);
+        let got = key("?", plain("shift"));
+        assert_eq!(got, vec![Key::char('?')]);
+        assert!(!got[0].shift);
     }
 
     #[test]
@@ -269,9 +318,9 @@ mod tests {
     #[test]
     fn the_platform_modifier_does_not_translate() {
         // The menu's keys. Translating them too would run a command twice.
-        assert_eq!(key("q", plain("cmd")), None);
-        assert_eq!(key("c", plain("cmd")), None);
-        assert_eq!(key("a", plain("cmd")), None);
+        assert!(key("q", plain("cmd")).is_empty());
+        assert!(key("c", plain("cmd")).is_empty());
+        assert!(key("a", plain("cmd")).is_empty());
     }
 
     #[test]
@@ -280,12 +329,16 @@ mod tests {
         // shift-´, and GPUI reports key "/" with insert "?". A binding written
         // "?" is a binding on the *character* — every other client reports the
         // character — so the insert wins whenever the two spellings part ways.
-        assert_eq!(typed("/", Some("?"), plain("shift")), Some(Key::char('?')));
-        // The shipped diff bindings, which are punctuation too.
-        assert_eq!(typed("ù", Some("["), plain("")), Some(Key::char('[')));
-        assert_eq!(typed("à", Some("]"), plain("")), Some(Key::char(']')));
+        assert_eq!(typed("/", Some("?"), plain("shift")), vec![Key::char('?')]);
+        // The shipped diff bindings, which are punctuation too. No modifiers
+        // held, so the physical half falls back as the bare key it is.
+        assert_eq!(
+            typed("ù", Some("["), plain("")),
+            vec![Key::char('['), Key::char('ù')]
+        );
+        assert_eq!(typed("à", Some("]"), plain(""))[0], Key::char(']'));
         // ...and with no insert at all the physical spelling still answers.
-        assert_eq!(key("[", plain("")), Some(Key::char('[')));
+        assert_eq!(key("[", plain("")), vec![Key::char('[')]);
     }
 
     #[test]
@@ -295,13 +348,21 @@ mod tests {
         // (alt-ç inserts `$` on a Czech keyboard; the `$` needs no alt), and
         // alt was part of composing it. Control survives, because ctrl-a is
         // still a command and not a character anybody typed.
-        let got = typed("ç", Some("$"), plain("alt")).expect("$");
-        assert_eq!(got, Key::char('$'));
-        assert!(!got.alt && !got.shift);
+        let got = typed("ç", Some("$"), plain("alt"));
+        assert_eq!(got[0], Key::char('$'));
+        assert!(!got[0].alt && !got[0].shift);
+        // The physical half falls back with its own modifiers, as GPUI's
+        // comparison does after the logical one missed — a binding on alt-ç
+        // fires here, on a map that never heard of `$`.
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[1], Key::parse("alt-ç").unwrap());
 
-        let got = typed("x", Some("X"), plain("ctrl-shift")).expect("ctrl-X");
-        assert_eq!(got, Key::ctrl(Code::Char('X')));
-        assert!(got.ctrl && !got.shift);
+        let got = typed("x", Some("X"), plain("ctrl-shift"));
+        assert_eq!(got[0], Key::ctrl(Code::Char('X')));
+        assert!(got[0].ctrl && !got[0].shift);
+        // ...and no physical fallback under shift: this map cannot hold
+        // `shift-x`, so a second candidate would fire something GPUI would not.
+        assert_eq!(got.len(), 1, "{got:?}");
     }
 
     #[test]
@@ -310,19 +371,25 @@ mod tests {
         // GPUI falls back to matching the physical key with its own modifiers —
         // so this file does too. alt-j stays alt-j rather than dissolving into
         // a bare j because the insert happened to say j.
-        let got = typed("j", Some("j"), plain("alt")).expect("alt-j");
-        assert_eq!(got, Key::parse("alt-j").unwrap());
-        let got = typed("d", Some("d"), plain("ctrl")).expect("ctrl-d");
-        assert_eq!(got, Key::parse("ctrl-d").unwrap());
+        assert_eq!(
+            typed("j", Some("j"), plain("alt")),
+            vec![Key::parse("alt-j").unwrap()]
+        );
+        assert_eq!(
+            typed("d", Some("d"), plain("ctrl")),
+            vec![Key::parse("ctrl-d").unwrap()]
+        );
     }
 
     #[test]
     fn capitals_survive_whether_they_came_from_the_key_or_the_insert() {
-        // Both spellings of shift-g land on the capital the map binds.
-        assert_eq!(typed("g", Some("G"), plain("shift")), Some(Key::char('G')));
-        assert_eq!(typed("g", None, plain("shift")), Some(Key::char('G')));
+        // Both spellings of shift-g land on the capital the map binds — and on
+        // the capital only: the physical `g` underneath must not come along,
+        // or shift-g would fire whatever `g` is bound to.
+        assert_eq!(typed("g", Some("G"), plain("shift")), vec![Key::char('G')]);
+        assert_eq!(typed("g", None, plain("shift")), vec![Key::char('G')]);
         // An unshifted letter whose insert is itself stays lowercase.
-        assert_eq!(typed("g", Some("g"), plain("")), Some(Key::char('g')));
+        assert_eq!(typed("g", Some("g"), plain("")), vec![Key::char('g')]);
     }
 
     #[test]
@@ -331,15 +398,15 @@ mod tests {
         // a binding on the keys — and escape inserts nothing at all.
         assert_eq!(
             typed("return", Some("\r"), plain("")),
-            Some(Key::plain(Code::Enter))
+            vec![Key::plain(Code::Enter)]
         );
         assert_eq!(
             typed("space", Some(" "), plain("")),
-            Some(Key::plain(Code::Char(' ')))
+            vec![Key::plain(Code::Char(' '))]
         );
         assert_eq!(
             typed("escape", None, plain("")),
-            Some(Key::plain(Code::Esc))
+            vec![Key::plain(Code::Esc)]
         );
     }
 
@@ -348,20 +415,90 @@ mod tests {
         // Multi-character inserts are IME composition state, not keystrokes:
         // nothing is taken from them, though a physical spelling underneath
         // still answers for itself.
-        assert_eq!(typed("a", Some("ab"), plain("")), Some(Key::char('a')));
+        assert_eq!(typed("a", Some("ab"), plain("")), vec![Key::char('a')]);
         // And where neither half is a single character — the Insert key, a
         // media key — the press is nothing, exactly as before.
-        assert_eq!(typed("insert", Some("help"), plain("")), None);
-        assert_eq!(typed("insert", None, plain("")), None);
-        assert_eq!(typed("f3", None, plain("")), None);
-        assert_eq!(typed("media", Some("play"), plain("")), None);
+        assert!(typed("insert", Some("help"), plain("")).is_empty());
+        assert!(key("insert", plain("")).is_empty());
+        assert!(key("f3", plain("")).is_empty());
+        assert!(typed("media", Some("play"), plain("")).is_empty());
     }
 
     #[test]
-    fn what_no_client_can_bind_comes_back_none() {
+    fn what_no_client_can_bind_comes_back_nothing() {
         // Function keys have no Code variant; multi-character names that are
         // not keys are not invented into one.
-        assert_eq!(key("f3", plain("")), None);
-        assert_eq!(key("media", plain("")), None);
+        assert!(key("f3", plain("")).is_empty());
+        assert!(key("media", plain("")).is_empty());
+    }
+}
+
+/// End-to-end: a keystroke through [`translate`] into [`Keymap::resolve_any`],
+/// which is the whole of what `on_key` does. The unit tests above hold the
+/// spellings; these hold the decision the spellings exist for.
+#[cfg(test)]
+mod resolution_tests {
+    use super::translate;
+    use gpui::{Keystroke, Modifiers};
+    use plait_core::command::{Code, Key, Keymap, Modes, Resolve};
+
+    /// Option-s as a German Mac delivers it.
+    fn option_s() -> Keystroke {
+        Keystroke {
+            modifiers: Modifiers {
+                alt: true,
+                ..Default::default()
+            },
+            key: "s".into(),
+            key_char: Some("ß".into()),
+        }
+    }
+
+    #[test]
+    fn option_s_means_either_binding_the_map_actually_holds() {
+        let mut modes = Modes::new();
+        modes.push("diff");
+        let candidates = translate(&option_s());
+        assert_eq!(
+            candidates,
+            vec![
+                Key::new(Code::Char('ß'), false, false, false),
+                Key::parse("alt-s").unwrap(),
+            ],
+            "logical first, then physical"
+        );
+        // One press, both spellings: the candidate list rides under the one
+        // key it belongs to.
+        let pressed = [candidates.as_slice()];
+
+        // A plain ß binding fires through the logical spelling…
+        let mut k = Keymap::empty();
+        k.bind("diff", "ß", "insert.ssharp").unwrap();
+        assert_eq!(
+            k.resolve_any(&modes, &pressed),
+            Resolve::Run("insert.ssharp")
+        );
+
+        // …and an alt-s binding fires through the physical one, on a map with
+        // no opinion about ß at all.
+        let mut k = Keymap::empty();
+        k.bind("diff", "alt-s", "save.now").unwrap();
+        assert_eq!(k.resolve_any(&modes, &pressed), Resolve::Run("save.now"));
+    }
+
+    #[test]
+    fn mode_precedence_answers_before_spelling_order_does() {
+        // Deciding between the two spellings *before* consulting the map would
+        // hand every option-s to the global `ß` row. The innermost mode's
+        // binding wins instead, whichever way it was written.
+        let mut k = Keymap::empty();
+        k.bind(plait_core::command::GLOBAL, "ß", "global.ssharp")
+            .unwrap();
+        k.bind("diff", "alt-s", "diff.save").unwrap();
+        let mut modes = Modes::new();
+        modes.push("diff");
+        let candidates = translate(&option_s());
+        let pressed = [candidates.as_slice()];
+        assert_eq!(k.resolve_any(&modes, &pressed), Resolve::Run("diff.save"));
     }
 }

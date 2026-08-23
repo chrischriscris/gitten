@@ -429,21 +429,72 @@ impl Keymap {
     /// Innermost mode first, falling through outwards, so a mode overrides
     /// [`GLOBAL`] by binding the same chord and inherits everything it does not.
     pub fn resolve(&self, modes: &Modes, pending: &[Key]) -> Resolve<'_> {
-        if pending.is_empty() {
+        self.resolve_any(
+            modes,
+            &pending
+                .iter()
+                .map(std::slice::from_ref)
+                .collect::<Vec<&[Key]>>(),
+        )
+    }
+
+    /// [`resolve`](Self::resolve) when a press may carry more than one
+    /// spelling.
+    ///
+    /// A window's keystroke names a physical key *and* the character it would
+    /// insert, and on anything but a US layout those part ways: option-s on a
+    /// German keyboard inserts `ß`. GPUI's own matcher,
+    /// `Keystroke::should_match`, answers for *each binding* whether it
+    /// matches either spelling — logical first, then physical — so which one
+    /// wins is decided by the map, never by the client picking a favourite
+    /// before asking.
+    ///
+    /// So this takes one candidate list per press and matches each binding
+    /// against **any** of its spellings, per position. Trying whole candidates
+    /// in order instead would be wrong twice over: a global `ß` would beat a
+    /// diff-mode `alt-s` because the logical spelling went first, and mode
+    /// precedence — the walk below — is the invariant every other test here
+    /// rests on. With the disjunction inside the match, the innermost mode's
+    /// binding wins whichever spelling it was written in, exactly as one pass
+    /// over GPUI's bindings in map order would land.
+    ///
+    /// Within a mode, a chord that continues beats a binding that ends — the
+    /// order GPUI's own dispatcher uses, where pending outranks a full match.
+    /// One spelling alone can never need this: [`bind`](Self::bind) refuses
+    /// prefixes, so an exact match and a longer chord cannot share a mode.
+    /// Spellings can, though — `ß` and the `alt-s` that inserts it are
+    /// different chords to `bind` and the same press to a German keyboard —
+    /// and the chord keeps waiting, which is also the only way its second key
+    /// is ever reachable.
+    ///
+    /// `pending[i]` must be non-empty; [`Self::resolve`] is the
+    /// single-spelling case.
+    pub fn resolve_any(&self, modes: &Modes, pending: &[&[Key]]) -> Resolve<'_> {
+        if pending.is_empty() || pending.iter().any(|alts| alts.is_empty()) {
             return Resolve::None;
         }
+        let matches = |chord: &[Key]| {
+            chord.len() == pending.len()
+                && chord.iter().zip(pending).all(|(k, alts)| alts.contains(k))
+        };
+        let prefixes = |chord: &[Key]| {
+            chord.len() > pending.len()
+                && chord.iter().zip(pending).all(|(k, alts)| alts.contains(k))
+        };
         for mode in modes.as_slice().iter().rev() {
+            if self
+                .bindings
+                .iter()
+                .any(|b| b.mode == *mode && prefixes(&b.chord))
+            {
+                return Resolve::Pending;
+            }
             if let Some(b) = self
                 .bindings
                 .iter()
-                .find(|b| b.mode == *mode && b.chord == pending)
+                .find(|b| b.mode == *mode && matches(&b.chord))
             {
                 return Resolve::Run(&b.command);
-            }
-            if self.bindings.iter().any(|b| {
-                b.mode == *mode && b.chord.len() > pending.len() && b.chord.starts_with(pending)
-            }) {
-                return Resolve::Pending;
             }
         }
         Resolve::None
@@ -938,6 +989,117 @@ mod tests {
     #[test]
     fn an_empty_press_resolves_to_nothing() {
         assert_eq!(Keymap::builtin().resolve(&Modes::new(), &[]), Resolve::None);
+    }
+
+    // ------------------------------------------------- alternate spellings
+    //
+    // The window client reports a keystroke as a physical key *and* an insert;
+    // where they differ, GPUI matches a binding against either. These hold the
+    // contract `resolve_any` exists for: the map decides, never the spelling.
+
+    /// Option-s on a German layout: insert `ß`, physical `s` with alt.
+    fn option_s() -> Vec<Key> {
+        vec![Key::char('ß'), Key::parse("alt-s").unwrap()]
+    }
+
+    #[test]
+    fn either_spelling_of_a_press_fires_whichever_binding_exists() {
+        let mut modes = Modes::new();
+        modes.push("diff");
+
+        // The logical spelling is bound: it runs.
+        let mut k = Keymap::empty();
+        k.bind("diff", "ß", "layout.ssharp").unwrap();
+        assert_eq!(
+            k.resolve_any(&modes, &[&option_s()]),
+            Resolve::Run("layout.ssharp")
+        );
+
+        // Only the physical one is bound: it runs too — the press is not lost
+        // for lack of the character.
+        let mut k = Keymap::empty();
+        k.bind("diff", "alt-s", "layout.alts").unwrap();
+        assert_eq!(
+            k.resolve_any(&modes, &[&option_s()]),
+            Resolve::Run("layout.alts")
+        );
+    }
+
+    #[test]
+    fn mode_precedes_spelling_order() {
+        // The trap a candidate *order* would fall into: `ß` is the logical
+        // spelling and would be tried first, and a global binding on it would
+        // beat a diff-mode binding on alt-s. GPUI checks bindings, not
+        // spellings — so does this walk.
+        let mut k = Keymap::builtin();
+        k.bind(GLOBAL, "ß", "global.ssharp").unwrap();
+        k.bind("diff", "alt-s", "diff.alts").unwrap();
+        let mut modes = Modes::new();
+        modes.push("diff");
+        assert_eq!(
+            k.resolve_any(&modes, &[&option_s()]),
+            Resolve::Run("diff.alts"),
+            "the inner mode won with its own spelling"
+        );
+
+        // Outside the mode the same press reaches the global after all.
+        assert_eq!(
+            k.resolve_any(&Modes::new(), &[&option_s()]),
+            Resolve::Run("global.ssharp")
+        );
+    }
+
+    #[test]
+    fn a_chord_waits_with_alternatives_in_its_first_key() {
+        // Pending has to keep *both* spellings alive: which one completes the
+        // chord is decided by the second key's map lookup, and throwing either
+        // away at prefix time loses a binding that exists.
+        let mut k = Keymap::empty();
+        k.bind(GLOBAL, "ß", "insert.ssharp").unwrap();
+        k.bind(GLOBAL, "alt-s n", "pane.next").unwrap();
+        let modes = Modes::new();
+
+        // A plain `ß` binding must NOT fire here: alt-s is also alive, and
+        // until the second key arrives the press is a prefix of it.
+        assert_eq!(k.resolve_any(&modes, &[&option_s()]), Resolve::Pending);
+        let n = [Key::char('n')];
+        assert_eq!(
+            k.resolve_any(&modes, &[&option_s(), &n]),
+            Resolve::Run("pane.next")
+        );
+
+        // ...and the other branch of the fork still resolves on its own key.
+        let sharp = [Key::char('ß')];
+        assert_eq!(
+            k.resolve_any(&modes, &[&sharp]),
+            Resolve::Run("insert.ssharp")
+        );
+    }
+
+    #[test]
+    fn resolve_and_resolve_any_agree_on_a_single_spelling() {
+        let k = Keymap::builtin();
+        let mut modes = Modes::new();
+        modes.push("commits");
+        for chord in ["j", "?", "enter", "ctrl-d", "z"] {
+            let keys = keys(chord);
+            let singles: Vec<&[Key]> = keys.iter().map(std::slice::from_ref).collect();
+            assert_eq!(
+                k.resolve(&modes, &keys),
+                k.resolve_any(&modes, &singles),
+                "{chord} resolved differently through alternatives"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_candidate_list_resolves_to_nothing() {
+        // A press no client can bind translates to nothing; feeding that
+        // nothing onward must not read as "the first key of every chord".
+        let k = Keymap::builtin();
+        let j = [Key::char('j')];
+        assert_eq!(k.resolve_any(&Modes::new(), &[&[]]), Resolve::None);
+        assert_eq!(k.resolve_any(&Modes::new(), &[&[], &j]), Resolve::None);
     }
 
     fn shown(keys: &Keymap, commands: &Commands, modes: &Modes) -> Vec<String> {

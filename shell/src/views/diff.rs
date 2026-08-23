@@ -732,7 +732,9 @@ impl Diff {
             v.set_len(self.order.len());
             v.go_to(built.anchor);
             self.view.set(v);
-            self.show(v);
+            // Deferred, not written: the list has not laid out the new row
+            // count, and its bound is the old shape's. See `defer_show`.
+            self.defer_show(v);
             // After the order table, because the bound is the widest row's and
             // that is what just moved. Said out loud when it is not zero: "the
             // diff fits" and "there is a kilometre of it off the right of the
@@ -934,16 +936,42 @@ impl Diff {
     /// already visible": the margin arithmetic is [`Viewport::follow`]'s, and
     /// re-doing it here would be doing it differently.
     ///
-    /// Direct offset rather than `scroll_to_item`, whose non-strict strategy
-    /// skips scrolling for a row already on screen — a page that lands the
-    /// cursor one row short instead of one screenful down.
+    /// Direct offset rather than a deferred request, because this runs at event
+    /// time against geometry that already exists: the list laid out on the
+    /// frame before, so its bound is the truth. Which is also why any request
+    /// still parked in the handle is cancelled here — a command's position is
+    /// written *now*, and a stale one left pending would override it when the
+    /// list next lays out.
     fn show(&self, v: Viewport) {
         let target = v.top();
+        self.scroll.0.borrow_mut().deferred_scroll_to_item = None;
         let s = self.scroll.0.borrow();
         let cur = s.base_handle.offset();
         let y = -(target as f32 * ROW_H).clamp(0.0, f32::from(s.base_handle.max_offset().y));
         s.base_handle.set_offset(point(cur.x, px(y)));
         self.synced.set(y);
+        self.top.set(target);
+    }
+
+    /// [`Diff::show`] against geometry that does not exist yet.
+    ///
+    /// A cursor-preserving reflow has just changed how many rows there are,
+    /// which means the list's own bound — what [`Diff::show`] clamps against —
+    /// still describes the *old* shape: narrower rows means more of them, and
+    /// a deep cursor needs more offset than the old maximum allows, so writing
+    /// now would clamp it back on screen-edge and record the wrong place in
+    /// [`Diff::synced`]. GPUI's deferred request is the fix: it is consumed by
+    /// the list's own prepaint, after it has measured the new row count, and
+    /// **strict**, so it lands exactly where the model says even if that row
+    /// would have been visible somewhere else.
+    ///
+    /// The offset itself is deliberately left alone until then; [`Diff::top`]
+    /// says where the list is about to sit, and [`Diff::reconcile`] meets the
+    /// real number once prepaint has written it.
+    fn defer_show(&self, v: Viewport) {
+        let target = v.top();
+        self.scroll
+            .scroll_to_item_strict(target, ScrollStrategy::Top);
         self.top.set(target);
     }
 
@@ -1057,6 +1085,13 @@ impl Diff {
     /// never been laid out: without it, `go_to` would clamp a saved row 4,102
     /// against a list the model still believes is empty, and the first frame
     /// would open at row zero no matter what was restored.
+    ///
+    /// And **strict**, deferred to the list's own prepaint: the non-strict
+    /// strategy skips scrolling for a row already inside the initial viewport,
+    /// so a saved row 5 of a tall window would leave GPUI parked at row zero
+    /// while the model and the session both claimed 5 — and every later
+    /// reconcile would then read that lie back as the truth. Strict puts row
+    /// `row` at the top, whatever was there.
     pub fn scroll_to(&self, row: usize, host: &Host) {
         if self.order.is_empty() {
             return;
@@ -1066,7 +1101,7 @@ impl Diff {
         v.scroll_to(row);
         self.view.set(v);
         self.top.set(v.top());
-        self.scroll.scroll_to_item(row, ScrollStrategy::Top);
+        self.scroll.scroll_to_item_strict(row, ScrollStrategy::Top);
     }
 
     pub fn go_to(&self, row: usize, host: &Host) {
@@ -1192,7 +1227,10 @@ impl Diff {
         v.set_len(self.order.len());
         v.go_to_fraction(fraction);
         self.view.set(v);
-        self.show(v);
+        // A presentation swap is a new row count too — split merges a replace
+        // pair onto one row — so the same rule as a reflow: the position lands
+        // when the list has measured what it now holds.
+        self.defer_show(v);
     }
 }
 
@@ -1426,8 +1464,13 @@ impl Diff {
     /// [`Viewport::go_to`] may drag the top for its margin, [`Diff::show`]
     /// writes the list back to where the model now says it is — one write, so
     /// the two cannot disagree about who moved.
-    fn click_row(&mut self, visual: usize) {
-        let mut v = self.view.get();
+    ///
+    /// Through [`Diff::live_view`], and not the stored one: a click can be the
+    /// first thing that ever happens to this view — no key has navigated, no
+    /// frame has reported a height — and against a model that still believes
+    /// the list is empty, `go_to` clamps every row onto zero.
+    fn click_row(&mut self, visual: usize, host: &Host) {
+        let mut v = self.live_view(host);
         v.go_to(visual);
         self.view.set(v);
         self.show(v);
@@ -1446,7 +1489,7 @@ impl Diff {
             cx.notify();
             return;
         };
-        self.click_row(visual);
+        self.click_row(visual, &host);
         self.dragging = true;
         // Shift extends whatever is already there, which is how a selection
         // longer than the window gets made without a drag that has to scroll.
@@ -2502,6 +2545,7 @@ mod tests {
     };
     use gpui::{
         div, rgb, AnyElement, FontStyle, FontWeight, HighlightStyle, IntoElement, ParentElement,
+        ScrollStrategy,
     };
     use plait_core::host::Host;
     use plait_core::prepared::{prepare, File as PreparedFile};
@@ -4111,7 +4155,7 @@ diff --git a/b.md b/b.md
             .expect("a wrapped line produced a continuation row");
         with_height(&mut d, 20);
 
-        d.click_row(continuation);
+        d.click_row(continuation, &host);
         assert_eq!(
             d.cursor(),
             continuation,
@@ -4123,6 +4167,41 @@ diff --git a/b.md b/b.md
             v.top() <= d.cursor() && d.cursor() < v.top() + 20,
             "the clicked row is visible"
         );
+        assert_eq!(
+            d.synced.get(),
+            f32::from(d.scroll.0.borrow().base_handle.offset().y),
+            "the handle and the sync mark disagree"
+        );
+    }
+
+    #[test]
+    fn a_first_click_lands_where_it_pointed_before_any_navigation() {
+        // The regression: `click_row` read the *stored* viewport, and a view
+        // nothing has navigated yet believes it is empty — so `go_to` clamped
+        // every click onto row zero, deep rows included.
+        let host = Host::new();
+        let mut d = Diff::with_layouts(parse_unified_diff(LONG), &host, Layouts::builtin());
+        assert_eq!(d.view.get().len(), 0, "the test means to start fresh");
+        assert!(d.total() > 0, "but the rows themselves exist");
+
+        // No key has moved, no frame has reported a height — and the click is
+        // on the last row there is.
+        let last = d.order.len() - 1;
+        d.click_row(last, &host);
+        assert_eq!(d.cursor(), last, "row zero is not where I clicked");
+
+        // A wrapped continuation, with the stored model again empty — the
+        // state it is in until the first frame fills it.
+        d.reflow(width_for(30, &host), &host);
+        let continuation = d
+            .order
+            .iter()
+            .position(|r| r.seg > 0)
+            .expect("a wrapped continuation to click on");
+        d.view.set(plait_core::view::Viewport::new());
+        d.click_row(continuation, &host);
+        assert_eq!(d.cursor(), continuation);
+        // And the list was written back to meet the model, so they agree.
         assert_eq!(
             d.synced.get(),
             f32::from(d.scroll.0.borrow().base_handle.offset().y),
@@ -4169,6 +4248,98 @@ diff --git a/b.md b/b.md
             v.top() <= v.cursor() && v.cursor() < v.top() + 20,
             "and it stayed on screen through the reflow"
         );
+    }
+
+    #[test]
+    fn a_cursor_preserving_reflow_waits_for_the_new_geometry() {
+        // The other half of a reflow: the rows have been rebuilt but the list
+        // has not laid them out yet, so its own bound still describes the
+        // *wide* shape. `show` clamps against that stale maximum — and a deep
+        // cursor needs more offset than the old shape ever had — then writes
+        // the clamped lie into the sync mark. The position goes through GPUI's
+        // deferred request instead, which the list consumes after measuring
+        // what it now holds.
+        let host = Host::new();
+        let mut d = Diff::with_layouts(long_diff(), &host, Layouts::builtin());
+        d.reflow(width_for(80, &host), &host);
+        with_height(&mut d, 20);
+        let wide_rows = d.total();
+
+        // Read to the very end, so the cursor sits past anything the wide
+        // shape's geometry could name.
+        assert!(d.run_view("view.bottom", &host));
+        let cursor_line = d.order[d.cursor()].logical();
+
+        d.reflow(width_for(12, &host), &host);
+        assert!(
+            d.total() >= wide_rows * 3 / 2,
+            "{} did not materially grow past {wide_rows}",
+            d.total()
+        );
+
+        let v = d.view.get();
+        assert_eq!(
+            d.order[v.cursor()].logical(),
+            cursor_line,
+            "the reflow moved the keyboard"
+        );
+        let request = d
+            .scroll
+            .0
+            .borrow()
+            .deferred_scroll_to_item
+            .expect("the position was not parked for layout");
+        assert!(request.scroll_strict, "exact, not merely visible");
+        assert_eq!(request.strategy, ScrollStrategy::Top);
+        assert_eq!(request.item_index, v.top(), "on the cursor's viewport");
+        // And the parked row is one the OLD geometry had no offset for — the
+        // clamp this test exists to prevent would have pinned it there.
+        let row_h = super::ROW_H;
+        assert!(
+            (v.top() as f32) * row_h > ((wide_rows - 20) as f32) * row_h,
+            "top {} was inside the old bound; nothing would have been clamped",
+            v.top()
+        );
+
+        // Nothing was claimed about pixels the list has not measured: the old
+        // code wrote a clamped offset and its own sync mark over it.
+        assert_eq!(
+            f32::from(d.scroll.0.borrow().base_handle.offset().y),
+            0.0,
+            "an offset was written against the old shape"
+        );
+        assert_eq!(d.synced.get(), 0.0);
+
+        // ...and when a command does move the list before then, its position
+        // wins: a pending request consumed at prepaint would override it.
+        assert!(d.run_view("view.down", &host));
+        assert!(
+            d.scroll.0.borrow().deferred_scroll_to_item.is_none(),
+            "a command left a stale deferred scroll behind it"
+        );
+    }
+
+    #[test]
+    fn a_restored_row_inside_the_first_screen_still_moves_the_list() {
+        // Session restore: a view constructed, a saved row handed to it,
+        // nothing laid out. Row 5 of a tall window is inside the initial
+        // viewport, which is precisely where the non-strict strategy declines
+        // to scroll — the list would open at row zero while model, session and
+        // title all claimed 5.
+        let host = Host::new();
+        let d = Diff::with_layouts(long_diff(), &host, Layouts::builtin());
+        d.scroll_to(5, &host);
+
+        let request = d
+            .scroll
+            .0
+            .borrow()
+            .deferred_scroll_to_item
+            .expect("no request was parked");
+        assert_eq!(request.item_index, 5);
+        assert_eq!(request.strategy, ScrollStrategy::Top);
+        assert!(request.scroll_strict, "visible-in-range is exactly the bug");
+        assert_eq!(d.view.get().top(), 5, "and the model says so too");
     }
 
     #[test]
