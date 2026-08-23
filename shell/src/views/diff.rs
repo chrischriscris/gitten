@@ -68,6 +68,7 @@ use plait_core::runs::{self, surfaces, Run};
 use plait_core::select::{self, Caret, RowId, Selected, Selection, Text as _};
 use plait_core::syntax::Token;
 use plait_core::theme::{DiffPalette, Rgb, Surface, Theme};
+use plait_core::view::Viewport;
 use plait_core::wrap::{Wrap, Wrapped};
 use plait_core::{FileDiff, LineKind, Span};
 use std::cell::{Cell, RefCell};
@@ -208,7 +209,9 @@ pub trait Rows {
 
     /// Draws one visual row. `sel` is the part of it the mouse has selected, in
     /// the row's own byte coordinates — `None` for the overwhelming majority of
-    /// rows on the overwhelming majority of frames.
+    /// rows on the overwhelming majority of frames. `current` is whether this is
+    /// the row the keyboard is on, drawn as a background bar so navigation has a
+    /// visible cursor — see [`plait_core::view::Viewport`].
     ///
     /// `shift` is how many pixels of text a horizontal scroll has pulled off the
     /// left edge. A row is as wide as the viewport whatever it holds, so an
@@ -222,8 +225,16 @@ pub trait Rows {
         seg: usize,
         host: &Host,
         sel: Option<Selected>,
+        current: bool,
         shift: f32,
     ) -> AnyElement;
+
+    /// Whether logical row `index` is a file header. What `]` and `[` jump
+    /// between; the default is no, because only an implementation knows what it
+    /// drew as one.
+    fn is_header(&self, _index: usize) -> bool {
+        false
+    }
 
     /// Width of a visual row in characters. What the widest-row search ranks
     /// rows by, and therefore which row [`Rows::overflow`] is asked about.
@@ -370,17 +381,6 @@ impl Layouts {
     }
 }
 
-// Cycle to the next presentation. Bound to `s` in `main.rs`.
-//
-// The first real action in the app, and deliberately shaped like the last one
-// will be: the view owns a focus handle, the binding is global, and the handler
-// is a method. When command dispatch and the mode stack land in `core` this
-// becomes a named command they can reach — see `docs/extending.md`.
-actions!(
-    plait,
-    [CycleLayout, CycleWrap, CopySelection, SelectAll, SelectNone]
-);
-
 // The order table's row reference and the table itself are
 // `plait_core::rows`': 8 bytes a row, `logical()` for what survives a reflow,
 // and the same `widest`/`anchor` a walk of it computes. Only `expand` below is
@@ -394,8 +394,18 @@ actions!(
 /// previous table is its own source of truth. That is the whole reason a reflow
 /// needs no second table to remember the unwrapped shape: 8 bytes a row, once,
 /// however many times the window is dragged.
-fn expand(logical: &[RowRef], renderers: &[Box<dyn Rows>], anchor: Option<RowRef>) -> Ordered {
+///
+/// Returns the table plus where the file headers landed in it — what `]` and
+/// `[` jump between. Core's [`plait_core::rows::Ordered`] stays as it is because
+/// the terminal indexes headers off its own presentations; this client collects
+/// them during the same walk rather than search the table per keypress.
+fn expand(
+    logical: &[RowRef],
+    renderers: &[Box<dyn Rows>],
+    anchor: Option<RowRef>,
+) -> (Ordered, Vec<usize>) {
     let mut order: Vec<RowRef> = Vec::with_capacity(logical.len());
+    let mut headers: Vec<usize> = Vec::new();
     let (mut widest, mut widest_at) = (0usize, 0usize);
     let mut found = 0usize;
     let mut i = 0;
@@ -410,6 +420,12 @@ fn expand(logical: &[RowRef], renderers: &[Box<dyn Rows>], anchor: Option<RowRef
         if anchor.map(RowRef::logical) == Some(r.logical()) {
             found = order.len();
         }
+        // One branch per visual row, once per rebuild: where the file headers
+        // are is what `]` and `[` jump between, and no presentation has to know
+        // a jump list exists.
+        if rows.is_header(r.index as usize) {
+            headers.push(order.len());
+        }
         let n = rows.rows(r.index as usize).clamp(1, u16::MAX as usize);
         for seg in 0..n {
             let w = rows.width(r.index as usize, seg);
@@ -423,11 +439,14 @@ fn expand(logical: &[RowRef], renderers: &[Box<dyn Rows>], anchor: Option<RowRef
             });
         }
     }
-    Ordered {
-        order,
-        widest: widest_at,
-        anchor: found,
-    }
+    (
+        Ordered {
+            order,
+            widest: widest_at,
+            anchor: found,
+        },
+        headers,
+    )
 }
 
 /// This wheel event's delta with the gesture's axis lock applied: what is left on
@@ -447,7 +466,7 @@ fn expand(logical: &[RowRef], renderers: &[Box<dyn Rows>], anchor: Option<RowRef
 /// it first would call the gesture vertical and hand it to the list. Only when
 /// the platform has not already done the swap itself, which macOS does for some
 /// mice.
-fn locked(
+pub(crate) fn locked(
     mut delta: Point<Pixels>,
     shift: bool,
     ongoing: &mut OngoingScroll,
@@ -591,19 +610,26 @@ pub struct Diff {
     /// Index into `order` of the widest visual row: the one row the horizontal
     /// bound is taken from, because it is the one there is furthest to scroll to.
     widest: usize,
+    /// Where every file header is, in visual rows — what `]` and `[` jump
+    /// between. Collected by [`expand`] while it builds the order table, so it
+    /// costs one branch per row at rebuild and nothing per frame.
+    headers: Rc<Vec<usize>>,
     scroll: UniformListScrollHandle,
     /// The horizontal axis, which is this view's and not the list's — see the
     /// module note. Bounded from `widest` on every reflow.
     pan: Pan,
-    /// Which axis the wheel gesture in flight belongs to. `gpui`'s own lock, kept
-    /// here because the events arrive at a window handler rather than at a scroll
-    /// container — see [`sideways`].
-    ongoing: Cell<OngoingScroll>,
-    /// Absent in the headless tests, which build a `Diff` with no window and no
-    /// `Context` to take a handle from. Present in the app, where it is what
-    /// puts this view in the key dispatch path at all.
-    focus: Option<FocusHandle>,
-    focused: bool,
+    /// The cursor, the top row and the height, and nothing else about them. The
+    /// keyboard's position in this diff, from [`plait_core::view::Viewport`] —
+    /// the same model the terminal holds, so a key means the same thing in both.
+    ///
+    /// Behind a shared cell because the render closure reads it per batch, which
+    /// is also why it is not folded into [`Diff::top`]: that one is written *by*
+    /// the list, this one is what moves the list.
+    view: Rc<Cell<Viewport>>,
+    /// The vertical offset this view last wrote. A scrollbar thumb writes the
+    /// same offset without coming through here, and that mismatch — not the
+    /// position itself — is what [`Diff::reconcile`] treats as "the list moved".
+    synced: Rc<Cell<f32>>,
     pub rendered: Rc<Cell<usize>>,
     /// Rows that exist, live: wrapping changes it on every resize, so an
     /// overlay reading a number taken at load would be describing the diff as it
@@ -648,20 +674,6 @@ impl Diff {
         cx.notify();
     }
 
-    /// Moves to the next wrap. Bound to `w` in `main.rs`.
-    ///
-    /// Unlike a layout change this rebuilds nothing below stage 5: the lines,
-    /// their tokens and their spans are the same objects, and only where they
-    /// break moves. That is why it is a keystroke and the algorithm is a menu.
-    pub fn cycle_wrap(&mut self, cx: &mut Context<Self>) {
-        let host = crate::config::host(cx);
-        if host.wrap.len() < 2 {
-            return;
-        }
-        self.wrap = (self.wrap + 1) % host.wrap.len();
-        cx.notify();
-    }
-
     /// Re-expands the rows for a new width, keeping the line you were reading at
     /// the top.
     ///
@@ -701,7 +713,7 @@ impl Diff {
             // layout change has no such correspondence, which is why it uses a
             // fraction instead.
             let anchor = self.order.get(self.top.get()).copied();
-            let built = expand(&self.order, &self.renderers.borrow(), anchor);
+            let (built, headers) = expand(&self.order, &self.renderers.borrow(), anchor);
             let logical = self
                 .renderers
                 .borrow()
@@ -710,7 +722,14 @@ impl Diff {
                 .sum::<usize>();
             self.order = Rc::new(built.order);
             self.widest = built.widest;
+            self.headers = Rc::new(headers);
             self.total.set(self.order.len());
+            // The line you were reading is still at the top; the cursor goes
+            // where that line now is, because a reflow is the same diff.
+            let mut v = self.view.get();
+            v.set_len(self.order.len());
+            v.go_to(built.anchor);
+            self.view.set(v);
             self.top.set(built.anchor);
             self.scroll_to(built.anchor);
             // After the order table, because the bound is the widest row's and
@@ -757,58 +776,220 @@ impl Diff {
         })
     }
 
-    /// A wheel or a trackpad, sideways — and the decision about whether *this*
-    /// gesture is sideways at all.
+    // -------------------------------------------------------------- commands
+
+    /// The box the row list is drawn in — what a wheel event over the window is
+    /// hit-tested against. Zero until the first paint.
+    pub fn list_bounds(&self) -> Bounds<Pixels> {
+        self.scroll.0.borrow().base_handle.bounds()
+    }
+
+    /// Moves the text sideways by `dx` pixels. The wheel's horizontal half,
+    /// routed through [`crate::main`]'s axis lock; `h` and `l` arrive as columns
+    /// via [`Diff::pan_columns`].
     ///
-    /// **A sideways gesture never reaches the list**, and that is the whole of
-    /// this method. `uniform_list` scrolls one axis, so `overflow.x` on it is
-    /// visible, and `gpui`'s scroll handler reads that as permission to use a
-    /// horizontal delta for vertical movement — the arm is
-    /// `Overflow::Scroll if !restrict_scroll_to_axis && overflow.x != Scroll => delta.x`.
-    /// With the text panning from the same event, a flick to the right came out
-    /// diagonal. So this runs in the **capture** phase and stops the event dead
-    /// when the gesture is horizontal: one component decides the axis, and the
-    /// one that decides is the one that owns the axis it decided on.
+    /// Returns whether anything moved, which is what decides a redraw.
+    pub fn pan_pixels(&self, dx: f32) -> bool {
+        self.pan.by(dx)
+    }
+
+    /// Moves the text sideways by `columns` characters. `view.left`,
+    /// `view.right` — the terminal's eight columns, in this client's unit.
+    pub fn pan_columns(&mut self, columns: isize, host: &Host) {
+        self.pan_pixels(columns as f32 * host.font.char_width());
+    }
+
+    /// Moves the list by `dy` pixels without translating it into rows first.
     ///
-    /// Whether it *could* move does not come into it. A page with nothing to the
-    /// right does nothing when you swipe right; it does not start scrolling down.
-    fn wheel(&mut self, ev: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
-        // Over the rows, and not over the title bar or a dropdown above them.
-        // A capture-phase handler is registered on the window, so it is outside
-        // the hit test a bubble-phase one gets for free.
-        if !self
-            .scroll
+    /// The wheel reports pixels, not rows, and this is what keeps it *smooth*:
+    /// the command it resolves to (`view.scroll-up`, from `[keys]`) says what the
+    /// wheel does; the event's own delta says how far. A key repeat has no delta
+    /// and uses [`Diff::run_view`] like every other command.
+    ///
+    /// The cursor comes along when the pixels push it off screen — the same rule
+    /// [`Viewport::scroll_by`] applies to a terminal's wheel — so `j` after a
+    /// flick lands on a row you can see.
+    pub fn scroll_pixels(&mut self, dy: f32) -> bool {
+        let (offset, max) = {
+            let s = self.scroll.0.borrow();
+            (s.base_handle.offset(), s.base_handle.max_offset())
+        };
+        let y = (f32::from(offset.y) + dy).clamp(-f32::from(max.y), 0.0);
+        if y == f32::from(offset.y) {
+            return false;
+        }
+        self.scroll
             .0
             .borrow()
             .base_handle
-            .bounds()
-            .contains(&ev.position)
-        {
+            .set_offset(point(offset.x, px(y)));
+        // The top row the pixels landed on, and the viewport dragged to meet it.
+        let mut v = self.view.get();
+        v.set_height(self.rendered.get());
+        v.scroll_to((-y / ROW_H).round().max(0.0) as usize);
+        v.set_len(self.order.len());
+        self.view.set(v);
+        self.synced.set(y);
+        true
+    }
+
+    /// Meets the list where it actually is: a scrollbar drag moves the offset
+    /// without touching anything else, and the next key should act on what is on
+    /// screen now — with the cursor dragged along, exactly as the wheel drags it.
+    ///
+    /// [`Diff::synced`] is what separates "the list moved under us" from "we
+    /// moved the list": only a mismatch counts, so two commands in a row do not
+    /// fight each other through this method.
+    fn reconcile(&mut self) {
+        let shown_y = f32::from(self.scroll.0.borrow().base_handle.offset().y);
+        if (shown_y - self.synced.get()).abs() < 0.5 {
             return;
         }
-        let mut ongoing = self.ongoing.get();
-        let delta = locked(
-            ev.delta.pixel_delta(window.line_height()),
-            ev.modifiers.shift,
-            &mut ongoing,
-            ev.touch_phase,
-        );
-        self.ongoing.set(ongoing);
-        if delta.x.is_zero() {
+        self.synced.set(shown_y);
+        let shown = (-shown_y / ROW_H).round().max(0.0) as usize;
+        let mut v = self.view.get();
+        if v.top() == shown {
             return;
         }
-        // Ours *alone* only when the lock says so. A gesture that unlocked
-        // mid-flick — swipe left, then up, without lifting — carries both axes
-        // for the rest of its life, and eating it would be a diff that stops
-        // scrolling down until the fingers come off the glass.
-        if delta.y.is_zero() {
-            cx.stop_propagation();
+        v.set_height(self.rendered.get());
+        v.set_len(self.order.len());
+        v.scroll_to(shown);
+        self.view.set(v);
+    }
+
+    /// Runs one of the `view.*` commands against the viewport, keeping the list
+    /// and the saved position honest afterwards. The same names the terminal
+    /// dispatches; [`Viewport`] is the part that must not differ. The `diff.*`
+    /// family rides the same method: one screen, one place its commands live.
+    ///
+    /// False is "not one of mine", and the caller says so.
+    pub fn run_view(&mut self, command: &str, host: &Host) -> bool {
+        // First, meet the list where it actually is: a scrollbar drag moved the
+        // offset without touching the cursor, and the next key should act on
+        // what is on screen now.
+        self.reconcile();
+        let mut v = self.view.get();
+        v.set_len(self.order.len());
+        v.set_height(self.rendered.get());
+        match command {
+            "view.down" => v.down(),
+            "view.up" => v.up(),
+            "view.page-down" => v.page(1),
+            "view.page-up" => v.page(-1),
+            "view.scroll-down" => v.scroll_by(host.view.rows as isize),
+            "view.scroll-up" => v.scroll_by(-(host.view.rows as isize)),
+            "view.top" => v.to_top(),
+            "view.bottom" => v.to_bottom(),
+            "view.left" => {
+                let _ = v;
+                self.pan_columns(-8, host);
+                return true;
+            }
+            "view.right" => {
+                let _ = v;
+                self.pan_columns(8, host);
+                return true;
+            }
+            "diff.next-file" => {
+                let _ = v;
+                self.jump_file(1);
+                return true;
+            }
+            "diff.prev-file" => {
+                let _ = v;
+                self.jump_file(-1);
+                return true;
+            }
+            "diff.cycle-layout" => {
+                let _ = v;
+                // A single-presentation registry has nothing to cycle to, which
+                // is what [`Layouts::len`] says.
+                if self.layouts.len() >= 2 {
+                    self.apply_layout((self.current + 1) % self.layouts.len(), host);
+                }
+                return true;
+            }
+            "diff.cycle-wrap" => {
+                let _ = v;
+                if host.wrap.len() >= 2 {
+                    self.wrap = (self.wrap + 1) % host.wrap.len();
+                }
+                return true;
+            }
+            _ => return false,
         }
-        // A scroll to the right moves the content left, which is further into
-        // the line: the sign is the one thing to get right in here.
-        if self.pan.by(-f32::from(delta.x)) {
-            cx.notify();
+        self.view.set(v);
+        self.show(v);
+        true
+    }
+
+    /// Puts row `v.top()` at the top of the viewport — exactly, not "if it is
+    /// already visible": the margin arithmetic is [`Viewport::follow`]'s, and
+    /// re-doing it here would be doing it differently.
+    ///
+    /// Direct offset rather than `scroll_to_item`, whose non-strict strategy
+    /// skips scrolling for a row already on screen — a page that lands the
+    /// cursor one row short instead of one screenful down.
+    fn show(&self, v: Viewport) {
+        let target = v.top();
+        let s = self.scroll.0.borrow();
+        let cur = s.base_handle.offset();
+        let y = -(target as f32 * ROW_H).clamp(0.0, f32::from(s.base_handle.max_offset().y));
+        s.base_handle.set_offset(point(cur.x, px(y)));
+        self.synced.set(y);
+        self.top.set(target);
+    }
+
+    /// The header of the next or previous file. `]` and `[`, tab and backtab.
+    pub fn jump_file(&mut self, by: isize) {
+        let mut v = self.view.get();
+        v.set_len(self.order.len());
+        v.set_height(self.rendered.get());
+        let cursor = v.cursor();
+        // Binary search rather than a scan: a 5,953-file diff is a realistic
+        // input and this is a keypress. Same walk as the terminal's.
+        let target = match by.is_negative() {
+            true => self
+                .headers
+                .partition_point(|&h| h < cursor)
+                .checked_sub(1)
+                .and_then(|i| self.headers.get(i))
+                .copied(),
+            false => self
+                .headers
+                .get(self.headers.partition_point(|&h| h <= cursor))
+                .copied(),
+        };
+        if let Some(t) = target {
+            v.go_to(t);
+            self.view.set(v);
+            self.show(v);
         }
+    }
+
+    /// Where the keyboard is. What `copy.selection` falls back to and the tests
+    /// assert against.
+    ///
+    /// `dead_code` for the binary — dispatch reads the cursor through the shared
+    /// viewport cell — and live in the tests, which is what it is here for. A
+    /// binary crate does not count a test as a use.
+    #[allow(dead_code)]
+    pub fn cursor(&self) -> usize {
+        self.view.get().cursor()
+    }
+
+    /// The text of the row the keyboard is on, or nothing past either end. The
+    /// fallback half of `copy.selection`.
+    pub fn cursor_text(&self) -> String {
+        let v = self.view.get();
+        let r = self.order.get(v.cursor()).copied();
+        let renderers = self.renderers.borrow();
+        r.and_then(|r| {
+            renderers
+                .get(r.owner as usize)
+                .and_then(|rows| rows.selectable(r.index as usize, 0).map(str::to_string))
+        })
+        .unwrap_or_default()
     }
 
     /// Which presentation is loaded. Read by the tests and by anything that
@@ -861,11 +1042,10 @@ impl Diff {
         self.apply_layout(self.current, host);
     }
 
-    /// Puts a saved row back at the top of the viewport.
-    ///
-    /// Clamped rather than validated: the diff may be shorter than it was when
-    /// the position was taken — a rebuild is usually a code change, but nothing
-    /// stops the working tree having moved too.
+    /// Puts a saved row back at the top of the viewport, with the keyboard on
+    /// it. Clamped rather than validated: the diff may be shorter than it was
+    /// when the position was taken — a rebuild is usually a code change, but
+    /// nothing stops the working tree having moved too.
     pub fn scroll_to(&self, row: usize) {
         if self.order.is_empty() {
             return;
@@ -874,14 +1054,19 @@ impl Diff {
             .scroll_to_item(row.min(self.order.len() - 1), ScrollStrategy::Top);
     }
 
+    pub fn go_to(&self, row: usize) {
+        let mut v = self.view.get();
+        v.set_len(self.order.len());
+        v.go_to(row);
+        self.view.set(v);
+    }
+
     /// The shipped set: the registry of presentations, opened on whichever one
     /// the host names. An unknown name falls back to the first rather than
     /// failing — the config layer is what reports it, because it is the layer
     /// that knows it came from a file somebody is editing.
-    pub fn new(files: Vec<FileDiff>, host: Rc<Host>, cx: &mut Context<Self>) -> Self {
-        let mut d = Self::with_layouts(files, &host, Layouts::builtin());
-        d.focus = Some(cx.focus_handle());
-        d
+    pub fn new(files: Vec<FileDiff>, host: Rc<Host>, _cx: &mut Context<Self>) -> Self {
+        Self::with_layouts(files, &host, Layouts::builtin())
     }
 
     /// One presentation, pinned: no registry, so nothing to cycle to.
@@ -935,12 +1120,13 @@ impl Diff {
             }
         };
         let files = Rc::new(files);
-        let built = assemble(&files, host, &layouts, current);
+        let (built, headers) = assemble(&files, host, &layouts, current);
         // The host names the wrap this opens on, exactly as it names the layout.
         // An unknown name is reported by the config layer, which is the layer
         // that knows it came from a file somebody is editing.
         let wrap = host.wrap.selected_index();
         let total = Rc::new(Cell::new(built.order.len()));
+        let view = Viewport::new();
         Self {
             files,
             layouts: Rc::new(layouts),
@@ -953,11 +1139,11 @@ impl Diff {
             sel: None,
             dragging: false,
             widest: built.widest,
+            headers: Rc::new(headers),
             scroll: UniformListScrollHandle::new(),
             pan: Pan::default(),
-            ongoing: Cell::default(),
-            focus: None,
-            focused: false,
+            view: Rc::new(Cell::new(view)),
+            synced: Rc::new(Cell::new(0.0)),
             rendered: Rc::new(Cell::new(0)),
             total,
             note: Rc::new(RefCell::new(SharedString::default())),
@@ -966,57 +1152,33 @@ impl Diff {
         }
     }
 
-    /// Moves to the next presentation and rebuilds the rows, keeping you roughly
-    /// where you were reading.
-    ///
-    /// **Roughly, and not exactly.** The two presentations do not have the same
-    /// number of rows — a replace pair is one row in the two-column layout and
-    /// two in the unified one — so a row index means something different in each
-    /// and there is nothing to preserve exactly. The proportion through the diff
-    /// is preserved instead, which lands you on the same screenful.
-    ///
-    /// The whole pipeline from stage 3 runs again. That is 8 ms on a typical diff
-    /// and 289 ms on the pathological fixture, once, on a keystroke — which is
-    /// the right place to spend it. Making it instant would mean the row
-    /// implementations sharing their text behind a refcount instead of owning
-    /// it, and that is a change to `prepared::Line`, not to this function.
-    pub fn cycle_layout(&mut self, cx: &mut Context<Self>) {
-        if self.layouts.len() < 2 {
-            return;
-        }
-        // The live host, not one captured when this view was built — the same
-        // reason `render` reads it per batch. A layout rebuilt from a stale font
-        // would quietly disagree with the row it replaced.
-        let host = crate::config::host(cx);
-        self.apply_layout((self.current + 1) % self.layouts.len(), &host);
-        cx.notify();
-    }
-
     /// Rebuilds the rows for `index`, keeping the reading position. The half of
-    /// [`Diff::cycle_layout`] and [`Diff::replace`] that needs no window, and
-    /// therefore the half with tests.
+    /// a layout cycle and [`Diff::replace`] that needs no window, and therefore
+    /// the half with tests.
     fn apply_layout(&mut self, index: usize, host: &Host) {
-        let fraction = match self.order.len() {
-            0 => 0.0,
-            n => self.top.get() as f32 / n as f32,
-        };
+        let fraction = self.view.get().progress();
         self.current = index;
         // Every row about to be replaced, so a selection anchored to one of them
         // would be pointing at whatever now has its index. There is no honest
         // way to carry a selection across two presentations of the same diff —
         // a replace pair is one row here and two there — so it goes.
         self.sel = None;
-        let built = assemble(&self.files, host, &self.layouts, index);
+        let (built, headers) = assemble(&self.files, host, &self.layouts, index);
         self.order = Rc::new(built.order);
         *self.renderers.borrow_mut() = built.renderers;
         self.widest = built.widest;
+        self.headers = Rc::new(headers);
         self.load = built.load;
         self.total.set(self.order.len());
         // Fresh implementations hold no wrap, so the next frame reflows them.
         // Left to that rather than done here, because the width belongs to the
         // window and this half of a layout change is the half with no window.
         self.applied = (0.0, "");
-        let row = (fraction * self.order.len() as f32) as usize;
+        let mut v = self.view.get();
+        v.set_len(self.order.len());
+        v.go_to_fraction(fraction);
+        self.view.set(v);
+        let row = v.top();
         self.top.set(row);
         self.scroll_to(row);
     }
@@ -1034,8 +1196,14 @@ struct Built {
 /// build the order table.
 ///
 /// A free function rather than a method because it runs before a `Diff` exists
-/// and again after one does, and both callers want exactly this.
-fn assemble(files: &[FileDiff], host: &Host, layouts: &Layouts, current: usize) -> Built {
+/// and again after one does, and both callers want exactly this. Returns the
+/// built rows plus where the file headers are, in visual rows.
+fn assemble(
+    files: &[FileDiff],
+    host: &Host,
+    layouts: &Layouts,
+    current: usize,
+) -> (Built, Vec<usize>) {
     let t = std::time::Instant::now();
     let mut renderers = match layouts.0.get(current) {
         Some(layout) => (layout.build)(host),
@@ -1080,8 +1248,9 @@ fn assemble(files: &[FileDiff], host: &Host, layouts: &Layouts, current: usize) 
 
     // One entry per logical row so far, which is what `expand` wants. Nothing
     // wraps yet — no implementation has been given a width — so this pass only
-    // finds the widest row; the first frame reflows and runs it again.
-    let Ordered { order, widest, .. } = expand(&order, &renderers, None);
+    // finds the widest row and the file headers; the first frame reflows and
+    // runs it again.
+    let (Ordered { order, widest, .. }, headers) = expand(&order, &renderers, None);
 
     let mut reports: Vec<String> = vec![format!("intraline {intraline:.0?} · syntax {syntax:.0?}")];
     reports.extend(
@@ -1098,12 +1267,15 @@ fn assemble(files: &[FileDiff], host: &Host, layouts: &Layouts, current: usize) 
         reports.join(" · "),
     );
     eprintln!("{load}");
-    Built {
-        renderers,
-        order,
-        widest,
-        load,
-    }
+    (
+        Built {
+            renderers,
+            order,
+            widest,
+            load,
+        },
+        headers,
+    )
 }
 
 impl Diff {
@@ -1241,6 +1413,12 @@ impl Diff {
             cx.notify();
             return;
         };
+        // The cursor follows the mouse: a click is a place, and everything a key
+        // does next — copy, jump, open — acts on the row the cursor is on. The
+        // same rule the terminal's diff applies.
+        let mut v = self.view.get();
+        v.go_to(caret.at.start);
+        self.view.set(v);
         self.dragging = true;
         // Shift extends whatever is already there, which is how a selection
         // longer than the window gets made without a drag that has to scroll.
@@ -1338,11 +1516,15 @@ impl Diff {
         }
     }
 
-    /// `copy.selection`. A no-op with nothing selected rather than a cleared
-    /// clipboard — losing what somebody copied elsewhere is worse than a key
-    /// that did nothing.
+    /// `copy.selection`. The selection, or the row the keyboard is on when there
+    /// is none — "copy this line" should not need the mouse. A no-op with
+    /// neither, rather than a cleared clipboard: losing what somebody copied
+    /// elsewhere is worse than a key that did nothing.
     pub fn copy(&self, cx: &mut Context<Self>) {
-        let text = self.selection();
+        let mut text = self.selection();
+        if text.is_empty() {
+            text = self.cursor_text();
+        }
         if !text.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
@@ -1354,11 +1536,13 @@ impl Diff {
         cx.notify();
     }
 
-    /// `select.none`.
-    pub fn select_none(&mut self, cx: &mut Context<Self>) {
-        if self.sel.take().is_some() {
+    /// `select.none`. Whether there was one, which is what `back` wants to know.
+    pub fn select_none(&mut self, cx: &mut Context<Self>) -> bool {
+        let had = self.sel.take().is_some();
+        if had {
             cx.notify();
         }
+        had
     }
 
     /// While a drag is live the mouse belongs to it, wherever the pointer is.
@@ -1391,35 +1575,10 @@ impl Diff {
         .h(px(0.))
         .into_any_element()
     }
-
-    /// The same trick as [`Diff::drag_probe`], for the wheel, and for a different
-    /// reason: not to hear about events outside the box, but to hear about them
-    /// **first**. A `div`'s `on_scroll_wheel` is bubble-phase only, and the list
-    /// is a child — so by the time it fired, the list had already turned a
-    /// sideways flick into vertical scrolling. See [`Diff::wheel`].
-    fn wheel_probe(&self, cx: &mut Context<Self>) -> AnyElement {
-        let me = cx.entity().downgrade();
-        canvas(
-            |_, _, _| {},
-            move |_, _, window, _| {
-                let me = me.clone();
-                window.on_mouse_event(move |ev: &ScrollWheelEvent, phase, window, cx| {
-                    if phase == DispatchPhase::Capture {
-                        _ = me.update(cx, |this, cx| this.wheel(ev, window, cx));
-                    }
-                });
-            },
-        )
-        .absolute()
-        .top_0()
-        .left_0()
-        .h(px(0.))
-        .into_any_element()
-    }
 }
 
 impl Render for Diff {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Whatever the last frame measured this view to be. Reflowing here and
         // not in the probe itself keeps every mutation of the row tables on the
         // one path, and costs one frame of unwrapped rows at startup.
@@ -1433,6 +1592,9 @@ impl Render for Diff {
         // closure lives for one element tree, and every path that changes a
         // selection notifies — so the copy in here is never the stale one.
         let sel = self.sel.clone();
+        // Where the keyboard is, read per batch: commands run between frames and
+        // this cell is what they move.
+        let view = self.view.clone();
         // Where the scrollbar draws itself and how long its thumb is. Last
         // frame's box, like everything else measured here — a view is handed
         // one and cannot ask before.
@@ -1450,6 +1612,7 @@ impl Render for Diff {
             rendered.set(range.len());
             top.set(range.start);
             let host = crate::config::host(cx);
+            let cursor = view.get().cursor();
             // Once per batch of rows, not once per row.
             let renderers = renderers.borrow();
             range
@@ -1463,6 +1626,7 @@ impl Render for Diff {
                         r.seg as usize,
                         &host,
                         at,
+                        i == cursor,
                         shift,
                     )
                 })
@@ -1477,7 +1641,7 @@ impl Render for Diff {
         // scrollable width nothing scrolls.
         .size_full();
 
-        let mut root = div()
+        let root = div()
             .relative()
             .size_full()
             // Text, because it is: the whole view is selectable, headers
@@ -1502,7 +1666,6 @@ impl Render for Diff {
             )
             .child(list)
             .child(self.drag_probe(cx))
-            .child(self.wheel_probe(cx))
             // How wide this view actually is, which is the wrap budget. A view
             // is handed its box by whatever assembled it and cannot know it
             // during `render`, so it is read off the paint pass and used on the
@@ -1517,25 +1680,6 @@ impl Render for Diff {
                 d.child(Scrollbar::vertical(&self.scroll))
                     .child(Scrollbar::horizontal(&self.pan))
             });
-
-        // Key dispatch runs down the focus path, so an action handler on an
-        // element nothing has focused is never reached. Taking focus on the
-        // first frame is what puts this view in that path; there is no other
-        // focusable thing in the window yet, and when there is, a mode stack is
-        // what should be deciding.
-        if let Some(focus) = self.focus.clone() {
-            if !self.focused {
-                self.focused = true;
-                window.focus(&focus, cx);
-            }
-            root = root
-                .track_focus(&focus)
-                .on_action(cx.listener(|this, _: &CycleLayout, _, cx| this.cycle_layout(cx)))
-                .on_action(cx.listener(|this, _: &CycleWrap, _, cx| this.cycle_wrap(cx)))
-                .on_action(cx.listener(|this, _: &CopySelection, _, cx| this.copy(cx)))
-                .on_action(cx.listener(|this, _: &SelectAll, _, cx| this.select_all(cx)))
-                .on_action(cx.listener(|this, _: &SelectNone, _, cx| this.select_none(cx)));
-        }
         root
     }
 }
@@ -1732,20 +1876,27 @@ impl Rows for TextRows {
         })
     }
 
+    fn is_header(&self, index: usize) -> bool {
+        matches!(self.rows.get(index), Some(Row::File { .. }))
+    }
+
     fn render(
         &self,
         index: usize,
         seg: usize,
         host: &Host,
         sel: Option<Selected>,
+        current: bool,
         shift: f32,
     ) -> AnyElement {
         let theme = &host.theme;
         let p = &theme.diff;
         match &self.rows[index] {
-            Row::File { path, adds, dels } => file_header(path, *adds, *dels, theme, sel, shift),
+            Row::File { path, adds, dels } => {
+                file_header(path, *adds, *dels, theme, sel, current, shift)
+            }
 
-            Row::Hunk(header) => hunk_header(header, theme, sel, shift),
+            Row::Hunk(header) => hunk_header(header, theme, sel, current, shift),
 
             Row::Line {
                 kind,
@@ -1757,6 +1908,13 @@ impl Rows for TextRows {
                 tokens,
             } => {
                 let (bg, fg, sign) = line_colors(*kind, *moved, p);
+                // The keyboard's row is a bar across the whole line, whatever
+                // kind of line it is — the same background the terminal draws,
+                // so the cursor reads as one thing in both.
+                let bg = match current {
+                    true => theme.chrome.selection_bg,
+                    false => bg,
+                };
                 // Which background this row's furniture lands on, so the line
                 // numbers are resolved against it — see `Theme::gutter_on`.
                 let gutter = theme.gutter_on(surfaces(*kind, *moved).0);
@@ -1978,6 +2136,7 @@ pub(crate) fn file_header(
     dels: usize,
     theme: &Theme,
     sel: Option<Selected>,
+    current: bool,
     shift: f32,
 ) -> AnyElement {
     let p = &theme.diff;
@@ -1990,7 +2149,10 @@ pub(crate) fn file_header(
         // added to them: every row in this list is exactly `ROW_H` tall and the
         // list is what makes 714k of them scroll.
         .flex_col()
-        .bg(rgb(p.file_bg))
+        .bg(rgb(match current {
+            true => theme.chrome.selection_bg,
+            false => p.file_bg,
+        }))
         .child(div().flex_none().h(px(1.)).bg(rgb(p.rule)))
         // A path longer than the window is reached the same way a line is: it is
         // the row's text, and the only thing in front of it is the page padding —
@@ -2093,6 +2255,7 @@ pub(crate) fn hunk_header(
     header: &std::sync::Arc<str>,
     theme: &Theme,
     sel: Option<Selected>,
+    current: bool,
     shift: f32,
 ) -> AnyElement {
     let p = &theme.diff;
@@ -2100,7 +2263,10 @@ pub(crate) fn hunk_header(
     row_frame()
         .items_center()
         .px_4()
-        .bg(rgb(p.hunk_bg))
+        .bg(rgb(match current {
+            true => theme.chrome.selection_bg,
+            false => p.hunk_bg,
+        }))
         .text_color(rgb(p.hunk_fg))
         .child(scrolled(
             shift,
@@ -3415,6 +3581,7 @@ diff --git a/a.rs b/a.rs
             _seg: usize,
             _host: &Host,
             _sel: Option<Selected>,
+            _current: bool,
             _shift: f32,
         ) -> AnyElement {
             div().child(self.rows[index].clone()).into_any_element()
@@ -3537,11 +3704,15 @@ diff --git a/b.md b/b.md
     #[test]
     fn cycling_keeps_you_at_the_same_point_in_the_diff() {
         // Exactly is impossible — the two presentations do not have the same
-        // number of rows — so the proportion is what is preserved.
+        // number of rows — so the proportion is what is preserved. The cursor,
+        // which is where a proportion comes from now.
         let host = Host::new();
         let mut diff = Diff::with_layouts(long_diff(), &host, Layouts::builtin());
         let total = diff.total();
-        diff.top.set(total / 2);
+        let mut v = diff.view.get();
+        v.set_len(total);
+        v.go_to(total / 2);
+        diff.view.set(v);
         diff.apply_layout(1, &host);
         let landed = diff.top.get() as f32 / diff.total() as f32;
         assert!(
@@ -3617,6 +3788,7 @@ diff --git a/b.md b/b.md
             _seg: usize,
             _host: &Host,
             _sel: Option<Selected>,
+            _current: bool,
             _shift: f32,
         ) -> AnyElement {
             div().child(self.rows[index].clone()).into_any_element()
@@ -3695,5 +3867,151 @@ diff --git a/b.md b/b.md
             vec![Box::new(TextRows::default()), Box::new(OneLiner::default())],
         );
         assert!(diff.order.iter().all(|r| r.owner == 0));
+    }
+
+    // ------------------------------------------------------------ navigation
+
+    /// A viewport of `n` visible rows, as the list would report after a frame.
+    fn with_height(diff: &mut Diff, n: usize) {
+        diff.rendered.set(n);
+        let mut v = diff.view.get();
+        v.set_len(diff.order.len());
+        v.set_height(n);
+        diff.view.set(v);
+    }
+
+    #[test]
+    fn navigation_moves_the_cursor_and_the_view_follows_with_a_margin() {
+        let host = Host::new();
+        let mut d = Diff::with_layouts(long_diff(), &host, Layouts::builtin());
+        with_height(&mut d, 20);
+        assert!(d.run_view("view.down", &host));
+        assert!(d.run_view("view.down", &host));
+        assert!(d.run_view("view.down", &host));
+        assert_eq!(d.cursor(), 3);
+        assert_eq!(d.top.get(), 0, "inside the margin, nothing scrolled");
+        // Past the margin the view moves one row, not a screenful.
+        for _ in 0..20 {
+            assert!(d.run_view("view.down", &host));
+        }
+        assert_eq!(d.cursor(), 23);
+        assert!(d.top.get() > 0, "the margin was breached");
+    }
+
+    #[test]
+    fn pages_move_a_screenful_and_top_bottom_reach_both_ends() {
+        let host = Host::new();
+        let mut d = Diff::with_layouts(long_diff(), &host, Layouts::builtin());
+        let total = d.total();
+        with_height(&mut d, 20);
+        assert!(d.run_view("view.page-down", &host));
+        assert_eq!(d.cursor(), 19, "a screenful less one row");
+        assert!(d.run_view("view.page-up", &host));
+        assert_eq!(d.cursor(), 0);
+        assert!(d.run_view("view.bottom", &host));
+        assert_eq!(d.cursor(), total - 1, "clamped to the last row");
+        assert!(d.run_view("view.top", &host));
+        assert_eq!((d.cursor(), d.view.get().top()), (0, 0));
+    }
+
+    #[test]
+    fn navigation_clamps_instead_of_leaving_the_diff() {
+        let host = Host::new();
+        let mut d = Diff::with_layouts(long_diff(), &host, Layouts::builtin());
+        let total = d.total();
+        with_height(&mut d, 20);
+        for _ in 0..5 {
+            assert!(d.run_view("view.up", &host));
+        }
+        assert_eq!(d.cursor(), 0, "clamped at the first row");
+        assert!(total > 10);
+        assert!(d.run_view("view.scroll-down", &host));
+        // A scroll is not a cursor move — but the cursor is dragged to the near
+        // edge rather than left off screen: top row 1 plus the three-row margin.
+        assert_eq!(d.view.get().top(), 1);
+        assert_eq!(d.cursor(), 4);
+    }
+
+    #[test]
+    fn file_jumps_land_on_headers_in_both_directions() {
+        let host = Host::new();
+        let mut d = Diff::with_layouts(parse_unified_diff(TWO_FILES), &host, Layouts::builtin());
+        assert_eq!(d.headers.len(), 2, "two files, two headers");
+        assert!(d.headers.windows(2).all(|w| w[0] < w[1]));
+        assert!(d.run_view("diff.next-file", &host));
+        assert_eq!(d.cursor(), d.headers[1], "skipped to the second header");
+        assert!(d.run_view("diff.next-file", &host));
+        assert_eq!(d.cursor(), d.headers[1], "no third file: it stayed");
+        assert!(d.run_view("diff.prev-file", &host));
+        assert_eq!(d.cursor(), d.headers[0]);
+        assert!(d.run_view("diff.prev-file", &host));
+        assert_eq!(d.cursor(), d.headers[0], "no row above the first header");
+    }
+
+    #[test]
+    fn cycling_layout_and_wrap_are_commands_too() {
+        let host = Host::new();
+        let mut d = Diff::with_layouts(long_diff(), &host, Layouts::builtin());
+        assert!(d.run_view("diff.cycle-layout", &host));
+        assert_eq!(d.layout_index(), 1);
+        assert_eq!(d.layout(), "split");
+        assert!(d.run_view("diff.cycle-layout", &host));
+        assert_eq!(d.layout_index(), 0, "wrapped round");
+        assert!(d.run_view("diff.cycle-wrap", &host));
+        assert_ne!(d.wrap_index(), host.wrap.selected_index(), "moved on");
+    }
+
+    #[test]
+    fn a_command_no_screen_owns_is_reported_not_swallowed() {
+        let mut host = Host::new();
+        let mut d = Diff::with_layouts(long_diff(), &host, Layouts::builtin());
+        with_height(&mut d, 20);
+        // Registered by an extension somewhere else; nothing here answers it.
+        host.commands.register("blame.toggle", "show blame");
+        assert!(!d.run_view("blame.toggle", &host));
+    }
+
+    #[test]
+    fn consecutive_commands_compose_rather_than_resetting_each_other() {
+        // The regression this guards against: reconcile reading the scroll
+        // handle's position and deciding every previous command had not
+        // happened. In a headless view the handle never paints, so its offset
+        // stays where `show` left it.
+        let host = Host::new();
+        let mut d = Diff::with_layouts(long_diff(), &host, Layouts::builtin());
+        with_height(&mut d, 20);
+        for _ in 0..4 {
+            d.run_view("view.down", &host);
+        }
+        assert_eq!(d.cursor(), 4);
+        d.run_view("view.page-down", &host);
+        assert_eq!(d.cursor(), 23, "four rows plus a nineteen-row page");
+        d.run_view("view.down", &host);
+        assert_eq!(d.cursor(), 24, "and one more, not back to zero plus one");
+    }
+
+    #[test]
+    fn scrolling_by_pixels_is_smooth_and_drags_the_cursor_along() {
+        // With a measured viewport of two rows, three rows of pixels push the
+        // cursor off the bottom — where it lands is `Viewport`'s rule, shared
+        // with the terminal's wheel.
+        let host = Host::new();
+        let mut d = Diff::with_layouts(long_diff(), &host, Layouts::builtin());
+        with_height(&mut d, 2);
+        // Headless, the handle has no bounds and reports nowhere to go.
+        if d.scroll_pixels(-66.0) {
+            assert_eq!(d.view.get().top(), 3, "66 px at 22 px a row");
+        }
+    }
+
+    #[test]
+    fn the_cursor_row_text_is_what_copy_falls_back_to() {
+        let host = Host::new();
+        let mut d = Diff::with_layouts(parse_unified_diff(TWO_FILES), &host, Layouts::builtin());
+        with_height(&mut d, 10);
+        d.run_view("diff.prev-file", &host); // already at the first header
+                                             // The path as the diff parsed it: `b/` stripped, which is what the row
+                                             // drew and therefore what a copy of it should hold.
+        assert_eq!(d.cursor_text(), "a.rs");
     }
 }

@@ -11,7 +11,7 @@
 //! place that exists to stop you guessing.
 
 use crate::screen::{Ink, Screen};
-use plait_core::command::{chord_string, Commands, Keymap, Modes};
+use plait_core::command::{Commands, HelpRow, Keymap, Modes};
 use plait_core::theme::Theme;
 
 /// Widest the panel gets, in columns. Past this the descriptions are further
@@ -27,50 +27,18 @@ enum Row {
     Blank,
 }
 
-/// The rows, innermost mode last — the order they resolve in, reversed, so the
-/// most general is at the top and reads like a table of contents.
-///
-/// A command bound to several keys is one row with them joined, because that is
-/// one thing you can do and not three.
+/// The rows, straight out of [`Keymap::help`] — `core`'s projection of what the
+/// active modes resolve to, which is the part two clients must not say
+/// differently. What is left here is only how wide to draw it and in which ink.
 fn rows(keys: &Keymap, commands: &Commands, modes: &Modes) -> Vec<Row> {
-    let mut out = Vec::new();
-    for mode in modes.as_slice() {
-        let mut in_mode: Vec<(String, String)> = Vec::new();
-        // Grouped by command, in the order the keymap holds them, so a config
-        // file's own order survives into the help.
-        let mut seen: Vec<&str> = Vec::new();
-        for b in keys.bindings().iter().filter(|b| b.mode == *mode) {
-            if seen.contains(&b.command.as_str()) {
-                continue;
-            }
-            seen.push(&b.command);
-            let all = keys
-                .bindings()
-                .iter()
-                .filter(|o| o.mode == *mode && o.command == b.command)
-                .map(|o| chord_string(&o.chord))
-                .collect::<Vec<_>>()
-                .join(" / ");
-            let doc = commands
-                .get(&b.command)
-                .map(|c| c.doc.clone())
-                .unwrap_or_default();
-            in_mode.push((all, doc));
-        }
-        if in_mode.is_empty() {
-            continue;
-        }
-        if !out.is_empty() {
-            out.push(Row::Blank);
-        }
-        out.push(Row::Mode(mode.clone()));
-        out.extend(
-            in_mode
-                .into_iter()
-                .map(|(keys, doc)| Row::Key { keys, doc }),
-        );
-    }
-    out
+    keys.help(commands, modes)
+        .into_iter()
+        .map(|row| match row {
+            HelpRow::Mode(name) => Row::Mode(name),
+            HelpRow::Command { keys, doc } => Row::Key { keys, doc },
+            HelpRow::Blank => Row::Blank,
+        })
+        .collect()
 }
 
 /// Draws the panel, centred in the rows `top..top + height`.

@@ -695,18 +695,25 @@ impl Rows for MarkdownRows {
         })
     }
 
+    fn is_header(&self, index: usize) -> bool {
+        matches!(self.rows.get(index), Some(Row::File { .. }))
+    }
+
     fn render(
         &self,
         index: usize,
         seg: usize,
         host: &Host,
         sel: Option<Selected>,
+        current: bool,
         shift: f32,
     ) -> AnyElement {
         let theme = &host.theme;
         match &self.rows[index] {
-            Row::File { path, adds, dels } => file_header(path, *adds, *dels, theme, sel, shift),
-            Row::Hunk(header) => hunk_header(header, theme, sel, shift),
+            Row::File { path, adds, dels } => {
+                file_header(path, *adds, *dels, theme, sel, current, shift)
+            }
+            Row::Hunk(header) => hunk_header(header, theme, sel, current, shift),
             Row::Line {
                 block,
                 kind,

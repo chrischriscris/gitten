@@ -411,18 +411,25 @@ impl Rows for SplitRows {
         }
     }
 
+    fn is_header(&self, index: usize) -> bool {
+        matches!(self.rows.get(index), Some(Row::File { .. }))
+    }
+
     fn render(
         &self,
         index: usize,
         seg: usize,
         host: &Host,
         sel: Option<Selected>,
+        current: bool,
         shift: f32,
     ) -> AnyElement {
         let theme = &host.theme;
         match &self.rows[index] {
-            Row::File { path, adds, dels } => file_header(path, *adds, *dels, theme, sel, shift),
-            Row::Hunk(header) => hunk_header(header, theme, sel, shift),
+            Row::File { path, adds, dels } => {
+                file_header(path, *adds, *dels, theme, sel, current, shift)
+            }
+            Row::Hunk(header) => hunk_header(header, theme, sel, current, shift),
             Row::Pair { old, new } => {
                 // Page padding, then two columns of *measured* width and a
                 // fixed rule. The width is `cell_px` — the number the hit test
@@ -436,7 +443,21 @@ impl Rows for SplitRows {
                 row_frame()
                     .items_center()
                     .px(px(PAD))
-                    .child(self.cell(*old, seg, Column::Old, theme, sel, shift, index, cell))
+                    .bg(rgb(match current {
+                        true => theme.chrome.selection_bg,
+                        false => theme.chrome.bg,
+                    }))
+                    .child(self.cell(
+                        *old,
+                        seg,
+                        Column::Old,
+                        theme,
+                        sel,
+                        current,
+                        shift,
+                        index,
+                        cell,
+                    ))
                     .child(
                         div()
                             .flex_none()
@@ -448,7 +469,17 @@ impl Rows for SplitRows {
                             // text floor is a bright seam down the window.
                             .bg(rgb(theme.diff.rule)),
                     )
-                    .child(self.cell(*new, seg, Column::New, theme, sel, shift, index, cell))
+                    .child(self.cell(
+                        *new,
+                        seg,
+                        Column::New,
+                        theme,
+                        sel,
+                        current,
+                        shift,
+                        index,
+                        cell,
+                    ))
                     .into_any_element()
             }
         }
@@ -503,6 +534,7 @@ impl SplitRows {
         column: Column,
         theme: &Theme,
         sel: Option<Selected>,
+        current: bool,
         shift: f32,
         row: usize,
         width: gpui::Pixels,
@@ -514,14 +546,24 @@ impl SplitRows {
         // which reads as an unchanged line that is not there.
         let Some(index) = self.present(line, seg) else {
             // Nothing opposite: a flat, darker block, so a run of them reads as
-            // a hole in the column rather than as unchanged content.
+            // a hole in the column rather than as unchanged content. The
+            // keyboard's bar runs across it too, so the cursor reads as one bar.
+            let bg = match current {
+                true => theme.chrome.selection_bg,
+                false => p.absent_bg,
+            };
             return cell_frame(width)
                 .debug_selector(move || format!("cell-{}-{row}", column.name()))
-                .bg(rgb(p.absent_bg))
+                .bg(rgb(bg))
                 .into_any_element();
         };
         let line = &self.lines[index as usize];
         let (bg, fg, sign) = line_colors(line.kind, line.moved, p);
+        // The keyboard's row, on this side and on the other: one bar, not two.
+        let bg = match current {
+            true => theme.chrome.selection_bg,
+            false => bg,
+        };
         let gutter = theme.gutter_on(surfaces(line.kind, line.moved).0);
         let no = match column {
             Column::Old => line.old_no,
@@ -977,7 +1019,7 @@ diff --git a/.github/workflows/check.yml b/.github/workflows/check.yml
                 range
                     .map(|k| {
                         let (i, seg) = flat[k];
-                        rows.render(i, seg as usize, &host, None, 0.0)
+                        rows.render(i, seg as usize, &host, None, false, 0.0)
                     })
                     .collect::<Vec<_>>()
             })

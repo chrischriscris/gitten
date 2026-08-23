@@ -461,6 +461,72 @@ impl Keymap {
             .map(|b| chord_string(&b.chord))
             .collect()
     }
+
+    /// What the help screen shows with `modes` active: which key runs what,
+    /// **now**.
+    ///
+    /// A projection and not a drawing — no colours, no widths, no panel —
+    /// because what it says is a property of the keymap, the registry and the
+    /// mode stack alone, and all three are the same in every client. The window
+    /// and the terminal draw it differently; neither of them may say something
+    /// different. That is also why it takes the *effective* modes rather than a
+    /// screen: which bindings are live is decided by [`Keymap::resolve`]'s same
+    /// innermost-first walk, so a key listed here is a key that would actually
+    /// fire.
+    pub fn help(&self, commands: &Commands, modes: &Modes) -> Vec<HelpRow> {
+        let mut out = Vec::new();
+        for mode in modes.as_slice() {
+            // Grouped by command, in the order this map holds them, so a config
+            // file's own order survives into the help. A command bound to several
+            // keys is one row with them joined, because that is one thing you can
+            // do and not three.
+            let mut seen: Vec<&str> = Vec::new();
+            let mut rows: Vec<HelpRow> = Vec::new();
+            for b in self.bindings().iter().filter(|b| b.mode == *mode) {
+                if seen.contains(&b.command.as_str()) {
+                    continue;
+                }
+                seen.push(&b.command);
+                let all = self
+                    .bindings()
+                    .iter()
+                    .filter(|o| o.mode == *mode && o.command == b.command)
+                    .map(|o| chord_string(&o.chord))
+                    .collect::<Vec<_>>()
+                    .join(" / ");
+                let doc = commands
+                    .get(&b.command)
+                    .map(|c| c.doc.clone())
+                    .unwrap_or_default();
+                rows.push(HelpRow::Command { keys: all, doc });
+            }
+            if rows.is_empty() {
+                continue;
+            }
+            if !out.is_empty() {
+                out.push(HelpRow::Blank);
+            }
+            out.push(HelpRow::Mode(mode.clone()));
+            out.extend(rows);
+        }
+        out
+    }
+}
+
+/// One row of a help screen, as [`Keymap::help`] projects it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HelpRow {
+    /// Which mode the rows under it (until the next heading) are bound in.
+    Mode(String),
+    /// Every key that runs one command there, joined, and what it does.
+    Command {
+        /// The chords that run it, joined with `" / "` in keymap order.
+        keys: String,
+        /// The command's own one-liner, from [`Commands`].
+        doc: String,
+    },
+    /// Air between two modes.
+    Blank,
 }
 
 /// One command a client can be asked to run.
@@ -818,5 +884,108 @@ mod tests {
     #[test]
     fn an_empty_press_resolves_to_nothing() {
         assert_eq!(Keymap::builtin().resolve(&Modes::new(), &[]), Resolve::None);
+    }
+
+    fn shown(keys: &Keymap, commands: &Commands, modes: &Modes) -> Vec<String> {
+        keys.help(commands, modes)
+            .iter()
+            .map(|row| match row {
+                HelpRow::Mode(name) => format!("[{name}]"),
+                HelpRow::Command { keys, doc } => format!("{keys} · {doc}"),
+                HelpRow::Blank => String::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_projection_lists_keys_and_what_they_do() {
+        let rows = shown(&Keymap::builtin(), &Commands::builtin(), &Modes::new());
+        // Keys and descriptions, both.
+        assert!(rows
+            .iter()
+            .any(|r| r.contains("j / down") || r.contains("down / j")));
+        assert!(rows.iter().any(|r| r.contains("one row down")));
+        assert!(
+            rows.iter().any(|r| r.contains("leave")),
+            "no description for quit"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("ctrl-d")),
+            "a modified key was not spelled out"
+        );
+        // The mode is named.
+        assert!(rows.iter().any(|r| r == "[global]"));
+    }
+
+    #[test]
+    fn the_projection_shows_only_the_active_modes() {
+        // A key bound in `commits` is not a key you can press in a diff, and
+        // listing it is a lie in the one place that exists to stop you guessing.
+        let (k, c) = (Keymap::builtin(), Commands::builtin());
+        let global = shown(&k, &c, &Modes::new());
+        assert!(!global.iter().any(|r| r.contains("the next presentation")));
+
+        let mut modes = Modes::new();
+        modes.push("diff");
+        let in_diff = shown(&k, &c, &modes);
+        assert!(in_diff.iter().any(|r| r.contains("the next presentation")));
+        assert!(
+            in_diff.iter().any(|r| r == "[diff]"),
+            "the mode is not named"
+        );
+        assert!(
+            !in_diff
+                .iter()
+                .any(|r| r.contains("the diff for this commit")),
+            "a commits key leaked in"
+        );
+        // ...and the mode's rows come after the globals they resolve through,
+        // which is the order the bindings resolve in reversed.
+        let g = in_diff.iter().position(|r| r == "[global]").unwrap();
+        let d = in_diff.iter().position(|r| r == "[diff]").unwrap();
+        assert!(g < d);
+    }
+
+    #[test]
+    fn a_command_with_several_keys_is_one_projected_row() {
+        let k = Keymap::builtin();
+        let rows = k.help(&Commands::builtin(), &Modes::new());
+        let hits = rows
+            .iter()
+            .filter(|r| matches!(r, HelpRow::Command { doc, .. } if doc == "one row down"))
+            .count();
+        assert_eq!(hits, 1, "one command, one row");
+    }
+
+    #[test]
+    fn a_binding_from_the_config_file_is_projected_without_being_told_to() {
+        // The whole point of the projection being a function of the registry.
+        let mut k = Keymap::builtin();
+        let mut c = Commands::builtin();
+        c.register("blame.toggle", "show blame beside the diff");
+        k.bind("global", "b", "blame.toggle").unwrap();
+        assert!(shown(&k, &c, &Modes::new())
+            .iter()
+            .any(|r| r.contains("show blame beside the diff")));
+    }
+
+    #[test]
+    fn an_unbound_key_leaves_the_projection_and_an_unknown_mode_is_silent() {
+        let mut k = Keymap::builtin();
+        let c = Commands::builtin();
+        assert!(shown(&k, &c, &Modes::new())
+            .iter()
+            .any(|r| r.contains("one row down")));
+        k.unbind("global", "j");
+        k.unbind("global", "down");
+        assert!(!shown(&k, &c, &Modes::new())
+            .iter()
+            .any(|r| r.contains("one row down")));
+
+        // A pushed mode with no bindings of its own adds nothing, not even a
+        // heading — it inherits everything and repeats nothing.
+        let mut modes = Modes::new();
+        modes.push("empty-mode");
+        assert_eq!(k.help(&c, &modes), k.help(&c, &Modes::new()));
     }
 }
