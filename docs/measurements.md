@@ -86,9 +86,10 @@ startup and to nobody else, so read it as an order of magnitude:
 | `git/git`, `HEAD~4..HEAD` | 2.0 ms | 8.4 ms | 22 ms |
 
 Ignoring whitespace costs 2–4× the exact relation, and all of it is the
-per-line normalisation — one `String` per line of both files. It is paid on a
-click, not on a frame, and the obvious fix if that ever changes is to hash the
-keys instead of materialising them.
+per-line normalisation. This table's runs paid one `String` per line of both
+files; since [the August 2026 memory pass](#the-august-2026-memory-pass) the
+normalized form materialises once per *distinct* line, interned in a per-file
+arena and byte-compared on collision. Still paid on a click, not on a frame.
 
 Acquisition is separate and is two processes regardless of file count: 45 ms on
 this repository, 125 ms for cmux's 307k lines. One exception worth knowing about —
@@ -350,7 +351,8 @@ with a large `docs/` tree and a few thousand commits produces the same shape.
 | prepare | 683 ms |
 
 These absolutes predate [the August 2026 allocation and startup
-pass](#the-august-2026-allocation-and-startup-pass), which moved most of them;
+pass](#the-august-2026-allocation-and-startup-pass) and [the memory pass
+after it](#the-august-2026-memory-pass), which moved most of them;
 read them next to the *before* column there, never against the *after* — the two
 columns were measured in one sitting, this table was not, and cross-vintage
 comparisons are how an improvement reads as a regression.
@@ -406,6 +408,54 @@ desktop client was **not** measured: it needs a window, and nothing headless
 exercises it; its win (window-before-acquisition) is structural rather than a
 number here. The stage clock also only exists after the pass, so no per-stage
 baseline against `main` is possible by construction.
+
+### The August 2026 memory pass
+
+One commit on top of [the allocation and startup pass above](#the-august-2026-allocation-and-startup-pass):
+acquired line text is one `Arc<str>` shared from git through the prepared rows
+instead of a `String` per copy; each differ reuses its scratch buffers across
+files; normalized whitespace keys are interned per file; token and span offsets
+are `u32`. A second commit touches only dev profiles — no runtime number here.
+
+Measured against **`main` as of the merge of the pass above**, not against that
+pass's baseline — the passes share a twin commit, so comparing across vintages
+would credit it twice. Same discipline as the table above: six rounds a side,
+starting side flipped every round, settle gaps, medians. Structural output
+identical either side: 1,000,000 commits / widest 21 lanes; 928,577 lines /
+5,953 files / 142,858 replace-pairs / 2,071,441 tokens / 0 wrap rejections.
+Peak RSS read off `/usr/bin/time -l target/release/examples/bench`.
+
+| stage | main | branch | Δ |
+|---|---|---|---|
+| parse `log.txt`, 1M commits | 272 ms | 302 ms | **+11.1 %** |
+| assign lanes | 195 ms | 189 ms | −2.7 % |
+| intraline, 142,858 replace-pairs | 372 ms | 374 ms | noise |
+| syntax highlighting | 292 ms | 286 ms | noise |
+| `prepare` | 728 ms | 723 ms | −0.7 % |
+| `align` | 7.9 ms | 5.3 ms | **−33 %** |
+| wrap @150 cols | 30.9 ms | 27.4 ms | −11 % |
+| **peak RSS, whole bench run** | **1,161 MB** | **972 MB** | **−16.3 % (−189 MB)** |
+
+The RSS line is the point of the pass and the steadiest number in it: twelve
+runs spread under half a megabyte. Most of the win is line text — a loaded diff
+held each line as several independent heap strings, and now holds one buffer per
+distinct text with counts beside it.
+
+The parse regression is the pass's one deliberate trade. Authors are interned
+through a `HashMap<&str, Arc<str>>` keyed on the borrowed field — one copy per
+distinct author instead of one per commit — so a million commits pay a SipHash
+of the name apiece, and on this fixture hashing costs ~30 ns a commit more than
+cloning did. Most of it would buy itself back with a cheaper hasher in that one
+map: `core` takes no dependencies, but a fifteen-line FNV `Hasher` is std-only.
+Recorded as follow-up, not smuggled in here.
+
+`align` and wrap got faster for free. Both walk spans and line text, and both
+moved from owned `String`s to compact `u32` ranges beside one buffer — better
+locality, nothing else changed. Their ranges do not overlap across rounds, so
+unlike `align`'s usual 13–27 % CV these two rows are real effects.
+
+Diffing answers did not move: `./check.sh`'s `differs vs git` section ran on the
+merged tree and matches the tolerance profile in the section above exactly.
 
 ### Topology
 

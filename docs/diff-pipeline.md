@@ -45,8 +45,8 @@ pub struct Pair {
     pub path: String,
     pub old_path: Option<String>,   // Some when renamed
     pub status: char,               // git's --raw letter: A M D R C T
-    pub old: Vec<String>,
-    pub new: Vec<String>,
+    pub old: Vec<Arc<str>>,
+    pub new: Vec<Arc<str>>,
     pub binary: bool,
 }
 ```

@@ -27,9 +27,14 @@ picks an implementation per path.
 comments, strings, numbers, words. Everything language-specific is data.
 
 Per position it tries, in order: line-comment openers, block-comment openers,
-string openers, digits, word characters. A first-byte table (`opens: [bool; 256]`,
-built with the `Syntax`) skips the whole rule walk for any byte that cannot open
-anything — worth about 2× on every language measured.
+string openers, digits, word characters. First-byte tables built with the
+`Syntax` skip work no rule could do. The union table (`opens: [bool; 256]`)
+skips the whole rule walk for any byte that cannot open anything — worth about
+2× on every language measured — and per-category tables (`line_opens`,
+`block_opens`, `string_opens`) let each attempt decline on its first byte
+instead of walking its patterns; keywords get the same gate (`kw_first`) plus a
+minimum-length check, so a word too short to be any keyword never reaches the
+binary search.
 
 The one non-obvious invariant: **a byte whose opener matched but whose rule then
 declined must still advance the cursor.** An apostrophe in HTML prose, a `#`
