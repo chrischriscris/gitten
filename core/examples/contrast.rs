@@ -52,29 +52,81 @@ fn report(t: &Theme) {
         row(name, contrast(bg, ctx), 0.0);
     }
     println!("  -- and against what they are read beside --");
-    row("added_word vs added", contrast(d.added_word_bg, d.added_bg), 1.10);
-    row("removed_word vs removed", contrast(d.removed_word_bg, d.removed_bg), 1.10);
+    row(
+        "added_word vs added",
+        contrast(d.added_word_bg, d.added_bg),
+        1.10,
+    );
+    row(
+        "removed_word vs removed",
+        contrast(d.removed_word_bg, d.removed_bg),
+        1.10,
+    );
     // The only comparison that decides `absent_bg`: it appears beside a change
     // and nowhere else, so context is not what it has to differ from.
     row("absent vs added", contrast(d.absent_bg, d.added_bg), 1.15);
-    row("absent vs removed", contrast(d.absent_bg, d.removed_bg), 1.15);
-    row("file vs hunk", contrast(d.file_bg, ctx) / contrast(d.hunk_bg, ctx), 1.0);
+    row(
+        "absent vs removed",
+        contrast(d.absent_bg, d.removed_bg),
+        1.15,
+    );
+    row(
+        "file vs hunk",
+        contrast(d.file_bg, ctx) / contrast(d.hunk_bg, ctx),
+        1.0,
+    );
 
     println!("  -- text, on the row it is drawn on --");
     row("context_fg", contrast(d.context_fg, ctx), t.min_contrast);
-    row("added_fg on added", contrast(d.added_fg, d.added_bg), t.min_contrast);
-    row("added_fg on moved", contrast(d.added_fg, d.moved_added_bg), t.min_contrast);
-    row("removed_fg on removed", contrast(d.removed_fg, d.removed_bg), t.min_contrast);
-    row("removed_fg on moved", contrast(d.removed_fg, d.moved_removed_bg), t.min_contrast);
-    row("file_fg on file", contrast(d.file_fg, d.file_bg), t.min_contrast);
-    row("adds_fg on file", contrast(d.adds_fg, d.file_bg), t.min_contrast);
-    row("dels_fg on file", contrast(d.dels_fg, d.file_bg), t.min_contrast);
-    row("hunk_fg on hunk", contrast(d.hunk_fg, d.hunk_bg), t.min_contrast);
+    row(
+        "added_fg on added",
+        contrast(d.added_fg, d.added_bg),
+        t.min_contrast,
+    );
+    row(
+        "added_fg on moved",
+        contrast(d.added_fg, d.moved_added_bg),
+        t.min_contrast,
+    );
+    row(
+        "removed_fg on removed",
+        contrast(d.removed_fg, d.removed_bg),
+        t.min_contrast,
+    );
+    row(
+        "removed_fg on moved",
+        contrast(d.removed_fg, d.moved_removed_bg),
+        t.min_contrast,
+    );
+    row(
+        "file_fg on file",
+        contrast(d.file_fg, d.file_bg),
+        t.min_contrast,
+    );
+    row(
+        "adds_fg on file",
+        contrast(d.adds_fg, d.file_bg),
+        t.min_contrast,
+    );
+    row(
+        "dels_fg on file",
+        contrast(d.dels_fg, d.file_bg),
+        t.min_contrast,
+    );
+    row(
+        "hunk_fg on hunk",
+        contrast(d.hunk_fg, d.hunk_bg),
+        t.min_contrast,
+    );
 
     println!("  -- chrome --");
-    for (name, fg) in
-        [("fg", c.fg), ("dim", c.dim), ("faint", c.faint), ("accent", c.accent), ("error", c.error)]
-    {
+    for (name, fg) in [
+        ("fg", c.fg),
+        ("dim", c.dim),
+        ("faint", c.faint),
+        ("accent", c.accent),
+        ("error", c.error),
+    ] {
         row(&format!("{name} on bg"), contrast(fg, c.bg), 0.0);
     }
     for (name, bg) in [
@@ -103,7 +155,11 @@ fn report(t: &Theme) {
     println!("  -- furniture, as written and then resolved per surface --");
     // Below the floor on purpose and marked `*` for it: what a theme *chooses*
     // is this one grey, and the eight below are what `rebuild` made of it.
-    row("gutter_fg, unlifted", contrast(d.gutter_fg, ctx), t.min_furniture);
+    row(
+        "gutter_fg, unlifted",
+        contrast(d.gutter_fg, ctx),
+        t.min_furniture,
+    );
     for s in Surface::ALL {
         let got = contrast(t.gutter_on(s), t.background(s));
         row(&format!("gutter on {s:?}"), got, t.min_furniture);
@@ -120,7 +176,11 @@ fn report(t: &Theme) {
                 format!("{on:5.1}{}", if moved { "*" } else { " " })
             })
             .collect();
-        println!("  {:<12} {raw:6.2}   {}", format!("{kind:?}"), lifted.join(" "));
+        println!(
+            "  {:<12} {raw:6.2}   {}",
+            format!("{kind:?}"),
+            lifted.join(" ")
+        );
     }
 }
 

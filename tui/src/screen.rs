@@ -74,14 +74,26 @@ pub struct Ink {
 
 impl Ink {
     pub const fn new(fg: Rgb, bg: Rgb) -> Self {
-        Self { fg, bg, bold: false, italic: false, underline: false }
+        Self {
+            fg,
+            bg,
+            bold: false,
+            italic: false,
+            underline: false,
+        }
     }
 
     /// A [`Style`] from the theme, on a background the theme resolved it
     /// against. The two travel together everywhere in the diff view — see
     /// [`Theme::syntax_on`](plait_core::theme::Theme::syntax_on).
     pub const fn styled(style: Style, bg: Rgb) -> Self {
-        Self { fg: style.fg, bg, bold: style.bold, italic: style.italic, underline: false }
+        Self {
+            fg: style.fg,
+            bg,
+            bold: style.bold,
+            italic: style.italic,
+            underline: false,
+        }
     }
 
     pub const fn bold(mut self) -> Self {
@@ -132,7 +144,12 @@ pub struct Screen {
 impl Screen {
     pub fn new(w: usize, h: usize) -> Self {
         let blank = Cell::blank(Ink::new(0, 0));
-        Self { w, h, back: vec![blank; w * h], front: Vec::new() }
+        Self {
+            w,
+            h,
+            back: vec![blank; w * h],
+            front: Vec::new(),
+        }
     }
 
     /// Resizes, discarding both buffers.
@@ -178,7 +195,11 @@ impl Screen {
             true => &mut self.back[y * self.w..(y + 1) * self.w],
             false => &mut [][..],
         };
-        Pen { cells, x: 0, skip: 0 }
+        Pen {
+            cells,
+            x: 0,
+            skip: 0,
+        }
     }
 
     /// A pen over part of a row, for a view that owns a column range — a
@@ -190,7 +211,11 @@ impl Screen {
             true => &mut self.back[y * self.w + start..y * self.w + end],
             false => &mut [][..],
         };
-        Pen { cells, x: 0, skip: 0 }
+        Pen {
+            cells,
+            x: 0,
+            skip: 0,
+        }
     }
 
     /// Writes the difference between the back buffer and the screen.
@@ -306,7 +331,10 @@ impl Screen {
     /// The whole grid as text, one row per line. What a test asserts against and
     /// what a `--dump` flag prints instead of opening a terminal.
     pub fn dump(&self) -> String {
-        (0..self.h).map(|y| self.row_text(y)).collect::<Vec<_>>().join("\n")
+        (0..self.h)
+            .map(|y| self.row_text(y))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Draws one character over whatever is already in a cell, keeping that
@@ -432,7 +460,11 @@ impl Pen<'_> {
         let start = self.x;
         let end = (start + cols).min(self.cells.len());
         self.x = end;
-        Pen { cells: &mut self.cells[start..end], x: 0, skip: 0 }
+        Pen {
+            cells: &mut self.cells[start..end],
+            x: 0,
+            skip: 0,
+        }
     }
 
     /// Fills `cols` columns with `ch`.
@@ -567,7 +599,9 @@ mod tests {
     #[test]
     fn nothing_written_can_leave_its_row() {
         let mut s = screen(8, 2);
-        let took = s.row(0).put("far too long for eight columns", Ink::new(FG, BG));
+        let took = s
+            .row(0)
+            .put("far too long for eight columns", Ink::new(FG, BG));
         assert_eq!(took, 8);
         assert_eq!(s.row_text(0), "far too");
         assert_eq!(s.row_text(1), "", "it did not spill downwards");
@@ -588,7 +622,11 @@ mod tests {
         let took = s.row(0).put("日本語ab", Ink::new(FG, BG));
         assert_eq!(took, 8);
         assert_eq!(s.char_at(0, 0), Some('日'));
-        assert_eq!(s.char_at(1, 0), None, "the continuation cell holds no character");
+        assert_eq!(
+            s.char_at(1, 0),
+            None,
+            "the continuation cell holds no character"
+        );
         assert_eq!(s.char_at(6, 0), Some('a'));
         assert_eq!(s.row_text(0), "日本語ab");
     }
@@ -675,7 +713,10 @@ mod tests {
         s.row(0).put("hello", Ink::new(FG, BG));
         let first = flushed(&mut s);
         assert!(first.contains("hello"));
-        assert!(first.starts_with("\x1b[?2026h"), "no synchronized update: {first:?}");
+        assert!(
+            first.starts_with("\x1b[?2026h"),
+            "no synchronized update: {first:?}"
+        );
         assert!(first.ends_with("\x1b[0m\x1b[?2026l"));
 
         let mut out = Vec::new();
@@ -711,7 +752,10 @@ mod tests {
         flushed(&mut s);
         s.row(0).put("日語", Ink::new(FG, BG));
         let out = flushed(&mut s);
-        assert!(out.contains("\x1b[1;3H"), "cursor was not put on the lead cell: {out:?}");
+        assert!(
+            out.contains("\x1b[1;3H"),
+            "cursor was not put on the lead cell: {out:?}"
+        );
         assert!(out.contains('語'), "{out:?}");
     }
 
@@ -746,10 +790,19 @@ mod tests {
     #[test]
     fn every_attribute_reaches_the_wire() {
         let mut s = screen(4, 1);
-        let ink = Ink { fg: 0xff0000, bg: 0x00ff00, bold: true, italic: true, underline: true };
+        let ink = Ink {
+            fg: 0xff0000,
+            bg: 0x00ff00,
+            bold: true,
+            italic: true,
+            underline: true,
+        };
         s.row(0).put("x", ink);
         let out = flushed(&mut s);
-        assert!(out.contains("\x1b[0;38;2;255;0;0;48;2;0;255;0;1;3;4m"), "{out:?}");
+        assert!(
+            out.contains("\x1b[0;38;2;255;0;0;48;2;0;255;0;1;3;4m"),
+            "{out:?}"
+        );
     }
 
     #[test]
@@ -782,8 +835,15 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("one"));
         assert!(text.contains("two"));
-        assert!(!text.contains("\x1b[1;1H"), "a printable dump moved the cursor");
-        assert_eq!(text.matches("\x1b[0m\n").count(), 2, "a row did not reset: {text:?}");
+        assert!(
+            !text.contains("\x1b[1;1H"),
+            "a printable dump moved the cursor"
+        );
+        assert_eq!(
+            text.matches("\x1b[0m\n").count(),
+            2,
+            "a row did not reset: {text:?}"
+        );
     }
 
     #[test]

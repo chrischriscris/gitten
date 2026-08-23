@@ -59,12 +59,18 @@ fn main() {
     }
     if let Some(name) = env("WRAP") {
         if !host.wrap.select(&name) {
-            eprintln!("plait: unknown wrap {name:?}; have {}", host.wrap.names().join(", "));
+            eprintln!(
+                "plait: unknown wrap {name:?}; have {}",
+                host.wrap.names().join(", ")
+            );
         }
     }
     if let Some(name) = env("THEME") {
         if !host.select_theme(&name) {
-            eprintln!("plait: unknown theme {name:?}; have {}", host.themes.names().join(", "));
+            eprintln!(
+                "plait: unknown theme {name:?}; have {}",
+                host.themes.names().join(", ")
+            );
         }
     }
 

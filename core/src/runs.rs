@@ -136,7 +136,12 @@ pub fn runs_selected(
     // disqualifies the fast path — part of the row is somebody else's
     // background even when nothing else is.
     if tokens.is_empty() && spans.is_empty() && sel.start >= sel.end {
-        out.push(Run { at, kind: None, surface: plain, word: false });
+        out.push(Run {
+            at,
+            kind: None,
+            surface: plain,
+            word: false,
+        });
         return;
     }
 
@@ -226,7 +231,11 @@ mod tests {
             assert!(out.is_empty(), "an empty range produced {out:?}");
             return;
         }
-        assert_eq!(out.first().unwrap().at.start, at.start, "starts late: {out:?}");
+        assert_eq!(
+            out.first().unwrap().at.start,
+            at.start,
+            "starts late: {out:?}"
+        );
         assert_eq!(out.last().unwrap().at.end, at.end, "stops early: {out:?}");
         for r in out {
             assert!(r.at.start < r.at.end, "empty run in {out:?}");
@@ -252,9 +261,19 @@ mod tests {
     #[test]
     fn a_token_and_a_span_that_partly_overlap_split_into_three() {
         let mut out = Vec::new();
-        runs(0..12, &[tok(0, 8, Kind::Str)], &[span(4, 12)], LineKind::Added, false, &mut out);
+        runs(
+            0..12,
+            &[tok(0, 8, Kind::Str)],
+            &[span(4, 12)],
+            LineKind::Added,
+            false,
+            &mut out,
+        );
         well_formed(0..12, &out);
-        let got: Vec<_> = out.iter().map(|r| (r.at.clone(), r.kind, r.surface, r.word)).collect();
+        let got: Vec<_> = out
+            .iter()
+            .map(|r| (r.at.clone(), r.kind, r.surface, r.word))
+            .collect();
         assert_eq!(
             got,
             vec![
@@ -274,7 +293,10 @@ mod tests {
         let spans = [span(2, 30)];
         runs(8..16, &tokens, &spans, LineKind::Removed, false, &mut out);
         well_formed(8..16, &out);
-        assert!(out.iter().all(|r| r.at.start >= 8 && r.at.end <= 16), "{out:?}");
+        assert!(
+            out.iter().all(|r| r.at.start >= 8 && r.at.end <= 16),
+            "{out:?}"
+        );
         // The keyword ended before this row; the string starts inside it.
         assert_eq!(out[0].kind, None);
         assert!(out.iter().any(|r| r.kind == Some(Kind::Str)));
@@ -286,7 +308,11 @@ mod tests {
         let mut out = Vec::new();
         runs(0..6, &[], &[span(1, 3)], LineKind::Added, true, &mut out);
         well_formed(0..6, &out);
-        assert_eq!(out.len(), 1, "the dropped span left an edge behind: {out:?}");
+        assert_eq!(
+            out.len(),
+            1,
+            "the dropped span left an edge behind: {out:?}"
+        );
         assert_eq!(out[0].surface, Surface::MovedAdded);
         assert!(!out[0].word);
     }
@@ -314,8 +340,24 @@ mod tests {
     fn a_selection_outranks_a_changed_word_and_resolves_against_its_background() {
         let mut plain = Vec::new();
         let mut selected = Vec::new();
-        runs_selected(0..9, &[tok(2, 7, Kind::Str)], &[span(4, 8)], LineKind::Added, false, 5..9, &mut selected);
-        runs_selected(0..9, &[tok(2, 7, Kind::Str)], &[span(4, 8)], LineKind::Added, false, 0..0, &mut plain);
+        runs_selected(
+            0..9,
+            &[tok(2, 7, Kind::Str)],
+            &[span(4, 8)],
+            LineKind::Added,
+            false,
+            5..9,
+            &mut selected,
+        );
+        runs_selected(
+            0..9,
+            &[tok(2, 7, Kind::Str)],
+            &[span(4, 8)],
+            LineKind::Added,
+            false,
+            0..0,
+            &mut plain,
+        );
         well_formed(0..9, &selected);
         // The word's bytes 5..8 were Selected; only 4..5 kept the word surface,
         // the token underneath split the selected stretch at its own edge, and
@@ -339,14 +381,34 @@ mod tests {
         let mut a = Vec::new();
         let mut b = Vec::new();
         runs(0..10, &tokens, &spans, LineKind::Removed, false, &mut a);
-        runs_selected(0..10, &tokens, &spans, LineKind::Removed, false, 3..3, &mut b);
+        runs_selected(
+            0..10,
+            &tokens,
+            &spans,
+            LineKind::Removed,
+            false,
+            3..3,
+            &mut b,
+        );
         assert_eq!(a, b);
     }
 
     #[test]
     fn an_empty_range_produces_nothing_rather_than_a_panic() {
-        let mut out = vec![Run { at: 0..1, kind: None, surface: Surface::Context, word: false }];
-        runs(5..5, &[tok(0, 9, Kind::Str)], &[span(0, 9)], LineKind::Context, false, &mut out);
+        let mut out = vec![Run {
+            at: 0..1,
+            kind: None,
+            surface: Surface::Context,
+            word: false,
+        }];
+        runs(
+            5..5,
+            &[tok(0, 9, Kind::Str)],
+            &[span(0, 9)],
+            LineKind::Context,
+            false,
+            &mut out,
+        );
         assert!(out.is_empty(), "the buffer was not cleared");
     }
 
@@ -390,7 +452,11 @@ diff --git a/a.rs b/a.rs
             well_formed(at, &out);
             let joined: String = out.iter().map(|r| &l.text[r.at.clone()]).collect();
             assert_eq!(joined, &*l.text, "the runs did not reassemble the line");
-            words.extend(out.iter().filter(|r| r.word).map(|r| l.text[r.at.clone()].to_string()));
+            words.extend(
+                out.iter()
+                    .filter(|r| r.word)
+                    .map(|r| l.text[r.at.clone()].to_string()),
+            );
         }
         // `let x` -> `let y`: the identifier is the change, on both sides, and
         // the trailing comment is not.

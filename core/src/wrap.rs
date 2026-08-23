@@ -54,7 +54,10 @@ pub struct Break {
 impl Break {
     /// A break that keeps every byte — what a hard break at a column is.
     pub fn hard(at: usize) -> Self {
-        Self { end: at as u32, next: at as u32 }
+        Self {
+            end: at as u32,
+            next: at as u32,
+        }
     }
 }
 
@@ -190,13 +193,11 @@ impl Wrap for Word {
             // rather than bytes: a line of box drawing is a third as many
             // columns as it is bytes.
             let mut limit = text.len();
-            let mut n = 0;
-            for (i, _) in text[start..].char_indices() {
+            for (n, (i, _)) in text[start..].char_indices().enumerate() {
                 if n == cols {
                     limit = start + i;
                     break;
                 }
-                n += 1;
             }
             if limit == text.len() {
                 return;
@@ -228,7 +229,10 @@ impl Wrap for Word {
                     // is a line with nothing after the run but more whitespace,
                     // and a break before it would draw one too.
                     if s > start && e < text.len() {
-                        cut = Some(Break { end: s as u32, next: e as u32 });
+                        cut = Some(Break {
+                            end: s as u32,
+                            next: e as u32,
+                        });
                     }
                     break;
                 }
@@ -266,7 +270,10 @@ impl Wraps {
     ///
     /// `off` first, so the menu reads from least to most aggressive.
     pub fn builtin() -> Self {
-        let mut w = Self { impls: Vec::new(), selected: 0 };
+        let mut w = Self {
+            impls: Vec::new(),
+            selected: 0,
+        };
         w.register(Off);
         w.register(Word);
         w.register(Char);
@@ -324,7 +331,10 @@ impl Wraps {
     /// means the menu moved, and drawing the diff the way it was already being
     /// drawn is the answer that surprises nobody.
     pub fn at(&self, index: usize) -> &dyn Wrap {
-        self.impls.get(index).unwrap_or(&self.impls[self.selected]).as_ref()
+        self.impls
+            .get(index)
+            .unwrap_or(&self.impls[self.selected])
+            .as_ref()
     }
 
     pub fn current(&self) -> &dyn Wrap {
@@ -388,7 +398,11 @@ impl Wrapped {
         lines: impl Iterator<Item = (&'a str, Budget<'a>)>,
         wrap: &dyn Wrap,
     ) -> Self {
-        let mut out = Self { breaks: Vec::new(), at: vec![0], rejected: 0 };
+        let mut out = Self {
+            breaks: Vec::new(),
+            at: vec![0],
+            rejected: 0,
+        };
         let mut scratch = Vec::new();
         for (text, budget) in lines {
             match budget {
@@ -472,9 +486,16 @@ impl Wrapped {
         if row > count {
             return 0..text.len();
         }
-        let start = if row == 0 { 0 } else { self.breaks[first + row - 1].next as usize };
-        let stop =
-            if row == count { text.len() } else { self.breaks[first + row].end as usize };
+        let start = if row == 0 {
+            0
+        } else {
+            self.breaks[first + row - 1].next as usize
+        };
+        let stop = if row == count {
+            text.len()
+        } else {
+            self.breaks[first + row].end as usize
+        };
         start..stop.max(start)
     }
 }
@@ -487,7 +508,9 @@ mod tests {
     /// anybody can check by eye.
     fn rows(w: &dyn Wrap, text: &str, cols: usize) -> Vec<String> {
         let t = Wrapped::build(std::iter::once((text, cols)), w);
-        (0..t.rows(0)).map(|r| text[t.range(0, r, text)].to_string()).collect()
+        (0..t.rows(0))
+            .map(|r| text[t.range(0, r, text)].to_string())
+            .collect()
     }
 
     #[test]
@@ -507,7 +530,11 @@ mod tests {
         // the end of a row is not ink, and a run that reaches the end of the
         // line is deliberately left on the last row rather than broken before —
         // breaking there would draw a row of nothing.
-        for text in ["a bb ccc dddd eeeee ffffff ggggggg", "short   ", "a b\t \t  "] {
+        for text in [
+            "a bb ccc dddd eeeee ffffff ggggggg",
+            "short   ",
+            "a b\t \t  ",
+        ] {
             for cols in 1..40 {
                 for row in rows(&Word, text, cols) {
                     assert!(row.trim_end().chars().count() <= cols, "{cols}: {row:?}");
@@ -521,7 +548,10 @@ mod tests {
         // What a minified bundle and a base64 blob are made of. The alternative
         // is a row wider than the window, which is what wrapping is for.
         assert_eq!(rows(&Word, "abcdefghij", 4), ["abcd", "efgh", "ij"]);
-        assert_eq!(rows(&Word, "hi abcdefghij", 4), ["hi", "abcd", "efgh", "ij"]);
+        assert_eq!(
+            rows(&Word, "hi abcdefghij", 4),
+            ["hi", "abcd", "efgh", "ij"]
+        );
     }
 
     #[test]
@@ -558,7 +588,10 @@ mod tests {
 
     #[test]
     fn char_wrap_keeps_every_byte_and_breaks_on_the_column() {
-        assert_eq!(rows(&Char, "the quick brown", 5), ["the q", "uick ", "brown"]);
+        assert_eq!(
+            rows(&Char, "the quick brown", 5),
+            ["the q", "uick ", "brown"]
+        );
         let text = "the quick brown";
         let t = Wrapped::build(std::iter::once((text, 5)), &Char);
         let joined: String = (0..t.rows(0)).map(|r| &text[t.range(0, r, text)]).collect();
@@ -611,7 +644,10 @@ mod tests {
     #[test]
     fn off_is_the_old_behaviour_exactly() {
         assert!(!Off.breaks_lines());
-        assert_eq!(rows(&Off, "a line long enough to wrap several times over", 5).len(), 1);
+        assert_eq!(
+            rows(&Off, "a line long enough to wrap several times over", 5).len(),
+            1
+        );
     }
 
     #[test]
@@ -695,7 +731,11 @@ mod tests {
         assert_eq!(w.selected(), "silly");
         assert_eq!(w.at(w.selected_index()).name(), "silly");
         assert!(!w.select("nothing-registered-under-this"));
-        assert_eq!(w.selected(), "silly", "a failed select changed the selection");
+        assert_eq!(
+            w.selected(),
+            "silly",
+            "a failed select changed the selection"
+        );
     }
 
     #[test]
@@ -709,8 +749,16 @@ mod tests {
         }
         let mut w = Wraps::builtin();
         w.register(NotWord);
-        assert_eq!(w.names(), ["off", "word", "char"], "it was added rather than replaced");
-        assert_eq!(rows(w.current(), "a b c d e", 3).len(), 1, "the built-in still ran");
+        assert_eq!(
+            w.names(),
+            ["off", "word", "char"],
+            "it was added rather than replaced"
+        );
+        assert_eq!(
+            rows(w.current(), "a b c d e", 3).len(),
+            1,
+            "the built-in still ran"
+        );
     }
 
     #[test]

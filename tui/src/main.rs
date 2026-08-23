@@ -50,7 +50,6 @@ const EXTRA: &str = "  --ascii        draw the graph and the scrollbar without b
   keymap are re-read every time the file is saved.
 ";
 
-
 /// How often the loop wakes to notice a saved config file.
 ///
 /// A save is a human action and 150 ms of latency is imperceptible; polling a
@@ -540,7 +539,9 @@ impl App {
                 // host is read while a screen is written, and moving it out and
                 // back would rebuild every theme and every registry per click.
                 let Self { stack, host, .. } = self;
-                let Some(screen) = stack.last_mut() else { return };
+                let Some(screen) = stack.last_mut() else {
+                    return;
+                };
                 screen.press(m.col, row as usize, clicks, m.shift, host);
                 // Two clicks on a commit open it, which is the one gesture a
                 // terminal has for "go in" besides the key that already does.
@@ -563,7 +564,11 @@ impl App {
                 // one to the terminal per motion event would be an escape
                 // sequence per cell the pointer crossed.
                 if self.host.mouse.copy_on_select {
-                    let text = self.stack.last().map(Screens::selection).unwrap_or_default();
+                    let text = self
+                        .stack
+                        .last()
+                        .map(Screens::selection)
+                        .unwrap_or_default();
                     if !text.is_empty() {
                         self.copy = Some(text);
                     }
@@ -615,7 +620,11 @@ impl App {
             // `Term::copy`. Held until the loop, which is the one place that has
             // a terminal to write to.
             "copy.selection" => {
-                let text = self.stack.last().map(Screens::copy_text).unwrap_or_default();
+                let text = self
+                    .stack
+                    .last()
+                    .map(Screens::copy_text)
+                    .unwrap_or_default();
                 match text.is_empty() {
                     true => self.message = "nothing to copy".into(),
                     false => self.copy = Some(text),
@@ -689,13 +698,19 @@ impl App {
             self.message = "a fixture has no repository to diff against".into();
             return;
         };
-        let source = Source::Repo { path: repo, arg: sha.clone() };
+        let source = Source::Repo {
+            path: repo,
+            arg: sha.clone(),
+        };
         match acquire::acquire(View::Diff, &source, &self.host) {
             Ok(loaded) => {
-                let mut diff = Diff::new(match loaded.data {
-                    Data::Diff(files) => files,
-                    Data::Commits(_) => return,
-                }, &self.host);
+                let mut diff = Diff::new(
+                    match loaded.data {
+                        Data::Diff(files) => files,
+                        Data::Commits(_) => return,
+                    },
+                    &self.host,
+                );
                 diff.set_bar(self.bar);
                 let (w, h) = self.screen.size();
                 diff.resize(w, h.saturating_sub(2), &self.host);
@@ -736,7 +751,11 @@ impl App {
         }
 
         let status = match self.message.is_empty() {
-            true => self.stack.last().map(|s| s.status(&self.host)).unwrap_or_default(),
+            true => self
+                .stack
+                .last()
+                .map(|s| s.status(&self.host))
+                .unwrap_or_default(),
             false => self.message.clone(),
         };
         let ink = Ink::new(c.dim, c.status_bg);

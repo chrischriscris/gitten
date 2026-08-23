@@ -315,7 +315,10 @@ impl Languages {
     pub fn for_path(&self, path: &str) -> Option<&Syntax> {
         let name = path.rsplit(['/', '\\']).next()?;
         let find = |key: &str| {
-            self.by_ext.iter().find(|(e, _)| e.eq_ignore_ascii_case(key)).map(|(_, s)| s)
+            self.by_ext
+                .iter()
+                .find(|(e, _)| e.eq_ignore_ascii_case(key))
+                .map(|(_, s)| s)
         };
         find(name).or_else(|| find(name.rsplit_once('.')?.1))
     }
@@ -341,7 +344,9 @@ pub struct Lexer {
 impl Lexer {
     /// Every language described below.
     pub fn builtin() -> Self {
-        Self { languages: builtin_languages() }
+        Self {
+            languages: builtin_languages(),
+        }
     }
 }
 
@@ -392,13 +397,19 @@ impl Default for Highlighters {
 impl Highlighters {
     /// The scanner for everything, with Markdown routed away from it.
     pub fn builtin() -> Self {
-        let mut h = Self { routes: Vec::new(), fallback: Fallback::Scanner(Lexer::builtin()) };
+        let mut h = Self {
+            routes: Vec::new(),
+            fallback: Fallback::Scanner(Lexer::builtin()),
+        };
         h.route(&["md", "markdown", "mdx"], Markdown);
         h
     }
 
     pub fn with_fallback(fallback: impl Highlighter + 'static) -> Self {
-        Self { routes: Vec::new(), fallback: Fallback::Custom(Box::new(fallback)) }
+        Self {
+            routes: Vec::new(),
+            fallback: Fallback::Custom(Box::new(fallback)),
+        }
     }
 
     /// The scanner's language tables, for adding or replacing one:
@@ -486,7 +497,7 @@ fn at(b: &[u8], i: usize, p: &[u8]) -> bool {
 /// plain compare beats a call. An empty opener matches anywhere.
 #[inline]
 fn may_open(p: &[u8], c: u8) -> bool {
-    p.first().map_or(true, |&f| f == c)
+    p.first().is_none_or(|&f| f == c)
 }
 
 /// Scans `src` once, appending tokens in order. Ranges never overlap.
@@ -496,7 +507,11 @@ pub fn lex(src: &str, syn: &Syntax, out: &mut Vec<Token>) {
     // Offsets stay `usize` through the scan and narrow at the boundary; a line
     // is clipped text far below `u32::MAX` — see [`Token`].
     let mut push = |start: usize, end: usize, kind: Kind| {
-        out.push(Token { start: start as u32, end: end as u32, kind })
+        out.push(Token {
+            start: start as u32,
+            end: end as u32,
+            kind,
+        })
     };
 
     'scan: while i < b.len() {
@@ -525,7 +540,10 @@ pub fn lex(src: &str, syn: &Syntax, out: &mut Vec<Token>) {
                     let p = pat.as_bytes();
                     if may_open(p, c) && at(b, i, p) {
                         let start = i;
-                        i += b[i..].iter().position(|&d| d == b'\n').unwrap_or(b.len() - i);
+                        i += b[i..]
+                            .iter()
+                            .position(|&d| d == b'\n')
+                            .unwrap_or(b.len() - i);
                         push(start, i, Kind::Comment);
                         continue 'scan;
                     }
@@ -602,7 +620,8 @@ pub fn lex(src: &str, syn: &Syntax, out: &mut Vec<Token>) {
             // 10ms. A `.` only continues a number if a digit follows, so `x.0.1`
             // and a range `0..n` do not swallow the operator.
             while i < b.len()
-                && (is_word(b[i]) || (b[i] == b'.' && matches!(b.get(i + 1), Some(d) if d.is_ascii_digit())))
+                && (is_word(b[i])
+                    || (b[i] == b'.' && matches!(b.get(i + 1), Some(d) if d.is_ascii_digit())))
             {
                 i += 1;
             }
@@ -623,7 +642,10 @@ pub fn lex(src: &str, syn: &Syntax, out: &mut Vec<Token>) {
             if syn.kw_first[c as usize]
                 && len >= syn.kw_min_len
                 && len <= syn.kw_max_len
-                && syn.keywords.binary_search_by(|k| k.as_str().cmp(word)).is_ok()
+                && syn
+                    .keywords
+                    .binary_search_by(|k| k.as_str().cmp(word))
+                    .is_ok()
             {
                 push(start, i, Kind::Keyword);
             } else if syn.capitalized_types && c.is_ascii_uppercase() {
@@ -708,7 +730,11 @@ pub fn lex_lines(lines: &[&str], syn: &Syntax) -> Vec<Vec<Token>> {
             let start = (t.start as usize).saturating_sub(base).min(len);
             let end = (t.end as usize - base).min(len);
             if start < end {
-                out[r].push(Token { start: start as u32, end: end as u32, kind: t.kind });
+                out[r].push(Token {
+                    start: start as u32,
+                    end: end as u32,
+                    kind: t.kind,
+                });
             }
             if r + 1 >= lines.len() || t.end as usize <= starts[r + 1] {
                 break;
@@ -770,7 +796,7 @@ pub fn for_each_side(kinds: &[LineKind], mut f: impl FnMut(&[usize])) {
     // A hunk with no added lines has nothing for the added pass to see that the
     // removed pass has not already covered, and pure-deletion diffs are common
     // enough to be worth the check: it halves the work on them.
-    let has = |k: LineKind| kinds.iter().any(|c| *c == k);
+    let has = |k: LineKind| kinds.contains(&k);
     let sides: &[LineKind] = match (has(LineKind::Removed), has(LineKind::Added)) {
         (true, true) => &[LineKind::Removed, LineKind::Added],
         (true, false) => &[LineKind::Removed],
@@ -782,7 +808,9 @@ pub fn for_each_side(kinds: &[LineKind], mut f: impl FnMut(&[usize])) {
     // side's tokens. The text is identical either way; this is just definite.
     for &side in sides {
         rows.clear();
-        rows.extend((0..kinds.len()).filter(|&i| kinds[i] == side || kinds[i] == LineKind::Context));
+        rows.extend(
+            (0..kinds.len()).filter(|&i| kinds[i] == side || kinds[i] == LineKind::Context),
+        );
         if !rows.is_empty() {
             f(&rows);
         }
@@ -819,7 +847,11 @@ impl Highlighter for Markdown {
             let indent = line.len() - trimmed.len();
             let whole = |toks: &mut Vec<Token>, kind| {
                 if !line.is_empty() {
-                    toks.push(Token { start: 0, end: line.len() as u32, kind });
+                    toks.push(Token {
+                        start: 0,
+                        end: line.len() as u32,
+                        kind,
+                    });
                 }
             };
 
@@ -926,7 +958,8 @@ pub(crate) fn list_marker(trimmed: &str) -> usize {
         return 2;
     }
     let digits = b.iter().take_while(|c| c.is_ascii_digit()).count();
-    if digits > 0 && matches!(b.get(digits), Some(b'.' | b')')) && b.get(digits + 1) == Some(&b' ') {
+    if digits > 0 && matches!(b.get(digits), Some(b'.' | b')')) && b.get(digits + 1) == Some(&b' ')
+    {
         return digits + 2;
     }
     0
@@ -945,7 +978,11 @@ fn inline(line: &str, from: usize, out: &mut Vec<Token>) {
                 let run = b[i..].iter().take_while(|c| **c == b'`').count();
                 match close_run(b, i + run, b'`', run) {
                     Some(end) => {
-                        out.push(Token { start: i as u32, end: (end + run) as u32, kind: Kind::Str });
+                        out.push(Token {
+                            start: i as u32,
+                            end: (end + run) as u32,
+                            kind: Kind::Str,
+                        });
                         i = end + run;
                     }
                     None => i += run,
@@ -955,8 +992,16 @@ fn inline(line: &str, from: usize, out: &mut Vec<Token>) {
                 let run = if b.get(i + 1) == Some(&c) { 2 } else { 1 };
                 match close_run(b, i + run, c, run) {
                     Some(end) => {
-                        let kind = if run == 2 { Kind::Strong } else { Kind::Emphasis };
-                        out.push(Token { start: i as u32, end: (end + run) as u32, kind });
+                        let kind = if run == 2 {
+                            Kind::Strong
+                        } else {
+                            Kind::Emphasis
+                        };
+                        out.push(Token {
+                            start: i as u32,
+                            end: (end + run) as u32,
+                            kind,
+                        });
                         i = end + run;
                     }
                     None => i += run,
@@ -964,7 +1009,11 @@ fn inline(line: &str, from: usize, out: &mut Vec<Token>) {
             }
             b'[' => match link_end(b, i) {
                 Some(end) => {
-                    out.push(Token { start: i as u32, end: end as u32, kind: Kind::Link });
+                    out.push(Token {
+                        start: i as u32,
+                        end: end as u32,
+                        kind: Kind::Link,
+                    });
                     i = end;
                 }
                 None => i += 1,
@@ -1043,9 +1092,31 @@ fn builtin_languages() -> Languages {
             .block(C_BLOCK)
             .strings(&[("`", "`", false, true), DQ, SQ])
             .keywords(&[
-                "break", "case", "chan", "const", "continue", "default", "defer", "else",
-                "fallthrough", "for", "func", "go", "goto", "if", "import", "interface", "map",
-                "package", "range", "return", "select", "struct", "switch", "type", "var",
+                "break",
+                "case",
+                "chan",
+                "const",
+                "continue",
+                "default",
+                "defer",
+                "else",
+                "fallthrough",
+                "for",
+                "func",
+                "go",
+                "goto",
+                "if",
+                "import",
+                "interface",
+                "map",
+                "package",
+                "range",
+                "return",
+                "select",
+                "struct",
+                "switch",
+                "type",
+                "var",
             ])
             .capitalized_types()
             .call_heuristic(),
@@ -1079,12 +1150,56 @@ fn builtin_languages() -> Languages {
             .block(C_BLOCK)
             .strings(&[("\"\"\"", "\"\"\"", true, true), DQ, SQ])
             .keywords(&[
-                "abstract", "assert", "boolean", "break", "byte", "case", "catch", "char", "class",
-                "const", "continue", "default", "do", "double", "else", "enum", "extends", "final",
-                "finally", "float", "for", "if", "implements", "import", "instanceof", "int",
-                "interface", "long", "native", "new", "package", "private", "protected", "public",
-                "record", "return", "short", "static", "super", "switch", "synchronized", "this",
-                "throw", "throws", "transient", "try", "var", "void", "volatile", "while",
+                "abstract",
+                "assert",
+                "boolean",
+                "break",
+                "byte",
+                "case",
+                "catch",
+                "char",
+                "class",
+                "const",
+                "continue",
+                "default",
+                "do",
+                "double",
+                "else",
+                "enum",
+                "extends",
+                "final",
+                "finally",
+                "float",
+                "for",
+                "if",
+                "implements",
+                "import",
+                "instanceof",
+                "int",
+                "interface",
+                "long",
+                "native",
+                "new",
+                "package",
+                "private",
+                "protected",
+                "public",
+                "record",
+                "return",
+                "short",
+                "static",
+                "super",
+                "switch",
+                "synchronized",
+                "this",
+                "throw",
+                "throws",
+                "transient",
+                "try",
+                "var",
+                "void",
+                "volatile",
+                "while",
             ])
             .capitalized_types()
             .call_heuristic(),
@@ -1098,11 +1213,47 @@ fn builtin_languages() -> Languages {
             .nested_block()
             .strings(&[("\"\"\"", "\"\"\"", false, true), DQ, SQ])
             .keywords(&[
-                "as", "break", "by", "class", "companion", "const", "continue", "data", "do",
-                "else", "enum", "false", "for", "fun", "if", "import", "in", "interface",
-                "internal", "is", "null", "object", "open", "override", "package", "private",
-                "protected", "public", "return", "sealed", "super", "suspend", "this", "throw",
-                "true", "try", "typealias", "val", "var", "when", "while",
+                "as",
+                "break",
+                "by",
+                "class",
+                "companion",
+                "const",
+                "continue",
+                "data",
+                "do",
+                "else",
+                "enum",
+                "false",
+                "for",
+                "fun",
+                "if",
+                "import",
+                "in",
+                "interface",
+                "internal",
+                "is",
+                "null",
+                "object",
+                "open",
+                "override",
+                "package",
+                "private",
+                "protected",
+                "public",
+                "return",
+                "sealed",
+                "super",
+                "suspend",
+                "this",
+                "throw",
+                "true",
+                "try",
+                "typealias",
+                "val",
+                "var",
+                "when",
+                "while",
             ])
             .capitalized_types()
             .call_heuristic(),
@@ -1116,12 +1267,56 @@ fn builtin_languages() -> Languages {
             .nested_block()
             .strings(&[("\"\"\"", "\"\"\"", true, true), DQ])
             .keywords(&[
-                "as", "associatedtype", "break", "case", "catch", "class", "continue", "default",
-                "defer", "deinit", "do", "else", "enum", "extension", "fallthrough", "false",
-                "fileprivate", "for", "func", "guard", "if", "import", "in", "init", "inout",
-                "internal", "is", "let", "nil", "open", "operator", "private", "protocol",
-                "public", "repeat", "return", "self", "static", "struct", "subscript", "super",
-                "switch", "throw", "throws", "true", "try", "typealias", "var", "where", "while",
+                "as",
+                "associatedtype",
+                "break",
+                "case",
+                "catch",
+                "class",
+                "continue",
+                "default",
+                "defer",
+                "deinit",
+                "do",
+                "else",
+                "enum",
+                "extension",
+                "fallthrough",
+                "false",
+                "fileprivate",
+                "for",
+                "func",
+                "guard",
+                "if",
+                "import",
+                "in",
+                "init",
+                "inout",
+                "internal",
+                "is",
+                "let",
+                "nil",
+                "open",
+                "operator",
+                "private",
+                "protocol",
+                "public",
+                "repeat",
+                "return",
+                "self",
+                "static",
+                "struct",
+                "subscript",
+                "super",
+                "switch",
+                "throw",
+                "throws",
+                "true",
+                "try",
+                "typealias",
+                "var",
+                "where",
+                "while",
             ])
             .capitalized_types()
             .call_heuristic(),
@@ -1134,13 +1329,65 @@ fn builtin_languages() -> Languages {
             .block(C_BLOCK)
             .strings(&[("`", "`", true, true), DQ, SQ])
             .keywords(&[
-                "abstract", "any", "as", "async", "await", "boolean", "break", "case", "catch",
-                "class", "const", "constructor", "continue", "declare", "default", "delete", "do",
-                "else", "enum", "export", "extends", "false", "finally", "for", "from", "function",
-                "get", "if", "implements", "import", "in", "instanceof", "interface", "let",
-                "namespace", "new", "null", "number", "of", "private", "protected", "public",
-                "readonly", "return", "set", "static", "string", "super", "switch", "this",
-                "throw", "true", "try", "type", "typeof", "undefined", "var", "void", "while",
+                "abstract",
+                "any",
+                "as",
+                "async",
+                "await",
+                "boolean",
+                "break",
+                "case",
+                "catch",
+                "class",
+                "const",
+                "constructor",
+                "continue",
+                "declare",
+                "default",
+                "delete",
+                "do",
+                "else",
+                "enum",
+                "export",
+                "extends",
+                "false",
+                "finally",
+                "for",
+                "from",
+                "function",
+                "get",
+                "if",
+                "implements",
+                "import",
+                "in",
+                "instanceof",
+                "interface",
+                "let",
+                "namespace",
+                "new",
+                "null",
+                "number",
+                "of",
+                "private",
+                "protected",
+                "public",
+                "readonly",
+                "return",
+                "set",
+                "static",
+                "string",
+                "super",
+                "switch",
+                "this",
+                "throw",
+                "true",
+                "try",
+                "type",
+                "typeof",
+                "undefined",
+                "var",
+                "void",
+                "while",
                 "yield",
             ])
             .capitalized_types()
@@ -1171,13 +1418,64 @@ fn builtin_languages() -> Languages {
             .block(C_BLOCK)
             .strings(&[DQ, SQ])
             .keywords(&[
-                "auto", "bool", "break", "case", "catch", "char", "class", "const", "constexpr",
-                "continue", "default", "delete", "do", "double", "else", "enum", "explicit",
-                "export", "extern", "false", "float", "for", "friend", "goto", "if", "inline",
-                "int", "long", "mutable", "namespace", "new", "noexcept", "nullptr", "operator",
-                "private", "protected", "public", "return", "short", "signed", "sizeof", "static",
-                "struct", "switch", "template", "this", "throw", "true", "try", "typedef",
-                "typename", "union", "unsigned", "using", "virtual", "void", "volatile", "while",
+                "auto",
+                "bool",
+                "break",
+                "case",
+                "catch",
+                "char",
+                "class",
+                "const",
+                "constexpr",
+                "continue",
+                "default",
+                "delete",
+                "do",
+                "double",
+                "else",
+                "enum",
+                "explicit",
+                "export",
+                "extern",
+                "false",
+                "float",
+                "for",
+                "friend",
+                "goto",
+                "if",
+                "inline",
+                "int",
+                "long",
+                "mutable",
+                "namespace",
+                "new",
+                "noexcept",
+                "nullptr",
+                "operator",
+                "private",
+                "protected",
+                "public",
+                "return",
+                "short",
+                "signed",
+                "sizeof",
+                "static",
+                "struct",
+                "switch",
+                "template",
+                "this",
+                "throw",
+                "true",
+                "try",
+                "typedef",
+                "typename",
+                "union",
+                "unsigned",
+                "using",
+                "virtual",
+                "void",
+                "volatile",
+                "while",
             ])
             .capitalized_types()
             .call_heuristic(),
@@ -1189,12 +1487,51 @@ fn builtin_languages() -> Languages {
             .line(&["//"])
             .strings(&[DQ, SQ])
             .keywords(&[
-                "align", "allowzero", "and", "anyframe", "anytype", "asm", "async", "await",
-                "break", "catch", "comptime", "const", "continue", "defer", "else", "enum",
-                "errdefer", "error", "export", "extern", "fn", "for", "if", "inline", "noalias",
-                "nosuspend", "opaque", "or", "orelse", "packed", "pub", "resume", "return",
-                "struct", "suspend", "switch", "test", "threadlocal", "try", "union",
-                "unreachable", "usingnamespace", "var", "volatile", "while",
+                "align",
+                "allowzero",
+                "and",
+                "anyframe",
+                "anytype",
+                "asm",
+                "async",
+                "await",
+                "break",
+                "catch",
+                "comptime",
+                "const",
+                "continue",
+                "defer",
+                "else",
+                "enum",
+                "errdefer",
+                "error",
+                "export",
+                "extern",
+                "fn",
+                "for",
+                "if",
+                "inline",
+                "noalias",
+                "nosuspend",
+                "opaque",
+                "or",
+                "orelse",
+                "packed",
+                "pub",
+                "resume",
+                "return",
+                "struct",
+                "suspend",
+                "switch",
+                "test",
+                "threadlocal",
+                "try",
+                "union",
+                "unreachable",
+                "usingnamespace",
+                "var",
+                "volatile",
+                "while",
             ])
             .capitalized_types()
             .call_heuristic(),
@@ -1311,7 +1648,9 @@ mod tests {
         let syn = lexer.languages.for_path(path).expect("no table for path");
         let mut out = Vec::new();
         lex(src, syn, &mut out);
-        out.iter().map(|t| (t.kind, src[t.range()].to_string())).collect()
+        out.iter()
+            .map(|t| (t.kind, src[t.range()].to_string()))
+            .collect()
     }
 
     #[test]
@@ -1335,7 +1674,9 @@ mod tests {
         let mut out = Vec::new();
         lex(src, syn, &mut out);
         assert!(out.windows(2).all(|w| w[0].end <= w[1].start), "{out:?}");
-        assert!(out.iter().all(|t| t.start < t.end && t.end as usize <= src.len()));
+        assert!(out
+            .iter()
+            .all(|t| t.start < t.end && t.end as usize <= src.len()));
     }
 
     #[test]
@@ -1355,7 +1696,14 @@ mod tests {
         // given, which is one side of one hunk. The next hunk starts clean.
         let lexer = Lexer::builtin();
         let got = lexer.highlight("a.rs", &["let s = \"open", "still inside", "\";"]);
-        assert_eq!(got[1], vec![Token { start: 0, end: 12, kind: Kind::Str }]);
+        assert_eq!(
+            got[1],
+            vec![Token {
+                start: 0,
+                end: 12,
+                kind: Kind::Str
+            }]
+        );
         let next = lexer.highlight("a.rs", &["fn clean() {}"]);
         assert!(next[0].iter().all(|t| t.kind != Kind::Str));
     }
@@ -1363,7 +1711,10 @@ mod tests {
     #[test]
     fn rust_raw_strings_may_contain_quotes() {
         let got = tokens("a.rs", "let s = r#\"say \"hi\"\"#;");
-        assert!(got.contains(&(Kind::Str, "r#\"say \"hi\"\"#".into())), "{got:?}");
+        assert!(
+            got.contains(&(Kind::Str, "r#\"say \"hi\"\"#".into())),
+            "{got:?}"
+        );
     }
 
     #[test]
@@ -1392,7 +1743,11 @@ mod tests {
     #[test]
     fn numbers_do_not_swallow_operators() {
         let got = tokens("a.rs", "for i in 0..10 { x = 1.5 }");
-        let nums: Vec<_> = got.iter().filter(|(k, _)| *k == Kind::Number).map(|(_, s)| s.as_str()).collect();
+        let nums: Vec<_> = got
+            .iter()
+            .filter(|(k, _)| *k == Kind::Number)
+            .map(|(_, s)| s.as_str())
+            .collect();
         assert_eq!(nums, vec!["0", "10", "1.5"]);
     }
 
@@ -1408,9 +1763,30 @@ mod tests {
         let lexer = Lexer::builtin();
         let lines = ["/* one", " * two", " */ let x = 1;"];
         let got = lexer.highlight("a.rs", &lines);
-        assert_eq!(got[0], vec![Token { start: 0, end: 6, kind: Kind::Comment }]);
-        assert_eq!(got[1], vec![Token { start: 0, end: 6, kind: Kind::Comment }]);
-        assert_eq!(got[2][0], Token { start: 0, end: 3, kind: Kind::Comment });
+        assert_eq!(
+            got[0],
+            vec![Token {
+                start: 0,
+                end: 6,
+                kind: Kind::Comment
+            }]
+        );
+        assert_eq!(
+            got[1],
+            vec![Token {
+                start: 0,
+                end: 6,
+                kind: Kind::Comment
+            }]
+        );
+        assert_eq!(
+            got[2][0],
+            Token {
+                start: 0,
+                end: 3,
+                kind: Kind::Comment
+            }
+        );
         assert!(got[2].iter().any(|t| t.kind == Kind::Keyword));
     }
 
@@ -1439,10 +1815,9 @@ mod tests {
     fn a_registered_table_replaces_a_built_in_one() {
         // The extension seam: if this test can do it, so can an extension.
         let mut lexer = Lexer::builtin();
-        lexer.languages.register(
-            &["rs"],
-            Syntax::new().line(&[";;"]).keywords(&["fn"]),
-        );
+        lexer
+            .languages
+            .register(&["rs"], Syntax::new().line(&[";;"]).keywords(&["fn"]));
         let got = lexer.highlight("a.rs", &["fn x() {} ;; note"]);
         assert_eq!(got[0].first().unwrap().kind, Kind::Keyword);
         assert_eq!(got[0].last().unwrap().kind, Kind::Comment);
@@ -1455,7 +1830,12 @@ mod tests {
         // end of line, which is what the reader sees.
         let lexer = Lexer::builtin();
         let texts = ["let a = 1;", "let s = \"x;", "let s = \"y\";", "done();"];
-        let kinds = [LineKind::Context, LineKind::Removed, LineKind::Added, LineKind::Context];
+        let kinds = [
+            LineKind::Context,
+            LineKind::Removed,
+            LineKind::Added,
+            LineKind::Context,
+        ];
         let got = highlight_hunk(&lexer, "a.rs", &texts, &kinds);
         assert_eq!(got.len(), 4);
         assert_eq!(got[1].last().unwrap().kind, Kind::Str);
@@ -1512,7 +1892,13 @@ mod tests {
         fn highlight(&self, _path: &str, lines: &[&str]) -> Vec<Vec<Token>> {
             lines
                 .iter()
-                .map(|l| vec![Token { start: 0, end: l.len() as u32, kind: Kind::Comment }])
+                .map(|l| {
+                    vec![Token {
+                        start: 0,
+                        end: l.len() as u32,
+                        kind: Kind::Comment,
+                    }]
+                })
                 .collect()
         }
     }
@@ -1522,7 +1908,10 @@ mod tests {
         let mut hl = Highlighters::builtin();
         hl.route(&["rs"], EverythingIsAComment);
         assert_eq!(hl.highlight("a.rs", &["let x = 1;"])[0].len(), 1);
-        assert_eq!(hl.highlight("a.rs", &["let x = 1;"])[0][0].kind, Kind::Comment);
+        assert_eq!(
+            hl.highlight("a.rs", &["let x = 1;"])[0][0].kind,
+            Kind::Comment
+        );
         // Everything else still goes to the scanner.
         assert!(hl.highlight("a.go", &["func main() {}"])[0].len() > 1);
     }
@@ -1540,7 +1929,10 @@ mod tests {
     fn routes_match_whole_filenames_too() {
         let mut hl = Highlighters::builtin();
         hl.route(&["Makefile"], EverythingIsAComment);
-        assert_eq!(hl.highlight("deps/Makefile", &["all:"])[0][0].kind, Kind::Comment);
+        assert_eq!(
+            hl.highlight("deps/Makefile", &["all:"])[0][0].kind,
+            Kind::Comment
+        );
         assert!(hl.highlight("makefile.rs", &["let x = 1;"])[0][0].kind != Kind::Comment);
     }
 
@@ -1568,7 +1960,10 @@ mod tests {
         // An extension that wants to own every language it was not asked about.
         let mut hl = Highlighters::with_fallback(EverythingIsAComment);
         hl.route(&["md"], Markdown);
-        assert_eq!(hl.highlight("whatever.xyz", &["hello"])[0][0].kind, Kind::Comment);
+        assert_eq!(
+            hl.highlight("whatever.xyz", &["hello"])[0][0].kind,
+            Kind::Comment
+        );
         assert_eq!(hl.highlight("r.md", &["# h"])[0][0].kind, Kind::Heading);
     }
 
@@ -1589,7 +1984,9 @@ mod tests {
         let hl = Highlighters::builtin();
         let indented = "    ./check.sh        # everything headless";
         assert!(
-            hl.highlight("a.md", &[indented])[0].iter().all(|t| t.kind != Kind::Heading),
+            hl.highlight("a.md", &[indented])[0]
+                .iter()
+                .all(|t| t.kind != Kind::Heading),
             "an indented command with a trailing comment was highlighted as a heading"
         );
     }
@@ -1598,7 +1995,14 @@ mod tests {
     fn markdown_is_routed_away_from_the_scanner_by_default() {
         let hl = Highlighters::builtin();
         let got = hl.highlight("README.md", &["# Title"]);
-        assert_eq!(got[0], vec![Token { start: 0, end: 7, kind: Kind::Heading }]);
+        assert_eq!(
+            got[0],
+            vec![Token {
+                start: 0,
+                end: 7,
+                kind: Kind::Heading
+            }]
+        );
     }
 
     // --------------------------------------------------------- markdown
@@ -1609,7 +2013,9 @@ mod tests {
             .iter()
             .zip(lines)
             .map(|(toks, line)| {
-                toks.iter().map(|t| (t.kind, line[t.range()].to_string())).collect()
+                toks.iter()
+                    .map(|t| (t.kind, line[t.range()].to_string()))
+                    .collect()
             })
             .collect()
     }
@@ -1641,7 +2047,10 @@ mod tests {
         // the language inside it is not markdown at all.
         let got = md(&["```rust", "let x = **not emphasis**;", "```", "*after*"]);
         assert_eq!(got[0][0].0, Kind::Str);
-        assert_eq!(got[1], vec![(Kind::Str, "let x = **not emphasis**;".into())]);
+        assert_eq!(
+            got[1],
+            vec![(Kind::Str, "let x = **not emphasis**;".into())]
+        );
         assert_eq!(got[2][0].0, Kind::Str);
         assert_eq!(got[3], vec![(Kind::Emphasis, "*after*".into())]);
     }
@@ -1668,7 +2077,10 @@ mod tests {
         for (toks, line) in Markdown.highlight("r.md", &lines).iter().zip(lines) {
             assert!(toks.windows(2).all(|w| w[0].end <= w[1].start), "{toks:?}");
             for t in toks {
-                assert!(t.start < t.end && t.end as usize <= line.len(), "{t:?} in {line:?}");
+                assert!(
+                    t.start < t.end && t.end as usize <= line.len(),
+                    "{t:?} in {line:?}"
+                );
                 assert!(
                     line.is_char_boundary(t.start as usize)
                         && line.is_char_boundary(t.end as usize)
@@ -1687,9 +2099,14 @@ mod tests {
     #[test]
     fn tables_cover_the_extensions_we_claim() {
         let lexer = Lexer::builtin();
-        for ext in ["rs", "go", "py", "java", "kt", "swift", "ts", "tsx", "js", "c", "h", "cpp",
-                    "zig", "lua", "sh", "yaml", "yml", "toml", "json", "css", "sql", "html"] {
-            assert!(lexer.languages.for_path(&format!("f.{ext}")).is_some(), "{ext}");
+        for ext in [
+            "rs", "go", "py", "java", "kt", "swift", "ts", "tsx", "js", "c", "h", "cpp", "zig",
+            "lua", "sh", "yaml", "yml", "toml", "json", "css", "sql", "html",
+        ] {
+            assert!(
+                lexer.languages.for_path(&format!("f.{ext}")).is_some(),
+                "{ext}"
+            );
         }
     }
 }

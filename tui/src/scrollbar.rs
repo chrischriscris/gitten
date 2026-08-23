@@ -54,12 +54,18 @@ impl Bar {
     /// eye has to find while the list moves under it, and a half-width glyph in a
     /// quiet palette reads as another line of the graph.
     pub fn block() -> Self {
-        Self { track: '│', thumb: '█' }
+        Self {
+            track: '│',
+            thumb: '█',
+        }
     }
 
     /// Nothing outside ASCII, for a terminal or a font that cannot draw the rest.
     pub fn ascii() -> Self {
-        Self { track: '|', thumb: '#' }
+        Self {
+            track: '|',
+            thumb: '#',
+        }
     }
 }
 
@@ -69,7 +75,9 @@ impl Bar {
 /// not been given a height yet. Costs one `over` per visible row and allocates
 /// nothing.
 pub fn paint(screen: &mut Screen, bar: Bar, x: usize, y: usize, view: &Viewport, host: &Host) {
-    let Some(thumb) = thumb(view, host) else { return };
+    let Some(thumb) = thumb(view, host) else {
+        return;
+    };
     let c = &host.theme.chrome;
     for i in 0..view.height() {
         let on = thumb.contains(&i);
@@ -107,7 +115,9 @@ pub fn hit(col: usize, cols: usize, view: &Viewport, host: &Host) -> bool {
 /// thumb snaps its top to the pointer on the first pixel of every drag, which is
 /// a scrollbar that jumps whenever it is used.
 pub fn grab(view: &mut Viewport, host: &Host, row: usize) -> usize {
-    let Some(thumb) = thumb(view, host) else { return 0 };
+    let Some(thumb) = thumb(view, host) else {
+        return 0;
+    };
     if thumb.contains(&row) {
         return row - thumb.start;
     }
@@ -150,7 +160,11 @@ mod tests {
         paint(&mut screen, Bar::block(), 19, 1, &v, &host);
         assert_eq!(screen.char_at(19, 1), Some('█'), "the thumb is at the top");
         assert_eq!(screen.char_at(19, 9), Some('│'));
-        assert_eq!(screen.ink(19, 9).unwrap().bg, 0x330000, "it repainted the row");
+        assert_eq!(
+            screen.ink(19, 9).unwrap().bg,
+            0x330000,
+            "it repainted the row"
+        );
     }
 
     #[test]
@@ -179,7 +193,10 @@ mod tests {
         let mut v = view(100, 20);
         v.scroll_to(40);
         let thumb = thumb(&v, &host).unwrap();
-        assert!(thumb.len() > 1, "a one-cell thumb has nowhere to be grabbed");
+        assert!(
+            thumb.len() > 1,
+            "a one-cell thumb has nowhere to be grabbed"
+        );
         let grabbed = grab(&mut v, &host, thumb.start + 1);
         assert_eq!(grabbed, 1);
         assert_eq!(v.top(), 40, "a press on the thumb scrolled the list");

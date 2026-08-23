@@ -62,7 +62,13 @@ pub const LANE_HUES: usize = 6;
 pub fn lane_count(rows: &[GraphRow]) -> usize {
     rows.iter()
         .map(|r| {
-            let widest = r.through.iter().chain(&r.merges).chain(&r.forks).max().copied();
+            let widest = r
+                .through
+                .iter()
+                .chain(&r.merges)
+                .chain(&r.forks)
+                .max()
+                .copied();
             widest.unwrap_or(r.lane).max(r.lane) + 1
         })
         .max()
@@ -239,7 +245,12 @@ r\x1fr\x1f\x1fA\x1f1\x1froot\x1e";
     #[test]
     fn the_newest_row_has_no_history_above_it_and_a_root_none_below() {
         let (_, p) = planned(LOG);
-        let own = |d: &Draw| *d.lines.iter().find(|l| l.lane == d.lane).expect("its own lane");
+        let own = |d: &Draw| {
+            *d.lines
+                .iter()
+                .find(|l| l.lane == d.lane)
+                .expect("its own lane")
+        };
         assert!(!own(&p[0]).up, "drew a line above the newest commit");
         assert!(own(&p[0]).down, "the trunk stops at the newest commit");
         // `r` is a root: its lane ends at the dot.
@@ -251,11 +262,19 @@ r\x1fr\x1f\x1fA\x1f1\x1froot\x1e";
     fn a_fork_and_the_merge_it_rejoins_are_curve_halves_that_meet() {
         let (_, p) = planned(LOG);
         // `m` forks lane 1 downward for its second parent.
-        let out = p[0].curves.iter().find(|c| c.down).expect("a fork out of the merge");
+        let out = p[0]
+            .curves
+            .iter()
+            .find(|c| c.down)
+            .expect("a fork out of the merge");
         assert_eq!((out.lane, out.partner), (0, 1));
         // `b` sits in lane 1 and its lane converges on the root below, so `r`
         // carries the other half — upward, from its own lane toward lane 1.
-        let back = p[3].curves.iter().find(|c| !c.down).expect("a merge into the root");
+        let back = p[3]
+            .curves
+            .iter()
+            .find(|c| !c.down)
+            .expect("a merge into the root");
         assert_eq!((back.lane, back.partner), (0, 1));
     }
 
@@ -288,7 +307,11 @@ r\x1fr\x1f\x1fA\x1f1\x1froot\x1e";
             .map(|i| format!("{i}\x1f{i}\x1f{}\x1fA\x1f1\x1fc{i}\x1e", i + 1))
             .collect();
         let (_, q) = planned(&straight);
-        assert!(q.iter().all(|d| d.lanes == 1), "{:?}", q.iter().map(|d| d.lanes).collect::<Vec<_>>());
+        assert!(
+            q.iter().all(|d| d.lanes == 1),
+            "{:?}",
+            q.iter().map(|d| d.lanes).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -303,7 +326,10 @@ r\x1fr\x1f\x1fA\x1f1\x1froot\x1e";
             log.push_str(&format!("{p}\x1f{p}\x1f\x1fA\x1f1\x1fparent\x1e"));
         }
         let (_, p) = planned(&log);
-        assert!(p[0].capped, "the octopus row hides lanes and did not say so");
+        assert!(
+            p[0].capped,
+            "the octopus row hides lanes and did not say so"
+        );
         for d in &p {
             assert!(d.lanes <= MAX_LANES, "{} columns", d.lanes);
             assert!(d.lines.iter().all(|l| l.lane as usize <= MAX_LANES));
@@ -334,7 +360,10 @@ r\x1fr\x1f\x1fA\x1f1\x1froot\x1e";
         // those twelve lanes are full lines. That is the point of measuring
         // each row on its own.
         assert_eq!(p.iter().map(|d| d.lanes).max(), Some(MAX_LANES));
-        assert!(p[0].lanes < MAX_LANES, "a row of half-curves measured full width");
+        assert!(
+            p[0].lanes < MAX_LANES,
+            "a row of half-curves measured full width"
+        );
         assert!(p.iter().all(|d| !d.capped), "nothing was hidden");
     }
 
@@ -342,7 +371,6 @@ r\x1fr\x1f\x1fA\x1f1\x1froot\x1e";
     fn an_empty_history_plans_nothing() {
         assert!(plan(&[], &[]).is_empty());
     }
-
 
     fn commit(sha: &str, parents: &[&str]) -> Commit {
         Commit {
@@ -369,15 +397,21 @@ r\x1fr\x1f\x1fA\x1f1\x1froot\x1e";
     fn halves_meet(ds: &[Draw]) {
         for (i, d) in ds.iter().enumerate() {
             for c in &d.curves {
-                let (row, want_down) =
-                    if c.down { (i + 1, false) } else { (i.wrapping_sub(1), true) };
+                let (row, want_down) = if c.down {
+                    (i + 1, false)
+                } else {
+                    (i.wrapping_sub(1), true)
+                };
                 let Some(other) = ds.get(row) else { continue };
                 let pair = |c: &Curve| {
                     let (a, b) = (c.lane.min(c.partner), c.lane.max(c.partner));
                     (a, b, c.hue)
                 };
                 assert!(
-                    other.curves.iter().any(|o| o.down == want_down && pair(o) == pair(c)),
+                    other
+                        .curves
+                        .iter()
+                        .any(|o| o.down == want_down && pair(o) == pair(c)),
                     "row {i} curve {:?} has no other half in row {row}: {:?}",
                     pair(c),
                     other.curves.iter().map(pair).collect::<Vec<_>>(),
@@ -443,7 +477,11 @@ r\x1fr\x1f\x1fA\x1f1\x1froot\x1e";
         // shape a merge-heavy history actually has.
         let log: String = (0..60)
             .map(|i| match i % 5 {
-                0 => format!("c{i}\x1fc{i}\x1fc{}  c{}\x1fA\x1f1\x1fmerge\x1e", i + 1, i + 3),
+                0 => format!(
+                    "c{i}\x1fc{i}\x1fc{}  c{}\x1fA\x1f1\x1fmerge\x1e",
+                    i + 1,
+                    i + 3
+                ),
                 _ => format!("c{i}\x1fc{i}\x1fc{}\x1fA\x1f1\x1fone\x1e", i + 1),
             })
             .collect();
@@ -603,7 +641,12 @@ pub fn plan(commits: &[Commit], rows: &[GraphRow]) -> Vec<Draw> {
             }
             for (end, down) in [(up, false), (down, true)] {
                 if let Some(partner) = end {
-                    curves.push(Curve { lane: cap(lane), partner: cap(partner), hue: line.hue, down });
+                    curves.push(Curve {
+                        lane: cap(lane),
+                        partner: cap(partner),
+                        hue: line.hue,
+                        down,
+                    });
                 }
             }
         }
@@ -663,7 +706,7 @@ fn width(lane: u16, lines: &[Line], curves: &[Curve]) -> usize {
     for c in curves {
         // `(a + b) / 2` rounded *up*: a half that ends mid-column still needs
         // that column.
-        let mid = (c.lane as usize + c.partner as usize + 1) / 2;
+        let mid = (c.lane as usize + c.partner as usize).div_ceil(2);
         last = last.max(c.lane as usize).max(mid);
     }
     last + 1

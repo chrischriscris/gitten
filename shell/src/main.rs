@@ -13,12 +13,12 @@ use plait_app::{Started, Startup};
 use plait_core::differ::{Overrides, Whitespace};
 use plait_core::host::Host;
 use plait_core::FileDiff;
+use stats::Stats;
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use stats::Stats;
 
 /// Startup-stage timestamps on stderr, behind `PLAIT_START_LOG=1`.
 ///
@@ -74,8 +74,6 @@ actions!(plait, [Quit, CycleTheme]);
 
 use views::diff::{CopySelection, CycleLayout, CycleWrap, SelectAll, SelectNone};
 
-
-
 /// The title strip, which is also the window's titlebar — see the note on
 /// [`window_options`]. Tall enough to hold the traffic lights with the same air
 /// above and below them, which is what makes it read as one band rather than as
@@ -94,7 +92,8 @@ const BAND_H: f32 = 22.0;
 /// documented once, in `plait_app::cli::usage`, because they are the same in
 /// every client — see that function for why that is a promise and not a
 /// convenience.
-const EXTRA: &str = "  The title bar carries five pickers: the presentation (unified, side-by-side),
+const EXTRA: &str =
+    "  The title bar carries five pickers: the presentation (unified, side-by-side),
   where a line too wide for the window breaks (off, word, char), the diff
   algorithm (histogram, patience, myers), how much whitespace has to match
   (exact, trailing, change, all — git's default, --ignore-space-at-eol, -b and
@@ -200,14 +199,18 @@ impl DevShell {
     /// Costs no re-diff and no `prepare` — only where the lines break moves —
     /// which is why this one needs none of `set_overrides`' machinery.
     fn set_wrap(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(diff) = self.diff.clone() else { return };
+        let Some(diff) = self.diff.clone() else {
+            return;
+        };
         let host = config::host(cx);
         diff.update(cx, |d, cx| d.set_wrap(index, &host, cx));
         cx.notify();
     }
 
     fn set_layout(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(diff) = self.diff.clone() else { return };
+        let Some(diff) = self.diff.clone() else {
+            return;
+        };
         // A layout change is a fresh look at the same diff, so a message about
         // an algorithm that failed to load is no longer describing the screen.
         self.error = None;
@@ -291,7 +294,9 @@ impl DevShell {
                 let names: Vec<String> = theme_names.iter().map(|s| s.to_string()).collect();
                 let me = me.clone();
                 move |i, _, cx| {
-                    let Some(name) = names.get(i).cloned() else { return };
+                    let Some(name) = names.get(i).cloned() else {
+                        return;
+                    };
                     _ = me.update(cx, |this, cx| {
                         this.open = None;
                         this.set_theme(name, cx);
@@ -303,7 +308,9 @@ impl DevShell {
         // Everything below drives the diff view, so there is nothing to draw
         // when that is not what is on screen: the commit graph gets no strip of
         // dead controls.
-        let Some(diff) = &self.diff else { return vec![theme_picker] };
+        let Some(diff) = &self.diff else {
+            return vec![theme_picker];
+        };
 
         let names = diff.read(cx).layout_names();
         let layouts = controls::Picker::new("layout", &names, diff.read(cx).layout_index());
@@ -314,7 +321,11 @@ impl DevShell {
         let wrap = controls::Picker::new("wrap", &wrap_names, diff.read(cx).wrap_index());
 
         let algorithms = host.differ.names();
-        let selected = self.over.algorithm.as_deref().unwrap_or(host.differ.selected());
+        let selected = self
+            .over
+            .algorithm
+            .as_deref()
+            .unwrap_or(host.differ.selected());
         let algorithm = controls::Picker::new(
             "algorithm",
             &algorithms,
@@ -379,11 +390,15 @@ impl DevShell {
                     let names: Vec<String> = algorithms.iter().map(|s| s.to_string()).collect();
                     let me = me.clone();
                     move |i, _, cx| {
-                        let Some(name) = names.get(i).cloned() else { return };
+                        let Some(name) = names.get(i).cloned() else {
+                            return;
+                        };
                         _ = me.update(cx, |this, cx| {
                             this.open = None;
-                            let next =
-                                Overrides { algorithm: Some(name), ..this.over.clone() };
+                            let next = Overrides {
+                                algorithm: Some(name),
+                                ..this.over.clone()
+                            };
                             this.set_overrides(next, cx);
                         });
                     }
@@ -519,7 +534,12 @@ impl Render for DevShell {
                     .text_color(rgb(c.error))
                     .child(div().min_w_0().truncate().child(e))
             }))
-            .child(div().flex_grow(1.0).overflow_hidden().child(self.view.clone()))
+            .child(
+                div()
+                    .flex_grow(1.0)
+                    .overflow_hidden()
+                    .child(self.view.clone()),
+            )
             .children(overlay.map(|(frames, rows, heap, load)| {
                 div()
                     .flex_none()
@@ -559,7 +579,13 @@ fn main() {
         Err(exit) => exit.finish(),
     };
     start::mark("startup done (args + plait.toml + acquire)");
-    let Started { view: which, source, host, loaded, config: config_path } = started;
+    let Started {
+        view: which,
+        source,
+        host,
+        loaded,
+        config: config_path,
+    } = started;
     let host = Rc::new(host);
 
     // Names this exact view, so a saved scroll position is only ever restored
@@ -618,14 +644,19 @@ fn main() {
             config::watch(&config_path, move || dirty.store(true, Ordering::Relaxed)).ok()
         };
         if watcher.is_none() {
-            eprintln!("plait: could not watch {}; config reload is off", config_path.display());
+            eprintln!(
+                "plait: could not watch {}; config reload is off",
+                config_path.display()
+            );
         }
         cx.spawn(async move |cx: &mut AsyncApp| {
             // Held for as long as the task lives: dropping a `notify` watcher
             // stops it watching, silently.
             let _watcher = watcher;
             loop {
-                cx.background_executor().timer(Duration::from_millis(120)).await;
+                cx.background_executor()
+                    .timer(Duration::from_millis(120))
+                    .await;
                 if !dirty.swap(false, Ordering::Relaxed) {
                     continue;
                 }
@@ -645,8 +676,7 @@ fn main() {
             let path = theme_config_path;
             move |_: &CycleTheme, cx: &mut App| {
                 let host = config::host(cx);
-                let Some(next) = host.themes.after(&host.theme.name).map(|t| t.name.clone())
-                else {
+                let Some(next) = host.themes.after(&host.theme.name).map(|t| t.name.clone()) else {
                     return;
                 };
                 cx.set_global(config::Chosen(Some(next)));
@@ -744,14 +774,14 @@ fn main() {
             // no callback, and this task dies as soon as it fires.
             if start::on() {
                 let drawn = rendered.clone();
-                cx.spawn(async move |cx| {
-                    loop {
-                        cx.background_executor().timer(Duration::from_millis(5)).await;
-                        let n = drawn.get();
-                        if n > 0 {
-                            start::mark(&format!("first rows drawn ({n})"));
-                            break;
-                        }
+                cx.spawn(async move |cx| loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(5))
+                        .await;
+                    let n = drawn.get();
+                    if n > 0 {
+                        start::mark(&format!("first rows drawn ({n})"));
+                        break;
                     }
                 })
                 .detach();
@@ -766,11 +796,19 @@ fn main() {
                 cx.spawn(async move |cx: &mut AsyncApp| {
                     let mut last = start;
                     loop {
-                        cx.background_executor().timer(Duration::from_millis(400)).await;
+                        cx.background_executor()
+                            .timer(Duration::from_millis(400))
+                            .await;
                         let now = top.get();
                         if now != last {
                             last = now;
-                            session::save(&session::Session { key: key.clone(), top: now }, &path);
+                            session::save(
+                                &session::Session {
+                                    key: key.clone(),
+                                    top: now,
+                                },
+                                &path,
+                            );
                         }
                     }
                 })

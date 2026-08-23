@@ -69,11 +69,11 @@ pub struct Edit {
 }
 
 impl Edit {
-    pub fn old(&self) -> std::ops::Range<usize> {
+    pub fn old_range(&self) -> std::ops::Range<usize> {
         self.old_start as usize..self.old_end as usize
     }
 
-    pub fn new(&self) -> std::ops::Range<usize> {
+    pub fn new_range(&self) -> std::ops::Range<usize> {
         self.new_start as usize..self.new_end as usize
     }
 
@@ -197,7 +197,9 @@ impl Differ for Histogram {
     }
 
     fn diff(&self, _path: &str, old: &[Arc<str>], new: &[Arc<str>]) -> Vec<Edit> {
-        self.scratch.borrow_mut().diffed(old, new, Some(MAX_ANCHOR_OCCURRENCES))
+        self.scratch
+            .borrow_mut()
+            .diffed(old, new, Some(MAX_ANCHOR_OCCURRENCES))
     }
 }
 
@@ -235,7 +237,12 @@ struct Region {
 
 impl Region {
     fn whole(a: &[u32], b: &[u32]) -> Self {
-        Self { a0: 0, a1: a.len(), b0: 0, b1: b.len() }
+        Self {
+            a0: 0,
+            a1: a.len(),
+            b0: 0,
+            b1: b.len(),
+        }
     }
 
     fn is_empty(&self) -> bool {
@@ -383,8 +390,18 @@ impl Ctx {
             }
             match self.split(a, b, r) {
                 Some((x, y)) => {
-                    stack.push(Region { a0: x, a1: r.a1, b0: y, b1: r.b1 });
-                    stack.push(Region { a0: r.a0, a1: x, b0: r.b0, b1: y });
+                    stack.push(Region {
+                        a0: x,
+                        a1: r.a1,
+                        b0: y,
+                        b1: r.b1,
+                    });
+                    stack.push(Region {
+                        a0: r.a0,
+                        a1: x,
+                        b0: r.b0,
+                        b1: y,
+                    });
                 }
                 // Out of budget, or a split that would have recursed on the
                 // region it was given. Either way: this region was replaced.
@@ -408,7 +425,7 @@ impl Ctx {
         let (a, b) = (&a[r.a0..r.a1], &b[r.b0..r.b1]);
         let (n, m) = (a.len(), b.len());
         let delta = n as isize - m as isize;
-        let dmax = ((n + m + 1) / 2 + 1) as isize;
+        let dmax = ((n + m).div_ceil(2) + 1) as isize;
 
         // Only `1` needs seeding: at every depth the recurrence reads diagonals
         // one *closer* to the centre than the ones it writes, never further, so
@@ -422,8 +439,7 @@ impl Ctx {
                 if !self.spend(1) {
                     return None;
                 }
-                let mut x = if k == -d || (k != d && self.fwd.get(k - 1) < self.fwd.get(k + 1))
-                {
+                let mut x = if k == -d || (k != d && self.fwd.get(k - 1) < self.fwd.get(k + 1)) {
                     self.fwd.get(k + 1)
                 } else {
                     self.fwd.get(k - 1) + 1
@@ -437,10 +453,12 @@ impl Ctx {
                 // The backward frontier is one depth behind, so only the
                 // diagonals it has actually reached may be consulted. An odd
                 // delta is when the two frontiers can meet on a forward step.
-                if delta % 2 != 0 && d >= 1 && (delta - k).abs() <= d - 1 {
-                    if x + self.bwd.get(delta - k) >= n {
-                        return inside(r, x, y, n, m);
-                    }
+                if delta % 2 != 0
+                    && d >= 1
+                    && (delta - k).abs() < d
+                    && x + self.bwd.get(delta - k) >= n
+                {
+                    return inside(r, x, y, n, m);
                 }
                 k -= 2;
             }
@@ -452,8 +470,7 @@ impl Ctx {
                 }
                 // The same recurrence in the frame where both files are
                 // reversed, so `x` here is a distance from the end.
-                let mut x = if k == -d || (k != d && self.bwd.get(k - 1) < self.bwd.get(k + 1))
-                {
+                let mut x = if k == -d || (k != d && self.bwd.get(k - 1) < self.bwd.get(k + 1)) {
                     self.bwd.get(k + 1)
                 } else {
                     self.bwd.get(k - 1) + 1
@@ -464,10 +481,8 @@ impl Ctx {
                     y += 1;
                 }
                 self.bwd.set(k, x);
-                if delta % 2 == 0 && (delta - k).abs() <= d {
-                    if self.fwd.get(delta - k) + x >= n {
-                        return inside(r, n - x, m - y, n, m);
-                    }
+                if delta % 2 == 0 && (delta - k).abs() <= d && self.fwd.get(delta - k) + x >= n {
+                    return inside(r, n - x, m - y, n, m);
                 }
                 k -= 2;
             }
@@ -499,8 +514,18 @@ impl Ctx {
                 // algorithm that does not guess.
                 Anchor::TooCommon => self.myers(a, b, r, out),
                 Anchor::At { a_at, b_at, len } => {
-                    stack.push(Region { a0: a_at + len, a1: r.a1, b0: b_at + len, b1: r.b1 });
-                    stack.push(Region { a0: r.a0, a1: a_at, b0: r.b0, b1: b_at });
+                    stack.push(Region {
+                        a0: a_at + len,
+                        a1: r.a1,
+                        b0: b_at + len,
+                        b1: r.b1,
+                    });
+                    stack.push(Region {
+                        a0: r.a0,
+                        a1: a_at,
+                        b0: r.b0,
+                        b1: b_at,
+                    });
                 }
             }
         }
@@ -624,7 +649,11 @@ enum Anchor {
     /// Lines in common, none of them rare enough to anchor on.
     TooCommon,
     /// `len` matching lines starting at `a_at` and `b_at`.
-    At { a_at: usize, b_at: usize, len: usize },
+    At {
+        a_at: usize,
+        b_at: usize,
+        len: usize,
+    },
 }
 
 /// A split point, unless it is a corner of the region it came from.
@@ -649,7 +678,7 @@ impl V {
     /// to — which is fine: only diagonals this call seeds are ever read.
     fn grow(&mut self, span: usize) {
         // Diagonals reach |k| = dmax, and the recurrence reads k+1 at the edge.
-        self.offset = ((span + 1) / 2 + 3) as isize;
+        self.offset = (span.div_ceil(2) + 3) as isize;
         let need = 2 * self.offset as usize + 1;
         if self.buf.len() < need {
             self.buf.resize(need, 0);
@@ -695,7 +724,9 @@ pub fn hunks(old: &[Arc<str>], new: &[Arc<str>], edits: &[Edit], context: usize)
         // The same number of lines off both sides, so the two cursors stay
         // aligned. Taking `context` from each independently drifts them apart at
         // the top of a file.
-        let lead = context.min(first.old_start as usize).min(first.new_start as usize);
+        let lead = context
+            .min(first.old_start as usize)
+            .min(first.new_start as usize);
         let trail = context
             .min(old.len() - last.old_end as usize)
             .min(new.len() - last.new_end as usize);
@@ -713,10 +744,10 @@ pub fn hunks(old: &[Arc<str>], new: &[Arc<str>], edits: &[Edit], context: usize)
                 o += 1;
                 n += 1;
             }
-            for k in e.old() {
+            for k in e.old_range() {
                 lines.push(line(LineKind::Removed, Some(k), None, &old[k]));
             }
-            for k in e.new() {
+            for k in e.new_range() {
                 lines.push(line(LineKind::Added, None, Some(k), &new[k]));
             }
             o = e.old_end as usize;
@@ -729,7 +760,14 @@ pub fn hunks(old: &[Arc<str>], new: &[Arc<str>], edits: &[Edit], context: usize)
         }
 
         out.push(Hunk {
-            header: header(o_start, o_end - o_start, n_start, n_end - n_start, old, o_start),
+            header: header(
+                o_start,
+                o_end - o_start,
+                n_start,
+                n_end - n_start,
+                old,
+                o_start,
+            ),
             lines,
         });
         i = j + 1;
@@ -775,7 +813,11 @@ fn header(
         1 => format!("{}", start + 1),
         _ => format!("{},{count}", start + 1),
     };
-    let mut h = format!("@@ -{} +{} @@", range(o_start, o_count), range(n_start, n_count));
+    let mut h = format!(
+        "@@ -{} +{} @@",
+        range(o_start, o_count),
+        range(n_start, n_count)
+    );
     if let Some(name) = enclosing(old, from) {
         h.push(' ');
         h.push_str(name);
@@ -800,10 +842,13 @@ const FUNCNAME_LOOKBACK: usize = 400;
 /// plenty of languages and right often enough to be worth the four lines — and
 /// a language that cares can ship a `Differ` that writes its own headers.
 fn enclosing(old: &[Arc<str>], from: usize) -> Option<&str> {
-    old[from.saturating_sub(FUNCNAME_LOOKBACK)..from].iter().rev().find_map(|l| {
-        let c = *l.as_bytes().first()?;
-        (c.is_ascii_alphabetic() || c == b'_' || c == b'$').then(|| l.trim_end())
-    })
+    old[from.saturating_sub(FUNCNAME_LOOKBACK)..from]
+        .iter()
+        .rev()
+        .find_map(|l| {
+            let c = *l.as_bytes().first()?;
+            (c.is_ascii_alphabetic() || c == b'_' || c == b'$').then(|| l.trim_end())
+        })
 }
 
 // ------------------------------------------------------------- how lines match
@@ -835,8 +880,12 @@ pub enum Whitespace {
 }
 
 impl Whitespace {
-    pub const ALL: [Whitespace; 4] =
-        [Whitespace::Exact, Whitespace::Trailing, Whitespace::Change, Whitespace::All];
+    pub const ALL: [Whitespace; 4] = [
+        Whitespace::Exact,
+        Whitespace::Trailing,
+        Whitespace::Change,
+        Whitespace::All,
+    ];
 
     /// The name a config file and a picker use.
     pub fn name(self) -> &'static str {
@@ -976,7 +1025,10 @@ pub struct Overrides {
 
 impl Overrides {
     pub fn algorithm(name: impl Into<String>) -> Self {
-        Self { algorithm: Some(name.into()), ..Default::default() }
+        Self {
+            algorithm: Some(name.into()),
+            ..Default::default()
+        }
     }
 }
 
@@ -1014,11 +1066,11 @@ impl Moves {
         self.old.iter().filter(|b| **b).count() + self.new.iter().filter(|b| **b).count()
     }
 
-    pub fn old(&self, line: usize) -> bool {
+    pub fn in_old(&self, line: usize) -> bool {
         self.old.get(line).copied().unwrap_or(false)
     }
 
-    pub fn new(&self, line: usize) -> bool {
+    pub fn in_new(&self, line: usize) -> bool {
         self.new.get(line).copied().unwrap_or(false)
     }
 }
@@ -1042,8 +1094,8 @@ pub fn moves(old: &[Arc<str>], new: &[Arc<str>], edits: &[Edit], min: usize) -> 
     let mut removed = vec![false; old.len()];
     let mut added = vec![false; new.len()];
     for e in edits {
-        removed[e.old()].fill(true);
-        added[e.new()].fill(true);
+        removed[e.old_range()].fill(true);
+        added[e.new_range()].fill(true);
     }
 
     // Where each added line's text can be found. Built over the added lines
@@ -1055,7 +1107,10 @@ pub fn moves(old: &[Arc<str>], new: &[Arc<str>], edits: &[Edit], min: usize) -> 
         }
     }
 
-    let mut out = Moves { old: vec![false; old.len()], new: vec![false; new.len()] };
+    let mut out = Moves {
+        old: vec![false; old.len()],
+        new: vec![false; new.len()],
+    };
     let mut taken = vec![false; new.len()];
     let mut i = 0;
     while i < old.len() {
@@ -1103,8 +1158,8 @@ pub fn moves(old: &[Arc<str>], new: &[Arc<str>], edits: &[Edit], min: usize) -> 
 pub fn mark_moved(hunks: &mut [Hunk], m: &Moves) {
     for line in hunks.iter_mut().flat_map(|h| &mut h.lines) {
         line.moved = match line.kind {
-            LineKind::Removed => line.old_no.is_some_and(|n| m.old(n as usize - 1)),
-            LineKind::Added => line.new_no.is_some_and(|n| m.new(n as usize - 1)),
+            LineKind::Removed => line.old_no.is_some_and(|n| m.in_old(n as usize - 1)),
+            LineKind::Added => line.new_no.is_some_and(|n| m.in_new(n as usize - 1)),
             LineKind::Context => false,
         };
     }
@@ -1151,7 +1206,11 @@ pub fn compact_with<K: PartialEq>(
     for i in 0..edits.len() {
         // The window this group may slide within: not past its neighbours, and
         // not off either end of the file.
-        let lo = if i == 0 { 0 } else { edits[i - 1].old_end as usize };
+        let lo = if i == 0 {
+            0
+        } else {
+            edits[i - 1].old_end as usize
+        };
         let hi = match edits.get(i + 1) {
             Some(next) => next.old_start as usize,
             None => old.len(),
@@ -1175,7 +1234,7 @@ fn slide<K: PartialEq>(
     // sides moving, and git slides those in each file independently through
     // machinery this does not have; its boundaries are pinned on both sides
     // anyway, so the case is rare.
-    let (lines, keys, start, end) = match (e.old().len(), e.new().len()) {
+    let (lines, keys, start, end) = match (e.old_range().len(), e.new_range().len()) {
         (0, 0) => return,
         (0, _) => (new, new_keys, e.new_start as usize, e.new_end as usize),
         (_, 0) => (old, old_keys, e.old_start as usize, e.old_end as usize),
@@ -1199,7 +1258,7 @@ fn slide<K: PartialEq>(
     }
     // Never over a neighbouring change: two edits that overlap describe nothing,
     // and `verify` is the only thing that would notice.
-    if e.new().is_empty() {
+    if e.new_range().is_empty() {
         lowest = lowest.max(lo);
         highest = highest.min(hi.saturating_sub(len));
     }
@@ -1319,7 +1378,14 @@ fn measure(lines: &[Arc<str>], split: usize) -> Measure {
         j += 1;
     }
 
-    Measure { end_of_file, indent, pre_blank, pre_indent, post_blank, post_indent }
+    Measure {
+        end_of_file,
+        indent,
+        pre_blank,
+        pre_indent,
+        post_blank,
+        post_indent,
+    }
 }
 
 /// A position's badness, in the two parts git keeps separate.
@@ -1367,22 +1433,33 @@ fn add_split(m: &Measure, s: &mut Score) {
     // favourably on indent and unfavourably on penalty.
     s.effective_indent += indent.unwrap_or(-1);
 
-    let (Some(indent), Some(pre)) = (indent, m.pre_indent) else { return };
+    let (Some(indent), Some(pre)) = (indent, m.pre_indent) else {
+        return;
+    };
     if indent > pre {
         // More indented than what came before: likely inside a block.
-        s.penalty +=
-            if any_blanks { RELATIVE_INDENT_WITH_BLANK_PENALTY } else { RELATIVE_INDENT_PENALTY };
+        s.penalty += if any_blanks {
+            RELATIVE_INDENT_WITH_BLANK_PENALTY
+        } else {
+            RELATIVE_INDENT_PENALTY
+        };
     } else if indent == pre {
         // Same level. Nothing to say.
     } else if m.post_indent.is_some_and(|post| post > indent) {
         // Less indented, and what follows is more: this line opens a block —
         // an `else`, or a signature. A good place to break, relatively.
-        s.penalty +=
-            if any_blanks { RELATIVE_OUTDENT_WITH_BLANK_PENALTY } else { RELATIVE_OUTDENT_PENALTY };
+        s.penalty += if any_blanks {
+            RELATIVE_OUTDENT_WITH_BLANK_PENALTY
+        } else {
+            RELATIVE_OUTDENT_PENALTY
+        };
     } else {
         // Less indented and nothing opens after it: the end of a block.
-        s.penalty +=
-            if any_blanks { RELATIVE_DEDENT_WITH_BLANK_PENALTY } else { RELATIVE_DEDENT_PENALTY };
+        s.penalty += if any_blanks {
+            RELATIVE_DEDENT_WITH_BLANK_PENALTY
+        } else {
+            RELATIVE_DEDENT_PENALTY
+        };
     }
 }
 
@@ -1478,7 +1555,8 @@ impl Differs {
     pub fn route(&mut self, keys: &[&str], name: &str) -> bool {
         match self.position(name) {
             Some(i) => {
-                self.routes.push((keys.iter().map(|k| k.to_ascii_lowercase()).collect(), i));
+                self.routes
+                    .push((keys.iter().map(|k| k.to_ascii_lowercase()).collect(), i));
                 true
             }
             None => false,
@@ -1510,7 +1588,11 @@ impl Differs {
     }
 
     pub fn for_path(&self, path: &str) -> &dyn Differ {
-        let name = path.rsplit(['/', '\\']).next().unwrap_or(path).to_ascii_lowercase();
+        let name = path
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(path)
+            .to_ascii_lowercase();
         let ext = name.rsplit_once('.').map(|(_, e)| e.to_string());
         for (keys, i) in self.routes.iter().rev() {
             if keys.iter().any(|k| *k == name || Some(k) == ext.as_ref()) {
@@ -1606,7 +1688,10 @@ impl Differs {
         if !m.is_empty() {
             mark_moved(&mut hunks, &m);
         }
-        FileDiff { path: path.to_string(), hunks }
+        FileDiff {
+            path: path.to_string(),
+            hunks,
+        }
     }
 }
 
@@ -1620,7 +1705,10 @@ mod tests {
         if s.is_empty() {
             return Vec::new();
         }
-        s.trim_end_matches('\n').split('\n').map(Arc::from).collect()
+        s.trim_end_matches('\n')
+            .split('\n')
+            .map(Arc::from)
+            .collect()
     }
 
     /// Every property the rest of the pipeline relies on, for any differ.
@@ -1632,8 +1720,14 @@ mod tests {
             assert!(!e.is_empty(), "edit {i} is empty: {e:?}");
             assert!(e.old_start as usize >= o, "edit {i} out of order: {e:?}");
             assert!(e.new_start as usize >= n, "edit {i} out of order: {e:?}");
-            assert!(e.old_start <= e.old_end && e.new_start <= e.new_end, "{e:?}");
-            assert!(e.old_end as usize <= old.len() && e.new_end as usize <= new.len(), "{e:?}");
+            assert!(
+                e.old_start <= e.old_end && e.new_start <= e.new_end,
+                "{e:?}"
+            );
+            assert!(
+                e.old_end as usize <= old.len() && e.new_end as usize <= new.len(),
+                "{e:?}"
+            );
             if i > 0 {
                 let p = edits[i - 1];
                 assert!(
@@ -1649,12 +1743,15 @@ mod tests {
                 "edit {i} shifts without an edit: {e:?}"
             );
             rebuilt.extend_from_slice(&old[o..e.old_start as usize]);
-            rebuilt.extend_from_slice(&new[e.new()]);
+            rebuilt.extend_from_slice(&new[e.new_range()]);
             o = e.old_end as usize;
             n = e.new_end as usize;
         }
         rebuilt.extend_from_slice(&old[o..]);
-        assert_eq!(rebuilt, new, "applying the script did not produce the new file");
+        assert_eq!(
+            rebuilt, new,
+            "applying the script did not produce the new file"
+        );
     }
 
     /// Length of the longest common subsequence, by the textbook table. The
@@ -1663,15 +1760,21 @@ mod tests {
         let mut t = vec![vec![0usize; b.len() + 1]; a.len() + 1];
         for i in (0..a.len()).rev() {
             for j in (0..b.len()).rev() {
-                t[i][j] =
-                    if a[i] == b[j] { t[i + 1][j + 1] + 1 } else { t[i + 1][j].max(t[i][j + 1]) };
+                t[i][j] = if a[i] == b[j] {
+                    t[i + 1][j + 1] + 1
+                } else {
+                    t[i + 1][j].max(t[i][j + 1])
+                };
             }
         }
         t[0][0]
     }
 
     fn changed(edits: &[Edit]) -> usize {
-        edits.iter().map(|e| e.old().len() + e.new().len()).sum()
+        edits
+            .iter()
+            .map(|e| e.old_range().len() + e.new_range().len())
+            .sum()
     }
 
     /// The three shipped algorithms, freshly constructed — each carries its own
@@ -1709,10 +1812,26 @@ mod tests {
         for d in all() {
             let add = d.diff("x", &[], &f);
             verify(&[], &f, &add);
-            assert_eq!(add, vec![Edit { old_start: 0, old_end: 0, new_start: 0, new_end: 3 }]);
+            assert_eq!(
+                add,
+                vec![Edit {
+                    old_start: 0,
+                    old_end: 0,
+                    new_start: 0,
+                    new_end: 3
+                }]
+            );
             let del = d.diff("x", &f, &[]);
             verify(&f, &[], &del);
-            assert_eq!(del, vec![Edit { old_start: 0, old_end: 3, new_start: 0, new_end: 0 }]);
+            assert_eq!(
+                del,
+                vec![Edit {
+                    old_start: 0,
+                    old_end: 3,
+                    new_start: 0,
+                    new_end: 0
+                }]
+            );
             // And two empty files are not a change.
             assert!(d.diff("x", &[], &[]).is_empty());
         }
@@ -1744,14 +1863,20 @@ mod tests {
         for case in 0..400 {
             let (n, m) = (rand(24) as usize, rand(24) as usize);
             let letters = 2 + rand(6) as usize;
-            let old: Vec<Arc<str>> =
-                (0..n).map(|_| Arc::from(alphabet[rand(letters as u64) as usize])).collect();
-            let new: Vec<Arc<str>> =
-                (0..m).map(|_| Arc::from(alphabet[rand(letters as u64) as usize])).collect();
+            let old: Vec<Arc<str>> = (0..n)
+                .map(|_| Arc::from(alphabet[rand(letters as u64) as usize]))
+                .collect();
+            let new: Vec<Arc<str>> = (0..m)
+                .map(|_| Arc::from(alphabet[rand(letters as u64) as usize]))
+                .collect();
             let edits = Myers::default().diff("x", &old, &new);
             verify(&old, &new, &edits);
             let ideal = old.len() + new.len() - 2 * lcs(&old, &new);
-            assert_eq!(changed(&edits), ideal, "case {case}: {old:?} -> {new:?} gave {edits:?}");
+            assert_eq!(
+                changed(&edits),
+                ideal,
+                "case {case}: {old:?} -> {new:?} gave {edits:?}"
+            );
         }
     }
 
@@ -1770,10 +1895,12 @@ mod tests {
         for case in 0..400 {
             let (n, m) = (rand(30) as usize, rand(30) as usize);
             let letters = 1 + rand(7) as usize;
-            let old: Vec<Arc<str>> =
-                (0..n).map(|_| Arc::from(alphabet[rand(letters as u64) as usize])).collect();
-            let new: Vec<Arc<str>> =
-                (0..m).map(|_| Arc::from(alphabet[rand(letters as u64) as usize])).collect();
+            let old: Vec<Arc<str>> = (0..n)
+                .map(|_| Arc::from(alphabet[rand(letters as u64) as usize]))
+                .collect();
+            let new: Vec<Arc<str>> = (0..m)
+                .map(|_| Arc::from(alphabet[rand(letters as u64) as usize]))
+                .collect();
             for d in all() {
                 let edits = d.diff("x", &old, &new);
                 verify(&old, &new, &edits);
@@ -1797,7 +1924,8 @@ mod tests {
         verify(&old, &new, &h);
         assert_eq!(h.len(), 2, "expected a move, got {h:?}");
         assert!(
-            h.iter().all(|e| e.old().is_empty() || e.new().is_empty()),
+            h.iter()
+                .all(|e| e.old_range().is_empty() || e.new_range().is_empty()),
             "a move is a delete and an insert, not a replace: {h:?}"
         );
     }
@@ -1811,7 +1939,11 @@ mod tests {
         let new = lines("b\na\nb\na\n");
         let p = Patience::default().diff("x", &old, &new);
         verify(&old, &new, &p);
-        assert_eq!(p, Myers::default().diff("x", &old, &new), "the fallback is not myers");
+        assert_eq!(
+            p,
+            Myers::default().diff("x", &old, &new),
+            "the fallback is not myers"
+        );
         let h = Histogram::default().diff("x", &old, &new);
         verify(&old, &new, &h);
     }
@@ -1826,20 +1958,31 @@ mod tests {
         let new: Vec<Arc<str>> = (0..400).map(|i| Arc::from(format!("new {i}"))).collect();
         let (a, b) = intern(&old, &new);
 
-        let mut ctx = Ctx { steps: 50, ..Default::default() };
+        let mut ctx = Ctx {
+            steps: 50,
+            ..Default::default()
+        };
         let mut out = Vec::new();
         ctx.myers(&a, &b, Region::whole(&a, &b), &mut out);
         verify(&old, &new, &out);
         assert_eq!(
             out,
-            vec![Edit { old_start: 0, old_end: 400, new_start: 0, new_end: 400 }],
+            vec![Edit {
+                old_start: 0,
+                old_end: 400,
+                new_start: 0,
+                new_end: 400
+            }],
             "an exhausted myers must say the region was replaced"
         );
 
         // The anchored ones charge their index build to the same budget, and a
         // region they cannot afford to index goes to myers, which cannot afford
         // it either — so the same replace comes out.
-        let mut ctx = Ctx { steps: 50, ..Default::default() };
+        let mut ctx = Ctx {
+            steps: 50,
+            ..Default::default()
+        };
         let mut out = Vec::new();
         ctx.anchored(&a, &b, MAX_ANCHOR_OCCURRENCES, &mut out);
         verify(&old, &new, &out);
@@ -1852,10 +1995,12 @@ mod tests {
         // line between every pair of identical ones, so every anchor is one line
         // long and the region to the right of it is almost the whole file. As a
         // call stack that is a crash; as a work stack it is a loop.
-        let old: Vec<Arc<str>> =
-            (0..2000).flat_map(|i| [Arc::from(format!("anchor {i}")), Arc::from("x")]).collect();
-        let new: Vec<Arc<str>> =
-            (0..2000).flat_map(|i| [Arc::from(format!("anchor {i}")), Arc::from("y")]).collect();
+        let old: Vec<Arc<str>> = (0..2000)
+            .flat_map(|i| [Arc::from(format!("anchor {i}")), Arc::from("x")])
+            .collect();
+        let new: Vec<Arc<str>> = (0..2000)
+            .flat_map(|i| [Arc::from(format!("anchor {i}")), Arc::from("y")])
+            .collect();
         for d in all() {
             let edits = d.diff("generated.rs", &old, &new);
             verify(&old, &new, &edits);
@@ -1871,7 +2016,12 @@ mod tests {
             verify(&old, &new, &edits);
             assert_eq!(
                 edits,
-                vec![Edit { old_start: 0, old_end: 2, new_start: 0, new_end: 2 }],
+                vec![Edit {
+                    old_start: 0,
+                    old_end: 2,
+                    new_start: 0,
+                    new_end: 2
+                }],
                 "{}",
                 d.name()
             );
@@ -1883,8 +2033,12 @@ mod tests {
         // The shape that makes recursion depth equal to file length: every
         // anchor peels one line. 40k lines of it, which as a call stack is a
         // crash rather than a slow load.
-        let old: Vec<Arc<str>> = (0..40_000).map(|i| Arc::from(format!("line {}", i % 3))).collect();
-        let new: Vec<Arc<str>> = (0..40_000).map(|i| Arc::from(format!("line {}", i % 4))).collect();
+        let old: Vec<Arc<str>> = (0..40_000)
+            .map(|i| Arc::from(format!("line {}", i % 3)))
+            .collect();
+        let new: Vec<Arc<str>> = (0..40_000)
+            .map(|i| Arc::from(format!("line {}", i % 4)))
+            .collect();
         for d in all() {
             let edits = d.diff("x", &old, &new);
             verify(&old, &new, &edits);
@@ -1915,9 +2069,15 @@ mod tests {
         assert_eq!(hs[0].header, "@@ -2,7 +2,7 @@");
         let kinds: Vec<LineKind> = hs[0].lines.iter().map(|l| l.kind).collect();
         use LineKind::*;
-        assert_eq!(kinds, vec![Context, Context, Context, Removed, Added, Context, Context, Context]);
+        assert_eq!(
+            kinds,
+            vec![Context, Context, Context, Removed, Added, Context, Context, Context]
+        );
         // Numbers are 1-based and both sides advance over context.
-        assert_eq!((hs[0].lines[0].old_no, hs[0].lines[0].new_no), (Some(2), Some(2)));
+        assert_eq!(
+            (hs[0].lines[0].old_no, hs[0].lines[0].new_no),
+            (Some(2), Some(2))
+        );
         let removed = hs[0].lines.iter().find(|l| l.kind == Removed).unwrap();
         assert_eq!((removed.old_no, removed.new_no), (Some(5), None));
         let added = hs[0].lines.iter().find(|l| l.kind == Added).unwrap();
@@ -1932,9 +2092,21 @@ mod tests {
         new[10] = "eleven".into(); // 5 lines away: context overlaps
         new[30] = "thirtyone".into(); // far away
         let hs = hunks(&old, &new, &Histogram::default().diff("x", &old, &new), 3);
-        assert_eq!(hs.len(), 2, "{:?}", hs.iter().map(|h| &h.header).collect::<Vec<_>>());
+        assert_eq!(
+            hs.len(),
+            2,
+            "{:?}",
+            hs.iter().map(|h| &h.header).collect::<Vec<_>>()
+        );
         // No line is printed twice: the merged hunk covers 3..14, the other 28..34.
-        assert!(hs[0].lines.iter().filter(|l| l.kind == LineKind::Removed).count() == 2);
+        assert!(
+            hs[0]
+                .lines
+                .iter()
+                .filter(|l| l.kind == LineKind::Removed)
+                .count()
+                == 2
+        );
     }
 
     #[test]
@@ -1944,7 +2116,10 @@ mod tests {
         let hs = hunks(&old, &new, &Histogram::default().diff("x", &old, &new), 0);
         assert_eq!(hs.len(), 1);
         assert_eq!(hs[0].lines.len(), 2);
-        assert_eq!(hs[0].header, "@@ -2 +2 @@ a", "a count of one is written without it");
+        assert_eq!(
+            hs[0].header, "@@ -2 +2 @@ a",
+            "a count of one is written without it"
+        );
     }
 
     #[test]
@@ -1964,7 +2139,12 @@ mod tests {
     fn the_header_names_the_enclosing_declaration() {
         let old = lines("fn dispatch() {\n    a();\n    b();\n    c();\n}\n");
         let new = lines("fn dispatch() {\n    a();\n    B();\n    c();\n}\n");
-        let hs = hunks(&old, &new, &Histogram::default().diff("x.rs", &old, &new), 1);
+        let hs = hunks(
+            &old,
+            &new,
+            &Histogram::default().diff("x.rs", &old, &new),
+            1,
+        );
         assert_eq!(hs[0].header, "@@ -2,3 +2,3 @@ fn dispatch() {");
     }
 
@@ -1972,17 +2152,31 @@ mod tests {
     fn the_header_search_gives_up_rather_than_scanning_a_whole_file() {
         // A formatted blob: every line indented, so there is no declaration to
         // find and the search would otherwise walk to line 0 for every hunk.
-        let mut old: Vec<Arc<str>> = (0..2000).map(|i| Arc::from(format!("    \"k{i}\": {i},"))).collect();
+        let mut old: Vec<Arc<str>> = (0..2000)
+            .map(|i| Arc::from(format!("    \"k{i}\": {i},")))
+            .collect();
         old[0] = "root = {".into();
         let mut new = old.clone();
         new[1500] = "    \"k1500\": 99,".into();
-        let hs = hunks(&old, &new, &Histogram::default().diff("x.json", &old, &new), 3);
+        let hs = hunks(
+            &old,
+            &new,
+            &Histogram::default().diff("x.json", &old, &new),
+            3,
+        );
         assert_eq!(hs.len(), 1);
-        assert_eq!(hs[0].header, "@@ -1498,7 +1498,7 @@", "no declaration within reach");
+        assert_eq!(
+            hs[0].header, "@@ -1498,7 +1498,7 @@",
+            "no declaration within reach"
+        );
 
         // Within reach, it is still found.
-        let hs =
-            hunks(&old[1200..], &new[1200..], &Myers::default().diff("x", &old[1200..], &new[1200..]), 0);
+        let hs = hunks(
+            &old[1200..],
+            &new[1200..],
+            &Myers::default().diff("x", &old[1200..], &new[1200..]),
+            0,
+        );
         assert!(hs[0].header.ends_with("@@"), "{}", hs[0].header);
     }
 
@@ -2014,7 +2208,11 @@ mod tests {
         let new: Vec<Arc<str>> = (0..500)
             .filter(|i| i % 7 != 0)
             .map(|i| {
-                if i % 11 == 0 { Arc::from(format!("changed {i}")) } else { Arc::from(format!("line {i}")) }
+                if i % 11 == 0 {
+                    Arc::from(format!("changed {i}"))
+                } else {
+                    Arc::from(format!("line {i}"))
+                }
             })
             .collect();
         for d in all() {
@@ -2023,10 +2221,20 @@ mod tests {
             for h in hunks(&old, &new, &edits, 3) {
                 for l in &h.lines {
                     if let Some(no) = l.old_no {
-                        assert_eq!(&*old[no as usize - 1], &*l.text, "{} old line {no}", d.name());
+                        assert_eq!(
+                            &*old[no as usize - 1],
+                            &*l.text,
+                            "{} old line {no}",
+                            d.name()
+                        );
                     }
                     if let Some(no) = l.new_no {
-                        assert_eq!(&*new[no as usize - 1], &*l.text, "{} new line {no}", d.name());
+                        assert_eq!(
+                            &*new[no as usize - 1],
+                            &*l.text,
+                            "{} new line {no}",
+                            d.name()
+                        );
                     }
                     if l.kind == LineKind::Context {
                         assert!(l.old_no.is_some() && l.new_no.is_some());
@@ -2073,7 +2281,11 @@ mod tests {
         assert!(d.route(&["rs", "Cargo.lock"], "myers"));
         assert_eq!(d.for_path("a.rs").name(), "myers");
         assert_eq!(d.for_path("deep/path/cargo.lock").name(), "myers");
-        assert_eq!(d.for_path("a.go").name(), "reverse", "unrouted paths keep the fallback");
+        assert_eq!(
+            d.for_path("a.go").name(),
+            "reverse",
+            "unrouted paths keep the fallback"
+        );
         assert!(!d.route(&["go"], "nope"));
     }
 
@@ -2093,7 +2305,10 @@ mod tests {
         assert_eq!(d.names().len(), 3, "a replacement must not also append");
         assert!(d.select("myers"));
         let f = lines("a\nb\n");
-        assert!(d.for_path("x").diff("x", &f, &[]).is_empty(), "the built-in still ran");
+        assert!(
+            d.for_path("x").diff("x", &f, &[]).is_empty(),
+            "the built-in still ran"
+        );
         // ...and the one that was not replaced is untouched.
         assert!(d.select("histogram"));
         assert!(!d.for_path("x").diff("x", &f, &[]).is_empty());
@@ -2133,8 +2348,14 @@ mod tests {
 
         // An unregistered name is a click that cannot be honoured, so it falls
         // back rather than producing nothing.
-        assert_eq!(d.file_using(&Overrides::algorithm("nope"), "x.rs", &old, &new), routed);
-        assert_eq!(d.file_using(&Overrides::default(), "x.rs", &old, &new), routed);
+        assert_eq!(
+            d.file_using(&Overrides::algorithm("nope"), "x.rs", &old, &new),
+            routed
+        );
+        assert_eq!(
+            d.file_using(&Overrides::default(), "x.rs", &old, &new),
+            routed
+        );
     }
 
     #[test]
@@ -2168,7 +2389,10 @@ mod tests {
         // and a flush one still differ — that is git's rule and the easy one to
         // get wrong.
         assert_eq!(key(Whitespace::Change, "a\t \tb  "), "a b");
-        assert_eq!(key(Whitespace::Change, "  a b"), key(Whitespace::Change, "\ta\tb"));
+        assert_eq!(
+            key(Whitespace::Change, "  a b"),
+            key(Whitespace::Change, "\ta\tb")
+        );
         assert_ne!(key(Whitespace::Change, "a"), key(Whitespace::Change, " a"));
 
         // `-w`: all of it, anywhere.
@@ -2189,12 +2413,18 @@ mod tests {
         let new = lines("fn main() {\n    let x = 1;\n    f(x);\n}\n");
 
         let mut d = Differs::builtin();
-        assert!(!d.file("a.rs", &old, &new).hunks.is_empty(), "exact must see it");
+        assert!(
+            !d.file("a.rs", &old, &new).hunks.is_empty(),
+            "exact must see it"
+        );
 
         d.whitespace = Whitespace::All;
         assert!(d.file("a.rs", &old, &new).hunks.is_empty(), "-w must not");
         d.whitespace = Whitespace::Change;
-        assert!(d.file("a.rs", &old, &new).hunks.is_empty(), "-b must not either");
+        assert!(
+            d.file("a.rs", &old, &new).hunks.is_empty(),
+            "-b must not either"
+        );
         // ...and `--ignore-space-at-eol` must, because this is leading space.
         d.whitespace = Whitespace::Trailing;
         assert!(!d.file("a.rs", &old, &new).hunks.is_empty());
@@ -2277,10 +2507,16 @@ mod tests {
         let removed = lines_of(LineKind::Removed);
         let added = lines_of(LineKind::Added);
         assert!(!removed.is_empty(), "no removed line was called moved");
-        assert_eq!(removed, added, "the two halves of a move must be the same lines");
+        assert_eq!(
+            removed, added,
+            "the two halves of a move must be the same lines"
+        );
         assert!(removed.len() >= MIN_MOVED_LINES);
         assert!(
-            f.hunks.iter().flat_map(|h| &h.lines).all(|l| !l.moved || l.kind != LineKind::Context),
+            f.hunks
+                .iter()
+                .flat_map(|h| &h.lines)
+                .all(|l| !l.moved || l.kind != LineKind::Context),
             "a context line was called moved"
         );
     }
@@ -2293,7 +2529,10 @@ mod tests {
         let new = lines("b\n}\na\n");
         let d = Differs::builtin();
         let f = d.file("x.rs", &old, &new);
-        assert!(f.hunks.iter().flat_map(|h| &h.lines).all(|l| !l.moved), "{f:?}");
+        assert!(
+            f.hunks.iter().flat_map(|h| &h.lines).all(|l| !l.moved),
+            "{f:?}"
+        );
     }
 
     #[test]
@@ -2303,9 +2542,19 @@ mod tests {
         let old = lines("k1\nk2\nk3\nk4\nk5\nm1\nm2\nm3\n");
         let new = lines("m1\nm2\nm3\nk1\nk2\nk3\nk4\nk5\n");
         let mut d = Differs::builtin();
-        assert!(d.file("x", &old, &new).hunks.iter().flat_map(|h| &h.lines).any(|l| l.moved));
+        assert!(d
+            .file("x", &old, &new)
+            .hunks
+            .iter()
+            .flat_map(|h| &h.lines)
+            .any(|l| l.moved));
         d.min_moved = 0;
-        assert!(d.file("x", &old, &new).hunks.iter().flat_map(|h| &h.lines).all(|l| !l.moved));
+        assert!(d
+            .file("x", &old, &new)
+            .hunks
+            .iter()
+            .flat_map(|h| &h.lines)
+            .all(|l| !l.moved));
     }
 
     #[test]
@@ -2316,10 +2565,19 @@ mod tests {
         // mark six added ones, and the moved count exceeds what exists.
         let old = lines("one\ntwo\nthree\n");
         let new = lines("one\ntwo\nthree\none\ntwo\nthree\n");
-        let edits = vec![Edit { old_start: 0, old_end: 3, new_start: 0, new_end: 6 }];
+        let edits = vec![Edit {
+            old_start: 0,
+            old_end: 3,
+            new_start: 0,
+            new_end: 6,
+        }];
         let m = moves(&old, &new, &edits, 3);
         assert_eq!(m.old.iter().filter(|b| **b).count(), 3);
-        assert_eq!(m.new.iter().filter(|b| **b).count(), 3, "two landings were claimed");
+        assert_eq!(
+            m.new.iter().filter(|b| **b).count(),
+            3,
+            "two landings were claimed"
+        );
     }
 
     #[test]
@@ -2344,7 +2602,10 @@ mod tests {
         let new = lines("a\nb\nc\na\nb\nc\nCHANGED\n");
         let d = Differs::builtin();
         let f = d.file("x", &old, &new);
-        assert!(f.hunks.iter().flat_map(|h| &h.lines).all(|l| !l.moved), "{f:?}");
+        assert!(
+            f.hunks.iter().flat_map(|h| &h.lines).all(|l| !l.moved),
+            "{f:?}"
+        );
     }
 
     // ------------------------------------------------------ indent heuristic
@@ -2367,7 +2628,11 @@ mod tests {
         // Same amount of change either way — a slide is not a better diff, it is
         // the same diff in a more readable place.
         let count = |f: &FileDiff| {
-            f.hunks.iter().flat_map(|h| &h.lines).filter(|l| l.kind != LineKind::Context).count()
+            f.hunks
+                .iter()
+                .flat_map(|h| &h.lines)
+                .filter(|l| l.kind != LineKind::Context)
+                .count()
         };
         assert_eq!(count(&with), count(&without));
 
@@ -2403,7 +2668,16 @@ mod tests {
             seed ^= seed << 17;
             seed % n
         };
-        let pool = ["", "a", "    a", "        b", "}", "    }", "fn f() {", "  # c"];
+        let pool = [
+            "",
+            "a",
+            "    a",
+            "        b",
+            "}",
+            "    }",
+            "fn f() {",
+            "  # c",
+        ];
         for case in 0..300 {
             let (n, m) = (rand(20) as usize, rand(20) as usize);
             let old: Vec<Arc<str>> = (0..n).map(|_| Arc::from(pool[rand(8) as usize])).collect();
@@ -2423,14 +2697,23 @@ mod tests {
         // under `-w` a group may cross a line that differs from it only in
         // indentation, and comparing the real text says it may not. Two hunks in
         // cmux's history land in the wrong place without this.
-        let old: Vec<Arc<str>> = ["a();", "  x();", "b();"].iter().copied().map(Arc::from).collect();
-        let new: Vec<Arc<str>> =
-            ["a();", "x();", "  x();", "b();"].iter().copied().map(Arc::from).collect();
+        let old: Vec<Arc<str>> = ["a();", "  x();", "b();"]
+            .iter()
+            .copied()
+            .map(Arc::from)
+            .collect();
+        let new: Vec<Arc<str>> = ["a();", "x();", "  x();", "b();"]
+            .iter()
+            .copied()
+            .map(Arc::from)
+            .collect();
         let strip = |l: &Arc<str>| -> Arc<str> {
             Arc::from(l.chars().filter(|c| !c.is_whitespace()).collect::<String>())
         };
-        let (ok, nk): (Vec<Arc<str>>, Vec<Arc<str>>) =
-            (old.iter().map(strip).collect(), new.iter().map(strip).collect());
+        let (ok, nk): (Vec<Arc<str>>, Vec<Arc<str>>) = (
+            old.iter().map(strip).collect(),
+            new.iter().map(strip).collect(),
+        );
 
         let script = Histogram::default().diff("x.rs", &ok, &nk);
         let mut through_keys = script.clone();
@@ -2450,7 +2733,9 @@ mod tests {
         // Two changes with one line between them: sliding either onto the other
         // would produce overlapping edits, which is the one thing `verify`
         // catches and a reader never would.
-        let old: Vec<Arc<str>> = (0..40).map(|i| Arc::from(format!("    line {i}"))).collect();
+        let old: Vec<Arc<str>> = (0..40)
+            .map(|i| Arc::from(format!("    line {i}")))
+            .collect();
         let mut new = old.clone();
         new.insert(10, "    inserted a".into());
         new.insert(12, "    inserted b".into());

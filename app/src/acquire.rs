@@ -78,8 +78,7 @@ pub fn acquire(view: View, source: &Source, host: &Host) -> Result<Loaded, Strin
             // as this call.
             std::thread::scope(|s| {
                 let title = s.spawn(|| describe(path, arg));
-                let files =
-                    plait_git::diff(path, arg, &host.differ, &Overrides::default())?;
+                let files = plait_git::diff(path, arg, &host.differ, &Overrides::default())?;
                 if files.is_empty() {
                     let what = match arg.is_empty() {
                         true => "(working tree)",
@@ -89,15 +88,23 @@ pub fn acquire(view: View, source: &Source, host: &Host) -> Result<Loaded, Strin
                 }
                 // No algorithm in the label: a client has a control that says which
                 // one, and that stays true when you change it.
-                Ok(Loaded { label: joined(title), data: Data::Diff(files) })
+                Ok(Loaded {
+                    label: joined(title),
+                    data: Data::Diff(files),
+                })
             })
         }
         (View::Diff, Source::Fixtures) => {
             let files = plait_core::parse_unified_diff(&read_fixture(DIFF_FIXTURE));
             if files.is_empty() {
-                return Err(format!("{DIFF_FIXTURE} is missing or empty — ./fixtures/gen.sh 1000 1000"));
+                return Err(format!(
+                    "{DIFF_FIXTURE} is missing or empty — ./fixtures/gen.sh 1000 1000"
+                ));
             }
-            Ok(Loaded { label: "fixtures".into(), data: Data::Diff(files) })
+            Ok(Loaded {
+                label: "fixtures".into(),
+                data: Data::Diff(files),
+            })
         }
         (View::Commits, Source::Repo { path, arg }) => {
             // Beside, not behind: the same overlap the diff view has, because
@@ -108,15 +115,23 @@ pub fn acquire(view: View, source: &Source, host: &Host) -> Result<Loaded, Strin
                 if commits.is_empty() {
                     return Err(format!("no commits in {}", path.display()));
                 }
-                Ok(Loaded { label: joined(title), data: Data::Commits(commits) })
+                Ok(Loaded {
+                    label: joined(title),
+                    data: Data::Commits(commits),
+                })
             })
         }
         (View::Commits, Source::Fixtures) => {
             let commits = plait_core::parse_log(&read_fixture(LOG_FIXTURE));
             if commits.is_empty() {
-                return Err(format!("{LOG_FIXTURE} is missing or empty — ./fixtures/dump.sh ."));
+                return Err(format!(
+                    "{LOG_FIXTURE} is missing or empty — ./fixtures/dump.sh ."
+                ));
             }
-            Ok(Loaded { label: "fixtures".into(), data: Data::Commits(commits) })
+            Ok(Loaded {
+                label: "fixtures".into(),
+                data: Data::Commits(commits),
+            })
         }
     }
 }
@@ -127,11 +142,15 @@ pub fn acquire(view: View, source: &Source, host: &Host) -> Result<Loaded, Strin
 /// that `join` is a panic — resumed here, on the caller's thread, exactly as it
 /// came out of the inline call this used to be.
 fn joined(title: std::thread::ScopedJoinHandle<'_, String>) -> String {
-    title.join().unwrap_or_else(|p| std::panic::resume_unwind(p))
+    title
+        .join()
+        .unwrap_or_else(|p| std::panic::resume_unwind(p))
 }
 
 fn describe(repo: &Path, revspec: &str) -> String {
-    format!("{} {revspec}", plait_git::describe(repo)).trim().into()
+    format!("{} {revspec}", plait_git::describe(repo))
+        .trim()
+        .into()
 }
 
 #[cfg(test)]
@@ -140,7 +159,10 @@ mod tests {
     use std::path::PathBuf;
 
     fn here() -> Source {
-        Source::Repo { path: PathBuf::from("."), arg: "HEAD~1..HEAD".into() }
+        Source::Repo {
+            path: PathBuf::from("."),
+            arg: "HEAD~1..HEAD".into(),
+        }
     }
 
     #[test]
@@ -167,13 +189,19 @@ mod tests {
             Data::Diff(f) => f.iter().map(|f| f.hunks.len()).sum::<usize>(),
             _ => 0,
         };
-        assert!(hunks(&a) >= hunks(&b), "more context merges hunks; it did not reach the differ");
+        assert!(
+            hunks(&a) >= hunks(&b),
+            "more context merges hunks; it did not reach the differ"
+        );
     }
 
     #[test]
     fn a_path_that_is_not_a_repository_is_a_message_and_not_a_panic() {
         let host = Host::new();
-        let source = Source::Repo { path: PathBuf::from("/nonexistent"), arg: String::new() };
+        let source = Source::Repo {
+            path: PathBuf::from("/nonexistent"),
+            arg: String::new(),
+        };
         assert!(acquire(View::Commits, &source, &host).is_err());
         assert!(acquire(View::Diff, &source, &host).is_err());
     }
@@ -183,7 +211,10 @@ mod tests {
         let host = Host::new();
         // A revspec that resolves to nothing changed. The message has to name
         // it, or "no changes" is indistinguishable from a broken argument.
-        let source = Source::Repo { path: PathBuf::from("."), arg: "HEAD..HEAD".into() };
+        let source = Source::Repo {
+            path: PathBuf::from("."),
+            arg: "HEAD..HEAD".into(),
+        };
         let err = acquire(View::Diff, &source, &host).unwrap_err();
         assert!(err.contains("HEAD..HEAD"), "{err}");
     }
@@ -195,14 +226,20 @@ mod tests {
         let host = Host::new();
         if let Err(e) = acquire(View::Diff, &Source::Fixtures, &host) {
             assert!(e.contains("fixtures/"), "{e}");
-            assert!(e.contains("./fixtures/"), "the message did not say how: {e}");
+            assert!(
+                e.contains("./fixtures/"),
+                "the message did not say how: {e}"
+            );
         }
     }
 
     #[test]
     fn a_commit_limit_is_the_second_positional() {
         let host = Host::new();
-        let source = Source::Repo { path: PathBuf::from("."), arg: "3".into() };
+        let source = Source::Repo {
+            path: PathBuf::from("."),
+            arg: "3".into(),
+        };
         let loaded = acquire(View::Commits, &source, &host).unwrap();
         assert_eq!(loaded.data.len(), 3);
     }

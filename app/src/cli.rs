@@ -88,7 +88,10 @@ pub enum Request {
     /// `plait config` — print the current host as TOML. A complete, correct
     /// starting file rather than a page of documentation to copy out of.
     Config,
-    Open { view: View, source: Source },
+    Open {
+        view: View,
+        source: Source,
+    },
 }
 
 /// Reads the shared positional shape, after a client has taken its own flags.
@@ -116,9 +119,10 @@ pub fn parse(args: &[String], default: View) -> Request {
     };
     let source = match rest.first().map(String::as_str) {
         Some("--fixtures") => Source::Fixtures,
-        Some(path) => {
-            Source::Repo { path: PathBuf::from(path), arg: rest.get(1).cloned().unwrap_or_default() }
-        }
+        Some(path) => Source::Repo {
+            path: PathBuf::from(path),
+            arg: rest.get(1).cloned().unwrap_or_default(),
+        },
         None => Source::Repo {
             path: PathBuf::from("."),
             arg: rest.get(1).cloned().unwrap_or_default(),
@@ -196,18 +200,27 @@ mod tests {
     }
 
     fn repo(path: &str, arg: &str) -> Source {
-        Source::Repo { path: PathBuf::from(path), arg: arg.into() }
+        Source::Repo {
+            path: PathBuf::from(path),
+            arg: arg.into(),
+        }
     }
 
     #[test]
     fn the_shape_every_client_promises() {
         assert_eq!(
             parsed("diff . HEAD~2..HEAD"),
-            Request::Open { view: View::Diff, source: repo(".", "HEAD~2..HEAD") }
+            Request::Open {
+                view: View::Diff,
+                source: repo(".", "HEAD~2..HEAD")
+            }
         );
         assert_eq!(
             parsed("commits ~/src 500"),
-            Request::Open { view: View::Commits, source: repo("~/src", "500") }
+            Request::Open {
+                view: View::Commits,
+                source: repo("~/src", "500")
+            }
         );
     }
 
@@ -215,16 +228,25 @@ mod tests {
     fn everything_defaults_to_this_repository() {
         assert_eq!(
             parsed("diff"),
-            Request::Open { view: View::Diff, source: repo(".", "") }
+            Request::Open {
+                view: View::Diff,
+                source: repo(".", "")
+            }
         );
         assert_eq!(
             parsed(""),
-            Request::Open { view: View::Commits, source: repo(".", "") }
+            Request::Open {
+                view: View::Commits,
+                source: repo(".", "")
+            }
         );
         // A client whose reason to exist is one diff opens on one.
         assert_eq!(
             parse(&args(""), View::Diff),
-            Request::Open { view: View::Diff, source: repo(".", "") }
+            Request::Open {
+                view: View::Diff,
+                source: repo(".", "")
+            }
         );
     }
 
@@ -240,7 +262,10 @@ mod tests {
     fn fixtures_is_a_source_and_not_a_repository_called_fixtures() {
         assert_eq!(
             parsed("diff --fixtures"),
-            Request::Open { view: View::Diff, source: Source::Fixtures }
+            Request::Open {
+                view: View::Diff,
+                source: Source::Fixtures
+            }
         );
     }
 
@@ -260,18 +285,27 @@ mod tests {
     #[test]
     fn a_client_flag_can_appear_anywhere_on_the_line() {
         let mut a = args("diff --port 9000 . HEAD~1..HEAD");
-        assert_eq!(take_value(&mut a, "--port").unwrap().as_deref(), Some("9000"));
+        assert_eq!(
+            take_value(&mut a, "--port").unwrap().as_deref(),
+            Some("9000")
+        );
         assert!(!take_switch(&mut a, "--stats"));
         assert_eq!(
             parse(&a, View::Diff),
-            Request::Open { view: View::Diff, source: repo(".", "HEAD~1..HEAD") }
+            Request::Open {
+                view: View::Diff,
+                source: repo(".", "HEAD~1..HEAD")
+            }
         );
 
         let mut b = args("diff . --stats");
         assert!(take_switch(&mut b, "--stats"));
         assert_eq!(
             parse(&b, View::Diff),
-            Request::Open { view: View::Diff, source: repo(".", "") }
+            Request::Open {
+                view: View::Diff,
+                source: repo(".", "")
+            }
         );
     }
 
@@ -293,7 +327,11 @@ mod tests {
 
     #[test]
     fn the_usage_names_the_binary_it_was_asked_about() {
-        let text = usage("plait-tui", "plait in a terminal", "  --ascii   no box drawing");
+        let text = usage(
+            "plait-tui",
+            "plait in a terminal",
+            "  --ascii   no box drawing",
+        );
         assert!(text.starts_with("plait-tui — plait in a terminal"));
         assert!(text.contains("plait-tui config > plait.toml"));
         assert!(text.contains("--ascii"));

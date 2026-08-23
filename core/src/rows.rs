@@ -53,7 +53,11 @@ use std::time::Duration;
 /// and there is nothing a header does that a row cannot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Row {
-    File { path: String, adds: usize, dels: usize },
+    File {
+        path: String,
+        adds: usize,
+        dels: usize,
+    },
     Hunk(String),
     Line(Line),
 }
@@ -124,7 +128,11 @@ impl Flat {
             dels: f.dels,
             row: self.rows.len(),
         });
-        self.rows.push(Row::File { path: f.path, adds: f.adds, dels: f.dels });
+        self.rows.push(Row::File {
+            path: f.path,
+            adds: f.adds,
+            dels: f.dels,
+        });
         for h in f.hunks {
             self.rows.push(Row::Hunk(h.header));
             for l in h.lines {
@@ -239,7 +247,11 @@ impl Flat {
             if !out.is_empty() {
                 out.push_str(" · ");
             }
-            out.push_str(&format!("{} invalid breaks from {}", self.rejected(), self.wrap));
+            out.push_str(&format!(
+                "{} invalid breaks from {}",
+                self.rejected(),
+                self.wrap
+            ));
         }
         out
     }
@@ -374,7 +386,9 @@ impl Ordered {
     /// The first visual row of a logical one. Linear, so it is for a jump and
     /// not for a scroll: a frontend scrolling by rows already holds the index.
     pub fn visual(&self, owner: u16, index: u32) -> Option<usize> {
-        self.order.iter().position(|r| r.logical() == (owner, index))
+        self.order
+            .iter()
+            .position(|r| r.logical() == (owner, index))
     }
 }
 
@@ -385,11 +399,7 @@ impl Ordered {
 /// previous table is its own source of truth. That is the whole reason a reflow
 /// needs no second table remembering the unwrapped shape — 8 bytes a row, once,
 /// however many times the window is dragged.
-pub fn expand<P: Present>(
-    logical: &[RowRef],
-    owners: &[P],
-    anchor: Option<RowRef>,
-) -> Ordered {
+pub fn expand<P: Present>(logical: &[RowRef], owners: &[P], anchor: Option<RowRef>) -> Ordered {
     let mut order: Vec<RowRef> = Vec::with_capacity(logical.len());
     let (mut widest, mut widest_at) = (0usize, 0usize);
     let mut found = 0usize;
@@ -399,7 +409,9 @@ pub fn expand<P: Present>(
         while i < logical.len() && logical[i].logical() == r.logical() {
             i += 1;
         }
-        let Some(rows) = owners.get(r.owner as usize) else { continue };
+        let Some(rows) = owners.get(r.owner as usize) else {
+            continue;
+        };
         if anchor.map(RowRef::logical) == Some(r.logical()) {
             found = order.len();
         }
@@ -411,10 +423,18 @@ pub fn expand<P: Present>(
             if w > widest {
                 (widest, widest_at) = (w, order.len());
             }
-            order.push(RowRef { owner: r.owner, seg: seg as u16, index: r.index });
+            order.push(RowRef {
+                owner: r.owner,
+                seg: seg as u16,
+                index: r.index,
+            });
         }
     }
-    Ordered { order, widest: widest_at, anchor: found }
+    Ordered {
+        order,
+        widest: widest_at,
+        anchor: found,
+    }
 }
 
 /// What one pass of the pipeline produced, beside the rows themselves.
@@ -447,7 +467,11 @@ pub fn assemble<P: Present>(
     max_line_chars: usize,
     owners: &mut [P],
 ) -> Assembled {
-    let Prepared { files: prepared, intraline, syntax } = prepare(files, hl, max_line_chars);
+    let Prepared {
+        files: prepared,
+        intraline,
+        syntax,
+    } = prepare(files, hl, max_line_chars);
     let count = prepared.len();
     let mut logical: Vec<RowRef> = Vec::new();
 
@@ -470,11 +494,20 @@ pub fn assemble<P: Present>(
         let first = r.len();
         r.build(f);
         for index in first..r.len() {
-            logical.push(RowRef { owner: owner as u16, seg: 0, index: index as u32 });
+            logical.push(RowRef {
+                owner: owner as u16,
+                seg: 0,
+                index: index as u32,
+            });
         }
     }
 
-    Assembled { ordered: expand(&logical, owners, None), files: count, intraline, syntax }
+    Assembled {
+        ordered: expand(&logical, owners, None),
+        files: count,
+        intraline,
+        syntax,
+    }
 }
 
 #[cfg(test)]
@@ -603,7 +636,10 @@ diff --git a/b.md b/b.md
         let host = Host::new();
         let mut owners: Vec<Box<dyn Present>> = vec![
             Box::new(Text::default()),
-            Box::new(Text { only: Some(".md"), ..Default::default() }),
+            Box::new(Text {
+                only: Some(".md"),
+                ..Default::default()
+            }),
         ];
         let a = assemble(&parse_unified_diff(DIFF), &host.syntax, 2000, &mut owners);
         assert_eq!(owners[0].len(), 6, "the generalist kept a.rs");
@@ -678,7 +714,9 @@ diff --git a/b.md b/b.md
         // ...and the pieces of a wrapped line reassemble it, minus the
         // whitespace `Word` dropped.
         let text = owners[0].flat.get(8).unwrap().text().to_string();
-        let joined: String = (0..owners[0].rows(8)).map(|s| owners[0].flat.piece(8, s)).collect();
+        let joined: String = (0..owners[0].rows(8))
+            .map(|s| owners[0].flat.piece(8, s))
+            .collect();
         assert_eq!(joined.replace(' ', ""), text.replace(' ', ""));
     }
 
@@ -706,7 +744,10 @@ diff --git a/b.md b/b.md
         let re = expand(&a.ordered.order, &owners, Some(anchor));
         assert_eq!(re.order[re.anchor].logical(), anchor.logical());
         assert_eq!(re.order[re.anchor].seg, 0, "landed mid-line");
-        assert!(re.anchor > 8, "the rows above it wrapped and it did not move");
+        assert!(
+            re.anchor > 8,
+            "the rows above it wrapped and it did not move"
+        );
     }
 
     #[test]
@@ -717,7 +758,10 @@ diff --git a/b.md b/b.md
         owners[0].flat.reflow(8, &Off);
         let re = expand(&a.ordered.order, &owners, None);
         assert_eq!(re.len(), owners[0].len());
-        assert_eq!(owners[0].flat.piece(8, 0), owners[0].flat.get(8).unwrap().text());
+        assert_eq!(
+            owners[0].flat.piece(8, 0),
+            owners[0].flat.get(8).unwrap().text()
+        );
     }
 
     #[test]
@@ -757,7 +801,11 @@ diff --git a/b.md b/b.md
         }
         flat.reflow(8, &Bad);
         assert!(flat.rejected() > 0);
-        assert!(flat.report().contains("invalid breaks from bad"), "{}", flat.report());
+        assert!(
+            flat.report().contains("invalid breaks from bad"),
+            "{}",
+            flat.report()
+        );
     }
 
     #[test]

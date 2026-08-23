@@ -47,16 +47,16 @@ pub enum Slot {
 }
 
 impl Slot {
-    /// The line to draw in the left column, if any.
-    pub fn old(self) -> Option<u32> {
+    /// The line to draw in the old column, if any.
+    pub fn left(self) -> Option<u32> {
         match self {
             Slot::Context(i) | Slot::Replace(i, _) | Slot::Removed(i) => Some(i),
             Slot::Added(_) => None,
         }
     }
 
-    /// The line to draw in the right column, if any.
-    pub fn new(self) -> Option<u32> {
+    /// The line to draw in the new column, if any.
+    pub fn right(self) -> Option<u32> {
         match self {
             Slot::Context(i) | Slot::Replace(_, i) | Slot::Added(i) => Some(i),
             Slot::Removed(_) => None,
@@ -99,7 +99,10 @@ pub fn align(kinds: &[LineKind]) -> Vec<Slot> {
                 let adds = dels.end..i;
                 let both = dels.len().min(adds.len());
                 for k in 0..both {
-                    out.push(Slot::Replace((dels.start + k) as u32, (adds.start + k) as u32));
+                    out.push(Slot::Replace(
+                        (dels.start + k) as u32,
+                        (adds.start + k) as u32,
+                    ));
                 }
                 for j in dels.start + both..dels.end {
                     out.push(Slot::Removed(j as u32));
@@ -197,7 +200,7 @@ mod tests {
             let slots = align(kinds);
             let mut seen = vec![0u32; kinds.len()];
             for s in &slots {
-                for i in s.old().into_iter().chain(s.new()) {
+                for i in s.left().into_iter().chain(s.right()) {
                     seen[i as usize] += 1;
                 }
             }

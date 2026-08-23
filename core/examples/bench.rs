@@ -1,5 +1,3 @@
-
-
 use plait_core::*;
 use std::time::Instant;
 
@@ -15,7 +13,10 @@ fn main() {
     let lanes = t.elapsed();
     let widest = rows.iter().map(|r| r.through.len() + 1).max().unwrap_or(0);
     println!("COMMITS  {:>9}  widest {:>2} lanes", commits.len(), widest);
-    println!("  read {:>9.1?}   parse {:>9.1?}   lanes {:>9.1?}", read, parse, lanes);
+    println!(
+        "  read {:>9.1?}   parse {:>9.1?}   lanes {:>9.1?}",
+        read, parse, lanes
+    );
 
     let t = Instant::now();
     let raw = String::from_utf8_lossy(&std::fs::read("fixtures/big.diff").unwrap()).into_owned();
@@ -23,7 +24,11 @@ fn main() {
     let t = Instant::now();
     let files = parse_unified_diff(&raw);
     let parse = t.elapsed();
-    let nlines: usize = files.iter().flat_map(|f| &f.hunks).map(|h| h.lines.len()).sum();
+    let nlines: usize = files
+        .iter()
+        .flat_map(|f| &f.hunks)
+        .map(|h| h.lines.len())
+        .sum();
 
     let t = Instant::now();
     let mut pairs = 0usize;
@@ -76,7 +81,7 @@ fn main() {
         let kinds: Vec<LineKind> = h.lines.iter().map(|l| l.kind).collect();
         for s in align::align(&kinds) {
             slots += 1;
-            paired += (s.old().is_some() && s.new().is_some()) as usize;
+            paired += (s.left().is_some() && s.right().is_some()) as usize;
         }
     }
     let aligned = t.elapsed();
@@ -102,8 +107,16 @@ fn main() {
     );
     let wrapping = t.elapsed();
 
-    println!("DIFF     {:>9} lines  {:>5} files  {} replace-pairs", nlines, files.len(), pairs);
-    println!("  read {:>9.1?}   parse {:>9.1?}   intraline {:>9.1?}", read, parse, intra);
+    println!(
+        "DIFF     {:>9} lines  {:>5} files  {} replace-pairs",
+        nlines,
+        files.len(),
+        pairs
+    );
+    println!(
+        "  read {:>9.1?}   parse {:>9.1?}   intraline {:>9.1?}",
+        read, parse, intra
+    );
     println!(
         "  prepare {:>6.1?}   intraline {:>7.1?}  syntax {:>7.1?}  {} tokens  {:.1} MB scanned ({:.0} MB/s)",
         build,

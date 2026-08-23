@@ -77,7 +77,15 @@ impl Stats {
         note: Rc<RefCell<SharedString>>,
         load: String,
     ) -> Self {
-        Self { ring: [0.0; RING], n: 0, last: None, rows_drawn, total_rows, load, note }
+        Self {
+            ring: [0.0; RING],
+            n: 0,
+            last: None,
+            rows_drawn,
+            total_rows,
+            load,
+            note,
+        }
     }
 
     /// After the view rebuilt its rows — a layout or algorithm change. A one-off
@@ -137,6 +145,10 @@ impl Stats {
 
     pub fn heap(&self) -> String {
         let mb = |b: usize| b as f64 / (1024.0 * 1024.0);
-        format!("heap {:>7.1} MB   peak {:>7.1} MB", mb(LIVE.load(Relaxed)), mb(PEAK.load(Relaxed)))
+        format!(
+            "heap {:>7.1} MB   peak {:>7.1} MB",
+            mb(LIVE.load(Relaxed)),
+            mb(PEAK.load(Relaxed))
+        )
     }
 }

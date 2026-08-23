@@ -33,9 +33,9 @@ pub mod log;
 pub mod rows;
 
 use http::{Request, Response};
+use log::Log;
 use plait_app::MIN_WRAP_COLS;
 use plait_core::host::Host;
-use log::Log;
 use rows::Doc;
 use std::sync::Mutex;
 
@@ -135,9 +135,10 @@ impl State {
             // A route that exists for the other view is a different mistake from
             // one that does not exist at all, and saying so is what stops a
             // wrong subcommand looking like a broken build.
-            ("/api/rows", _) | ("/api/commits", _) => {
-                Response::status(404, "not this view — start plait-web with the other subcommand")
-            }
+            ("/api/rows", _) | ("/api/commits", _) => Response::status(
+                404,
+                "not this view — start plait-web with the other subcommand",
+            ),
             _ => Response::status(404, "no such route"),
         }
     }
@@ -152,9 +153,16 @@ mod tests {
     fn diff_state() -> State {
         let host = Host::new();
         let raw = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,2 +1,2 @@\n-let a = 1;\n+let a = 2;\n fn b() {}\n";
-        let doc =
-            Doc::build(prepare(&parse_unified_diff(raw), &host.syntax, plait_app::MAX_LINE_CHARS));
-        State { label: "test".into(), host, data: Data::Diff(Mutex::new(doc)) }
+        let doc = Doc::build(prepare(
+            &parse_unified_diff(raw),
+            &host.syntax,
+            plait_app::MAX_LINE_CHARS,
+        ));
+        State {
+            label: "test".into(),
+            host,
+            data: Data::Diff(Mutex::new(doc)),
+        }
     }
 
     /// `Request` builds from a target the way the server does, so a test asks
@@ -209,7 +217,8 @@ mod tests {
     #[test]
     fn an_absurd_column_budget_is_clamped_rather_than_honoured() {
         let s = diff_state();
-        assert!(body(get(&s, "/api/meta?cols=1&wrap=char")).contains(&format!("\"cols\":{MIN_WRAP_COLS}")));
+        assert!(body(get(&s, "/api/meta?cols=1&wrap=char"))
+            .contains(&format!("\"cols\":{MIN_WRAP_COLS}")));
         assert!(body(get(&s, "/api/meta?cols=99999999&wrap=char"))
             .contains(&format!("\"cols\":{MAX_WRAP_COLS}")));
     }
@@ -232,7 +241,11 @@ mod tests {
     fn the_commits_view_serves_its_own_rows() {
         let host = Host::new();
         let log = parse_log("aaaa1111\x1faaaa111\x1f\x1fAda Lovelace\x1f1700000000\x1froot\x1e");
-        let s = State { label: "t".into(), host, data: Data::Commits(Log::build(log)) };
+        let s = State {
+            label: "t".into(),
+            host,
+            data: Data::Commits(Log::build(log)),
+        };
         let out = body(get(&s, "/api/commits?from=0&count=10"));
         assert!(out.contains("\"subject\":\"root\""));
         assert!(out.contains("\"initials\":\"AL\""));

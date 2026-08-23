@@ -51,7 +51,10 @@ fn rows(keys: &Keymap, commands: &Commands, modes: &Modes) -> Vec<Row> {
                 .map(|o| chord_string(&o.chord))
                 .collect::<Vec<_>>()
                 .join(" / ");
-            let doc = commands.get(&b.command).map(|c| c.doc.clone()).unwrap_or_default();
+            let doc = commands
+                .get(&b.command)
+                .map(|c| c.doc.clone())
+                .unwrap_or_default();
             in_mode.push((all, doc));
         }
         if in_mode.is_empty() {
@@ -61,7 +64,11 @@ fn rows(keys: &Keymap, commands: &Commands, modes: &Modes) -> Vec<Row> {
             out.push(Row::Blank);
         }
         out.push(Row::Mode(mode.clone()));
-        out.extend(in_mode.into_iter().map(|(keys, doc)| Row::Key { keys, doc }));
+        out.extend(
+            in_mode
+                .into_iter()
+                .map(|(keys, doc)| Row::Key { keys, doc }),
+        );
     }
     out
 }
@@ -90,7 +97,9 @@ pub fn paint(
         .unwrap_or(0);
 
     // Two columns and a border either side, never wider than the screen.
-    let inner = (key_w + GAP + 28).min(MAX_W).min(screen.width().saturating_sub(4));
+    let inner = (key_w + GAP + 28)
+        .min(MAX_W)
+        .min(screen.width().saturating_sub(4));
     let w = inner + 4;
     let h = (rows.len() + 2).min(height);
     let x = screen.width().saturating_sub(w) / 2;
@@ -127,7 +136,11 @@ pub fn paint(
                     }
                     Some(Row::Key { keys, doc: text }) => {
                         pen.put(keys, key);
-                        pen.fill(key_w + GAP - crate::screen::width(keys).min(key_w + GAP), ' ', doc);
+                        pen.fill(
+                            key_w + GAP - crate::screen::width(keys).min(key_w + GAP),
+                            ' ',
+                            doc,
+                        );
                         pen.put(text, doc);
                     }
                     _ => {}
@@ -166,16 +179,28 @@ mod tests {
         assert!(contains(&rows, "one row down"), "no description");
         assert!(contains(&rows, "leave"), "no description for quit");
         assert!(rows.iter().any(|r| r.contains("q / ctrl-c")), "{rows:?}");
-        assert!(contains(&rows, "ctrl-d"), "a modified key was not spelled out");
+        assert!(
+            contains(&rows, "ctrl-d"),
+            "a modified key was not spelled out"
+        );
     }
 
     #[test]
     fn a_command_with_several_keys_is_one_row() {
         let host = Host::new();
         let rows = shown(&host, &Modes::new());
-        let row = rows.iter().find(|r| r.contains("one row down")).expect("view.down");
-        assert!(row.contains("j / down") || row.contains("down / j"), "{row}");
-        assert_eq!(rows.iter().filter(|r| r.contains("one row down")).count(), 1);
+        let row = rows
+            .iter()
+            .find(|r| r.contains("one row down"))
+            .expect("view.down");
+        assert!(
+            row.contains("j / down") || row.contains("down / j"),
+            "{row}"
+        );
+        assert_eq!(
+            rows.iter().filter(|r| r.contains("one row down")).count(),
+            1
+        );
     }
 
     #[test]
@@ -191,14 +216,18 @@ mod tests {
         let in_diff = shown(&host, &modes);
         assert!(contains(&in_diff, "the next presentation"));
         assert!(contains(&in_diff, "diff"), "the mode is not named");
-        assert!(!contains(&in_diff, "the diff for this commit"), "a commits key leaked in");
+        assert!(
+            !contains(&in_diff, "the diff for this commit"),
+            "a commits key leaked in"
+        );
     }
 
     #[test]
     fn a_binding_from_the_config_file_appears_without_being_told_to() {
         // The whole point of the panel being a function of the registry.
         let mut host = Host::new();
-        host.commands.register("blame.toggle", "show blame beside the diff");
+        host.commands
+            .register("blame.toggle", "show blame beside the diff");
         host.keys.bind("global", "b", "blame.toggle").unwrap();
         let rows = shown(&host, &Modes::new());
         assert!(contains(&rows, "show blame beside the diff"));
@@ -220,8 +249,14 @@ mod tests {
         screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
         paint(&mut screen, 0, 40, &host, &Modes::new());
         let rows: Vec<String> = (0..40).map(|y| screen.row_text(y)).collect();
-        let first = rows.iter().position(|r| r.contains('╭')).expect("a top border");
-        let last = rows.iter().rposition(|r| r.contains('╰')).expect("a bottom border");
+        let first = rows
+            .iter()
+            .position(|r| r.contains('╭'))
+            .expect("a top border");
+        let last = rows
+            .iter()
+            .rposition(|r| r.contains('╰'))
+            .expect("a bottom border");
         assert!(last > first + 2);
         let left = rows[first].find('╭').unwrap();
         assert!(left > 0, "not centred: {}", rows[first]);

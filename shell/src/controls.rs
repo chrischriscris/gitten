@@ -71,7 +71,10 @@ impl Picker {
     pub fn new(label: &'static str, options: &[&str], current: usize) -> Self {
         Self {
             label,
-            options: options.iter().map(|s| SharedString::from(s.to_string())).collect(),
+            options: options
+                .iter()
+                .map(|s| SharedString::from(s.to_string()))
+                .collect(),
             current,
             enabled: true,
         }
@@ -140,7 +143,11 @@ pub fn picker(
         .child(div().text_color(rgb(fg)).child(p.value()))
         // A caret and not a glyph from an icon font: the app ships no icons, and
         // one drawn character is not worth a dependency.
-        .child(div().text_color(rgb(dim)).child(if open { "▴" } else { "▾" }));
+        .child(
+            div()
+                .text_color(rgb(dim))
+                .child(if open { "▴" } else { "▾" }),
+        );
 
     if p.enabled {
         trigger = trigger
@@ -164,7 +171,12 @@ pub fn picker(
         // Wide enough for the longest option plus its tick, from the font rather
         // than a constant — the same reason `font.advance` exists at all. A
         // stale width here is a menu that clips its own labels.
-        let widest = p.options.iter().map(|o| o.chars().count()).max().unwrap_or(0);
+        let widest = p
+            .options
+            .iter()
+            .map(|o| o.chars().count())
+            .max()
+            .unwrap_or(0);
         let w = px((widest as f32 + 4.0) * font.advance * font.size + 16.0);
 
         let list = div()
@@ -204,9 +216,10 @@ pub fn picker(
                             .text_color(rgb(if i == p.current { c.accent } else { c.fg }))
                             .child(option.clone()),
                     )
-                    .children((i == p.current).then(|| {
-                        div().flex_none().text_color(rgb(c.accent)).child("✓")
-                    }))
+                    .children(
+                        (i == p.current)
+                            .then(|| div().flex_none().text_color(rgb(c.accent)).child("✓")),
+                    )
                     .on_click(move |_, window, cx| on_pick(i, window, cx))
             }));
 
@@ -249,6 +262,10 @@ mod tests {
         // disappears as you change view is harder to find than one that greys.
         let p = Picker::new("algorithm", &["histogram"], 0).enabled(false);
         assert!(!p.enabled);
-        assert_eq!(p.value().as_ref(), "histogram", "it still says what it is on");
+        assert_eq!(
+            p.value().as_ref(),
+            "histogram",
+            "it still says what it is on"
+        );
     }
 }

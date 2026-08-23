@@ -60,15 +60,15 @@
 
 use super::diff::{
     column_at, columns, file_header, header_hit, hunk_header, into_text, line_colors, num,
-    row_frame, scrolled, selected, slice, slice_shared, Hit, Rows, Scratch, ROW_H, PAD, SIGN_W,
+    row_frame, scrolled, selected, slice, slice_shared, Hit, Rows, Scratch, PAD, ROW_H, SIGN_W,
     TEXT_CHROME,
 };
 use gpui::*;
 use plait_core::host::Host;
 use plait_core::markdown::{flow_table, lay_out_tables, Block, Grid, Layout, TableRow};
+use plait_core::runs::surfaces;
 use plait_core::select::Selected;
 use plait_core::syntax::Token;
-use plait_core::runs::surfaces;
 use plait_core::theme::Rgb;
 use plait_core::wrap::{Break, Budget, Wrap, Wrapped};
 use plait_core::{LineKind, Span};
@@ -133,7 +133,10 @@ impl Metrics {
         }
         Self {
             heading,
-            layout: Layout { monospaced: font.monospaced, ..Default::default() },
+            layout: Layout {
+                monospaced: font.monospaced,
+                ..Default::default()
+            },
             ..Self::default()
         }
     }
@@ -144,7 +147,10 @@ impl Metrics {
 
     fn bullet(&self, depth: u8) -> &'static str {
         let last = self.bullets.len().saturating_sub(1);
-        self.bullets.get(depth as usize).copied().unwrap_or(self.bullets[last])
+        self.bullets
+            .get(depth as usize)
+            .copied()
+            .unwrap_or(self.bullets[last])
     }
 }
 
@@ -154,7 +160,11 @@ impl Metrics {
 /// are the parsed diff's own strings by handle, and the gutter numbers stay
 /// integers until draw time — see [`Row::Line`](super::diff::Row) for why.
 enum Row {
-    File { path: std::sync::Arc<str>, adds: usize, dels: usize },
+    File {
+        path: std::sync::Arc<str>,
+        adds: usize,
+        dels: usize,
+    },
     Hunk(std::sync::Arc<str>),
     Line {
         block: Block,
@@ -279,7 +289,12 @@ impl MarkdownRows {
     /// [`flow_table`] — cells wrapped inside their own columns — or drawn whole
     /// and scrolled to. See [`MarkdownRows::reflow_tables`].
     fn budget(&self, block: Block, width: f32, host: &Host) -> usize {
-        columns(width, TEXT_CHROME + self.furniture(block), self.size(block, host), host)
+        columns(
+            width,
+            TEXT_CHROME + self.furniture(block),
+            self.size(block, host),
+            host,
+        )
     }
 
     /// How many pixels of furniture sit between the sign column and the text: a
@@ -305,9 +320,16 @@ impl MarkdownRows {
     /// approximations are not good enough — a bound half a character out is a
     /// diff you cannot scroll to the end of.
     fn chars(&self, index: usize, seg: usize) -> usize {
-        let Some(Row::Line { text, .. }) = self.rows.get(index) else { return 0 };
-        let text = self.flowed(index).map_or(text.as_ref(), |f| f.text.as_str());
-        text[self.wrapped.range(index, seg, text)].trim_end().chars().count()
+        let Some(Row::Line { text, .. }) = self.rows.get(index) else {
+            return 0;
+        };
+        let text = self
+            .flowed(index)
+            .map_or(text.as_ref(), |f| f.text.as_str());
+        text[self.wrapped.range(index, seg, text)]
+            .trim_end()
+            .chars()
+            .count()
     }
 
     /// One character of this block's text, in pixels. `Font::char_width` at the
@@ -362,11 +384,23 @@ impl MarkdownRows {
             run.clear();
             of.clear();
             for (r, _) in &self.tables[start..i] {
-                let Row::Line { block, text, spans, tokens, .. } = &self.rows[*r as usize] else {
+                let Row::Line {
+                    block,
+                    text,
+                    spans,
+                    tokens,
+                    ..
+                } = &self.rows[*r as usize]
+                else {
                     continue;
                 };
                 of.push(*r);
-                run.push(TableRow { text, block: *block, tokens, spans });
+                run.push(TableRow {
+                    text,
+                    block: *block,
+                    tokens,
+                    spans,
+                });
             }
             let Some(flowed) = flow_table(
                 &run,
@@ -397,7 +431,10 @@ impl MarkdownRows {
     /// row per frame over a list that holds a handful of entries, and the
     /// alternative costs four bytes on every row of every diff to say "no".
     fn flowed(&self, index: usize) -> Option<&Flowed> {
-        let at = self.flows.binary_search_by_key(&(index as u32), |(r, _)| *r).ok()?;
+        let at = self
+            .flows
+            .binary_search_by_key(&(index as u32), |(r, _)| *r)
+            .ok()?;
         Some(&self.flows[at].1)
     }
 
@@ -417,7 +454,9 @@ impl MarkdownRows {
     /// One method rather than a condition at the call site, because it is a rule
     /// about rows and a test can ask it directly.
     fn ruled(&self, index: usize, seg: usize) -> bool {
-        let Some(Row::Line { block, .. }) = self.rows.get(index) else { return false };
+        let Some(Row::Line { block, .. }) = self.rows.get(index) else {
+            return false;
+        };
         *block == Block::Table
             && seg + 1 == self.wrapped.rows(index)
             && matches!(self.rows.get(index + 1), Some(Row::Line { block, .. }) if *block == Block::Table)
@@ -434,7 +473,12 @@ impl MarkdownRows {
         tokens: &'a [Token],
     ) -> (&'a str, &'a [Span], &'a [Token], Source<'a>) {
         match self.flowed(index) {
-            Some(f) => (f.text.as_str(), &f.spans, &f.tokens, Source::Flowed(&f.text)),
+            Some(f) => (
+                f.text.as_str(),
+                &f.spans,
+                &f.tokens,
+                Source::Flowed(&f.text),
+            ),
             None => (text, spans, tokens, Source::Own(text)),
         }
     }
@@ -461,7 +505,8 @@ impl Rows for MarkdownRows {
         // `rsplit` on the whole path, not the file name: a path with no dot in
         // its last segment must not pick up a dot from a parent directory.
         let name = path.rsplit('/').next().unwrap_or(path);
-        name.rsplit_once('.').is_some_and(|(_, ext)| self.extensions.iter().any(|e| e == ext))
+        name.rsplit_once('.')
+            .is_some_and(|(_, ext)| self.extensions.iter().any(|e| e == ext))
     }
 
     fn len(&self) -> usize {
@@ -473,8 +518,11 @@ impl Rows for MarkdownRows {
     }
 
     fn reflow(&mut self, width: f32, host: &Host, wrap: &dyn Wrap) -> bool {
-        let budgets: Vec<usize> =
-            self.blocks.iter().map(|b| self.budget(*b, width, host)).collect();
+        let budgets: Vec<usize> = self
+            .blocks
+            .iter()
+            .map(|b| self.budget(*b, width, host))
+            .collect();
         if budgets == self.budgets && wrap.name() == self.wrap {
             return false;
         }
@@ -492,9 +540,10 @@ impl Rows for MarkdownRows {
                     // A grid that fits, or one nothing could be done with, is
                     // drawn whole: a break at a column shears it.
                     None if block.is_table() => (text.as_ref(), Budget::Cols(0)),
-                    None => {
-                        (text.as_ref(), Budget::Cols(self.budget(*block, width, host)))
-                    }
+                    None => (
+                        text.as_ref(),
+                        Budget::Cols(self.budget(*block, width, host)),
+                    ),
                 },
                 // A header is drawn by the built-in's own function at the built-in's
                 // own width, and a path is not prose. One row, always.
@@ -513,7 +562,8 @@ impl Rows for MarkdownRows {
             dels: f.dels,
         });
         for mut h in f.hunks {
-            self.rows.push(Row::Hunk(std::mem::take(&mut h.header).into()));
+            self.rows
+                .push(Row::Hunk(std::mem::take(&mut h.header).into()));
             // Per hunk, because that is the largest unit whose block structure is
             // knowable: a fence opened in one hunk and closed in another has
             // everything between them missing from the diff entirely.
@@ -525,7 +575,8 @@ impl Rows for MarkdownRows {
             // the first. Rebased onto this presentation's own row numbering.
             let (row, grid) = (self.rows.len() as u32, self.grids.len() as u32);
             self.grids.extend(tables.grids);
-            self.tables.extend(tables.of_line.iter().map(|(l, g)| (row + l, grid + g)));
+            self.tables
+                .extend(tables.of_line.iter().map(|(l, g)| (row + l, grid + g)));
             for (l, block) in h.lines.into_iter().zip(blocks) {
                 if !self.blocks.contains(&block) {
                     self.blocks.push(block);
@@ -559,7 +610,9 @@ impl Rows for MarkdownRows {
                 // squeezed to fit is exactly as wide as the budget, and measuring
                 // the one it was squeezed out of would leave the whole list
                 // scrolling sideways for a row nothing draws.
-                let text = self.flowed(index).map_or(text.as_ref(), |f| f.text.as_str());
+                let text = self
+                    .flowed(index)
+                    .map_or(text.as_ref(), |f| f.text.as_str());
                 // `chars`, not `len`: a table row is full of three-byte box
                 // drawing and would otherwise measure three times too wide and
                 // win the widest-row contest for the whole diff.
@@ -597,8 +650,7 @@ impl Rows for MarkdownRows {
             }
             // A header is the built-in's, drawn behind the page padding and
             // nothing else.
-            _ => (self.width(index, seg) as f32 * host.font.char_width()
-                - (width - 2.0 * PAD))
+            _ => (self.width(index, seg) as f32 * host.font.char_width() - (width - 2.0 * PAD))
                 .max(0.0),
         }
     }
@@ -611,7 +663,9 @@ impl Rows for MarkdownRows {
             Row::File { path, .. } => header_hit(path, x, host, shift),
             Row::Hunk(h) => header_hit(h, x, host, shift),
             Row::Line { block, text, .. } => {
-                let text = self.flowed(index).map_or(text.as_ref(), |f| f.text.as_str());
+                let text = self
+                    .flowed(index)
+                    .map_or(text.as_ref(), |f| f.text.as_str());
                 let at = self.wrapped.range(index, seg, text);
                 let from = TEXT_CHROME - PAD + self.furniture(*block);
                 let off = at.start
@@ -633,7 +687,9 @@ impl Rows for MarkdownRows {
         Some(match self.rows.get(index)? {
             // The flowed grid, when there is one, because that is what is on
             // screen — and what `hit` returned offsets into.
-            Row::Line { text, .. } => self.flowed(index).map_or(text.as_ref(), |f| f.text.as_str()),
+            Row::Line { text, .. } => self
+                .flowed(index)
+                .map_or(text.as_ref(), |f| f.text.as_str()),
             Row::Hunk(h) => h.as_ref(),
             Row::File { path, .. } => path.as_ref(),
         })
@@ -649,17 +705,37 @@ impl Rows for MarkdownRows {
     ) -> AnyElement {
         let theme = &host.theme;
         match &self.rows[index] {
-            Row::File { path, adds, dels } => {
-                file_header(path, *adds, *dels, theme, sel, shift)
-            }
+            Row::File { path, adds, dels } => file_header(path, *adds, *dels, theme, sel, shift),
             Row::Hunk(header) => hunk_header(header, theme, sel, shift),
-            Row::Line { block, kind, moved, old, new, text, spans, tokens } => {
+            Row::Line {
+                block,
+                kind,
+                moved,
+                old,
+                new,
+                text,
+                spans,
+                tokens,
+            } => {
                 let (text, spans, tokens, source) = self.text_of(index, text, spans, tokens);
                 let at = self.wrapped.range(index, seg, text);
                 let rule = self.ruled(index, seg);
                 self.line(
-                    *block, *kind, *moved, *old, *new, source.piece(&at), text.len(), at, seg,
-                    spans, tokens, rule, host, sel, shift,
+                    *block,
+                    *kind,
+                    *moved,
+                    *old,
+                    *new,
+                    source.piece(&at),
+                    text.len(),
+                    at,
+                    seg,
+                    spans,
+                    tokens,
+                    rule,
+                    host,
+                    sel,
+                    shift,
                 )
             }
         }
@@ -732,9 +808,17 @@ impl MarkdownRows {
         if block.is_table() {
             let body = div().text_color(rgb(fg)).child(
                 StyledText::new(text.clone()).with_highlights(
-                    sc.merged(at, tokens, spans, theme, kind, moved, selected(sel, 0, full_len))
-                        .iter()
-                        .cloned(),
+                    sc.merged(
+                        at,
+                        tokens,
+                        spans,
+                        theme,
+                        kind,
+                        moved,
+                        selected(sel, 0, full_len),
+                    )
+                    .iter()
+                    .cloned(),
                 ),
             );
             // The grid is structure, not content, and a separator row is nothing
@@ -807,7 +891,12 @@ impl MarkdownRows {
         // and below, which is a ladder rather than a bar — and grouping a run of
         // rows is the whole job.
         let bar = |color: Rgb| {
-            div().flex_none().w(px(m.bar)).h(px(ROW_H)).mr(px(m.indent - m.bar)).bg(rgb(color))
+            div()
+                .flex_none()
+                .w(px(m.bar))
+                .h(px(ROW_H))
+                .mr(px(m.indent - m.bar))
+                .bg(rgb(color))
         };
 
         let row = match block {
@@ -847,13 +936,23 @@ impl MarkdownRows {
 
         let body = div().text_color(rgb(fg)).child(
             StyledText::new(text.clone()).with_highlights(
-                sc.merged(at, tokens, spans, theme, kind, moved, selected(sel, 0, full_len))
-                    .iter()
-                    .cloned(),
+                sc.merged(
+                    at,
+                    tokens,
+                    spans,
+                    theme,
+                    kind,
+                    moved,
+                    selected(sel, 0, full_len),
+                )
+                .iter()
+                .cloned(),
             ),
         );
         let body = match block {
-            Block::Heading(level) => body.text_size(px(m.size(level))).font_weight(FontWeight::BOLD),
+            Block::Heading(level) => body
+                .text_size(px(m.size(level)))
+                .font_weight(FontWeight::BOLD),
             // A fence's language label is punctuation the reader should be able
             // to skip. A table's pipes are too, but a table is drawn verbatim —
             // see the note on `Block::Table` in `plait_core::markdown`.
@@ -931,7 +1030,14 @@ diff --git a/README.md b/README.md
         for p in ["README.md", "docs/a.markdown", "x/y/z.mdx", "a.b.md"] {
             assert!(r.claims(p), "{p}");
         }
-        for p in ["a.rs", "Cargo.lock", "no-extension", "weird.xyz", "md", ".md.rs"] {
+        for p in [
+            "a.rs",
+            "Cargo.lock",
+            "no-extension",
+            "weird.xyz",
+            "md",
+            ".md.rs",
+        ] {
             assert!(!r.claims(p), "{p}");
         }
     }
@@ -949,14 +1055,21 @@ diff --git a/README.md b/README.md
     fn what_it_claims_is_configurable() {
         let r = MarkdownRows::new(Metrics::default(), &["mdown", "txt"]);
         assert!(r.claims("a.mdown") && r.claims("b.txt"));
-        assert!(!r.claims("c.md"), "the default list was replaced, not extended");
+        assert!(
+            !r.claims("c.md"),
+            "the default list was replaced, not extended"
+        );
     }
 
     #[test]
     fn the_metrics_are_configurable_too() {
         // Rule 1: the numbers a built-in draws with are not the built-in's to
         // keep. Anything an extension cannot reach is not a knob.
-        let tight = Metrics { heading: [14.0; 6], indent: 8.0, ..Metrics::default() };
+        let tight = Metrics {
+            heading: [14.0; 6],
+            indent: 8.0,
+            ..Metrics::default()
+        };
         let r = MarkdownRows::new(tight, &["md"]);
         assert_eq!(r.metrics.size(1), 14.0);
         assert_eq!(r.metrics.indent, 8.0);
@@ -994,15 +1107,30 @@ diff --git a/README.md b/README.md
     fn the_markers_are_gone_from_the_text_that_will_be_drawn() {
         let t = texts(&built(DOC));
         assert!(t.contains(&"plait".to_string()), "hashes survived: {t:?}");
-        assert!(t.iter().any(|l| l == "one"), "a bullet marker survived: {t:?}");
-        assert!(t.iter().any(|l| l == "quoted"), "a quote marker survived: {t:?}");
-        assert!(t.iter().any(|l| l == "rust"), "a fence kept more than its language");
+        assert!(
+            t.iter().any(|l| l == "one"),
+            "a bullet marker survived: {t:?}"
+        );
+        assert!(
+            t.iter().any(|l| l == "quoted"),
+            "a quote marker survived: {t:?}"
+        );
+        assert!(
+            t.iter().any(|l| l == "rust"),
+            "a fence kept more than its language"
+        );
         assert!(
             t.iter().any(|l| l.contains("bolder claims and a link")),
             "inline markup survived: {t:?}"
         );
-        assert!(!t.iter().any(|l| l.contains("https://")), "a url survived: {t:?}");
-        assert!(t.iter().any(|l| l == "let x = 1;"), "a fence body was altered");
+        assert!(
+            !t.iter().any(|l| l.contains("https://")),
+            "a url survived: {t:?}"
+        );
+        assert!(
+            t.iter().any(|l| l == "let x = 1;"),
+            "a fence body was altered"
+        );
     }
 
     #[test]
@@ -1014,13 +1142,19 @@ diff --git a/README.md b/README.md
             .rows
             .iter()
             .find_map(|row| match row {
-                super::Row::Line { block: Block::Heading(_), text, tokens, .. } => {
-                    Some((text.clone(), tokens.clone()))
-                }
+                super::Row::Line {
+                    block: Block::Heading(_),
+                    text,
+                    tokens,
+                    ..
+                } => Some((text.clone(), tokens.clone())),
                 _ => None,
             })
             .expect("a heading row");
-        let t = tokens.iter().find(|t| t.kind == Kind::Heading).expect("a heading token");
+        let t = tokens
+            .iter()
+            .find(|t| t.kind == Kind::Heading)
+            .expect("a heading token");
         assert_eq!(&text[t.range()], "plait");
     }
 
@@ -1030,7 +1164,15 @@ diff --git a/README.md b/README.md
         // than into a wrong colour.
         let r = built(DOC);
         for row in &r.rows {
-            let super::Row::Line { text, tokens, spans, .. } = row else { continue };
+            let super::Row::Line {
+                text,
+                tokens,
+                spans,
+                ..
+            } = row
+            else {
+                continue;
+            };
             for t in tokens {
                 assert!(t.end as usize <= text.len(), "token {t:?} outside {text:?}");
                 assert!(
@@ -1053,21 +1195,26 @@ diff --git a/README.md b/README.md
             .rows
             .iter()
             .filter_map(|row| match row {
-                super::Row::Line { kind: LineKind::Added, text, spans, .. } if !spans.is_empty() => {
-                    Some(
-                        spans
-                            .iter()
-                            .map(|s| text[s.start as usize..s.end as usize].to_string())
-                            .collect::<Vec<_>>()
-                    )
-                }
+                super::Row::Line {
+                    kind: LineKind::Added,
+                    text,
+                    spans,
+                    ..
+                } if !spans.is_empty() => Some(
+                    spans
+                        .iter()
+                        .map(|s| text[s.start as usize..s.end as usize].to_string())
+                        .collect::<Vec<_>>(),
+                ),
                 _ => None,
             })
             .flatten()
             .collect();
         assert!(!marked.is_empty(), "no changed words survived the layout");
         assert!(
-            marked.iter().any(|m| m.contains("bolder") || m.contains("other")),
+            marked
+                .iter()
+                .any(|m| m.contains("bolder") || m.contains("other")),
             "spans point at {marked:?}"
         );
     }
@@ -1113,7 +1260,10 @@ diff --git a/README.md b/README.md
     fn a_bigger_font_gives_up_the_top_of_the_scale_rather_than_the_row() {
         // The constraint is the row, not the font: at a 20px body size a 1.3x h1
         // would be 26px and clip into the row below, so it is capped instead.
-        let big = plait_core::font::Font { size: 20.0, ..plait_core::font::Font::default() };
+        let big = plait_core::font::Font {
+            size: 20.0,
+            ..plait_core::font::Font::default()
+        };
         let m = Metrics::for_font(&big);
         for level in 1..=6u8 {
             assert!(
@@ -1122,7 +1272,10 @@ diff --git a/README.md b/README.md
                 m.size(level)
             );
         }
-        assert!((1..6u8).all(|l| m.size(l) >= m.size(l + 1)), "scale is not monotonic");
+        assert!(
+            (1..6u8).all(|l| m.size(l) >= m.size(l + 1)),
+            "scale is not monotonic"
+        );
     }
 
     #[test]
@@ -1142,7 +1295,11 @@ diff --git a/README.md b/README.md
         // that breaks this clips into the row below.
         let m = Metrics::default();
         for level in 1..=6u8 {
-            assert!(m.size(level) * 1.2 <= super::ROW_H, "h{level} at {}px", m.size(level));
+            assert!(
+                m.size(level) * 1.2 <= super::ROW_H,
+                "h{level} at {}px",
+                m.size(level)
+            );
         }
         // Monotonic, or level three outranks level two.
         assert!((1..6u8).all(|l| m.size(l) >= m.size(l + 1)));
@@ -1178,12 +1335,19 @@ diff --git a/README.md b/README.md
         let diff = Diff::with_renderers(
             parse_unified_diff(MIXED),
             host,
-            vec![Box::new(TextRows::default()), Box::new(MarkdownRows::default())],
+            vec![
+                Box::new(TextRows::default()),
+                Box::new(MarkdownRows::default()),
+            ],
         );
         // Two headers and a removed/added pair per file, every row accounted for
         // exactly once, and only the markdown file's two lines were laid out.
         assert_eq!(diff.total(), 8);
-        assert!(diff.load.contains("markdown 2 rows"), "report missing: {}", diff.load);
+        assert!(
+            diff.load.contains("markdown 2 rows"),
+            "report missing: {}",
+            diff.load
+        );
     }
 
     // ------------------------------------------------------------- wrapping
@@ -1224,16 +1388,29 @@ diff --git a/a.md b/a.md
         let (mut r, host) = reflowed(PROSE, 40);
         let f = &host.font;
         let w = crate::views::diff::TEXT_CHROME + 40.5 * f.size * f.advance;
-        assert!(!r.reflow(w, &host, host.wrap.current()), "the same width rebuilt");
-        assert!(!r.reflow(w + 0.4, &host, host.wrap.current()), "half a pixel rebuilt");
-        assert!(r.reflow(w + 200.0, &host, host.wrap.current()), "24 characters did not");
+        assert!(
+            !r.reflow(w, &host, host.wrap.current()),
+            "the same width rebuilt"
+        );
+        assert!(
+            !r.reflow(w + 0.4, &host, host.wrap.current()),
+            "half a pixel rebuilt"
+        );
+        assert!(
+            r.reflow(w + 200.0, &host, host.wrap.current()),
+            "24 characters did not"
+        );
 
         // And the blocks it collected are the ones the document has, once each —
         // the list is what stands in for every row, so a duplicate is wasted work
         // on every frame of a drag and a miss is a row wrapped to a stale budget.
         assert!(r.blocks.len() >= 3, "{:?}", r.blocks);
         for (i, b) in r.blocks.iter().enumerate() {
-            assert!(!r.blocks[..i].contains(b), "{b:?} collected twice: {:?}", r.blocks);
+            assert!(
+                !r.blocks[..i].contains(b),
+                "{b:?} collected twice: {:?}",
+                r.blocks
+            );
         }
         for i in 0..r.len() {
             if let Row::Line { block, .. } = &r.rows[i] {
@@ -1246,7 +1423,16 @@ diff --git a/a.md b/a.md
     fn grid(r: &MarkdownRows) -> Vec<(usize, usize, String)> {
         let mut out = Vec::new();
         for i in 0..r.len() {
-            let Row::Line { block, text, spans, tokens, .. } = &r.rows[i] else { continue };
+            let Row::Line {
+                block,
+                text,
+                spans,
+                tokens,
+                ..
+            } = &r.rows[i]
+            else {
+                continue;
+            };
             if !block.is_table() {
                 continue;
             }
@@ -1270,16 +1456,29 @@ diff --git a/a.md b/a.md
             for seg in 0..r.rows(i) {
                 // The two the measure adds for the padding it approximates; see
                 // `width`.
-                assert!(r.width(i, seg) <= 32, "row {i}.{seg} measured {}", r.width(i, seg));
+                assert!(
+                    r.width(i, seg) <= 32,
+                    "row {i}.{seg} measured {}",
+                    r.width(i, seg)
+                );
             }
         }
         // And it is still a grid: the same pipes in the same columns, whichever
         // row and whichever sub-row.
         let pipes = |t: &str| -> Vec<usize> {
-            t.chars().enumerate().filter(|(_, c)| "│├┤┼".contains(*c)).map(|(i, _)| i).collect()
+            t.chars()
+                .enumerate()
+                .filter(|(_, c)| "│├┤┼".contains(*c))
+                .map(|(i, _)| i)
+                .collect()
         };
         let first = pipes(&rows[0].2);
-        assert_eq!(first.len(), 4, "three columns is four boundaries: {:?}", rows[0].2);
+        assert_eq!(
+            first.len(),
+            4,
+            "three columns is four boundaries: {:?}",
+            rows[0].2
+        );
         for (i, seg, t) in &rows {
             assert_eq!(pipes(t), first, "row {i}.{seg} sheared the grid: {t:?}");
         }
@@ -1302,7 +1501,10 @@ diff --git a/a.md b/a.md
             }
         }
         assert_eq!(tables, 3, "the fixture lost its table");
-        assert!(r.flows.is_empty(), "a table nobody can read a word of was squeezed");
+        assert!(
+            r.flows.is_empty(),
+            "a table nobody can read a word of was squeezed"
+        );
     }
 
     #[test]
@@ -1330,17 +1532,32 @@ diff --git a/a.md b/a.md
         assert_eq!(rows.len(), 4, "header, separator and two rows: {rows:?}");
         let (header, sep, first, last) = (rows[0].0, rows[1].0, rows[2].0, rows[3].0);
 
-        assert!(!r.ruled(header, 0), "a header's separator row is already a rule");
+        assert!(
+            !r.ruled(header, 0),
+            "a header's separator row is already a rule"
+        );
         assert_eq!(rows[1].1, Block::TableRule);
-        assert!(!r.ruled(sep, 0), "the separator row drew a second rule under itself");
-        assert!(!r.ruled(last, 0), "the last row of the table has nothing under it");
+        assert!(
+            !r.ruled(sep, 0),
+            "the separator row drew a second rule under itself"
+        );
+        assert!(
+            !r.ruled(last, 0),
+            "the last row of the table has nothing under it"
+        );
 
         // The wrapped one: under its last sub-row, and none of the others.
         assert!(r.rows(first) > 1, "the fixture stopped wrapping");
         for seg in 0..r.rows(first) - 1 {
-            assert!(!r.ruled(first, seg), "a rule cut through a wrapped cell at {seg}");
+            assert!(
+                !r.ruled(first, seg),
+                "a rule cut through a wrapped cell at {seg}"
+            );
         }
-        assert!(r.ruled(first, r.rows(first) - 1), "no rule between the two rows");
+        assert!(
+            r.ruled(first, r.rows(first) - 1),
+            "no rule between the two rows"
+        );
     }
 
     #[test]
@@ -1349,7 +1566,10 @@ diff --git a/a.md b/a.md
         // sub-rows is load-bearing: without it three rows of a grid paste as one
         // 90-character line that was never on the screen.
         let (r, _) = reflowed(PROSE, 30);
-        let (row, _, _) = *grid(&r).iter().find(|(i, ..)| r.rows(*i) > 1).expect("a wrapped row");
+        let (row, _, _) = *grid(&r)
+            .iter()
+            .find(|(i, ..)| r.rows(*i) > 1)
+            .expect("a wrapped row");
         let copied = r.selectable(row, 0).expect("a table row copies");
         let lines: Vec<&str> = copied.split('\n').collect();
         assert_eq!(lines.len(), r.rows(row), "{copied:?}");
@@ -1360,7 +1580,9 @@ diff --git a/a.md b/a.md
         // same coordinates the copy is in.
         for seg in 0..r.rows(row) {
             let at = r.wrapped.range(row, seg, copied);
-            let hit = r.hit(row, seg, 60.0, &Host::new().into(), 0.0).expect("a table row is hittable");
+            let hit = r
+                .hit(row, seg, 60.0, &Host::new(), 0.0)
+                .expect("a table row is hittable");
             assert!(at.contains(&hit.off), "{:?} is outside {at:?}", hit.off);
         }
     }
@@ -1398,7 +1620,10 @@ diff --git a/a.md b/a.md
         let mut t = TextRows::default();
         t.build(p.files.remove(0));
         assert_eq!(r.len(), t.len());
-        assert!((0..r.len()).map(|i| r.rows(i)).sum::<usize>() > r.len(), "nothing wrapped");
+        assert!(
+            (0..r.len()).map(|i| r.rows(i)).sum::<usize>() > r.len(),
+            "nothing wrapped"
+        );
     }
 
     #[test]
@@ -1427,8 +1652,17 @@ diff --git a/a.md b/a.md
                 _ => None,
             })
             .collect();
-        let plain = rows.iter().find(|(_, b)| matches!(b, Block::Paragraph)).unwrap().0;
-        let nested = rows.iter().filter(|(_, b)| matches!(b, Block::Bullet(_))).nth(1).unwrap().0;
+        let plain = rows
+            .iter()
+            .find(|(_, b)| matches!(b, Block::Paragraph))
+            .unwrap()
+            .0;
+        let nested = rows
+            .iter()
+            .filter(|(_, b)| matches!(b, Block::Bullet(_)))
+            .nth(1)
+            .unwrap()
+            .0;
         assert!(r.furniture(Block::Paragraph) < r.furniture(Block::Bullet(1)));
 
         // The same pixel column, two rows: the indented one starts later, so the
@@ -1436,13 +1670,20 @@ diff --git a/a.md b/a.md
         let x = TEXT_CHROME - PAD + 20.0 * host.font.size * host.font.advance;
         let flat = r.hit(plain, 0, x, &host, 0.0).unwrap().off;
         let inset = r.hit(nested, 0, x, &host, 0.0).unwrap().off;
-        assert!(inset < flat, "the indent did not move the caret: {inset} vs {flat}");
+        assert!(
+            inset < flat,
+            "the indent did not move the caret: {inset} vs {flat}"
+        );
 
         // And a click at the start of a row's own text is byte 0 of it, whatever
         // that row drew in front of itself.
         for (i, block) in &rows {
             let from = TEXT_CHROME - PAD + r.furniture(*block);
-            assert_eq!(r.hit(*i, 0, from, &host, 0.0).unwrap().off, 0, "row {i} {block:?}");
+            assert_eq!(
+                r.hit(*i, 0, from, &host, 0.0).unwrap().off,
+                0,
+                "row {i} {block:?}"
+            );
         }
     }
 
@@ -1469,10 +1710,18 @@ diff --git a/a.md b/a.md
             }
             let from = TEXT_CHROME - PAD + r.furniture(*block);
             let shift = 3.0 * r.char_width(*block, &host);
-            assert_eq!(r.hit(*i, 0, from, &host, shift).unwrap().off, 3, "row {i} {block:?}");
+            assert_eq!(
+                r.hit(*i, 0, from, &host, shift).unwrap().off,
+                3,
+                "row {i} {block:?}"
+            );
             // In the gutter, scrolled: the first character on screen, and never
             // a byte to the left of the row's own text.
-            assert_eq!(r.hit(*i, 0, 0.0, &host, shift).unwrap().off, 3, "row {i} gutter");
+            assert_eq!(
+                r.hit(*i, 0, 0.0, &host, shift).unwrap().off,
+                3,
+                "row {i} gutter"
+            );
         }
     }
 
@@ -1491,17 +1740,31 @@ diff --git a/a.md b/a.md
 
         let mut checked = 0;
         for i in 0..r.len() {
-            let Row::Line { block, .. } = r.rows[i] else { continue };
+            let Row::Line { block, .. } = r.rows[i] else {
+                continue;
+            };
             let room = width - TEXT_CHROME - r.furniture(block);
             let text = r.chars(i, 0) as f32 * r.char_width(block, &host);
-            assert_eq!(r.overflow(i, 0, width, &host), (text - room).max(0.0), "row {i}");
+            assert_eq!(
+                r.overflow(i, 0, width, &host),
+                (text - room).max(0.0),
+                "row {i}"
+            );
             checked += 1;
         }
         assert!(checked > 6, "only {checked} rows measured");
 
         // And the two things that make it per row, one at a time.
         let heading = (0..r.len())
-            .find(|i| matches!(r.rows[*i], Row::Line { block: Block::Heading(_), .. }))
+            .find(|i| {
+                matches!(
+                    r.rows[*i],
+                    Row::Line {
+                        block: Block::Heading(_),
+                        ..
+                    }
+                )
+            })
             .expect("a heading");
         let chars = r.chars(heading, 0) as f32;
         assert!(
@@ -1525,7 +1788,15 @@ diff --git a/a.md b/a.md
         let heading = r
             .rows
             .iter()
-            .position(|row| matches!(row, Row::Line { block: Block::Heading(_), .. }))
+            .position(|row| {
+                matches!(
+                    row,
+                    Row::Line {
+                        block: Block::Heading(_),
+                        ..
+                    }
+                )
+            })
             .expect("a heading");
         let text = r.selectable(heading, 0).unwrap().to_string();
         let end = TEXT_CHROME - PAD + text.chars().count() as f32 * r.metrics.size(1) * 0.602;

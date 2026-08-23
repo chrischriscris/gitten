@@ -10,7 +10,8 @@ use plait_core::prepared::prepare;
 use plait_web::log::Log;
 use plait_web::rows::Doc;
 use plait_web::{http, Data, State};
-use std::sync::{Arc, Mutex};
+use std::rc::Rc;
+use std::sync::Mutex;
 
 const EXTRA: &str = "  --port N       listen on N instead of 7423
 
@@ -55,7 +56,14 @@ fn main() {
         )))),
         Loaded::Commits(commits) => Data::Commits(Log::build(commits)),
     };
-    let state = Arc::new(State { label: label.clone(), host: started.host, data });
+    // `Rc`, not `Arc`: requests run on the serving thread (see http.rs) and the
+    // host behind this state is deliberately not Send. An Arc here is the same
+    // type with a promise nothing keeps.
+    let state = Rc::new(State {
+        label: label.clone(),
+        host: started.host,
+        data,
+    });
 
     // Printed, never opened. A browser window appearing on its own interrupts
     // whoever is at the keyboard — the same reason `./dev` is a rebuild and not

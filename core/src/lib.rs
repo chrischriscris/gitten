@@ -64,8 +64,7 @@ impl Hasher for FxHasher {
         for chunk in bytes.chunks(8) {
             let mut buf = [0u8; 8];
             buf[..chunk.len()].copy_from_slice(chunk);
-            self.hash =
-                (self.hash.rotate_left(5) ^ u64::from_le_bytes(buf)).wrapping_mul(FX_SEED);
+            self.hash = (self.hash.rotate_left(5) ^ u64::from_le_bytes(buf)).wrapping_mul(FX_SEED);
         }
     }
     fn write_u8(&mut self, b: u8) {
@@ -183,9 +182,16 @@ pub fn assign_lanes(commits: &[Commit]) -> Vec<GraphRow> {
         // Re-point our lane at the first parent; fork new lanes for the rest.
         let mut parents = c.parents.iter();
         lanes[lane] = parents.next().map(|p| p.as_str());
-        let forks: Vec<usize> = parents.map(|p| claim_lane(&mut lanes, p.as_str())).collect();
+        let forks: Vec<usize> = parents
+            .map(|p| claim_lane(&mut lanes, p.as_str()))
+            .collect();
 
-        rows.push(GraphRow { lane, through, merges, forks });
+        rows.push(GraphRow {
+            lane,
+            through,
+            merges,
+            forks,
+        });
     }
     rows
 }
@@ -286,7 +292,10 @@ pub fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
                 .and_then(|p| p.strip_prefix("b/"))
                 .unwrap_or("?")
                 .to_string();
-            files.push(FileDiff { path, hunks: Vec::new() });
+            files.push(FileDiff {
+                path,
+                hunks: Vec::new(),
+            });
             continue;
         }
         if line.starts_with("@@ ") {
@@ -294,7 +303,10 @@ pub fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
             old_no = o;
             new_no = n;
             if let Some(f) = files.last_mut() {
-                f.hunks.push(Hunk { header: line.to_string(), lines: Vec::new() });
+                f.hunks.push(Hunk {
+                    header: line.to_string(),
+                    lines: Vec::new(),
+                });
             }
             continue;
         }
@@ -349,9 +361,10 @@ pub fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
 pub fn hunk_parts(header: &str) -> (&str, &str) {
     // The second `@@`, not the first: a filename in the tail cannot be confused
     // for the marker, because the marker is always the closing one of a pair.
-    let Some(end) = header.find("@@").and_then(|a| {
-        header[a + 2..].find("@@").map(|b| a + 2 + b + 2)
-    }) else {
+    let Some(end) = header
+        .find("@@")
+        .and_then(|a| header[a + 2..].find("@@").map(|b| a + 2 + b + 2))
+    else {
         return (header, "");
     };
     (&header[..end], header[end..].trim_start())
@@ -658,7 +671,11 @@ mod tests {
         assert_eq!(initials(""), "");
         assert_eq!(initials("  spaced   out  "), "SO");
         assert_eq!(initials("émile zola"), "ÉZ");
-        assert_eq!(initials("émile"), "ÉM", "a multi-byte first letter is still one letter");
+        assert_eq!(
+            initials("émile"),
+            "ÉM",
+            "a multi-byte first letter is still one letter"
+        );
     }
 
     #[test]
@@ -710,9 +727,15 @@ index 1111111..2222222 100644
     fn intraline_handles_a_substitution_on_both_sides() {
         let (o, n) = intraline("go ext.Run(ev)", "go ext.Submit(ev)");
         assert_eq!(o.len(), 1);
-        assert_eq!(&"go ext.Run(ev)"[o[0].start as usize..o[0].end as usize], "Run");
+        assert_eq!(
+            &"go ext.Run(ev)"[o[0].start as usize..o[0].end as usize],
+            "Run"
+        );
         assert_eq!(n.len(), 1);
-        assert_eq!(&"go ext.Submit(ev)"[n[0].start as usize..n[0].end as usize], "Submit");
+        assert_eq!(
+            &"go ext.Submit(ev)"[n[0].start as usize..n[0].end as usize],
+            "Submit"
+        );
     }
 
     #[test]
@@ -722,10 +745,14 @@ index 1111111..2222222 100644
         let old = "# Collect the failures first";
         let new = "# Collect every check failure before exiting";
         let (_, n) = intraline(old, new);
-        assert_eq!(n.len(), 1, "expected one block, got {:?}", n
-            .iter()
-            .map(|s| &new[s.start as usize..s.end as usize])
-            .collect::<Vec<_>>());
+        assert_eq!(
+            n.len(),
+            1,
+            "expected one block, got {:?}",
+            n.iter()
+                .map(|s| &new[s.start as usize..s.end as usize])
+                .collect::<Vec<_>>()
+        );
         assert_eq!(
             &new[n[0].start as usize..n[0].end as usize],
             "every check failure before exiting"
@@ -749,7 +776,10 @@ index 1111111..2222222 100644
     fn a_genuine_rewrite_still_highlights_at_the_measured_floor() {
         // The least similar real pair in the fixtures, at 0.60. If the floor
         // ever rises past this, actual renames stop being highlighted.
-        let (o, n) = intraline("#define ZIG_DECL AUTO_EXTERN_C_ZIG", "#define RUST_DECL AUTO_EXTERN_C_RUST");
+        let (o, n) = intraline(
+            "#define ZIG_DECL AUTO_EXTERN_C_ZIG",
+            "#define RUST_DECL AUTO_EXTERN_C_RUST",
+        );
         assert!(!o.is_empty() && !n.is_empty());
         // Both identifiers changed and only a space separates them, so they
         // coalesce into one block — `AUTO_EXTERN_C_ZIG` is a single token, not a
@@ -795,7 +825,10 @@ diff --git a/x b/x
         let huge_a = "x ".repeat(MAX_INTRALINE_TOKENS + 50);
         let huge_b = "y ".repeat(MAX_INTRALINE_TOKENS + 50);
         let (o, n) = intraline(&huge_a, &huge_b);
-        assert!(o.is_empty() && n.is_empty(), "must degrade to no highlighting");
+        assert!(
+            o.is_empty() && n.is_empty(),
+            "must degrade to no highlighting"
+        );
 
         // Just under the cap still works normally.
         let ok_a = "a ".repeat(100);

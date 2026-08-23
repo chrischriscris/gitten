@@ -67,7 +67,11 @@ pub struct Prepared {
 
 impl Prepared {
     pub fn lines(&self) -> usize {
-        self.files.iter().flat_map(|f| &f.hunks).map(|h| h.lines.len()).sum()
+        self.files
+            .iter()
+            .flat_map(|f| &f.hunks)
+            .map(|h| h.lines.len())
+            .sum()
     }
 }
 
@@ -101,7 +105,11 @@ pub fn clip(s: &Arc<str>, max_chars: usize) -> Arc<str> {
         Some(i) => i,
         None => return s.clone(),
     };
-    Arc::from(format!("{}  … {} more chars", &s[..head_end], n - max_chars))
+    Arc::from(format!(
+        "{}  … {} more chars",
+        &s[..head_end],
+        n - max_chars
+    ))
 }
 
 pub fn prepare(files: &[FileDiff], hl: &dyn Highlighter, max_line_chars: usize) -> Prepared {
@@ -116,8 +124,11 @@ pub fn prepare(files: &[FileDiff], hl: &dyn Highlighter, max_line_chars: usize) 
         let mut hunks = Vec::with_capacity(f.hunks.len());
 
         for h in &f.hunks {
-            let mut texts: Vec<Arc<str>> =
-                h.lines.iter().map(|l| clip(&l.text, max_line_chars)).collect();
+            let mut texts: Vec<Arc<str>> = h
+                .lines
+                .iter()
+                .map(|l| clip(&l.text, max_line_chars))
+                .collect();
 
             // Second pass: only the removed/added pairs a line diff already
             // matched get word-level spans.
@@ -150,12 +161,24 @@ pub fn prepare(files: &[FileDiff], hl: &dyn Highlighter, max_line_chars: usize) 
                     tokens: std::mem::take(&mut tokens[i]).into_boxed_slice(),
                 })
                 .collect();
-            hunks.push(Hunk { header: h.header.clone(), lines });
+            hunks.push(Hunk {
+                header: h.header.clone(),
+                lines,
+            });
         }
-        out.push(File { path: f.path.clone(), adds, dels, hunks });
+        out.push(File {
+            path: f.path.clone(),
+            adds,
+            dels,
+            hunks,
+        });
     }
 
-    Prepared { files: out, intraline: intraline_time, syntax: syntax_time }
+    Prepared {
+        files: out,
+        intraline: intraline_time,
+        syntax: syntax_time,
+    }
 }
 
 #[cfg(test)]
@@ -204,10 +227,18 @@ index 1111111..2222222 100644
         let p = prepare(&parse_unified_diff(SAMPLE), &hl, 2000);
         for l in p.files.iter().flat_map(|f| &f.hunks).flat_map(|h| &h.lines) {
             for s in &l.spans {
-                assert!(s.end as usize <= l.text.len(), "span {s:?} outside {:?}", l.text);
+                assert!(
+                    s.end as usize <= l.text.len(),
+                    "span {s:?} outside {:?}",
+                    l.text
+                );
             }
             for t in &l.tokens {
-                assert!(t.end as usize <= l.text.len(), "token {t:?} outside {:?}", l.text);
+                assert!(
+                    t.end as usize <= l.text.len(),
+                    "token {t:?} outside {:?}",
+                    l.text
+                );
                 assert!(
                     l.text.is_char_boundary(t.start as usize)
                         && l.text.is_char_boundary(t.end as usize)
@@ -240,7 +271,11 @@ index 1111111..2222222 100644
         let hl = Highlighters::builtin();
         let p = prepare(&parse_unified_diff(raw), &hl, 2000);
         let first = &p.files[0].hunks[0].lines[0];
-        assert_eq!(first.tokens[0].kind, Kind::Heading, "markdown routing was lost");
+        assert_eq!(
+            first.tokens[0].kind,
+            Kind::Heading,
+            "markdown routing was lost"
+        );
     }
 
     fn arc(s: &str) -> Arc<str> {
@@ -253,7 +288,11 @@ index 1111111..2222222 100644
         // text can overshoot in bytes while fitting in characters, and the
         // suffix always names characters.
         let wide = Arc::<str>::from("\u{4e2d}".repeat(60)); // three bytes each, 180 bytes total
-        assert_eq!(clip(&wide, 60), wide, "fits in characters despite the byte length");
+        assert_eq!(
+            clip(&wide, 60),
+            wide,
+            "fits in characters despite the byte length"
+        );
         assert_eq!(
             clip(&wide, 10).as_ref(),
             format!("{}  … {} more chars", &wide[..30], 50)

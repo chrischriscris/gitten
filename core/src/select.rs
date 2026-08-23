@@ -82,7 +82,9 @@ pub struct Mousing {
 
 impl Default for Mousing {
     fn default() -> Self {
-        Self { copy_on_select: true }
+        Self {
+            copy_on_select: true,
+        }
     }
 }
 
@@ -126,7 +128,11 @@ pub struct Caret {
 impl Caret {
     /// A caret on a row that occupies one visual row, which is nearly every row.
     pub fn new(row: RowId, off: usize, at: usize) -> Self {
-        Self { row, off, at: at..at + 1 }
+        Self {
+            row,
+            off,
+            at: at..at + 1,
+        }
     }
 
     /// Draw order, with the offset breaking a tie inside one logical row. A
@@ -176,7 +182,11 @@ impl Selection {
     /// something [`extend`](Selection::extend)s it, which is what makes a plain
     /// click a *clear* rather than a one-byte selection.
     pub fn new(part: u16, at: Caret) -> Self {
-        Self { part, anchor: at.clone(), head: at }
+        Self {
+            part,
+            anchor: at.clone(),
+            head: at,
+        }
     }
 
     /// Everything, in draw order, or `None` if there is nothing to select.
@@ -186,9 +196,19 @@ impl Selection {
     /// is would mean this function needing a presentation.
     pub fn all(order: &[RowRef]) -> Option<Self> {
         let (first, last) = (order.first()?, order.last()?);
-        let mut sel = Self::new(0, Caret { row: first.logical(), off: 0, at: 0..1 });
-        sel.head =
-            Caret { row: last.logical(), off: usize::MAX, at: order.len() - 1..order.len() };
+        let mut sel = Self::new(
+            0,
+            Caret {
+                row: first.logical(),
+                off: 0,
+                at: 0..1,
+            },
+        );
+        sel.head = Caret {
+            row: last.logical(),
+            off: usize::MAX,
+            at: order.len() - 1..order.len(),
+        };
         sel.resolve(order);
         Some(sel)
     }
@@ -250,7 +270,11 @@ impl Selection {
         }
         let from = if row == a.row { a.off } else { 0 };
         let to = if row == b.row { b.off } else { usize::MAX };
-        (from < to).then_some(Selected { part: self.part, from, to })
+        (from < to).then_some(Selected {
+            part: self.part,
+            from,
+            to,
+        })
     }
 
     /// Rebuilds both carets' visual ranges from the order table.
@@ -300,14 +324,23 @@ impl Selection {
         let mut out = String::new();
         let mut last: Option<RowId> = None;
         let rows = self.rows();
-        for visual in rows.start..rows.end.min(order.len()) {
-            let id = order[visual].logical();
+        for (visual, row) in order
+            .iter()
+            .enumerate()
+            .take(rows.end.min(order.len()))
+            .skip(rows.start)
+        {
+            let id = row.logical();
             if last == Some(id) {
                 continue;
             }
             last = Some(id);
-            let Some(text) = src.text(id, self.part) else { continue };
-            let Some(sel) = self.at(visual, id) else { continue };
+            let Some(text) = src.text(id, self.part) else {
+                continue;
+            };
+            let Some(sel) = self.at(visual, id) else {
+                continue;
+            };
             if !out.is_empty() {
                 out.push('\n');
             }
@@ -360,7 +393,11 @@ pub fn word_at(text: &str, off: usize) -> Range<usize> {
     }
     // The character *under* the caret, or the one before it at the end of a
     // line — a double-click past the last word should still select that word.
-    let Some(here) = text[off..].chars().next().or_else(|| text[..off].chars().next_back()) else {
+    let Some(here) = text[off..]
+        .chars()
+        .next()
+        .or_else(|| text[..off].chars().next_back())
+    else {
         return 0..0;
     };
     let want = class(here);
@@ -385,12 +422,20 @@ mod tests {
     use super::*;
 
     fn order(spec: &[(u16, u32, u16)]) -> Vec<RowRef> {
-        spec.iter().map(|&(owner, index, seg)| RowRef { owner, seg, index }).collect()
+        spec.iter()
+            .map(|&(owner, index, seg)| RowRef { owner, seg, index })
+            .collect()
     }
 
     /// One row per line, no wrapping: the shape of nearly every diff.
     fn flat(n: u32) -> Vec<RowRef> {
-        (0..n).map(|i| RowRef { owner: 0, seg: 0, index: i }).collect()
+        (0..n)
+            .map(|i| RowRef {
+                owner: 0,
+                seg: 0,
+                index: i,
+            })
+            .collect()
     }
 
     struct Lines(Vec<&'static str>);
@@ -448,7 +493,11 @@ mod tests {
     #[test]
     fn a_row_in_the_middle_is_selected_whole_and_the_ends_are_not() {
         let s = sel((1, 4), (3, 2));
-        assert_eq!(s.at(1, (0, 1)).unwrap().range(10), 4..10, "from the anchor to the end");
+        assert_eq!(
+            s.at(1, (0, 1)).unwrap().range(10),
+            4..10,
+            "from the anchor to the end"
+        );
         assert_eq!(s.at(2, (0, 2)).unwrap().range(10), 0..10, "all of it");
         assert_eq!(s.at(3, (0, 3)).unwrap().range(10), 0..2, "up to the head");
     }
@@ -475,10 +524,17 @@ mod tests {
         assert_eq!(s.anchor.at, 1..4, "the whole run of visual rows");
         assert_eq!(s.rows(), 1..4);
         for v in 1..4 {
-            assert_eq!(s.at(v, (0, 1)).unwrap().range(60), 3..40, "row {v} of the line");
+            assert_eq!(
+                s.at(v, (0, 1)).unwrap().range(60),
+                3..40,
+                "row {v} of the line"
+            );
         }
         // And it copies once, not three times.
-        assert_eq!(s.text(&table, &Lines(vec!["a", "0123456789", "c"])), "3456789");
+        assert_eq!(
+            s.text(&table, &Lines(vec!["a", "0123456789", "c"])),
+            "3456789"
+        );
     }
 
     #[test]
@@ -492,7 +548,14 @@ mod tests {
         assert!(s.resolve(&before));
         assert_eq!(s.rows(), 3..4);
 
-        let after = order(&[(0, 0, 0), (0, 1, 0), (0, 1, 1), (0, 1, 2), (0, 1, 3), (0, 2, 0)]);
+        let after = order(&[
+            (0, 0, 0),
+            (0, 1, 0),
+            (0, 1, 1),
+            (0, 1, 2),
+            (0, 1, 3),
+            (0, 2, 0),
+        ]);
         assert!(s.resolve(&after));
         assert_eq!(s.rows(), 5..6);
         assert_eq!(s.at(5, (0, 2)).unwrap().range(9), 0..4);
@@ -510,7 +573,10 @@ mod tests {
     fn copying_joins_rows_with_newlines_and_never_a_trailing_one() {
         let table = flat(4);
         let s = sel((0, 1), (2, 2));
-        assert_eq!(s.text(&table, &Lines(vec!["abcd", "efgh", "ijkl", "mnop"])), "bcd\nefgh\nij");
+        assert_eq!(
+            s.text(&table, &Lines(vec!["abcd", "efgh", "ijkl", "mnop"])),
+            "bcd\nefgh\nij"
+        );
     }
 
     #[test]
@@ -521,7 +587,10 @@ mod tests {
         let table = flat(4);
         let mut s = sel((0, 0), (3, 4));
         s.part = 1;
-        assert_eq!(s.text(&table, &Lines(vec!["aaaa", "bbbb", "cccc", "dddd"])), "aaaa\nbbbb");
+        assert_eq!(
+            s.text(&table, &Lines(vec!["aaaa", "bbbb", "cccc", "dddd"])),
+            "aaaa\nbbbb"
+        );
     }
 
     #[test]
@@ -529,8 +598,15 @@ mod tests {
         let table = flat(3);
         let s = Selection::all(&table).expect("a non-empty diff");
         assert_eq!(s.rows(), 0..3);
-        assert_eq!(s.at(2, (0, 2)).unwrap().range(4), 0..4, "to the end of the last line");
-        assert_eq!(s.text(&table, &Lines(vec!["one", "two", "three"])), "one\ntwo\nthree");
+        assert_eq!(
+            s.at(2, (0, 2)).unwrap().range(4),
+            0..4,
+            "to the end of the last line"
+        );
+        assert_eq!(
+            s.text(&table, &Lines(vec!["one", "two", "three"])),
+            "one\ntwo\nthree"
+        );
         assert_eq!(Selection::all(&[]), None);
     }
 
@@ -543,13 +619,21 @@ mod tests {
         assert_eq!(&text[word_at(text, 12)], "bar_baz");
         assert_eq!(&text[word_at(text, 8)], "foo");
         assert_eq!(&text[word_at(text, 11)], "(", "punctuation is its own run");
-        assert_eq!(&text[word_at(text, 22)], ");", "a run of punctuation, together");
+        assert_eq!(
+            &text[word_at(text, 22)],
+            ");",
+            "a run of punctuation, together"
+        );
     }
 
     #[test]
     fn a_word_survives_the_ends_and_the_middle_of_a_character() {
         assert_eq!(word_at("", 0), 0..0);
-        assert_eq!(word_at("ab", 99), 0..2, "past the end clamps back onto the word");
+        assert_eq!(
+            word_at("ab", 99),
+            0..2,
+            "past the end clamps back onto the word"
+        );
         let text = "héllo wörld";
         // Offset 2 is inside the two-byte `é`.
         assert_eq!(&text[word_at(text, 2)], "héllo");

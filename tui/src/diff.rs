@@ -268,7 +268,9 @@ impl Diff {
             if r.seg != 0 {
                 continue;
             }
-            let Some(rows) = per_owner.get(r.owner as usize) else { continue };
+            let Some(rows) = per_owner.get(r.owner as usize) else {
+                continue;
+            };
             if rows.binary_search(&r.index).is_ok() {
                 self.headers.push(at);
             }
@@ -344,7 +346,10 @@ impl Diff {
                 .checked_sub(1)
                 .and_then(|i| self.headers.get(i))
                 .copied(),
-            false => self.headers.get(self.headers.partition_point(|&h| h <= cursor)).copied(),
+            false => self
+                .headers
+                .get(self.headers.partition_point(|&h| h <= cursor))
+                .copied(),
         };
         if let Some(t) = target {
             self.view.go_to(t);
@@ -392,7 +397,14 @@ impl Diff {
         // run is.
         let first = visual - r.seg as usize;
         let n = rows.rows(r.index as usize).max(1);
-        Some((hit.part, Caret { row: r.logical(), off: hit.off, at: first..first + n }))
+        Some((
+            hit.part,
+            Caret {
+                row: r.logical(),
+                off: hit.off,
+                at: first..first + n,
+            },
+        ))
     }
 
     /// A caret for the *free* end of a drag, which is one character further on
@@ -443,7 +455,10 @@ impl Diff {
         // Before the selection is taken out of `self`: the free end of a shift
         // click is one character further on than the caret, and which way that
         // is depends on the anchor that is still in there.
-        let head = extend.then(|| self.head(col, visual)).flatten().map(|(_, c)| c);
+        let head = extend
+            .then(|| self.head(col, visual))
+            .flatten()
+            .map(|(_, c)| c);
         self.sel = match (extend, clicks) {
             (true, _) => {
                 let mut sel = self.sel.take().expect("extend implies a selection");
@@ -497,8 +512,12 @@ impl Diff {
             }
             r => r,
         };
-        let Some(visual) = self.view.row_at(row as usize) else { return };
-        let Some((part, mut caret)) = self.head(col, visual) else { return };
+        let Some(visual) = self.view.row_at(row as usize) else {
+            return;
+        };
+        let Some((part, mut caret)) = self.head(col, visual) else {
+            return;
+        };
         let Some(sel) = &self.sel else { return };
         if part != sel.part() {
             // Parts are laid out left to right, so a part further along than the
@@ -641,7 +660,11 @@ impl Diff {
         let blank = Ink::new(host.theme.chrome.dim, host.theme.chrome.bg);
         for i in 0..self.view.height() {
             let row = y + i;
-            match self.view.row_at(i).and_then(|n| self.order.get(n).map(|r| (n, *r))) {
+            match self
+                .view
+                .row_at(i)
+                .and_then(|n| self.order.get(n).map(|r| (n, *r)))
+            {
                 Some((n, r)) => {
                     let at = Frame {
                         host,
@@ -652,8 +675,13 @@ impl Diff {
                         sel: self.sel.as_ref().and_then(|s| s.at(n, r.logical())),
                     };
                     let mut pen = screen.row(row);
-                    self.owners[r.owner as usize]
-                        .render(r.index as usize, r.seg as usize, &at, &mut pen, out);
+                    self.owners[r.owner as usize].render(
+                        r.index as usize,
+                        r.seg as usize,
+                        &at,
+                        &mut pen,
+                        out,
+                    );
                 }
                 // Past the end of a diff shorter than the screen. Washed in the
                 // chrome's background rather than left as whatever the last
@@ -663,7 +691,14 @@ impl Diff {
         }
         // Last, and over the rows rather than beside them: a row's colour still
         // runs to the right edge underneath it.
-        scrollbar::paint(screen, self.bar, self.cols.saturating_sub(1), y, &self.view, host);
+        scrollbar::paint(
+            screen,
+            self.bar,
+            self.cols.saturating_sub(1),
+            y,
+            &self.view,
+            host,
+        );
     }
 
     /// One line describing what is on screen, for whatever draws a status bar.
@@ -683,7 +718,12 @@ impl Diff {
         if self.shift > 0 {
             out.push_str(&format!(" · +{}c", self.shift));
         }
-        for report in self.owners.iter().map(|o| o.report()).filter(|r| !r.is_empty()) {
+        for report in self
+            .owners
+            .iter()
+            .map(|o| o.report())
+            .filter(|r| !r.is_empty())
+        {
             out.push_str(" · ");
             out.push_str(&report);
         }
@@ -700,8 +740,17 @@ impl Diff {
 /// A selection over one byte range of one row: what a double or a triple click
 /// makes.
 fn span(part: u16, at: &Caret, bytes: std::ops::Range<usize>) -> Selection {
-    let mut sel = Selection::new(part, Caret { off: bytes.start, ..at.clone() });
-    sel.extend(Caret { off: bytes.end, ..at.clone() });
+    let mut sel = Selection::new(
+        part,
+        Caret {
+            off: bytes.start,
+            ..at.clone()
+        },
+    );
+    sel.extend(Caret {
+        off: bytes.end,
+        ..at.clone()
+    });
     sel
 }
 
@@ -767,7 +816,11 @@ mod tests {
         assert_eq!(d.top(), 0);
         d.move_by(2);
         assert_eq!(d.cursor(), 3);
-        assert_eq!(d.top(), 0, "a four-row screen scrolled on the first keypress");
+        assert_eq!(
+            d.top(),
+            0,
+            "a four-row screen scrolled on the first keypress"
+        );
     }
 
     #[test]
@@ -823,7 +876,11 @@ mod tests {
         }
         assert_eq!(seen, *d.headers(), "a jump landed off a header");
         d.jump_file(1);
-        assert_eq!(d.cursor(), *d.headers().last().unwrap(), "jumped past the last file");
+        assert_eq!(
+            d.cursor(),
+            *d.headers().last().unwrap(),
+            "jumped past the last file"
+        );
         for _ in 0..199 {
             d.jump_file(-1);
         }
@@ -839,7 +896,11 @@ mod tests {
         let second = d.cursor();
         d.move_by(2);
         d.jump_file(-1);
-        assert_eq!(d.cursor(), second, "landed on the previous file, not this one");
+        assert_eq!(
+            d.cursor(),
+            second,
+            "landed on the previous file, not this one"
+        );
     }
 
     #[test]
@@ -860,7 +921,15 @@ mod tests {
             }
         }
         impl Rows for Bare {
-            fn render(&self, _: usize, _: usize, _: &Frame, _: &mut crate::screen::Pen, _: &mut Vec<Run>) {}
+            fn render(
+                &self,
+                _: usize,
+                _: usize,
+                _: &Frame,
+                _: &mut crate::screen::Pen,
+                _: &mut Vec<Run>,
+            ) {
+            }
         }
         let host = Host::new();
         let mut layouts = Layouts::builtin();
@@ -876,13 +945,19 @@ mod tests {
     fn a_reflow_keeps_the_line_the_cursor_is_on() {
         let long = format!(
             "diff --git a/a.rs b/a.rs\n@@ -1,1 +1,1 @@\n{}",
-            (0..12).map(|i| format!(" line {i} {}\n", "padding ".repeat(6))).collect::<String>()
+            (0..12)
+                .map(|i| format!(" line {i} {}\n", "padding ".repeat(6)))
+                .collect::<String>()
         );
         let (mut d, host) = view(parse_unified_diff(&long), 100, 20);
         d.move_by(8);
         let before = d.order[d.cursor()].logical();
         d.resize(30, 20, &host);
-        assert_eq!(d.order[d.cursor()].logical(), before, "the cursor left its line");
+        assert_eq!(
+            d.order[d.cursor()].logical(),
+            before,
+            "the cursor left its line"
+        );
         assert_eq!(d.order[d.cursor()].seg, 0, "it landed mid-line");
         assert!(d.rows() > 14, "nothing wrapped at 30 columns");
     }
@@ -939,9 +1014,8 @@ mod tests {
 
     #[test]
     fn a_horizontal_scroll_is_bounded_by_the_widest_row_and_reset_by_wrapping() {
-        let long = "diff --git a/a.rs b/a.rs\n@@ -1,1 +1,1 @@\n-".to_string()
-            + &"x".repeat(200)
-            + "\n";
+        let long =
+            "diff --git a/a.rs b/a.rs\n@@ -1,1 +1,1 @@\n-".to_string() + &"x".repeat(200) + "\n";
         let (mut d, host) = view(parse_unified_diff(&long), 40, 10);
         d.set_wrap(host.wrap.position("off").unwrap(), &host);
         d.scroll_x(-5);
@@ -961,7 +1035,11 @@ mod tests {
         // Row 0 is reserved for a title bar the assembly owns; the view starts
         // at 1 and must not touch the row above it.
         d.paint(&mut screen, 1, &host, &mut out);
-        assert_eq!(screen.ink(0, 0).unwrap().bg, 0x000000, "the view wrote above its box");
+        assert_eq!(
+            screen.ink(0, 0).unwrap().bg,
+            0x000000,
+            "the view wrote above its box"
+        );
         assert!(screen.row_text(1).contains("a.rs"));
         assert!(screen.row_text(4).contains("line 1"));
         // Past the end of the diff: the chrome's background, not the last frame.
@@ -1112,14 +1190,20 @@ mod tests {
         // the one place a stale selection would highlight the wrong line.
         let long = format!(
             "diff --git a/a.rs b/a.rs\n@@ -1,1 +1,1 @@\n{}",
-            (0..12).map(|i| format!(" line {i} {}\n", "padding ".repeat(6))).collect::<String>()
+            (0..12)
+                .map(|i| format!(" line {i} {}\n", "padding ".repeat(6)))
+                .collect::<String>()
         );
         let (mut d, host) = view(parse_unified_diff(&long), 100, 20);
         d.press(10, 6, 3, false, &host);
         let before = d.selection();
         assert!(!before.is_empty());
         d.resize(40, 20, &host);
-        assert_eq!(d.selection(), before, "the selection followed the wrong line");
+        assert_eq!(
+            d.selection(),
+            before,
+            "the selection followed the wrong line"
+        );
         d.cycle_layout(&host);
         assert_eq!(d.selection(), "", "a selection outlived the rows it was on");
     }
@@ -1133,7 +1217,11 @@ mod tests {
         assert_eq!(d.selection(), "", "the bar started a selection");
         assert_eq!(d.cursor(), d.cursor().min(d.rows()));
         d.drag(39, 9, &host);
-        assert_eq!(d.top(), d.rows() - 10, "the end of the track is the end of the list");
+        assert_eq!(
+            d.top(),
+            d.rows() - 10,
+            "the end of the track is the end of the list"
+        );
         d.release();
         // Once released, the bar is not holding the pointer any more.
         let top = d.top();

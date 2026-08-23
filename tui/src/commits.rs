@@ -331,7 +331,9 @@ impl Commits {
             self.grabbed = Some(scrollbar::grab(&mut self.view, host, row));
             return;
         }
-        let Some(index) = self.view.row_at(row) else { return };
+        let Some(index) = self.view.row_at(row) else {
+            return;
+        };
         let anchor = match (extend, self.sel) {
             (true, Some((a, _))) => a,
             _ => index,
@@ -363,7 +365,9 @@ impl Commits {
             }
             r => r,
         };
-        let Some(index) = self.view.row_at(row as usize) else { return };
+        let Some(index) = self.view.row_at(row as usize) else {
+            return;
+        };
         // The cursor follows the free end, so the row a command would act on is
         // the row the pointer is over.
         self.view.go_to(index);
@@ -450,7 +454,14 @@ impl Commits {
             let mut pen = screen.row(row);
             self.row(&mut pen, index, bg, theme);
         }
-        scrollbar::paint(screen, self.bar, self.cols.saturating_sub(1), y, &self.view, host);
+        scrollbar::paint(
+            screen,
+            self.bar,
+            self.cols.saturating_sub(1),
+            y,
+            &self.view,
+            host,
+        );
     }
 
     /// lazygit's order — sha, author, graph, subject — because the graph is the
@@ -464,7 +475,8 @@ impl Commits {
         let dim = Ink::new(theme.chrome.dim, bg);
         pen.take(SHA_W - 1).put(&c.short, dim);
         pen.put(" ", dim);
-        pen.take(WHO_W - 1).put(&d.initials, Ink::new(theme.author(&c.author), bg));
+        pen.take(WHO_W - 1)
+            .put(&d.initials, Ink::new(theme.author(&c.author), bg));
         pen.put(" ", dim);
 
         let after = pen.col() + self.gutter;
@@ -516,9 +528,15 @@ impl Commits {
                 (if d.merge { g.merge_dot } else { g.dot }, Some(d.hue))
             } else if on_lane {
                 match (
-                    d.merges.iter().find(|(l, _)| (*l as usize).min(MAX_LANES - 1) == lane),
-                    d.forks.iter().find(|(l, _)| (*l as usize).min(MAX_LANES - 1) == lane),
-                    d.through.iter().find(|(l, _)| (*l as usize).min(MAX_LANES - 1) == lane),
+                    d.merges
+                        .iter()
+                        .find(|(l, _)| (*l as usize).min(MAX_LANES - 1) == lane),
+                    d.forks
+                        .iter()
+                        .find(|(l, _)| (*l as usize).min(MAX_LANES - 1) == lane),
+                    d.through
+                        .iter()
+                        .find(|(l, _)| (*l as usize).min(MAX_LANES - 1) == lane),
                 ) {
                     // A lane that arrives from above and turns toward the dot.
                     // Its corner points *up* because the row above is newer.
@@ -526,9 +544,14 @@ impl Commits {
                         (if lane < dot { g.up_left } else { g.up_right }, Some(*h))
                     }
                     // A lane born here, continuing into older history below.
-                    (None, Some((_, h)), _) => {
-                        (if lane < dot { g.down_left } else { g.down_right }, Some(*h))
-                    }
+                    (None, Some((_, h)), _) => (
+                        if lane < dot {
+                            g.down_left
+                        } else {
+                            g.down_right
+                        },
+                        Some(*h),
+                    ),
                     // A lane minding its own business — crossed by a connector
                     // if one passes over it.
                     (None, None, Some((_, h))) => {
@@ -540,7 +563,10 @@ impl Commits {
             } else {
                 // Between two lanes: connector, or nothing.
                 let between = cell > lo * LANE_W && cell < hi * LANE_W;
-                (if between { g.run } else { ' ' }, hue_of(lane).or(Some(d.hue)))
+                (
+                    if between { g.run } else { ' ' },
+                    hue_of(lane).or(Some(d.hue)),
+                )
             };
 
             // Past the cap every lane shares one column, so they share one grey
@@ -581,10 +607,16 @@ fn draws(commits: &[Commit], rows: &[GraphRow]) -> Vec<Draw> {
     let mut out = Vec::with_capacity(rows.len());
     for (c, r) in commits.iter().zip(rows) {
         let hue = hues.claim(r.lane);
-        let merges: Vec<(u16, u16)> =
-            r.merges.iter().map(|&m| (m as u16, hues.claim(m))).collect();
-        let through: Vec<(u16, u16)> =
-            r.through.iter().map(|&t| (t as u16, hues.claim(t))).collect();
+        let merges: Vec<(u16, u16)> = r
+            .merges
+            .iter()
+            .map(|&m| (m as u16, hues.claim(m)))
+            .collect();
+        let through: Vec<(u16, u16)> = r
+            .through
+            .iter()
+            .map(|&t| (t as u16, hues.claim(t)))
+            .collect();
 
         // Branches that end here give their colour back, and a root gives up its
         // own lane, *before* the forks below claim theirs.
@@ -697,7 +729,11 @@ r\x1frrrrrrr\x1f\x1fAda Lovelace\x1f1700000100\x1fRoot\x1e";
         let range = c.selected();
         assert_eq!(range, 0..3);
         c.scroll_y(20);
-        assert_eq!(c.selected(), range, "scrolling changed what would be copied");
+        assert_eq!(
+            c.selected(),
+            range,
+            "scrolling changed what would be copied"
+        );
     }
 
     #[test]
@@ -709,7 +745,11 @@ r\x1frrrrrrr\x1f\x1fAda Lovelace\x1f1700000100\x1fRoot\x1e";
         assert_eq!(c.selected().len(), 3);
         c.down();
         assert_eq!(c.selected().len(), 1);
-        assert_eq!(c.selection(), "", "a range outlived the keypress that dropped it");
+        assert_eq!(
+            c.selection(),
+            "",
+            "a range outlived the keypress that dropped it"
+        );
         assert_eq!(c.copy_text(), "rrrrrrr Root");
     }
 
@@ -721,12 +761,20 @@ r\x1frrrrrrr\x1f\x1fAda Lovelace\x1f1700000100\x1fRoot\x1e";
         screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
         c.paint(&mut screen, 0, &host);
         assert_eq!(screen.ink(0, 0).unwrap().bg, host.theme.chrome.selection_bg);
-        assert_eq!(screen.ink(0, 1).unwrap().bg, host.theme.chrome.bg, "one row lit two");
+        assert_eq!(
+            screen.ink(0, 1).unwrap().bg,
+            host.theme.chrome.bg,
+            "one row lit two"
+        );
         // Now a real drag: the rows behind the cursor take the selected colour.
         c.drag(2, &host);
         c.paint(&mut screen, 0, &host);
         assert_eq!(screen.ink(0, 1).unwrap().bg, host.theme.chrome.selected_bg);
-        assert_eq!(screen.ink(0, 2).unwrap().bg, host.theme.chrome.selection_bg, "the cursor");
+        assert_eq!(
+            screen.ink(0, 2).unwrap().bg,
+            host.theme.chrome.selection_bg,
+            "the cursor"
+        );
     }
 
     #[test]
@@ -762,7 +810,11 @@ r\x1frrrrrrr\x1f\x1fAda Lovelace\x1f1700000100\x1fRoot\x1e";
         let rows = painted(&c, &host);
         assert!(rows[0].starts_with("mmmmmmm AL "), "{:?}", rows[0]);
         assert!(rows[0].ends_with("Merge branch"), "{:?}", rows[0]);
-        assert!(rows[2].contains("GH"), "the author column is per commit: {:?}", rows[2]);
+        assert!(
+            rows[2].contains("GH"),
+            "the author column is per commit: {:?}",
+            rows[2]
+        );
     }
 
     #[test]
@@ -774,9 +826,8 @@ r\x1frrrrrrr\x1f\x1fAda Lovelace\x1f1700000100\x1fRoot\x1e";
         // Display columns, not bytes: box drawing is three bytes a glyph, so a
         // `find` compares the wrong thing and passes or fails by the graph's
         // shape rather than by its width.
-        let at = |row: &String, word: &str| {
-            crate::screen::width(&row[..row.find(word).expect(word)])
-        };
+        let at =
+            |row: &String, word: &str| crate::screen::width(&row[..row.find(word).expect(word)]);
         let first = at(&rows[0], "Merge branch");
         assert_eq!(first, 16, "{:?}", rows[0]);
         assert_eq!(at(&rows[1], "On the trunk"), first);
@@ -789,7 +840,11 @@ r\x1frrrrrrr\x1f\x1fAda Lovelace\x1f1700000100\x1fRoot\x1e";
         let (c, host) = view(LOG, 60, 4);
         let rows = painted(&c, &host);
         assert!(rows[0].contains('◉'), "{:?}", rows[0]);
-        assert!(rows[1].contains('●') && !rows[1].contains('◉'), "{:?}", rows[1]);
+        assert!(
+            rows[1].contains('●') && !rows[1].contains('◉'),
+            "{:?}",
+            rows[1]
+        );
     }
 
     #[test]
@@ -799,9 +854,17 @@ r\x1frrrrrrr\x1f\x1fAda Lovelace\x1f1700000100\x1fRoot\x1e";
         let (c, host) = view(LOG, 60, 4);
         let rows = painted(&c, &host);
         // The merge forks lane 1 for its second parent: it continues downward.
-        assert!(rows[0].contains('╮'), "the fork did not point down: {:?}", rows[0]);
+        assert!(
+            rows[0].contains('╮'),
+            "the fork did not point down: {:?}",
+            rows[0]
+        );
         // The root has both branches converging on it from above.
-        assert!(rows[3].contains('╯'), "the merge did not point up: {:?}", rows[3]);
+        assert!(
+            rows[3].contains('╯'),
+            "the merge did not point up: {:?}",
+            rows[3]
+        );
     }
 
     #[test]
@@ -819,7 +882,11 @@ r\x1fr\x1f\x1fA\x1f1\x1froot\x1e";
         let (c, host) = view(log, 70, 6);
         let rows = painted(&c, &host);
         assert!(rows[1].contains('─'), "no connector: {:?}", rows[1]);
-        assert!(rows[1].contains('┼'), "the connector broke a lane: {:?}", rows[1]);
+        assert!(
+            rows[1].contains('┼'),
+            "the connector broke a lane: {:?}",
+            rows[1]
+        );
     }
 
     #[test]
@@ -829,10 +896,14 @@ r\x1fr\x1f\x1fA\x1f1\x1froot\x1e";
         screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
         c.paint(&mut screen, 0, &host);
         // The trunk is the first colour the wheel hands out.
-        let dot = (0..60).find(|x| screen.char_at(*x, 1) == Some('●')).unwrap();
+        let dot = (0..60)
+            .find(|x| screen.char_at(*x, 1) == Some('●'))
+            .unwrap();
         assert_eq!(screen.ink(dot, 1).unwrap().fg, host.theme.lane(0));
         // The branch is not.
-        let branch = (0..60).find(|x| screen.char_at(*x, 2) == Some('●')).unwrap();
+        let branch = (0..60)
+            .find(|x| screen.char_at(*x, 2) == Some('●'))
+            .unwrap();
         assert_ne!(screen.ink(branch, 2).unwrap().fg, host.theme.lane(0));
     }
 
@@ -850,7 +921,10 @@ r\x1fr\x1f\x1fA\x1f1\x1froot\x1e";
         let (c, host) = view(&log, 120, 8);
         assert!(c.lanes > MAX_LANES, "{} lanes", c.lanes);
         assert!(c.status().contains("drawn"), "{}", c.status());
-        assert!(c.gutter <= MAX_LANES * LANE_W, "the gutter blew past the cap");
+        assert!(
+            c.gutter <= MAX_LANES * LANE_W,
+            "the gutter blew past the cap"
+        );
         let mut screen = Screen::new(120, 8);
         screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
         c.paint(&mut screen, 0, &host);
@@ -890,7 +964,10 @@ r\x1fr\x1f\x1fA\x1f1\x1froot\x1e";
         let rows = painted(&c, &host);
         assert!(rows[0].contains('@'), "{:?}", rows[0]);
         assert!(rows[1].contains('*'), "{:?}", rows[1]);
-        assert!(!rows.iter().any(|r| r.contains('│')), "box drawing survived: {rows:?}");
+        assert!(
+            !rows.iter().any(|r| r.contains('│')),
+            "box drawing survived: {rows:?}"
+        );
     }
 
     #[test]
@@ -944,6 +1021,10 @@ r\x1fr\x1f\x1fA\x1f1\x1froot\x1e";
         // truncated subject still says what it is.
         let (c, host) = view(LOG, 20, 4);
         let rows = painted(&c, &host);
-        assert!(rows[0].contains('◉'), "the graph was clipped first: {:?}", rows[0]);
+        assert!(
+            rows[0].contains('◉'),
+            "the graph was clipped first: {:?}",
+            rows[0]
+        );
     }
 }

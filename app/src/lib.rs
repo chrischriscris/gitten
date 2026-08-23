@@ -109,7 +109,11 @@ impl Started {
             true => "  ·  DEBUG BUILD — timings meaningless, use --release",
             false => "",
         };
-        format!("{binary} · {} · {}{build}", self.view.name(), self.loaded.label)
+        format!(
+            "{binary} · {} · {}{build}",
+            self.view.name(),
+            self.loaded.label
+        )
     }
 
     /// A key naming this exact view of this exact source, for a saved position.
@@ -170,7 +174,11 @@ pub struct StartClock {
 
 impl StartClock {
     pub fn new() -> Self {
-        Self { at: std::env::var_os("PLAIT_START_LOG").is_some_and(|v| v != "0").then(Instant::now) }
+        Self {
+            at: std::env::var_os("PLAIT_START_LOG")
+                .is_some_and(|v| v != "0")
+                .then(Instant::now),
+        }
     }
 
     /// Ends one stage and says how long it took. A no-op once disarmed.
@@ -265,11 +273,19 @@ impl Startup {
         match acquire::acquire(view, &source, &host) {
             Ok(loaded) => {
                 clock.stage("acquired");
-                Ok(Started { view, source, host, loaded, config: path })
+                Ok(Started {
+                    view,
+                    source,
+                    host,
+                    loaded,
+                    config: path,
+                })
             }
-            Err(e) => {
-                Err(Exit::Failed(format!("{}: {e}\n\n{}", self.binary, self.usage())))
-            }
+            Err(e) => Err(Exit::Failed(format!(
+                "{}: {e}\n\n{}",
+                self.binary,
+                self.usage()
+            ))),
         }
     }
 }
@@ -309,12 +325,16 @@ mod tests {
             panic!("a missing repository started anyway");
         };
         assert!(text.starts_with("plait-test: "), "{text}");
-        assert!(text.contains("plait-test commits"), "the usage was not shown");
+        assert!(
+            text.contains("plait-test commits"),
+            "the usage was not shown"
+        );
     }
 
     #[test]
     fn a_real_start_produces_everything_a_client_needs() {
-        let started = start("diff . HEAD~1..HEAD").unwrap_or_else(|_| panic!("this repo has history"));
+        let started =
+            start("diff . HEAD~1..HEAD").unwrap_or_else(|_| panic!("this repo has history"));
         assert_eq!(started.view, View::Diff);
         assert!(!started.loaded.data.is_empty());
         assert!(started.title("plait-test").contains("plait-test · diff · "));
@@ -328,8 +348,12 @@ mod tests {
         // A revspec and not the bare working tree: `diff .` is "no changes" on
         // whatever clean checkout runs the tests, and this wants an acquisition
         // that succeeds everywhere the repo has history at all.
-        let mut s = Startup::new("plait-test", View::Diff)
-            .args("diff --port 9000 . HEAD~1..HEAD".split_whitespace().map(String::from).collect());
+        let mut s = Startup::new("plait-test", View::Diff).args(
+            "diff --port 9000 . HEAD~1..HEAD"
+                .split_whitespace()
+                .map(String::from)
+                .collect(),
+        );
         let port = cli::take_value(s.take(), "--port").unwrap();
         assert_eq!(port.as_deref(), Some("9000"));
         let started = s.go().unwrap_or_else(|_| panic!("start"));

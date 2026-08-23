@@ -36,7 +36,12 @@ impl Log {
         let concurrent = lane_count(&rows);
         let plan = plan(&commits, &rows);
         let lanes = plan.iter().map(|d| d.lanes).max().unwrap_or(1);
-        Self { commits, plan, lanes, concurrent }
+        Self {
+            commits,
+            plan,
+            lanes,
+            concurrent,
+        }
     }
 
     pub fn len(&self) -> usize {

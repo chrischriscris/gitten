@@ -180,7 +180,7 @@ pub fn meta(out: &mut String, doc: &Doc, host: &Host, label: &str) {
         key(o, f, "wrap");
         object(o, |o, f| {
             key(o, f, "names");
-            list(o, host.wrap.names(), |o, n| string(o, n));
+            list(o, host.wrap.names(), string);
             field_str(o, f, "selected", doc.wrap_name());
             field_num(o, f, "cols", doc.cols());
             // Surfaced, never swallowed: an extension's wrap whose breaks were
@@ -521,6 +521,9 @@ diff --git a/a.rs b/a.rs
         well_formed(&meta);
         assert!(meta.contains("\"lanes\":1"), "{meta}");
         assert!(meta.contains("\"maxLanes\":12"), "{meta}");
-        assert!(meta.contains("\"laneOverflow\":"), "the palette did not ride along");
+        assert!(
+            meta.contains("\"laneOverflow\":"),
+            "the palette did not ride along"
+        );
     }
 }

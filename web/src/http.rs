@@ -36,7 +36,10 @@ impl Request {
     /// `query` stays private so nothing outside can hand itself a half-parsed
     /// one.
     pub fn new(path: &str, query: &str) -> Self {
-        Self { path: decode(path), query: query.to_string() }
+        Self {
+            path: decode(path),
+            query: query.to_string(),
+        }
     }
 
     /// A query parameter, percent-decoded. `None` when it is absent, `Some("")`
@@ -53,7 +56,9 @@ impl Request {
     /// Garbage from a client is not worth a `400`: it means a stale script, and
     /// a sensible window of rows is a more useful reply than an error.
     pub fn number(&self, name: &str, fallback: usize) -> usize {
-        self.param(name).and_then(|v| v.parse().ok()).unwrap_or(fallback)
+        self.param(name)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(fallback)
     }
 }
 
@@ -107,23 +112,48 @@ pub struct Response {
 
 impl Response {
     pub fn json(body: String) -> Self {
-        Self { status: 200, content_type: "application/json; charset=utf-8", body: body.into_bytes(), cache: false }
+        Self {
+            status: 200,
+            content_type: "application/json; charset=utf-8",
+            body: body.into_bytes(),
+            cache: false,
+        }
     }
 
     pub fn html(body: &str) -> Self {
-        Self { status: 200, content_type: "text/html; charset=utf-8", body: body.as_bytes().to_vec(), cache: false }
+        Self {
+            status: 200,
+            content_type: "text/html; charset=utf-8",
+            body: body.as_bytes().to_vec(),
+            cache: false,
+        }
     }
 
     pub fn css(body: &str) -> Self {
-        Self { status: 200, content_type: "text/css; charset=utf-8", body: body.as_bytes().to_vec(), cache: false }
+        Self {
+            status: 200,
+            content_type: "text/css; charset=utf-8",
+            body: body.as_bytes().to_vec(),
+            cache: false,
+        }
     }
 
     pub fn js(body: &str) -> Self {
-        Self { status: 200, content_type: "text/javascript; charset=utf-8", body: body.as_bytes().to_vec(), cache: false }
+        Self {
+            status: 200,
+            content_type: "text/javascript; charset=utf-8",
+            body: body.as_bytes().to_vec(),
+            cache: false,
+        }
     }
 
     pub fn status(status: u16, message: &str) -> Self {
-        Self { status, content_type: "text/plain; charset=utf-8", body: message.as_bytes().to_vec(), cache: false }
+        Self {
+            status,
+            content_type: "text/plain; charset=utf-8",
+            body: message.as_bytes().to_vec(),
+            cache: false,
+        }
     }
 }
 
@@ -204,9 +234,13 @@ fn connection(stream: TcpStream, post: &mpsc::Sender<Job>) -> std::io::Result<()
     let (reply, answers) = mpsc::channel::<Response>();
 
     loop {
-        let Some(head) = read_head(&mut reader)? else { return Ok(()) };
+        let Some(head) = read_head(&mut reader)? else {
+            return Ok(());
+        };
         let mut lines = head.lines();
-        let Some(start) = lines.next() else { return Ok(()) };
+        let Some(start) = lines.next() else {
+            return Ok(());
+        };
         let mut parts = start.split(' ');
         let method = parts.next().unwrap_or("");
         let target = parts.next().unwrap_or("/");
@@ -215,7 +249,10 @@ fn connection(stream: TcpStream, post: &mpsc::Sender<Job>) -> std::io::Result<()
             Response::status(405, "GET only")
         } else {
             let (path, query) = target.split_once('?').unwrap_or((target, ""));
-            let job = Job { request: Request::new(path, query), reply: reply.clone() };
+            let job = Job {
+                request: Request::new(path, query),
+                reply: reply.clone(),
+            };
             // A closed channel means the handler thread is gone, which means the
             // process is going. Nothing useful to answer with.
             if post.send(job).is_err() {
@@ -264,7 +301,11 @@ fn read_head(reader: &mut BufReader<TcpStream>) -> std::io::Result<Option<String
 }
 
 fn write(out: &mut TcpStream, r: &Response) -> std::io::Result<()> {
-    let cache = if r.cache { "Cache-Control: max-age=3600\r\n" } else { "Cache-Control: no-store\r\n" };
+    let cache = if r.cache {
+        "Cache-Control: max-age=3600\r\n"
+    } else {
+        "Cache-Control: no-store\r\n"
+    };
     let head = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{cache}\r\n",
         r.status,
@@ -282,7 +323,10 @@ mod tests {
     use super::*;
 
     fn req(query: &str) -> Request {
-        Request { path: "/api/rows".into(), query: query.into() }
+        Request {
+            path: "/api/rows".into(),
+            query: query.into(),
+        }
     }
 
     #[test]

@@ -92,7 +92,12 @@ impl Font {
     /// macOS's default terminal face, and what this shipped with before the font
     /// was a knob. Kept as a fallback worth naming: it is present on every mac.
     pub fn menlo() -> Self {
-        Self { family: "Menlo".into(), size: 14.0, monospaced: true, advance: 0.602 }
+        Self {
+            family: "Menlo".into(),
+            size: 14.0,
+            monospaced: true,
+            advance: 0.602,
+        }
     }
 
     /// Width of one character in pixels. Only meaningful when
@@ -143,14 +148,22 @@ mod tests {
     fn scaling_is_clamped_at_both_ends() {
         let f = Font::jetbrains_mono();
         assert_eq!(f.scaled(1.0), 14.0);
-        assert!(f.scaled(0.0) >= 1.0, "a scale of zero produced invisible text");
+        assert!(
+            f.scaled(0.0) >= 1.0,
+            "a scale of zero produced invisible text"
+        );
         assert!(f.scaled(1e9) <= 512.0, "a huge scale was not clamped");
     }
 
     #[test]
     fn a_proportional_font_is_expressible() {
         // Not a hypothetical: it is what turns Markdown table padding off.
-        let f = Font { family: "Helvetica".into(), size: 14.0, monospaced: false, advance: 0.5 };
+        let f = Font {
+            family: "Helvetica".into(),
+            size: 14.0,
+            monospaced: false,
+            advance: 0.5,
+        };
         assert!(!f.monospaced);
     }
 }

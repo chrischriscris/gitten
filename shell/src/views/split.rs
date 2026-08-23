@@ -55,9 +55,9 @@ use super::diff::{
 use gpui::*;
 use plait_core::align::align;
 use plait_core::host::Host;
+use plait_core::runs::surfaces;
 use plait_core::select::Selected;
 use plait_core::syntax::Token;
-use plait_core::runs::surfaces;
 use plait_core::theme::Theme;
 use plait_core::wrap::{Wrap, Wrapped};
 use plait_core::{LineKind, Span};
@@ -150,11 +150,18 @@ struct Line {
 /// line each time. The headers take the row's own `Arc<str>` handles for the
 /// same reason [`Row::Line`](super::diff::Row) does — see that enum.
 enum Row {
-    File { path: std::sync::Arc<str>, adds: usize, dels: usize },
+    File {
+        path: std::sync::Arc<str>,
+        adds: usize,
+        dels: usize,
+    },
     Hunk(std::sync::Arc<str>),
     /// Indices into [`SplitRows::lines`]. A context row points both columns at
     /// the same line; a lone removal or addition leaves one side `None`.
-    Pair { old: Option<u32>, new: Option<u32> },
+    Pair {
+        old: Option<u32>,
+        new: Option<u32>,
+    },
 }
 
 /// The two-column presentation. Register it as `renderers[0]` and it takes the
@@ -217,8 +224,12 @@ impl Rows for SplitRows {
         // Half of what is left over, less the slack the column already carries,
         // because a column is drawn `SLACK` characters wider than its content.
         let f = &host.font;
-        let cols =
-            columns((width - CHROME) / 2.0, SLACK * f.size * f.advance, f.size, host);
+        let cols = columns(
+            (width - CHROME) / 2.0,
+            SLACK * f.size * f.advance,
+            f.size,
+            host,
+        );
         // The width lands whatever else is true: it is what the divider and the
         // hit test are halves of, and a stale one puts the rule somewhere the
         // click does not agree with. No row count depends on it, which is why it
@@ -237,13 +248,16 @@ impl Rows for SplitRows {
             self.wrapped = Wrapped::default();
             return broken;
         }
-        self.wrapped =
-            Wrapped::build(self.lines.iter().map(|l| (l.text.as_ref(), cols)), wrap);
+        self.wrapped = Wrapped::build(self.lines.iter().map(|l| (l.text.as_ref(), cols)), wrap);
         true
     }
 
     fn build(&mut self, f: plait_core::prepared::File) {
-        self.rows.push(Row::File { path: f.path.into(), adds: f.adds, dels: f.dels });
+        self.rows.push(Row::File {
+            path: f.path.into(),
+            adds: f.adds,
+            dels: f.dels,
+        });
         for h in f.hunks {
             self.rows.push(Row::Hunk(h.header.into()));
 
@@ -272,7 +286,7 @@ impl Rows for SplitRows {
             }
 
             for slot in slots {
-                let (old, new) = (slot.old(), slot.new());
+                let (old, new) = (slot.left(), slot.right());
                 if old.is_some() && new.is_some() {
                     self.paired += 1;
                 }
@@ -321,7 +335,11 @@ impl Rows for SplitRows {
             out.push_str(&format!(" · {} moved", self.moved));
         }
         if self.wrapped.rejected() > 0 {
-            out.push_str(&format!(" · {} invalid breaks from {}", self.wrapped.rejected(), self.wrap));
+            out.push_str(&format!(
+                " · {} invalid breaks from {}",
+                self.wrapped.rejected(),
+                self.wrap
+            ));
         }
         out
     }
@@ -348,7 +366,10 @@ impl Rows for SplitRows {
                 // drag through the hole extending instead of freezing, and copies
                 // nothing for it because `selectable` has nothing to give.
                 let Some(line) = line else {
-                    return Some(Hit { part: part.part(), off: 0 });
+                    return Some(Hit {
+                        part: part.part(),
+                        off: 0,
+                    });
                 };
                 let text = &self.lines[line as usize].text;
                 let at = self.wrapped.range(line as usize, seg, text);
@@ -366,7 +387,10 @@ impl Rows for SplitRows {
                     // its line is the honest place for the caret.
                     false => text.len(),
                 };
-                Some(Hit { part: part.part(), off })
+                Some(Hit {
+                    part: part.part(),
+                    off,
+                })
             }
         }
     }
@@ -397,9 +421,7 @@ impl Rows for SplitRows {
     ) -> AnyElement {
         let theme = &host.theme;
         match &self.rows[index] {
-            Row::File { path, adds, dels } => {
-                file_header(path, *adds, *dels, theme, sel, shift)
-            }
+            Row::File { path, adds, dels } => file_header(path, *adds, *dels, theme, sel, shift),
             Row::Hunk(header) => hunk_header(header, theme, sel, shift),
             Row::Pair { old, new } => {
                 // Page padding, then two columns of *measured* width and a
@@ -458,7 +480,10 @@ impl SplitRows {
     fn chars(&self, line: Option<u32>, seg: usize) -> usize {
         self.present(line, seg).map_or(0, |i| {
             let text = &self.lines[i as usize].text;
-            text[self.wrapped.range(i as usize, seg, text)].trim_end().chars().count()
+            text[self.wrapped.range(i as usize, seg, text)]
+                .trim_end()
+                .chars()
+                .count()
         })
     }
 
@@ -470,6 +495,7 @@ impl SplitRows {
         line.filter(|i| seg < self.wrapped.rows(*i as usize))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn cell(
         &self,
         line: Option<u32>,
@@ -571,10 +597,10 @@ fn cell_frame(width: gpui::Pixels) -> Div {
 mod tests {
     // By name, not a glob: `use gpui::*` in the parent shadows `#[test]` with
     // GPUI's own attribute macro and every test in here fails to expand.
-    use super::{Column, Row, Rows, SplitRows, GUTTER_W, RULE_W, SIGN_W, PAD};
+    use super::{Column, Row, Rows, SplitRows, GUTTER_W, PAD, RULE_W, SIGN_W};
     use plait_core::host::Host;
-    use plait_core::prepared::prepare;
     use plait_core::parse_unified_diff;
+    use plait_core::prepared::prepare;
 
     const SAMPLE: &str = "\
 diff --git a/a.rs b/a.rs
@@ -612,7 +638,13 @@ diff --git a/a.rs b/a.rs
             .collect();
         assert_eq!(
             pairs,
-            vec![(true, true), (true, true), (true, true), (false, true), (true, true)]
+            vec![
+                (true, true),
+                (true, true),
+                (true, true),
+                (false, true),
+                (true, true)
+            ]
         );
         assert_eq!(r.paired, 4, "two context rows and two replace pairs");
     }
@@ -623,12 +655,22 @@ diff --git a/a.rs b/a.rs
         // Seven diff lines, seven table entries — a context row appears in both
         // columns and is still stored once. Five rows hold those seven lines.
         assert_eq!(r.lines.len(), 7);
-        assert_eq!(r.rows.iter().filter(|row| matches!(row, Row::Pair { .. })).count(), 5);
+        assert_eq!(
+            r.rows
+                .iter()
+                .filter(|row| matches!(row, Row::Pair { .. }))
+                .count(),
+            5
+        );
         let context = r
             .rows
             .iter()
             .find_map(|row| match row {
-                Row::Pair { old: Some(o), new: Some(n), .. } if o == n => Some(*o),
+                Row::Pair {
+                    old: Some(o),
+                    new: Some(n),
+                    ..
+                } if o == n => Some(*o),
                 _ => None,
             })
             .expect("a context row points both columns at one line");
@@ -646,14 +688,26 @@ diff --git a/a.rs b/a.rs
             .iter()
             .filter_map(|row| match row {
                 Row::Pair { old, new } => Some((
-                    old.and_then(|i| r.lines[i as usize].old_no).map(|n| n.to_string()).unwrap_or_default(),
-                    new.and_then(|i| r.lines[i as usize].new_no).map(|n| n.to_string()).unwrap_or_default(),
+                    old.and_then(|i| r.lines[i as usize].old_no)
+                        .map(|n| n.to_string())
+                        .unwrap_or_default(),
+                    new.and_then(|i| r.lines[i as usize].new_no)
+                        .map(|n| n.to_string())
+                        .unwrap_or_default(),
                 )),
                 _ => None,
             })
             .collect();
-        assert_eq!(numbers[3], ("".to_string(), "4".to_string()), "a lone addition");
-        assert_eq!(numbers[4], ("4".to_string(), "5".to_string()), "context after the shift");
+        assert_eq!(
+            numbers[3],
+            ("".to_string(), "4".to_string()),
+            "a lone addition"
+        );
+        assert_eq!(
+            numbers[4],
+            ("4".to_string(), "5".to_string()),
+            "context after the shift"
+        );
     }
 
     #[test]
@@ -662,7 +716,9 @@ diff --git a/a.rs b/a.rs
         // for a row is whichever of its two lines is longer.
         let r = built();
         for i in (0..r.len()).filter(|i| matches!(r.rows[*i], Row::Pair { .. })) {
-            let Row::Pair { old, new } = r.rows[i] else { unreachable!() };
+            let Row::Pair { old, new } = r.rows[i] else {
+                unreachable!()
+            };
             let of = |line: Option<u32>| {
                 line.map_or(0, |l| r.lines[l as usize].text.trim_end().chars().count())
             };
@@ -696,8 +752,12 @@ diff --git a/a.rs b/a.rs
         // The two columns wrap independently — a long removal beside a short
         // addition — and the row has to hold the longer of them.
         let (r, _) = wrapped(LOPSIDED, 20);
-        let pair = (0..r.len()).find(|i| matches!(r.rows[*i], Row::Pair { .. })).unwrap();
-        let Row::Pair { old, new } = r.rows[pair] else { unreachable!() };
+        let pair = (0..r.len())
+            .find(|i| matches!(r.rows[*i], Row::Pair { .. }))
+            .unwrap();
+        let Row::Pair { old, new } = r.rows[pair] else {
+            unreachable!()
+        };
         let (old, new) = (old.unwrap() as usize, new.unwrap() as usize);
         assert!(r.wrapped.rows(old) > 1, "the long side did not wrap");
         assert_eq!(r.wrapped.rows(new), 1, "the short side wrapped");
@@ -714,13 +774,18 @@ diff --git a/a.rs b/a.rs
         let width = super::CHROME + 2.0 * (20.0 + super::SLACK + 0.5) * f.size * f.advance;
         let half = r.cell_px(width);
         assert_eq!(r.cols, 20);
-        let pair = (0..r.len()).find(|i| matches!(r.rows[*i], Row::Pair { .. })).unwrap();
+        let pair = (0..r.len())
+            .find(|i| matches!(r.rows[*i], Row::Pair { .. }))
+            .unwrap();
         // Wrapping on, every row fits its column, so there is nothing to the
         // right of the window at all.
         assert_eq!(r.overflow(pair, 0, width, &host), 0.0);
 
         let off = host.wrap.at(host.wrap.position("off").unwrap());
-        assert!(r.reflow(width, &host, off), "the rows did not come back together");
+        assert!(
+            r.reflow(width, &host, off),
+            "the rows did not come back together"
+        );
         assert_eq!(r.cell_px(width), half, "the divider moved with the wrap");
         // And now the long side runs past its column's edge by however much of
         // it did not fit.
@@ -748,16 +813,33 @@ diff --git a/a.rs b/a.rs
         let host = Host::new();
         let mut r = built();
         r.reflow(900.0, &host, host.wrap.current());
-        let pair = (0..r.len()).find(|i| matches!(r.rows[*i], Row::Pair { .. })).unwrap();
+        let pair = (0..r.len())
+            .find(|i| matches!(r.rows[*i], Row::Pair { .. }))
+            .unwrap();
         let rule_at = PAD + r.cell_px(900.0);
 
-        let left = r.hit(pair, 0, PAD + GUTTER_W + SIGN_W + 2.0, &host, 0.0).unwrap();
+        let left = r
+            .hit(pair, 0, PAD + GUTTER_W + SIGN_W + 2.0, &host, 0.0)
+            .unwrap();
         assert_eq!(left.part, Column::Old.part());
-        let right = r.hit(pair, 0, rule_at + RULE_W + GUTTER_W + SIGN_W + 2.0, &host, 0.0).unwrap();
+        let right = r
+            .hit(
+                pair,
+                0,
+                rule_at + RULE_W + GUTTER_W + SIGN_W + 2.0,
+                &host,
+                0.0,
+            )
+            .unwrap();
         assert_eq!(right.part, Column::New.part());
         // Either side of the rule itself, and nothing in between.
         assert_eq!(r.hit(pair, 0, rule_at - 1.0, &host, 0.0).unwrap().part, 0);
-        assert_eq!(r.hit(pair, 0, rule_at + RULE_W + 1.0, &host, 0.0).unwrap().part, 1);
+        assert_eq!(
+            r.hit(pair, 0, rule_at + RULE_W + 1.0, &host, 0.0)
+                .unwrap()
+                .part,
+            1
+        );
         // The page padding is the left column's too: a click on it is a click in
         // the old half, not a miss.
         assert_eq!(r.hit(pair, 0, PAD - 1.0, &host, 0.0).unwrap().part, 0);
@@ -770,8 +852,9 @@ diff --git a/a.rs b/a.rs
         let host = Host::new();
         let mut r = built();
         r.reflow(900.0, &host, host.wrap.current());
-        let pairs: Vec<usize> =
-            (0..r.len()).filter(|i| matches!(r.rows[*i], Row::Pair { .. })).collect();
+        let pairs: Vec<usize> = (0..r.len())
+            .filter(|i| matches!(r.rows[*i], Row::Pair { .. }))
+            .collect();
         let mut both = 0;
         let mut holes = 0;
         for i in pairs {
@@ -794,8 +877,14 @@ diff --git a/a.rs b/a.rs
         // anything scrolled.
         let host = Host::new();
         let mut r = built();
-        r.reflow(900.0, &host, host.wrap.at(host.wrap.position("off").unwrap()));
-        let pair = (0..r.len()).find(|i| matches!(r.rows[*i], Row::Pair { .. })).unwrap();
+        r.reflow(
+            900.0,
+            &host,
+            host.wrap.at(host.wrap.position("off").unwrap()),
+        );
+        let pair = (0..r.len())
+            .find(|i| matches!(r.rows[*i], Row::Pair { .. }))
+            .unwrap();
         let cw = host.font.char_width();
         let shift = 4.0 * cw;
         // A fifth of a character in, and not half: `column_at` rounds, so a
@@ -838,7 +927,7 @@ diff --git a/a.rs b/a.rs
 mod list_layout_tests {
     use std::rc::Rc;
 
-    use super::{Rows, SplitRows, RULE_W, PAD};
+    use super::{Rows, SplitRows, PAD, RULE_W};
     use gpui::{
         px, size, AppContext, Bounds, Context, IntoElement, Render, Styled, WindowBounds,
         WindowOptions,
@@ -912,7 +1001,10 @@ diff --git a/.github/workflows/check.yml b/.github/workflows/check.yml
                 flat.push((i, seg as u16));
             }
         }
-        assert!(flat.len() > 6, "nothing wrapped; the fixture is not exercising the bug");
+        assert!(
+            flat.len() > 6,
+            "nothing wrapped; the fixture is not exercising the bug"
+        );
         (Rc::new(r), Rc::new(host), flat)
     }
 
@@ -930,7 +1022,11 @@ diff --git a/.github/workflows/check.yml b/.github/workflows/check.yml
                     ..Default::default()
                 },
                 |_window, cx| {
-                    cx.new(|_| Probe { rows, host, flat: Rc::new(flat[..n].to_vec()) })
+                    cx.new(|_| Probe {
+                        rows,
+                        host,
+                        flat: Rc::new(flat[..n].to_vec()),
+                    })
                 },
             )
             .unwrap()
@@ -959,7 +1055,11 @@ diff --git a/.github/workflows/check.yml b/.github/workflows/check.yml
                 "row {k} new cell {} != {half}",
                 nw.size.width
             );
-            assert_eq!(nw.origin.x, px(PAD + half + RULE_W), "row {k} new column drifted");
+            assert_eq!(
+                nw.origin.x,
+                px(PAD + half + RULE_W),
+                "row {k} new column drifted"
+            );
         }
         assert!(checked >= 3, "only {checked} rows laid out cells");
     }
@@ -1007,15 +1107,30 @@ diff --git a/.github/workflows/check.yml b/.github/workflows/check.yml
                     "{what}: {actual} != {expected}"
                 );
             };
-            drift(f32::from(o.origin.x), PAD, format!("row {k} old column drifted"));
+            drift(
+                f32::from(o.origin.x),
+                PAD,
+                format!("row {k} old column drifted"),
+            );
             drift(
                 f32::from(n.origin.x),
                 PAD + half + RULE_W,
                 format!("row {k} new column drifted"),
             );
-            drift(f32::from(o.size.width), half, format!("row {k} old cell width"));
-            drift(f32::from(n.size.width), half, format!("row {k} new cell width"));
+            drift(
+                f32::from(o.size.width),
+                half,
+                format!("row {k} old cell width"),
+            );
+            drift(
+                f32::from(n.size.width),
+                half,
+                format!("row {k} new cell width"),
+            );
         }
-        assert!(checked >= 5, "only {checked} rows painted; the fixture shrank");
+        assert!(
+            checked >= 5,
+            "only {checked} rows painted; the fixture shrank"
+        );
     }
 }

@@ -23,11 +23,21 @@ use plait_core::wrap::Wrapped;
 use plait_core::{parse_unified_diff, LineKind};
 
 fn fg(c: Rgb) -> String {
-    format!("\x1b[38;2;{};{};{}m", c >> 16 & 0xff, c >> 8 & 0xff, c & 0xff)
+    format!(
+        "\x1b[38;2;{};{};{}m",
+        c >> 16 & 0xff,
+        c >> 8 & 0xff,
+        c & 0xff
+    )
 }
 
 fn bg(c: Rgb) -> String {
-    format!("\x1b[48;2;{};{};{}m", c >> 16 & 0xff, c >> 8 & 0xff, c & 0xff)
+    format!(
+        "\x1b[48;2;{};{};{}m",
+        c >> 16 & 0xff,
+        c >> 8 & 0xff,
+        c & 0xff
+    )
 }
 
 /// Underline a piece if any intraline span covers it. Cheap and approximate —
@@ -76,15 +86,19 @@ fn furniture(block: Block, p: &MarkdownPalette, first: bool) -> String {
         Block::Heading(l) => format!("{}{}", fg(p.marker), "  ".repeat(l as usize - 1)),
         Block::Bullet(d) => {
             let glyph = ["•", "◦", "▪", "·"][(d as usize).min(3)];
-            format!("{indent}{}{} ", fg(p.marker), if first { glyph } else { " " })
+            format!(
+                "{indent}{}{} ",
+                fg(p.marker),
+                if first { glyph } else { " " }
+            )
         }
         Block::Quote(_) => format!("{indent}{}│ ", fg(p.quote_bar)),
         Block::Fence | Block::Code => format!("{}│ ", fg(p.code_bar)),
         Block::Rule => format!("{}{}", fg(p.rule), "─".repeat(40)),
         // A table draws its own grid inside its text; anything added in front of
         // it would shift one row of the grid relative to the next.
-        Block::Table | Block::TableRule => format!("{}", fg(p.marker)),
-        _ => format!("{indent}"),
+        Block::Table | Block::TableRule => fg(p.marker).to_string(),
+        _ => indent.to_string(),
     }
 }
 
@@ -124,14 +138,22 @@ fn main() {
         blocks.push(
             f.hunks
                 .iter_mut()
-                .map(|h| if md { lay_out(&mut h.lines, &layout) } else { Vec::new() })
+                .map(|h| {
+                    if md {
+                        lay_out(&mut h.lines, &layout)
+                    } else {
+                        Vec::new()
+                    }
+                })
                 .collect(),
         );
     }
     // Where every line breaks, from the host's own registry. The sign column and
     // one space are all this draws in front of the text, so that is the chrome.
-    let cols: usize =
-        std::env::var("WRAP_COLS").ok().and_then(|v| v.parse().ok()).unwrap_or(100);
+    let cols: usize = std::env::var("WRAP_COLS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100);
     let wrapped: Vec<Wrapped> = p
         .files
         .iter()
@@ -179,15 +201,27 @@ fn main() {
                 }
                 left -= 1;
                 let (sign, row_bg, row_fg, surface, word) = match l.kind {
-                    LineKind::Added => {
-                        ("+", theme.diff.added_bg, theme.diff.added_fg, Surface::Added, Surface::AddedWord)
-                    }
-                    LineKind::Removed => {
-                        ("-", theme.diff.removed_bg, theme.diff.removed_fg, Surface::Removed, Surface::RemovedWord)
-                    }
-                    LineKind::Context => {
-                        (" ", theme.diff.context_bg, theme.diff.context_fg, Surface::Context, Surface::Context)
-                    }
+                    LineKind::Added => (
+                        "+",
+                        theme.diff.added_bg,
+                        theme.diff.added_fg,
+                        Surface::Added,
+                        Surface::AddedWord,
+                    ),
+                    LineKind::Removed => (
+                        "-",
+                        theme.diff.removed_bg,
+                        theme.diff.removed_fg,
+                        Surface::Removed,
+                        Surface::RemovedWord,
+                    ),
+                    LineKind::Context => (
+                        " ",
+                        theme.diff.context_bg,
+                        theme.diff.context_fg,
+                        Surface::Context,
+                        Surface::Context,
+                    ),
                 };
                 let block = hb.get(i).copied();
                 // One pass per row the line takes. A continuation gets a blank
@@ -227,17 +261,19 @@ fn main() {
                         if e <= s {
                             continue;
                         }
-                        print!("{}", underlined(&l, cursor, s, &l.text[cursor..s]));
-                        let on_word =
-                            l.spans.iter().any(|w| (w.start as usize) < e && (w.end as usize) > s);
+                        print!("{}", underlined(l, cursor, s, &l.text[cursor..s]));
+                        let on_word = l
+                            .spans
+                            .iter()
+                            .any(|w| (w.start as usize) < e && (w.end as usize) > s);
                         let style = theme.syntax_on(t.kind, if on_word { word } else { surface });
                         let piece = styled(style, &l.text[s..e]);
-                        print!("{}{}", underlined(&l, s, e, &piece), fg(row_fg));
+                        print!("{}{}", underlined(l, s, e, &piece), fg(row_fg));
                         cursor = e;
                     }
                     println!(
                         "{}\x1b[0m",
-                        underlined(&l, cursor, span.end, &l.text[cursor..span.end])
+                        underlined(l, cursor, span.end, &l.text[cursor..span.end])
                     );
                 }
             }

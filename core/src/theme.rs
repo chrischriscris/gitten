@@ -73,7 +73,11 @@ pub struct Style {
 
 impl Style {
     pub const fn fg(fg: Rgb) -> Self {
-        Self { fg, bold: false, italic: false }
+        Self {
+            fg,
+            bold: false,
+            italic: false,
+        }
     }
     pub const fn bold(mut self) -> Self {
         self.bold = true;
@@ -508,14 +512,15 @@ impl Theme {
             for surface in Surface::ALL {
                 let base = self.syntax[kind.index()];
                 let bg = self.background(surface);
-                self.resolved[kind.index() * Surface::COUNT + surface.index()] =
-                    Style { fg: readable(base.fg, bg, self.min_contrast), ..base };
+                self.resolved[kind.index() * Surface::COUNT + surface.index()] = Style {
+                    fg: readable(base.fg, bg, self.min_contrast),
+                    ..base
+                };
             }
         }
         for surface in Surface::ALL {
             let bg = self.background(surface);
-            self.gutter[surface.index()] =
-                readable(self.diff.gutter_fg, bg, self.min_furniture);
+            self.gutter[surface.index()] = readable(self.diff.gutter_fg, bg, self.min_furniture);
         }
     }
 
@@ -579,7 +584,9 @@ impl Theme {
         if self.authors.is_empty() {
             return self.chrome.dim;
         }
-        let hash = author.bytes().fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
+        let hash = author
+            .bytes()
+            .fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
         self.authors[hash as usize % self.authors.len()]
     }
 }
@@ -701,7 +708,11 @@ pub fn readable(fg: Rgb, bg: Rgb, target: f32) -> Rgb {
     if contrast(fg, bg) >= target {
         return fg;
     }
-    let toward = if luminance(bg) < 0.35 { 0xffffff } else { 0x000000 };
+    let toward = if luminance(bg) < 0.35 {
+        0xffffff
+    } else {
+        0x000000
+    };
     const STEPS: u32 = 24;
     for i in 1..=STEPS {
         let candidate = mix(fg, toward, i as f32 / STEPS as f32);
@@ -760,7 +771,10 @@ mod tests {
         let lifted = t.syntax_on(Kind::Comment, Surface::AddedWord).fg;
         assert_ne!(lifted, t.syntax_on(Kind::Comment, Surface::Context).fg);
         assert!(lifted > 0x615a52, "lifted toward white on a dark surface");
-        assert!(t.syntax_on(Kind::Comment, Surface::AddedWord).italic, "style survives");
+        assert!(
+            t.syntax_on(Kind::Comment, Surface::AddedWord).italic,
+            "style survives"
+        );
     }
 
     #[test]
@@ -772,9 +786,15 @@ mod tests {
         let t = Theme::light();
         let base = t.syntax(Kind::Comment).fg;
         let fg = t.syntax_on(Kind::Comment, Surface::AddedWord).fg;
-        assert!(fg < base, "text should darken on paper, got {fg:06x} from {base:06x}");
+        assert!(
+            fg < base,
+            "text should darken on paper, got {fg:06x} from {base:06x}"
+        );
         assert!(contrast(fg, t.background(Surface::AddedWord)) >= t.min_contrast);
-        assert!(t.syntax_on(Kind::Comment, Surface::AddedWord).italic, "style survives");
+        assert!(
+            t.syntax_on(Kind::Comment, Surface::AddedWord).italic,
+            "style survives"
+        );
     }
 
     #[test]
@@ -832,7 +852,11 @@ mod tests {
             let d = &t.diff;
             for (what, fg, bgs) in [
                 ("added_fg", d.added_fg, [d.added_bg, d.moved_added_bg]),
-                ("removed_fg", d.removed_fg, [d.removed_bg, d.moved_removed_bg]),
+                (
+                    "removed_fg",
+                    d.removed_fg,
+                    [d.removed_bg, d.moved_removed_bg],
+                ),
                 ("context_fg", d.context_fg, [d.context_bg, d.context_bg]),
             ] {
                 for bg in bgs {
@@ -859,7 +883,11 @@ mod tests {
             let d = &t.diff;
             for (what, bg) in [("added", d.added_bg), ("removed", d.removed_bg)] {
                 let got = contrast(d.absent_bg, bg);
-                assert!(got >= 1.15, "{}: absent is {got:.2}:1 against {what}", t.name);
+                assert!(
+                    got >= 1.15,
+                    "{}: absent is {got:.2}:1 against {what}",
+                    t.name
+                );
             }
         }
     }
@@ -908,9 +936,21 @@ mod tests {
         for t in Themes::builtin().0 {
             let file = contrast(t.diff.file_bg, t.diff.context_bg);
             let hunk = contrast(t.diff.hunk_bg, t.diff.context_bg);
-            assert!(file > hunk, "{}: file {file:.3} does not out-read hunk {hunk:.3}", t.name);
-            assert!(file >= 1.15, "{}: a file header at {file:.3} is not a boundary", t.name);
-            assert_ne!(t.diff.file_bg, t.chrome.title_bg, "{}: one colour, two meanings", t.name);
+            assert!(
+                file > hunk,
+                "{}: file {file:.3} does not out-read hunk {hunk:.3}",
+                t.name
+            );
+            assert!(
+                file >= 1.15,
+                "{}: a file header at {file:.3} is not a boundary",
+                t.name
+            );
+            assert_ne!(
+                t.diff.file_bg, t.chrome.title_bg,
+                "{}: one colour, two meanings",
+                t.name
+            );
         }
     }
 
@@ -932,7 +972,10 @@ mod tests {
         t.diff.moved_added_bg = 0x002b36;
         t.lanes = vec![0xb58900];
         assert_eq!(t.syntax(Kind::Comment).fg, 0x93a1a1);
-        assert!(!t.syntax(Kind::Comment).italic, "the whole style is replaced");
+        assert!(
+            !t.syntax(Kind::Comment).italic,
+            "the whole style is replaced"
+        );
         assert_eq!(t.lane(0), 0xb58900);
         assert_eq!(t.lane(97), 0xb58900, "lane colours cycle");
     }

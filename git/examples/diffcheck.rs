@@ -52,13 +52,18 @@ fn main() {
         }
     };
     let acquire = t.elapsed();
-    let (old_lines, new_lines): (usize, usize) =
-        pairs.iter().fold((0, 0), |(o, n), p| (o + p.old.len(), n + p.new.len()));
+    let (old_lines, new_lines): (usize, usize) = pairs
+        .iter()
+        .fold((0, 0), |(o, n), p| (o + p.old.len(), n + p.new.len()));
 
     println!(
         "{} {}\n  {} files  {} old lines  {} new lines  acquire {:.1?}  ({} binary)",
         repo.display(),
-        if revspec.is_empty() { "(working tree)" } else { &revspec },
+        if revspec.is_empty() {
+            "(working tree)"
+        } else {
+            &revspec
+        },
         pairs.len(),
         old_lines,
         new_lines,
@@ -73,12 +78,32 @@ fn main() {
     // thing. That mistake cost a real half hour — it reported a two-line
     // difference on this file and the cause was the flag list, not the code.
     for (name, algorithm, flags, ws) in [
-        ("histogram", "histogram", &["--histogram"][..], Whitespace::Exact),
+        (
+            "histogram",
+            "histogram",
+            &["--histogram"][..],
+            Whitespace::Exact,
+        ),
         ("patience", "patience", &["--patience"], Whitespace::Exact),
         ("myers", "myers", &["--minimal"], Whitespace::Exact),
-        ("ws-eol", "histogram", &["--histogram", "--ignore-space-at-eol"], Whitespace::Trailing),
-        ("ws-change", "histogram", &["--histogram", "-b"], Whitespace::Change),
-        ("ws-all", "histogram", &["--histogram", "-w"], Whitespace::All),
+        (
+            "ws-eol",
+            "histogram",
+            &["--histogram", "--ignore-space-at-eol"],
+            Whitespace::Trailing,
+        ),
+        (
+            "ws-change",
+            "histogram",
+            &["--histogram", "-b"],
+            Whitespace::Change,
+        ),
+        (
+            "ws-all",
+            "histogram",
+            &["--histogram", "-w"],
+            Whitespace::All,
+        ),
     ] {
         let mut differs = Differs::builtin();
         assert!(differs.select(algorithm), "{algorithm} is not registered");
@@ -114,13 +139,9 @@ fn main() {
             let g = theirs
                 .iter()
                 .find(|f| &f.path == path)
-                .map(|f| ranges(f))
+                .map(ranges)
                 .unwrap_or_default();
-            misplaced += ours
-                .iter()
-                .zip(g.iter())
-                .filter(|(a, b)| a != b)
-                .count()
+            misplaced += ours.iter().zip(g.iter()).filter(|(a, b)| a != b).count()
                 + ours.len().abs_diff(g.len());
         }
         // Positions must match — except for myers, where they need not. A
@@ -177,7 +198,10 @@ fn main() {
 /// the same scan, which is one place for the two to disagree about what a header
 /// is — and this comparison is the thing that decides whether a differ is right.
 fn ranges(f: &plait_core::FileDiff) -> Vec<String> {
-    f.hunks.iter().map(|h| plait_core::hunk_parts(&h.header).0.to_string()).collect()
+    f.hunks
+        .iter()
+        .map(|h| plait_core::hunk_parts(&h.header).0.to_string())
+        .collect()
 }
 
 fn git_diff(
@@ -191,7 +215,15 @@ fn git_diff(
     } else if revspec.contains("..") {
         vec!["-C", dir, "diff", "--no-ext-diff", "-M", revspec]
     } else {
-        vec!["-C", dir, "show", "--no-ext-diff", "-M", "--format=", revspec]
+        vec![
+            "-C",
+            dir,
+            "show",
+            "--no-ext-diff",
+            "-M",
+            "--format=",
+            revspec,
+        ]
     };
     args.extend_from_slice(flags);
     let t = Instant::now();
@@ -212,7 +244,6 @@ fn git_diff(
     (adds, dels, hunks, elapsed, files)
 }
 
-
 /// The files this algorithm did worst on relative to git, so a regression has a
 /// name and a path rather than only a total.
 fn report_worst(
@@ -231,7 +262,15 @@ fn report_worst(
     } else if revspec.contains("..") {
         vec!["-C", dir, "diff", "--no-ext-diff", "-M", revspec]
     } else {
-        vec!["-C", dir, "show", "--no-ext-diff", "-M", "--format=", revspec]
+        vec![
+            "-C",
+            dir,
+            "show",
+            "--no-ext-diff",
+            "-M",
+            "--format=",
+            revspec,
+        ]
     };
     args.extend_from_slice(flags);
     let out = Command::new("git").args(&args).output().expect("git");
@@ -252,7 +291,12 @@ fn report_worst(
             .map(count)
             .unwrap_or(0);
         if ours != theirs {
-            rows.push((ours as isize - theirs as isize, p.path.clone(), ours, theirs));
+            rows.push((
+                ours as isize - theirs as isize,
+                p.path.clone(),
+                ours,
+                theirs,
+            ));
         }
     }
     rows.sort_by_key(|r| -r.0.abs());

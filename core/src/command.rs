@@ -143,7 +143,12 @@ pub struct Key {
 
 impl Key {
     pub fn new(code: Code, ctrl: bool, alt: bool, shift: bool) -> Self {
-        Self { code, ctrl, alt, shift: shift && !matches!(code, Code::Char(_)) }
+        Self {
+            code,
+            ctrl,
+            alt,
+            shift: shift && !matches!(code, Code::Char(_)),
+        }
     }
 
     pub fn plain(code: Code) -> Self {
@@ -204,7 +209,11 @@ pub fn parse_chord(s: &str) -> Option<Chord> {
 }
 
 pub fn chord_string(chord: &[Key]) -> String {
-    chord.iter().map(Key::to_string).collect::<Vec<_>>().join(" ")
+    chord
+        .iter()
+        .map(Key::to_string)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The mode every client is always in, and the one an unqualified binding lands
@@ -290,7 +299,9 @@ impl Default for Keymap {
 
 impl Keymap {
     pub fn empty() -> Self {
-        Self { bindings: Vec::new() }
+        Self {
+            bindings: Vec::new(),
+        }
     }
 
     /// The shipped keyboard. lazygit's, where lazygit has an opinion, and vi's
@@ -303,7 +314,8 @@ impl Keymap {
     pub fn builtin() -> Self {
         let mut k = Self::empty();
         let mut bind = |mode: &str, chord: &str, command: &str| {
-            k.bind(mode, chord, command).expect("a shipped binding conflicts with another")
+            k.bind(mode, chord, command)
+                .expect("a shipped binding conflicts with another")
         };
 
         bind(GLOBAL, "q", "quit");
@@ -375,9 +387,16 @@ impl Keymap {
                 chord_string(&other),
             ));
         }
-        let binding =
-            Binding { mode: mode.into(), chord, command: command.into() };
-        match self.bindings.iter().position(|b| b.mode == mode && b.chord == binding.chord) {
+        let binding = Binding {
+            mode: mode.into(),
+            chord,
+            command: command.into(),
+        };
+        match self
+            .bindings
+            .iter()
+            .position(|b| b.mode == mode && b.chord == binding.chord)
+        {
             Some(i) => self.bindings[i] = binding,
             None => self.bindings.push(binding),
         }
@@ -388,9 +407,12 @@ impl Keymap {
     /// built-in has to be expressible, or a shipped key can only be moved and
     /// never removed.
     pub fn unbind(&mut self, mode: &str, chord: &str) -> bool {
-        let Some(chord) = parse_chord(chord) else { return false };
+        let Some(chord) = parse_chord(chord) else {
+            return false;
+        };
         let before = self.bindings.len();
-        self.bindings.retain(|b| !(b.mode == mode && b.chord == chord));
+        self.bindings
+            .retain(|b| !(b.mode == mode && b.chord == chord));
         self.bindings.len() != before
     }
 
@@ -411,16 +433,16 @@ impl Keymap {
             return Resolve::None;
         }
         for mode in modes.as_slice().iter().rev() {
-            if let Some(b) =
-                self.bindings.iter().find(|b| b.mode == *mode && b.chord == pending)
+            if let Some(b) = self
+                .bindings
+                .iter()
+                .find(|b| b.mode == *mode && b.chord == pending)
             {
                 return Resolve::Run(&b.command);
             }
-            if self
-                .bindings
-                .iter()
-                .any(|b| b.mode == *mode && b.chord.len() > pending.len() && b.chord.starts_with(pending))
-            {
+            if self.bindings.iter().any(|b| {
+                b.mode == *mode && b.chord.len() > pending.len() && b.chord.starts_with(pending)
+            }) {
                 return Resolve::Pending;
             }
         }
@@ -500,7 +522,10 @@ impl Commands {
             ("commits.open-diff", "the diff for this commit"),
             ("select.all", "select the whole view"),
             ("select.none", "drop the selection"),
-            ("copy.selection", "copy the selection, or the row the cursor is on"),
+            (
+                "copy.selection",
+                "copy the selection, or the row the cursor is on",
+            ),
         ] {
             c.register(name, doc);
         }
@@ -510,7 +535,10 @@ impl Commands {
     /// Adds one, replacing any with the same name — so a built-in's description
     /// can be corrected rather than only added to.
     pub fn register(&mut self, name: impl Into<String>, doc: impl Into<String>) {
-        let command = Command { name: name.into(), doc: doc.into() };
+        let command = Command {
+            name: name.into(),
+            doc: doc.into(),
+        };
         match self.0.iter().position(|c| c.name == command.name) {
             Some(i) => self.0[i] = command,
             None => self.0.push(command),
@@ -543,8 +571,22 @@ mod tests {
         // The property a config file rests on: a settings panel writes what it
         // read, and `plait config` emits a file that parses back.
         for s in [
-            "j", "G", "?", "-", "space", "esc", "enter", "tab", "backtab", "up", "pagedown",
-            "ctrl-d", "alt-enter", "ctrl-alt-left", "shift-tab", "ctrl--",
+            "j",
+            "G",
+            "?",
+            "-",
+            "space",
+            "esc",
+            "enter",
+            "tab",
+            "backtab",
+            "up",
+            "pagedown",
+            "ctrl-d",
+            "alt-enter",
+            "ctrl-alt-left",
+            "shift-tab",
+            "ctrl--",
         ] {
             let key = Key::parse(s).unwrap_or_else(|| panic!("{s} did not parse"));
             assert_eq!(key.to_string(), s, "{s} did not round-trip");
@@ -567,7 +609,11 @@ mod tests {
     fn nonsense_is_none_rather_than_a_guess() {
         assert_eq!(Key::parse(""), None);
         assert_eq!(Key::parse("ctrl-"), None);
-        assert_eq!(Key::parse("hyper-j"), None, "an unknown modifier is not a key name");
+        assert_eq!(
+            Key::parse("hyper-j"),
+            None,
+            "an unknown modifier is not a key name"
+        );
         assert_eq!(Key::parse("pgdown"), None);
         assert_eq!(parse_chord("   "), None);
     }
@@ -583,7 +629,10 @@ mod tests {
         let k = Keymap::builtin();
         let modes = Modes::new();
         assert_eq!(k.resolve(&modes, &keys("j")), Resolve::Run("view.down"));
-        assert_eq!(k.resolve(&modes, &keys("ctrl-d")), Resolve::Run("view.page-down"));
+        assert_eq!(
+            k.resolve(&modes, &keys("ctrl-d")),
+            Resolve::Run("view.page-down")
+        );
         assert_eq!(k.resolve(&modes, &keys("G")), Resolve::Run("view.bottom"));
         assert_eq!(k.resolve(&modes, &keys("z")), Resolve::None);
     }
@@ -592,10 +641,16 @@ mod tests {
     fn the_wheel_is_a_key_like_any_other() {
         let k = Keymap::builtin();
         let modes = Modes::new();
-        assert_eq!(k.resolve(&modes, &keys("wheeldown")), Resolve::Run("view.scroll-down"));
+        assert_eq!(
+            k.resolve(&modes, &keys("wheeldown")),
+            Resolve::Run("view.scroll-down")
+        );
         // Round-trips, so `./dev config` writes a line that parses back.
         assert_eq!(Key::parse("wheelup").unwrap().to_string(), "wheelup");
-        assert_eq!(Key::parse("ctrl-wheeldown").unwrap().to_string(), "ctrl-wheeldown");
+        assert_eq!(
+            Key::parse("ctrl-wheeldown").unwrap().to_string(),
+            "ctrl-wheeldown"
+        );
     }
 
     #[test]
@@ -604,14 +659,23 @@ mod tests {
         let mut modes = Modes::new();
         modes.push("diff");
         // Its own.
-        assert_eq!(k.resolve(&modes, &keys("s")), Resolve::Run("diff.cycle-layout"));
+        assert_eq!(
+            k.resolve(&modes, &keys("s")),
+            Resolve::Run("diff.cycle-layout")
+        );
         // Inherited, with nothing repeated in the mode to get it.
         assert_eq!(k.resolve(&modes, &keys("j")), Resolve::Run("view.down"));
         // Overridden.
         k.bind("diff", "j", "diff.next-file").unwrap();
-        assert_eq!(k.resolve(&modes, &keys("j")), Resolve::Run("diff.next-file"));
+        assert_eq!(
+            k.resolve(&modes, &keys("j")),
+            Resolve::Run("diff.next-file")
+        );
         // ...and only inside that mode.
-        assert_eq!(k.resolve(&Modes::new(), &keys("j")), Resolve::Run("view.down"));
+        assert_eq!(
+            k.resolve(&Modes::new(), &keys("j")),
+            Resolve::Run("view.down")
+        );
     }
 
     #[test]
@@ -627,7 +691,10 @@ mod tests {
         k.bind(GLOBAL, "ctrl-w l", "pane.right").unwrap();
         let modes = Modes::new();
         assert_eq!(k.resolve(&modes, &keys("ctrl-w")), Resolve::Pending);
-        assert_eq!(k.resolve(&modes, &keys("ctrl-w l")), Resolve::Run("pane.right"));
+        assert_eq!(
+            k.resolve(&modes, &keys("ctrl-w l")),
+            Resolve::Run("pane.right")
+        );
         assert_eq!(k.resolve(&modes, &keys("ctrl-w x")), Resolve::None);
     }
 
@@ -658,7 +725,12 @@ mod tests {
         let k = Keymap::builtin();
         assert!(!k.bindings().is_empty());
         for b in k.bindings() {
-            assert_eq!(b.chord.len(), 1, "{} is a chord in the shipped map", chord_string(&b.chord));
+            assert_eq!(
+                b.chord.len(),
+                1,
+                "{} is a chord in the shipped map",
+                chord_string(&b.chord)
+            );
         }
     }
 
@@ -666,8 +738,14 @@ mod tests {
     fn rebinding_replaces_and_unbinding_removes() {
         let mut k = Keymap::builtin();
         k.bind(GLOBAL, "j", "view.up").unwrap();
-        assert_eq!(k.resolve(&Modes::new(), &keys("j")), Resolve::Run("view.up"));
-        assert_eq!(k.bindings().iter().filter(|b| b.chord == keys("j")).count(), 1);
+        assert_eq!(
+            k.resolve(&Modes::new(), &keys("j")),
+            Resolve::Run("view.up")
+        );
+        assert_eq!(
+            k.bindings().iter().filter(|b| b.chord == keys("j")).count(),
+            1
+        );
         // A built-in has to be removable, not only movable.
         assert!(k.unbind(GLOBAL, "j"));
         assert_eq!(k.resolve(&Modes::new(), &keys("j")), Resolve::None);
@@ -697,7 +775,11 @@ mod tests {
     fn every_registered_command_says_what_it_does() {
         for c in Commands::builtin().all() {
             assert!(!c.doc.is_empty(), "{} has no description", c.name);
-            assert!(!c.doc.ends_with('.'), "{} reads as a sentence, not a label", c.name);
+            assert!(
+                !c.doc.ends_with('.'),
+                "{} reads as a sentence, not a label",
+                c.name
+            );
         }
     }
 
@@ -712,7 +794,10 @@ mod tests {
         let mut modes = Modes::new();
         modes.push("diff");
         assert!(commands.known("blame.toggle"));
-        assert_eq!(keys_.resolve(&modes, &keys("b")), Resolve::Run("blame.toggle"));
+        assert_eq!(
+            keys_.resolve(&modes, &keys("b")),
+            Resolve::Run("blame.toggle")
+        );
         assert_eq!(keys_.keys_for("blame.toggle"), vec!["b"]);
     }
 

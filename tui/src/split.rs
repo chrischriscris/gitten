@@ -80,11 +80,18 @@ impl Column {
 const RULE: &str = "│";
 
 enum Row {
-    File { path: String, adds: usize, dels: usize },
+    File {
+        path: String,
+        adds: usize,
+        dels: usize,
+    },
     Hunk(String),
     /// Indices into [`SplitRows::lines`]. A context row points both columns at
     /// the same line; a lone removal or addition leaves one side `None`.
-    Pair { old: Option<u32>, new: Option<u32> },
+    Pair {
+        old: Option<u32>,
+        new: Option<u32>,
+    },
 }
 
 /// The two-column presentation.
@@ -186,7 +193,16 @@ impl SplitRows {
         pen.put(if seg > 0 { " " } else { sign }, row_ink);
         pen.put(" ", row_ink);
         let span = self.wrapped.range(index as usize, seg, &l.text);
-        text_run(l, span, theme, row_ink, at.shift, at.part(column.part()), pen, out);
+        text_run(
+            l,
+            span,
+            theme,
+            row_ink,
+            at.shift,
+            at.part(column.part()),
+            pen,
+            out,
+        );
     }
 }
 
@@ -209,7 +225,11 @@ impl Present for SplitRows {
             dels: f.dels,
             row: self.rows.len(),
         });
-        self.rows.push(Row::File { path: f.path, adds: f.adds, dels: f.dels });
+        self.rows.push(Row::File {
+            path: f.path,
+            adds: f.adds,
+            dels: f.dels,
+        });
         for h in f.hunks {
             self.rows.push(Row::Hunk(h.header));
 
@@ -222,16 +242,19 @@ impl Present for SplitRows {
             let base = self.lines.len() as u32;
             for l in h.lines {
                 self.moved += l.moved as usize;
-                self.digits =
-                    self.digits.max(digits(l.old_no.unwrap_or(0).max(l.new_no.unwrap_or(0))));
+                self.digits = self
+                    .digits
+                    .max(digits(l.old_no.unwrap_or(0).max(l.new_no.unwrap_or(0))));
                 self.lines.push(l);
             }
 
             for slot in slots {
-                let (old, new) = (slot.old(), slot.new());
+                let (old, new) = (slot.left(), slot.right());
                 self.paired += (old.is_some() && new.is_some()) as usize;
-                self.rows
-                    .push(Row::Pair { old: old.map(|i| base + i), new: new.map(|i| base + i) });
+                self.rows.push(Row::Pair {
+                    old: old.map(|i| base + i),
+                    new: new.map(|i| base + i),
+                });
             }
         }
     }
@@ -333,21 +356,26 @@ impl Rows for SplitRows {
                 // drag through the hole extending instead of freezing, and copies
                 // nothing for it because `selectable` has nothing to give.
                 let Some(line) = line else {
-                    return Some(Hit { part: column.part(), off: 0 });
+                    return Some(Hit {
+                        part: column.part(),
+                        off: 0,
+                    });
                 };
                 let text = &self.lines[line as usize].text;
                 let at = self.wrapped.range(line as usize, seg, text);
                 let off = match seg < self.wrapped.rows(line as usize) {
                     true => {
-                        let within =
-                            col.saturating_sub(from + self.side_chrome()) + shift;
+                        let within = col.saturating_sub(from + self.side_chrome()) + shift;
                         at.start + col_at(&text[at.clone()], within)
                     }
                     // This side wrapped less far than the other one. The end of
                     // its line is the honest place for the caret.
                     false => text.len(),
                 };
-                Some(Hit { part: column.part(), off })
+                Some(Hit {
+                    part: column.part(),
+                    off,
+                })
             }
         }
     }
@@ -435,7 +463,13 @@ diff --git a/a.rs b/a.rs
                 o.reflow(cols, &host, wrap);
             }
             let order = plait_core::rows::expand(&a.ordered.order, &owners, None).order;
-            Harness { host, owners, order, screen: Screen::new(cols, 64), cols }
+            Harness {
+                host,
+                owners,
+                order,
+                screen: Screen::new(cols, 64),
+                cols,
+            }
         }
 
         fn paint(&mut self, shift: usize) -> Vec<String> {
@@ -443,12 +477,24 @@ diff --git a/a.rs b/a.rs
             self.screen.clear(ink);
             let mut out = Vec::new();
             for (y, r) in self.order.iter().enumerate() {
-                let at = Frame { host: &self.host, shift, current: false, sel: None };
+                let at = Frame {
+                    host: &self.host,
+                    shift,
+                    current: false,
+                    sel: None,
+                };
                 let mut pen = self.screen.row(y);
-                self.owners[r.owner as usize]
-                    .render(r.index as usize, r.seg as usize, &at, &mut pen, &mut out);
+                self.owners[r.owner as usize].render(
+                    r.index as usize,
+                    r.seg as usize,
+                    &at,
+                    &mut pen,
+                    &mut out,
+                );
             }
-            (0..self.order.len()).map(|y| self.screen.row_text(y)).collect()
+            (0..self.order.len())
+                .map(|y| self.screen.row_text(y))
+                .collect()
         }
     }
 
@@ -483,7 +529,11 @@ diff --git a/a.rs b/a.rs
         // Two headers, then one context, one pair, one lone addition, one
         // context: six rows where the unified presentation has seven.
         assert_eq!(rows.len(), 6);
-        assert!(rows[3].contains("let x = 1;") && rows[3].contains("let x = 2;"), "{:?}", rows[3]);
+        assert!(
+            rows[3].contains("let x = 1;") && rows[3].contains("let x = 2;"),
+            "{:?}",
+            rows[3]
+        );
         assert!(rows[4].contains("let z = 3;"), "{:?}", rows[4]);
     }
 
@@ -493,7 +543,9 @@ diff --git a/a.rs b/a.rs
         // divider that drifts as you scroll is worse than one too far right.
         let mut h = Harness::new(DIFF, 60, &Word);
         h.paint(0);
-        let at = (0..h.cols).find(|x| h.screen.char_at(*x, 3) == Some('│')).expect("a rule");
+        let at = (0..h.cols)
+            .find(|x| h.screen.char_at(*x, 3) == Some('│'))
+            .expect("a rule");
         for y in [2, 3, 4, 5] {
             assert_eq!(h.screen.char_at(at, y), Some('│'), "row {y} lost the rule");
         }
@@ -505,7 +557,10 @@ diff --git a/a.rs b/a.rs
         let rows = h.paint(0);
         // The lone addition is line 3 on the new side and nothing on the old.
         let cells: Vec<&str> = rows[4].split('│').collect();
-        assert!(cells[0].trim().is_empty(), "the old side of an insertion was not empty");
+        assert!(
+            cells[0].trim().is_empty(),
+            "the old side of an insertion was not empty"
+        );
         assert!(cells[1].trim_start().starts_with('3'), "{:?}", cells[1]);
     }
 
@@ -528,8 +583,16 @@ diff --git a/a.rs b/a.rs
         );
         let h = Harness::new(&raw, 60, &Word);
         // One header, one hunk header, then a pair taking several rows.
-        assert!(h.order.len() > 3, "the pair did not grow with its longer side");
-        let segs: Vec<u16> = h.order.iter().filter(|r| r.index == 2).map(|r| r.seg).collect();
+        assert!(
+            h.order.len() > 3,
+            "the pair did not grow with its longer side"
+        );
+        let segs: Vec<u16> = h
+            .order
+            .iter()
+            .filter(|r| r.index == 2)
+            .map(|r| r.seg)
+            .collect();
         assert_eq!(segs, (0..segs.len() as u16).collect::<Vec<_>>());
     }
 
@@ -544,7 +607,9 @@ diff --git a/a.rs b/a.rs
         let p = &h.host.theme.diff;
         // Row 2 is the pair's first row: both sides have text.
         assert_eq!(h.screen.ink(0, 2).unwrap().bg, p.removed_bg);
-        let rule = (0..h.cols).find(|x| h.screen.char_at(*x, 2) == Some('│')).unwrap();
+        let rule = (0..h.cols)
+            .find(|x| h.screen.char_at(*x, 2) == Some('│'))
+            .unwrap();
         assert_eq!(h.screen.ink(rule + 1, 2).unwrap().bg, p.added_bg);
         // Row 3 continues the removal, and the addition has run out.
         assert_eq!(h.screen.ink(0, 3).unwrap().bg, p.removed_bg);
@@ -553,7 +618,10 @@ diff --git a/a.rs b/a.rs
 
     #[test]
     fn a_column_wraps_at_half_the_width_the_unified_presentation_would() {
-        let raw = format!("diff --git a/a.rs b/a.rs\n@@ -1,1 +1,1 @@\n-{}\n+b\n", "word ".repeat(30));
+        let raw = format!(
+            "diff --git a/a.rs b/a.rs\n@@ -1,1 +1,1 @@\n-{}\n+b\n",
+            "word ".repeat(30)
+        );
         let split = Harness::new(&raw, 80, &Word);
         let host = Host::new();
         let layouts = Layouts::builtin();
@@ -578,7 +646,11 @@ diff --git a/a.rs b/a.rs
         let mut h = Harness::new(DIFF, 40, &Off);
         let rows = h.paint(4);
         let cells: Vec<&str> = rows[3].split('│').collect();
-        assert!(cells[0].contains(" 2 - "), "the gutter moved: {:?}", cells[0]);
+        assert!(
+            cells[0].contains(" 2 - "),
+            "the gutter moved: {:?}",
+            cells[0]
+        );
         assert!(cells[0].contains("x = 1;"), "{:?}", cells[0]);
         assert!(!cells[0].contains("let"), "{:?}", cells[0]);
     }
@@ -587,9 +659,15 @@ diff --git a/a.rs b/a.rs
     fn neither_half_can_write_past_the_divider() {
         let mut h = Harness::new(DIFF, 34, &Off);
         h.paint(0);
-        let at = (0..h.cols).find(|x| h.screen.char_at(*x, 3) == Some('│')).unwrap();
+        let at = (0..h.cols)
+            .find(|x| h.screen.char_at(*x, 3) == Some('│'))
+            .unwrap();
         for y in 2..6 {
-            assert_eq!(h.screen.char_at(at, y), Some('│'), "row {y} overran the rule");
+            assert_eq!(
+                h.screen.char_at(at, y),
+                Some('│'),
+                "row {y} overran the rule"
+            );
         }
     }
 
@@ -613,7 +691,10 @@ diff --git a/a.rs b/a.rs
         );
         let mut h = Harness::new(&raw, 80, &Word);
         let host = Host::new();
-        assert!(!h.owners[0].reflow(80, &host, &Word), "same width, same policy");
+        assert!(
+            !h.owners[0].reflow(80, &host, &Word),
+            "same width, same policy"
+        );
         // Off pulls the wrapped line back together — the order table must hear.
         assert!(h.owners[0].reflow(80, &host, &Off));
         // And off to off changed nothing at all.

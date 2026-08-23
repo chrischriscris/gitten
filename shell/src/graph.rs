@@ -128,14 +128,28 @@ fn paint_row(bounds: Bounds<Pixels>, d: &Draw, window: &mut Window, theme: &Them
         // branch's colour and the half in the collapsed column comes out grey,
         // and one curve changes colour halfway across the gutter.
         let over = overflowed(d, c.lane.max(c.partner));
-        half_s(window, x(c.lane), x(c.partner), mid, c.down, color(theme, over, c.hue));
+        half_s(
+            window,
+            x(c.lane),
+            x(c.partner),
+            mid,
+            c.down,
+            color(theme, over, c.hue),
+        );
     }
 
     // The node last: it is opaque, so it punches through whatever runs under
     // it and the lines read as passing behind. GPUI orders overlapping
     // primitives by insertion, so this is enough — no z-index needed.
     let r = if d.merge { MERGE_R } else { DOT_R };
-    dot(window, x(d.lane), mid, r, color(theme, overflowed(d, d.lane), d.hue), theme.chrome.bg);
+    dot(
+        window,
+        x(d.lane),
+        mid,
+        r,
+        color(theme, overflowed(d, d.lane), d.hue),
+        theme.chrome.bg,
+    );
 }
 
 /// One row's half of an S, from the dot line at `(x, y)` out through the row

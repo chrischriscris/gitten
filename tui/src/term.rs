@@ -257,11 +257,14 @@ impl Drop for Term {
 /// pulling a crate into the client whose dependency list is a stated design
 /// constraint.
 fn base64(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
         for i in 0..4 {
             // A chunk of one encodes two characters and a chunk of two encodes
@@ -395,7 +398,12 @@ mod tests {
     }
 
     fn at(kind: MouseEventKind, mods: KeyModifiers) -> Option<Input> {
-        translate_event(Event::Mouse(MouseEvent { kind, column: 4, row: 9, modifiers: mods }))
+        translate_event(Event::Mouse(MouseEvent {
+            kind,
+            column: 4,
+            row: 9,
+            modifiers: mods,
+        }))
     }
 
     #[test]
@@ -403,13 +411,19 @@ mod tests {
         let notch = |kind| at(kind, KeyModifiers::NONE);
         let down = Some(Input::Key(Key::plain(Code::WheelDown)));
         assert_eq!(notch(MouseEventKind::ScrollDown), down);
-        assert_eq!(notch(MouseEventKind::ScrollUp), Some(Input::Key(Key::plain(Code::WheelUp))));
+        assert_eq!(
+            notch(MouseEventKind::ScrollUp),
+            Some(Input::Key(Key::plain(Code::WheelUp)))
+        );
         // A horizontal wheel is unmapped, exactly as an unmapped key is.
         assert_eq!(notch(MouseEventKind::ScrollLeft), None);
         // And the whole point of it being a key: the shipped map already binds it.
         let k = Keymap::builtin();
         let press = [Key::plain(Code::WheelDown)];
-        assert_eq!(k.resolve(&Modes::new(), &press), Resolve::Run("view.scroll-down"));
+        assert_eq!(
+            k.resolve(&Modes::new(), &press),
+            Resolve::Run("view.scroll-down")
+        );
     }
 
     #[test]
@@ -456,21 +470,35 @@ mod tests {
         assert_eq!(base64(b"fooba"), "Zm9vYmE=");
         assert_eq!(base64(b"foobar"), "Zm9vYmFy");
         // A line of a diff is not ASCII in general.
-        assert_eq!(base64("héllo — wörld".as_bytes()), "aMOpbGxvIOKAlCB3w7ZybGQ=");
+        assert_eq!(
+            base64("héllo — wörld".as_bytes()),
+            "aMOpbGxvIOKAlCB3w7ZybGQ="
+        );
     }
 
     #[test]
     fn a_keypress_becomes_cores_own_key() {
         // The boundary this module exists to be: what leaves here is the type
         // `plait.toml` and the keymap already speak.
-        assert_eq!(key(KeyCode::Char('j'), KeyModifiers::NONE), Some(Key::char('j')));
-        assert_eq!(key(KeyCode::Esc, KeyModifiers::NONE), Some(Key::plain(Code::Esc)));
+        assert_eq!(
+            key(KeyCode::Char('j'), KeyModifiers::NONE),
+            Some(Key::char('j'))
+        );
+        assert_eq!(
+            key(KeyCode::Esc, KeyModifiers::NONE),
+            Some(Key::plain(Code::Esc))
+        );
         assert_eq!(
             key(KeyCode::Char('d'), KeyModifiers::CONTROL),
             Some(Key::ctrl(Code::Char('d')))
         );
         // ...and it spells itself the way a config file writes it.
-        assert_eq!(key(KeyCode::Char('d'), KeyModifiers::CONTROL).unwrap().to_string(), "ctrl-d");
+        assert_eq!(
+            key(KeyCode::Char('d'), KeyModifiers::CONTROL)
+                .unwrap()
+                .to_string(),
+            "ctrl-d"
+        );
     }
 
     #[test]
@@ -488,13 +516,19 @@ mod tests {
     fn a_line_feed_is_the_return_key() {
         // What `script`, and a few ssh setups, send instead of a carriage
         // return. Both have to be Enter or the key that opens things is dead.
-        assert_eq!(key(KeyCode::Enter, KeyModifiers::NONE), Some(Key::plain(Code::Enter)));
+        assert_eq!(
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            Some(Key::plain(Code::Enter))
+        );
         assert_eq!(
             key(KeyCode::Char('j'), KeyModifiers::CONTROL),
             Some(Key::plain(Code::Enter))
         );
         // ...and an unmodified `j` is still `j`.
-        assert_eq!(key(KeyCode::Char('j'), KeyModifiers::NONE), Some(Key::char('j')));
+        assert_eq!(
+            key(KeyCode::Char('j'), KeyModifiers::NONE),
+            Some(Key::char('j'))
+        );
     }
 
     #[test]
@@ -528,6 +562,9 @@ mod tests {
         // belongs to this client.
         let map = Keymap::builtin();
         let press = key(KeyCode::Char('d'), KeyModifiers::CONTROL).unwrap();
-        assert_eq!(map.resolve(&Modes::new(), &[press]), Resolve::Run("view.page-down"));
+        assert_eq!(
+            map.resolve(&Modes::new(), &[press]),
+            Resolve::Run("view.page-down")
+        );
     }
 }

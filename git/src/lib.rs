@@ -31,9 +31,9 @@
 use plait_core::differ::{Differs, Overrides};
 use plait_core::{parse_log, Commit, FileDiff};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::sync::Arc;
 use std::path::Path;
 use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -72,7 +72,16 @@ fn run(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
 /// branches interleave and the graph is drawn wrong.
 pub fn log(repo: &Path, limit: usize) -> Result<Vec<Commit>> {
     let n = limit.to_string();
-    let bytes = run(repo, &["log", "--topo-order", "-n", &n, &format!("--format={LOG_FORMAT}")])?;
+    let bytes = run(
+        repo,
+        &[
+            "log",
+            "--topo-order",
+            "-n",
+            &n,
+            &format!("--format={LOG_FORMAT}"),
+        ],
+    )?;
     Ok(parse_log(&String::from_utf8_lossy(&bytes)))
 }
 
@@ -133,7 +142,10 @@ pub fn pairs(repo: &Path, revspec: &str) -> Result<Vec<Pair>> {
         run(repo, &[&["diff"], &RAW[..], &[revspec]].concat())?
     } else {
         // A bare revision means "what did this commit change".
-        run(repo, &[&["show"], &RAW[..], &["--format=", revspec]].concat())?
+        run(
+            repo,
+            &[&["show"], &RAW[..], &["--format=", revspec]].concat(),
+        )?
     };
 
     let changes = parse_raw(&String::from_utf8_lossy(&raw));
@@ -170,7 +182,12 @@ pub fn pairs(repo: &Path, revspec: &str) -> Result<Vec<Pair>> {
         std::thread::scope(|s| {
             let loose = s.spawn(|| untracked(repo));
             let blobs = BlobStream::start(repo, &wanted);
-            (blobs, loose.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+            (
+                blobs,
+                loose
+                    .join()
+                    .unwrap_or_else(|p| std::panic::resume_unwind(p)),
+            )
         })
     } else {
         (BlobStream::start(repo, &wanted), Ok(Vec::new()))
@@ -195,8 +212,16 @@ pub fn pairs(repo: &Path, revspec: &str) -> Result<Vec<Pair>> {
         // added file against itself. On the new side a null OID is the
         // ordinary case of a working-tree diff — what the file says now is on
         // disk and nowhere else.
-        let fetched_old = if fetchable(&c.old_mode, &c.old_oid) { blobs.answer()? } else { None };
-        let fetched_new = if fetchable(&c.new_mode, &c.new_oid) { blobs.answer()? } else { None };
+        let fetched_old = if fetchable(&c.old_mode, &c.old_oid) {
+            blobs.answer()?
+        } else {
+            None
+        };
+        let fetched_new = if fetchable(&c.new_mode, &c.new_oid) {
+            blobs.answer()?
+        } else {
+            None
+        };
         let old = Change::synthetic(&c.old_mode, &c.old_oid).or(fetched_old);
         let new = Change::synthetic(&c.new_mode, &c.new_oid)
             .or(fetched_new)
@@ -207,8 +232,16 @@ pub fn pairs(repo: &Path, revspec: &str) -> Result<Vec<Pair>> {
             path: c.path,
             old_path: c.old_path,
             status: c.status,
-            old: if binary { Vec::new() } else { lines(old.as_deref().unwrap_or_default()) },
-            new: if binary { Vec::new() } else { lines(new.as_deref().unwrap_or_default()) },
+            old: if binary {
+                Vec::new()
+            } else {
+                lines(old.as_deref().unwrap_or_default())
+            },
+            new: if binary {
+                Vec::new()
+            } else {
+                lines(new.as_deref().unwrap_or_default())
+            },
             binary,
         });
     }
@@ -244,7 +277,13 @@ fn untracked(repo: &Path) -> Result<Vec<Pair>> {
     // it. `--no-renames` because a rename needs an old side and these have none.
     let raw = run(
         repo,
-        &["status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"],
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--no-renames",
+        ],
     )?;
     let text = String::from_utf8_lossy(&raw);
 
@@ -252,14 +291,18 @@ fn untracked(repo: &Path) -> Result<Vec<Pair>> {
     for record in text.split('\0') {
         // `XY path`: two status letters, a space, then the path. Anything that
         // is not `??` is a tracked change and `git diff --raw` already had it.
-        let Some(path) = record.strip_prefix("?? ") else { continue };
+        let Some(path) = record.strip_prefix("?? ") else {
+            continue;
+        };
         if path.is_empty() {
             continue;
         }
         // Unreadable is skipped rather than an error: a broken symlink, a socket
         // and a file deleted between the two git calls are all untracked, and
         // none of them is worth refusing to show the rest of the diff over.
-        let Ok(content) = std::fs::read(repo.join(path)) else { continue };
+        let Ok(content) = std::fs::read(repo.join(path)) else {
+            continue;
+        };
         let binary = is_binary(&content);
         out.push(Pair {
             path: path.to_string(),
@@ -299,8 +342,14 @@ pub fn diff(
             // Modelled as a file with no hunks rather than skipped: the diff
             // still has to say the file changed, and "binary" is the honest
             // thing for it to say.
-            true => FileDiff { path: p.label(), hunks: Vec::new() },
-            false => FileDiff { path: p.label(), ..differs.file_using(over, &p.path, &p.old, &p.new) }
+            true => FileDiff {
+                path: p.label(),
+                hunks: Vec::new(),
+            },
+            false => FileDiff {
+                path: p.label(),
+                ..differs.file_using(over, &p.path, &p.old, &p.new)
+            },
         })
         .collect())
 }
@@ -311,7 +360,10 @@ pub fn describe(repo: &Path) -> String {
     // client is given by default — so without this the commonest invocation of
     // all produces a label with the repository's name missing from it.
     let named = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
-    let name = named.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = named
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let branch = run(repo, &["rev-parse", "--abbrev-ref", "HEAD"])
         .ok()
         .map(|b| String::from_utf8_lossy(&b).trim().to_string())
@@ -319,7 +371,11 @@ pub fn describe(repo: &Path) -> String {
     // `name (branch)` and not `name · branch`: a client puts this after its own
     // name and view, so a third middle dot in one line of chrome reads as four
     // things of equal weight when it is one repository on one branch.
-    if branch.is_empty() { name } else { format!("{name} ({branch})") }
+    if branch.is_empty() {
+        name
+    } else {
+        format!("{name} ({branch})")
+    }
 }
 
 // ------------------------------------------------------------------- internals
@@ -438,7 +494,12 @@ impl BlobStream {
     /// working tree takes no process at all.
     fn start(repo: &Path, oids: &[&str]) -> Result<Self> {
         if oids.is_empty() {
-            return Ok(Self { child: None, reader: None, stderr: None, writer: None });
+            return Ok(Self {
+                child: None,
+                reader: None,
+                stderr: None,
+                writer: None,
+            });
         }
         let mut child = Command::new("git")
             .arg("-C")
@@ -452,8 +513,7 @@ impl BlobStream {
 
         // One buffer for the whole request: a `[oid, b"\n"].concat()` per OID
         // was an allocation each, for bytes written once and never read again.
-        let mut request =
-            Vec::with_capacity(oids.iter().map(|o| o.len() + 1).sum::<usize>());
+        let mut request = Vec::with_capacity(oids.iter().map(|o| o.len() + 1).sum::<usize>());
         for o in oids {
             request.extend_from_slice(o.as_bytes());
             request.push(b'\n');
@@ -489,9 +549,13 @@ impl BlobStream {
     /// a blob is not text and the header's size is authoritative, so this
     /// never has to guess where a record ends.
     fn answer(&mut self) -> Result<Option<Vec<u8>>> {
-        let Some(stream) = self.reader.as_mut() else { return Ok(None) };
+        let Some(stream) = self.reader.as_mut() else {
+            return Ok(None);
+        };
         let mut header = Vec::new();
-        let read = stream.read_until(b'\n', &mut header).map_err(|e| format!("git cat-file: {e}"))?;
+        let read = stream
+            .read_until(b'\n', &mut header)
+            .map_err(|e| format!("git cat-file: {e}"))?;
         if read == 0 {
             // Every requested answer was written before any of this could run;
             // ending early is a broken protocol, not an empty diff.
@@ -506,9 +570,13 @@ impl BlobStream {
             return Ok(None);
         };
         let mut content = vec![0; size];
-        stream.read_exact(&mut content).map_err(|e| format!("git cat-file: {e}"))?;
+        stream
+            .read_exact(&mut content)
+            .map_err(|e| format!("git cat-file: {e}"))?;
         let mut terminator = [0; 1];
-        stream.read_exact(&mut terminator).map_err(|e| format!("git cat-file: {e}"))?;
+        stream
+            .read_exact(&mut terminator)
+            .map_err(|e| format!("git cat-file: {e}"))?;
         Ok(Some(content))
     }
 
@@ -524,7 +592,11 @@ impl BlobStream {
     /// three things behind as a completed run does.
     fn close(&mut self) -> Result<()> {
         drop(self.reader.take()); // EOF for git, and no pipe left to block on
-        let err = self.stderr.take().and_then(|h| h.join().ok()).unwrap_or_default();
+        let err = self
+            .stderr
+            .take()
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default();
         if let Some(mut child) = self.child.take() {
             let status = child.wait().map_err(|e| format!("git cat-file: {e}"))?;
             let _ = self.writer.take().and_then(|h| h.join().ok());
@@ -584,7 +656,9 @@ fn lines(content: &[u8]) -> Vec<Arc<str>> {
     if text.is_empty() && content.is_empty() {
         return Vec::new();
     }
-    text.split('\n').map(|l| Arc::from(l.strip_suffix('\r').unwrap_or(l))).collect()
+    text.split('\n')
+        .map(|l| Arc::from(l.strip_suffix('\r').unwrap_or(l)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -614,7 +688,11 @@ mod tests {
                 .args(args)
                 .output()
                 .expect("git runs");
-            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
 
         fn write(&self, path: &str, content: &[u8]) {
@@ -654,9 +732,16 @@ mod tests {
         r.write("new.txt", b"brand new\nsecond\n");
 
         let got = pairs(&r.0, "").expect("a working tree diff");
-        assert_eq!(paths(&got), vec!["new.txt", "tracked.txt"], "untracked comes first");
+        assert_eq!(
+            paths(&got),
+            vec!["new.txt", "tracked.txt"],
+            "untracked comes first"
+        );
         let new = &got[0];
-        assert_eq!(new.status, 'A', "an untracked file is an addition like any other");
+        assert_eq!(
+            new.status, 'A',
+            "an untracked file is an addition like any other"
+        );
         assert!(new.old.is_empty(), "it has no old side");
         assert_eq!(strs(&new.new), ["brand new", "second"]);
         assert!(!new.binary);
@@ -735,7 +820,10 @@ mod tests {
         r.write("loose.txt", b"not in history\n");
 
         assert_eq!(paths(&pairs(&r.0, "HEAD~1..HEAD").unwrap()), vec!["a.txt"]);
-        assert!(paths(&pairs(&r.0, "").unwrap()).contains(&"loose.txt"), "the working tree has it");
+        assert!(
+            paths(&pairs(&r.0, "").unwrap()).contains(&"loose.txt"),
+            "the working tree has it"
+        );
     }
 
     #[test]
@@ -808,7 +896,10 @@ mod tests {
         let raw = ":100644 100644 a b M\0one.rs\0:000000 100644 0000000000000000000000000000000000000000 c A\0two.rs\0:100644 000000 d 0000000000000000000000000000000000000000 D\0three.rs\0";
         let c = parse_raw(raw);
         assert_eq!(c.len(), 3);
-        assert_eq!(c.iter().map(|r| r.status).collect::<Vec<_>>(), vec!['M', 'A', 'D']);
+        assert_eq!(
+            c.iter().map(|r| r.status).collect::<Vec<_>>(),
+            vec!['M', 'A', 'D']
+        );
         assert_eq!(c[2].path, "three.rs");
     }
 
@@ -848,7 +939,10 @@ mod tests {
         assert_eq!(strs(&lines(&new)), ["Subproject commit 5697db813"]);
 
         // An added submodule has no old side at all.
-        assert_eq!(Change::synthetic("160000", &"0".repeat(40)), Some(Vec::new()));
+        assert_eq!(
+            Change::synthetic("160000", &"0".repeat(40)),
+            Some(Vec::new())
+        );
         // And an ordinary file is not synthetic, so it goes to `cat-file`.
         assert_eq!(Change::synthetic("100644", "aaa"), None);
     }
@@ -859,7 +953,11 @@ mod tests {
         assert_eq!(strs(&lines(b"a\nb")), ["a", "b"]);
         assert_eq!(lines(b""), Vec::<Arc<str>>::new());
         assert_eq!(strs(&lines(b"\n")), [""], "a file of one blank line");
-        assert_eq!(strs(&lines(b"a\r\nb\r\n")), ["a", "b"], "CRLF is not part of the line");
+        assert_eq!(
+            strs(&lines(b"a\r\nb\r\n")),
+            ["a", "b"],
+            "CRLF is not part of the line"
+        );
     }
 
     #[test]
@@ -892,6 +990,13 @@ mod tests {
             binary: false,
         };
         assert_eq!(p.label(), "old.rs → new.rs");
-        assert_eq!(Pair { old_path: None, ..p }.label(), "new.rs");
+        assert_eq!(
+            Pair {
+                old_path: None,
+                ..p
+            }
+            .label(),
+            "new.rs"
+        );
     }
 }

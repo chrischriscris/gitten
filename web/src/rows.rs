@@ -19,7 +19,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub enum Row {
-    File { path: String, adds: usize, dels: usize },
+    File {
+        path: String,
+        adds: usize,
+        dels: usize,
+    },
     Hunk(String),
     Line(Line),
 }
@@ -96,7 +100,11 @@ impl Doc {
             dels: f.dels,
             row: self.rows.len(),
         });
-        self.rows.push(Row::File { path: f.path, adds: f.adds, dels: f.dels });
+        self.rows.push(Row::File {
+            path: f.path,
+            adds: f.adds,
+            dels: f.dels,
+        });
         for h in f.hunks {
             self.rows.push(Row::Hunk(h.header));
             for l in h.lines {
@@ -239,7 +247,11 @@ pub fn pieces<'a>(line: &'a Line, at: Range<usize>, out: &mut Vec<Piece<'a>>) {
         return;
     }
     if tokens.is_empty() && spans.is_empty() {
-        out.push(Piece { text: &line.text[at], kind: None, word: false });
+        out.push(Piece {
+            text: &line.text[at],
+            kind: None,
+            word: false,
+        });
         return;
     }
 
@@ -268,8 +280,15 @@ pub fn pieces<'a>(line: &'a Line, at: Range<usize>, out: &mut Vec<Piece<'a>>) {
             si += 1;
         }
         let word = spans.get(si).is_some_and(|s| s.start as usize <= cursor);
-        let kind = tokens.get(ti).filter(|t| t.start as usize <= cursor).map(|t| t.kind);
-        out.push(Piece { text: &line.text[cursor..edge], kind, word });
+        let kind = tokens
+            .get(ti)
+            .filter(|t| t.start as usize <= cursor)
+            .map(|t| t.kind);
+        out.push(Piece {
+            text: &line.text[cursor..edge],
+            kind,
+            word,
+        });
         cursor = edge;
     }
 }
@@ -384,8 +403,13 @@ diff --git a/a.rs b/a.rs
     fn a_moved_line_reports_no_changed_words() {
         let d = doc();
         let mut out = Vec::new();
-        let Row::Line(l) = &d.rows[3] else { panic!("row 3 is a line") };
-        assert!(!l.spans.is_empty(), "the line this is built from has spans to drop");
+        let Row::Line(l) = &d.rows[3] else {
+            panic!("row 3 is a line")
+        };
+        assert!(
+            !l.spans.is_empty(),
+            "the line this is built from has spans to drop"
+        );
         let moved = Line {
             kind: l.kind,
             moved: true,

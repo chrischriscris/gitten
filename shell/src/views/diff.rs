@@ -58,13 +58,13 @@
 //! nothing outside it can hold one of them still. What the list keeps is the
 //! vertical axis, which is the one that has to virtualize.
 
-use gpui::*;
 use gpui::prelude::FluentBuilder as _;
+use gpui::*;
 use gpui_component::scroll::{Scrollbar, ScrollbarHandle};
 use plait_core::host::Host;
 use plait_core::prepared::{prepare, Prepared};
-use plait_core::runs::{self, surfaces, Run};
 use plait_core::rows::{Ordered, RowRef};
+use plait_core::runs::{self, surfaces, Run};
 use plait_core::select::{self, Caret, RowId, Selected, Selection, Text as _};
 use plait_core::syntax::Token;
 use plait_core::theme::{DiffPalette, Rgb, Surface, Theme};
@@ -144,7 +144,10 @@ pub(crate) fn column_at(text: &str, x: f32, size: f32, host: &Host) -> usize {
         return 0;
     }
     let col = (x / advance).round().max(0.0) as usize;
-    text.char_indices().nth(col).map(|(i, _)| i).unwrap_or(text.len())
+    text.char_indices()
+        .nth(col)
+        .map(|(i, _)| i)
+        .unwrap_or(text.len())
 }
 
 // ------------------------------------------------------------------ the seam
@@ -260,14 +263,7 @@ pub trait Rows {
     /// takes no part in a selection, and defaults to it: an extension's
     /// presentation compiles unchanged and is simply not selectable until it says
     /// where its text is.
-    fn hit(
-        &self,
-        _index: usize,
-        _seg: usize,
-        _x: f32,
-        _host: &Host,
-        _shift: f32,
-    ) -> Option<Hit> {
+    fn hit(&self, _index: usize, _seg: usize, _x: f32, _host: &Host, _shift: f32) -> Option<Hit> {
         None
     }
 
@@ -338,7 +334,9 @@ impl Layouts {
         // No Markdown specialist here on purpose: a rendered document in a
         // 44-character column is worse than its source, and the two-column
         // presentation is already the answer to "show me both versions".
-        l.register("split", |_| vec![Box::new(super::split::SplitRows::default())]);
+        l.register("split", |_| {
+            vec![Box::new(super::split::SplitRows::default())]
+        });
         l
     }
 
@@ -349,7 +347,10 @@ impl Layouts {
         name: &'static str,
         build: impl Fn(&Host) -> Vec<Box<dyn Rows>> + 'static,
     ) {
-        let layout = Layout { name, build: Box::new(build) };
+        let layout = Layout {
+            name,
+            build: Box::new(build),
+        };
         match self.0.iter().position(|l| l.name == name) {
             Some(i) => self.0[i] = layout,
             None => self.0.push(layout),
@@ -367,8 +368,6 @@ impl Layouts {
     pub fn len(&self) -> usize {
         self.0.len()
     }
-
-
 }
 
 // Cycle to the next presentation. Bound to `s` in `main.rs`.
@@ -377,7 +376,10 @@ impl Layouts {
 // will be: the view owns a focus handle, the binding is global, and the handler
 // is a method. When command dispatch and the mode stack land in `core` this
 // becomes a named command they can reach — see `docs/extending.md`.
-actions!(plait, [CycleLayout, CycleWrap, CopySelection, SelectAll, SelectNone]);
+actions!(
+    plait,
+    [CycleLayout, CycleWrap, CopySelection, SelectAll, SelectNone]
+);
 
 // The order table's row reference and the table itself are
 // `plait_core::rows`': 8 bytes a row, `logical()` for what survives a reflow,
@@ -402,7 +404,9 @@ fn expand(logical: &[RowRef], renderers: &[Box<dyn Rows>], anchor: Option<RowRef
         while i < logical.len() && logical[i].logical() == r.logical() {
             i += 1;
         }
-        let Some(rows) = renderers.get(r.owner as usize) else { continue };
+        let Some(rows) = renderers.get(r.owner as usize) else {
+            continue;
+        };
         if anchor.map(RowRef::logical) == Some(r.logical()) {
             found = order.len();
         }
@@ -412,10 +416,18 @@ fn expand(logical: &[RowRef], renderers: &[Box<dyn Rows>], anchor: Option<RowRef
             if w > widest {
                 (widest, widest_at) = (w, order.len());
             }
-            order.push(RowRef { owner: r.owner, seg: seg as u16, index: r.index });
+            order.push(RowRef {
+                owner: r.owner,
+                seg: seg as u16,
+                index: r.index,
+            });
         }
     }
-    Ordered { order, widest: widest_at, anchor: found }
+    Ordered {
+        order,
+        widest: widest_at,
+        anchor: found,
+    }
 }
 
 /// This wheel event's delta with the gesture's axis lock applied: what is left on
@@ -679,7 +691,8 @@ impl Diff {
 
         let changed = {
             let mut rs = self.renderers.borrow_mut();
-            rs.iter_mut().fold(false, |acc, r| r.reflow(width, host, wrap) | acc)
+            rs.iter_mut()
+                .fold(false, |acc, r| r.reflow(width, host, wrap) | acc)
         };
         if changed {
             // Anchored to the logical row at the top, not to a proportion: a
@@ -689,7 +702,12 @@ impl Diff {
             // fraction instead.
             let anchor = self.order.get(self.top.get()).copied();
             let built = expand(&self.order, &self.renderers.borrow(), anchor);
-            let logical = self.renderers.borrow().iter().map(|r| r.len()).sum::<usize>();
+            let logical = self
+                .renderers
+                .borrow()
+                .iter()
+                .map(|r| r.len())
+                .sum::<usize>();
             self.order = Rc::new(built.order);
             self.widest = built.widest;
             self.total.set(self.order.len());
@@ -758,7 +776,14 @@ impl Diff {
         // Over the rows, and not over the title bar or a dropdown above them.
         // A capture-phase handler is registered on the window, so it is outside
         // the hit test a bubble-phase one gets for free.
-        if !self.scroll.0.borrow().base_handle.bounds().contains(&ev.position) {
+        if !self
+            .scroll
+            .0
+            .borrow()
+            .base_handle
+            .bounds()
+            .contains(&ev.position)
+        {
             return;
         }
         let mut ongoing = self.ongoing.get();
@@ -790,7 +815,11 @@ impl Diff {
     /// wants to name it; the control strip asks for the index and the list.
     #[allow(dead_code)]
     pub fn layout(&self) -> &'static str {
-        self.layouts.names().get(self.current).copied().unwrap_or("custom")
+        self.layouts
+            .names()
+            .get(self.current)
+            .copied()
+            .unwrap_or("custom")
     }
 
     /// Every presentation registered, in the order `s` cycles them. What a
@@ -841,7 +870,8 @@ impl Diff {
         if self.order.is_empty() {
             return;
         }
-        self.scroll.scroll_to_item(row.min(self.order.len() - 1), ScrollStrategy::Top);
+        self.scroll
+            .scroll_to_item(row.min(self.order.len() - 1), ScrollStrategy::Top);
     }
 
     /// The shipped set: the registry of presentations, opened on whichever one
@@ -1022,8 +1052,11 @@ fn assemble(files: &[FileDiff], host: &Host, layouts: &Layouts, current: usize) 
 
     // One pass in core, shared with the CLI and the ANSI painter, before any
     // renderer sees a row.
-    let Prepared { files: prepared, intraline, syntax } =
-        prepare(files, &host.syntax, MAX_LINE_CHARS);
+    let Prepared {
+        files: prepared,
+        intraline,
+        syntax,
+    } = prepare(files, &host.syntax, MAX_LINE_CHARS);
     let file_count = prepared.len();
 
     for f in prepared {
@@ -1037,7 +1070,11 @@ fn assemble(files: &[FileDiff], host: &Host, layouts: &Layouts, current: usize) 
         let first = r.len();
         r.build(f);
         for index in first..r.len() {
-            order.push(RowRef { owner: owner as u16, seg: 0, index: index as u32 });
+            order.push(RowRef {
+                owner: owner as u16,
+                seg: 0,
+                index: index as u32,
+            });
         }
     }
 
@@ -1046,9 +1083,13 @@ fn assemble(files: &[FileDiff], host: &Host, layouts: &Layouts, current: usize) 
     // finds the widest row; the first frame reflows and runs it again.
     let Ordered { order, widest, .. } = expand(&order, &renderers, None);
 
-    let mut reports: Vec<String> =
-        vec![format!("intraline {intraline:.0?} · syntax {syntax:.0?}")];
-    reports.extend(renderers.iter().map(|r| r.report()).filter(|s| !s.is_empty()));
+    let mut reports: Vec<String> = vec![format!("intraline {intraline:.0?} · syntax {syntax:.0?}")];
+    reports.extend(
+        renderers
+            .iter()
+            .map(|r| r.report())
+            .filter(|s| !s.is_empty()),
+    );
     let load = format!(
         "{} rows · {} files · {name} · build {:.0?} ({})",
         order.len(),
@@ -1057,7 +1098,12 @@ fn assemble(files: &[FileDiff], host: &Host, layouts: &Layouts, current: usize) 
         reports.join(" · "),
     );
     eprintln!("{load}");
-    Built { renderers, order, widest, load }
+    Built {
+        renderers,
+        order,
+        widest,
+        load,
+    }
 }
 
 impl Diff {
@@ -1148,20 +1194,38 @@ impl Diff {
         // the run is.
         let first = visual - r.seg as usize;
         let n = rows.rows(r.index as usize).max(1);
-        Some((hit.part, Caret { row: r.logical(), off: hit.off, at: first..first + n }))
+        Some((
+            hit.part,
+            Caret {
+                row: r.logical(),
+                off: hit.off,
+                at: first..first + n,
+            },
+        ))
     }
 
     /// A selection over one byte range of one row: what a double or a triple
     /// click makes.
     fn span(&self, part: u16, at: &Caret, bytes: Range<usize>) -> Selection {
-        let mut sel = Selection::new(part, Caret { off: bytes.start, ..at.clone() });
-        sel.extend(Caret { off: bytes.end, ..at.clone() });
+        let mut sel = Selection::new(
+            part,
+            Caret {
+                off: bytes.start,
+                ..at.clone()
+            },
+        );
+        sel.extend(Caret {
+            off: bytes.end,
+            ..at.clone()
+        });
         sel
     }
 
     /// The text of one row, for a word or a whole-row selection.
     fn row_text(&self, row: RowId, part: u16) -> Option<String> {
-        Selectable(&self.renderers.borrow()).text(row, part).map(str::to_string)
+        Selectable(&self.renderers.borrow())
+            .text(row, part)
+            .map(str::to_string)
     }
 
     /// Mouse down: a new selection, a widened one on a repeat click, or an
@@ -1181,8 +1245,7 @@ impl Diff {
         // Shift extends whatever is already there, which is how a selection
         // longer than the window gets made without a drag that has to scroll.
         // Only within the same part: across the divider it means nothing.
-        let extend =
-            ev.modifiers.shift && self.sel.as_ref().is_some_and(|s| s.part() == part);
+        let extend = ev.modifiers.shift && self.sel.as_ref().is_some_and(|s| s.part() == part);
         self.sel = match (extend, ev.click_count) {
             (true, _) => {
                 let mut sel = self.sel.take().expect("extend implies a selection");
@@ -1217,7 +1280,9 @@ impl Diff {
         }
         let host = crate::config::host(cx);
         self.autoscroll(ev.position);
-        let Some((part, mut caret)) = self.locate(ev.position, &host) else { return };
+        let Some((part, mut caret)) = self.locate(ev.position, &host) else {
+            return;
+        };
         let Some(sel) = &self.sel else { return };
         if part != sel.part() {
             // Parts are laid out left to right, so a part further along than the
@@ -1309,14 +1374,17 @@ impl Diff {
             return div().into_any_element();
         }
         let me = cx.entity().downgrade();
-        canvas(|_, _, _| {}, move |_, _, window, _| {
-            let me = me.clone();
-            window.on_mouse_event(move |ev: &MouseMoveEvent, phase, _, cx| {
-                if phase == DispatchPhase::Bubble {
-                    _ = me.update(cx, |this, cx| this.drag(ev, cx));
-                }
-            });
-        })
+        canvas(
+            |_, _, _| {},
+            move |_, _, window, _| {
+                let me = me.clone();
+                window.on_mouse_event(move |ev: &MouseMoveEvent, phase, _, cx| {
+                    if phase == DispatchPhase::Bubble {
+                        _ = me.update(cx, |this, cx| this.drag(ev, cx));
+                    }
+                });
+            },
+        )
         .absolute()
         .top_0()
         .left_0()
@@ -1331,14 +1399,17 @@ impl Diff {
     /// sideways flick into vertical scrolling. See [`Diff::wheel`].
     fn wheel_probe(&self, cx: &mut Context<Self>) -> AnyElement {
         let me = cx.entity().downgrade();
-        canvas(|_, _, _| {}, move |_, _, window, _| {
-            let me = me.clone();
-            window.on_mouse_event(move |ev: &ScrollWheelEvent, phase, window, cx| {
-                if phase == DispatchPhase::Capture {
-                    _ = me.update(cx, |this, cx| this.wheel(ev, window, cx));
-                }
-            });
-        })
+        canvas(
+            |_, _, _| {},
+            move |_, _, window, _| {
+                let me = me.clone();
+                window.on_mouse_event(move |ev: &ScrollWheelEvent, phase, window, cx| {
+                    if phase == DispatchPhase::Capture {
+                        _ = me.update(cx, |this, cx| this.wheel(ev, window, cx));
+                    }
+                });
+            },
+        )
         .absolute()
         .top_0()
         .left_0()
@@ -1365,7 +1436,8 @@ impl Render for Diff {
         // Where the scrollbar draws itself and how long its thumb is. Last
         // frame's box, like everything else measured here — a view is handed
         // one and cannot ask before.
-        self.pan.set_viewport(self.scroll.0.borrow().base_handle.bounds());
+        self.pan
+            .set_viewport(self.scroll.0.borrow().base_handle.bounds());
         // Read once per frame and copied into the rows, so every row of the
         // frame is drawn at the same offset. Reading it per row would be the
         // same number and one `Cell` load each.
@@ -1386,8 +1458,13 @@ impl Render for Diff {
                     // Two integer comparisons on a row with no selection, which
                     // is every row of every frame until somebody drags.
                     let at = sel.as_ref().and_then(|s| s.at(i, r.logical()));
-                    renderers[r.owner as usize]
-                        .render(r.index as usize, r.seg as usize, &host, at, shift)
+                    renderers[r.owner as usize].render(
+                        r.index as usize,
+                        r.seg as usize,
+                        &host,
+                        at,
+                        shift,
+                    )
                 })
                 .collect()
         })
@@ -1603,9 +1680,10 @@ impl Rows for TextRows {
     /// wider than anything on screen.
     fn width(&self, index: usize, seg: usize) -> usize {
         match &self.rows[index] {
-            Row::Line { text, .. } => {
-                text[self.wrapped.range(index, seg, text)].trim_end().chars().count()
-            }
+            Row::Line { text, .. } => text[self.wrapped.range(index, seg, text)]
+                .trim_end()
+                .chars()
+                .count(),
             Row::Hunk(h) => h.chars().count(),
             Row::File { path, .. } => path.chars().count(),
         }
@@ -1669,7 +1747,15 @@ impl Rows for TextRows {
 
             Row::Hunk(header) => hunk_header(header, theme, sel, shift),
 
-            Row::Line { kind, moved, old, new, text, spans, tokens } => {
+            Row::Line {
+                kind,
+                moved,
+                old,
+                new,
+                text,
+                spans,
+                tokens,
+            } => {
                 let (bg, fg, sign) = line_colors(*kind, *moved, p);
                 // Which background this row's furniture lands on, so the line
                 // numbers are resolved against it — see `Theme::gutter_on`.
@@ -1830,7 +1916,10 @@ pub(crate) fn selected(sel: Option<Selected>, part: u16, len: usize) -> Range<us
 /// its text starts at the page padding. Three presentations working that out
 /// separately is three places for the caret to be a gutter's width off.
 pub(crate) fn header_hit(text: &str, x: f32, host: &Host, shift: f32) -> Hit {
-    Hit { part: 0, off: column_at(text, into_text(x, PAD, shift), host.font.size, host) }
+    Hit {
+        part: 0,
+        off: column_at(text, into_text(x, PAD, shift), host.font.size, host),
+    }
 }
 
 /// How far into a row's text a click landed: `x` is from the left edge of the
@@ -1906,49 +1995,61 @@ pub(crate) fn file_header(
         // A path longer than the window is reached the same way a line is: it is
         // the row's text, and the only thing in front of it is the page padding —
         // which is why the padding is out here and the scroll is inside it.
-        .child(div().flex().flex_grow(1.0).px_4().child(scrolled(
-            shift,
-            div()
-                .flex()
-                .items_center()
-                .gap_3()
-                .child(
-                    div()
-                        .flex()
-                        .flex_none()
-                        .children(dir.map(|d| {
-                            // The furniture colour, resolved against the header's
-                            // own background rather than a row's — a header is not
-                            // a `Surface`, and `gutter_fg` raw is 1.7:1 on it.
-                            // Twice a frame at most: one header per file.
-                            let fg = plait_core::theme::readable(
-                                p.gutter_fg,
-                                p.file_bg,
-                                theme.min_furniture,
-                            );
-                            let at = clipped(&sel, 0..cut);
-                            div().flex_none().text_color(rgb(fg)).child(header_text(
-                                SharedString::from(d),
-                                at,
-                                theme,
-                            ))
-                        }))
-                        .child(
-                            div().flex_none().text_color(rgb(p.file_fg)).child(header_text(
-                                match dir {
-                                    // A bare name *is* the whole path: adopt the
-                                    // row's own handle rather than copying it.
-                                    None => SharedString::from(std::sync::Arc::clone(path)),
-                                    Some(_) => SharedString::from(name),
-                                },
-                                clipped(&sel, cut..path.len()),
-                                theme,
+        .child(
+            div().flex().flex_grow(1.0).px_4().child(scrolled(
+                shift,
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .children(dir.map(|d| {
+                                // The furniture colour, resolved against the header's
+                                // own background rather than a row's — a header is not
+                                // a `Surface`, and `gutter_fg` raw is 1.7:1 on it.
+                                // Twice a frame at most: one header per file.
+                                let fg = plait_core::theme::readable(
+                                    p.gutter_fg,
+                                    p.file_bg,
+                                    theme.min_furniture,
+                                );
+                                let at = clipped(&sel, 0..cut);
+                                div().flex_none().text_color(rgb(fg)).child(header_text(
+                                    SharedString::from(d),
+                                    at,
+                                    theme,
+                                ))
+                            }))
+                            .child(div().flex_none().text_color(rgb(p.file_fg)).child(
+                                header_text(
+                                    match dir {
+                                        // A bare name *is* the whole path: adopt the
+                                        // row's own handle rather than copying it.
+                                        None => SharedString::from(std::sync::Arc::clone(path)),
+                                        Some(_) => SharedString::from(name),
+                                    },
+                                    clipped(&sel, cut..path.len()),
+                                    theme,
+                                ),
                             )),
-                        ),
-                )
-                .child(div().flex_none().text_color(rgb(p.adds_fg)).child(format!("+{adds}")))
-                .child(div().flex_none().text_color(rgb(p.dels_fg)).child(format!("-{dels}"))),
-        )))
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(rgb(p.adds_fg))
+                            .child(format!("+{adds}")),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(rgb(p.dels_fg))
+                            .child(format!("-{dels}")),
+                    ),
+            )),
+        )
         .into_any_element()
 }
 
@@ -2005,12 +2106,9 @@ pub(crate) fn hunk_header(
             shift,
             div().child(
                 // The row's own handle, adopted rather than copied.
-                StyledText::new(SharedString::from(std::sync::Arc::clone(header)))
-                    .with_highlights(hunk_runs(
-                        marker.len(),
-                        selected(sel, 0, header.len()),
-                        theme,
-                    )),
+                StyledText::new(SharedString::from(std::sync::Arc::clone(header))).with_highlights(
+                    hunk_runs(marker.len(), selected(sel, 0, header.len()), theme),
+                ),
             ),
         ))
         .into_any_element()
@@ -2207,10 +2305,10 @@ mod tests {
         div, rgb, AnyElement, FontStyle, FontWeight, HighlightStyle, IntoElement, ParentElement,
     };
     use plait_core::host::Host;
-    use plait_core::syntax::{Kind, Token};
-    use plait_core::theme::{Style, Surface, Theme};
     use plait_core::prepared::{prepare, File as PreparedFile};
     use plait_core::select::{Caret, Selected, Selection};
+    use plait_core::syntax::{Kind, Token};
+    use plait_core::theme::{Style, Surface, Theme};
     use plait_core::{parse_unified_diff, LineKind, Span};
     use std::rc::Rc;
 
@@ -2252,10 +2350,19 @@ mod tests {
     }
 
     fn well_formed(text: &str, runs: &[(std::ops::Range<usize>, HighlightStyle)]) {
-        assert!(runs.windows(2).all(|w| w[0].0.end <= w[1].0.start), "overlapping: {runs:?}");
+        assert!(
+            runs.windows(2).all(|w| w[0].0.end <= w[1].0.start),
+            "overlapping: {runs:?}"
+        );
         for (r, _) in runs {
-            assert!(r.start < r.end && r.end <= text.len(), "{r:?} outside {text:?}");
-            assert!(text.is_char_boundary(r.start) && text.is_char_boundary(r.end), "{r:?}");
+            assert!(
+                r.start < r.end && r.end <= text.len(),
+                "{r:?} outside {text:?}"
+            );
+            assert!(
+                text.is_char_boundary(r.start) && text.is_char_boundary(r.end),
+                "{r:?}"
+            );
         }
     }
 
@@ -2271,8 +2378,14 @@ mod tests {
         // foreground and a background, not two elements fighting over it.
         let theme = Theme::dark();
         let text = "let x = 1;";
-        let out =
-            runs(all(text), &[tok(0, 3, Kind::Keyword)], &[Span { start: 0, end: 3 }], &theme, LineKind::Added, false);
+        let out = runs(
+            all(text),
+            &[tok(0, 3, Kind::Keyword)],
+            &[Span { start: 0, end: 3 }],
+            &theme,
+            LineKind::Added,
+            false,
+        );
         well_formed(text, &out);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].0, 0..3);
@@ -2286,14 +2399,23 @@ mod tests {
         //  span:    #####      changed
         let theme = Theme::dark();
         let text = "let x = 1;";
-        let out =
-            runs(all(text), &[tok(0, 3, Kind::Keyword)], &[Span { start: 2, end: 7 }], &theme, LineKind::Added, false);
+        let out = runs(
+            all(text),
+            &[tok(0, 3, Kind::Keyword)],
+            &[Span { start: 2, end: 7 }],
+            &theme,
+            LineKind::Added,
+            false,
+        );
         well_formed(text, &out);
         let shape: Vec<_> = out
             .iter()
             .map(|(r, s)| (r.clone(), s.color.is_some(), s.background_color.is_some()))
             .collect();
-        assert_eq!(shape, vec![(0..2, true, false), (2..3, true, true), (3..7, false, true)]);
+        assert_eq!(
+            shape,
+            vec![(0..2, true, false), (2..3, true, true), (3..7, false, true)]
+        );
     }
 
     #[test]
@@ -2327,7 +2449,10 @@ mod tests {
                 tok(0, 3, Kind::Keyword),
                 tok(quote as u32, (text.len() - 1) as u32, Kind::Str),
             ],
-            &[Span { start: quote as u32, end: (text.len() - 1) as u32 }],
+            &[Span {
+                start: quote as u32,
+                end: (text.len() - 1) as u32,
+            }],
             &theme,
             LineKind::Added,
             false,
@@ -2367,7 +2492,10 @@ mod tests {
         for kind in [LineKind::Added, LineKind::Removed] {
             let (plain, _, sign) = line_colors(kind, false, p);
             let (moved, _, moved_sign) = line_colors(kind, true, p);
-            assert_ne!(plain, moved, "{kind:?} moved and unmoved share a background");
+            assert_ne!(
+                plain, moved,
+                "{kind:?} moved and unmoved share a background"
+            );
             assert_eq!(sign, moved_sign, "the sign column must stay scannable");
         }
         // Context is never moved, and asking must not change what it looks like.
@@ -2410,7 +2538,10 @@ mod tests {
         let out = runs(all(text), &[], &spans, &theme, LineKind::Added, true);
         let unmoved = runs(all(text), &[], &spans, &theme, LineKind::Added, false);
         assert!(unmoved.iter().any(|(_, s)| s.background_color.is_some()));
-        assert!(out.is_empty(), "a moved line produced runs for nothing: {out:?}");
+        assert!(
+            out.is_empty(),
+            "a moved line produced runs for nothing: {out:?}"
+        );
     }
 
     #[test]
@@ -2424,7 +2555,10 @@ mod tests {
         let out = runs(
             all(text),
             &[tok(0, text.len() as u32, Kind::Comment)],
-            &[Span { start: 10, end: text.len() as u32 }],
+            &[Span {
+                start: 10,
+                end: text.len() as u32,
+            }],
             &theme,
             LineKind::Added,
             false,
@@ -2433,7 +2567,10 @@ mod tests {
         let plain = out.iter().find(|(r, _)| r.start == 0).unwrap();
         let on_word = out.iter().find(|(r, _)| r.start == 10).unwrap();
         assert!(on_word.1.background_color.is_some());
-        assert_ne!(plain.1.color, on_word.1.color, "same grey on both backgrounds");
+        assert_ne!(
+            plain.1.color, on_word.1.color,
+            "same grey on both backgrounds"
+        );
     }
 
     // ------------------------------------------------------ the draw scratch
@@ -2447,14 +2584,35 @@ mod tests {
         let tokens = [tok(0, 3, Kind::Keyword), tok(15, 18, Kind::Keyword)];
         let spans = [Span { start: 4, end: 9 }, Span { start: 19, end: 23 }];
         let mut sc = super::Scratch::default();
-        let out =
-            super::Scratch::merged(&mut sc, all(text), &tokens, &spans, &theme, LineKind::Added, false, 6..20);
+        let out = super::Scratch::merged(
+            &mut sc,
+            all(text),
+            &tokens,
+            &spans,
+            &theme,
+            LineKind::Added,
+            false,
+            6..20,
+        );
         well_formed(text, out);
         let caps = (sc.runs.capacity(), sc.hl.capacity());
         for _ in 0..100 {
-            super::Scratch::merged(&mut sc, all(text), &tokens, &spans, &theme, LineKind::Added, false, 6..20);
+            super::Scratch::merged(
+                &mut sc,
+                all(text),
+                &tokens,
+                &spans,
+                &theme,
+                LineKind::Added,
+                false,
+                6..20,
+            );
         }
-        assert_eq!((sc.runs.capacity(), sc.hl.capacity()), caps, "a repaint grew a buffer");
+        assert_eq!(
+            (sc.runs.capacity(), sc.hl.capacity()),
+            caps,
+            "a repaint grew a buffer"
+        );
     }
 
     #[test]
@@ -2465,8 +2623,16 @@ mod tests {
         let mut sc = super::Scratch::default();
         assert_eq!(&*sc.number(Some(9), false), "9");
         assert_eq!(&*sc.number(Some(12345), false), "12345");
-        assert_eq!(&*sc.number(Some(7), true), "", "a continuation row draws nothing");
-        assert_eq!(&*sc.number(None, false), "", "so does a side with no number");
+        assert_eq!(
+            &*sc.number(Some(7), true),
+            "",
+            "a continuation row draws nothing"
+        );
+        assert_eq!(
+            &*sc.number(None, false),
+            "",
+            "so does a side with no number"
+        );
         let drawn = sc.number(Some(41), false);
         assert_eq!(&*drawn, "41");
         assert_eq!(&*sc.no, "41", "the scratch is the one home of the digits");
@@ -2515,11 +2681,16 @@ diff --git a/a.rs b/a.rs
         // start of the line every time you clicked on a wrapped one.
         let (mut r, host) = text_rows(LONG);
         assert!(r.reflow(width_for(40, &host), &host, host.wrap.current()));
-        let row = (0..r.len()).find(|i| r.rows(*i) > 1).expect("a wrapped line");
+        let row = (0..r.len())
+            .find(|i| r.rows(*i) > 1)
+            .expect("a wrapped line");
         let first = r.hit(row, 0, x_for(3, &host), &host, 0.0).unwrap().off;
         let second = r.hit(row, 1, x_for(3, &host), &host, 0.0).unwrap().off;
         assert_eq!(first, 3);
-        assert!(second > 30, "the second row rebased to {second}, not into the line");
+        assert!(
+            second > 30,
+            "the second row rebased to {second}, not into the line"
+        );
         // And the byte it names is the byte drawn there.
         let text = r.selectable(row, 0).unwrap();
         let at = r.wrapped.range(row, 1, text);
@@ -2533,7 +2704,15 @@ diff --git a/a.rs b/a.rs
         assert_eq!(r.selectable(1, 0), Some("@@ -1,2 +1,2 @@"));
         // Drawn at the page padding and nowhere else, whichever presentation
         // owns the lines beneath it.
-        let hit = r.hit(0, 0, PAD + 2.5 * host.font.size * host.font.advance, &host, 0.0).unwrap();
+        let hit = r
+            .hit(
+                0,
+                0,
+                PAD + 2.5 * host.font.size * host.font.advance,
+                &host,
+                0.0,
+            )
+            .unwrap();
         assert_eq!(hit.off, 2);
     }
 
@@ -2543,14 +2722,20 @@ diff --git a/a.rs b/a.rs
         let mut diff = Diff::with_layouts(parse_unified_diff(SAMPLE), &host, Layouts::builtin());
         // Rows: the file header, the hunk header, then three lines.
         diff.sel = Some(select(&diff, (2, 0), (4, 9)));
-        assert_eq!(diff.selection(), "fn main() {
+        assert_eq!(
+            diff.selection(),
+            "fn main() {
     let x = 1;
-    let x");
+    let x"
+        );
         // The anchor is not the start: the same drag backwards is the same text.
         diff.sel = Some(select(&diff, (4, 9), (2, 0)));
-        assert_eq!(diff.selection(), "fn main() {
+        assert_eq!(
+            diff.selection(),
+            "fn main() {
     let x = 1;
-    let x");
+    let x"
+        );
     }
 
     #[test]
@@ -2571,8 +2756,19 @@ diff --git a/a.rs b/a.rs
             .to_string();
         let at = diff.order.iter().position(|r| *r == long).unwrap();
         let n = diff.renderers.borrow()[long.owner as usize].rows(long.index as usize);
-        let mut sel = Selection::new(0, Caret { row: long.logical(), off: 0, at: at..at + n });
-        sel.extend(Caret { row: long.logical(), off: whole.len(), at: at..at + n });
+        let mut sel = Selection::new(
+            0,
+            Caret {
+                row: long.logical(),
+                off: 0,
+                at: at..at + n,
+            },
+        );
+        sel.extend(Caret {
+            row: long.logical(),
+            off: whole.len(),
+            at: at..at + n,
+        });
         diff.sel = Some(sel);
         assert_eq!(diff.selection(), whole);
         assert!(!whole.is_empty());
@@ -2644,7 +2840,8 @@ diff --git a/a.rs b/a.rs
             .collect();
         assert_eq!(painted, (4..11).collect::<Vec<_>>());
         assert!(
-            !out.iter().any(|(r, s)| r.contains(&8) && s.background_color == Some(word.into())),
+            !out.iter()
+                .any(|(r, s)| r.contains(&8) && s.background_color == Some(word.into())),
             "the changed word kept its background inside the selection"
         );
     }
@@ -2662,7 +2859,10 @@ diff --git a/a.rs b/a.rs
         well_formed(header, &out);
         assert_eq!(out.len(), 1, "one run: the coordinates");
         assert_eq!(out[0].0, 0..marker.len());
-        assert_eq!(out[0].1.color, Some(rgb(theme.gutter_on(Surface::Context)).into()));
+        assert_eq!(
+            out[0].1.color,
+            Some(rgb(theme.gutter_on(Surface::Context)).into())
+        );
         assert!(out[0].1.background_color.is_none());
         assert!(!code.is_empty() && out.iter().all(|(r, _)| r.end <= marker.len()));
     }
@@ -2682,7 +2882,11 @@ diff --git a/a.rs b/a.rs
             .filter(|(_, st)| st.background_color == Some(bg.into()))
             .flat_map(|(r, _)| r.clone())
             .collect();
-        assert_eq!(painted, (5..25).collect::<Vec<_>>(), "the selection, exactly");
+        assert_eq!(
+            painted,
+            (5..25).collect::<Vec<_>>(),
+            "the selection, exactly"
+        );
         // ...and the coordinates are still the coordinates inside it.
         let fg = rgb(theme.gutter_on(Surface::Context));
         let coloured: Vec<usize> = out
@@ -2714,7 +2918,10 @@ diff --git a/a.rs b/a.rs
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].0, 2..6);
         assert!(out[0].1.color.is_none(), "no coordinates to colour");
-        assert!(super::hunk_runs(0, 0..0, &theme).is_empty(), "nothing at all");
+        assert!(
+            super::hunk_runs(0, 0..0, &theme).is_empty(),
+            "nothing at all"
+        );
     }
 
     #[test]
@@ -2745,7 +2952,15 @@ diff --git a/a.rs b/a.rs
         let theme = Theme::dark();
         let text = "aaaa bbbb cccc";
         let first = runs_sel(0..5, &[], &[], &theme, LineKind::Context, false, 2..12);
-        let second = runs_sel(5..text.len(), &[], &[], &theme, LineKind::Context, false, 2..12);
+        let second = runs_sel(
+            5..text.len(),
+            &[],
+            &[],
+            &theme,
+            LineKind::Context,
+            false,
+            2..12,
+        );
         assert_eq!(first.first().map(|(r, _)| r.clone()), Some(2..5));
         assert_eq!(second.first().map(|(r, _)| r.clone()), Some(0..7));
         // A selection that misses this row entirely leaves no runs at all.
@@ -2779,9 +2994,22 @@ diff --git a/a.rs b/a.rs
     /// Every row of these fixtures is one visual row, which is what lets a test
     /// name them by index.
     fn select(diff: &Diff, from: (usize, usize), to: (usize, usize)) -> Selection {
-        let at = |v: usize| Caret { row: diff.order[v].logical(), off: 0, at: v..v + 1 };
-        let mut sel = Selection::new(0, Caret { off: from.1, ..at(from.0) });
-        sel.extend(Caret { off: to.1, ..at(to.0) });
+        let at = |v: usize| Caret {
+            row: diff.order[v].logical(),
+            off: 0,
+            at: v..v + 1,
+        };
+        let mut sel = Selection::new(
+            0,
+            Caret {
+                off: from.1,
+                ..at(from.0)
+            },
+        );
+        sel.extend(Caret {
+            off: to.1,
+            ..at(to.0)
+        });
         sel
     }
 
@@ -2799,12 +3027,19 @@ diff --git a/a.rs b/a.rs
         // `rows` counts what is drawn and does.
         let (mut r, host) = text_rows(LONG);
         let before = r.len();
-        assert!((0..r.len()).all(|i| r.rows(i) == 1), "nothing wraps before a reflow");
+        assert!(
+            (0..r.len()).all(|i| r.rows(i) == 1),
+            "nothing wraps before a reflow"
+        );
 
         assert!(r.reflow(width_for(40, &host), &host, host.wrap.current()));
         assert_eq!(r.len(), before, "wrapping changed the line count");
         let rows: Vec<usize> = (0..r.len()).map(|i| r.rows(i)).collect();
-        assert_eq!(rows, [1, 1, 1, 3, 3], "headers, a short line, two long ones");
+        assert_eq!(
+            rows,
+            [1, 1, 1, 3, 3],
+            "headers, a short line, two long ones"
+        );
     }
 
     #[test]
@@ -2837,8 +3072,14 @@ diff --git a/a.rs b/a.rs
         let (mut r, host) = text_rows(LONG);
         let w = width_for(40, &host);
         assert!(r.reflow(w, &host, host.wrap.current()));
-        assert!(!r.reflow(w + 1.0, &host, host.wrap.current()), "one pixel rebuilt the table");
-        assert!(r.reflow(w + 40.0, &host, host.wrap.current()), "five characters did not");
+        assert!(
+            !r.reflow(w + 1.0, &host, host.wrap.current()),
+            "one pixel rebuilt the table"
+        );
+        assert!(
+            r.reflow(w + 40.0, &host, host.wrap.current()),
+            "five characters did not"
+        );
     }
 
     #[test]
@@ -2850,7 +3091,10 @@ diff --git a/a.rs b/a.rs
 
         let off = host.wrap.at(host.wrap.position("off").unwrap());
         assert!(r.reflow(narrow, &host, off));
-        assert!((0..r.len()).all(|i| r.rows(i) == 1), "off still broke something");
+        assert!(
+            (0..r.len()).all(|i| r.rows(i) == 1),
+            "off still broke something"
+        );
         // And the widest row is the whole line again, which is what the
         // horizontal scrollbar is for.
         assert!(r.width(3, 0) > 20);
@@ -2868,8 +3112,14 @@ diff --git a/a.rs b/a.rs
         let (r, host) = text_rows(SAMPLE);
         let cw = host.font.char_width();
         for col in [0, 4, 13] {
-            let plain = r.hit(3, 0, x_for(0, &host), &host, col as f32 * cw).unwrap();
-            assert_eq!((plain.part, plain.off), (0, col), "scrolled {col} characters");
+            let plain = r
+                .hit(3, 0, x_for(0, &host), &host, col as f32 * cw)
+                .unwrap();
+            assert_eq!(
+                (plain.part, plain.off),
+                (0, col),
+                "scrolled {col} characters"
+            );
         }
         // A click on a line number, scrolled: the first character there is to
         // see, and never a negative offset into the line.
@@ -2906,7 +3156,12 @@ diff --git a/a.rs b/a.rs
         let moved = TouchPhase::Moved;
 
         // Sideways, and nothing on the vertical axis for the list to have.
-        let d = locked(point(px(-30.), px(0.)), false, &mut lock, TouchPhase::Started);
+        let d = locked(
+            point(px(-30.), px(0.)),
+            false,
+            &mut lock,
+            TouchPhase::Started,
+        );
         assert_eq!((d.x, d.y), (px(-30.), px(0.)));
         // The rest of the same gesture is sideways too, however the fingers
         // wander: this is the drift that read as the text sliding at an angle.
@@ -2917,14 +3172,24 @@ diff --git a/a.rs b/a.rs
         // A vertical gesture is the list's, and this hands back nothing for the
         // text to move by — not even the sideways wobble in it.
         let mut lock = OngoingScroll::default();
-        let d = locked(point(px(3.), px(-40.)), false, &mut lock, TouchPhase::Started);
+        let d = locked(
+            point(px(3.), px(-40.)),
+            false,
+            &mut lock,
+            TouchPhase::Started,
+        );
         assert_eq!((d.x, d.y), (px(0.), px(-40.)));
 
         // `shift` is the platform's way of saying "this one is horizontal", and
         // it is applied before the lock — after it, the lock has already called
         // the gesture vertical and given it away.
         let mut lock = OngoingScroll::default();
-        let d = locked(point(px(0.), px(-40.)), true, &mut lock, TouchPhase::Started);
+        let d = locked(
+            point(px(0.), px(-40.)),
+            true,
+            &mut lock,
+            TouchPhase::Started,
+        );
         assert_eq!((d.x, d.y), (px(-40.), px(0.)));
     }
 
@@ -2954,8 +3219,7 @@ diff --git a/a.rs b/a.rs
         let mut h = Host::new();
         assert!(h.wrap.select(wrap), "no wrap called {wrap}");
         let host = Rc::new(h);
-        let diff =
-            Diff::with_layouts(parse_unified_diff(src), &host, Layouts::builtin());
+        let diff = Diff::with_layouts(parse_unified_diff(src), &host, Layouts::builtin());
         (diff, host)
     }
 
@@ -2970,7 +3234,11 @@ diff --git a/a.rs b/a.rs
         let chars = diff.renderers.borrow()[widest.owner as usize]
             .width(widest.index as usize, widest.seg as usize);
         let expected = chars as f32 * host.font.char_width() - (w - TEXT_CHROME);
-        assert!((diff.bound(w, &host) - expected).abs() < 0.001, "{}", diff.bound(w, &host));
+        assert!(
+            (diff.bound(w, &host) - expected).abs() < 0.001,
+            "{}",
+            diff.bound(w, &host)
+        );
         // The offset the reflow left is inside it, whatever it was before.
         diff.pan.set(1e6);
         assert_eq!(diff.pan.at(), diff.bound(w, &host));
@@ -2979,7 +3247,11 @@ diff --git a/a.rs b/a.rs
         // back at column zero the moment `w` turns wrapping on.
         let (mut wrapped, host) = diff_wrapped(LONG, "word");
         wrapped.reflow(w, &host);
-        assert_eq!(wrapped.bound(w, &host), 0.0, "a wrapped row hangs over the edge");
+        assert_eq!(
+            wrapped.bound(w, &host),
+            0.0,
+            "a wrapped row hangs over the edge"
+        );
         assert_eq!(wrapped.pan.at(), 0.0);
     }
 
@@ -3053,7 +3325,14 @@ diff --git a/a.rs b/a.rs
         let tokens = [tok(0, 3, Kind::Keyword), tok(15, 18, Kind::Keyword)];
         let second = text.find("let beta").unwrap();
 
-        let out = runs(second..text.len(), &tokens, &[], &theme, LineKind::Context, false);
+        let out = runs(
+            second..text.len(),
+            &tokens,
+            &[],
+            &theme,
+            LineKind::Context,
+            false,
+        );
         assert_eq!(out.len(), 1, "{out:?}");
         assert_eq!(out[0].0, 0..3, "the second `let` is at 0 of the second row");
 
@@ -3187,18 +3466,22 @@ diff --git a/b.md b/b.md
     fn the_host_chooses_which_presentation_opens() {
         let mut host = Host::new();
         host.layout = "split".into();
-        let diff = Diff::with_layouts(
-            parse_unified_diff(TWO_FILES),
-            &host,
-            Layouts::builtin(),
-        );
+        let diff = Diff::with_layouts(parse_unified_diff(TWO_FILES), &host, Layouts::builtin());
         assert_eq!(diff.layout(), "split");
         // The two-column layout collapses a replace pair onto one row, so it has
         // strictly fewer rows than unified for the same diff.
-        let unified =
-            Diff::with_layouts(parse_unified_diff(TWO_FILES), &Host::new(), Layouts::builtin());
+        let unified = Diff::with_layouts(
+            parse_unified_diff(TWO_FILES),
+            &Host::new(),
+            Layouts::builtin(),
+        );
         assert_eq!(unified.layout(), "unified");
-        assert!(diff.total() < unified.total(), "{} vs {}", diff.total(), unified.total());
+        assert!(
+            diff.total() < unified.total(),
+            "{} vs {}",
+            diff.total(),
+            unified.total()
+        );
     }
 
     #[test]
@@ -3207,21 +3490,27 @@ diff --git a/b.md b/b.md
         host.layout = "sidebyside".into();
         let diff = Diff::with_layouts(parse_unified_diff(SAMPLE), &host, Layouts::builtin());
         assert_eq!(diff.layout(), "unified");
-        assert!(diff.total() > 0, "a typo in a live-reloaded file must not blank the diff");
+        assert!(
+            diff.total() > 0,
+            "a typo in a live-reloaded file must not blank the diff"
+        );
     }
 
     #[test]
     fn cycling_returns_to_where_it_started() {
         let host = Host::new();
-        let mut diff =
-            Diff::with_layouts(parse_unified_diff(TWO_FILES), &host, Layouts::builtin());
+        let mut diff = Diff::with_layouts(parse_unified_diff(TWO_FILES), &host, Layouts::builtin());
         let (name, total) = (diff.layout(), diff.total());
         diff.apply_layout(1, &host);
         assert_eq!(diff.layout(), "split");
         assert_ne!(diff.total(), total);
         diff.apply_layout(0, &host);
         assert_eq!(diff.layout(), name);
-        assert_eq!(diff.total(), total, "a round trip must rebuild the same rows");
+        assert_eq!(
+            diff.total(),
+            total,
+            "a round trip must rebuild the same rows"
+        );
     }
 
     #[test]
@@ -3255,7 +3544,10 @@ diff --git a/b.md b/b.md
         diff.top.set(total / 2);
         diff.apply_layout(1, &host);
         let landed = diff.top.get() as f32 / diff.total() as f32;
-        assert!((landed - 0.5).abs() < 0.05, "landed {landed} of the way through");
+        assert!(
+            (landed - 0.5).abs() < 0.05,
+            "landed {landed} of the way through"
+        );
     }
 
     #[test]
@@ -3263,7 +3555,9 @@ diff --git a/b.md b/b.md
         // Rule 1, as a test: a third presentation needs no edit to the two
         // shipped ones, and `[diff] layout` reaches it.
         let mut layouts = Layouts::builtin();
-        layouts.register("one-liner", |_| vec![Box::new(OneLinerEverything::default())]);
+        layouts.register("one-liner", |_| {
+            vec![Box::new(OneLinerEverything::default())]
+        });
         assert_eq!(layouts.names(), vec!["unified", "split", "one-liner"]);
 
         let mut host = Host::new();
@@ -3277,9 +3571,12 @@ diff --git a/b.md b/b.md
     fn registering_a_name_twice_replaces_the_presentation() {
         let mut layouts = Layouts::builtin();
         layouts.register("unified", |_| vec![Box::new(OneLinerEverything::default())]);
-        assert_eq!(layouts.names(), vec!["unified", "split"], "a replacement must not append");
-        let diff =
-            Diff::with_layouts(parse_unified_diff(TWO_FILES), &Host::new(), layouts);
+        assert_eq!(
+            layouts.names(),
+            vec!["unified", "split"],
+            "a replacement must not append"
+        );
+        let diff = Diff::with_layouts(parse_unified_diff(TWO_FILES), &Host::new(), layouts);
         assert_eq!(diff.total(), 2);
     }
 
@@ -3331,7 +3628,10 @@ diff --git a/b.md b/b.md
         let mut raw = String::from("diff --git a/big.rs b/big.rs\n@@ -1,200 +1,200 @@\n");
         for i in 0..200 {
             if i % 5 == 0 {
-                raw.push_str(&format!("-    let x{i} = {i};\n+    let x{i} = {};\n", i + 1));
+                raw.push_str(&format!(
+                    "-    let x{i} = {i};\n+    let x{i} = {};\n",
+                    i + 1
+                ));
             } else {
                 raw.push_str(&format!("     let y{i} = {i};\n"));
             }
@@ -3369,7 +3669,12 @@ diff --git a/b.md b/b.md
                 let _ = diff.renderers.borrow()[r.owner as usize]
                     .width(r.index as usize, r.seg as usize);
             }
-            assert!(diff.widest < diff.total(), "{name}: widest {} of {}", diff.widest, diff.total());
+            assert!(
+                diff.widest < diff.total(),
+                "{name}: widest {} of {}",
+                diff.widest,
+                diff.total()
+            );
         }
         // And cycling between them, both ways, over the same input.
         let mut diff = Diff::with_layouts(files, &host, Layouts::builtin());
@@ -3392,4 +3697,3 @@ diff --git a/b.md b/b.md
         assert!(diff.order.iter().all(|r| r.owner == 0));
     }
 }
-

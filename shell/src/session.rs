@@ -85,11 +85,18 @@ mod tests {
     use std::path::PathBuf;
 
     fn key(view: View, repo: &str, arg: &str) -> String {
-        Source::Repo { path: PathBuf::from(repo), arg: arg.into() }.key(view)
+        Source::Repo {
+            path: PathBuf::from(repo),
+            arg: arg.into(),
+        }
+        .key(view)
     }
 
     fn session() -> Session {
-        Session { key: key(View::Diff, ".", "HEAD~2..HEAD"), top: 431 }
+        Session {
+            key: key(View::Diff, ".", "HEAD~2..HEAD"),
+            top: 431,
+        }
     }
 
     #[test]
@@ -116,14 +123,24 @@ mod tests {
 
     #[test]
     fn nothing_saved_means_nothing_restored() {
-        assert_eq!(restore("anything", Path::new("/nonexistent/plait-session")), None);
+        assert_eq!(
+            restore("anything", Path::new("/nonexistent/plait-session")),
+            None
+        );
     }
 
     #[test]
     fn a_corrupt_file_is_ignored_rather_than_fatal() {
         // It is written every few hundred milliseconds and can be caught
         // half-flushed by a kill; every one of these must be a quiet `None`.
-        for text in ["", "\n", "only-a-key\n", "key\nnot-a-number\n", "key\n-1\n", "\n\n"] {
+        for text in [
+            "",
+            "\n",
+            "only-a-key\n",
+            "key\nnot-a-number\n",
+            "key\n-1\n",
+            "\n\n",
+        ] {
             assert_eq!(decode(text), None, "{text:?} decoded to something");
         }
     }
@@ -132,7 +149,10 @@ mod tests {
     fn a_huge_row_number_survives() {
         // 714k-row diffs are a real fixture; the deletion one is bigger than any
         // sane default and must not overflow anything.
-        let s = Session { key: "k".into(), top: 713_995 };
+        let s = Session {
+            key: "k".into(),
+            top: 713_995,
+        };
         assert_eq!(decode(&encode(&s)), Some(s));
     }
 

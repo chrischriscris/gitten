@@ -73,7 +73,11 @@ pub struct Scrolling {
 
 impl Default for Scrolling {
     fn default() -> Self {
-        Self { rows: 1, scrolloff: SCROLLOFF, scrollbar: true }
+        Self {
+            rows: 1,
+            scrolloff: SCROLLOFF,
+            scrollbar: true,
+        }
     }
 }
 
@@ -100,7 +104,13 @@ impl Default for Viewport {
 
 impl Viewport {
     pub fn new() -> Self {
-        Self { len: 0, height: 0, top: 0, cursor: 0, scrolloff: SCROLLOFF }
+        Self {
+            len: 0,
+            height: 0,
+            top: 0,
+            cursor: 0,
+            scrolloff: SCROLLOFF,
+        }
     }
 
     // ----------------------------------------------------------------- the shape
@@ -417,7 +427,11 @@ mod tests {
     fn a_viewport_shorter_than_twice_the_margin_drops_it() {
         let mut v = view(100, 5);
         v.down();
-        assert_eq!(v.top(), 0, "a margin here would scroll on the first keypress");
+        assert_eq!(
+            v.top(),
+            0,
+            "a margin here would scroll on the first keypress"
+        );
         v.move_by(3);
         assert_eq!((v.cursor(), v.top()), (4, 0));
         v.down();
@@ -554,7 +568,11 @@ mod tests {
             // lands on the same cell.
             let mut back = v;
             back.scroll_to(v.top_at(cell, 25));
-            assert_eq!(back.thumb(25).unwrap().start, cell, "the thumb moved at top {top}");
+            assert_eq!(
+                back.thumb(25).unwrap().start,
+                cell,
+                "the thumb moved at top {top}"
+            );
         }
     }
 

@@ -70,7 +70,12 @@ pub struct Frame<'a> {
 
 impl<'a> Frame<'a> {
     pub fn new(host: &'a Host) -> Self {
-        Self { host, shift: 0, current: false, sel: None }
+        Self {
+            host,
+            shift: 0,
+            current: false,
+            sel: None,
+        }
     }
 
     /// The selection over one of this row's texts, or `None` if the selection is
@@ -179,7 +184,9 @@ impl Layouts {
         // The same name the desktop registers and `plait.toml` documents:
         // `diff.layout` is data, and one value has to open this presentation
         // from every client that reads the file.
-        l.register("split", |_| vec![Box::new(crate::split::SplitRows::default())]);
+        l.register("split", |_| {
+            vec![Box::new(crate::split::SplitRows::default())]
+        });
         l
     }
 
@@ -191,7 +198,10 @@ impl Layouts {
         name: &'static str,
         build: impl Fn(&Host) -> Vec<Box<dyn Rows>> + 'static,
     ) {
-        let layout = Layout { name, build: Box::new(build) };
+        let layout = Layout {
+            name,
+            build: Box::new(build),
+        };
         match self.0.iter().position(|l| l.name == name) {
             Some(i) => self.0[i] = layout,
             None => self.0.push(layout),
@@ -247,7 +257,13 @@ pub fn file_header(path: &str, adds: usize, dels: usize, at: &Frame, pen: &mut P
     let p = &at.theme().diff;
     let bg = row_bg(p.file_bg, at);
     pen.fill(HEADER_PAD, ' ', Ink::new(p.file_fg, bg));
-    selected_text(path, Ink::new(p.file_fg, bg).bold(), at.part(0), at.theme(), pen);
+    selected_text(
+        path,
+        Ink::new(p.file_fg, bg).bold(),
+        at.part(0),
+        at.theme(),
+        pen,
+    );
     pen.put("  ", Ink::new(p.file_fg, bg));
     pen.put(&format!("+{adds}"), Ink::new(p.adds_fg, bg));
     pen.put(" ", Ink::new(p.file_fg, bg));
@@ -270,7 +286,10 @@ pub fn hunk_header(header: &str, at: &Frame, pen: &mut Pen) {
 /// text starts at [`HEADER_PAD`]. Two presentations working that out separately
 /// is two places for the caret to be a column off.
 pub fn header_hit(text: &str, col: usize) -> Hit {
-    Hit { part: 0, off: col_at(text, col.saturating_sub(HEADER_PAD)) }
+    Hit {
+        part: 0,
+        off: col_at(text, col.saturating_sub(HEADER_PAD)),
+    }
 }
 
 /// Which byte of `text` is drawn in column `col` of it.
@@ -300,13 +319,7 @@ pub fn col_at(text: &str, col: usize) -> usize {
 /// For the rows that have no runs to speak of — a file path, a hunk header. A
 /// line of a diff goes through [`text_run`] instead, which has tokens and changed
 /// words to keep as well.
-pub fn selected_text(
-    text: &str,
-    ink: Ink,
-    sel: Option<Selected>,
-    theme: &Theme,
-    pen: &mut Pen,
-) {
+pub fn selected_text(text: &str, ink: Ink, sel: Option<Selected>, theme: &Theme, pen: &mut Pen) {
     let Some(range) = selection(sel, text.len()) else {
         pen.put(text, ink);
         return;
@@ -430,7 +443,11 @@ fn piece(
         Some(kind) => theme.syntax_on(kind, surface),
         // Text no highlighter claimed keeps the row's own foreground rather
         // than a syntax colour it was never given.
-        None => Style { fg: row_ink.fg, bold: false, italic: false },
+        None => Style {
+            fg: row_ink.fg,
+            bold: false,
+            italic: false,
+        },
     };
     pen.put(&line.text[at], Ink::styled(style, bg));
 }
@@ -553,7 +570,9 @@ impl Rows for TextRows {
     fn render(&self, index: usize, seg: usize, at: &Frame, pen: &mut Pen, out: &mut Vec<Run>) {
         let theme = at.theme();
         let p = &theme.diff;
-        let Some(row) = self.flat.get(index) else { return };
+        let Some(row) = self.flat.get(index) else {
+            return;
+        };
         match row {
             Row::File { path, adds, dels } => file_header(path, *adds, *dels, at, pen),
             Row::Hunk(header) => hunk_header(header, at, pen),
@@ -588,7 +607,10 @@ impl Rows for TextRows {
                 let text = col.saturating_sub(self.chrome()) + shift;
                 let span = self.flat.range(index, seg);
                 let at = col_at(&l.text[span.clone()], text);
-                Some(Hit { part: 0, off: span.start + at })
+                Some(Hit {
+                    part: 0,
+                    off: span.start + at,
+                })
             }
         }
     }
@@ -661,8 +683,7 @@ diff --git a/a.rs b/a.rs
             for o in self.owners.iter_mut() {
                 o.reflow(cols, host, wrap);
             }
-            self.order =
-                plait_core::rows::expand(&self.order, &self.owners, None).order;
+            self.order = plait_core::rows::expand(&self.order, &self.owners, None).order;
         }
 
         fn paint(&mut self, shift: usize, current: Option<usize>) {
@@ -688,13 +709,20 @@ diff --git a/a.rs b/a.rs
                     sel: sel.and_then(|s| s.at(y, r.logical())),
                 };
                 let mut pen = self.screen.row(y);
-                self.owners[r.owner as usize]
-                    .render(r.index as usize, r.seg as usize, &at, &mut pen, &mut out);
+                self.owners[r.owner as usize].render(
+                    r.index as usize,
+                    r.seg as usize,
+                    &at,
+                    &mut pen,
+                    &mut out,
+                );
             }
         }
 
         fn dump(&self) -> Vec<String> {
-            (0..self.order.len()).map(|y| self.screen.row_text(y)).collect()
+            (0..self.order.len())
+                .map(|y| self.screen.row_text(y))
+                .collect()
         }
     }
 
@@ -733,7 +761,9 @@ diff --git a/a.rs b/a.rs
         let theme = &h.host.theme;
         // Row 3 is `- let x = 1;`. Find the `1`, which is the changed word.
         let y = 3;
-        let x = (0..40).find(|x| h.screen.char_at(*x, y) == Some('1')).unwrap();
+        let x = (0..40)
+            .find(|x| h.screen.char_at(*x, y) == Some('1'))
+            .unwrap();
         assert_eq!(h.screen.ink(x, y).unwrap().bg, theme.diff.removed_word_bg);
         // ...and the character beside it is on the plain removal background.
         assert_eq!(h.screen.ink(x - 1, y).unwrap().bg, theme.diff.removed_bg);
@@ -745,11 +775,16 @@ diff --git a/a.rs b/a.rs
         h.paint(0, None);
         let theme = &h.host.theme;
         let expected = theme
-            .syntax_on(plait_core::syntax::Kind::Keyword, plait_core::theme::Surface::Removed)
+            .syntax_on(
+                plait_core::syntax::Kind::Keyword,
+                plait_core::theme::Surface::Removed,
+            )
             .fg;
         // `let` on the removed line.
         let y = 3;
-        let x = (0..40).find(|x| h.screen.char_at(*x, y) == Some('l')).unwrap();
+        let x = (0..40)
+            .find(|x| h.screen.char_at(*x, y) == Some('l'))
+            .unwrap();
         assert_eq!(h.screen.ink(x, y).unwrap().fg, expected);
     }
 
@@ -758,7 +793,10 @@ diff --git a/a.rs b/a.rs
         let mut h = Harness::new(DIFF, 40, "unified");
         h.paint(0, None);
         assert_eq!(h.screen.ink(39, 4).unwrap().bg, h.host.theme.diff.added_bg);
-        assert_eq!(h.screen.ink(39, 5).unwrap().bg, h.host.theme.diff.context_bg);
+        assert_eq!(
+            h.screen.ink(39, 5).unwrap().bg,
+            h.host.theme.diff.context_bg
+        );
     }
 
     #[test]
@@ -766,8 +804,16 @@ diff --git a/a.rs b/a.rs
         let mut h = Harness::new(DIFF, 40, "unified");
         h.paint(0, Some(3));
         let bar = h.host.theme.chrome.selection_bg;
-        assert_eq!(h.screen.ink(0, 3).unwrap().bg, bar, "the gutter was left out");
-        assert_eq!(h.screen.ink(39, 3).unwrap().bg, bar, "it stopped at the text");
+        assert_eq!(
+            h.screen.ink(0, 3).unwrap().bg,
+            bar,
+            "the gutter was left out"
+        );
+        assert_eq!(
+            h.screen.ink(39, 3).unwrap().bg,
+            bar,
+            "it stopped at the text"
+        );
         assert_ne!(h.screen.ink(0, 4).unwrap().bg, bar, "it leaked downwards");
     }
 
@@ -809,11 +855,21 @@ diff --git a/a.rs b/a.rs
         sel.extend(Caret::new((0, 3), 9, 3));
         h.paint_sel(0, None, Some(&sel));
         let bg = h.host.theme.background(Surface::Selected);
-        let x = (0..40).find(|x| h.screen.char_at(*x, 3) == Some('x')).unwrap();
+        let x = (0..40)
+            .find(|x| h.screen.char_at(*x, 3) == Some('x'))
+            .unwrap();
         assert_eq!(h.screen.ink(x, 3).unwrap().bg, bg);
-        assert_eq!(h.screen.ink(x + 4, 3).unwrap().bg, bg, "the last selected byte");
+        assert_eq!(
+            h.screen.ink(x + 4, 3).unwrap().bg,
+            bg,
+            "the last selected byte"
+        );
         assert_ne!(h.screen.ink(x - 1, 3).unwrap().bg, bg, "it started early");
-        assert_ne!(h.screen.ink(x + 5, 3).unwrap().bg, bg, "it ran past the end");
+        assert_ne!(
+            h.screen.ink(x + 5, 3).unwrap().bg,
+            bg,
+            "it ran past the end"
+        );
         // The row it is not on keeps its own colour.
         assert_eq!(h.screen.ink(x, 4).unwrap().bg, h.host.theme.diff.added_bg);
     }
@@ -830,8 +886,14 @@ diff --git a/a.rs b/a.rs
         sel.extend(Caret::new((0, 3), 10, 3));
         h.paint_sel(0, None, Some(&sel));
         let bg = h.host.theme.background(Surface::Selected);
-        let one = (0..40).find(|x| h.screen.char_at(*x, 3) == Some('1')).unwrap();
-        assert_eq!(h.screen.ink(one, 3).unwrap().bg, bg, "the changed word kept its own");
+        let one = (0..40)
+            .find(|x| h.screen.char_at(*x, 3) == Some('1'))
+            .unwrap();
+        assert_eq!(
+            h.screen.ink(one, 3).unwrap().bg,
+            bg,
+            "the changed word kept its own"
+        );
     }
 
     #[test]
@@ -883,8 +945,14 @@ diff --git a/a.rs b/a.rs
             h.paint(0, None);
             let rows = h.dump();
             assert!(!rows.is_empty(), "{name} drew nothing");
-            assert!(rows.iter().any(|r| r.contains("a.rs")), "{name} lost the file header");
-            assert!(rows.iter().any(|r| r.contains("let x = 2")), "{name} lost an addition");
+            assert!(
+                rows.iter().any(|r| r.contains("a.rs")),
+                "{name} lost the file header"
+            );
+            assert!(
+                rows.iter().any(|r| r.contains("let x = 2")),
+                "{name} lost an addition"
+            );
             assert_eq!(layouts.name(i), *name);
             let _ = &host;
         }
@@ -939,7 +1007,11 @@ diff --git a/a.rs b/a.rs
         });
         let mut owners = layouts.build(0, &host);
         let a = assemble(&parse_unified_diff(DIFF), &host, &mut owners);
-        assert_eq!(owners[0].len(), 0, "the built-in kept a file the specialist claimed");
+        assert_eq!(
+            owners[0].len(),
+            0,
+            "the built-in kept a file the specialist claimed"
+        );
         assert_eq!(owners[1].len(), 6);
 
         let mut screen = Screen::new(40, 8);
@@ -947,17 +1019,30 @@ diff --git a/a.rs b/a.rs
         let mut out = Vec::new();
         for (y, r) in a.ordered.order.iter().enumerate() {
             let mut pen = screen.row(y);
-            owners[r.owner as usize].render(r.index as usize, r.seg as usize, &at, &mut pen, &mut out);
+            owners[r.owner as usize].render(
+                r.index as usize,
+                r.seg as usize,
+                &at,
+                &mut pen,
+                &mut out,
+            );
         }
         assert_eq!(screen.row_text(0), "A.RS");
-        assert_eq!(screen.row_text(3), "LET X = 1;", "a prepared line carries no sign; the presentation draws it");
+        assert_eq!(
+            screen.row_text(3),
+            "LET X = 1;",
+            "a prepared line carries no sign; the presentation draws it"
+        );
     }
 
     #[test]
     fn a_reflow_that_changes_nothing_says_so() {
         let mut h = Harness::new(DIFF, 40, "unified");
         let host = Host::new();
-        assert!(!h.owners[0].reflow(40, &host, &Word), "same width, same wrap");
+        assert!(
+            !h.owners[0].reflow(40, &host, &Word),
+            "same width, same wrap"
+        );
         assert!(h.owners[0].reflow(20, &host, &Word));
     }
 

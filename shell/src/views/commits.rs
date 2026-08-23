@@ -1,6 +1,6 @@
 use crate::graph;
-use gpui::*;
 use gpui::prelude::FluentBuilder as _;
+use gpui::*;
 use gpui_component::scroll::Scrollbar;
 use plait_core::host::Host;
 use plait_core::{assign_lanes, initials, Commit};
@@ -42,7 +42,8 @@ impl Commits {
         if self.data.commits.is_empty() {
             return;
         }
-        self.scroll.scroll_to_item(row.min(self.data.commits.len() - 1), ScrollStrategy::Top);
+        self.scroll
+            .scroll_to_item(row.min(self.data.commits.len() - 1), ScrollStrategy::Top);
     }
 
     pub fn total(&self) -> usize {
@@ -90,12 +91,20 @@ impl Commits {
 
         let load = format!(
             "{} commits · {} lanes · lanes {:.0?} draws {:.0?}",
-            commits.len(), lanes, t_lanes, t_draws
+            commits.len(),
+            lanes,
+            t_lanes,
+            t_draws
         );
         eprintln!("{load}");
 
         Self {
-            data: Rc::new(Data { commits, draws, who, widest }),
+            data: Rc::new(Data {
+                commits,
+                draws,
+                who,
+                widest,
+            }),
             scroll: UniformListScrollHandle::new(),
             rendered: Rc::new(Cell::new(0)),
             top: Rc::new(Cell::new(0)),
@@ -132,18 +141,12 @@ impl Render for Commits {
         // terminal draws its own bar from the same flag, and a knob that means
         // two things in two clients is a knob nobody trusts.
         let bars = crate::config::host(cx).view.scrollbar;
-        div()
-            .relative()
-            .size_full()
-            .child(list)
-            .when(bars, |d| {
-                d.child(Scrollbar::vertical(&self.scroll))
-                    .child(Scrollbar::horizontal(&self.scroll))
-            })
+        div().relative().size_full().child(list).when(bars, |d| {
+            d.child(Scrollbar::vertical(&self.scroll))
+                .child(Scrollbar::horizontal(&self.scroll))
+        })
     }
 }
-
-
 
 /// The sha and the initials columns, in *characters*.
 ///
@@ -185,4 +188,3 @@ fn row(c: &Commit, who: &Who, d: &graph::Draw, host: &Rc<Host>) -> AnyElement {
         .child(div().flex_none().child(c.subject.clone()))
         .into_any_element()
 }
-

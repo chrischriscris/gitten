@@ -14,9 +14,9 @@
 use crate::command::{Commands, Keymap};
 use crate::differ::Differs;
 use crate::font::Font;
+use crate::select::Mousing;
 use crate::syntax::Highlighters;
 use crate::theme::{Theme, Themes};
-use crate::select::Mousing;
 use crate::view::Scrolling;
 use crate::wrap::Wraps;
 
@@ -156,13 +156,17 @@ mod tests {
         assert!(host.select_theme("light"));
         // On top of the palette that was just selected, which is the order the
         // config file works in too.
-        host.theme.set_syntax(Kind::Heading, Style::fg(0x00ff00).bold());
+        host.theme
+            .set_syntax(Kind::Heading, Style::fg(0x00ff00).bold());
         host.theme.diff.added_bg = 0x001100;
         host.font = crate::font::Font::menlo();
-        host.commands.register("blame.toggle", "show blame beside the diff");
+        host.commands
+            .register("blame.toggle", "show blame beside the diff");
         host.keys.bind("diff", "b", "blame.toggle").unwrap();
 
-        let got = host.syntax.highlight("a.rs", &["# routed away from the scanner"]);
+        let got = host
+            .syntax
+            .highlight("a.rs", &["# routed away from the scanner"]);
         assert_eq!(got[0][0].kind, Kind::Heading);
         assert_eq!(host.theme.syntax(Kind::Heading).fg, 0x00ff00);
         assert_eq!(host.theme.diff.added_bg, 0x001100);
@@ -204,7 +208,11 @@ mod tests {
         // Every shipped binding names a command that exists — the check the
         // config layer runs against the file, applied to the defaults.
         for b in host.keys.bindings() {
-            assert!(host.commands.known(&b.command), "{} is not a command", b.command);
+            assert!(
+                host.commands.known(&b.command),
+                "{} is not a command",
+                b.command
+            );
         }
     }
 }

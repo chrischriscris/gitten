@@ -142,7 +142,9 @@ const KINDS: [(&str, Kind); Kind::COUNT] = [
 /// dev loop wants the file next to the code it is describing, and a per-user
 /// location is a product decision this does not need to make yet.
 pub fn path() -> PathBuf {
-    std::env::var_os("PLAIT_CONFIG").map(PathBuf::from).unwrap_or_else(|| "plait.toml".into())
+    std::env::var_os("PLAIT_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| "plait.toml".into())
 }
 
 /// Reads and applies the config, if there is one.
@@ -192,7 +194,10 @@ pub fn apply(host: &mut Host, text: &str) -> Vec<String> {
         apply_keys(host, keys, &mut warn);
     }
     for key in doc.keys() {
-        if !matches!(key.as_str(), "font" | "theme" | "diff" | "view" | "mouse" | "keys") {
+        if !matches!(
+            key.as_str(),
+            "font" | "theme" | "diff" | "view" | "mouse" | "keys"
+        ) {
             warn.push(format!("config: unknown section [{key}]"));
         }
     }
@@ -302,7 +307,9 @@ fn bind_one(
     };
     if name.is_empty() {
         if !host.keys.unbind(mode, chord) {
-            warn.push(format!("config: nothing was bound to {chord:?} in [{mode}]"));
+            warn.push(format!(
+                "config: nothing was bound to {chord:?} in [{mode}]"
+            ));
         }
         return;
     }
@@ -360,7 +367,11 @@ fn apply_diff(host: &mut Host, value: &toml::Value, warn: &mut Vec<String>) {
                 }
                 None => warn.push(format!(
                     "config: diff.whitespace must be one of {}",
-                    Whitespace::ALL.iter().map(|w| w.name()).collect::<Vec<_>>().join(", ")
+                    Whitespace::ALL
+                        .iter()
+                        .map(|w| w.name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 )),
             },
             // A length, not a switch: the threshold is what keeps two matching
@@ -372,9 +383,7 @@ fn apply_diff(host: &mut Host, value: &toml::Value, warn: &mut Vec<String>) {
                         warn.push("config: diff.moves applies on the next launch".into());
                     }
                 }
-                _ => warn.push(
-                    "config: diff.moves must be between 0 (off) and 1000 lines".into(),
-                ),
+                _ => warn.push("config: diff.moves must be between 0 (off) and 1000 lines".into()),
             },
             "indent_heuristic" => match v.as_bool() {
                 Some(b) => {
@@ -385,9 +394,7 @@ fn apply_diff(host: &mut Host, value: &toml::Value, warn: &mut Vec<String>) {
                         );
                     }
                 }
-                None => {
-                    warn.push("config: diff.indent_heuristic must be true or false".into())
-                }
+                None => warn.push("config: diff.indent_heuristic must be true or false".into()),
             },
             // Validated against the host's own registry, like `algorithm` and
             // unlike `layout`: the wraps live in `core`, so this layer can name
@@ -549,7 +556,9 @@ fn apply_palette(theme: &mut Theme, table: &str, value: &toml::Value, warn: &mut
                     warn.push(format!("config: unknown colour theme.{table}.{name}"));
                 }
             }
-            None => warn.push(format!("config: theme.{table}.{name} is not a #rrggbb colour")),
+            None => warn.push(format!(
+                "config: theme.{table}.{name} is not a #rrggbb colour"
+            )),
         }
     }
 }
@@ -600,7 +609,9 @@ fn colors(v: &toml::Value, warn: &mut Vec<String>, what: &str) -> Option<Vec<Rgb
         match rgb(item) {
             Some(c) => out.push(c),
             None => {
-                warn.push(format!("config: {what} has an entry that is not a #rrggbb colour"));
+                warn.push(format!(
+                    "config: {what} has an entry that is not a #rrggbb colour"
+                ));
                 return None;
             }
         }
@@ -621,7 +632,10 @@ fn rgb(v: &toml::Value) -> Option<Rgb> {
 /// `#rrggbb`, `rrggbb` or `0xrrggbb`.
 fn parse_hex(s: &str) -> Option<Rgb> {
     let t = s.trim();
-    let t = t.strip_prefix('#').or_else(|| t.strip_prefix("0x")).unwrap_or(t);
+    let t = t
+        .strip_prefix('#')
+        .or_else(|| t.strip_prefix("0x"))
+        .unwrap_or(t);
     (t.len() == 6 && t.chars().all(|c| c.is_ascii_hexdigit()))
         .then(|| u32::from_str_radix(t, 16).ok())
         .flatten()
@@ -669,7 +683,11 @@ pub fn dump(host: &Host) -> String {
     out.push_str(&format!(
         "whitespace = {:?}    # {}\n",
         host.differ.whitespace.name(),
-        Whitespace::ALL.iter().map(|w| w.name()).collect::<Vec<_>>().join(", ")
+        Whitespace::ALL
+            .iter()
+            .map(|w| w.name())
+            .collect::<Vec<_>>()
+            .join(", ")
     ));
     out.push_str(&format!(
         "moves = {}            # shortest block reported as moved; 0 is off\n",
@@ -690,7 +708,9 @@ pub fn dump(host: &Host) -> String {
     out.push_str("# `ctrl-e`/`ctrl-y` — one, because a terminal already reports the wheel once\n");
     out.push_str("# per line of however fast the platform says you scrolled. `scrolloff` is the\n");
     out.push_str("# lead the cursor keeps at the edge, and 0 lets it reach the last row.\n");
-    out.push_str("# `scrollbar` draws one beside a list too long to fit, and nothing when it fits.\n");
+    out.push_str(
+        "# `scrollbar` draws one beside a list too long to fit, and nothing when it fits.\n",
+    );
     out.push_str("[view]\n");
     out.push_str(&format!("scroll = {}\n", host.view.rows));
     out.push_str(&format!("scrolloff = {}\n", host.view.scrolloff));
@@ -701,7 +721,10 @@ pub fn dump(host: &Host) -> String {
     out.push_str("# copy. A click is a cursor move and never copies; `y` copies either way. The\n");
     out.push_str("# window has the platform's own cmd-c and ignores this.\n");
     out.push_str("[mouse]\n");
-    out.push_str(&format!("copy_on_select = {}\n\n", host.mouse.copy_on_select));
+    out.push_str(&format!(
+        "copy_on_select = {}\n\n",
+        host.mouse.copy_on_select
+    ));
 
     let t = &host.theme;
     out.push_str("# `name` picks one of the registered palettes and everything below is applied\n");
@@ -747,7 +770,9 @@ pub fn dump(host: &Host) -> String {
     // than as a diff against the built-ins: a file that only lists what you
     // changed cannot be read to find out what a key does, and `plait config`
     // exists to be read.
-    out.push_str("\n# Which command each key runs. A key at the top level is global; a key under\n");
+    out.push_str(
+        "\n# Which command each key runs. A key at the top level is global; a key under\n",
+    );
     out.push_str("# [keys.<mode>] applies only there and overrides the global one. Set a key to\n");
     out.push_str("# \"\" to unbind it. Commands:\n");
     for c in host.commands.all() {
@@ -781,7 +806,10 @@ fn hex(c: Rgb) -> String {
 }
 
 fn hex_list(cs: &[Rgb]) -> String {
-    cs.iter().map(|c| format!("\"{}\"", hex(*c))).collect::<Vec<_>>().join(", ")
+    cs.iter()
+        .map(|c| format!("\"{}\"", hex(*c)))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 // ------------------------------------------------------------------ watching
@@ -802,7 +830,10 @@ pub fn watch(
     use notify::{EventKind, RecursiveMode, Watcher};
 
     let file = path.file_name().map(|f| f.to_owned());
-    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
 
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         let Ok(event) = res else { return };
@@ -847,13 +878,19 @@ mod tests {
     fn a_key_reaches_the_keymap_in_the_mode_it_was_written_in() {
         use plait_core::command::{Modes, Resolve};
         let mut h = host();
-        let warn = apply(&mut h, "[keys]\n\"x\" = \"quit\"\n\n[keys.diff]\n\"x\" = \"diff.cycle-wrap\"\n");
+        let warn = apply(
+            &mut h,
+            "[keys]\n\"x\" = \"quit\"\n\n[keys.diff]\n\"x\" = \"diff.cycle-wrap\"\n",
+        );
         assert!(warn.is_empty(), "{warn:?}");
         let chord = [plait_core::command::Key::char('x')];
         assert_eq!(h.keys.resolve(&Modes::new(), &chord), Resolve::Run("quit"));
         let mut diff = Modes::new();
         diff.push("diff");
-        assert_eq!(h.keys.resolve(&diff, &chord), Resolve::Run("diff.cycle-wrap"));
+        assert_eq!(
+            h.keys.resolve(&diff, &chord),
+            Resolve::Run("diff.cycle-wrap")
+        );
     }
 
     #[test]
@@ -861,7 +898,10 @@ mod tests {
         use plait_core::command::{Key, Modes, Resolve};
         let mut h = host();
         assert!(apply(&mut h, "[keys]\n\"j\" = \"\"\n").is_empty());
-        assert_eq!(h.keys.resolve(&Modes::new(), &[Key::char('j')]), Resolve::None);
+        assert_eq!(
+            h.keys.resolve(&Modes::new(), &[Key::char('j')]),
+            Resolve::None
+        );
         // Unbinding what was never bound is worth saying: it is almost always a
         // typo in the key rather than a request.
         let warn = apply(&mut h, "[keys]\n\"j\" = \"\"\n");
@@ -882,10 +922,16 @@ mod tests {
             "[keys]\n\"j\" = \"nope.nothing\"\n\"nonsense\" = \"quit\"\n\"g g\" = \"quit\"\n",
         );
         assert_eq!(warn.len(), 3, "{warn:?}");
-        assert!(warn.iter().any(|w| w.contains("no such command")), "{warn:?}");
+        assert!(
+            warn.iter().any(|w| w.contains("no such command")),
+            "{warn:?}"
+        );
         assert!(warn.iter().any(|w| w.contains("not a key")), "{warn:?}");
         assert!(warn.iter().any(|w| w.contains("prefix")), "{warn:?}");
-        assert_eq!(h.keys.resolve(&Modes::new(), &[Key::char('j')]), Resolve::Run(&before));
+        assert_eq!(
+            h.keys.resolve(&Modes::new(), &[Key::char('j')]),
+            Resolve::Run(&before)
+        );
     }
 
     #[test]
@@ -894,7 +940,8 @@ mod tests {
         // in here: the registry is the thing that knows what exists.
         use plait_core::command::{Key, Modes, Resolve};
         let mut h = host();
-        h.commands.register("blame.toggle", "show blame beside the diff");
+        h.commands
+            .register("blame.toggle", "show blame beside the diff");
         assert!(apply(&mut h, "[keys]\n\"b\" = \"blame.toggle\"\n").is_empty());
         assert_eq!(
             h.keys.resolve(&Modes::new(), &[Key::char('b')]),
@@ -913,7 +960,10 @@ mod tests {
         let mut back = Host::new();
         let warn = apply(&mut back, &text);
         assert!(warn.is_empty(), "{warn:?}");
-        assert!(back.keys.keys_for("diff.cycle-wrap").contains(&"b".to_string()));
+        assert!(back
+            .keys
+            .keys_for("diff.cycle-wrap")
+            .contains(&"b".to_string()));
         // `apply` starts from the built-ins, so an unbind is the one thing a
         // round trip cannot carry: the file says what *is* bound, and `j` is
         // absent from it rather than present as a removal.
@@ -933,7 +983,10 @@ mod tests {
         let mut h = host();
         let warn = apply(&mut h, "[theme]\nname = \"light\"\n");
         assert!(warn.is_empty(), "{warn:?}");
-        assert_eq!(h.theme.chrome.bg, plait_core::theme::Theme::light().chrome.bg);
+        assert_eq!(
+            h.theme.chrome.bg,
+            plait_core::theme::Theme::light().chrome.bg
+        );
         assert_eq!(h.theme.name, "light");
     }
 
@@ -947,8 +1000,14 @@ mod tests {
         let text = "[theme]\nname = \"light\"\n\n[theme.diff]\nadded_bg = \"#123456\"\n";
         let warn = apply(&mut h, text);
         assert!(warn.is_empty(), "{warn:?}");
-        assert_eq!(h.theme.diff.added_bg, 0x123456, "the theme overwrote the colour");
-        assert_eq!(h.theme.diff.removed_bg, plait_core::theme::Theme::light().diff.removed_bg);
+        assert_eq!(
+            h.theme.diff.added_bg, 0x123456,
+            "the theme overwrote the colour"
+        );
+        assert_eq!(
+            h.theme.diff.removed_bg,
+            plait_core::theme::Theme::light().diff.removed_bg
+        );
     }
 
     #[test]
@@ -960,8 +1019,14 @@ mod tests {
         let text = "[theme]\nname = \"solarized-ish\"\n\n[theme.diff]\nadded_bg = \"#073642\"\n";
         let warn = apply(&mut h, text);
         assert!(warn.is_empty(), "{warn:?}");
-        assert_eq!(h.themes.names(), vec!["dark", "light", "slate", "solarized-ish"]);
-        assert_eq!(h.themes.get("solarized-ish").map(|t| t.diff.added_bg), Some(0x073642));
+        assert_eq!(
+            h.themes.names(),
+            vec!["dark", "light", "slate", "solarized-ish"]
+        );
+        assert_eq!(
+            h.themes.get("solarized-ish").map(|t| t.diff.added_bg),
+            Some(0x073642)
+        );
         // And selecting it again gives back what the file said, not the built-in
         // it was based on.
         h.select_theme("dark");
@@ -975,8 +1040,15 @@ mod tests {
         let text = "[theme]\nname = \"slate\"\n\n[theme.chrome]\naccent = \"#ff0000\"\n";
         let warn = apply(&mut h, text);
         assert!(warn.is_empty(), "{warn:?}");
-        assert_eq!(h.themes.names(), vec!["dark", "light", "slate"], "a fourth entry appeared");
-        assert_eq!(h.themes.get("slate").map(|t| t.chrome.accent), Some(0xff0000));
+        assert_eq!(
+            h.themes.names(),
+            vec!["dark", "light", "slate"],
+            "a fourth entry appeared"
+        );
+        assert_eq!(
+            h.themes.get("slate").map(|t| t.chrome.accent),
+            Some(0xff0000)
+        );
         // The other two are untouched, which is the whole reason a pick can be
         // trusted: `plait config` dumps every colour of the theme you are on,
         // and that must not repaint the ones you are not.
@@ -992,7 +1064,10 @@ mod tests {
         let warn = apply(&mut h, "[theme]\nname = \"ligth\"\n");
         assert_eq!(warn.len(), 1, "{warn:?}");
         assert!(warn[0].contains("unknown theme"), "{warn:?}");
-        assert!(warn[0].contains("light"), "it should name what is registered: {warn:?}");
+        assert!(
+            warn[0].contains("light"),
+            "it should name what is registered: {warn:?}"
+        );
         let mut h = host();
         let text = "[theme]\nname = \"ligth\"\n\n[theme.chrome]\naccent = \"#ff0000\"\n";
         assert!(apply(&mut h, text).is_empty(), "a definition is not a typo");
@@ -1013,7 +1088,10 @@ mod tests {
         // The render path reads `syntax_on`, not `syntax`, so forgetting the
         // rebuild would mean the change never appears.
         let mut h = host();
-        let warn = apply(&mut h, "[theme.syntax]\ncomment = \"#ff0000 bold italic\"\n");
+        let warn = apply(
+            &mut h,
+            "[theme.syntax]\ncomment = \"#ff0000 bold italic\"\n",
+        );
         assert!(warn.is_empty(), "{warn:?}");
         let s = h.theme.syntax(Kind::Comment);
         assert_eq!(s.fg, 0xff0000);
@@ -1054,9 +1132,16 @@ mod tests {
         // one, so the message comes from the registry itself.
         let mut h = host();
         let warn = apply(&mut h, "[diff]\nalgorithm = \"patients\"\n");
-        assert_eq!(h.differ.selected(), "histogram", "a typo must not change the algorithm");
+        assert_eq!(
+            h.differ.selected(),
+            "histogram",
+            "a typo must not change the algorithm"
+        );
         assert_eq!(warn.len(), 1, "{warn:?}");
-        assert!(warn[0].contains("histogram") && warn[0].contains("myers"), "{warn:?}");
+        assert!(
+            warn[0].contains("histogram") && warn[0].contains("myers"),
+            "{warn:?}"
+        );
     }
 
     #[test]
@@ -1069,7 +1154,12 @@ mod tests {
             fn name(&self) -> &'static str {
                 "semantic"
             }
-            fn diff(&self, _: &str, _: &[std::sync::Arc<str>], _: &[std::sync::Arc<str>]) -> Vec<Edit> {
+            fn diff(
+                &self,
+                _: &str,
+                _: &[std::sync::Arc<str>],
+                _: &[std::sync::Arc<str>],
+            ) -> Vec<Edit> {
                 Vec::new()
             }
         }
@@ -1103,7 +1193,10 @@ mod tests {
         let warn = apply(&mut h, "[diff]\nwrap = \"wrod\"\n");
         assert_eq!(h.wrap.selected(), "sentence");
         assert_eq!(warn.len(), 1, "{warn:?}");
-        assert!(warn[0].contains("word") && warn[0].contains("sentence"), "{warn:?}");
+        assert!(
+            warn[0].contains("word") && warn[0].contains("sentence"),
+            "{warn:?}"
+        );
     }
 
     #[test]
@@ -1129,7 +1222,7 @@ mod tests {
     fn the_fields_that_need_a_relaunch_say_so() {
         let mut h = host();
         let warn = apply(&mut h, "[font]\nmonospaced = false\n");
-        assert!(h.font.monospaced == false, "it was still applied");
+        assert!(!h.font.monospaced, "it was still applied");
         assert!(
             warn.iter().any(|w| w.contains("next launch")),
             "no warning about needing a relaunch: {warn:?}"
@@ -1182,7 +1275,10 @@ mod tests {
     #[test]
     fn unknown_keys_are_named_not_ignored() {
         let mut h = host();
-        let warn = apply(&mut h, "[nope]\nx = 1\n[theme.diff]\nnot_a_colour = \"#111111\"\n");
+        let warn = apply(
+            &mut h,
+            "[nope]\nx = 1\n[theme.diff]\nnot_a_colour = \"#111111\"\n",
+        );
         assert!(warn.iter().any(|w| w.contains("[nope]")), "{warn:?}");
         assert!(warn.iter().any(|w| w.contains("not_a_colour")), "{warn:?}");
     }
@@ -1194,7 +1290,10 @@ mod tests {
         let mut h = host();
         let text = dump(&h);
         let warn = apply(&mut h, &text);
-        assert!(warn.is_empty(), "round-tripping the defaults warned: {warn:?}");
+        assert!(
+            warn.is_empty(),
+            "round-tripping the defaults warned: {warn:?}"
+        );
     }
 
     #[test]
@@ -1210,7 +1309,12 @@ mod tests {
         original.theme.authors = vec![0x1c1d1e];
         original.theme.min_contrast = 4.5;
         original.theme.name = "round trip".into();
-        original.font = Font { family: "Iosevka".into(), size: 15.0, monospaced: true, advance: 0.5 };
+        original.font = Font {
+            family: "Iosevka".into(),
+            size: 15.0,
+            monospaced: true,
+            advance: 0.5,
+        };
         original.differ.select("patience");
         original.differ.context = 5;
         original.differ.whitespace = Whitespace::Change;
@@ -1231,19 +1335,33 @@ mod tests {
             warn.iter().all(|w| w.contains("next launch")),
             "dump produced a file with real warnings: {warn:?}\n{text}"
         );
-        assert_eq!(restored.theme, original.theme, "theme did not survive:\n{text}");
+        assert_eq!(
+            restored.theme, original.theme,
+            "theme did not survive:\n{text}"
+        );
         assert_eq!(restored.font, original.font, "font did not survive");
-        assert_eq!(restored.differ.selected(), "patience", "diff.algorithm did not survive");
+        assert_eq!(
+            restored.differ.selected(),
+            "patience",
+            "diff.algorithm did not survive"
+        );
         assert_eq!(restored.differ.context, 5, "diff.context did not survive");
         assert_eq!(restored.differ.whitespace, Whitespace::Change);
         assert_eq!(restored.differ.min_moved, 8);
         assert!(!restored.differ.indent_heuristic);
         assert_eq!(restored.layout, "split", "diff.layout did not survive");
-        assert_eq!(restored.wrap.selected(), "char", "diff.wrap did not survive");
+        assert_eq!(
+            restored.wrap.selected(),
+            "char",
+            "diff.wrap did not survive"
+        );
         assert_eq!(restored.view.rows, 4, "view.scroll did not survive");
         assert_eq!(restored.view.scrolloff, 0, "view.scrolloff did not survive");
         assert!(!restored.view.scrollbar, "view.scrollbar did not survive");
-        assert!(!restored.mouse.copy_on_select, "mouse.copy_on_select did not survive");
+        assert!(
+            !restored.mouse.copy_on_select,
+            "mouse.copy_on_select did not survive"
+        );
     }
 
     #[test]
@@ -1267,7 +1385,10 @@ mod tests {
         assert!(!h.mouse.copy_on_select);
         let warn = apply(&mut h, "[mouse]\ncopy_on_select = \"yes\"\n");
         assert!(warn[0].contains("mouse.copy_on_select"), "{warn:?}");
-        assert!(!h.mouse.copy_on_select, "a rejected value left the old one alone");
+        assert!(
+            !h.mouse.copy_on_select,
+            "a rejected value left the old one alone"
+        );
         let warn = apply(&mut h, "[mouse]\nspeed = 3\n");
         assert!(warn[0].contains("unknown key mouse.speed"), "{warn:?}");
         let warn = apply(&mut h, "[view]\nspeed = 3\n");
@@ -1287,7 +1408,10 @@ mod tests {
             );
         }
         for (name, _) in KINDS {
-            assert!(text.contains(&format!("{name} = ")), "{name} missing from dump");
+            assert!(
+                text.contains(&format!("{name} = ")),
+                "{name} missing from dump"
+            );
         }
     }
 
@@ -1321,7 +1445,10 @@ mod tests {
         assert!(style("#ffffff bold").is_some());
         assert!(style("#ffffff bold italic").is_some());
         assert!(style("bold").is_none(), "accepted a style with no colour");
-        assert!(style("#ffffff wobbly").is_none(), "accepted an unknown word");
+        assert!(
+            style("#ffffff wobbly").is_none(),
+            "accepted an unknown word"
+        );
         assert!(style("").is_none());
     }
 
