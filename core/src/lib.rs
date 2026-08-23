@@ -36,24 +36,41 @@ pub struct Commit {
 /// Fields are \x1f-separated, records \x1e-separated — control characters git
 /// will never emit inside a subject, so there is nothing to escape.
 pub fn parse_log(raw: &str) -> Vec<Commit> {
-    raw.split('\u{1e}')
-        .map(str::trim)
-        .filter(|rec| !rec.is_empty())
-        .filter_map(|rec| {
-            let f: Vec<&str> = rec.split('\u{1f}').collect();
-            if f.len() < 6 {
-                return None;
-            }
-            Some(Commit {
-                sha: f[0].to_string(),
-                short: f[1].to_string(),
-                parents: f[2].split_whitespace().map(str::to_string).collect(),
-                author: f[3].to_string(),
-                timestamp: f[4].parse().unwrap_or(0),
-                subject: f[5].to_string(),
-            })
-        })
-        .collect()
+    // Counting separators first costs one byte scan and buys a right-sized
+    // vector: at 100k commits the growth path was re-copying the whole list
+    // several times over.
+    let mut out = Vec::with_capacity(raw.bytes().filter(|b| *b == b'\x1e').count() + 1);
+    for rec in raw.split('\u{1e}') {
+        let rec = rec.trim();
+        if rec.is_empty() {
+            continue;
+        }
+        // Fields are taken by position without collecting them first; a record
+        // with fewer than six has nothing to build and is skipped, exactly as
+        // when they were gathered into a Vec to be counted. A subject that
+        // itself contains \x1f still reads as field five — everything after it
+        // is simply never asked for.
+        let mut fields = rec.split('\u{1f}');
+        let (Some(sha), Some(short), Some(parents), Some(author), Some(ts), Some(subject)) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
+            continue;
+        };
+        out.push(Commit {
+            sha: sha.to_string(),
+            short: short.to_string(),
+            parents: parents.split_whitespace().map(str::to_string).collect(),
+            author: author.to_string(),
+            timestamp: ts.parse().unwrap_or(0),
+            subject: subject.to_string(),
+        });
+    }
+    out
 }
 
 // ----------------------------------------------------------------- the graph
@@ -75,20 +92,24 @@ pub struct GraphRow {
 /// it is deliberately here rather than in the renderer — it is testable without
 /// opening a window.
 pub fn assign_lanes(commits: &[Commit]) -> Vec<GraphRow> {
-    // lanes[i] = the sha lane `i` is currently waiting to draw.
-    let mut lanes: Vec<Option<String>> = Vec::new();
+    // lanes[i] = the sha lane `i` is currently waiting to draw, borrowed out
+    // of `commits` rather than cloned into it: claiming a lane or re-pointing
+    // one then moves two words instead of allocating, and the scan itself runs
+    // over a handful of cache-hot entries either way.
+    let mut lanes: Vec<Option<&str>> = Vec::new();
     let mut rows = Vec::with_capacity(commits.len());
 
     for c in commits {
-        let lane = match lanes.iter().position(|l| l.as_deref() == Some(&c.sha)) {
+        let sha = c.sha.as_str();
+        let lane = match lanes.iter().position(|l| *l == Some(sha)) {
             Some(i) => i,
-            None => claim_lane(&mut lanes, &c.sha),
+            None => claim_lane(&mut lanes, sha),
         };
 
         // Any *other* lane waiting on this sha converges here.
         let mut merges = Vec::new();
         for (i, l) in lanes.iter_mut().enumerate() {
-            if i != lane && l.as_deref() == Some(&c.sha) {
+            if i != lane && *l == Some(sha) {
                 merges.push(i);
                 *l = None;
             }
@@ -103,22 +124,22 @@ pub fn assign_lanes(commits: &[Commit]) -> Vec<GraphRow> {
 
         // Re-point our lane at the first parent; fork new lanes for the rest.
         let mut parents = c.parents.iter();
-        lanes[lane] = parents.next().cloned();
-        let forks: Vec<usize> = parents.map(|p| claim_lane(&mut lanes, p)).collect();
+        lanes[lane] = parents.next().map(|p| p.as_str());
+        let forks: Vec<usize> = parents.map(|p| claim_lane(&mut lanes, p.as_str())).collect();
 
         rows.push(GraphRow { lane, through, merges, forks });
     }
     rows
 }
 
-fn claim_lane(lanes: &mut Vec<Option<String>>, sha: &str) -> usize {
+fn claim_lane<'a>(lanes: &mut Vec<Option<&'a str>>, sha: &'a str) -> usize {
     match lanes.iter().position(Option::is_none) {
         Some(i) => {
-            lanes[i] = Some(sha.to_string());
+            lanes[i] = Some(sha);
             i
         }
         None => {
-            lanes.push(Some(sha.to_string()));
+            lanes.push(Some(sha));
             lanes.len() - 1
         }
     }
@@ -300,8 +321,11 @@ pub struct Span {
 /// Splits a line into word-ish tokens: runs of alphanumerics/underscore, and
 /// every other character on its own. Word granularity, not character — a
 /// char-level diff of code highlights every bracket and reads as confetti.
-fn tokenize(line: &str) -> Vec<(usize, &str)> {
-    let mut out = Vec::new();
+///
+/// Tokens are `(offset, length)` pairs appended to a caller-owned buffer, so
+/// both sides of a pair share one allocation and a token is 8 bytes rather
+/// than the 24 an owned slice-and-offset tuple costs.
+fn push_tokens(out: &mut Vec<(u32, u32)>, line: &str) {
     let b = line.as_bytes();
     let mut i = 0;
     while i < b.len() {
@@ -318,9 +342,14 @@ fn tokenize(line: &str) -> Vec<(usize, &str)> {
                 i += 1;
             }
         }
-        out.push((start, &line[start..i]));
+        out.push((start as u32, (i - start) as u32));
     }
-    out
+}
+
+/// A token's bytes back again, for comparing one against another. Token
+/// boundaries are char boundaries by construction in [`push_tokens`].
+fn token_text(side: &str, t: (u32, u32)) -> &str {
+    &side[t.0 as usize..(t.0 + t.1) as usize]
 }
 
 /// Above this many tokens on either side, skip word-level diffing entirely.
@@ -356,28 +385,49 @@ pub const MIN_INTRALINE_SIMILARITY: f32 = 0.4;
 /// quadratic: the inputs are one line each, not one file. See
 /// [`MAX_INTRALINE_TOKENS`] for the case where that assumption breaks.
 pub fn intraline(old: &str, new: &str) -> (Vec<Span>, Vec<Span>) {
-    let a = tokenize(old);
-    let b = tokenize(new);
+    // Offsets are u32, so a line beyond 4 GB has no representation. prepare
+    // clips at 2000 characters; the guard keeps the assumption honest for a
+    // direct caller that does not.
+    if old.len() > u32::MAX as usize || new.len() > u32::MAX as usize {
+        return (Vec::new(), Vec::new());
+    }
+    let mut tokens: Vec<(u32, u32)> = Vec::with_capacity(old.len() / 4 + new.len() / 4 + 8);
+    push_tokens(&mut tokens, old);
+    let na = tokens.len();
+    push_tokens(&mut tokens, new);
+    let (a, b) = tokens.split_at(na);
 
     if a.len() > MAX_INTRALINE_TOKENS || b.len() > MAX_INTRALINE_TOKENS {
         return (Vec::new(), Vec::new());
     }
 
-    // Classic LCS table over tokens.
-    let mut lcs = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    // Classic LCS table over tokens — one flat allocation of u32 rather than a
+    // Vec per row of usize: an entry never exceeds either side's token count,
+    // which the cap above bounds far below u32 range, and n+1 heap blocks per
+    // line pair was most of what a small pair cost.
+    let w = b.len() + 1;
+    let mut lcs = match (a.len() + 1).checked_mul(w) {
+        Some(cells) => vec![0u32; cells],
+        None => return (Vec::new(), Vec::new()),
+    };
     for i in (0..a.len()).rev() {
+        // Row i is written from row i+1's final values and row i's own right
+        // neighbour, so the split borrows them apart without aliasing.
+        let (upper, lower) = lcs.split_at_mut((i + 1) * w);
+        let cur = &mut upper[i * w..];
+        let ta = token_text(old, a[i]);
         for j in (0..b.len()).rev() {
-            lcs[i][j] = if a[i].1 == b[j].1 {
-                lcs[i + 1][j + 1] + 1
+            cur[j] = if ta == token_text(new, b[j]) {
+                lower[j + 1] + 1
             } else {
-                lcs[i + 1][j].max(lcs[i][j + 1])
+                lower[j].max(cur[j + 1])
             };
         }
     }
 
     // The table's corner is the length of the longest common subsequence, so
     // the similarity of the pair is already paid for.
-    let common = lcs[0][0];
+    let common = lcs[0];
     let similarity = 2.0 * common as f32 / (a.len() + b.len()) as f32;
     if similarity < MIN_INTRALINE_SIMILARITY {
         return (Vec::new(), Vec::new());
@@ -386,23 +436,23 @@ pub fn intraline(old: &str, new: &str) -> (Vec<Span>, Vec<Span>) {
     let (mut old_spans, mut new_spans) = (Vec::new(), Vec::new());
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
-        if a[i].1 == b[j].1 {
+        if token_text(old, a[i]) == token_text(new, b[j]) {
             i += 1;
             j += 1;
-        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
-            push_span(&mut old_spans, a[i].0, a[i].0 + a[i].1.len());
+        } else if lcs[(i + 1) * w + j] >= lcs[i * w + j + 1] {
+            push_span(&mut old_spans, a[i].0 as usize, (a[i].0 + a[i].1) as usize);
             i += 1;
         } else {
-            push_span(&mut new_spans, b[j].0, b[j].0 + b[j].1.len());
+            push_span(&mut new_spans, b[j].0 as usize, (b[j].0 + b[j].1) as usize);
             j += 1;
         }
     }
     while i < a.len() {
-        push_span(&mut old_spans, a[i].0, a[i].0 + a[i].1.len());
+        push_span(&mut old_spans, a[i].0 as usize, (a[i].0 + a[i].1) as usize);
         i += 1;
     }
     while j < b.len() {
-        push_span(&mut new_spans, b[j].0, b[j].0 + b[j].1.len());
+        push_span(&mut new_spans, b[j].0 as usize, (b[j].0 + b[j].1) as usize);
         j += 1;
     }
     coalesce(&mut old_spans, old);

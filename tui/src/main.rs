@@ -27,7 +27,7 @@
 
 use plait_app::acquire::{self, Data};
 use plait_app::cli::{self, Source, View};
-use plait_app::Startup;
+use plait_app::{StartClock, Startup};
 use plait_core::command::{chord_string, Key, Modes, Resolve};
 use plait_core::host::Host;
 use plait_core::runs::Run;
@@ -68,6 +68,10 @@ const TICK: Duration = Duration::from_millis(150);
 const DOUBLE: Duration = Duration::from_millis(400);
 
 fn main() {
+    // `Startup::go` reports the stages before this point — arguments, host,
+    // config, acquisition. The clock below is armed where that hands over and
+    // marks the ones only a terminal client has, so every number is the stage
+    // itself and not the road so far.
     let mut start = Startup::new("plait-tui", View::Commits)
         .blurb("plait in the terminal you started it from")
         .extra(EXTRA);
@@ -77,12 +81,34 @@ fn main() {
     };
     let mouse = !cli::take_switch(start.take(), "--no-mouse");
 
+    // The watcher is armed while acquisition runs, not after it. It needs only
+    // the config file's *name* — the same `config::path()` the shared startup
+    // will read, and the environment cannot change between the two — and its
+    // setup costs a couple of milliseconds of thread and kernel registration
+    // that would otherwise sit on the road to the first frame behind a git
+    // subprocess that takes far longer than that. Nothing here prints, so the
+    // early start is invisible on every path that ends in `Exit`.
+    let dirty = Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = plait_app::config::path();
+        let dirty = dirty.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(
+                plait_app::config::watch(&path, move || dirty.store(true, Ordering::Relaxed)).ok(),
+            );
+        });
+        rx
+    };
+
     let started = match start.go() {
         Ok(started) => started,
         Err(exit) => exit.finish(),
     };
+    let mut clock = StartClock::new();
     let config_path = started.config.clone();
     let mut app = App::new(started, glyphs);
+    clock.stage("views built");
 
     // The panic hook before the terminal is touched: a panic between the two
     // would leave raw mode on with nothing to restore it.
@@ -94,18 +120,17 @@ fn main() {
             std::process::exit(1);
         }
     };
+    clock.stage("terminal taken");
 
-    // The watcher's callback runs on its own thread, so it only sets a flag.
-    let dirty = Arc::new(AtomicBool::new(false));
-    let watcher = {
-        let dirty = dirty.clone();
-        plait_app::config::watch(&config_path, move || dirty.store(true, Ordering::Relaxed)).ok()
-    };
     // Held for as long as the loop runs: dropping a watcher stops it watching,
-    // silently, which is a good way to lose an afternoon.
-    let _watcher = watcher;
+    // silently, which is a good way to lose an afternoon. The recv collects
+    // what the thread above armed — it has had all of acquisition to finish,
+    // so this is the tail wait and not the setup; if that ever exceeded the
+    // time git took, this number would be the part still on the critical path.
+    let _watcher = watcher.recv().ok().flatten();
+    clock.stage("watcher joined");
 
-    if let Err(e) = app.run(&mut term, &dirty, &config_path) {
+    if let Err(e) = app.run(&mut term, &dirty, &config_path, &mut clock) {
         term.leave();
         eprintln!("plait-tui: {e}");
         std::process::exit(1);
@@ -375,8 +400,10 @@ impl App {
         term: &mut Term,
         dirty: &AtomicBool,
         config_path: &std::path::Path,
+        clock: &mut StartClock,
     ) -> io::Result<()> {
         let mut size = (0, 0);
+        let mut first = true;
         while !self.quit {
             let now = Term::size();
             if now != size {
@@ -395,6 +422,13 @@ impl App {
             let t = Instant::now();
             self.draw();
             let cells = self.screen.flush(term.out())?;
+            // The startup's last stage covers the resize above it, so the
+            // buffer allocation and the full repaint are inside the number.
+            // Later frames cost one false comparison.
+            if first {
+                first = false;
+                clock.stage("first frame flushed");
+            }
             if stats_on() {
                 self.stats = Some((t.elapsed(), cells));
             }

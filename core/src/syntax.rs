@@ -117,11 +117,42 @@ pub struct Syntax {
     /// of every file walks every rule; with it only the few bytes that could
     /// start something pay. Worth ~2x on every language measured.
     opens: [bool; 256],
+    /// The same lookup split per rule category, and this is why the split
+    /// exists: a word character reaches the rule walk for every identifier in
+    /// the file, and almost no rule opens with a word character — so the walk
+    /// is skipped whole rather than walked to a failing compare per identifier.
+    line_opens: [bool; 256],
+    block_opens: [bool; 256],
+    string_opens: [bool; 256],
+    /// First bytes, and the length range, of the keywords. Most words in code
+    /// are not keywords, and these two checks reject one without touching a
+    /// single heap-allocated keyword string; what survives still goes through
+    /// the binary search below, which stays authoritative.
+    kw_first: [bool; 256],
+    kw_min_len: usize,
+    kw_max_len: usize,
 }
 
 impl Default for Syntax {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Records a pattern's first byte in one category's table and in the union.
+/// An empty opener matches at any byte, so the degenerate config marks every
+/// byte — the tables stay exact and the scanner stays correct, just without
+/// its fast path, which no real table forfeits.
+fn mark(table: &mut [bool; 256], opens: &mut [bool; 256], pat: &str) {
+    match pat.as_bytes().first() {
+        Some(&b) => {
+            table[b as usize] = true;
+            opens[b as usize] = true;
+        }
+        None => {
+            table.fill(true);
+            opens.fill(true);
+        }
     }
 }
 
@@ -138,19 +169,19 @@ impl Syntax {
             line_needs_boundary: false,
             quote_after_eq: false,
             opens: [false; 256],
-        }
-    }
-
-    fn mark(&mut self, pat: &str) {
-        if let Some(b) = pat.as_bytes().first() {
-            self.opens[*b as usize] = true;
+            line_opens: [false; 256],
+            block_opens: [false; 256],
+            string_opens: [false; 256],
+            kw_first: [false; 256],
+            kw_min_len: usize::MAX,
+            kw_max_len: 0,
         }
     }
 
     /// Comment markers that run to the end of the line: `//`, `#`, `--`.
     pub fn line(mut self, pats: &[&str]) -> Self {
         for p in pats {
-            self.mark(p);
+            mark(&mut self.line_opens, &mut self.opens, p);
             self.line.push((*p).to_string());
         }
         self
@@ -159,7 +190,7 @@ impl Syntax {
     /// Delimited comments: `("/*", "*/")`, `("<!--", "-->")`.
     pub fn block(mut self, pairs: &[(&str, &str)]) -> Self {
         for (o, c) in pairs {
-            self.mark(o);
+            mark(&mut self.block_opens, &mut self.opens, o);
             self.block.push(((*o).to_string(), (*c).to_string()));
         }
         self
@@ -174,7 +205,7 @@ impl Syntax {
     /// String rules, longest opener first: `"""` must be tried before `"`.
     pub fn strings(mut self, rules: &[(&str, &str, bool, bool)]) -> Self {
         for (open, close, escape, multiline) in rules {
-            self.mark(open);
+            mark(&mut self.string_opens, &mut self.opens, open);
             self.strings.push(StrRule {
                 open: (*open).to_string(),
                 close: (*close).to_string(),
@@ -185,11 +216,26 @@ impl Syntax {
         self
     }
 
-    /// Keywords, in any order — they are sorted here for binary search.
+    /// Keywords, in any order — they are sorted here for binary search, and
+    /// the first-byte/length tables are filled from them so a non-keyword is
+    /// rejected before any string compare happens.
     pub fn keywords(mut self, words: &[&str]) -> Self {
         self.keywords.extend(words.iter().map(|w| (*w).to_string()));
         self.keywords.sort_unstable();
         self.keywords.dedup();
+        for w in &self.keywords {
+            let n = w.len();
+            self.kw_min_len = self.kw_min_len.min(n);
+            self.kw_max_len = self.kw_max_len.max(n);
+            if let Some(&b) = w.as_bytes().first() {
+                self.kw_first[b as usize] = true;
+            }
+        }
+        if self.keywords.is_empty() {
+            // No keywords: the gate below rejects everything.
+            self.kw_min_len = usize::MAX;
+            self.kw_max_len = 0;
+        }
         self
     }
 
@@ -258,10 +304,16 @@ impl Languages {
     ///
     /// The whole filename is tried before the extension, which is how a name
     /// with no useful extension — `Cargo.lock` — reaches a table at all.
+    ///
+    /// This runs per hunk side, not per file, so it must not allocate: keys are
+    /// stored lowercased by [`Languages::register`], and comparing with
+    /// `eq_ignore_ascii_case` is that same lowercase match without building one.
     pub fn for_path(&self, path: &str) -> Option<&Syntax> {
-        let name = path.rsplit(['/', '\\']).next()?.to_ascii_lowercase();
-        let find = |key: &str| self.by_ext.iter().find(|(e, _)| e == key).map(|(_, s)| s);
-        find(&name).or_else(|| find(name.rsplit_once('.')?.1))
+        let name = path.rsplit(['/', '\\']).next()?;
+        let find = |key: &str| {
+            self.by_ext.iter().find(|(e, _)| e.eq_ignore_ascii_case(key)).map(|(_, s)| s)
+        };
+        find(name).or_else(|| find(name.rsplit_once('.')?.1))
     }
 }
 
@@ -373,10 +425,16 @@ impl Highlighters {
     }
 
     pub fn for_path(&self, path: &str) -> &dyn Highlighter {
-        let name = path.rsplit(['/', '\\']).next().unwrap_or(path).to_ascii_lowercase();
-        let ext = name.rsplit_once('.').map(|(_, e)| e.to_string());
+        // Allocation-free on purpose: this runs per hunk side, and the
+        // lowercase copies it used to build were real memory traffic in the
+        // prepare profile. Route keys are lowercased by [`Self::route`], so
+        // `eq_ignore_ascii_case` is the same match without the String.
+        let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+        let ext = name.rsplit_once('.').map(|(_, e)| e);
         for (keys, hl) in self.routes.iter().rev() {
-            let hit = keys.iter().any(|k| *k == name || Some(k) == ext.as_ref());
+            let hit = keys.iter().any(|k| {
+                k.eq_ignore_ascii_case(name) || ext.is_some_and(|e| k.eq_ignore_ascii_case(e))
+            });
             if hit {
                 return hl.as_ref();
             }
@@ -393,15 +451,38 @@ impl Highlighter for Highlighters {
 
 // ---------------------------------------------------------------- the scanner
 
+/// Word bytes, precomputed: the run-length scan below is the hottest loop in
+/// the scanner, and one indexed load beats the three comparisons an
+/// `is_ascii_alphanumeric || == '_'` chain costs every character.
+const WORD: [bool; 256] = {
+    let mut t = [false; 256];
+    let mut c = 0usize;
+    while c < 256 {
+        t[c] = (c >= b'a' as usize && c <= b'z' as usize)
+            || (c >= b'A' as usize && c <= b'Z' as usize)
+            || (c >= b'0' as usize && c <= b'9' as usize)
+            || c == b'_' as usize;
+        c += 1;
+    }
+    t
+};
+
 #[inline]
 fn is_word(c: u8) -> bool {
-    c.is_ascii_alphanumeric() || c == b'_'
+    WORD[c as usize]
 }
 
 #[inline]
-fn at(b: &[u8], i: usize, pat: &str) -> bool {
-    let p = pat.as_bytes();
+fn at(b: &[u8], i: usize, p: &[u8]) -> bool {
     i + p.len() <= b.len() && &b[i..i + p.len()] == p
+}
+
+/// Could pattern `p` start at byte `c`? The first-byte test in front of every
+/// [`at`] keeps the memcmp off the hot path: rules are few and short, so a
+/// plain compare beats a call. An empty opener matches anywhere.
+#[inline]
+fn may_open(p: &[u8], c: u8) -> bool {
+    p.first().map_or(true, |&f| f == c)
 }
 
 /// Scans `src` once, appending tokens in order. Ranges never overlap.
@@ -422,67 +503,89 @@ pub fn lex(src: &str, syn: &Syntax, out: &mut Vec<Token>) {
             continue;
         }
 
-        for pat in &syn.line {
-            let boundary_ok = !syn.line_needs_boundary || i == 0 || b[i - 1].is_ascii_whitespace();
-            if boundary_ok && at(b, i, pat) {
-                let start = i;
-                while i < b.len() && b[i] != b'\n' {
-                    i += 1;
-                }
-                push(start, i, Kind::Comment);
-                continue 'scan;
-            }
-        }
+        // Each category is gated on its own first-byte table before any rule
+        // in it is walked, so an identifier — most of the bytes of code —
+        // reaches the word branch without a single failing compare.
 
-        for (open, close) in &syn.block {
-            if at(b, i, open) {
-                let start = i;
-                i += open.len();
-                let mut depth = 1usize;
-                while i < b.len() && depth > 0 {
-                    if at(b, i, close) {
-                        depth -= 1;
-                        i += close.len();
-                    } else if syn.nested_block && at(b, i, open) {
-                        depth += 1;
-                        i += open.len();
-                    } else {
-                        i += 1;
+        if syn.line_opens[c as usize] {
+            // The boundary test does not depend on the pattern; computing it
+            // once keeps a `#`-after-whitespace language from re-deriving it
+            // per marker.
+            let boundary_ok = !syn.line_needs_boundary || i == 0 || b[i - 1].is_ascii_whitespace();
+            if boundary_ok {
+                for pat in &syn.line {
+                    let p = pat.as_bytes();
+                    if may_open(p, c) && at(b, i, p) {
+                        let start = i;
+                        i += b[i..].iter().position(|&d| d == b'\n').unwrap_or(b.len() - i);
+                        push(start, i, Kind::Comment);
+                        continue 'scan;
                     }
                 }
-                push(start, i, Kind::Comment);
-                continue 'scan;
             }
         }
 
-        for r in &syn.strings {
-            if !at(b, i, &r.open) {
-                continue;
+        if syn.block_opens[c as usize] {
+            for (open, close) in &syn.block {
+                let o = open.as_bytes();
+                if may_open(o, c) && at(b, i, o) {
+                    let cl = close.as_bytes();
+                    let nested = syn.nested_block;
+                    let start = i;
+                    i += o.len();
+                    let mut depth = 1usize;
+                    while i < b.len() && depth > 0 {
+                        let d = b[i];
+                        if may_open(cl, d) && at(b, i, cl) {
+                            depth -= 1;
+                            i += cl.len();
+                        } else if nested && may_open(o, d) && at(b, i, o) {
+                            depth += 1;
+                            i += o.len();
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    push(start, i, Kind::Comment);
+                    continue 'scan;
+                }
             }
-            if syn.quote_after_eq && matches!(r.open.as_str(), "\"" | "'") {
-                let prev = b[..i].iter().rfind(|c| !c.is_ascii_whitespace()).copied();
-                if prev != Some(b'=') {
+        }
+
+        if syn.string_opens[c as usize] {
+            for r in &syn.strings {
+                let op = r.open.as_bytes();
+                if !(may_open(op, c) && at(b, i, op)) {
                     continue;
                 }
+                if syn.quote_after_eq && matches!(r.open.as_str(), "\"" | "'") {
+                    let prev = b[..i].iter().rfind(|c| !c.is_ascii_whitespace()).copied();
+                    if prev != Some(b'=') {
+                        continue;
+                    }
+                }
+                let cl = r.close.as_bytes();
+                let (escape, multiline) = (r.escape, r.multiline);
+                let start = i;
+                i += op.len();
+                while i < b.len() {
+                    let d = b[i];
+                    if escape && d == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if !multiline && d == b'\n' {
+                        break;
+                    }
+                    if may_open(cl, d) && at(b, i, cl) {
+                        i += cl.len();
+                        break;
+                    }
+                    i += 1;
+                }
+                push(start, i.min(b.len()), Kind::Str);
+                continue 'scan;
             }
-            let start = i;
-            i += r.open.len();
-            while i < b.len() {
-                if r.escape && b[i] == b'\\' {
-                    i += 2;
-                    continue;
-                }
-                if !r.multiline && b[i] == b'\n' {
-                    break;
-                }
-                if at(b, i, &r.close) {
-                    i += r.close.len();
-                    break;
-                }
-                i += 1;
-            }
-            push(start, i.min(b.len()), Kind::Str);
-            continue 'scan;
         }
 
         if c.is_ascii_digit() {
@@ -505,18 +608,35 @@ pub fn lex(src: &str, syn: &Syntax, out: &mut Vec<Token>) {
                 i += 1;
             }
             let word = &src[start..i];
-            if syn.keywords.binary_search_by(|k| k.as_str().cmp(word)).is_ok() {
+            // The tables say no keyword could match here without a single
+            // string compare; the binary search stays authoritative for what
+            // gets past them.
+            let len = word.len();
+            if syn.kw_first[c as usize]
+                && len >= syn.kw_min_len
+                && len <= syn.kw_max_len
+                && syn.keywords.binary_search_by(|k| k.as_str().cmp(word)).is_ok()
+            {
                 push(start, i, Kind::Keyword);
             } else if syn.capitalized_types && c.is_ascii_uppercase() {
                 let shouty = word.len() > 2 && !word.bytes().any(|b| b.is_ascii_lowercase());
                 push(start, i, if shouty { Kind::Constant } else { Kind::Type });
             } else if syn.call_heuristic {
                 let next = b[i..].iter().find(|c| !c.is_ascii_whitespace()).copied();
-                let prev = b[..start].iter().rfind(|c| !c.is_ascii_whitespace()).copied();
+                let prev = b[..start]
+                    .iter()
+                    .rposition(|c| !c.is_ascii_whitespace())
+                    .filter(|&p| b[p] == b'.');
                 if matches!(next, Some(b'(') | Some(b'!')) {
                     push(start, i, Kind::Func);
-                } else if prev == Some(b'.') && !src[..start].trim_end().ends_with("..") {
-                    push(start, i, Kind::Property);
+                } else if let Some(dot) = prev {
+                    // `x.y` is a field, but `0..n` and `a..b` are ranges: the
+                    // dot before this one makes it an operator, which is the
+                    // check `!trim_end().ends_with("..")` used to do — here
+                    // from the index the backward scan already found.
+                    if !dotted_pair(b, dot) {
+                        push(start, i, Kind::Property);
+                    }
                 }
             }
             continue;
@@ -530,6 +650,16 @@ pub fn lex(src: &str, syn: &Syntax, out: &mut Vec<Token>) {
             i += 1;
         }
     }
+}
+
+/// Is the byte immediately before `dot` another dot? True when the word just
+/// scanned follows a `..` range operator rather than a field access — the same
+/// answer `trim_end().ends_with("..")` gave, which required the pair to be
+/// adjacent once trailing whitespace was gone. Byte-level is safe here: neither
+/// `.` nor any multi-byte sequence ends in a byte this compare could confuse.
+#[inline]
+fn dotted_pair(b: &[u8], dot: usize) -> bool {
+    dot > 0 && b[dot - 1] == b'.'
 }
 
 /// Scans `lines` as one text and returns tokens per line, with ranges relative
@@ -548,7 +678,10 @@ pub fn lex_lines(lines: &[&str], syn: &Syntax) -> Vec<Vec<Token>> {
         joined.push('\n');
     }
 
-    let mut flat = Vec::new();
+    // Real code measures about one token per fifteen bytes, so a sixteenth of
+    // the byte count keeps the common hunk off the doubling chain without
+    // committing much on the sparse ones; the scan grows past it if it must.
+    let mut flat = Vec::with_capacity(joined.len() / 16 + 4);
     lex(&joined, syn, &mut flat);
 
     let mut out = vec![Vec::new(); lines.len()];

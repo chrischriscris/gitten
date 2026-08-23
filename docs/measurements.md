@@ -349,6 +349,64 @@ with a large `docs/` tree and a few thousand commits produces the same shape.
 | parse diff | 76 ms |
 | prepare | 683 ms |
 
+These absolutes predate [the August 2026 allocation and startup
+pass](#the-august-2026-allocation-and-startup-pass), which moved most of them;
+read them next to the *before* column there, never against the *after* — the two
+columns were measured in one sitting, this table was not, and cross-vintage
+comparisons are how an improvement reads as a regression.
+
+### The August 2026 allocation and startup pass
+
+Two commits, reviewed together because they share a measurement session:
+borrowed graph lane IDs, a flattened LCS table and token buffer,
+allocation-free syntax routing behind lexer category gates, and a byte-length
+fast path in `clip` (`core`); labels, untracked status and the tui's watcher run
+beside acquisition instead of behind it, the desktop window opens before
+acquisition finishes, and `PLAIT_START_LOG=1` prints per-stage startup timings
+(`app`, `git`, `shell`, `tui`). Outputs are byte-identical either side: 1,000,000
+commits / widest 21 lanes; 928,577 lines / 5,953 files / 142,858 replace-pairs /
+2,071,441 tokens / 0 wrap rejections.
+
+```
+cargo run -q -p plait-core --example bench --release   # per-stage, fixtures/big.diff + log.txt
+PLAIT_START_LOG=1 ./target/release/plait-shell diff .   # startup stages, opt-in
+```
+
+Before/after, `main` vs the pass, median of six rounds a side. The design
+matters more than usual: naive back-to-back A/B runs here swung **+25–95 %**
+depending purely on which binary ran second — the first process's multi-GB
+allocation churn leaves the VM reclaiming under the second. Rounds are therefore
+ABBA-interleaved with settle gaps and a flipping starting side; position bias
+verified absent (ran-first ≈ ran-second within each side), CV < 3 % on every CPU
+stage.
+
+| stage (fixture) | before | after | Δ |
+|---|---|---|---|
+| parse `log.txt`, 1M commits | 328 ms | 270 ms | −17.8 % |
+| assign lanes | 212 ms | 190 ms | −10.2 % |
+| intraline, 142,858 replace-pairs | 441 ms | 371 ms | −15.9 % |
+| syntax highlighting | 560 ms | 286 ms | **−48.9 %** |
+| `prepare`, whole assembly¹ | ~1,100 ms | 709 ms | ≈ −36 % |
+| wrap @150 cols | 29.2 ms | 29.1 ms | −0.3 % |
+| whole process wall | 2.47 s | 1.97 s | **−20.1 %** |
+
+¹ The example quantizes this line at 0.1 s. `align` is omitted: untouched by the
+pass, and at 13–27 % CV across rounds its ≤ 2 ms drift is noise.
+
+Terminal startup, spawn → first fully-presented frame (first frame-close
+sentinel on a private pty; seven alternating runs a side, ranges non-overlapping):
+
+| | before | after | Δ |
+|---|---|---|---|
+| spawn → first frame | 759 ms | 666 ms | −12.2 % |
+
+On the branch itself, `PLAIT_START_LOG` puts nearly all of that in two stages —
+acquired 347 ms, views built 308 ms — everything else under a millisecond. The
+desktop client was **not** measured: it needs a window, and nothing headless
+exercises it; its win (window-before-acquisition) is structural rather than a
+number here. The stage clock also only exists after the pass, so no per-stage
+baseline against `main` is possible by construction.
+
 ### Topology
 
 `shape`, on the two real repositories:

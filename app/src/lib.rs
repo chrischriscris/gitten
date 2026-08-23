@@ -57,6 +57,7 @@ pub mod config;
 
 use cli::{Request, Source, View};
 use plait_core::host::Host;
+use std::time::Instant;
 
 /// How wide a row may get before it is clipped.
 ///
@@ -148,6 +149,46 @@ impl Exit {
     }
 }
 
+/// Stage timing for the road to the first frame.
+///
+/// [`Startup::go`] reports the stages every client shares — arguments parsed,
+/// host built, config loaded, data acquired — and a client marks the ones only
+/// it has with the same clock: the terminal takes its tty, the window its
+/// surface. One prefix, `plait-start:`, so a run's whole breakdown is one grep
+/// however many crates printed it.
+///
+/// Off unless `PLAIT_START_LOG` says otherwise (`0` off, the same rule
+/// `PLAIT_STATS` follows). Nothing costs anything then: one `getenv` at
+/// construction and a `None` check per stage afterwards — no timer, no
+/// allocation.
+pub struct StartClock {
+    /// When the current stage began. Reset by every report, so the stages
+    /// chain: each one is timed against the previous, not against process
+    /// start, and the numbers sum to the whole road to the first frame.
+    at: Option<Instant>,
+}
+
+impl StartClock {
+    pub fn new() -> Self {
+        Self { at: std::env::var_os("PLAIT_START_LOG").is_some_and(|v| v != "0").then(Instant::now) }
+    }
+
+    /// Ends one stage and says how long it took. A no-op once disarmed.
+    pub fn stage(&mut self, what: &str) {
+        if let Some(at) = self.at.as_mut() {
+            let took = at.elapsed();
+            *at = Instant::now();
+            eprintln!("plait-start: {what} in {took:.0?}");
+        }
+    }
+}
+
+impl Default for StartClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Startup {
     /// `binary` is what usage and errors call this client; `default` is the view
     /// it opens on when nothing is typed.
@@ -197,7 +238,9 @@ impl Startup {
     /// that did not parse is worth saying at once, and is never worth refusing
     /// to start over.
     pub fn go(self) -> Result<Started, Exit> {
+        let mut clock = StartClock::new();
         let request = cli::parse(&self.args, self.default);
+        clock.stage("args parsed");
         if let Request::Help = request {
             return Err(Exit::Help(self.usage()));
         }
@@ -207,9 +250,11 @@ impl Startup {
         // rather than a dump of the built-ins.
         let path = config::path();
         let mut host = Host::new();
+        clock.stage("host built");
         for w in config::load(&mut host, &path) {
             eprintln!("{}: {w}", self.binary);
         }
+        clock.stage("config loaded");
 
         let (view, source) = match request {
             Request::Config => return Err(Exit::Config(config::dump(&host))),
@@ -218,7 +263,10 @@ impl Startup {
         };
 
         match acquire::acquire(view, &source, &host) {
-            Ok(loaded) => Ok(Started { view, source, host, loaded, config: path }),
+            Ok(loaded) => {
+                clock.stage("acquired");
+                Ok(Started { view, source, host, loaded, config: path })
+            }
             Err(e) => {
                 Err(Exit::Failed(format!("{}: {e}\n\n{}", self.binary, self.usage())))
             }

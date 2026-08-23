@@ -70,17 +70,27 @@ pub fn read_fixture(path: &str) -> String {
 pub fn acquire(view: View, source: &Source, host: &Host) -> Result<Loaded, String> {
     match (view, source) {
         (View::Diff, Source::Repo { path, arg }) => {
-            let files = plait_git::diff(path, arg, &host.differ, &Overrides::default())?;
-            if files.is_empty() {
-                let what = match arg.is_empty() {
-                    true => "(working tree)",
-                    false => arg.as_str(),
-                };
-                return Err(format!("no changes for {} {what}", path.display()));
-            }
-            // No algorithm in the label: a client has a control that says which
-            // one, and that stays true when you change it.
-            Ok(Loaded { label: describe(path, arg), data: Data::Diff(files) })
+            // The label is one more `git` process and the last thing anyone is
+            // waiting for, so it runs *beside* acquisition rather than behind
+            // it: one spawn floor (~7ms) off every repository open. `describe`
+            // is infallible, so joining it afterwards is all the coordination
+            // there is — and a scope thread borrows `path` for exactly as long
+            // as this call.
+            std::thread::scope(|s| {
+                let title = s.spawn(|| describe(path, arg));
+                let files =
+                    plait_git::diff(path, arg, &host.differ, &Overrides::default())?;
+                if files.is_empty() {
+                    let what = match arg.is_empty() {
+                        true => "(working tree)",
+                        false => arg.as_str(),
+                    };
+                    return Err(format!("no changes for {} {what}", path.display()));
+                }
+                // No algorithm in the label: a client has a control that says which
+                // one, and that stays true when you change it.
+                Ok(Loaded { label: joined(title), data: Data::Diff(files) })
+            })
         }
         (View::Diff, Source::Fixtures) => {
             let files = plait_core::parse_unified_diff(&read_fixture(DIFF_FIXTURE));
@@ -90,11 +100,16 @@ pub fn acquire(view: View, source: &Source, host: &Host) -> Result<Loaded, Strin
             Ok(Loaded { label: "fixtures".into(), data: Data::Diff(files) })
         }
         (View::Commits, Source::Repo { path, arg }) => {
-            let commits = plait_git::log(path, arg.parse().unwrap_or(5000))?;
-            if commits.is_empty() {
-                return Err(format!("no commits in {}", path.display()));
-            }
-            Ok(Loaded { label: plait_git::describe(path), data: Data::Commits(commits) })
+            // Beside, not behind: the same overlap the diff view has, because
+            // the graph waits on `git log` either way.
+            std::thread::scope(|s| {
+                let title = s.spawn(|| plait_git::describe(path));
+                let commits = plait_git::log(path, arg.parse().unwrap_or(5000))?;
+                if commits.is_empty() {
+                    return Err(format!("no commits in {}", path.display()));
+                }
+                Ok(Loaded { label: joined(title), data: Data::Commits(commits) })
+            })
         }
         (View::Commits, Source::Fixtures) => {
             let commits = plait_core::parse_log(&read_fixture(LOG_FIXTURE));
@@ -104,6 +119,15 @@ pub fn acquire(view: View, source: &Source, host: &Host) -> Result<Loaded, Strin
             Ok(Loaded { label: "fixtures".into(), data: Data::Commits(commits) })
         }
     }
+}
+
+/// Joins the thread fetching the title.
+///
+/// `describe` returns a `String` and cannot fail, so the only thing left in
+/// that `join` is a panic — resumed here, on the caller's thread, exactly as it
+/// came out of the inline call this used to be.
+fn joined(title: std::thread::ScopedJoinHandle<'_, String>) -> String {
+    title.join().unwrap_or_else(|p| std::panic::resume_unwind(p))
 }
 
 fn describe(repo: &Path, revspec: &str) -> String {
