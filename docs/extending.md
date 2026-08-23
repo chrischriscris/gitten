@@ -296,8 +296,22 @@ of the whole diff rather than of one kind of file.
 structural rather than an oversight: a `Rows` implementation returns an
 `AnyElement`, `Host` lives in `core`, and `core` never knows a UI exists. So the
 registry is shell-side and `Host` carries only the *name* of the entry to open,
-which is data. If panes arrive and more than one view wants one, that is where a
-second shell-side registry goes — not `Host`.
+which is data. Panes are now the second shell-side registry: `panes::Panes`
+registers a tenant under a stable name, replaces it in place under that name and
+tracks logical focus. A compiled-in extension implements the object-safe `Pane`
+adapter and enters through the same `register_pane` path as a built-in. The
+registry stays out of `Host` because its values are GPUI views, while the focus
+commands and bindings remain shared data.
+
+A repository-backed pane also implements `Pane::refresh`. It returns two erased
+closures: a `Send` load that owns every blocking read and a foreground apply that
+owns the pane's GPUI entity. The payload between them is tenant-defined, not an
+entry in `app::acquire::Data`; files, branches and third-party panes therefore do
+not add cases to shell dispatch. Applies carry the target generation, so an old
+load finishing late cannot replace newer data. Differ, highlighter and wrap
+implementations are `Send + Sync` and their registries are cheap clones for this
+reason: the configured extension implementation, not a rebuilt built-in
+substitute, runs on the background load.
 
 What arrives in `build` is already clipped, intraline-diffed and highlighted — see
 [diff-pipeline.md](diff-pipeline.md). An implementation draws; it does not redo any
@@ -308,7 +322,9 @@ is how the list holds 8 bytes per row instead of a box.
 because `uniform_list` is the only reason a 714k-row diff scrolls at all. You may
 draw anything within `ROW_H`, but you cannot ask for more. A presentation that
 genuinely needs variable height — a reflowed Markdown *preview*, a side-by-side
-image diff — wants a pane of its own, and that plug point does not exist yet.
+image diff — wants a pane of its own rather than a `Rows` implementation. That
+plug point is `panes::Panes`; the tenant owns its layout while the registry owns
+placement and focus.
 
 What you *can* have is more rows. That is what wrapping is: a line too wide for
 the window is drawn on several rows of `ROW_H` rather than on one tall one, which

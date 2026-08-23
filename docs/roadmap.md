@@ -7,42 +7,36 @@ plan that outlives its first few items is fiction — prune it as they land, and
 distrust anything here that has drifted from the code.
 
 Sizes are gut estimates of session scale (S ≈ an afternoon, M ≈ days,
-L ≈ a week or more), not measurements. Nothing here carries a number because
-nothing here has been built yet.
+L ≈ a week or more), not measurements.
 
 ## Where this stands
 
-The viewer is assembled: commit graph with lanes, the diff pipeline (three
-differs, two layouts, wrapping, intraline, rendered Markdown), selection and
-copy, theming, config hot reload, command dispatch as data, three clients
-proving the boundary. The actor does not exist: **zero write verbs** in
-`plait-git`, no branch/stash/remote/tag/reflog reads, no staged/unstaged split
-in what `pairs()` returns, no text input anywhere in `shell/`, one view filling
-the window. Lazygit is mostly actor — staging, committing, rebasing is its
-centre of gravity, not reading logs. What follows closes that gap without
-disturbing the foundations, because the expensive bets (commands as names, one
-acquisition layer, the client boundary) are already made correctly.
+The viewer and its actor seams are assembled: repository access is one trait,
+status separates staged/unstaged/untracked/conflicted paths without decoding
+their bytes, GPUI dispatches named commands from the shared keymap, writes have
+a serial background runner and invalidation generations, native text input can
+join the mode stack, and the window has registered stacked panes with logical
+focus. The commit and diff panes are the first two tenants.
 
-## Phase A — seams
+The actor itself does not exist: **zero write verbs** in `plait-git`, no
+branch/stash/remote/tag/reflog reads and no files panel consuming the status
+model. Lazygit is mostly actor — staging, committing, rebasing is its centre of
+gravity, not reading logs. What follows closes that gap on seams that now exist.
 
-Cheap while nothing sits on them; expensive once ten features do. Strictly
-before everything else.
+## Phase A — seams (landed)
 
-| # | Block | Lands | Why now | Unblocks | Size |
-|---|---|---|---|---|---|
-| 1 | **Repo access trait** | `plait-git` | Five free functions today (`log`, `pairs`, …). One surface so reads (someday gix) and writes (binary) hide behind it; frontends never learn which ran | every later item plugs in here | S |
-| 2 | **GPUI adopts `core::command` dispatch** | `shell` | Still GPUI's action system; every verb added before the migration costs three re-bindings after. Do it once, then each new command gets `[keys]`, help panel and extension reach for free | all of D | M |
-| 3 | **Job runner + invalidation generation** | `app`/`shell` (never `core` — no I/O there) | Writes are processes taking seconds; they cannot block render. Queue → run → completion event → bump a generation → affected views re-acquire → `session.rs` restores selection | every write verb | M |
-| 4 | **Text input block** | `shell`, mode on the existing mode stack | No text field exists anywhere in the shell. Consumer #1 is the commit message; #2 the search prompt (#17) | #10, #17 | M |
-| 5 | **Pane layout + focus model** | `shell` | One view fills the window; lazygit *is* a focus-switching pane grid. Two stacked panes and a focus ring is enough to start. Already listed under "Panes" in [architecture.md](architecture.md); the diff view measures its own box, so tenants exist ([decisions/0017](decisions/0017-wrapping-is-more-rows-not-taller-ones.md)) | Files/branches/stash panels | L |
+Blocks #1–#6 landed together: `Repo`, true porcelain-v2 status, GPUI command
+dispatch, the job runner and generation refresh, native text input, and pane
+layout/focus. They stay numbered because later entries refer to them; they no
+longer compete with product work.
 
 ## Phase B — read models
 
-Panels need data before verbs. Independent of A except #6 shapes #1's surface.
+Panels need data before verbs. Status (#6) already shaped the repository surface;
+the remaining read models add tenants to it.
 
 | # | Block | Lands | Notes | Size |
 |---|---|---|---|---|
-| 6 | **True status model** | types in `core`, parsing in `plait-git` | porcelain v1 today folds untracked into one pair set; no XY codes, no renames (`git/src/lib.rs:247`). Parse `--porcelain=v2` into staged / unstaged / untracked entries. **Do in the same pass as #1** — the model defines the trait's surface, and a seam shaped against real data beats a revised one | S/M |
 | 7 | **Branch + ref reads** | `plait-git` | Local and remote branches, upstream, ahead/behind, HEAD. Refs are gix's home turf, so this is also the honest start of the gix port — no hot path exists yet to break | M |
 | 8 | **Stash, remotes, tags, reflog reads** | `plait-git` | Each small through the trait; each feeds a panel later | S each |
 | 9 | **Diff cache keyed by blob OID** | `plait-git`/acquisition edge | Prescribed in AGENTS.md, never built; acquisition already yields both OIDs. Pays twice: repeat views free, post-commit reloads re-diff only what changed | S |

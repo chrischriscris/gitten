@@ -339,12 +339,6 @@ to. A terminal does the same.
 
 ## Still to do
 
-- **Assembly.** The views are components: `Diff` and `Commits` hold state and
-  expose commands (`down`, `page`, `jump_file`, `cycle_layout`), and neither
-  knows what a keypress is. There is no `main`, no event loop and no keymap —
-  deliberately, because command dispatch and the mode stack belong on `Host` and
-  are not built, and a keymap written in `tui/` is one `cli/` would have to
-  duplicate.
 - **Migrating `shell` and `web` onto `core::rows`.** Both still hold their own
   row flattening and order table. `shell`'s is the harder one: `TextRows` stores
   `SharedString` so GPUI is handed a refcount bump rather than a copy per frame,
@@ -354,11 +348,6 @@ to. A terminal does the same.
 - **`MarkdownRows`.** `core/examples/paint.rs` already draws the furniture in
   ANSI, so the terminal version is that function and a `Rows` impl — and the
   furniture itself is then a fourth thing to lift into `core`.
-- **`selection_bg` in the shell.** It was added to `ChromePalette` for this
-  client because a hardcoded selection colour is not a seam, and it means the row
-  the keyboard is on. No GPUI view draws *that* yet. The mouse selection is
-  `chrome.selected_bg` and both clients now draw *that* —
-  [decisions/0018](decisions/0018-selection-is-a-model-not-a-text-element.md).
 - **A drag does not autoscroll on a clock.** Holding the pointer outside the body
   scrolls by the overshoot once, per event, and stops when the pointer stops. A
   timer would fix it and a timer is a thing to own; the selection extends past
