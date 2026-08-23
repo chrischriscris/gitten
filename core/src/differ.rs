@@ -44,7 +44,10 @@
 //! generated file with a repeating structure produces exactly it.
 
 use crate::{DiffLine, FileDiff, Hunk, LineKind};
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::hash::Hasher;
+use std::sync::Arc;
 
 // ------------------------------------------------------------- the edit script
 
@@ -86,12 +89,15 @@ impl Edit {
 /// looking at — the same argument as
 /// [`Highlighter::highlight`](crate::syntax::Highlighter::highlight).
 ///
+/// The lines arrive as shared handles, which an implementation is free to keep:
+/// equality and hashing go through the text, so a handle compares as its content.
+///
 /// The name is what a config file and a keybinding refer to, which is why it is
 /// `&'static str` and part of the trait rather than a wrapper's business.
 pub trait Differ {
     fn name(&self) -> &'static str;
 
-    fn diff(&self, path: &str, old: &[&str], new: &[&str]) -> Vec<Edit>;
+    fn diff(&self, path: &str, old: &[Arc<str>], new: &[Arc<str>]) -> Vec<Edit>;
 }
 
 /// Every line replaced by a number, so the inner loops compare `u32`s.
@@ -99,17 +105,25 @@ pub trait Differ {
 /// Public because an implementation will want it: string comparison inside an
 /// O(ND) loop is most of the runtime, and interning is the whole reason the
 /// textbook algorithms are fast enough to be shipped as written.
-pub fn intern<'a>(old: &[&'a str], new: &[&'a str]) -> (Vec<u32>, Vec<u32>) {
-    // Keys borrow the caller's lines, so nothing is copied — only the `&str`
-    // headers are hashed, and each distinct line only once.
-    let mut ids: HashMap<&'a str, u32> = HashMap::with_capacity(old.len() + new.len());
-    let mut number = |s: &&'a str| -> u32 {
-        let next = ids.len() as u32;
-        *ids.entry(s).or_insert(next)
-    };
-    let a = old.iter().map(&mut number).collect();
-    let b = new.iter().map(&mut number).collect();
+pub fn intern(old: &[Arc<str>], new: &[Arc<str>]) -> (Vec<u32>, Vec<u32>) {
+    // One map over both sides, so a line present in each gets one id.
+    let mut map: HashMap<&Arc<str>, u32> = HashMap::with_capacity(old.len() + new.len());
+    let mut a = Vec::with_capacity(old.len());
+    let mut b = Vec::with_capacity(new.len());
+    number(&mut map, old, &mut a);
+    number(&mut map, new, &mut b);
     (a, b)
+}
+
+/// Numbers `lines` into `out` through `map`. Keys borrow the caller's handles,
+/// so nothing is copied — only the pointed-at text is hashed.
+fn number<'a>(map: &mut HashMap<&'a Arc<str>, u32>, lines: &'a [Arc<str>], out: &mut Vec<u32>) {
+    out.clear();
+    out.reserve(lines.len());
+    for line in lines {
+        let next = map.len() as u32;
+        out.push(*map.entry(line).or_insert(next));
+    }
 }
 
 /// How many diagonal steps a single file's diff may spend before it degrades to
@@ -142,8 +156,10 @@ pub const MAX_ANCHOR_OCCURRENCES: u32 = 64;
 /// Anchoring on lines that appear once means a function signature becomes the
 /// anchor and the moved block reads as a move — see
 /// `docs/decisions/0001-histogram-not-myers.md`.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Histogram;
+#[derive(Debug, Default)]
+pub struct Histogram {
+    scratch: RefCell<Ctx>,
+}
 
 /// Anchors only on lines appearing *exactly* once, and falls back to [`Myers`]
 /// everywhere else.
@@ -158,8 +174,10 @@ pub struct Histogram;
 /// Worth its own name because the difference from Histogram is visible on real
 /// code: a file with three identical `impl Default for` blocks gets anchored by
 /// Histogram and not by this, and which reads better depends on the file.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Patience;
+#[derive(Debug, Default)]
+pub struct Patience {
+    scratch: RefCell<Ctx>,
+}
 
 /// The minimal edit script, by Myers' 1986 algorithm with the linear-space
 /// middle-snake refinement.
@@ -168,16 +186,18 @@ pub struct Patience;
 /// produces by default. Available because "smallest" is sometimes exactly what
 /// is wanted — reviewing a whitespace change, or checking that a refactor really
 /// did not touch anything else.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Myers;
+#[derive(Debug, Default)]
+pub struct Myers {
+    scratch: RefCell<Ctx>,
+}
 
 impl Differ for Histogram {
     fn name(&self) -> &'static str {
         "histogram"
     }
 
-    fn diff(&self, _path: &str, old: &[&str], new: &[&str]) -> Vec<Edit> {
-        anchored(old, new, MAX_ANCHOR_OCCURRENCES)
+    fn diff(&self, _path: &str, old: &[Arc<str>], new: &[Arc<str>]) -> Vec<Edit> {
+        self.scratch.borrow_mut().diffed(old, new, Some(MAX_ANCHOR_OCCURRENCES))
     }
 }
 
@@ -186,8 +206,8 @@ impl Differ for Patience {
         "patience"
     }
 
-    fn diff(&self, _path: &str, old: &[&str], new: &[&str]) -> Vec<Edit> {
-        anchored(old, new, 1)
+    fn diff(&self, _path: &str, old: &[Arc<str>], new: &[Arc<str>]) -> Vec<Edit> {
+        self.scratch.borrow_mut().diffed(old, new, Some(1))
     }
 }
 
@@ -196,19 +216,9 @@ impl Differ for Myers {
         "myers"
     }
 
-    fn diff(&self, _path: &str, old: &[&str], new: &[&str]) -> Vec<Edit> {
-        let (a, b) = intern(old, new);
-        let mut out = Vec::new();
-        Ctx::new().myers(&a, &b, Region::whole(&a, &b), &mut out);
-        out
+    fn diff(&self, _path: &str, old: &[Arc<str>], new: &[Arc<str>]) -> Vec<Edit> {
+        self.scratch.borrow_mut().diffed(old, new, None)
     }
-}
-
-fn anchored(old: &[&str], new: &[&str], max_occurrences: u32) -> Vec<Edit> {
-    let (a, b) = intern(old, new);
-    let mut out = Vec::new();
-    Ctx::new().anchored(&a, &b, max_occurrences, &mut out);
-    out
 }
 
 // ----------------------------------------------------------------- the region
@@ -274,8 +284,11 @@ fn push(out: &mut Vec<Edit>, e: Edit) {
 
 // ------------------------------------------------------------ the shared state
 
-/// The step budget and the reusable occurrence index, shared across every
-/// region of one file.
+/// Scratch space one built-in differ reuses for its whole life: grown once and
+/// cleared per region and per file, never reallocated. Held behind a `RefCell`
+/// by [`Histogram`], [`Patience`] and [`Myers`], because `Differ::diff` takes
+/// `&self` — the registry is shared and immutable.
+#[derive(Debug, Default)]
 struct Ctx {
     steps: usize,
     /// Rebuilt per region rather than per file: rarity is only meaningful
@@ -283,6 +296,15 @@ struct Ctx {
     /// six lines under consideration is a usable anchor even though it appears
     /// four hundred times in the file. Git's histogram does the same.
     occurrences: HashMap<u32, Chain>,
+    /// Myers' forward and backward frontiers, sized for the largest span seen
+    /// and reused across every region of every file — including each
+    /// TooCommon fallback an anchored search hands over.
+    fwd: V,
+    bwd: V,
+    /// The interning output buffers. Taken out of here while the search borrows
+    /// them and returned afterwards, so their capacity survives the borrow.
+    ids_old: Vec<u32>,
+    ids_new: Vec<u32>,
 }
 
 /// Where a line appears in a region, and how often.
@@ -290,15 +312,42 @@ struct Ctx {
 /// The position list is capped because the anchor search walks it per candidate;
 /// the count is not, because the count is what decides whether the line is worth
 /// anchoring on at all.
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct Chain {
     count: u32,
     at: Vec<u32>,
 }
 
 impl Ctx {
-    fn new() -> Self {
-        Self { steps: MAX_STEPS, occurrences: HashMap::new() }
+    /// Per-file state: the budget and everything derived from one file's lines.
+    /// Buffer capacity is deliberately left alone.
+    fn begin_file(&mut self) {
+        self.steps = MAX_STEPS;
+        self.occurrences.clear();
+    }
+
+    /// One file, start to finish: intern both sides through the retained
+    /// buffers, then run the search on them. `Some(max)` anchors with that
+    /// rarity threshold, `None` runs plain Myers.
+    fn diffed(&mut self, old: &[Arc<str>], new: &[Arc<str>], max: Option<u32>) -> Vec<Edit> {
+        self.begin_file();
+        // One map over both sides; keys borrow the caller's handles and die with
+        // this call, which is why the map cannot live in `Ctx`.
+        let mut map: HashMap<&Arc<str>, u32> = HashMap::new();
+        number(&mut map, old, &mut self.ids_old);
+        let a = std::mem::take(&mut self.ids_old);
+        number(&mut map, new, &mut self.ids_new);
+        let b = std::mem::take(&mut self.ids_new);
+
+        let mut out = Vec::new();
+        match max {
+            Some(max) => self.anchored(&a, &b, max, &mut out),
+            None => self.myers(&a, &b, Region::whole(&a, &b), &mut out),
+        }
+        // Handed back rather than dropped: the next file starts at full size.
+        self.ids_old = a;
+        self.ids_new = b;
+        out
     }
 
     /// Spends `n` steps, reporting whether the budget survived.
@@ -314,11 +363,12 @@ impl Ctx {
     /// in increasing order: the left half is pushed last and therefore popped
     /// first.
     fn myers(&mut self, a: &[u32], b: &[u32], region: Region, out: &mut Vec<Edit>) {
-        // Sized on the region, so a fallback for six anchorless lines inside a
-        // large file allocates for six lines.
+        // The frontiers are sized for this span and kept afterwards — an
+        // anchored file hands every TooCommon region here, and reallocating
+        // per region is most of what a fallback-heavy diff costs.
         let span = (region.a1 - region.a0) + (region.b1 - region.b0);
-        let mut fwd = V::new(span);
-        let mut bwd = V::new(span);
+        self.fwd.grow(span);
+        self.bwd.grow(span);
         let mut stack = vec![region];
         while let Some(r) = stack.pop() {
             let r = r.trimmed(a, b);
@@ -331,7 +381,7 @@ impl Ctx {
                 push(out, r.edit());
                 continue;
             }
-            match self.split(a, b, r, &mut fwd, &mut bwd) {
+            match self.split(a, b, r) {
                 Some((x, y)) => {
                     stack.push(Region { a0: x, a1: r.a1, b0: y, b1: r.b1 });
                     stack.push(Region { a0: r.a0, a1: x, b0: r.b0, b1: y });
@@ -354,14 +404,7 @@ impl Ctx {
     /// `None` means the budget ran out, or the meeting point was a corner of the
     /// region, which would have recursed on the region itself forever. A trimmed
     /// region should make the corner unreachable; this does not rely on that.
-    fn split(
-        &mut self,
-        a: &[u32],
-        b: &[u32],
-        r: Region,
-        fwd: &mut V,
-        bwd: &mut V,
-    ) -> Option<(usize, usize)> {
+    fn split(&mut self, a: &[u32], b: &[u32], r: Region) -> Option<(usize, usize)> {
         let (a, b) = (&a[r.a0..r.a1], &b[r.b0..r.b1]);
         let (n, m) = (a.len(), b.len());
         let delta = n as isize - m as isize;
@@ -370,8 +413,8 @@ impl Ctx {
         // Only `1` needs seeding: at every depth the recurrence reads diagonals
         // one *closer* to the centre than the ones it writes, never further, so
         // nothing stale is ever read and neither array needs clearing.
-        fwd.set(1, 0);
-        bwd.set(1, 0);
+        self.fwd.set(1, 0);
+        self.bwd.set(1, 0);
 
         for d in 0..=dmax {
             let mut k = d;
@@ -379,22 +422,23 @@ impl Ctx {
                 if !self.spend(1) {
                     return None;
                 }
-                let mut x = if k == -d || (k != d && fwd.get(k - 1) < fwd.get(k + 1)) {
-                    fwd.get(k + 1)
+                let mut x = if k == -d || (k != d && self.fwd.get(k - 1) < self.fwd.get(k + 1))
+                {
+                    self.fwd.get(k + 1)
                 } else {
-                    fwd.get(k - 1) + 1
+                    self.fwd.get(k - 1) + 1
                 };
                 let mut y = (x as isize - k) as usize;
                 while x < n && y < m && a[x] == b[y] {
                     x += 1;
                     y += 1;
                 }
-                fwd.set(k, x);
+                self.fwd.set(k, x);
                 // The backward frontier is one depth behind, so only the
                 // diagonals it has actually reached may be consulted. An odd
                 // delta is when the two frontiers can meet on a forward step.
                 if delta % 2 != 0 && d >= 1 && (delta - k).abs() <= d - 1 {
-                    if x + bwd.get(delta - k) >= n {
+                    if x + self.bwd.get(delta - k) >= n {
                         return inside(r, x, y, n, m);
                     }
                 }
@@ -408,19 +452,20 @@ impl Ctx {
                 }
                 // The same recurrence in the frame where both files are
                 // reversed, so `x` here is a distance from the end.
-                let mut x = if k == -d || (k != d && bwd.get(k - 1) < bwd.get(k + 1)) {
-                    bwd.get(k + 1)
+                let mut x = if k == -d || (k != d && self.bwd.get(k - 1) < self.bwd.get(k + 1))
+                {
+                    self.bwd.get(k + 1)
                 } else {
-                    bwd.get(k - 1) + 1
+                    self.bwd.get(k - 1) + 1
                 };
                 let mut y = (x as isize - k) as usize;
                 while x < n && y < m && a[n - x - 1] == b[m - y - 1] {
                     x += 1;
                     y += 1;
                 }
-                bwd.set(k, x);
+                self.bwd.set(k, x);
                 if delta % 2 == 0 && (delta - k).abs() <= d {
-                    if fwd.get(delta - k) + x >= n {
+                    if self.fwd.get(delta - k) + x >= n {
                         return inside(r, n - x, m - y, n, m);
                     }
                 }
@@ -591,16 +636,24 @@ fn inside(r: Region, x: usize, y: usize, n: usize, m: usize) -> Option<(usize, u
 }
 
 /// Furthest-reaching path per diagonal, indexed by `x - y`, which runs negative.
+#[derive(Debug, Default)]
 struct V {
     offset: isize,
     buf: Vec<usize>,
 }
 
 impl V {
-    fn new(span: usize) -> Self {
+    /// Sizes the frontier for a region's `span`, growing the buffer once and
+    /// never shrinking it. A larger span moves the offset, so stale contents
+    /// from a previous region land at different indices than they were written
+    /// to — which is fine: only diagonals this call seeds are ever read.
+    fn grow(&mut self, span: usize) {
         // Diagonals reach |k| = dmax, and the recurrence reads k+1 at the edge.
-        let offset = ((span + 1) / 2 + 3) as isize;
-        Self { offset, buf: vec![0; 2 * offset as usize + 1] }
+        self.offset = ((span + 1) / 2 + 3) as isize;
+        let need = 2 * self.offset as usize + 1;
+        if self.buf.len() < need {
+            self.buf.resize(need, 0);
+        }
     }
 
     #[inline]
@@ -624,7 +677,7 @@ impl V {
 /// Shared by every [`Differ`] on purpose. An implementation decides which lines
 /// correspond; none of them should be re-deriving line numbering, and a hunk
 /// header that disagrees with the lines under it is a bug that survives review.
-pub fn hunks(old: &[&str], new: &[&str], edits: &[Edit], context: usize) -> Vec<Hunk> {
+pub fn hunks(old: &[Arc<str>], new: &[Arc<str>], edits: &[Edit], context: usize) -> Vec<Hunk> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < edits.len() {
@@ -656,21 +709,21 @@ pub fn hunks(old: &[&str], new: &[&str], edits: &[Edit], context: usize) -> Vec<
         let mut n = n_start;
         for e in &edits[i..=j] {
             while o < e.old_start as usize {
-                lines.push(line(LineKind::Context, Some(o), Some(n), old[o]));
+                lines.push(line(LineKind::Context, Some(o), Some(n), &old[o]));
                 o += 1;
                 n += 1;
             }
             for k in e.old() {
-                lines.push(line(LineKind::Removed, Some(k), None, old[k]));
+                lines.push(line(LineKind::Removed, Some(k), None, &old[k]));
             }
             for k in e.new() {
-                lines.push(line(LineKind::Added, None, Some(k), new[k]));
+                lines.push(line(LineKind::Added, None, Some(k), &new[k]));
             }
             o = e.old_end as usize;
             n = e.new_end as usize;
         }
         while o < o_end {
-            lines.push(line(LineKind::Context, Some(o), Some(n), old[o]));
+            lines.push(line(LineKind::Context, Some(o), Some(n), &old[o]));
             o += 1;
             n += 1;
         }
@@ -684,13 +737,18 @@ pub fn hunks(old: &[&str], new: &[&str], edits: &[Edit], context: usize) -> Vec<
     out
 }
 
-fn line(kind: LineKind, old_no: Option<usize>, new_no: Option<usize>, text: &str) -> DiffLine {
+/// One row of a hunk.
+///
+/// The text is the caller's handle, shared — never copied. Acquisition hands
+/// over `Arc`s so this can be a refcount bump; `Arc::from` here would put every
+/// changed line in memory twice for the life of a load.
+fn line(kind: LineKind, old_no: Option<usize>, new_no: Option<usize>, text: &Arc<str>) -> DiffLine {
     DiffLine {
         kind,
         // Both sides are 0-based here and 1-based on screen.
         old_no: old_no.map(|n| n as u32 + 1),
         new_no: new_no.map(|n| n as u32 + 1),
-        text: text.to_string(),
+        text: Arc::clone(text),
         // Set afterwards by `mark_moved`, once the whole script is known: a
         // block that moved cannot be recognised from one hunk.
         moved: false,
@@ -707,7 +765,7 @@ fn header(
     o_count: usize,
     n_start: usize,
     n_count: usize,
-    old: &[&str],
+    old: &[Arc<str>],
     from: usize,
 ) -> String {
     let range = |start: usize, count: usize| match count {
@@ -741,7 +799,7 @@ const FUNCNAME_LOOKBACK: usize = 400;
 /// or `$` is a declaration, anything indented is inside one. It is wrong on
 /// plenty of languages and right often enough to be worth the four lines — and
 /// a language that cares can ship a `Differ` that writes its own headers.
-fn enclosing<'a>(old: &[&'a str], from: usize) -> Option<&'a str> {
+fn enclosing(old: &[Arc<str>], from: usize) -> Option<&str> {
     old[from.saturating_sub(FUNCNAME_LOOKBACK)..from].iter().rev().find_map(|l| {
         let c = *l.as_bytes().first()?;
         (c.is_ascii_alphabetic() || c == b'_' || c == b'$').then(|| l.trim_end())
@@ -795,14 +853,29 @@ impl Whitespace {
     }
 
     /// One line as this relation sees it. `None` means "unchanged", so the
-    /// common case allocates nothing.
+    /// common case allocates nothing. Test-only: the pipeline asks [`Self::keys`]
+    /// for interned ids instead of materialising one of these per line.
+    #[cfg(test)]
     fn key(self, line: &str) -> Option<String> {
         match self {
             Whitespace::Exact => None,
-            Whitespace::Trailing => Some(line.trim_end().to_string()),
-            Whitespace::All => Some(line.chars().filter(|c| !c.is_whitespace()).collect()),
-            Whitespace::Change => {
+            _ => {
                 let mut out = String::with_capacity(line.len());
+                self.normalize(line, &mut out);
+                Some(out)
+            }
+        }
+    }
+
+    /// Writes the relation's form of `line` into `out`, which the caller
+    /// reuses across lines. Per line and length-preserving, so an edit script
+    /// computed over these still addresses the original lines.
+    fn normalize(self, line: &str, out: &mut String) {
+        match self {
+            Whitespace::Exact => unreachable!("Exact needs no key"),
+            Whitespace::Trailing => out.push_str(line.trim_end()),
+            Whitespace::All => out.extend(line.chars().filter(|c| !c.is_whitespace())),
+            Whitespace::Change => {
                 let mut space = false;
                 for c in line.trim_end().chars() {
                     match c.is_whitespace() {
@@ -821,16 +894,71 @@ impl Whitespace {
                         }
                     }
                 }
-                Some(out)
             }
         }
     }
 
-    fn keys(self, lines: &[&str]) -> Option<Vec<String>> {
+    /// Handles to every line's form under this relation, interned through
+    /// `arena`: equal text shares one allocation, so a line costs a refcount
+    /// bump and not a copy. Equal handles if and only if equal under this
+    /// relation, because the arena interns by content.
+    fn keys(self, lines: &[Arc<str>], arena: &mut KeyArena, out: &mut Vec<Arc<str>>) {
         match self {
-            Whitespace::Exact => None,
-            _ => Some(lines.iter().map(|l| self.key(l).expect("not Exact")).collect()),
+            Whitespace::Exact => {}
+            _ => {
+                out.clear();
+                out.reserve(lines.len());
+                // Taken out so `intern` can touch the arena while the scratch
+                // is borrowed; handed back afterwards.
+                let mut norm = std::mem::take(&mut arena.norm);
+                for line in lines {
+                    norm.clear();
+                    self.normalize(line, &mut norm);
+                    out.push(arena.intern(&norm));
+                }
+                arena.norm = norm;
+            }
         }
+    }
+}
+
+/// An interning arena for normalized line keys.
+///
+/// Distinct content maps to one shared handle; insertion compares actual bytes
+/// against every id its hash bucket names, so a hash collision can pair two
+/// different lines only by being proven equal — which it cannot be. Raw hashes
+/// alone would not do: two colliding keys would silently diff as equal.
+#[derive(Default)]
+struct KeyArena {
+    /// Every distinct key, owned once. Callers get clones of the handle back,
+    /// so a file costs an allocation per *distinct* line and a refcount bump
+    /// per occurrence of it.
+    keys: Vec<Arc<str>>,
+    /// Hash of a key to the ids that share it. Almost always one entry long;
+    /// collisions extend it instead of lying.
+    buckets: HashMap<u64, Vec<u32>>,
+    /// Scratch for [`Whitespace::normalize`], reused across lines.
+    norm: String,
+}
+
+impl KeyArena {
+    /// The handle for `key`'s content, inserting it when new. The bytes are
+    /// copied once, into the handle — every later equal key borrows that one.
+    fn intern(&mut self, key: &str) -> Arc<str> {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        hasher.write(key.as_bytes());
+        let hash = hasher.finish();
+        if let Some(ids) = self.buckets.get(&hash) {
+            for &id in ids {
+                if &*self.keys[id as usize] == key {
+                    return Arc::clone(&self.keys[id as usize]);
+                }
+            }
+        }
+        let id = self.keys.len() as u32;
+        self.keys.push(Arc::from(key));
+        self.buckets.entry(hash).or_default().push(id);
+        Arc::clone(&self.keys[id as usize])
     }
 }
 
@@ -904,7 +1032,7 @@ impl Moves {
 /// same order, as a run of added lines. Greedy and longest-first from each start,
 /// which is what git does — an exact optimum would be a matching problem, and the
 /// difference is not visible on a screen.
-pub fn moves(old: &[&str], new: &[&str], edits: &[Edit], min: usize) -> Moves {
+pub fn moves(old: &[Arc<str>], new: &[Arc<str>], edits: &[Edit], min: usize) -> Moves {
     if min == 0 {
         return Moves::none();
     }
@@ -920,7 +1048,7 @@ pub fn moves(old: &[&str], new: &[&str], edits: &[Edit], min: usize) -> Moves {
 
     // Where each added line's text can be found. Built over the added lines
     // only, so a line that also exists unchanged elsewhere is not a candidate.
-    let mut index: HashMap<&str, Vec<u32>> = HashMap::new();
+    let mut index: HashMap<&Arc<str>, Vec<u32>> = HashMap::new();
     for (i, line) in new.iter().enumerate() {
         if added[i] && !line.trim().is_empty() {
             index.entry(line).or_default().push(i as u32);
@@ -937,7 +1065,7 @@ pub fn moves(old: &[&str], new: &[&str], edits: &[Edit], min: usize) -> Moves {
         }
         // The longest run starting here, over every place its first line landed.
         let mut best = (0usize, 0usize);
-        for &start in index.get(old[i]).map(Vec::as_slice).unwrap_or(&[]) {
+        for &start in index.get(&old[i]).map(Vec::as_slice).unwrap_or(&[]) {
             let start = start as usize;
             let mut len = 0;
             while i + len < old.len()
@@ -998,7 +1126,7 @@ pub fn mark_moved(hunks: &mut [Hunk], m: &Moves) {
 /// be *checked*. `git/examples/diffcheck.rs` compares hunk counts, and an
 /// approximation of these weights would differ from git in a way no test could
 /// call right or wrong. The constants below are xdiff's, names and values.
-pub fn compact(old: &[&str], new: &[&str], edits: &mut [Edit]) {
+pub fn compact(old: &[Arc<str>], new: &[Arc<str>], edits: &mut [Edit]) {
     compact_with(old, new, old, new, edits)
 }
 
@@ -1010,11 +1138,14 @@ pub fn compact(old: &[&str], new: &[&str], edits: &mut [Edit]) {
 /// use the keys, or `-w` cannot slide across a reindented line and git can. How
 /// *readable* the result is depends on the real indentation — so scoring has to
 /// use the text, because the keys are the thing that erased it.
-pub fn compact_with(
-    old: &[&str],
-    new: &[&str],
-    old_keys: &[&str],
-    new_keys: &[&str],
+/// `K` is one side's key type — the lines' own handles when the relation is
+/// byte-for-byte, interned normalized handles when it is not. Equality is all a
+/// slide asks of it.
+pub fn compact_with<K: PartialEq>(
+    old: &[Arc<str>],
+    new: &[Arc<str>],
+    old_keys: &[K],
+    new_keys: &[K],
     edits: &mut [Edit],
 ) {
     for i in 0..edits.len() {
@@ -1031,11 +1162,11 @@ pub fn compact_with(
 
 /// Shifts one edit within `lo..hi` to the best-scoring equivalent position.
 #[allow(clippy::too_many_arguments)]
-fn slide(
-    old: &[&str],
-    new: &[&str],
-    old_keys: &[&str],
-    new_keys: &[&str],
+fn slide<K: PartialEq>(
+    old: &[Arc<str>],
+    new: &[Arc<str>],
+    old_keys: &[K],
+    new_keys: &[K],
     e: &mut Edit,
     lo: usize,
     hi: usize,
@@ -1148,10 +1279,10 @@ struct Measure {
     post_indent: Option<i64>,
 }
 
-fn measure(lines: &[&str], split: usize) -> Measure {
+fn measure(lines: &[Arc<str>], split: usize) -> Measure {
     let (end_of_file, indent) = match split >= lines.len() {
         true => (true, None),
-        false => (false, indent_of(lines[split])),
+        false => (false, indent_of(&lines[split])),
     };
 
     let mut pre_blank = 0;
@@ -1159,7 +1290,7 @@ fn measure(lines: &[&str], split: usize) -> Measure {
     let mut i = split;
     while i > 0 {
         i -= 1;
-        pre_indent = indent_of(lines[i]);
+        pre_indent = indent_of(&lines[i]);
         if pre_indent.is_some() {
             break;
         }
@@ -1176,7 +1307,7 @@ fn measure(lines: &[&str], split: usize) -> Measure {
     let mut post_indent = None;
     let mut j = split + 1;
     while j < lines.len() {
-        post_indent = indent_of(lines[j]);
+        post_indent = indent_of(&lines[j]);
         if post_indent.is_some() {
             break;
         }
@@ -1203,7 +1334,7 @@ struct Score {
     penalty: i64,
 }
 
-fn score_at(lines: &[&str], at: usize, len: usize) -> Score {
+fn score_at(lines: &[Arc<str>], at: usize, len: usize) -> Score {
     let mut s = Score::default();
     add_split(&measure(lines, at), &mut s);
     add_split(&measure(lines, at + len), &mut s);
@@ -1312,9 +1443,9 @@ impl Differs {
             min_moved: MIN_MOVED_LINES,
             indent_heuristic: true,
         };
-        d.register(Histogram);
-        d.register(Patience);
-        d.register(Myers);
+        d.register(Histogram::default());
+        d.register(Patience::default());
+        d.register(Myers::default());
         d.select("histogram");
         d
     }
@@ -1393,7 +1524,7 @@ impl Differs {
     ///
     /// This is what an acquisition layer calls. It never learns which algorithm
     /// ran, which is the point.
-    pub fn file(&self, path: &str, old: &[&str], new: &[&str]) -> FileDiff {
+    pub fn file(&self, path: &str, old: &[Arc<str>], new: &[Arc<str>]) -> FileDiff {
         self.file_using(&Overrides::default(), path, old, new)
     }
 
@@ -1404,23 +1535,12 @@ impl Differs {
     /// `.json` on whatever it was routed to would make the control lie about what
     /// is on screen. A name that is not registered falls back to the configured
     /// behaviour rather than failing, because the caller is a click.
-    ///
-    /// The four stages, in the order they have to happen:
-    ///
-    /// 1. **Normalise**, if the whitespace relation is not exact. Per line and
-    ///    length-preserving, so everything downstream still addresses the
-    ///    original lines and the hunks show the real text.
-    /// 2. **Diff** — the seam. The implementation never learns that 1 happened.
-    /// 3. **Compact**, sliding each change to the most readable of its equivalent
-    ///    positions. Before hunk assembly, because it moves the changes and the
-    ///    hunks are drawn around wherever they end up.
-    /// 4. **Detect moves**, which needs the whole script and so cannot be step 2.
     pub fn file_using(
         &self,
         over: &Overrides,
         path: &str,
-        old: &[&str],
-        new: &[&str],
+        old: &[Arc<str>],
+        new: &[Arc<str>],
     ) -> FileDiff {
         let differ = over
             .algorithm
@@ -1429,23 +1549,60 @@ impl Differs {
             .unwrap_or_else(|| self.for_path(path));
 
         let ws = over.whitespace.unwrap_or(self.whitespace);
-        let (old_keys, new_keys) = (ws.keys(old), ws.keys(new));
-        fn borrow(v: &Option<Vec<String>>) -> Option<Vec<&str>> {
-            v.as_ref().map(|v| v.iter().map(String::as_str).collect())
+        match ws {
+            // Byte-for-byte: the lines themselves are the keys, and their
+            // handles are already shared.
+            Whitespace::Exact => self.assemble(path, differ, old, new, old, new),
+            _ => {
+                // Normalised once per file into interned handles; what every
+                // stage below compares are those, equal exactly when the
+                // relation says so. See docs/measurements.md on what `-w` used
+                // to cost.
+                let mut arena = KeyArena::default();
+                let (mut ko, mut kn) =
+                    (Vec::with_capacity(old.len()), Vec::with_capacity(new.len()));
+                ws.keys(old, &mut arena, &mut ko);
+                ws.keys(new, &mut arena, &mut kn);
+                self.assemble(path, differ, old, new, &ko, &kn)
+            }
         }
-        let (ok, nk) = (borrow(&old_keys), borrow(&new_keys));
-        let (cmp_old, cmp_new) = (ok.as_deref().unwrap_or(old), nk.as_deref().unwrap_or(new));
+    }
 
-        let mut edits = differ.diff(path, cmp_old, cmp_new);
+    /// The four stages after routing, in the order they have to happen:
+    ///
+    /// 1. **Diff** — the seam. `keys_old`/`keys_new` are what it compares: the
+    ///    original lines, or their form under the whitespace relation. It never
+    ///    learns which.
+    /// 2. **Compact**, sliding each change to the most readable of its equivalent
+    ///    positions. Before hunk assembly, because it moves the changes and the
+    ///    hunks are drawn around wherever they end up.
+    /// 3. **Detect moves**, which needs the whole script and so cannot be step 1.
+    /// 4. **Assemble hunks** against the real text, which everything downstream
+    ///    addresses.
+    ///
+    /// Under the exact relation the keys *are* the lines — one slice passed for
+    /// both; otherwise interned handles into a per-file arena. Every stage below
+    /// sees exactly the equivalence relation it always did.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        &self,
+        path: &str,
+        differ: &dyn Differ,
+        old: &[Arc<str>],
+        new: &[Arc<str>],
+        keys_old: &[Arc<str>],
+        keys_new: &[Arc<str>],
+    ) -> FileDiff {
+        let mut edits = differ.diff(path, keys_old, keys_new);
         if self.indent_heuristic {
             // Both: readability is scored against the text a reader will see, and
             // whether a slide is possible at all is decided by the relation. Two
             // hunks in cmux's history land in a different place from git's if the
             // second half of that is skipped.
-            compact_with(old, new, cmp_old, cmp_new, &mut edits);
+            compact_with(old, new, keys_old, keys_new, &mut edits);
         }
         let mut hunks = hunks(old, new, &edits, self.context);
-        let m = moves(cmp_old, cmp_new, &edits, self.min_moved);
+        let m = moves(keys_old, keys_new, &edits, self.min_moved);
         if !m.is_empty() {
             mark_moved(&mut hunks, &m);
         }
@@ -1459,18 +1616,18 @@ impl Differs {
 mod tests {
     use super::*;
 
-    fn lines(s: &str) -> Vec<&str> {
+    fn lines(s: &str) -> Vec<Arc<str>> {
         if s.is_empty() {
             return Vec::new();
         }
-        s.trim_end_matches('\n').split('\n').collect()
+        s.trim_end_matches('\n').split('\n').map(Arc::from).collect()
     }
 
     /// Every property the rest of the pipeline relies on, for any differ.
-    fn verify(old: &[&str], new: &[&str], edits: &[Edit]) {
+    fn verify(old: &[Arc<str>], new: &[Arc<str>], edits: &[Edit]) {
         let mut o = 0usize;
         let mut n = 0usize;
-        let mut rebuilt: Vec<&str> = Vec::new();
+        let mut rebuilt: Vec<Arc<str>> = Vec::new();
         for (i, e) in edits.iter().enumerate() {
             assert!(!e.is_empty(), "edit {i} is empty: {e:?}");
             assert!(e.old_start as usize >= o, "edit {i} out of order: {e:?}");
@@ -1502,7 +1659,7 @@ mod tests {
 
     /// Length of the longest common subsequence, by the textbook table. The
     /// reference a minimal script is checked against.
-    fn lcs(a: &[&str], b: &[&str]) -> usize {
+    fn lcs(a: &[Arc<str>], b: &[Arc<str>]) -> usize {
         let mut t = vec![vec![0usize; b.len() + 1]; a.len() + 1];
         for i in (0..a.len()).rev() {
             for j in (0..b.len()).rev() {
@@ -1517,13 +1674,21 @@ mod tests {
         edits.iter().map(|e| e.old().len() + e.new().len()).sum()
     }
 
-    const ALL: [&dyn Differ; 3] = [&Histogram, &Patience, &Myers];
+    /// The three shipped algorithms, freshly constructed — each carries its own
+    /// scratch now, so a test-local value is what gets shared across its loop.
+    fn all() -> [Box<dyn Differ>; 3] {
+        [
+            Box::new(Histogram::default()),
+            Box::new(Patience::default()),
+            Box::new(Myers::default()),
+        ]
+    }
 
     #[test]
     fn every_differ_produces_a_script_that_applies() {
         let old = lines("fn main() {\n    let x = 1;\n    println!(\"{x}\");\n}\n");
         let new = lines("fn main() {\n    let x = 2;\n    let y = 3;\n    println!(\"{x}\");\n}\n");
-        for d in ALL {
+        for d in all() {
             let edits = d.diff("a.rs", &old, &new);
             verify(&old, &new, &edits);
             assert!(!edits.is_empty(), "{} found no change", d.name());
@@ -1533,7 +1698,7 @@ mod tests {
     #[test]
     fn identical_files_produce_no_edits() {
         let f = lines("a\nb\nc\n");
-        for d in ALL {
+        for d in all() {
             assert!(d.diff("x", &f, &f).is_empty(), "{}", d.name());
         }
     }
@@ -1541,7 +1706,7 @@ mod tests {
     #[test]
     fn one_side_empty_is_the_whole_file() {
         let f = lines("a\nb\nc\n");
-        for d in ALL {
+        for d in all() {
             let add = d.diff("x", &[], &f);
             verify(&[], &f, &add);
             assert_eq!(add, vec![Edit { old_start: 0, old_end: 0, new_start: 0, new_end: 3 }]);
@@ -1558,7 +1723,7 @@ mod tests {
         // The definition of the algorithm, checked against the textbook table.
         let old = lines("a\nb\nc\na\nb\nb\na\n");
         let new = lines("c\nb\na\nb\na\nc\n");
-        let edits = Myers.diff("x", &old, &new);
+        let edits = Myers::default().diff("x", &old, &new);
         verify(&old, &new, &edits);
         let ideal = old.len() + new.len() - 2 * lcs(&old, &new);
         assert_eq!(changed(&edits), ideal, "{edits:?}");
@@ -1579,11 +1744,11 @@ mod tests {
         for case in 0..400 {
             let (n, m) = (rand(24) as usize, rand(24) as usize);
             let letters = 2 + rand(6) as usize;
-            let old: Vec<&str> =
-                (0..n).map(|_| alphabet[rand(letters as u64) as usize]).collect();
-            let new: Vec<&str> =
-                (0..m).map(|_| alphabet[rand(letters as u64) as usize]).collect();
-            let edits = Myers.diff("x", &old, &new);
+            let old: Vec<Arc<str>> =
+                (0..n).map(|_| Arc::from(alphabet[rand(letters as u64) as usize])).collect();
+            let new: Vec<Arc<str>> =
+                (0..m).map(|_| Arc::from(alphabet[rand(letters as u64) as usize])).collect();
+            let edits = Myers::default().diff("x", &old, &new);
             verify(&old, &new, &edits);
             let ideal = old.len() + new.len() - 2 * lcs(&old, &new);
             assert_eq!(changed(&edits), ideal, "case {case}: {old:?} -> {new:?} gave {edits:?}");
@@ -1605,9 +1770,11 @@ mod tests {
         for case in 0..400 {
             let (n, m) = (rand(30) as usize, rand(30) as usize);
             let letters = 1 + rand(7) as usize;
-            let old: Vec<&str> = (0..n).map(|_| alphabet[rand(letters as u64) as usize]).collect();
-            let new: Vec<&str> = (0..m).map(|_| alphabet[rand(letters as u64) as usize]).collect();
-            for d in ALL {
+            let old: Vec<Arc<str>> =
+                (0..n).map(|_| Arc::from(alphabet[rand(letters as u64) as usize])).collect();
+            let new: Vec<Arc<str>> =
+                (0..m).map(|_| Arc::from(alphabet[rand(letters as u64) as usize])).collect();
+            for d in all() {
                 let edits = d.diff("x", &old, &new);
                 verify(&old, &new, &edits);
                 assert!(
@@ -1626,7 +1793,7 @@ mod tests {
         // themselves up: the answer is one block deleted and one inserted.
         let old = lines("fn one() {\n    a();\n}\nfn two() {\n    b();\n}\n");
         let new = lines("fn two() {\n    b();\n}\nfn one() {\n    a();\n}\n");
-        let h = Histogram.diff("x.rs", &old, &new);
+        let h = Histogram::default().diff("x.rs", &old, &new);
         verify(&old, &new, &h);
         assert_eq!(h.len(), 2, "expected a move, got {h:?}");
         assert!(
@@ -1642,10 +1809,10 @@ mod tests {
         // it. Histogram is free to anchor here and does.
         let old = lines("a\nb\na\nb\n");
         let new = lines("b\na\nb\na\n");
-        let p = Patience.diff("x", &old, &new);
+        let p = Patience::default().diff("x", &old, &new);
         verify(&old, &new, &p);
-        assert_eq!(p, Myers.diff("x", &old, &new), "the fallback is not myers");
-        let h = Histogram.diff("x", &old, &new);
+        assert_eq!(p, Myers::default().diff("x", &old, &new), "the fallback is not myers");
+        let h = Histogram::default().diff("x", &old, &new);
         verify(&old, &new, &h);
     }
 
@@ -1655,17 +1822,14 @@ mod tests {
         // directly with a small budget rather than by feeding it 60k lines,
         // because the cost of reaching `MAX_STEPS` honestly *is* MAX_STEPS and
         // `cargo test -p plait-core` is meant to stay under a second.
-        let old: Vec<String> = (0..400).map(|i| format!("old {i}")).collect();
-        let new: Vec<String> = (0..400).map(|i| format!("new {i}")).collect();
-        let o: Vec<&str> = old.iter().map(String::as_str).collect();
-        let n: Vec<&str> = new.iter().map(String::as_str).collect();
-        let (a, b) = intern(&o, &n);
+        let old: Vec<Arc<str>> = (0..400).map(|i| Arc::from(format!("old {i}"))).collect();
+        let new: Vec<Arc<str>> = (0..400).map(|i| Arc::from(format!("new {i}"))).collect();
+        let (a, b) = intern(&old, &new);
 
-        let mut ctx = Ctx::new();
-        ctx.steps = 50;
+        let mut ctx = Ctx { steps: 50, ..Default::default() };
         let mut out = Vec::new();
         ctx.myers(&a, &b, Region::whole(&a, &b), &mut out);
-        verify(&o, &n, &out);
+        verify(&old, &new, &out);
         assert_eq!(
             out,
             vec![Edit { old_start: 0, old_end: 400, new_start: 0, new_end: 400 }],
@@ -1675,11 +1839,10 @@ mod tests {
         // The anchored ones charge their index build to the same budget, and a
         // region they cannot afford to index goes to myers, which cannot afford
         // it either — so the same replace comes out.
-        let mut ctx = Ctx::new();
-        ctx.steps = 50;
+        let mut ctx = Ctx { steps: 50, ..Default::default() };
         let mut out = Vec::new();
         ctx.anchored(&a, &b, MAX_ANCHOR_OCCURRENCES, &mut out);
-        verify(&o, &n, &out);
+        verify(&old, &new, &out);
         assert_eq!(out.len(), 1, "{out:?}");
     }
 
@@ -1689,15 +1852,13 @@ mod tests {
         // line between every pair of identical ones, so every anchor is one line
         // long and the region to the right of it is almost the whole file. As a
         // call stack that is a crash; as a work stack it is a loop.
-        let old: Vec<String> =
-            (0..2000).flat_map(|i| [format!("anchor {i}"), "x".to_string()]).collect();
-        let new: Vec<String> =
-            (0..2000).flat_map(|i| [format!("anchor {i}"), "y".to_string()]).collect();
-        let o: Vec<&str> = old.iter().map(String::as_str).collect();
-        let n: Vec<&str> = new.iter().map(String::as_str).collect();
-        for d in ALL {
-            let edits = d.diff("generated.rs", &o, &n);
-            verify(&o, &n, &edits);
+        let old: Vec<Arc<str>> =
+            (0..2000).flat_map(|i| [Arc::from(format!("anchor {i}")), Arc::from("x")]).collect();
+        let new: Vec<Arc<str>> =
+            (0..2000).flat_map(|i| [Arc::from(format!("anchor {i}")), Arc::from("y")]).collect();
+        for d in all() {
+            let edits = d.diff("generated.rs", &old, &new);
+            verify(&old, &new, &edits);
         }
     }
 
@@ -1705,7 +1866,7 @@ mod tests {
     fn a_region_with_nothing_in_common_is_one_replace() {
         let old = lines("aaa\nbbb\n");
         let new = lines("ccc\nddd\n");
-        for d in ALL {
+        for d in all() {
             let edits = d.diff("x", &old, &new);
             verify(&old, &new, &edits);
             assert_eq!(
@@ -1722,13 +1883,11 @@ mod tests {
         // The shape that makes recursion depth equal to file length: every
         // anchor peels one line. 40k lines of it, which as a call stack is a
         // crash rather than a slow load.
-        let old: Vec<String> = (0..40_000).map(|i| format!("line {}", i % 3)).collect();
-        let new: Vec<String> = (0..40_000).map(|i| format!("line {}", i % 4)).collect();
-        let o: Vec<&str> = old.iter().map(String::as_str).collect();
-        let n: Vec<&str> = new.iter().map(String::as_str).collect();
-        for d in ALL {
-            let edits = d.diff("x", &o, &n);
-            verify(&o, &n, &edits);
+        let old: Vec<Arc<str>> = (0..40_000).map(|i| Arc::from(format!("line {}", i % 3))).collect();
+        let new: Vec<Arc<str>> = (0..40_000).map(|i| Arc::from(format!("line {}", i % 4))).collect();
+        for d in all() {
+            let edits = d.diff("x", &old, &new);
+            verify(&old, &new, &edits);
         }
     }
 
@@ -1736,13 +1895,11 @@ mod tests {
     fn a_fully_rewritten_generated_file_degrades_instead_of_stalling() {
         // 60k lines against 60k different lines is 10^10 Myers steps. The budget
         // has to turn that into a replace, and the result still has to apply.
-        let old: Vec<String> = (0..60_000).map(|i| format!("old {i}")).collect();
-        let new: Vec<String> = (0..60_000).map(|i| format!("new {i}")).collect();
-        let o: Vec<&str> = old.iter().map(String::as_str).collect();
-        let n: Vec<&str> = new.iter().map(String::as_str).collect();
+        let old: Vec<Arc<str>> = (0..60_000).map(|i| Arc::from(format!("old {i}"))).collect();
+        let new: Vec<Arc<str>> = (0..60_000).map(|i| Arc::from(format!("new {i}"))).collect();
         let t = std::time::Instant::now();
-        let edits = Myers.diff("bundle.js", &o, &n);
-        verify(&o, &n, &edits);
+        let edits = Myers::default().diff("bundle.js", &old, &new);
+        verify(&old, &new, &edits);
         assert!(t.elapsed().as_secs() < 20, "took {:?}", t.elapsed());
     }
 
@@ -1752,7 +1909,7 @@ mod tests {
     fn hunks_carry_context_and_both_line_numbers() {
         let old = lines("1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n");
         let new = lines("1\n2\n3\n4\nFIVE\n6\n7\n8\n9\n10\n");
-        let edits = Histogram.diff("x", &old, &new);
+        let edits = Histogram::default().diff("x", &old, &new);
         let hs = hunks(&old, &new, &edits, 3);
         assert_eq!(hs.len(), 1);
         assert_eq!(hs[0].header, "@@ -2,7 +2,7 @@");
@@ -1769,14 +1926,12 @@ mod tests {
 
     #[test]
     fn nearby_changes_share_a_hunk_and_distant_ones_do_not() {
-        let old: Vec<String> = (1..=40).map(|i| i.to_string()).collect();
+        let old: Vec<Arc<str>> = (1..=40).map(|i| Arc::from(i.to_string())).collect();
         let mut new = old.clone();
         new[5] = "six".into();
         new[10] = "eleven".into(); // 5 lines away: context overlaps
         new[30] = "thirtyone".into(); // far away
-        let o: Vec<&str> = old.iter().map(String::as_str).collect();
-        let n: Vec<&str> = new.iter().map(String::as_str).collect();
-        let hs = hunks(&o, &n, &Histogram.diff("x", &o, &n), 3);
+        let hs = hunks(&old, &new, &Histogram::default().diff("x", &old, &new), 3);
         assert_eq!(hs.len(), 2, "{:?}", hs.iter().map(|h| &h.header).collect::<Vec<_>>());
         // No line is printed twice: the merged hunk covers 3..14, the other 28..34.
         assert!(hs[0].lines.iter().filter(|l| l.kind == LineKind::Removed).count() == 2);
@@ -1786,7 +1941,7 @@ mod tests {
     fn context_of_zero_prints_only_the_change() {
         let old = lines("a\nb\nc\n");
         let new = lines("a\nB\nc\n");
-        let hs = hunks(&old, &new, &Histogram.diff("x", &old, &new), 0);
+        let hs = hunks(&old, &new, &Histogram::default().diff("x", &old, &new), 0);
         assert_eq!(hs.len(), 1);
         assert_eq!(hs[0].lines.len(), 2);
         assert_eq!(hs[0].header, "@@ -2 +2 @@ a", "a count of one is written without it");
@@ -1798,10 +1953,10 @@ mod tests {
         // an empty old side prints the line the insertion comes *after*.
         let old = lines("a\n");
         let new = lines("a\nb\n");
-        let hs = hunks(&old, &new, &Myers.diff("x", &old, &new), 0);
+        let hs = hunks(&old, &new, &Myers::default().diff("x", &old, &new), 0);
         assert_eq!(hs[0].header, "@@ -1,0 +2 @@ a");
 
-        let hs = hunks(&new, &old, &Myers.diff("x", &new, &old), 0);
+        let hs = hunks(&new, &old, &Myers::default().diff("x", &new, &old), 0);
         assert_eq!(hs[0].header, "@@ -2 +1,0 @@ a");
     }
 
@@ -1809,7 +1964,7 @@ mod tests {
     fn the_header_names_the_enclosing_declaration() {
         let old = lines("fn dispatch() {\n    a();\n    b();\n    c();\n}\n");
         let new = lines("fn dispatch() {\n    a();\n    B();\n    c();\n}\n");
-        let hs = hunks(&old, &new, &Histogram.diff("x.rs", &old, &new), 1);
+        let hs = hunks(&old, &new, &Histogram::default().diff("x.rs", &old, &new), 1);
         assert_eq!(hs[0].header, "@@ -2,3 +2,3 @@ fn dispatch() {");
     }
 
@@ -1817,18 +1972,17 @@ mod tests {
     fn the_header_search_gives_up_rather_than_scanning_a_whole_file() {
         // A formatted blob: every line indented, so there is no declaration to
         // find and the search would otherwise walk to line 0 for every hunk.
-        let mut old: Vec<String> = (0..2000).map(|i| format!("    \"k{i}\": {i},")).collect();
+        let mut old: Vec<Arc<str>> = (0..2000).map(|i| Arc::from(format!("    \"k{i}\": {i},"))).collect();
         old[0] = "root = {".into();
         let mut new = old.clone();
         new[1500] = "    \"k1500\": 99,".into();
-        let o: Vec<&str> = old.iter().map(String::as_str).collect();
-        let n: Vec<&str> = new.iter().map(String::as_str).collect();
-        let hs = hunks(&o, &n, &Histogram.diff("x.json", &o, &n), 3);
+        let hs = hunks(&old, &new, &Histogram::default().diff("x.json", &old, &new), 3);
         assert_eq!(hs.len(), 1);
         assert_eq!(hs[0].header, "@@ -1498,7 +1498,7 @@", "no declaration within reach");
 
         // Within reach, it is still found.
-        let hs = hunks(&o[1200..], &n[1200..], &Myers.diff("x", &o[1200..], &n[1200..]), 0);
+        let hs =
+            hunks(&old[1200..], &new[1200..], &Myers::default().diff("x", &old[1200..], &new[1200..]), 0);
         assert!(hs[0].header.ends_with("@@"), "{}", hs[0].header);
     }
 
@@ -1836,13 +1990,13 @@ mod tests {
     fn a_hunk_at_the_very_start_or_end_does_not_run_off_the_file() {
         let old = lines("a\nb\n");
         let new = lines("A\nb\n");
-        let hs = hunks(&old, &new, &Myers.diff("x", &old, &new), 10);
+        let hs = hunks(&old, &new, &Myers::default().diff("x", &old, &new), 10);
         assert_eq!(hs[0].header, "@@ -1,2 +1,2 @@");
         assert_eq!(hs[0].lines.len(), 3);
 
         let old = lines("a\nb\n");
         let new = lines("a\nB\n");
-        let hs = hunks(&old, &new, &Myers.diff("x", &old, &new), 10);
+        let hs = hunks(&old, &new, &Myers::default().diff("x", &old, &new), 10);
         assert_eq!(hs[0].header, "@@ -1,2 +1,2 @@");
     }
 
@@ -1856,23 +2010,23 @@ mod tests {
     fn every_hunk_line_number_matches_the_file_it_came_from() {
         // The property that makes a header trustworthy, over a diff big enough
         // that an off-by-one somewhere would not be visible by reading.
-        let old: Vec<String> = (0..500).map(|i| format!("line {i}")).collect();
-        let new: Vec<String> = (0..500)
+        let old: Vec<Arc<str>> = (0..500).map(|i| Arc::from(format!("line {i}"))).collect();
+        let new: Vec<Arc<str>> = (0..500)
             .filter(|i| i % 7 != 0)
-            .map(|i| if i % 11 == 0 { format!("changed {i}") } else { format!("line {i}") })
+            .map(|i| {
+                if i % 11 == 0 { Arc::from(format!("changed {i}")) } else { Arc::from(format!("line {i}")) }
+            })
             .collect();
-        let o: Vec<&str> = old.iter().map(String::as_str).collect();
-        let n: Vec<&str> = new.iter().map(String::as_str).collect();
-        for d in ALL {
-            let edits = d.diff("x", &o, &n);
-            verify(&o, &n, &edits);
-            for h in hunks(&o, &n, &edits, 3) {
+        for d in all() {
+            let edits = d.diff("x", &old, &new);
+            verify(&old, &new, &edits);
+            for h in hunks(&old, &new, &edits, 3) {
                 for l in &h.lines {
                     if let Some(no) = l.old_no {
-                        assert_eq!(o[no as usize - 1], l.text, "{} old line {no}", d.name());
+                        assert_eq!(&*old[no as usize - 1], &*l.text, "{} old line {no}", d.name());
                     }
                     if let Some(no) = l.new_no {
-                        assert_eq!(n[no as usize - 1], l.text, "{} new line {no}", d.name());
+                        assert_eq!(&*new[no as usize - 1], &*l.text, "{} new line {no}", d.name());
                     }
                     if l.kind == LineKind::Context {
                         assert!(l.old_no.is_some() && l.new_no.is_some());
@@ -1889,7 +2043,7 @@ mod tests {
         fn name(&self) -> &'static str {
             "reverse"
         }
-        fn diff(&self, _path: &str, old: &[&str], new: &[&str]) -> Vec<Edit> {
+        fn diff(&self, _path: &str, old: &[Arc<str>], new: &[Arc<str>]) -> Vec<Edit> {
             vec![Edit {
                 old_start: 0,
                 old_end: old.len() as u32,
@@ -1930,7 +2084,7 @@ mod tests {
             fn name(&self) -> &'static str {
                 "myers"
             }
-            fn diff(&self, _: &str, _: &[&str], _: &[&str]) -> Vec<Edit> {
+            fn diff(&self, _: &str, _: &[Arc<str>], _: &[Arc<str>]) -> Vec<Edit> {
                 Vec::new()
             }
         }
@@ -2065,11 +2219,11 @@ mod tests {
             match l.kind {
                 LineKind::Removed | LineKind::Context => {
                     let n = l.old_no.expect("has an old line") as usize;
-                    assert_eq!(old[n - 1], l.text, "old line {n} was normalised");
+                    assert_eq!(&*old[n - 1], &*l.text, "old line {n} was normalised");
                 }
                 LineKind::Added => {
                     let n = l.new_no.expect("has a new line") as usize;
-                    assert_eq!(new[n - 1], l.text, "new line {n} was normalised");
+                    assert_eq!(&*new[n - 1], &*l.text, "new line {n} was normalised");
                 }
             }
         }
@@ -2078,7 +2232,7 @@ mod tests {
             .lines
             .iter()
             .filter(|l| l.kind == LineKind::Context)
-            .map(|l| l.text.as_str())
+            .map(|l| l.text.as_ref())
             .collect();
         assert!(context.contains(&"  a"), "{context:?}");
     }
@@ -2114,7 +2268,7 @@ mod tests {
                 .iter()
                 .flat_map(|h| &h.lines)
                 .filter(|l| l.moved && l.kind == kind)
-                .map(|l| l.text.as_str())
+                .map(|l| l.text.as_ref())
                 .collect()
         };
         // *Which* block is called the mover is the differ's choice — moving the
@@ -2222,7 +2376,7 @@ mod tests {
                 .iter()
                 .flat_map(|h| &h.lines)
                 .filter(|l| l.kind == LineKind::Added)
-                .map(|l| l.text.clone())
+                .map(|l| l.text.to_string())
                 .collect()
         };
         assert_eq!(
@@ -2252,9 +2406,9 @@ mod tests {
         let pool = ["", "a", "    a", "        b", "}", "    }", "fn f() {", "  # c"];
         for case in 0..300 {
             let (n, m) = (rand(20) as usize, rand(20) as usize);
-            let old: Vec<&str> = (0..n).map(|_| pool[rand(8) as usize]).collect();
-            let new: Vec<&str> = (0..m).map(|_| pool[rand(8) as usize]).collect();
-            let mut edits = Histogram.diff("x.rs", &old, &new);
+            let old: Vec<Arc<str>> = (0..n).map(|_| Arc::from(pool[rand(8) as usize])).collect();
+            let new: Vec<Arc<str>> = (0..m).map(|_| Arc::from(pool[rand(8) as usize])).collect();
+            let mut edits = Histogram::default().diff("x.rs", &old, &new);
             let before = changed(&edits);
             compact(&old, &new, &mut edits);
             verify(&old, &new, &edits);
@@ -2269,17 +2423,16 @@ mod tests {
         // under `-w` a group may cross a line that differs from it only in
         // indentation, and comparing the real text says it may not. Two hunks in
         // cmux's history land in the wrong place without this.
-        let old = ["a();", "  x();", "b();"];
-        let new = ["a();", "x();", "  x();", "b();"];
-        let strip = |l: &&str| -> String { l.chars().filter(|c| !c.is_whitespace()).collect() };
-        let (ok, nk): (Vec<String>, Vec<String>) =
+        let old: Vec<Arc<str>> = ["a();", "  x();", "b();"].iter().copied().map(Arc::from).collect();
+        let new: Vec<Arc<str>> =
+            ["a();", "x();", "  x();", "b();"].iter().copied().map(Arc::from).collect();
+        let strip = |l: &Arc<str>| -> Arc<str> {
+            Arc::from(l.chars().filter(|c| !c.is_whitespace()).collect::<String>())
+        };
+        let (ok, nk): (Vec<Arc<str>>, Vec<Arc<str>>) =
             (old.iter().map(strip).collect(), new.iter().map(strip).collect());
-        let (ok, nk): (Vec<&str>, Vec<&str>) = (
-            ok.iter().map(String::as_str).collect(),
-            nk.iter().map(String::as_str).collect(),
-        );
 
-        let script = Histogram.diff("x.rs", &ok, &nk);
+        let script = Histogram::default().diff("x.rs", &ok, &nk);
         let mut through_keys = script.clone();
         let mut through_text = script.clone();
         compact_with(&old, &new, &ok, &nk, &mut through_keys);
@@ -2297,28 +2450,24 @@ mod tests {
         // Two changes with one line between them: sliding either onto the other
         // would produce overlapping edits, which is the one thing `verify`
         // catches and a reader never would.
-        let old: Vec<String> = (0..40).map(|i| format!("    line {i}")).collect();
+        let old: Vec<Arc<str>> = (0..40).map(|i| Arc::from(format!("    line {i}"))).collect();
         let mut new = old.clone();
         new.insert(10, "    inserted a".into());
         new.insert(12, "    inserted b".into());
-        let o: Vec<&str> = old.iter().map(String::as_str).collect();
-        let n: Vec<&str> = new.iter().map(String::as_str).collect();
-        let mut edits = Histogram.diff("x.rs", &o, &n);
-        compact(&o, &n, &mut edits);
-        verify(&o, &n, &edits);
+        let mut edits = Histogram::default().diff("x.rs", &old, &new);
+        compact(&old, &new, &mut edits);
+        verify(&old, &new, &edits);
     }
 
     #[test]
     fn the_context_setting_reaches_the_hunks() {
-        let old: Vec<String> = (0..20).map(|i| i.to_string()).collect();
+        let old: Vec<Arc<str>> = (0..20).map(|i| Arc::from(i.to_string())).collect();
         let mut new = old.clone();
         new[10] = "ten!".into();
-        let o: Vec<&str> = old.iter().map(String::as_str).collect();
-        let n: Vec<&str> = new.iter().map(String::as_str).collect();
         for context in [0, 1, 3, 7] {
             let mut d = Differs::builtin();
             d.context = context;
-            let f = d.file("x", &o, &n);
+            let f = d.file("x", &old, &new);
             assert_eq!(f.hunks[0].lines.len(), 2 + 2 * context, "context {context}");
         }
     }

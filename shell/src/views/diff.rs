@@ -63,7 +63,7 @@ use gpui::prelude::FluentBuilder as _;
 use gpui_component::scroll::{Scrollbar, ScrollbarHandle};
 use plait_core::host::Host;
 use plait_core::prepared::{prepare, Prepared};
-use plait_core::runs::surfaces;
+use plait_core::runs::{self, surfaces, Run};
 use plait_core::rows::{Ordered, RowRef};
 use plait_core::select::{self, Caret, RowId, Selected, Selection, Text as _};
 use plait_core::syntax::Token;
@@ -1465,24 +1465,37 @@ impl Render for Diff {
 
 // --------------------------------------------------------------- the built-in
 
-/// `SharedString` throughout, not `String`: `render` runs for every visible row
-/// on every frame that redraws, and handing GPUI a `String` there copies the
-/// line each time. A `SharedString` clone is a refcount bump.
+/// Rows hold [`Arc<str>`] text and exact-size boxed ranges, not owned copies.
+///
+/// The text is the *same* allocation `prepare` clipped into — a row takes a
+/// refcount bump at load and hands back another one at draw time, which is why
+/// cycling layouts on a 714k-line diff costs no second copy of every line.
+/// `render` runs for every visible row on every frame that redraws, so what it
+/// hands GPUI is `SharedString::from(Arc::clone(..))`: a refcount bump (or an
+/// inline copy for the shortest lines), never a heap allocation — see [`slice`].
+///
+/// The same handle shape for the strings the parsed diff already retains: a
+/// file's path and a hunk's header are one [`Arc<str>`] built at load and
+/// cloned by handle into the row, not a second copy of a string somebody else
+/// is keeping. And the gutter numbers are stored as the [`u32`]s they always
+/// were, formatted at draw time — see [`Scratch::number`] — because
+/// pre-rendering them put forty-eight bytes of string on every line of a
+/// 714k-line diff to describe an integer.
 enum Row {
     File {
-        path: SharedString,
+        path: std::sync::Arc<str>,
         adds: usize,
         dels: usize,
     },
-    Hunk(SharedString),
+    Hunk(std::sync::Arc<str>),
     Line {
         kind: LineKind,
         moved: bool,
-        old: SharedString,
-        new: SharedString,
-        text: SharedString,
-        spans: Vec<Span>,
-        tokens: Vec<Token>,
+        old: Option<u32>,
+        new: Option<u32>,
+        text: std::sync::Arc<str>,
+        spans: Box<[Span]>,
+        tokens: Box<[Token]>,
     },
 }
 
@@ -1502,6 +1515,8 @@ pub struct TextRows {
     /// changes neither costs a comparison.
     cols: usize,
     wrap: &'static str,
+    /// What drawing borrows. Cleared per cell, grown once ever — see [`Scratch`].
+    scratch: RefCell<Scratch>,
 }
 
 impl Rows for TextRows {
@@ -1572,9 +1587,9 @@ impl Rows for TextRows {
                 self.rows.push(Row::Line {
                     kind: l.kind,
                     moved: l.moved,
-                    old: number(l.old_no),
-                    new: number(l.new_no),
-                    text: l.text.into(),
+                    old: l.old_no,
+                    new: l.new_no,
+                    text: l.text,
                     spans: l.spans,
                     tokens: l.tokens,
                 });
@@ -1666,12 +1681,16 @@ impl Rows for TextRows {
                 // what says it is not a line of its own — every real line has at
                 // least one number, so there is nothing to confuse it with.
                 let blank = seg > 0;
+                // One borrow per row, held while the row's pieces are built:
+                // numbers are formatted into it and the run list swept into it,
+                // both copied out by the elements as they take them.
+                let mut sc = self.scratch.borrow_mut();
                 row_frame()
                     .items_center()
                     .px(px(PAD))
                     .bg(rgb(bg))
-                    .child(num(number_or_blank(old, blank), gutter))
-                    .child(num(number_or_blank(new, blank), gutter))
+                    .child(num(sc.number(*old, blank), gutter))
+                    .child(num(sc.number(*new, blank), gutter))
                     .child(
                         div()
                             .flex_none()
@@ -1682,15 +1701,19 @@ impl Rows for TextRows {
                     .child(scrolled(
                         shift,
                         div().text_color(rgb(fg)).child(
-                            StyledText::new(piece).with_highlights(runs(
-                                at.clone(),
-                                tokens,
-                                spans,
-                                theme,
-                                *kind,
-                                *moved,
-                                selected(sel, 0, text.len()),
-                            )),
+                            StyledText::new(piece).with_highlights(
+                                sc.merged(
+                                    at.clone(),
+                                    tokens,
+                                    spans,
+                                    theme,
+                                    *kind,
+                                    *moved,
+                                    selected(sel, 0, text.len()),
+                                )
+                                .iter()
+                                .cloned(),
+                            ),
                         ),
                     ))
                     .into_any_element()
@@ -1711,15 +1734,29 @@ fn wrappable(row: &Row) -> &str {
 
 /// One row's worth of a line, without copying the line when it is all of it.
 ///
-/// The common case by far — most lines fit — and it is a refcount bump. A row
-/// that *did* wrap copies its slice, which is up to a window's width of bytes on
-/// each of the fifty visible rows, per frame. That is smaller than the run list
-/// beside it, which is also rebuilt per row per frame and for the same reason:
-/// caching either across 714k rows costs far more memory than the rows.
-pub(crate) fn slice(text: &SharedString, at: &Range<usize>) -> SharedString {
+/// The common case by far — most lines fit — and it is a refcount bump twice
+/// over: the `Arc` is cloned and GPUI's `SharedString` adopts it as its own
+/// heap representation. Only the shortest lines (23 bytes or fewer) are copied,
+/// inline into the string itself. A row that *did* wrap cannot borrow — GPUI's
+/// elements are `'static`, so `StyledText` only ever takes owned text — but it
+/// goes in by reference all the same: `SharedString::from(&str)` copies into
+/// the inline representation for a window-width slice of 23 bytes or less and
+/// heap-allocates exactly once past that, where the `to_string()` it replaced
+/// allocated twice (the `String`, then the `Arc` adopted from it).
+pub(crate) fn slice(text: &std::sync::Arc<str>, at: &Range<usize>) -> SharedString {
+    match at.start == 0 && at.end == text.len() {
+        true => SharedString::from(text.clone()),
+        false => SharedString::from(&text[at.clone()]),
+    }
+}
+
+/// The same, for text GPUI already owns — a re-flowed Markdown table row.
+/// Whole-row clones stay refcount bumps there too, and wrapped segments take
+/// the by-reference path [`slice`] does.
+pub(crate) fn slice_shared(text: &SharedString, at: &Range<usize>) -> SharedString {
     match at.start == 0 && at.end == text.len() {
         true => text.clone(),
-        false => SharedString::from(text[at.clone()].to_string()),
+        false => SharedString::from(&text[at.clone()]),
     }
 }
 
@@ -1765,8 +1802,8 @@ pub(crate) fn row_frame() -> Div {
 ///
 /// A negative margin and not a slice of the text: the syntax tokens and the
 /// intraline spans address the *line*, so cutting the string before
-/// [`runs`] pairs styling with the wrong bytes. The same reason the terminal
-/// swallows columns in the pen rather than slicing.
+/// [`Scratch::merged`] pairs styling with the wrong bytes. The same reason the
+/// terminal swallows columns in the pen rather than slicing.
 pub(crate) fn scrolled(shift: f32, text: Div) -> Div {
     div()
         .flex()
@@ -1774,14 +1811,6 @@ pub(crate) fn scrolled(shift: f32, text: Div) -> Div {
         .min_w(px(0.))
         .overflow_x_hidden()
         .child(text.flex_none().ml(px(-shift)))
-}
-
-/// A line number, or nothing at all on a continuation row.
-pub(crate) fn number_or_blank(n: &SharedString, blank: bool) -> SharedString {
-    match blank {
-        true => SharedString::default(),
-        false => n.clone(),
-    }
 }
 
 /// The bytes of a `len`-long text that a selection covers, or nothing at all
@@ -1823,11 +1852,11 @@ pub(crate) fn into_text(x: f32, chrome: f32, shift: f32) -> f32 {
 /// so the only thing that can be true of a stretch of it is that it is selected.
 /// The unselected case stays a bare string child — a `StyledText` on every header
 /// of every frame is a shaped line for a highlight nobody asked for.
-fn header_text(text: &SharedString, sel: Range<usize>, theme: &Theme) -> AnyElement {
+fn header_text(text: SharedString, sel: Range<usize>, theme: &Theme) -> AnyElement {
     if sel.is_empty() {
-        return text.clone().into_any_element();
+        return text.into_any_element();
     }
-    StyledText::new(text.clone())
+    StyledText::new(text)
         .with_highlights([(
             sel,
             HighlightStyle {
@@ -1849,8 +1878,13 @@ fn header_text(text: &SharedString, sel: Range<usize>, theme: &Theme) -> AnyElem
 /// The **directory recedes and the file name does not**. A forty-file diff is
 /// scanned by name, and `src/views/` is the same eleven characters on most of
 /// them; drawn at one weight the names are the part that has to be hunted for.
+///
+/// The path arrives as the row's own handle and is borrowed, not copied: the
+/// directory/name split below is two subslices of one string, and only what a
+/// header actually draws is handed to GPUI — inline for any piece under 23
+/// bytes, which is nearly all of them.
 pub(crate) fn file_header(
-    path: &SharedString,
+    path: &std::sync::Arc<str>,
     adds: usize,
     dels: usize,
     theme: &Theme,
@@ -1893,11 +1927,20 @@ pub(crate) fn file_header(
                                 theme.min_furniture,
                             );
                             let at = clipped(&sel, 0..cut);
-                            div().flex_none().text_color(rgb(fg)).child(header_text(&d, at, theme))
+                            div().flex_none().text_color(rgb(fg)).child(header_text(
+                                SharedString::from(d),
+                                at,
+                                theme,
+                            ))
                         }))
                         .child(
                             div().flex_none().text_color(rgb(p.file_fg)).child(header_text(
-                                &name,
+                                match dir {
+                                    // A bare name *is* the whole path: adopt the
+                                    // row's own handle rather than copying it.
+                                    None => SharedString::from(std::sync::Arc::clone(path)),
+                                    Some(_) => SharedString::from(name),
+                                },
                                 clipped(&sel, cut..path.len()),
                                 theme,
                             )),
@@ -1923,17 +1966,14 @@ fn clipped(sel: &Range<usize>, at: Range<usize>) -> Range<usize> {
 
 /// `src/views/diff.rs` -> (`src/views/`, `diff.rs`). `None` for a bare name.
 ///
-/// Allocates, and is allowed to: a header is one row per *file*, so at most a
-/// couple are ever on screen, where a line is one of fifty. Doing it at load
-/// instead would put two more `SharedString`s on every `Row::File` in three
-/// presentations to save two allocations a frame.
-fn split_path(path: &SharedString) -> (Option<SharedString>, SharedString) {
+/// Borrows, and is allowed to be that cheap: a header is one row per *file*, so
+/// at most a couple are ever on screen, where a line is one of fifty — but the
+/// two pieces are subslices of the row's own handle, so there is nothing to
+/// allocate for until GPUI is handed a piece it must own.
+fn split_path(path: &str) -> (Option<&str>, &str) {
     match path.rfind('/') {
-        Some(i) => (
-            Some(SharedString::from(path[..=i].to_string())),
-            SharedString::from(path[i + 1..].to_string()),
-        ),
-        None => (None, path.clone()),
+        Some(i) => (Some(&path[..=i]), &path[i + 1..]),
+        None => (None, path),
     }
 }
 
@@ -1949,7 +1989,7 @@ fn split_path(path: &SharedString) -> (Option<SharedString>, SharedString) {
 /// headers, which had the hierarchy backwards: a hunk is a place inside a file,
 /// and the file is the boundary that matters.
 pub(crate) fn hunk_header(
-    header: &SharedString,
+    header: &std::sync::Arc<str>,
     theme: &Theme,
     sel: Option<Selected>,
     shift: f32,
@@ -1964,11 +2004,13 @@ pub(crate) fn hunk_header(
         .child(scrolled(
             shift,
             div().child(
-                StyledText::new(header.clone()).with_highlights(hunk_runs(
-                    marker.len(),
-                    selected(sel, 0, header.len()),
-                    theme,
-                )),
+                // The row's own handle, adopted rather than copied.
+                StyledText::new(SharedString::from(std::sync::Arc::clone(header)))
+                    .with_highlights(hunk_runs(
+                        marker.len(),
+                        selected(sel, 0, header.len()),
+                        theme,
+                    )),
             ),
         ))
         .into_any_element()
@@ -2063,117 +2105,97 @@ pub(crate) fn num(n: SharedString, fg: Rgb) -> Div {
         .child(n)
 }
 
-/// Line numbers are drawn, so they are formatted once at load rather than on
-/// every frame the row is visible.
-pub(crate) fn number(n: Option<u32>) -> SharedString {
-    n.map(|n| SharedString::from(n.to_string())).unwrap_or_default()
+/// What drawing borrows: the buffers a presentation reuses across the visible
+/// rows of a frame.
+///
+/// The render path allocates nothing per row. Gutter numbers are formatted
+/// into `no` and adopted inline by reference; the run list is swept into
+/// `runs` by `core`'s buffer-passing merge and resolved into `hl`. Both clear
+/// per cell and grow once ever — after the first frame nothing here touches
+/// the heap, which is rule 3 and the reason this replaced an edges-`Vec` plus
+/// an output-`Vec` per visible row per frame.
+#[derive(Default)]
+pub(crate) struct Scratch {
+    /// One gutter number at a time.
+    no: String,
+    /// The sweep's output, in line coordinates.
+    runs: Vec<Run>,
+    /// The same runs theme-resolved and rebased into row coordinates.
+    hl: Vec<(Range<usize>, HighlightStyle)>,
 }
 
-/// Merges three independent sets of byte ranges into the one flat, sorted,
-/// non-overlapping run list `StyledText` wants: syntax tokens style the
-/// foreground, intraline spans light the background of the words that changed,
-/// and `sel` lights the background of whatever the mouse has selected.
-///
-/// All three arrive sorted and internally non-overlapping, so this is a sweep
-/// over their combined edges rather than a sort.
-///
-/// `at` is the part of the line being drawn, which is the whole of it unless the
-/// line wrapped. Tokens, spans and the selection stay in *line* coordinates
-/// throughout — they belong to the line, not to one of its rows — and are clamped
-/// into `at` on the way in and rebased on the way out. Clipping them into a row's
-/// own vectors first is the other way to write this, and it is two allocations per
-/// visible row per frame for an answer the sweep already had.
-///
-/// **A selection outranks a changed word.** Both are backgrounds and only one can
-/// be drawn, and the reader already knows which words changed — the thing they do
-/// not know, and are about to press a key about, is what is selected.
-pub(crate) fn runs(
-    at: Range<usize>,
-    tokens: &[Token],
-    spans: &[Span],
-    theme: &Theme,
-    kind: LineKind,
-    moved: bool,
-    sel: Range<usize>,
-) -> Vec<(Range<usize>, HighlightStyle)> {
-    // Which background each run actually lands on, so the theme can hand back a
-    // foreground that reads against it. A changed word sits on a lighter
-    // background than the rest of its line and needs a different answer.
-    //
-    // A moved line is the same text in a different place, so nothing inside it
-    // changed and its spans describe a change the detection just said was not
-    // one. Dropped here rather than coloured the same as the row: an invisible
-    // run is still a run to merge and shape.
-    let spans: &[Span] = if moved { &[] } else { spans };
-
-    // `core`'s, because the split view, the Markdown rows and the terminal
-    // frontend resolve a token against the same background this does — see
-    // `plait_core::runs::surfaces`, which the terminal has always used.
-    let (plain_surface, word_surface) = surfaces(kind, moved);
-    let word_bg = theme.background(word_surface);
-    let selected_bg = theme.background(Surface::Selected);
-    if tokens.is_empty() && spans.is_empty() && sel.is_empty() {
-        return Vec::new();
-    }
-
-    // Clamped rather than filtered: anything wholly outside this row collapses
-    // to a zero-length edge pair, which `dedup` removes for free.
-    let clamp = |i: usize| i.clamp(at.start, at.end);
-    let sel = clamp(sel.start)..clamp(sel.end);
-    let mut edges = Vec::with_capacity((tokens.len() + spans.len()) * 2 + 3);
-    for t in tokens {
-        edges.push(clamp(t.start));
-        edges.push(clamp(t.end));
-    }
-    for s in spans {
-        edges.push(clamp(s.start));
-        edges.push(clamp(s.end));
-    }
-    edges.push(sel.start);
-    edges.push(sel.end);
-    edges.push(at.end);
-    edges.sort_unstable();
-    edges.dedup();
-
-    let mut out = Vec::with_capacity(edges.len());
-    let (mut ti, mut si) = (0usize, 0usize);
-    let mut cursor = edges[0];
-    for &edge in &edges[1..] {
-        while ti < tokens.len() && tokens[ti].end <= cursor {
-            ti += 1;
+impl Scratch {
+    /// A number as the row draws it: formatted into the scratch string and
+    /// handed over by reference, so GPUI copies it straight into its own
+    /// inline representation. Numbers are far under the 23-byte inline
+    /// capacity, so this is a stack-format and a short memcpy — never a heap
+    /// allocation, which is what pre-rendering them at load cost instead:
+    /// forty-eight bytes of string per line of a 714k-line diff to describe
+    /// two integers.
+    ///
+    /// Right-alignment is [`num`]'s (`justify_end` in a fixed-width column)
+    /// and padding is no part of that, so a formatted digit reads exactly
+    /// where a stored one did.
+    pub(crate) fn number(&mut self, n: Option<u32>, blank: bool) -> SharedString {
+        match n.filter(|_| !blank) {
+            Some(n) => {
+                use std::fmt::Write as _;
+                self.no.clear();
+                let _ = write!(self.no, "{n}");
+                SharedString::from(self.no.as_str())
+            }
+            None => SharedString::default(),
         }
-        while si < spans.len() && spans[si].end <= cursor {
-            si += 1;
-        }
-        let on_sel = sel.contains(&cursor);
-        let on_word = spans.get(si).is_some_and(|s| s.start <= cursor);
-        let surface = match (on_sel, on_word) {
-            (true, _) => Surface::Selected,
-            (false, true) => word_surface,
-            (false, false) => plain_surface,
-        };
-        let style =
-            tokens.get(ti).filter(|t| t.start <= cursor).map(|t| theme.syntax_on(t.kind, surface));
-        let bg = match (on_sel, on_word) {
-            (true, _) => Some(rgb(selected_bg).into()),
-            (false, true) => Some(rgb(word_bg).into()),
-            (false, false) => None,
-        };
-        if style.is_some() || bg.is_some() {
-            out.push((
-                cursor - at.start..edge - at.start,
+    }
+
+    /// The merged style list one row draws with: `core`'s single sweep — the
+    /// same implementation the terminal uses, selection folded in — produces
+    /// the runs, and resolving each against the theme is all that is left
+    /// here. Plain stretches are dropped, which is exactly what the
+    /// edge-sorting version this replaced emitted: only bytes carrying a
+    /// colour or a background are listed.
+    ///
+    /// The returned slice borrows `self.hl`; bind the borrow at the call site
+    /// so it outlives `with_highlights`'s copy into its own element.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn merged(
+        &mut self,
+        at: Range<usize>,
+        tokens: &[Token],
+        spans: &[Span],
+        theme: &Theme,
+        kind: LineKind,
+        moved: bool,
+        sel: Range<usize>,
+    ) -> &[(Range<usize>, HighlightStyle)] {
+        runs::runs_selected(at.clone(), tokens, spans, kind, moved, sel, &mut self.runs);
+        let selected_bg = rgb(theme.background(Surface::Selected));
+        self.hl.clear();
+        self.hl.extend(self.runs.iter().filter_map(|r| {
+            let on_sel = r.surface == Surface::Selected;
+            if r.kind.is_none() && !r.word && !on_sel {
+                return None;
+            }
+            // A token resolves against the surface it lands on, so a selected
+            // or changed byte gets a foreground that reads on that background.
+            let style = r.kind.map(|k| theme.syntax_on(k, r.surface));
+            Some((
+                r.at.start - at.start..r.at.end - at.start,
                 HighlightStyle {
                     color: style.map(|s| rgb(s.fg).into()),
-                    background_color: bg,
+                    background_color: match (on_sel, r.word) {
+                        (true, _) => Some(selected_bg.into()),
+                        (false, true) => Some(rgb(theme.background(r.surface)).into()),
+                        (false, false) => None,
+                    },
                     font_weight: style.filter(|s| s.bold).map(|_| FontWeight::BOLD),
                     font_style: style.filter(|s| s.italic).map(|_| FontStyle::Italic),
                     ..Default::default()
                 },
-            ));
-        }
-        cursor = edge;
+            ))
+        }));
+        &self.hl
     }
-    out
 }
 
 #[cfg(test)]
@@ -2192,7 +2214,7 @@ mod tests {
     use plait_core::{parse_unified_diff, LineKind, Span};
     use std::rc::Rc;
 
-    fn tok(start: usize, end: usize, kind: Kind) -> Token {
+    fn tok(start: u32, end: u32, kind: Kind) -> Token {
         Token { start, end, kind }
     }
 
@@ -2212,7 +2234,21 @@ mod tests {
         kind: LineKind,
         moved: bool,
     ) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
-        super::runs(at, tokens, spans, theme, kind, moved, 0..0)
+        runs_sel(at, tokens, spans, theme, kind, moved, 0..0)
+    }
+
+    /// The same, over an explicit selection.
+    fn runs_sel(
+        at: std::ops::Range<usize>,
+        tokens: &[Token],
+        spans: &[Span],
+        theme: &Theme,
+        kind: LineKind,
+        moved: bool,
+        sel: std::ops::Range<usize>,
+    ) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
+        let mut sc = super::Scratch::default();
+        super::Scratch::merged(&mut sc, at, tokens, spans, theme, kind, moved, sel).to_vec()
     }
 
     fn well_formed(text: &str, runs: &[(std::ops::Range<usize>, HighlightStyle)]) {
@@ -2287,8 +2323,11 @@ mod tests {
         let quote = text.find('"').unwrap();
         let out = runs(
             all(text),
-            &[tok(0, 3, Kind::Keyword), tok(quote, text.len() - 1, Kind::Str)],
-            &[Span { start: quote, end: text.len() - 1 }],
+            &[
+                tok(0, 3, Kind::Keyword),
+                tok(quote as u32, (text.len() - 1) as u32, Kind::Str),
+            ],
+            &[Span { start: quote as u32, end: (text.len() - 1) as u32 }],
             &theme,
             LineKind::Added,
             false,
@@ -2352,7 +2391,7 @@ mod tests {
         theme.diff.moved_removed_bg = 0xf2ede6;
         theme.rebuild();
         let text = "// a comment that moved";
-        let tokens = [tok(0, text.len(), Kind::Comment)];
+        let tokens = [tok(0, text.len() as u32, Kind::Comment)];
         let plain = runs(all(text), &tokens, &[], &theme, LineKind::Removed, false);
         let moved = runs(all(text), &tokens, &[], &theme, LineKind::Removed, true);
         well_formed(text, &plain);
@@ -2384,8 +2423,8 @@ mod tests {
         let text = "# Collect every check failure before exiting";
         let out = runs(
             all(text),
-            &[tok(0, text.len(), Kind::Comment)],
-            &[Span { start: 10, end: text.len() }],
+            &[tok(0, text.len() as u32, Kind::Comment)],
+            &[Span { start: 10, end: text.len() as u32 }],
             &theme,
             LineKind::Added,
             false,
@@ -2395,6 +2434,42 @@ mod tests {
         let on_word = out.iter().find(|(r, _)| r.start == 10).unwrap();
         assert!(on_word.1.background_color.is_some());
         assert_ne!(plain.1.color, on_word.1.color, "same grey on both backgrounds");
+    }
+
+    // ------------------------------------------------------ the draw scratch
+
+    #[test]
+    fn the_draw_scratch_grows_once_and_stops() {
+        // Rule 3, on the path every visible row of every frame walks: neither
+        // the sweep's buffer nor the resolved run list may grow on a repaint.
+        let theme = Theme::dark();
+        let text = "let alpha = 1; let beta = 2;";
+        let tokens = [tok(0, 3, Kind::Keyword), tok(15, 18, Kind::Keyword)];
+        let spans = [Span { start: 4, end: 9 }, Span { start: 19, end: 23 }];
+        let mut sc = super::Scratch::default();
+        let out =
+            super::Scratch::merged(&mut sc, all(text), &tokens, &spans, &theme, LineKind::Added, false, 6..20);
+        well_formed(text, out);
+        let caps = (sc.runs.capacity(), sc.hl.capacity());
+        for _ in 0..100 {
+            super::Scratch::merged(&mut sc, all(text), &tokens, &spans, &theme, LineKind::Added, false, 6..20);
+        }
+        assert_eq!((sc.runs.capacity(), sc.hl.capacity()), caps, "a repaint grew a buffer");
+    }
+
+    #[test]
+    fn a_gutter_number_formats_into_the_scratch_and_pads_nowhere() {
+        // The integers replaced pre-rendered strings, so what reaches the
+        // screen must be exactly what those strings were: bare digits, nothing
+        // padded in — right-alignment is the column's, not the text's.
+        let mut sc = super::Scratch::default();
+        assert_eq!(&*sc.number(Some(9), false), "9");
+        assert_eq!(&*sc.number(Some(12345), false), "12345");
+        assert_eq!(&*sc.number(Some(7), true), "", "a continuation row draws nothing");
+        assert_eq!(&*sc.number(None, false), "", "so does a side with no number");
+        let drawn = sc.number(Some(41), false);
+        assert_eq!(&*drawn, "41");
+        assert_eq!(&*sc.no, "41", "the scratch is the one home of the digits");
     }
 
     const SAMPLE: &str = "\
@@ -2548,7 +2623,7 @@ diff --git a/a.rs b/a.rs
         // what is selected.
         let theme = Theme::dark();
         let text = "    let x = 1;";
-        let out = super::runs(
+        let out = runs_sel(
             all(text),
             &[],
             &[Span { start: 8, end: 9 }],
@@ -2669,12 +2744,12 @@ diff --git a/a.rs b/a.rs
         // and spans have, and the same off-by-one available to it.
         let theme = Theme::dark();
         let text = "aaaa bbbb cccc";
-        let first = super::runs(0..5, &[], &[], &theme, LineKind::Context, false, 2..12);
-        let second = super::runs(5..text.len(), &[], &[], &theme, LineKind::Context, false, 2..12);
+        let first = runs_sel(0..5, &[], &[], &theme, LineKind::Context, false, 2..12);
+        let second = runs_sel(5..text.len(), &[], &[], &theme, LineKind::Context, false, 2..12);
         assert_eq!(first.first().map(|(r, _)| r.clone()), Some(2..5));
         assert_eq!(second.first().map(|(r, _)| r.clone()), Some(0..7));
         // A selection that misses this row entirely leaves no runs at all.
-        assert!(super::runs(5..14, &[], &[], &theme, LineKind::Context, false, 0..2).is_empty());
+        assert!(runs_sel(5..14, &[], &[], &theme, LineKind::Context, false, 0..2).is_empty());
     }
 
     // ------------------------------------------------------------- wrapping
@@ -3317,3 +3392,4 @@ diff --git a/b.md b/b.md
         assert!(diff.order.iter().all(|r| r.owner == 0));
     }
 }
+

@@ -60,8 +60,8 @@
 
 use super::diff::{
     column_at, columns, file_header, header_hit, hunk_header, into_text, line_colors, num,
-    number, number_or_blank, row_frame, runs, scrolled, selected, slice, Hit, Rows, ROW_H, PAD,
-    SIGN_W, TEXT_CHROME,
+    row_frame, scrolled, selected, slice, slice_shared, Hit, Rows, Scratch, ROW_H, PAD, SIGN_W,
+    TEXT_CHROME,
 };
 use gpui::*;
 use plait_core::host::Host;
@@ -139,7 +139,7 @@ impl Metrics {
     }
 
     fn size(&self, level: u8) -> f32 {
-        self.heading[(level.max(1).min(6) - 1) as usize]
+        self.heading[level.clamp(1, 6) as usize - 1]
     }
 
     fn bullet(&self, depth: u8) -> &'static str {
@@ -148,20 +148,23 @@ impl Metrics {
     }
 }
 
-/// One row. `Copy` fields and `SharedString`s only: `render` runs per visible row
-/// per redraw, so nothing in here may be worth allocating at that point.
+/// One row. `Copy` fields and shared text only: `render` runs per visible row
+/// per redraw, so nothing in here may be worth allocating at that point. The
+/// line's text is the prepared line's own `Arc`, not a copy of it; the headers
+/// are the parsed diff's own strings by handle, and the gutter numbers stay
+/// integers until draw time — see [`Row::Line`](super::diff::Row) for why.
 enum Row {
-    File { path: SharedString, adds: usize, dels: usize },
-    Hunk(SharedString),
+    File { path: std::sync::Arc<str>, adds: usize, dels: usize },
+    Hunk(std::sync::Arc<str>),
     Line {
         block: Block,
         kind: LineKind,
         moved: bool,
-        old: SharedString,
-        new: SharedString,
-        text: SharedString,
-        spans: Vec<Span>,
-        tokens: Vec<Token>,
+        old: Option<u32>,
+        new: Option<u32>,
+        text: std::sync::Arc<str>,
+        spans: Box<[Span]>,
+        tokens: Box<[Token]>,
     },
 }
 
@@ -209,6 +212,8 @@ pub struct MarkdownRows {
     /// one that does — `(row, flowed)`, ascending. Empty at any width where every
     /// table fits, and with wrapping off.
     flows: Vec<(u32, Flowed)>,
+    /// What drawing borrows. Cleared per row, grown once ever — see [`Scratch`].
+    scratch: std::cell::RefCell<Scratch>,
 }
 
 /// One table row re-laid-out to the window: the sub-rows of its grid laid end to
@@ -251,6 +256,7 @@ impl MarkdownRows {
             tables: Vec::new(),
             grids: Vec::new(),
             flows: Vec::new(),
+            scratch: std::cell::RefCell::default(),
         }
     }
 
@@ -300,7 +306,7 @@ impl MarkdownRows {
     /// diff you cannot scroll to the end of.
     fn chars(&self, index: usize, seg: usize) -> usize {
         let Some(Row::Line { text, .. }) = self.rows.get(index) else { return 0 };
-        let text = self.flowed(index).map_or(text, |f| &f.text);
+        let text = self.flowed(index).map_or(text.as_ref(), |f| f.text.as_str());
         text[self.wrapped.range(index, seg, text)].trim_end().chars().count()
     }
 
@@ -360,7 +366,7 @@ impl MarkdownRows {
                     continue;
                 };
                 of.push(*r);
-                run.push(TableRow { text: text.as_ref(), block: *block, tokens, spans });
+                run.push(TableRow { text, block: *block, tokens, spans });
             }
             let Some(flowed) = flow_table(
                 &run,
@@ -418,17 +424,34 @@ impl MarkdownRows {
     }
 
     /// What a row draws and what indexes it: its own text, or the grid this width
-    /// re-laid it out onto.
+    /// re-laid it out onto. The [`Source`] keeps which one, because slicing a
+    /// row's own `Arc` is a refcount bump and slicing a flowed grid is not.
     fn text_of<'a>(
         &'a self,
         index: usize,
-        text: &'a SharedString,
+        text: &'a std::sync::Arc<str>,
         spans: &'a [Span],
         tokens: &'a [Token],
-    ) -> (&'a SharedString, &'a [Span], &'a [Token]) {
+    ) -> (&'a str, &'a [Span], &'a [Token], Source<'a>) {
         match self.flowed(index) {
-            Some(f) => (&f.text, &f.spans, &f.tokens),
-            None => (text, spans, tokens),
+            Some(f) => (f.text.as_str(), &f.spans, &f.tokens, Source::Flowed(&f.text)),
+            None => (text, spans, tokens, Source::Own(text)),
+        }
+    }
+}
+
+/// Which storage a row's drawn text came from — see [`MarkdownRows::text_of`].
+enum Source<'a> {
+    Own(&'a std::sync::Arc<str>),
+    Flowed(&'a SharedString),
+}
+
+impl Source<'_> {
+    /// One row's worth of it: whole rows come out as refcount bumps either way.
+    fn piece(&self, at: &std::ops::Range<usize>) -> SharedString {
+        match self {
+            Source::Own(t) => slice(t, at),
+            Source::Flowed(t) => slice_shared(t, at),
         }
     }
 }
@@ -511,9 +534,9 @@ impl Rows for MarkdownRows {
                     block,
                     kind: l.kind,
                     moved: l.moved,
-                    old: number(l.old_no),
-                    new: number(l.new_no),
-                    text: l.text.into(),
+                    old: l.old_no,
+                    new: l.new_no,
+                    text: l.text,
                     spans: l.spans,
                     tokens: l.tokens,
                 });
@@ -536,7 +559,7 @@ impl Rows for MarkdownRows {
                 // squeezed to fit is exactly as wide as the budget, and measuring
                 // the one it was squeezed out of would leave the whole list
                 // scrolling sideways for a row nothing draws.
-                let text = self.flowed(index).map_or(text, |f| &f.text);
+                let text = self.flowed(index).map_or(text.as_ref(), |f| f.text.as_str());
                 // `chars`, not `len`: a table row is full of three-byte box
                 // drawing and would otherwise measure three times too wide and
                 // win the widest-row contest for the whole diff.
@@ -588,7 +611,7 @@ impl Rows for MarkdownRows {
             Row::File { path, .. } => header_hit(path, x, host, shift),
             Row::Hunk(h) => header_hit(h, x, host, shift),
             Row::Line { block, text, .. } => {
-                let text = self.flowed(index).map_or(text, |f| &f.text);
+                let text = self.flowed(index).map_or(text.as_ref(), |f| f.text.as_str());
                 let at = self.wrapped.range(index, seg, text);
                 let from = TEXT_CHROME - PAD + self.furniture(*block);
                 let off = at.start
@@ -610,7 +633,7 @@ impl Rows for MarkdownRows {
         Some(match self.rows.get(index)? {
             // The flowed grid, when there is one, because that is what is on
             // screen — and what `hit` returned offsets into.
-            Row::Line { text, .. } => self.flowed(index).map_or(text, |f| &f.text).as_ref(),
+            Row::Line { text, .. } => self.flowed(index).map_or(text.as_ref(), |f| f.text.as_str()),
             Row::Hunk(h) => h.as_ref(),
             Row::File { path, .. } => path.as_ref(),
         })
@@ -631,12 +654,12 @@ impl Rows for MarkdownRows {
             }
             Row::Hunk(header) => hunk_header(header, theme, sel, shift),
             Row::Line { block, kind, moved, old, new, text, spans, tokens } => {
-                let (text, spans, tokens) = self.text_of(index, text, spans, tokens);
+                let (text, spans, tokens, source) = self.text_of(index, text, spans, tokens);
                 let at = self.wrapped.range(index, seg, text);
                 let rule = self.ruled(index, seg);
                 self.line(
-                    *block, *kind, *moved, old, new, text, at, seg, spans, tokens, rule, host,
-                    sel, shift,
+                    *block, *kind, *moved, *old, *new, source.piece(&at), text.len(), at, seg,
+                    spans, tokens, rule, host, sel, shift,
                 )
             }
         }
@@ -650,9 +673,14 @@ impl MarkdownRows {
         block: Block,
         kind: LineKind,
         moved: bool,
-        old: &SharedString,
-        new: &SharedString,
-        full: &SharedString,
+        old: Option<u32>,
+        new: Option<u32>,
+        // What this visual row draws of the line — `slice` or `slice_shared`
+        // of it, already taken.
+        piece: SharedString,
+        // Length of the whole line the piece belongs to, which a selection
+        // range is measured against.
+        full_len: usize,
         at: std::ops::Range<usize>,
         seg: usize,
         spans: &[Span],
@@ -675,7 +703,10 @@ impl MarkdownRows {
         // bullet stays indented under its own text and a wrapped quote keeps its
         // bar, and no number and no sign, as everywhere else.
         let blank = seg > 0;
-        let text = &slice(full, &at);
+        let text = &piece;
+        // One borrow per row: the numbers format into it and the run list sweeps
+        // through it, both copied out as the elements take them.
+        let mut sc = self.scratch.borrow_mut();
 
         // The gutter is the built-in's, unchanged. Whatever the row does with the
         // text, the two line numbers and the sign have to sit where they sit on
@@ -684,8 +715,8 @@ impl MarkdownRows {
             .items_center()
             .px_4()
             .bg(rgb(bg))
-            .child(num(number_or_blank(old, blank), theme.gutter_on(surface)))
-            .child(num(number_or_blank(new, blank), theme.gutter_on(surface)))
+            .child(num(sc.number(old, blank), theme.gutter_on(surface)))
+            .child(num(sc.number(new, blank), theme.gutter_on(surface)))
             .child(
                 div()
                     .flex_none()
@@ -700,15 +731,11 @@ impl MarkdownRows {
         // then nothing: no bar, no indent, no glyph.
         if block.is_table() {
             let body = div().text_color(rgb(fg)).child(
-                StyledText::new(text.clone()).with_highlights(runs(
-                    at,
-                    tokens,
-                    spans,
-                    theme,
-                    kind,
-                    moved,
-                    selected(sel, 0, full.len()),
-                )),
+                StyledText::new(text.clone()).with_highlights(
+                    sc.merged(at, tokens, spans, theme, kind, moved, selected(sel, 0, full_len))
+                        .iter()
+                        .cloned(),
+                ),
             );
             // The grid is structure, not content, and a separator row is nothing
             // but grid.
@@ -819,15 +846,11 @@ impl MarkdownRows {
         }
 
         let body = div().text_color(rgb(fg)).child(
-            StyledText::new(text.clone()).with_highlights(runs(
-                at,
-                tokens,
-                spans,
-                theme,
-                kind,
-                moved,
-                selected(sel, 0, full.len()),
-            )),
+            StyledText::new(text.clone()).with_highlights(
+                sc.merged(at, tokens, spans, theme, kind, moved, selected(sel, 0, full_len))
+                    .iter()
+                    .cloned(),
+            ),
         );
         let body = match block {
             Block::Heading(level) => body.text_size(px(m.size(level))).font_weight(FontWeight::BOLD),
@@ -998,7 +1021,7 @@ diff --git a/README.md b/README.md
             })
             .expect("a heading row");
         let t = tokens.iter().find(|t| t.kind == Kind::Heading).expect("a heading token");
-        assert_eq!(&text[t.start..t.end], "plait");
+        assert_eq!(&text[t.range()], "plait");
     }
 
     #[test]
@@ -1009,11 +1032,14 @@ diff --git a/README.md b/README.md
         for row in &r.rows {
             let super::Row::Line { text, tokens, spans, .. } = row else { continue };
             for t in tokens {
-                assert!(t.end <= text.len(), "token {t:?} outside {text:?}");
-                assert!(text.is_char_boundary(t.start) && text.is_char_boundary(t.end));
+                assert!(t.end as usize <= text.len(), "token {t:?} outside {text:?}");
+                assert!(
+                    text.is_char_boundary(t.start as usize)
+                        && text.is_char_boundary(t.end as usize)
+                );
             }
             for s in spans {
-                assert!(s.end <= text.len(), "span {s:?} outside {text:?}");
+                assert!(s.end as usize <= text.len(), "span {s:?} outside {text:?}");
             }
         }
     }
@@ -1028,7 +1054,12 @@ diff --git a/README.md b/README.md
             .iter()
             .filter_map(|row| match row {
                 super::Row::Line { kind: LineKind::Added, text, spans, .. } if !spans.is_empty() => {
-                    Some(spans.iter().map(|s| text[s.start..s.end].to_string()).collect::<Vec<_>>())
+                    Some(
+                        spans
+                            .iter()
+                            .map(|s| text[s.start as usize..s.end as usize].to_string())
+                            .collect::<Vec<_>>()
+                    )
                 }
                 _ => None,
             })
@@ -1219,7 +1250,7 @@ diff --git a/a.md b/a.md
             if !block.is_table() {
                 continue;
             }
-            let (t, _, _) = r.text_of(i, text, spans, tokens);
+            let (t, _, _, _) = r.text_of(i, text, spans, tokens);
             for seg in 0..r.rows(i) {
                 out.push((i, seg, t[r.wrapped.range(i, seg, t)].to_string()));
             }

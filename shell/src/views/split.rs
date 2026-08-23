@@ -49,8 +49,8 @@
 //! many rows it takes.
 
 use super::diff::{
-    column_at, columns, file_header, header_hit, hunk_header, into_text, line_colors, number,
-    number_or_blank, row_frame, runs, scrolled, selected, slice, Hit, Rows, PAD, ROW_H,
+    column_at, columns, file_header, header_hit, hunk_header, into_text, line_colors, row_frame,
+    scrolled, selected, slice, Hit, Rows, Scratch, PAD, ROW_H,
 };
 use gpui::*;
 use plait_core::align::align;
@@ -61,6 +61,7 @@ use plait_core::runs::surfaces;
 use plait_core::theme::Theme;
 use plait_core::wrap::{Wrap, Wrapped};
 use plait_core::{LineKind, Span};
+use std::cell::RefCell;
 
 /// Which side of the divider a cell is being drawn on, and therefore which of
 /// the line's two numbers its gutter shows.
@@ -113,25 +114,29 @@ const CHROME: f32 = 2.0 * (GUTTER_W + SIGN_W) + RULE_W;
 /// One prepared line, ready to draw. Held in a flat table so that a context
 /// line, which appears in both columns, is stored once.
 ///
-/// Both numbers, because a context line carries both and which one is shown
-/// depends on the column it is being drawn in — the left says where the line was
-/// and the right says where it is now, and after an insertion those differ.
+/// Both numbers as the integers they are — formatted at draw time into the
+/// presentation's scratch, like every presentation's gutter — because which one
+/// is shown depends on the column it is being drawn in: the left says where the
+/// line was and the right says where it is now, and after an insertion those
+/// differ.
 struct Line {
     kind: LineKind,
     moved: bool,
-    old_no: SharedString,
-    new_no: SharedString,
-    text: SharedString,
-    spans: Vec<Span>,
-    tokens: Vec<Token>,
+    old_no: Option<u32>,
+    new_no: Option<u32>,
+    /// The prepared line's own allocation, shared rather than copied.
+    text: std::sync::Arc<str>,
+    spans: Box<[Span]>,
+    tokens: Box<[Token]>,
 }
 
 /// `SharedString` throughout, not `String`: `render` runs for every visible row
 /// on every frame that redraws, and handing GPUI a `String` there copies the
-/// line each time.
+/// line each time. The headers take the row's own `Arc<str>` handles for the
+/// same reason [`Row::Line`](super::diff::Row) does — see that enum.
 enum Row {
-    File { path: SharedString, adds: usize, dels: usize },
-    Hunk(SharedString),
+    File { path: std::sync::Arc<str>, adds: usize, dels: usize },
+    Hunk(std::sync::Arc<str>),
     /// Indices into [`SplitRows::lines`]. A context row points both columns at
     /// the same line; a lone removal or addition leaves one side `None`.
     Pair { old: Option<u32>, new: Option<u32> },
@@ -164,6 +169,8 @@ pub struct SplitRows {
     /// a click that lands on the wrong side of the rule is the whole bug one
     /// field prevents.
     width: f32,
+    /// What drawing borrows. Cleared per cell, grown once ever — see [`Scratch`].
+    scratch: RefCell<Scratch>,
 }
 
 impl Rows for SplitRows {
@@ -241,9 +248,9 @@ impl Rows for SplitRows {
                 self.lines.push(Line {
                     kind: l.kind,
                     moved: l.moved,
-                    old_no: number(l.old_no),
-                    new_no: number(l.new_no),
-                    text: l.text.into(),
+                    old_no: l.old_no,
+                    new_no: l.new_no,
+                    text: l.text,
                     spans: l.spans,
                     tokens: l.tokens,
                 });
@@ -463,11 +470,14 @@ impl SplitRows {
         let (bg, fg, sign) = line_colors(line.kind, line.moved, p);
         let gutter = theme.gutter_on(surfaces(line.kind, line.moved).0);
         let no = match column {
-            Column::Old => &line.old_no,
-            Column::New => &line.new_no,
+            Column::Old => line.old_no,
+            Column::New => line.new_no,
         };
         let at = self.wrapped.range(index as usize, seg, &line.text);
         let blank = seg > 0;
+        // One borrow per cell: the number formats into it and the run list
+        // sweeps through it, both copied out as the elements take them.
+        let mut sc = self.scratch.borrow_mut();
         column_frame()
             .items_center()
             .bg(rgb(bg))
@@ -482,7 +492,7 @@ impl SplitRows {
                     .w(px(GUTTER_W))
                     .pr(px(GUTTER_PAD))
                     .text_color(rgb(gutter))
-                    .child(number_or_blank(no, blank)),
+                    .child(sc.number(no, blank)),
             )
             .child(
                 div()
@@ -494,15 +504,19 @@ impl SplitRows {
             .child(scrolled(
                 shift,
                 div().text_color(rgb(fg)).child(
-                    StyledText::new(slice(&line.text, &at)).with_highlights(runs(
-                        at.clone(),
-                        &line.tokens,
-                        &line.spans,
-                        theme,
-                        line.kind,
-                        line.moved,
-                        selected(sel, column.part(), line.text.len()),
-                    )),
+                    StyledText::new(slice(&line.text, &at)).with_highlights(
+                        sc.merged(
+                            at.clone(),
+                            &line.tokens,
+                            &line.spans,
+                            theme,
+                            line.kind,
+                            line.moved,
+                            selected(sel, column.part(), line.text.len()),
+                        )
+                        .iter()
+                        .cloned(),
+                    ),
                 ),
             ))
             .into_any_element()
@@ -600,8 +614,8 @@ diff --git a/a.rs b/a.rs
             .iter()
             .filter_map(|row| match row {
                 Row::Pair { old, new } => Some((
-                    old.map(|i| r.lines[i as usize].old_no.to_string()).unwrap_or_default(),
-                    new.map(|i| r.lines[i as usize].new_no.to_string()).unwrap_or_default(),
+                    old.and_then(|i| r.lines[i as usize].old_no).map(|n| n.to_string()).unwrap_or_default(),
+                    new.and_then(|i| r.lines[i as usize].new_no).map(|n| n.to_string()).unwrap_or_default(),
                 )),
                 _ => None,
             })

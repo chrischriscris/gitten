@@ -30,10 +30,11 @@
 
 use plait_core::differ::{Differs, Overrides};
 use plait_core::{parse_log, Commit, FileDiff};
-use std::collections::HashMap;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::sync::Arc;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
+use std::thread::JoinHandle;
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -79,10 +80,12 @@ pub fn log(repo: &Path, limit: usize) -> Result<Vec<Commit>> {
 
 /// One changed file, as the two versions of its text.
 ///
-/// `Vec<String>` and not `&str` into one buffer because the two sides come from
-/// different blobs and a rename means the paths differ too. Splitting into lines
-/// here rather than in `core` keeps the lossy UTF-8 decode — which is I/O's
-/// problem — on this side of the boundary.
+/// `Vec<Arc<str>>` and not `&str` into one buffer because the two sides come
+/// from different blobs and a rename means the paths differ too. Splitting into
+/// lines here rather than in `core` keeps the lossy UTF-8 decode — which is I/O's
+/// problem — on this side of the boundary. Handles and not owned strings because
+/// every changed line flows into a `DiffLine` verbatim: one allocation per line,
+/// shared from here to the screen, never copied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pair {
     /// The path as it is now, which is what the diff is labelled with.
@@ -91,8 +94,8 @@ pub struct Pair {
     pub old_path: Option<String>,
     /// git's `--raw` status letter: `A`, `M`, `D`, `R`, `C`, `T`.
     pub status: char,
-    pub old: Vec<String>,
-    pub new: Vec<String>,
+    pub old: Vec<Arc<str>>,
+    pub new: Vec<Arc<str>>,
     /// Either side contains a NUL byte. Nothing here can usefully diff it, and
     /// the frontend needs to say so rather than draw mojibake.
     pub binary: bool,
@@ -135,38 +138,44 @@ pub fn pairs(repo: &Path, revspec: &str) -> Result<Vec<Pair>> {
 
     let changes = parse_raw(&String::from_utf8_lossy(&raw));
 
-    // Every blob the whole diff needs, fetched in one process. `cat-file
-    // --batch` keys its answers by the OID it was asked for, so duplicates cost
-    // nothing to ask for twice and it is not worth deduplicating here.
+    // Every blob the whole diff needs, fetched by one `cat-file --batch` —
+    // but held one file at a time. The batch answers strictly in request
+    // order (it reads one OID and writes one answer before reading the
+    // next), and requests go out in pair order, old side then new, so the
+    // answers can be pulled back per file as each [`Pair`] is built instead
+    // of parking every old+new blob of the diff in a map until the last one.
+    // On a thousand-file diff that map was tens of MB of pure peak overlap.
+    // A duplicate OID costs a second read rather than a second copy, which is
+    // the trade the map made implicitly.
     let mut wanted: Vec<&str> = Vec::with_capacity(changes.len() * 2);
     for c in &changes {
         for (mode, oid) in [(&c.old_mode, &c.old_oid), (&c.new_mode, &c.new_oid)] {
-            // A gitlink's OID is not in this repository at all; asking for it
-            // costs a round trip on a partial clone and gets "missing" anyway.
-            if !is_null_oid(oid) && mode != GITLINK {
+            if fetchable(mode, oid) {
                 wanted.push(oid);
             }
         }
     }
 
     // The working-tree pair wants blobs *and* a status, and the two are
-    // independent — status reads the index and the working tree, cat-file
+    // independent — status reads the index and the working tree, the batch
     // fetches OIDs the diff has already named — so they run side by side and
     // an open of uncommitted work pays one spawn floor instead of two. Nothing
-    // is shared between them but `repo`, which neither mutates. Both errors
-    // still surface with `cat-file`'s first, exactly as when they ran in
-    // sequence, and a panic in either is resumed rather than swallowed because
-    // both calls used to be inline.
+    // is shared between them but `repo`, and neither touches what the other
+    // reads. The stream's errors surface first, as `cat-file`'s did when both
+    // ran in sequence: a failure to start comes back before any answer is read,
+    // and the first failed answer below comes back before `loose` is asked for.
+    // A panic in either is resumed rather than swallowed because both calls
+    // used to be inline.
     let (blobs, loose) = if revspec.is_empty() {
         std::thread::scope(|s| {
             let loose = s.spawn(|| untracked(repo));
-            let blobs = cat_file(repo, &wanted);
+            let blobs = BlobStream::start(repo, &wanted);
             (blobs, loose.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
         })
     } else {
-        (cat_file(repo, &wanted), Ok(Vec::new()))
+        (BlobStream::start(repo, &wanted), Ok(Vec::new()))
     };
-    let blobs = blobs?;
+    let mut blobs = blobs?;
 
     let mut out = Vec::with_capacity(changes.len());
     // Untracked files first, so they read as new before the modifications —
@@ -175,14 +184,25 @@ pub fn pairs(repo: &Path, revspec: &str) -> Result<Vec<Pair>> {
     // Fetching them early changed when they arrive, not where they land.
     out.extend(loose?);
     for c in changes {
-        // The two sides read a null OID differently, and conflating them is a
-        // silent, plausible-looking bug: an added file whose old side falls back
-        // to the working tree diffs against itself and shows no change at all.
-        let old = Change::synthetic(&c.old_mode, &c.old_oid)
-            .or_else(|| blobs.get(&c.old_oid).cloned());
+        // Both sides pull in request order — old, then new — which is what
+        // keeps this loop aligned with the stream.
+        //
+        // The two sides also read a null OID differently, and conflating them
+        // is a silent, plausible-looking bug: an added file whose old side
+        // falls back to the working tree diffs against itself and shows no
+        // change at all. The old side has no fallback: a null OID there means
+        // the file did not exist, and reading the tree for it would diff an
+        // added file against itself. On the new side a null OID is the
+        // ordinary case of a working-tree diff — what the file says now is on
+        // disk and nowhere else.
+        let fetched_old = if fetchable(&c.old_mode, &c.old_oid) { blobs.answer()? } else { None };
+        let fetched_new = if fetchable(&c.new_mode, &c.new_oid) { blobs.answer()? } else { None };
+        let old = Change::synthetic(&c.old_mode, &c.old_oid).or(fetched_old);
         let new = Change::synthetic(&c.new_mode, &c.new_oid)
-            .or_else(|| new_side(&blobs, &c.new_oid, repo, &c.path));
-        let binary = old.as_ref().is_some_and(is_binary) || new.as_ref().is_some_and(is_binary);
+            .or(fetched_new)
+            .or_else(|| new_side(&c.new_oid, repo, &c.path));
+        let binary = old.as_ref().is_some_and(|b| is_binary(b))
+            || new.as_ref().is_some_and(|b| is_binary(b));
         out.push(Pair {
             path: c.path,
             old_path: c.old_path,
@@ -192,6 +212,7 @@ pub fn pairs(repo: &Path, revspec: &str) -> Result<Vec<Pair>> {
             binary,
         });
     }
+    blobs.finish()?;
     Ok(out)
 }
 
@@ -279,11 +300,7 @@ pub fn diff(
             // still has to say the file changed, and "binary" is the honest
             // thing for it to say.
             true => FileDiff { path: p.label(), hunks: Vec::new() },
-            false => {
-                let old: Vec<&str> = p.old.iter().map(String::as_str).collect();
-                let new: Vec<&str> = p.new.iter().map(String::as_str).collect();
-                FileDiff { path: p.label(), ..differs.file_using(over, &p.path, &old, &new) }
-            }
+            false => FileDiff { path: p.label(), ..differs.file_using(over, &p.path, &p.old, &p.new) }
         })
         .collect())
 }
@@ -389,68 +406,147 @@ fn parse_raw(raw: &str) -> Vec<Change> {
     out
 }
 
-/// Every blob in `oids`, in one `git cat-file --batch`.
+/// Whether one side of a [`Change`] has a blob on the wire: not a gitlink,
+/// whose OID is a *commit* in another repository and gets "missing" back, and
+/// not a null OID, which means "not in the object database". The exact
+/// predicate that builds the request list, asked again while consuming so the
+/// answers stay paired with their file.
+fn fetchable(mode: &str, oid: &str) -> bool {
+    !is_null_oid(oid) && mode != GITLINK
+}
+
+/// One `git cat-file --batch`, answered in request order.
 ///
 /// Writing the request list has to happen on another thread. `cat-file` answers
 /// as it reads, so a large enough request fills the pipe git is writing into
 /// while this process is still filling the pipe git is reading from, and both
 /// sides block forever. It is not a rare shape — a thousand-file diff is two
 /// thousand OIDs.
-fn cat_file(repo: &Path, oids: &[&str]) -> Result<HashMap<String, Vec<u8>>> {
-    let mut found = HashMap::new();
-    if oids.is_empty() {
-        return Ok(found);
-    }
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["cat-file", "--batch"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("could not run git cat-file: {e}"))?;
-
-    let request: Vec<u8> = oids.iter().flat_map(|o| [o.as_bytes(), b"\n"].concat()).collect();
-    let mut stdin = child.stdin.take().expect("piped");
-    let writer = std::thread::spawn(move || {
-        let _ = stdin.write_all(&request);
-        // Dropping it closes the pipe, which is what tells `cat-file` to exit.
-    });
-
-    let out = child.wait_with_output().map_err(|e| format!("git cat-file: {e}"))?;
-    let _ = writer.join();
-    if !out.status.success() {
-        return Err(format!("git cat-file: {}", String::from_utf8_lossy(&out.stderr).trim()));
-    }
-
-    // `<oid> SP <type> SP <size> LF <size bytes> LF`, repeated. Bytes
-    // throughout: a blob is not text and the header's size is authoritative, so
-    // this never has to guess where a record ends.
-    let buf = out.stdout;
-    let mut i = 0;
-    while i < buf.len() {
-        let Some(nl) = buf[i..].iter().position(|b| *b == b'\n') else { break };
-        let header = String::from_utf8_lossy(&buf[i..i + nl]).into_owned();
-        i += nl + 1;
-        let parts: Vec<&str> = header.split_whitespace().collect();
-        // "<oid> missing" — a blob a shallow or partial clone does not have.
-        // Treated as absent rather than as an error: a blobless clone of
-        // git/git is a supported fixture, and one unreachable side is still a
-        // diff worth showing.
-        let (Some(oid), Some(size)) =
-            (parts.first(), parts.get(2).and_then(|s| s.parse::<usize>().ok()))
-        else {
-            continue;
-        };
-        let end = (i + size).min(buf.len());
-        found.insert(oid.to_string(), buf[i..end].to_vec());
-        i = end + 1;
-    }
-    Ok(found)
+///
+/// Reading stays incremental rather than slurping the whole output: each
+/// answer is parsed and handed over as it arrives, so a file's blobs can be
+/// dropped before the next file's are read.
+struct BlobStream {
+    child: Option<Child>,
+    reader: Option<BufReader<ChildStdout>>,
+    stderr: Option<JoinHandle<Vec<u8>>>,
+    writer: Option<JoinHandle<()>>,
 }
 
-/// The new side's content: from the object database, or from the working tree.
+impl BlobStream {
+    /// Starts the batch. Nothing was asked for, nothing is started — a clean
+    /// working tree takes no process at all.
+    fn start(repo: &Path, oids: &[&str]) -> Result<Self> {
+        if oids.is_empty() {
+            return Ok(Self { child: None, reader: None, stderr: None, writer: None });
+        }
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["cat-file", "--batch"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("could not run git cat-file: {e}"))?;
+
+        // One buffer for the whole request: a `[oid, b"\n"].concat()` per OID
+        // was an allocation each, for bytes written once and never read again.
+        let mut request =
+            Vec::with_capacity(oids.iter().map(|o| o.len() + 1).sum::<usize>());
+        for o in oids {
+            request.extend_from_slice(o.as_bytes());
+            request.push(b'\n');
+        }
+        let mut stdin = child.stdin.take().expect("piped");
+        let writer = std::thread::spawn(move || {
+            let _ = stdin.write_all(&request);
+            // Dropping it closes the pipe, which is what tells `cat-file` to exit.
+        });
+
+        let stderr = child.stderr.take().expect("piped");
+        // Drained concurrently: an error long enough to fill the pipe must not
+        // be able to block git while nobody is reading its answer stream yet.
+        let stderr = std::thread::spawn(move || {
+            let mut err = Vec::new();
+            let mut stderr = stderr;
+            let _ = stderr.read_to_end(&mut err);
+            err
+        });
+        let stdout = child.stdout.take().expect("piped");
+        Ok(Self {
+            child: Some(child),
+            reader: Some(BufReader::new(stdout)),
+            stderr: Some(stderr),
+            writer: Some(writer),
+        })
+    }
+
+    /// The next answer in request order.
+    ///
+    /// `<oid> SP <type> SP <size> LF <size bytes> LF`, or `<oid> SP missing LF`
+    /// for a blob a shallow or partial clone does not have. Bytes throughout:
+    /// a blob is not text and the header's size is authoritative, so this
+    /// never has to guess where a record ends.
+    fn answer(&mut self) -> Result<Option<Vec<u8>>> {
+        let Some(stream) = self.reader.as_mut() else { return Ok(None) };
+        let mut header = Vec::new();
+        let read = stream.read_until(b'\n', &mut header).map_err(|e| format!("git cat-file: {e}"))?;
+        if read == 0 {
+            // Every requested answer was written before any of this could run;
+            // ending early is a broken protocol, not an empty diff.
+            return Err("git cat-file: unexpected end of output".into());
+        }
+        let header = String::from_utf8_lossy(&header).into_owned();
+        let parts: Vec<&str> = header.split_whitespace().collect();
+        // "<oid> missing" — treated as absent rather than as an error: a
+        // blobless clone of git/git is a supported fixture, and one unreachable
+        // side is still a diff worth showing.
+        let Some(size) = parts.get(2).and_then(|s| s.parse::<usize>().ok()) else {
+            return Ok(None);
+        };
+        let mut content = vec![0; size];
+        stream.read_exact(&mut content).map_err(|e| format!("git cat-file: {e}"))?;
+        let mut terminator = [0; 1];
+        stream.read_exact(&mut terminator).map_err(|e| format!("git cat-file: {e}"))?;
+        Ok(Some(content))
+    }
+
+    /// Waits for git to exit and reports failure the way a slurped run did:
+    /// closing our end of the pipe first, so git cannot block on answers
+    /// nobody will read.
+    fn finish(mut self) -> Result<()> {
+        self.close()?;
+        Ok(())
+    }
+
+    /// Shared by `finish` and `Drop`, because an early error leaves the same
+    /// three things behind as a completed run does.
+    fn close(&mut self) -> Result<()> {
+        drop(self.reader.take()); // EOF for git, and no pipe left to block on
+        let err = self.stderr.take().and_then(|h| h.join().ok()).unwrap_or_default();
+        if let Some(mut child) = self.child.take() {
+            let status = child.wait().map_err(|e| format!("git cat-file: {e}"))?;
+            let _ = self.writer.take().and_then(|h| h.join().ok());
+            if !status.success() {
+                return Err(format!(
+                    "git cat-file: {}",
+                    String::from_utf8_lossy(&err).trim()
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for BlobStream {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
+/// The new side's content when the object database had nothing: from the
+/// working tree.
 ///
 /// A null OID here means "not in the object database", which for the new side of
 /// a working-tree diff is the ordinary case — the file has been edited and not
@@ -459,25 +555,20 @@ fn cat_file(repo: &Path, oids: &[&str]) -> Result<HashMap<String, Vec<u8>>> {
 /// The old side has no equivalent. A null OID there means the file did not
 /// exist, and reading the working tree for it would diff an added file against
 /// itself and report that nothing changed.
-fn new_side(
-    blobs: &HashMap<String, Vec<u8>>,
-    oid: &str,
-    repo: &Path,
-    path: &str,
-) -> Option<Vec<u8>> {
+fn new_side(oid: &str, repo: &Path, path: &str) -> Option<Vec<u8>> {
     if !is_null_oid(oid) {
-        return blobs.get(oid).cloned();
+        return None;
     }
     std::fs::read(repo.join(path)).ok()
 }
 
 /// A NUL byte in the first 8 KB, which is git's own test. A real text file does
 /// not contain one and every binary format does.
-fn is_binary(content: &Vec<u8>) -> bool {
+fn is_binary(content: &[u8]) -> bool {
     content.iter().take(8000).any(|b| *b == 0)
 }
 
-/// Content into lines.
+/// Content into lines, one shared handle each.
 ///
 /// **Never `read_to_string`.** Git guarantees no encoding, real history carries
 /// Latin-1 author names and `git/git` has commits that are not valid UTF-8 at
@@ -487,13 +578,13 @@ fn is_binary(content: &Vec<u8>) -> bool {
 /// one. A file that ends without one is indistinguishable here, which loses
 /// git's `\ No newline at end of file` — a gap, and the same one
 /// `parse_unified_diff` has.
-fn lines(content: &[u8]) -> Vec<String> {
+fn lines(content: &[u8]) -> Vec<Arc<str>> {
     let text = String::from_utf8_lossy(content);
     let text = text.strip_suffix('\n').unwrap_or(&text);
     if text.is_empty() && content.is_empty() {
         return Vec::new();
     }
-    text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l).to_string()).collect()
+    text.split('\n').map(|l| Arc::from(l.strip_suffix('\r').unwrap_or(l))).collect()
 }
 
 #[cfg(test)]
@@ -545,6 +636,11 @@ mod tests {
         pairs.iter().map(|p| p.path.as_str()).collect()
     }
 
+    /// The lines as plain slices, for assertions.
+    fn strs(lines: &[Arc<str>]) -> Vec<&str> {
+        lines.iter().map(|l| l.as_ref()).collect()
+    }
+
     #[test]
     fn an_untracked_file_is_a_pair_with_nothing_opposite_it() {
         // The whole point: `git diff` cannot see these, so without the separate
@@ -562,7 +658,7 @@ mod tests {
         let new = &got[0];
         assert_eq!(new.status, 'A', "an untracked file is an addition like any other");
         assert!(new.old.is_empty(), "it has no old side");
-        assert_eq!(new.new, vec!["brand new", "second"]);
+        assert_eq!(strs(&new.new), ["brand new", "second"]);
         assert!(!new.binary);
     }
 
@@ -607,7 +703,7 @@ mod tests {
 
         let got = pairs(&r.0, "").unwrap();
         assert_eq!(paths(&got), vec!["has space.txt"]);
-        assert_eq!(got[0].new, vec!["spaced"]);
+        assert_eq!(strs(&got[0].new), ["spaced"]);
     }
 
     #[test]
@@ -640,6 +736,32 @@ mod tests {
 
         assert_eq!(paths(&pairs(&r.0, "HEAD~1..HEAD").unwrap()), vec!["a.txt"]);
         assert!(paths(&pairs(&r.0, "").unwrap()).contains(&"loose.txt"), "the working tree has it");
+    }
+
+    #[test]
+    fn blobs_arrive_with_their_own_file_when_the_stream_is_consumed_in_order() {
+        // The batch is answered in request order and consumed one file at a
+        // time; if that pairing ever slipped by one, contents would swap
+        // between files instead of anything failing loudly.
+        let r = Scratch::new("ordered");
+        r.write("a.txt", b"original a\n");
+        r.write("b.txt", b"original b\n");
+        r.write("c.txt", b"original c\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        r.write("a.txt", b"A\n");
+        r.write("b.txt", b"B\n");
+        // Identical content is an identical OID: the same blob asked for twice,
+        // which must still land on both of its files.
+        r.write("c.txt", b"same bytes\n");
+        r.write("d.txt", b"same bytes\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "second"]);
+
+        let got = pairs(&r.0, "HEAD~1..HEAD").unwrap();
+        assert_eq!(paths(&got), vec!["a.txt", "b.txt", "c.txt", "d.txt"]);
+        let new: Vec<_> = got.iter().map(|p| p.new.join("\n")).collect();
+        assert_eq!(new, vec!["A", "B", "same bytes", "same bytes"]);
     }
 
     #[test]
@@ -722,8 +844,8 @@ mod tests {
         assert_eq!(c.old_mode, "160000");
         let old = Change::synthetic(&c.old_mode, &c.old_oid).expect("a gitlink is synthetic");
         let new = Change::synthetic(&c.new_mode, &c.new_oid).unwrap();
-        assert_eq!(lines(&old), vec!["Subproject commit 34cbf180d"]);
-        assert_eq!(lines(&new), vec!["Subproject commit 5697db813"]);
+        assert_eq!(strs(&lines(&old)), ["Subproject commit 34cbf180d"]);
+        assert_eq!(strs(&lines(&new)), ["Subproject commit 5697db813"]);
 
         // An added submodule has no old side at all.
         assert_eq!(Change::synthetic("160000", &"0".repeat(40)), Some(Vec::new()));
@@ -733,11 +855,11 @@ mod tests {
 
     #[test]
     fn a_trailing_newline_terminates_rather_than_adds_a_line() {
-        assert_eq!(lines(b"a\nb\n"), vec!["a", "b"]);
-        assert_eq!(lines(b"a\nb"), vec!["a", "b"]);
-        assert_eq!(lines(b""), Vec::<String>::new());
-        assert_eq!(lines(b"\n"), vec![""], "a file of one blank line");
-        assert_eq!(lines(b"a\r\nb\r\n"), vec!["a", "b"], "CRLF is not part of the line");
+        assert_eq!(strs(&lines(b"a\nb\n")), ["a", "b"]);
+        assert_eq!(strs(&lines(b"a\nb")), ["a", "b"]);
+        assert_eq!(lines(b""), Vec::<Arc<str>>::new());
+        assert_eq!(strs(&lines(b"\n")), [""], "a file of one blank line");
+        assert_eq!(strs(&lines(b"a\r\nb\r\n")), ["a", "b"], "CRLF is not part of the line");
     }
 
     #[test]
@@ -751,8 +873,8 @@ mod tests {
 
     #[test]
     fn binary_is_detected_by_a_nul_byte() {
-        assert!(is_binary(&b"\x89PNG\r\n\x1a\n\0\0\0".to_vec()));
-        assert!(!is_binary(&b"fn main() {}\n".to_vec()));
+        assert!(is_binary(b"\x89PNG\r\n\x1a\n\0\0\0"));
+        assert!(!is_binary(b"fn main() {}\n"));
         // Past 8 KB it is text as far as this is concerned, which is git's rule.
         let mut late = vec![b'x'; 9000];
         late.push(0);

@@ -1069,7 +1069,7 @@ mod tests {
             fn name(&self) -> &'static str {
                 "semantic"
             }
-            fn diff(&self, _: &str, _: &[&str], _: &[&str]) -> Vec<Edit> {
+            fn diff(&self, _: &str, _: &[std::sync::Arc<str>], _: &[std::sync::Arc<str>]) -> Vec<Edit> {
                 Vec::new()
             }
         }

@@ -14,6 +14,7 @@
 
 use crate::syntax::{highlight_hunk, Highlighter, Token};
 use crate::{intraline, replace_pairs, FileDiff, LineKind, Span};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// One line, with everything a renderer needs and nothing it would have to
@@ -29,9 +30,15 @@ pub struct Line {
     pub moved: bool,
     pub old_no: Option<u32>,
     pub new_no: Option<u32>,
-    pub text: String,
-    pub spans: Vec<Span>,
-    pub tokens: Vec<Token>,
+    /// The same allocation the parsed [`crate::DiffLine`] holds whenever the
+    /// line fit the clip budget: `clip`'s fast path is a refcount bump. A
+    /// frontend's rows take another bump rather than a copy.
+    pub text: Arc<str>,
+    /// Never mutated after `prepare` — hence exact-size boxed slices rather
+    /// than `Vec`s with spare capacity. Markdown layout rebuilds these rather
+    /// than editing them in place.
+    pub spans: Box<[Span]>,
+    pub tokens: Box<[Token]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,12 +77,14 @@ impl Prepared {
 ///
 /// Clipping happens *before* both passes, so their output can only ever describe
 /// text that will actually be drawn.
-pub fn clip(s: &str, max_chars: usize) -> String {
+pub fn clip(s: &Arc<str>, max_chars: usize) -> Arc<str> {
     // A character is one to four bytes, so a line that fits the budget in
     // bytes fits it in characters too — and the count below is a full decode
-    // walk that nearly every line of a real diff should never pay.
+    // walk that nearly every line of a real diff should never pay. The fast
+    // path shares the caller's allocation; this is where parse copy A and
+    // prepared copy B become one.
     if s.len() <= max_chars {
-        return s.to_string();
+        return s.clone();
     }
     // Past the cheap check the count is still the arbiter, because byte
     // length overshoots for multibyte text. One walk produces both the total
@@ -90,9 +99,9 @@ pub fn clip(s: &str, max_chars: usize) -> String {
     }
     let head_end = match head_end {
         Some(i) => i,
-        None => return s.to_string(),
+        None => return s.clone(),
     };
-    format!("{}  … {} more chars", &s[..head_end], n - max_chars)
+    Arc::from(format!("{}  … {} more chars", &s[..head_end], n - max_chars))
 }
 
 pub fn prepare(files: &[FileDiff], hl: &dyn Highlighter, max_line_chars: usize) -> Prepared {
@@ -107,7 +116,7 @@ pub fn prepare(files: &[FileDiff], hl: &dyn Highlighter, max_line_chars: usize) 
         let mut hunks = Vec::with_capacity(f.hunks.len());
 
         for h in &f.hunks {
-            let mut texts: Vec<String> =
+            let mut texts: Vec<Arc<str>> =
                 h.lines.iter().map(|l| clip(&l.text, max_line_chars)).collect();
 
             // Second pass: only the removed/added pairs a line diff already
@@ -122,7 +131,7 @@ pub fn prepare(files: &[FileDiff], hl: &dyn Highlighter, max_line_chars: usize) 
             intraline_time += t.elapsed();
 
             let t = Instant::now();
-            let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+            let refs: Vec<&str> = texts.iter().map(|t| &**t).collect();
             let kinds: Vec<LineKind> = h.lines.iter().map(|l| l.kind).collect();
             let mut tokens = highlight_hunk(hl, &f.path, &refs, &kinds);
             syntax_time += t.elapsed();
@@ -137,8 +146,8 @@ pub fn prepare(files: &[FileDiff], hl: &dyn Highlighter, max_line_chars: usize) 
                     old_no: l.old_no,
                     new_no: l.new_no,
                     text: std::mem::take(&mut texts[i]),
-                    spans: std::mem::take(&mut spans[i]),
-                    tokens: std::mem::take(&mut tokens[i]),
+                    spans: std::mem::take(&mut spans[i]).into_boxed_slice(),
+                    tokens: std::mem::take(&mut tokens[i]).into_boxed_slice(),
                 })
                 .collect();
             hunks.push(Hunk { header: h.header.clone(), lines });
@@ -179,7 +188,10 @@ index 1111111..2222222 100644
 
         // The intraline pass found the one changed word...
         let removed = lines.iter().find(|l| l.kind == LineKind::Removed).unwrap();
-        assert_eq!(&removed.text[removed.spans[0].start..removed.spans[0].end], "x");
+        assert_eq!(
+            &removed.text[removed.spans[0].start as usize..removed.spans[0].end as usize],
+            "x"
+        );
         // ...and the syntax pass ran on the same text.
         assert!(removed.tokens.iter().any(|t| t.kind == Kind::Keyword));
         assert!(removed.tokens.iter().any(|t| t.kind == Kind::Comment));
@@ -192,11 +204,14 @@ index 1111111..2222222 100644
         let p = prepare(&parse_unified_diff(SAMPLE), &hl, 2000);
         for l in p.files.iter().flat_map(|f| &f.hunks).flat_map(|h| &h.lines) {
             for s in &l.spans {
-                assert!(s.end <= l.text.len(), "span {s:?} outside {:?}", l.text);
+                assert!(s.end as usize <= l.text.len(), "span {s:?} outside {:?}", l.text);
             }
             for t in &l.tokens {
-                assert!(t.end <= l.text.len(), "token {t:?} outside {:?}", l.text);
-                assert!(l.text.is_char_boundary(t.start) && l.text.is_char_boundary(t.end));
+                assert!(t.end as usize <= l.text.len(), "token {t:?} outside {:?}", l.text);
+                assert!(
+                    l.text.is_char_boundary(t.start as usize)
+                        && l.text.is_char_boundary(t.end as usize)
+                );
             }
         }
     }
@@ -213,8 +228,8 @@ index 1111111..2222222 100644
         let p = prepare(&parse_unified_diff(&raw), &hl, 40);
         for l in p.files.iter().flat_map(|f| &f.hunks).flat_map(|h| &h.lines) {
             assert!(l.text.chars().count() < 80, "{:?}", l.text);
-            assert!(l.spans.iter().all(|s| s.end <= l.text.len()));
-            assert!(l.tokens.iter().all(|t| t.end <= l.text.len()));
+            assert!(l.spans.iter().all(|s| s.end as usize <= l.text.len()));
+            assert!(l.tokens.iter().all(|t| t.end as usize <= l.text.len()));
         }
     }
 
@@ -228,19 +243,29 @@ index 1111111..2222222 100644
         assert_eq!(first.tokens[0].kind, Kind::Heading, "markdown routing was lost");
     }
 
+    fn arc(s: &str) -> Arc<str> {
+        s.into()
+    }
+
     #[test]
     fn clipping_is_counted_in_characters_not_bytes() {
         // The byte-length fast path must not change what comes out: multibyte
         // text can overshoot in bytes while fitting in characters, and the
         // suffix always names characters.
-        let wide = "\u{4e2d}".repeat(60); // three bytes each, 180 bytes total
+        let wide = Arc::<str>::from("\u{4e2d}".repeat(60)); // three bytes each, 180 bytes total
         assert_eq!(clip(&wide, 60), wide, "fits in characters despite the byte length");
-        assert_eq!(clip(&wide, 10), format!("{}  … {} more chars", &wide[..30], 50));
+        assert_eq!(
+            clip(&wide, 10).as_ref(),
+            format!("{}  … {} more chars", &wide[..30], 50)
+        );
 
-        let ascii = "x".repeat(100);
+        let ascii: Arc<str> = "x".repeat(100).into();
         assert_eq!(clip(&ascii, 100), ascii);
-        assert_eq!(clip(&ascii, 99), format!("{}  … 1 more chars", &ascii[..99]));
-        assert_eq!(clip("", 10), "");
-        assert_eq!(clip("éé", 0), "  … 2 more chars");
+        assert_eq!(
+            clip(&ascii, 99).as_ref(),
+            format!("{}  … 1 more chars", &ascii[..99])
+        );
+        assert_eq!(clip(&arc(""), 10).as_ref(), "");
+        assert_eq!(clip(&arc("éé"), 0).as_ref(), "  … 2 more chars");
     }
 }

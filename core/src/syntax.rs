@@ -71,16 +71,20 @@ impl Kind {
 }
 
 /// A classified byte range within one line.
+///
+/// Offsets are `u32`: they index *clipped* text, whose length the frontend
+/// budgets by window width — always far below `u32::MAX`. 12 bytes a token
+/// keeps a 700k-row diff's tokens in cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Token {
-    pub start: usize,
-    pub end: usize,
+    pub start: u32,
+    pub end: u32,
     pub kind: Kind,
 }
 
 impl Token {
     pub fn range(&self) -> Range<usize> {
-        self.start..self.end
+        self.start as usize..self.end as usize
     }
 }
 
@@ -489,7 +493,11 @@ fn may_open(p: &[u8], c: u8) -> bool {
 pub fn lex(src: &str, syn: &Syntax, out: &mut Vec<Token>) {
     let b = src.as_bytes();
     let mut i = 0;
-    let mut push = |start: usize, end: usize, kind: Kind| out.push(Token { start, end, kind });
+    // Offsets stay `usize` through the scan and narrow at the boundary; a line
+    // is clipped text far below `u32::MAX` — see [`Token`].
+    let mut push = |start: usize, end: usize, kind: Kind| {
+        out.push(Token { start: start as u32, end: end as u32, kind })
+    };
 
     'scan: while i < b.len() {
         let c = b[i];
@@ -688,7 +696,7 @@ pub fn lex_lines(lines: &[&str], syn: &Syntax) -> Vec<Vec<Token>> {
     let mut row = 0;
     for t in flat {
         // Tokens come out in order, so the row only ever moves forward.
-        while row + 1 < lines.len() && t.start >= starts[row + 1] {
+        while row + 1 < lines.len() && t.start as usize >= starts[row + 1] {
             row += 1;
         }
         // A block comment or a multi-line string covers several rows; clip it
@@ -697,12 +705,12 @@ pub fn lex_lines(lines: &[&str], syn: &Syntax) -> Vec<Vec<Token>> {
         loop {
             let base = starts[r];
             let len = lines[r].len();
-            let start = t.start.saturating_sub(base).min(len);
-            let end = (t.end - base).min(len);
+            let start = (t.start as usize).saturating_sub(base).min(len);
+            let end = (t.end as usize - base).min(len);
             if start < end {
-                out[r].push(Token { start, end, kind: t.kind });
+                out[r].push(Token { start: start as u32, end: end as u32, kind: t.kind });
             }
-            if r + 1 >= lines.len() || t.end <= starts[r + 1] {
+            if r + 1 >= lines.len() || t.end as usize <= starts[r + 1] {
                 break;
             }
             r += 1;
@@ -811,7 +819,7 @@ impl Highlighter for Markdown {
             let indent = line.len() - trimmed.len();
             let whole = |toks: &mut Vec<Token>, kind| {
                 if !line.is_empty() {
-                    toks.push(Token { start: 0, end: line.len(), kind });
+                    toks.push(Token { start: 0, end: line.len() as u32, kind });
                 }
             };
 
@@ -841,8 +849,8 @@ impl Highlighter for Markdown {
                         let marker = list_marker(trimmed);
                         if marker > 0 {
                             toks.push(Token {
-                                start: indent,
-                                end: indent + marker,
+                                start: indent as u32,
+                                end: (indent + marker) as u32,
                                 kind: Kind::Keyword,
                             });
                         }
@@ -937,7 +945,7 @@ fn inline(line: &str, from: usize, out: &mut Vec<Token>) {
                 let run = b[i..].iter().take_while(|c| **c == b'`').count();
                 match close_run(b, i + run, b'`', run) {
                     Some(end) => {
-                        out.push(Token { start: i, end: end + run, kind: Kind::Str });
+                        out.push(Token { start: i as u32, end: (end + run) as u32, kind: Kind::Str });
                         i = end + run;
                     }
                     None => i += run,
@@ -948,7 +956,7 @@ fn inline(line: &str, from: usize, out: &mut Vec<Token>) {
                 match close_run(b, i + run, c, run) {
                     Some(end) => {
                         let kind = if run == 2 { Kind::Strong } else { Kind::Emphasis };
-                        out.push(Token { start: i, end: end + run, kind });
+                        out.push(Token { start: i as u32, end: (end + run) as u32, kind });
                         i = end + run;
                     }
                     None => i += run,
@@ -956,7 +964,7 @@ fn inline(line: &str, from: usize, out: &mut Vec<Token>) {
             }
             b'[' => match link_end(b, i) {
                 Some(end) => {
-                    out.push(Token { start: i, end, kind: Kind::Link });
+                    out.push(Token { start: i as u32, end: end as u32, kind: Kind::Link });
                     i = end;
                 }
                 None => i += 1,
@@ -1327,7 +1335,7 @@ mod tests {
         let mut out = Vec::new();
         lex(src, syn, &mut out);
         assert!(out.windows(2).all(|w| w[0].end <= w[1].start), "{out:?}");
-        assert!(out.iter().all(|t| t.start < t.end && t.end <= src.len()));
+        assert!(out.iter().all(|t| t.start < t.end && t.end as usize <= src.len()));
     }
 
     #[test]
@@ -1413,7 +1421,7 @@ mod tests {
         let got = lexer.highlight("a.rs", &lines);
         for (line, toks) in lines.iter().zip(&got) {
             for t in toks {
-                assert!(t.end <= line.len(), "{t:?} outside {line:?}");
+                assert!(t.end as usize <= line.len(), "{t:?} outside {line:?}");
             }
         }
         assert_eq!(&lines[1][got[1].last().unwrap().range()], "\"hello\"");
@@ -1490,8 +1498,8 @@ mod tests {
             let mut out = Vec::new();
             lex(src, syn, &mut out);
             for t in &out {
-                assert!(src.is_char_boundary(t.start), "{t:?} in {src:?}");
-                assert!(src.is_char_boundary(t.end), "{t:?} in {src:?}");
+                assert!(src.is_char_boundary(t.start as usize), "{t:?} in {src:?}");
+                assert!(src.is_char_boundary(t.end as usize), "{t:?} in {src:?}");
             }
         }
     }
@@ -1504,7 +1512,7 @@ mod tests {
         fn highlight(&self, _path: &str, lines: &[&str]) -> Vec<Vec<Token>> {
             lines
                 .iter()
-                .map(|l| vec![Token { start: 0, end: l.len(), kind: Kind::Comment }])
+                .map(|l| vec![Token { start: 0, end: l.len() as u32, kind: Kind::Comment }])
                 .collect()
         }
     }
@@ -1660,8 +1668,11 @@ mod tests {
         for (toks, line) in Markdown.highlight("r.md", &lines).iter().zip(lines) {
             assert!(toks.windows(2).all(|w| w[0].end <= w[1].start), "{toks:?}");
             for t in toks {
-                assert!(t.start < t.end && t.end <= line.len(), "{t:?} in {line:?}");
-                assert!(line.is_char_boundary(t.start) && line.is_char_boundary(t.end));
+                assert!(t.start < t.end && t.end as usize <= line.len(), "{t:?} in {line:?}");
+                assert!(
+                    line.is_char_boundary(t.start as usize)
+                        && line.is_char_boundary(t.end as usize)
+                );
             }
         }
     }
