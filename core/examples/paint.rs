@@ -33,7 +33,10 @@ fn bg(c: Rgb) -> String {
 /// Underline a piece if any intraline span covers it. Cheap and approximate —
 /// the point is to see that the spans and the tokens agree.
 fn underlined(l: &plait_core::prepared::Line, start: usize, end: usize, piece: &str) -> String {
-    let hit = l.spans.iter().any(|s| s.start < end.max(start + 1) && s.end > start);
+    let hit = l
+        .spans
+        .iter()
+        .any(|s| s.start < (end.max(start + 1)) as u32 && s.end > start as u32);
     if hit && start < end {
         format!("\x1b[4m{piece}\x1b[24m")
     } else {
@@ -137,7 +140,7 @@ fn main() {
                 f.hunks
                     .iter()
                     .flat_map(|h| &h.lines)
-                    .map(|l| (l.text.as_str(), cols.saturating_sub(2))),
+                    .map(|l| (l.text.as_ref(), cols.saturating_sub(2))),
                 host.wrap.current(),
             )
         })
@@ -217,12 +220,16 @@ fn main() {
                     // this row, which is what `runs` does in the shell.
                     let mut cursor = span.start;
                     for t in &l.tokens {
-                        let (s, e) = (t.start.max(span.start), t.end.min(span.end));
+                        let (s, e) = (
+                            (t.start as usize).max(span.start),
+                            (t.end as usize).min(span.end),
+                        );
                         if e <= s {
                             continue;
                         }
                         print!("{}", underlined(&l, cursor, s, &l.text[cursor..s]));
-                        let on_word = l.spans.iter().any(|w| w.start < e && w.end > s);
+                        let on_word =
+                            l.spans.iter().any(|w| (w.start as usize) < e && (w.end as usize) > s);
                         let style = theme.syntax_on(t.kind, if on_word { word } else { surface });
                         let piece = styled(style, &l.text[s..e]);
                         print!("{}{}", underlined(&l, s, e, &piece), fg(row_fg));

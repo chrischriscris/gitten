@@ -4,6 +4,10 @@
 //! or the other way — nothing in this crate changes. Keep it that way: the day
 //! something in here needs to know what a window is, the boundary is gone.
 
+use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
+use std::sync::Arc;
+
 pub mod align;
 pub mod command;
 pub mod differ;
@@ -26,8 +30,13 @@ pub mod wrap;
 pub struct Commit {
     pub sha: String,
     pub short: String,
-    pub parents: Vec<String>,
-    pub author: String,
+    /// Built once and never mutated: a boxed slice carries no growth slack,
+    /// which across 82k commits of git/git is real memory for nothing.
+    pub parents: Box<[String]>,
+    /// Interned by text in `parse_log` — a few thousand authors repeat across
+    /// tens of thousands of commits, and one `Arc<str>` per distinct name
+    /// beats one `String` per commit.
+    pub author: Arc<str>,
     pub timestamp: i64,
     pub subject: String,
 }
@@ -35,11 +44,53 @@ pub struct Commit {
 /// Parses the output of `fixtures/dump.sh` (see that script for the format).
 /// Fields are \x1f-separated, records \x1e-separated — control characters git
 /// will never emit inside a subject, so there is nothing to escape.
+/// The hash behind the author intern map: rustc's own Fx construction, a
+/// rotate-xor-multiply over eight-byte chunks. `HashMap`'s default SipHash
+/// cost more per lookup than the rest of the interning put together on short
+/// names — measured at about a third of `parse_log`'s regression before this
+/// replaced it. Not cryptographic, and it does not need to be: a collision
+/// only costs a probe, because the map compares the real bytes either way.
+/// The 0xff terminator keeps `"ab" + "c"` and `"abc"` apart in one stream, as
+/// `str`'s default hash does.
+#[derive(Default)]
+struct FxHasher {
+    hash: u64,
+}
+
+const FX_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+
+impl Hasher for FxHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut buf = [0u8; 8];
+            buf[..chunk.len()].copy_from_slice(chunk);
+            self.hash =
+                (self.hash.rotate_left(5) ^ u64::from_le_bytes(buf)).wrapping_mul(FX_SEED);
+        }
+    }
+    fn write_u8(&mut self, b: u8) {
+        self.hash = (self.hash.rotate_left(5) ^ u64::from(b)).wrapping_mul(FX_SEED);
+    }
+    // `str`'s default hash walks `write` then `write_u8(0xff)` — the same
+    // stream this type would produce, so no override needed.
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+}
+
 pub fn parse_log(raw: &str) -> Vec<Commit> {
     // Counting separators first costs one byte scan and buys a right-sized
     // vector: at 100k commits the growth path was re-copying the whole list
     // several times over.
     let mut out = Vec::with_capacity(raw.bytes().filter(|b| *b == b'\x1e').count() + 1);
+    // Interned on the borrowed field: a repeat costs one hash lookup and no
+    // allocation, and the keys borrow `raw`, which lives past the loop. Hashed
+    // with [`FxHasher`] — see there for why the default hasher lost money —
+    // and sized for a real history up front: growing this table mid-parse
+    // rehashed everything parsed so far, twice, on the way to a few thousand
+    // authors.
+    let mut authors: HashMap<&str, Arc<str>, BuildHasherDefault<FxHasher>> =
+        HashMap::with_capacity_and_hasher(4096, BuildHasherDefault::default());
     for rec in raw.split('\u{1e}') {
         let rec = rec.trim();
         if rec.is_empty() {
@@ -65,7 +116,14 @@ pub fn parse_log(raw: &str) -> Vec<Commit> {
             sha: sha.to_string(),
             short: short.to_string(),
             parents: parents.split_whitespace().map(str::to_string).collect(),
-            author: author.to_string(),
+            author: match authors.get(author) {
+                Some(seen) => Arc::clone(seen),
+                None => {
+                    let seen: Arc<str> = Arc::from(author);
+                    authors.insert(author, Arc::clone(&seen));
+                    seen
+                }
+            },
             timestamp: ts.parse().unwrap_or(0),
             subject: subject.to_string(),
         });
@@ -186,7 +244,12 @@ pub struct DiffLine {
     pub kind: LineKind,
     pub old_no: Option<u32>,
     pub new_no: Option<u32>,
-    pub text: String,
+    /// Shared with [`prepared::Line`](crate::prepared::Line) and the rows every
+    /// frontend builds from it: one allocation per distinct line of text for
+    /// the whole pipeline instead of one per copy of it. `Arc<str>` and not
+    /// `String` so `clip`'s fast path and a layout change's rebuild are
+    /// refcount bumps.
+    pub text: Arc<str>,
     /// This line is part of a block that moved rather than changed — see
     /// [`differ::moves`](crate::differ::moves).
     ///
@@ -265,7 +328,7 @@ pub fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
             kind,
             old_no: o,
             new_no: n,
-            text: text.to_string(),
+            text: Arc::from(text),
             moved: false,
         });
     }
@@ -312,10 +375,14 @@ fn parse_hunk_header(line: &str) -> (u32, u32) {
 // ------------------------------------------------------------ intraline diff
 
 /// A byte range within a line.
+///
+/// Offsets are `u32`: they index *clipped* text, whose length the frontend
+/// budgets by window width — always far below `u32::MAX`. 8 bytes a span keeps
+/// a 700k-row diff's spans in cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
-    pub start: usize,
-    pub end: usize,
+    pub start: u32,
+    pub end: u32,
 }
 
 /// Splits a line into word-ish tokens: runs of alphanumerics/underscore, and
@@ -440,19 +507,19 @@ pub fn intraline(old: &str, new: &str) -> (Vec<Span>, Vec<Span>) {
             i += 1;
             j += 1;
         } else if lcs[(i + 1) * w + j] >= lcs[i * w + j + 1] {
-            push_span(&mut old_spans, a[i].0 as usize, (a[i].0 + a[i].1) as usize);
+            push_span(&mut old_spans, a[i].0, a[i].0 + a[i].1);
             i += 1;
         } else {
-            push_span(&mut new_spans, b[j].0 as usize, (b[j].0 + b[j].1) as usize);
+            push_span(&mut new_spans, b[j].0, b[j].0 + b[j].1);
             j += 1;
         }
     }
     while i < a.len() {
-        push_span(&mut old_spans, a[i].0 as usize, (a[i].0 + a[i].1) as usize);
+        push_span(&mut old_spans, a[i].0, a[i].0 + a[i].1);
         i += 1;
     }
     while j < b.len() {
-        push_span(&mut new_spans, b[j].0 as usize, (b[j].0 + b[j].1) as usize);
+        push_span(&mut new_spans, b[j].0, b[j].0 + b[j].1);
         j += 1;
     }
     coalesce(&mut old_spans, old);
@@ -462,7 +529,7 @@ pub fn intraline(old: &str, new: &str) -> (Vec<Span>, Vec<Span>) {
 
 /// Merge into the previous span when adjacent, so a changed phrase highlights
 /// as one block rather than a row of separate token boxes.
-fn push_span(spans: &mut Vec<Span>, start: usize, end: usize) {
+fn push_span(spans: &mut Vec<Span>, start: u32, end: u32) {
     match spans.last_mut() {
         Some(last) if last.end == start => last.end = end,
         _ => spans.push(Span { start, end }),
@@ -482,7 +549,7 @@ fn coalesce(spans: &mut Vec<Span>, text: &str) {
         match merged.last_mut() {
             Some(last)
                 if text
-                    .get(last.end..s.start)
+                    .get(last.end as usize..s.start as usize)
                     .is_some_and(|gap| !gap.is_empty() && gap.trim().is_empty()) =>
             {
                 last.end = s.end;
@@ -545,7 +612,7 @@ mod tests {
                    def\u{1f}def\u{1f}\u{1f}Ada\u{1f}1699999999\u{1f}Initial commit\u{1e}";
         let c = parse_log(raw);
         assert_eq!(c.len(), 2);
-        assert_eq!(c[0].parents, vec!["def", "ghi"]);
+        assert_eq!(c[0].parents.to_vec(), vec!["def", "ghi"]);
         assert_eq!(c[0].subject, "Fix the thing");
         assert!(c[1].parents.is_empty());
     }
@@ -633,16 +700,19 @@ index 1111111..2222222 100644
         assert_eq!(n.len(), 1, "the inserted clause should be one merged span");
         // Which of the two equivalent spaces the LCS keeps is arbitrary and
         // visually identical, so compare the substance.
-        assert_eq!(new[n[0].start..n[0].end].trim(), "|| h.budget.Exhausted()");
+        assert_eq!(
+            new[n[0].start as usize..n[0].end as usize].trim(),
+            "|| h.budget.Exhausted()"
+        );
     }
 
     #[test]
     fn intraline_handles_a_substitution_on_both_sides() {
         let (o, n) = intraline("go ext.Run(ev)", "go ext.Submit(ev)");
         assert_eq!(o.len(), 1);
-        assert_eq!(&"go ext.Run(ev)"[o[0].start..o[0].end], "Run");
+        assert_eq!(&"go ext.Run(ev)"[o[0].start as usize..o[0].end as usize], "Run");
         assert_eq!(n.len(), 1);
-        assert_eq!(&"go ext.Submit(ev)"[n[0].start..n[0].end], "Submit");
+        assert_eq!(&"go ext.Submit(ev)"[n[0].start as usize..n[0].end as usize], "Submit");
     }
 
     #[test]
@@ -654,9 +724,12 @@ index 1111111..2222222 100644
         let (_, n) = intraline(old, new);
         assert_eq!(n.len(), 1, "expected one block, got {:?}", n
             .iter()
-            .map(|s| &new[s.start..s.end])
+            .map(|s| &new[s.start as usize..s.end as usize])
             .collect::<Vec<_>>());
-        assert_eq!(&new[n[0].start..n[0].end], "every check failure before exiting");
+        assert_eq!(
+            &new[n[0].start as usize..n[0].end as usize],
+            "every check failure before exiting"
+        );
     }
 
     #[test]
@@ -682,7 +755,10 @@ index 1111111..2222222 100644
         // coalesce into one block — `AUTO_EXTERN_C_ZIG` is a single token, not a
         // shared prefix with a different tail.
         let new = "#define RUST_DECL AUTO_EXTERN_C_RUST";
-        assert_eq!(&new[n[0].start..n[0].end], "RUST_DECL AUTO_EXTERN_C_RUST");
+        assert_eq!(
+            &new[n[0].start as usize..n[0].end as usize],
+            "RUST_DECL AUTO_EXTERN_C_RUST"
+        );
     }
 
     #[test]
@@ -691,8 +767,8 @@ index 1111111..2222222 100644
         // outside the highlight, which is the whole point of an intraline diff.
         let (_, n) = intraline("a keep b", "x keep y");
         assert_eq!(n.len(), 2, "{:?}", n);
-        assert_eq!(&"x keep y"[n[0].start..n[0].end], "x");
-        assert_eq!(&"x keep y"[n[1].start..n[1].end], "y");
+        assert_eq!(&"x keep y"[n[0].start as usize..n[0].end as usize], "x");
+        assert_eq!(&"x keep y"[n[1].start as usize..n[1].end as usize], "y");
     }
 
     #[test]

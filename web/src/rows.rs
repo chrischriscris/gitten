@@ -15,6 +15,7 @@ use plait_core::syntax::{Kind, Token};
 use plait_core::wrap::{Wrap, Wrapped};
 use plait_core::{LineKind, Span};
 use std::ops::Range;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub enum Row {
@@ -28,9 +29,10 @@ pub struct Line {
     pub moved: bool,
     pub old_no: Option<u32>,
     pub new_no: Option<u32>,
-    pub text: String,
-    pub spans: Vec<Span>,
-    pub tokens: Vec<Token>,
+    /// Shared with the prepared line it came from — a move, not a copy.
+    pub text: Arc<str>,
+    pub spans: Box<[Span]>,
+    pub tokens: Box<[Token]>,
 }
 
 /// A file's place in the flat row list, for the jump list in the sidebar.
@@ -245,12 +247,12 @@ pub fn pieces<'a>(line: &'a Line, at: Range<usize>, out: &mut Vec<Piece<'a>>) {
     let mut edges = Vec::with_capacity((tokens.len() + spans.len()) * 2 + 2);
     edges.push(at.start);
     for t in tokens {
-        edges.push(clamp(t.start));
-        edges.push(clamp(t.end));
+        edges.push(clamp(t.start as usize));
+        edges.push(clamp(t.end as usize));
     }
     for s in spans {
-        edges.push(clamp(s.start));
-        edges.push(clamp(s.end));
+        edges.push(clamp(s.start as usize));
+        edges.push(clamp(s.end as usize));
     }
     edges.push(at.end);
     edges.sort_unstable();
@@ -259,14 +261,14 @@ pub fn pieces<'a>(line: &'a Line, at: Range<usize>, out: &mut Vec<Piece<'a>>) {
     let (mut ti, mut si) = (0usize, 0usize);
     let mut cursor = edges[0];
     for &edge in &edges[1..] {
-        while ti < tokens.len() && tokens[ti].end <= cursor {
+        while ti < tokens.len() && tokens[ti].end as usize <= cursor {
             ti += 1;
         }
-        while si < spans.len() && spans[si].end <= cursor {
+        while si < spans.len() && spans[si].end as usize <= cursor {
             si += 1;
         }
-        let word = spans.get(si).is_some_and(|s| s.start <= cursor);
-        let kind = tokens.get(ti).filter(|t| t.start <= cursor).map(|t| t.kind);
+        let word = spans.get(si).is_some_and(|s| s.start as usize <= cursor);
+        let kind = tokens.get(ti).filter(|t| t.start as usize <= cursor).map(|t| t.kind);
         out.push(Piece { text: &line.text[cursor..edge], kind, word });
         cursor = edge;
     }

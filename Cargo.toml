@@ -15,3 +15,40 @@ opt-level = 3
 # speed for a small hit to build time and still debuggable.
 [profile.dev]
 opt-level = 1
+# Line tables, not full DWARF: backtraces keep their file:line, six hundred
+# units stop emitting debug info nothing reads outside a debugger.
+debug = 1
+
+# Cargo's own default is to leave compile-time-only code unoptimized; the
+# blanket above defeated that for every crate in the tree. These run only
+# while the build compiles — macro expansion, header generation — never in
+# the shipped app, so optimizing them buys nothing and costs real minutes of
+# cold build. Named pins outrank the "*" blanket; runtime deps stay at O3.
+# Keep the list to crates verified absent from the runtime graph.
+[profile.dev.package.syn]
+opt-level = 1
+debug = false
+[profile.dev.package.serde_derive]
+opt-level = 1
+debug = false
+[profile.dev.package.thiserror-impl]
+opt-level = 1
+debug = false
+[profile.dev.package.derive_more-impl]
+opt-level = 1
+debug = false
+[profile.dev.package.schemars_derive]
+opt-level = 1
+debug = false
+[profile.dev.package.strum_macros]
+opt-level = 1
+debug = false
+[profile.dev.package.gpui_macros]
+opt-level = 1
+debug = false
+[profile.dev.package.cbindgen]
+opt-level = 1
+debug = false
+[profile.dev.package.bindgen]
+opt-level = 1
+debug = false

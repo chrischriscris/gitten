@@ -17,7 +17,9 @@
 //!
 //! The style *type*. This yields a [`Surface`] and an optional [`Kind`] per run;
 //! turning that into a `HighlightStyle`, an SGR escape or a JSON field is one
-//! line each and is the only part that knows what draws it.
+//! line each and is the only part that knows what draws it. A selection is a
+//! [`Surface`] like the rest — [`runs_selected`] folds it in — so ranking it
+//! against a changed word is decided once, here, and not per frontend.
 //!
 //! # Coordinates
 //!
@@ -96,14 +98,44 @@ pub fn runs(
     moved: bool,
     out: &mut Vec<Run>,
 ) {
+    runs_selected(at, tokens, spans, kind, moved, 0..0, out);
+}
+
+/// [`runs`], with a **selection** folded in: `sel` is the part of the line the
+/// mouse is holding, in line coordinates like everything else.
+///
+/// A selection outranks a changed word — both are backgrounds and only one can
+/// be drawn, and the reader already knows which words changed; what they are
+/// about to press a key about is what is selected. Runs split at its
+/// boundaries and every byte inside it comes back on [`Surface::Selected`], so
+/// a caller resolving foregrounds against the surface sees the background that
+/// will actually be painted. Empty — nearly every row of nearly every frame —
+/// it changes nothing, which is what makes `runs` above a plain delegation.
+pub fn runs_selected(
+    at: Range<usize>,
+    tokens: &[Token],
+    spans: &[Span],
+    kind: LineKind,
+    moved: bool,
+    sel: Range<usize>,
+    out: &mut Vec<Run>,
+) {
     out.clear();
     if at.start >= at.end {
         return;
     }
+    // Clamped into `at` like tokens and spans — a drag across several rows
+    // reaches each one as the part of itself it covers.
+    let sel = sel.start.clamp(at.start, at.end)..sel.end.clamp(at.start, at.end);
+    let selecting = |c: usize| sel.start < sel.end && sel.start <= c && c < sel.end;
     let (plain, word_surface) = surfaces(kind, moved);
     let spans: &[Span] = if moved { &[] } else { spans };
 
-    if tokens.is_empty() && spans.is_empty() {
+    // Nothing claimed any byte of this row: one plain run and done. A
+    // non-empty selection always reaches this row once clamped, so it
+    // disqualifies the fast path — part of the row is somebody else's
+    // background even when nothing else is.
+    if tokens.is_empty() && spans.is_empty() && sel.start >= sel.end {
         out.push(Run { at, kind: None, surface: plain, word: false });
         return;
     }
@@ -114,36 +146,44 @@ pub fn runs(
         // Anything ending at or before the cursor is behind us. Not clamped into
         // `at`: a token that runs past the end of this row is still the token
         // covering the cursor, and clamping it here would skip it.
-        while ti < tokens.len() && tokens[ti].end <= cursor {
+        while ti < tokens.len() && tokens[ti].end as usize <= cursor {
             ti += 1;
         }
-        while si < spans.len() && spans[si].end <= cursor {
+        while si < spans.len() && spans[si].end as usize <= cursor {
             si += 1;
         }
         // Whichever of the two actually covers the cursor, if either does.
-        let tok = tokens.get(ti).filter(|t| t.start <= cursor);
-        let spn = spans.get(si).filter(|s| s.start <= cursor);
+        let tok = tokens.get(ti).filter(|t| t.start as usize <= cursor);
+        let spn = spans.get(si).filter(|s| s.start as usize <= cursor);
 
         // The next byte at which any of that changes: where a live range ends,
         // or where a pending one begins. Every candidate is strictly past the
         // cursor — a live range's end is, because it was not skipped, and a
         // pending one's start is, because it is not live — so the run advances
-        // and this terminates.
+        // and this terminates. The selection's edges are candidates by the same
+        // argument: inside it, its end; before it, its start.
         let mut edge = at.end;
         match tok {
-            Some(t) => edge = edge.min(t.end),
+            Some(t) => edge = edge.min(t.end as usize),
             None => {
                 if let Some(t) = tokens.get(ti) {
-                    edge = edge.min(t.start);
+                    edge = edge.min(t.start as usize);
                 }
             }
         }
         match spn {
-            Some(s) => edge = edge.min(s.end),
+            Some(s) => edge = edge.min(s.end as usize),
             None => {
                 if let Some(s) = spans.get(si) {
-                    edge = edge.min(s.start);
+                    edge = edge.min(s.start as usize);
                 }
+            }
+        }
+        if sel.start < sel.end {
+            if selecting(cursor) {
+                edge = edge.min(sel.end);
+            } else if sel.start > cursor {
+                edge = edge.min(sel.start);
             }
         }
 
@@ -151,7 +191,13 @@ pub fn runs(
         out.push(Run {
             at: cursor..edge,
             kind: tok.map(|t| t.kind),
-            surface: if word { word_surface } else { plain },
+            surface: if selecting(cursor) {
+                Surface::Selected
+            } else if word {
+                word_surface
+            } else {
+                plain
+            },
             word,
         });
         cursor = edge;
@@ -165,11 +211,11 @@ mod tests {
     use crate::parse_unified_diff;
     use crate::prepared::prepare;
 
-    fn tok(start: usize, end: usize, kind: Kind) -> Token {
+    fn tok(start: u32, end: u32, kind: Kind) -> Token {
         Token { start, end, kind }
     }
 
-    fn span(start: usize, end: usize) -> Span {
+    fn span(start: u32, end: u32) -> Span {
         Span { start, end }
     }
 
@@ -246,6 +292,58 @@ mod tests {
     }
 
     #[test]
+    fn a_selection_splits_the_runs_at_its_own_edges() {
+        // No tokens, no spans, one selection in the middle: the plain stretches
+        // either side of it are still runs, and the selected bytes are on the
+        // selection surface even though nothing else claimed them.
+        let mut out = Vec::new();
+        runs_selected(0..10, &[], &[], LineKind::Context, false, 3..7, &mut out);
+        well_formed(0..10, &out);
+        let got: Vec<_> = out.iter().map(|r| (r.at.clone(), r.surface)).collect();
+        assert_eq!(
+            got,
+            vec![
+                (0..3, Surface::Context),
+                (3..7, Surface::Selected),
+                (7..10, Surface::Context),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_selection_outranks_a_changed_word_and_resolves_against_its_background() {
+        let mut plain = Vec::new();
+        let mut selected = Vec::new();
+        runs_selected(0..9, &[tok(2, 7, Kind::Str)], &[span(4, 8)], LineKind::Added, false, 5..9, &mut selected);
+        runs_selected(0..9, &[tok(2, 7, Kind::Str)], &[span(4, 8)], LineKind::Added, false, 0..0, &mut plain);
+        well_formed(0..9, &selected);
+        // The word's bytes 5..8 were Selected; only 4..5 kept the word surface,
+        // the token underneath split the selected stretch at its own edge, and
+        // the unclaimed tail past the word is selected too — the selection runs
+        // to the end of the row.
+        assert_eq!(plain[2].surface, Surface::AddedWord);
+        let picked: Vec<_> = selected
+            .iter()
+            .filter(|r| r.surface == Surface::Selected)
+            .map(|r| r.at.clone())
+            .collect();
+        assert_eq!(picked, vec![5..7, 7..8, 8..9]);
+        assert_eq!(selected[2].at, 4..5);
+        assert_eq!(selected[2].surface, Surface::AddedWord);
+    }
+
+    #[test]
+    fn an_empty_selection_is_exactly_the_plain_sweep() {
+        let tokens = [tok(1, 4, Kind::Keyword), tok(6, 9, Kind::Str)];
+        let spans = [span(2, 8)];
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        runs(0..10, &tokens, &spans, LineKind::Removed, false, &mut a);
+        runs_selected(0..10, &tokens, &spans, LineKind::Removed, false, 3..3, &mut b);
+        assert_eq!(a, b);
+    }
+
+    #[test]
     fn an_empty_range_produces_nothing_rather_than_a_panic() {
         let mut out = vec![Run { at: 0..1, kind: None, surface: Surface::Context, word: false }];
         runs(5..5, &[tok(0, 9, Kind::Str)], &[span(0, 9)], LineKind::Context, false, &mut out);
@@ -291,7 +389,7 @@ diff --git a/a.rs b/a.rs
             runs(at.clone(), &l.tokens, &l.spans, l.kind, l.moved, &mut out);
             well_formed(at, &out);
             let joined: String = out.iter().map(|r| &l.text[r.at.clone()]).collect();
-            assert_eq!(joined, l.text, "the runs did not reassemble the line");
+            assert_eq!(joined, &*l.text, "the runs did not reassemble the line");
             words.extend(out.iter().filter(|r| r.word).map(|r| l.text[r.at.clone()].to_string()));
         }
         // `let x` -> `let y`: the identifier is the change, on both sides, and

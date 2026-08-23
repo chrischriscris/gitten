@@ -91,9 +91,7 @@ fn main() {
         let (mut adds, mut dels, mut hunks) = (0usize, 0usize, 0usize);
         let mut ours_ranges: Vec<(String, Vec<String>)> = Vec::new();
         for p in pairs.iter().filter(|p| !p.binary) {
-            let old: Vec<&str> = p.old.iter().map(String::as_str).collect();
-            let new: Vec<&str> = p.new.iter().map(String::as_str).collect();
-            let f = differs.file_using(&Overrides::default(), &p.path, &old, &new);
+            let f = differs.file_using(&Overrides::default(), &p.path, &p.old, &p.new);
             ours_ranges.push((p.path.clone(), ranges(&f)));
             hunks += f.hunks.len();
             for l in f.hunks.iter().flat_map(|h| &h.lines) {
@@ -247,9 +245,7 @@ fn report_worst(
     };
     let mut rows: Vec<(isize, String, usize, usize)> = Vec::new();
     for p in pairs.iter().filter(|p| !p.binary) {
-        let old: Vec<&str> = p.old.iter().map(String::as_str).collect();
-        let new: Vec<&str> = p.new.iter().map(String::as_str).collect();
-        let ours = count(&differs.file_using(&Overrides::default(), &p.path, &old, &new));
+        let ours = count(&differs.file_using(&Overrides::default(), &p.path, &p.old, &p.new));
         let theirs = theirs
             .iter()
             .find(|f| f.path == p.path || Some(f.path.as_str()) == p.old_path.as_deref())

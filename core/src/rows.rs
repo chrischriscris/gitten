@@ -200,7 +200,7 @@ impl Flat {
         self.wrap = wrap.name();
         self.wrapped = Wrapped::build(
             self.rows.iter().map(|r| match r {
-                Row::Line(l) => (l.text.as_str(), cols),
+                Row::Line(l) => (l.text.as_ref(), cols),
                 _ => (r.text(), 0),
             }),
             wrap,

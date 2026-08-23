@@ -433,7 +433,6 @@ fn grid_row(line: &mut Line, cells: &[Range<usize>], grid: &Grid, layout: &Layou
     // Where each cell's content, copied verbatim, now begins. This is the whole
     // correspondence between the old text and the new one — see `remap`.
     let mut map: Vec<(Range<usize>, usize)> = Vec::with_capacity(cells.len());
-
     out.push_str(g.vertical);
     for k in 0..widths.len() {
         // A row with fewer cells than the widest one still gets the missing
@@ -462,7 +461,7 @@ fn grid_row(line: &mut Line, cells: &[Range<usize>], grid: &Grid, layout: &Layou
     }
 
     remap(line, &map, out.len());
-    line.text = out;
+    line.text = out.into();
 }
 
 /// Replaces a separator row's dashes with a rule sized to the columns.
@@ -472,9 +471,10 @@ fn grid_row(line: &mut Line, cells: &[Range<usize>], grid: &Grid, layout: &Layou
 /// longer there. Nothing is lost that a reader wanted — a separator row differing
 /// between two revisions says nothing the columns either side of it do not.
 fn rule_row(line: &mut Line, widths: &[usize], layout: &Layout) {
-    line.text = rule_text(widths, layout);
-    line.tokens.clear();
-    line.spans.clear();
+    line.text = rule_text(widths, layout).into();
+    // Empty boxed slices: nothing allocates to say "no ranges".
+    line.tokens = Box::default();
+    line.spans = Box::default();
 }
 
 /// The rule itself, which [`flow_table`] draws again at the widths it settled on.
@@ -517,16 +517,24 @@ fn remap(line: &mut Line, map: &[(Range<usize>, usize)], new_len: usize) {
         }
         new_len
     };
-    for t in &mut line.tokens {
-        t.start = at(t.start);
-        t.end = at(t.end);
-    }
-    line.tokens.retain(|t| t.start < t.end);
-    for s in &mut line.spans {
-        s.start = at(s.start);
-        s.end = at(s.end);
-    }
-    line.spans.retain(|s| s.start < s.end);
+    // Rebuilt rather than edited: ranges live in exact-size boxed slices, and a
+    // table is a small enough fraction of rows that one collection is nothing.
+    line.tokens = line
+        .tokens
+        .iter()
+        .map(|t| (at(t.start as usize), at(t.end as usize), t.kind))
+        .filter(|(s, e, _)| s < e)
+        .map(|(s, e, k)| Token { start: s as u32, end: e as u32, kind: k })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    line.spans = line
+        .spans
+        .iter()
+        .map(|s| (at(s.start as usize), at(s.end as usize)))
+        .filter(|(s, e)| s < e)
+        .map(|(s, e)| Span { start: s as u32, end: e as u32 })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
 }
 
 // ------------------------------------------------- fitting a grid to a window
@@ -732,13 +740,13 @@ fn carry(
         (start < end).then(|| at + (start - piece.start)..at + (end - piece.start))
     };
     for t in row.tokens {
-        if let Some(r) = clip(t.start, t.end) {
-            tokens.push(Token { start: r.start, end: r.end, ..*t });
+        if let Some(r) = clip(t.start as usize, t.end as usize) {
+            tokens.push(Token { start: r.start as u32, end: r.end as u32, kind: t.kind });
         }
     }
     for s in row.spans {
-        if let Some(r) = clip(s.start, s.end) {
-            spans.push(Span { start: r.start, end: r.end });
+        if let Some(r) = clip(s.start as usize, s.end as usize) {
+            spans.push(Span { start: r.start as u32, end: r.end as u32 });
         }
     }
 }
@@ -1006,30 +1014,31 @@ fn mark(line: &Line, block: Block, out: &mut Vec<Range<usize>>) {
     }
 
     for t in &line.tokens {
-        if t.end > b.len() || t.start >= t.end {
+        let (ts, te) = (t.start as usize, t.end as usize);
+        if te > b.len() || ts >= te {
             continue;
         }
         let delim = match t.kind {
             // Two bytes a side by construction, but checked rather than assumed
             // so a differently-shaped token from another highlighter is left
             // alone instead of losing two bytes of its content.
-            Kind::Strong => wrapped(b, t, 2, |c| c == b'*' || c == b'_'),
-            Kind::Emphasis => wrapped(b, t, 1, |c| c == b'*' || c == b'_'),
+            Kind::Strong => wrapped(b, ts, te, 2, |c| c == b'*' || c == b'_'),
+            Kind::Emphasis => wrapped(b, ts, te, 1, |c| c == b'*' || c == b'_'),
             // A backtick run of any length, matched at both ends: ``a `b` c``
             // is one code span delimited by two.
             Kind::Str => {
-                let n = b[t.start..t.end].iter().take_while(|c| **c == b'`').count();
-                (n > 0).then(|| wrapped(b, t, n, |c| c == b'`')).flatten()
+                let n = b[ts..te].iter().take_while(|c| **c == b'`').count();
+                (n > 0).then(|| wrapped(b, ts, te, n, |c| c == b'`')).flatten()
             }
             Kind::Link => {
-                link_cuts(b, t, out);
+                link_cuts(b, ts, te, out);
                 None
             }
             _ => None,
         };
         if let Some(n) = delim {
-            push_sorted(out, t.start..t.start + n);
-            push_sorted(out, t.end - n..t.end);
+            push_sorted(out, ts..ts + n);
+            push_sorted(out, te - n..te);
         }
     }
 
@@ -1046,11 +1055,16 @@ fn mark(line: &Line, block: Block, out: &mut Vec<Range<usize>>) {
 /// `n` if the token wears `n` matching delimiter bytes at each end and has
 /// anything left in between, otherwise `None`. The last condition is what stops
 /// `****` from collapsing to nothing.
-fn wrapped(b: &[u8], t: &Token, n: usize, is_delim: impl Fn(u8) -> bool) -> Option<usize> {
-    let len = t.end - t.start;
-    (len > 2 * n
-        && b[t.start..t.start + n].iter().all(|c| is_delim(*c))
-        && b[t.end - n..t.end].iter().all(|c| is_delim(*c)))
+fn wrapped(
+    b: &[u8],
+    start: usize,
+    end: usize,
+    n: usize,
+    is_delim: impl Fn(u8) -> bool,
+) -> Option<usize> {
+    (end - start > 2 * n
+        && b[start..start + n].iter().all(|c| is_delim(*c))
+        && b[end - n..end].iter().all(|c| is_delim(*c)))
     .then_some(n)
 }
 
@@ -1060,24 +1074,24 @@ fn wrapped(b: &[u8], t: &Token, n: usize, is_delim: impl Fn(u8) -> bool) -> Opti
 /// It is not thrown away as far as the user is concerned — the row underneath is
 /// the source, one keystroke away in the default presentation — but on a rendered
 /// row it is what pushes the sentence off the screen.
-fn link_cuts(b: &[u8], t: &Token, out: &mut Vec<Range<usize>>) {
-    if b.get(t.start) != Some(&b'[') {
+fn link_cuts(b: &[u8], start: usize, end: usize, out: &mut Vec<Range<usize>>) {
+    if b.get(start) != Some(&b'[') {
         return;
     }
     // Rightmost `](` inside the token: the text half may contain brackets of its
     // own, the URL half may not contain the pair.
-    let close = (t.start + 1..t.end.saturating_sub(1))
+    let close = (start + 1..end.saturating_sub(1))
         .rev()
         .find(|&i| b[i] == b']' && b.get(i + 1) == Some(&b'('));
     let Some(close) = close else { return };
-    if close == t.start + 1 {
+    if close == start + 1 {
         return; // `[](url)` — nothing to show, so show the source.
     }
     // The `!` of an image sits outside the token; taken with the `[` as one cut
     // so the list stays sorted.
-    let from = if t.start > 0 && b[t.start - 1] == b'!' { t.start - 1 } else { t.start };
-    push_sorted(out, from..t.start + 1);
-    push_sorted(out, close..t.end);
+    let from = if start > 0 && b[start - 1] == b'!' { start - 1 } else { start };
+    push_sorted(out, from..start + 1);
+    push_sorted(out, close..end);
 }
 
 fn skip_space(b: &[u8], from: usize) -> usize {
@@ -1101,14 +1115,11 @@ fn push_sorted(out: &mut Vec<Range<usize>>, r: Range<usize>) {
 
 /// Removes `cuts` from the line and moves every token and span onto the result.
 ///
-/// Back to front, so an earlier cut's offsets are still valid when it is taken,
-/// and through [`String::drain`], so the line keeps the buffer it already owns.
-/// A row is not reallocated and no row is copied: on a 75k-line markdown diff
-/// that is the difference between this pass costing something and costing
-/// nothing.
-///
 /// The ranges are moved *before* the text, because both have to be described in
-/// the same coordinates while the mapping is computed.
+/// the same coordinates while the mapping is computed. The text is rebuilt
+/// rather than drained: it is an `Arc<str>` shared with the parsed diff and the
+/// rows other presentations hold, so the kept bytes go into a fresh buffer and
+/// the line takes it. One allocation per cut row, on `.md` files only.
 fn apply(line: &mut Line, cuts: &[Range<usize>]) {
     if cuts.is_empty() {
         return;
@@ -1130,20 +1141,33 @@ fn apply(line: &mut Line, cuts: &[Range<usize>]) {
         p - gone
     };
 
-    for t in &mut line.tokens {
-        t.start = shift(t.start);
-        t.end = shift(t.end);
-    }
-    line.tokens.retain(|t| t.start < t.end);
-    for s in &mut line.spans {
-        s.start = shift(s.start);
-        s.end = shift(s.end);
-    }
-    line.spans.retain(|s| s.start < s.end);
+    line.tokens = line
+        .tokens
+        .iter()
+        .map(|t| (shift(t.start as usize), shift(t.end as usize), t.kind))
+        .filter(|(s, e, _)| s < e)
+        .map(|(s, e, k)| Token { start: s as u32, end: e as u32, kind: k })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    line.spans = line
+        .spans
+        .iter()
+        .map(|s| (shift(s.start as usize), shift(s.end as usize)))
+        .filter(|(s, e)| s < e)
+        .map(|(s, e)| Span { start: s as u32, end: e as u32 })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
 
-    for c in cuts.iter().rev() {
-        line.text.drain(c.clone());
+    // Cuts are sorted and disjoint — `push_sorted` guarantees it — so one walk
+    // copies everything between them.
+    let mut out = String::with_capacity(line.text.len());
+    let mut cursor = 0usize;
+    for c in cuts {
+        out.push_str(&line.text[cursor..c.start]);
+        cursor = c.end;
     }
+    out.push_str(&line.text[cursor..]);
+    line.text = out.into();
 }
 
 #[cfg(test)]
@@ -1214,7 +1238,7 @@ mod tests {
     }
 
     fn text(t: &str) -> String {
-        one(t).1.text
+        one(t).1.text.to_string()
     }
 
     #[test]
@@ -1237,16 +1261,17 @@ mod tests {
         assert_eq!(blocks.len(), lines.len());
         for l in &lines {
             for t in &l.tokens {
-                assert!(t.end <= l.text.len(), "token {t:?} outside {:?}", l.text);
+                assert!(t.end as usize <= l.text.len(), "token {t:?} outside {:?}", l.text);
                 assert!(
-                    l.text.is_char_boundary(t.start) && l.text.is_char_boundary(t.end),
+                    l.text.is_char_boundary(t.start as usize)
+                        && l.text.is_char_boundary(t.end as usize),
                     "token {t:?} off a boundary in {:?}",
                     l.text
                 );
                 assert!(t.start < t.end, "empty token {t:?} in {:?}", l.text);
             }
             for s in &l.spans {
-                assert!(s.end <= l.text.len(), "span {s:?} outside {:?}", l.text);
+                assert!(s.end as usize <= l.text.len(), "span {s:?} outside {:?}", l.text);
                 assert!(s.start < s.end);
             }
         }
@@ -1288,7 +1313,7 @@ mod tests {
         // draws its title in the body colour.
         let (block, line) = one("## A title");
         assert_eq!(block, Block::Heading(2));
-        assert_eq!(line.text, "A title");
+        assert_eq!(line.text.as_ref(), "A title");
         let t = line.tokens.iter().find(|t| t.kind == Kind::Heading).expect("heading token");
         assert_eq!(&line.text[t.range()], "A title");
     }
@@ -1296,7 +1321,7 @@ mod tests {
     #[test]
     fn inline_emphasis_loses_its_delimiters_and_keeps_its_kind() {
         let (_, line) = one("a **strong** and an *emphatic* word");
-        assert_eq!(line.text, "a strong and an emphatic word");
+        assert_eq!(line.text.as_ref(), "a strong and an emphatic word");
         let by = |k: Kind| {
             line.tokens.iter().find(|t| t.kind == k).map(|t| line.text[t.range()].to_string())
         };
@@ -1307,7 +1332,7 @@ mod tests {
     #[test]
     fn a_code_span_loses_its_backticks_however_many_there_were() {
         let (_, line) = one("call `f()` please");
-        assert_eq!(line.text, "call f() please");
+        assert_eq!(line.text.as_ref(), "call f() please");
         let t = line.tokens.iter().find(|t| t.kind == Kind::Str).unwrap();
         assert_eq!(&line.text[t.range()], "f()");
         // A doubled fence around a span containing a backtick.
@@ -1324,7 +1349,7 @@ mod tests {
     #[test]
     fn a_link_keeps_its_text_and_drops_its_url() {
         let (_, line) = one("see [the docs](https://example.com/a/b) for more");
-        assert_eq!(line.text, "see the docs for more");
+        assert_eq!(line.text.as_ref(), "see the docs for more");
         let t = line.tokens.iter().find(|t| t.kind == Kind::Link).unwrap();
         assert_eq!(&line.text[t.range()], "the docs");
     }
@@ -1374,12 +1399,12 @@ mod tests {
         // code and has to survive, which is why nothing is cut from a Code row.
         let (blocks, lines) = run(" ```rust\n     let x = *p;\n ```\n text\n");
         assert_eq!(blocks[0], Block::Fence);
-        assert_eq!(lines[0].text, "rust");
+        assert_eq!(lines[0].text.as_ref(), "rust");
         assert_eq!(blocks[1], Block::Code);
         // Inside a fence nothing is markup: the text is untouched, indent included.
-        assert_eq!(lines[1].text, "    let x = *p;");
+        assert_eq!(lines[1].text.as_ref(), "    let x = *p;");
         assert_eq!(blocks[2], Block::Fence);
-        assert_eq!(lines[2].text, "");
+        assert_eq!(lines[2].text.as_ref(), "");
         assert_eq!(blocks[3], Block::Paragraph);
     }
 
@@ -1387,7 +1412,7 @@ mod tests {
     fn an_unlabelled_fence_leaves_an_empty_row_rather_than_backticks() {
         let (blocks, lines) = run(" ```\n body\n ```\n");
         assert_eq!(blocks[0], Block::Fence);
-        assert_eq!(lines[0].text, "");
+        assert_eq!(lines[0].text.as_ref(), "");
         assert_eq!(blocks[1], Block::Code);
     }
 
@@ -1442,7 +1467,7 @@ diff --git a/d.md b/d.md
     fn a_setext_underline_promotes_the_line_above_it() {
         let (blocks, lines) = run(" Title\n =====\n body\n");
         assert_eq!(blocks[0], Block::Heading(1));
-        assert_eq!(lines[0].text, "Title");
+        assert_eq!(lines[0].text.as_ref(), "Title");
         assert_eq!(blocks[1], Block::Blank, "the underline draws as nothing");
         assert_eq!(blocks[2], Block::Paragraph);
 
@@ -1480,9 +1505,9 @@ diff --git a/d.md b/d.md
     #[test]
     fn a_table_is_padded_to_its_widest_cell_in_each_column() {
         let (_, lines) = run(" | stage | time |\n |---|---|\n | assign lanes | 301 ms |\n");
-        assert_eq!(lines[0].text, "│ stage        │ time   │");
-        assert_eq!(lines[1].text, "├──────────────┼────────┤");
-        assert_eq!(lines[2].text, "│ assign lanes │ 301 ms │");
+        assert_eq!(lines[0].text.as_ref(), "│ stage        │ time   │");
+        assert_eq!(lines[1].text.as_ref(), "├──────────────┼────────┤");
+        assert_eq!(lines[2].text.as_ref(), "│ assign lanes │ 301 ms │");
         // Every row of a grid is the same width, which is the whole point.
         let w: Vec<usize> = lines.iter().map(|l| l.text.chars().count()).collect();
         assert!(w.windows(2).all(|p| p[0] == p[1]), "ragged: {w:?}");
@@ -1492,7 +1517,7 @@ diff --git a/d.md b/d.md
     fn the_separator_says_how_its_columns_align() {
         let (_, lines) =
             run(" | l | c | r |\n |:--|:-:|--:|\n | 1 | 2 | 3 |\n | xxxx | yyyy | zzzz |\n");
-        assert_eq!(lines[2].text, "│ 1    │  2   │    3 │");
+        assert_eq!(lines[2].text.as_ref(), "│ 1    │  2   │    3 │");
     }
 
     #[test]
@@ -1500,8 +1525,8 @@ diff --git a/d.md b/d.md
         // Ragged tables are normal by hand, and a row that stopped early would
         // break the grid under it.
         let (_, lines) = run(" | a | b | c |\n | d |\n");
-        assert_eq!(lines[0].text, "│ a │ b │ c │");
-        assert_eq!(lines[1].text, "│ d │   │   │");
+        assert_eq!(lines[0].text.as_ref(), "│ a │ b │ c │");
+        assert_eq!(lines[1].text.as_ref(), "│ d │   │   │");
     }
 
     #[test]
@@ -1509,8 +1534,8 @@ diff --git a/d.md b/d.md
         // A run, not the hunk: the second table's long cell must not widen the
         // first table's column.
         let (_, lines) = run(" | a |\n\x20\n text\n\x20\n | wiiiiiide |\n");
-        assert_eq!(lines[0].text, "│ a │");
-        assert_eq!(lines[4].text, "│ wiiiiiide │");
+        assert_eq!(lines[0].text.as_ref(), "│ a │");
+        assert_eq!(lines[4].text.as_ref(), "│ wiiiiiide │");
     }
 
     #[test]
@@ -1520,8 +1545,8 @@ diff --git a/d.md b/d.md
         let (_, lines) = run("-| a | b |\n+| a | bbbbbbbbbb |\n");
         let removed = lines.iter().find(|l| l.kind == LineKind::Removed).unwrap();
         let added = lines.iter().find(|l| l.kind == LineKind::Added).unwrap();
-        assert_eq!(removed.text, "│ a │ b │");
-        assert_eq!(added.text, "│ a │ bbbbbbbbbb │");
+        assert_eq!(removed.text.as_ref(), "│ a │ b │");
+        assert_eq!(added.text.as_ref(), "│ a │ bbbbbbbbbb │");
     }
 
     #[test]
@@ -1529,7 +1554,7 @@ diff --git a/d.md b/d.md
         // The hard part: the cell was trimmed of backticks by the cut pass and
         // then moved by the padding, so its token has been through both.
         let (_, lines) = run(" | `code` | x |\n | aaaaaaaa | y |\n");
-        assert_eq!(lines[0].text, "│ code     │ x │");
+        assert_eq!(lines[0].text.as_ref(), "│ code     │ x │");
         let t = lines[0].tokens.iter().find(|t| t.kind == Kind::Str).expect("a code span");
         assert_eq!(&lines[0].text[t.range()], "code");
     }
@@ -1537,7 +1562,7 @@ diff --git a/d.md b/d.md
     #[test]
     fn an_escaped_pipe_is_not_a_column_boundary() {
         let (_, lines) = run(r" | a \| b | c |");
-        assert_eq!(lines[0].text, r"│ a \| b │ c │");
+        assert_eq!(lines[0].text.as_ref(), r"│ a \| b │ c │");
     }
 
     #[test]
@@ -1550,7 +1575,7 @@ diff --git a/d.md b/d.md
         let mut lines = std::mem::take(&mut p.files[0].hunks[0].lines);
         let blocks = lay_out(&mut lines, &Layout::proportional());
         assert_eq!(blocks[0], Block::Table);
-        assert_eq!(lines[0].text, "| a | bbbb |", "a table was padded anyway");
+        assert_eq!(lines[0].text.as_ref(), "| a | bbbb |", "a table was padded anyway");
     }
 
     #[test]
@@ -1559,8 +1584,8 @@ diff --git a/d.md b/d.md
         // separator. Aligning to what is present beats refusing to align.
         let (blocks, lines) = run(" | mid | row |\n | another | one |\n");
         assert!(blocks.iter().all(|b| *b == Block::Table));
-        assert_eq!(lines[0].text, "│ mid     │ row │");
-        assert_eq!(lines[1].text, "│ another │ one │");
+        assert_eq!(lines[0].text.as_ref(), "│ mid     │ row │");
+        assert_eq!(lines[1].text.as_ref(), "│ another │ one │");
     }
 
     #[test]
@@ -1571,7 +1596,7 @@ diff --git a/d.md b/d.md
         let (blocks, lines) = run(" | keep | this |\n-| old | x |\n+| new | y |\n");
         assert!(blocks.iter().all(|b| *b == Block::Table));
         let context = lines.iter().find(|l| l.kind == LineKind::Context).unwrap();
-        assert_eq!(context.text, "│ keep │ this │");
+        assert_eq!(context.text.as_ref(), "│ keep │ this │");
         // Every row of the grid the context row belongs to is the same width.
         let w: Vec<usize> = lines.iter().map(|l| l.text.chars().count()).collect();
         assert!(w.windows(2).all(|p| p[0] == p[1]), "ragged: {w:?} in {lines:#?}");
@@ -1598,8 +1623,8 @@ diff --git a/d.md b/d.md
             table: TableGlyphs { vertical: "|", horizontal: "-", cross: "+", end: ("+", "+") },
         };
         lay_out(&mut lines, &ascii);
-        assert_eq!(lines[0].text, "| a | b |");
-        assert_eq!(lines[1].text, "+---+---+");
+        assert_eq!(lines[0].text.as_ref(), "| a | b |");
+        assert_eq!(lines[1].text.as_ref(), "+---+---+");
     }
 
     #[test]
@@ -1615,10 +1640,10 @@ diff --git a/d.md b/d.md
         // with everything else or the wrong word lights up.
         let (_, lines) = run("-## alpha beta\n+## alpha gamma\n");
         let added = lines.iter().find(|l| l.kind == LineKind::Added).unwrap();
-        assert_eq!(added.text, "alpha gamma");
+        assert_eq!(added.text.as_ref(), "alpha gamma");
         assert!(!added.spans.is_empty(), "expected a changed word");
         let marked: Vec<&str> =
-            added.spans.iter().map(|s| &added.text[s.start..s.end]).collect();
+            added.spans.iter().map(|s| &added.text[s.start as usize..s.end as usize]).collect();
         assert!(marked.iter().any(|m| m.contains("gamma")), "spans point at {marked:?}");
     }
 
@@ -1629,16 +1654,19 @@ diff --git a/d.md b/d.md
         // stray block.
         let (_, lines) = run("-# title\n+## title\n");
         for l in &lines {
-            assert!(l.spans.iter().all(|s| s.start < s.end && s.end <= l.text.len()));
+            assert!(l.spans.iter().all(|s| s.start < s.end && s.end as usize <= l.text.len()));
         }
     }
 
     #[test]
     fn multi_byte_text_survives_the_cut() {
         let (_, line) = one("**Café** naïve 😀 [ok](u)");
-        assert_eq!(line.text, "Café naïve 😀 ok");
+        assert_eq!(line.text.as_ref(), "Café naïve 😀 ok");
         for t in &line.tokens {
-            assert!(line.text.is_char_boundary(t.start) && line.text.is_char_boundary(t.end));
+            assert!(
+                line.text.is_char_boundary(t.start as usize)
+                    && line.text.is_char_boundary(t.end as usize)
+            );
         }
     }
 
@@ -1657,7 +1685,7 @@ diff --git a/d.md b/d.md
         // percent of changed rows. Cheap to leave; see the decision record.
         let (block, line) = one("## A `code` heading");
         assert_eq!(block, Block::Heading(2));
-        assert_eq!(line.text, "A `code` heading", "the hashes still go");
+        assert_eq!(line.text.as_ref(), "A `code` heading", "the hashes still go");
     }
 
     #[test]
@@ -1665,7 +1693,7 @@ diff --git a/d.md b/d.md
         let before = "just some prose with no markup at all";
         let (block, line) = one(before);
         assert_eq!(block, Block::Paragraph);
-        assert_eq!(line.text, before);
+        assert_eq!(line.text.as_ref(), before);
     }
 
     #[test]
@@ -1705,14 +1733,14 @@ diff --git a/d.md b/d.md
             old_no: Some(1),
             new_no: Some(1),
             text: "plain strong words".into(),
-            spans: vec![Span { start: 6, end: 12 }],
-            tokens: vec![Token { start: 6, end: 12, kind: Kind::Strong }],
+            spans: Box::new([Span { start: 6, end: 12 }]),
+            tokens: Box::new([Token { start: 6, end: 12, kind: Kind::Strong }]),
         };
         let mut cuts = Vec::new();
         mark(&line, Block::Paragraph, &mut cuts);
         assert!(cuts.is_empty(), "cut {cuts:?} out of a token with no delimiters");
         apply(&mut line, &cuts);
-        assert_eq!(line.text, "plain strong words");
+        assert_eq!(line.text.as_ref(), "plain strong words");
         assert_eq!(&line.text[line.tokens[0].range()], "strong");
     }
 
@@ -1856,7 +1884,7 @@ diff --git a/d.md b/d.md
             .tokens
             .iter()
             .filter(|t| t.kind == Kind::Strong)
-            .map(|t| &row.text[t.start..t.end])
+            .map(|t| &row.text[t.start as usize..t.end as usize])
             .collect();
         assert_eq!(strong, vec!["emphatic", "phrase"], "in {:?}", row.text);
     }

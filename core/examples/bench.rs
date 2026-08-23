@@ -97,7 +97,7 @@ fn main() {
             .iter()
             .flat_map(|f| &f.hunks)
             .flat_map(|h| &h.lines)
-            .map(|l| (l.text.as_str(), cols)),
+            .map(|l| (l.text.as_ref(), cols)),
         &wrap::Word,
     );
     let wrapping = t.elapsed();

@@ -277,7 +277,7 @@ impl Rows for SplitRows {
         }
         self.cols = cols;
         self.wrap = wrap.name();
-        self.wrapped = Wrapped::build(self.lines.iter().map(|l| (l.text.as_str(), cols)), wrap);
+        self.wrapped = Wrapped::build(self.lines.iter().map(|l| (l.text.as_ref(), cols)), wrap);
         true
     }
 
