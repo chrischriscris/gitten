@@ -325,8 +325,11 @@ mod tests {
 
     #[test]
     fn a_client_takes_its_own_flags_before_the_shared_parse_sees_them() {
+        // A revspec and not the bare working tree: `diff .` is "no changes" on
+        // whatever clean checkout runs the tests, and this wants an acquisition
+        // that succeeds everywhere the repo has history at all.
         let mut s = Startup::new("plait-test", View::Diff)
-            .args("diff --port 9000 .".split_whitespace().map(String::from).collect());
+            .args("diff --port 9000 . HEAD~1..HEAD".split_whitespace().map(String::from).collect());
         let port = cli::take_value(s.take(), "--port").unwrap();
         assert_eq!(port.as_deref(), Some("9000"));
         let started = s.go().unwrap_or_else(|_| panic!("start"));

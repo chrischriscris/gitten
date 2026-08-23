@@ -277,6 +277,14 @@ impl Rows for SplitRows {
         }
         self.cols = cols;
         self.wrap = wrap.name();
+        // A wrap that breaks nothing needs no scan: the unbroken table is the
+        // default one, and building it to be told so is a pass over every line
+        // in the diff on every column of a resize drag.
+        if !wrap.breaks_lines() {
+            let broken = self.wrapped.total() > self.wrapped.lines();
+            self.wrapped = Wrapped::default();
+            return broken;
+        }
         self.wrapped = Wrapped::build(self.lines.iter().map(|l| (l.text.as_ref(), cols)), wrap);
         true
     }
@@ -421,7 +429,7 @@ diff --git a/a.rs b/a.rs
         fn new(raw: &str, cols: usize, wrap: &dyn Wrap) -> Self {
             let host = Host::new();
             let layouts = Layouts::builtin();
-            let mut owners = layouts.build(layouts.position("side-by-side").unwrap(), &host);
+            let mut owners = layouts.build(layouts.position("split").unwrap(), &host);
             let a = assemble(&parse_unified_diff(raw), &host, &mut owners);
             for o in owners.iter_mut() {
                 o.reflow(cols, &host, wrap);
@@ -596,9 +604,25 @@ diff --git a/a.rs b/a.rs
 
     #[test]
     fn a_reflow_that_changes_nothing_says_so() {
-        let mut h = Harness::new(DIFF, 60, &Word);
+        // The answer is "did the row expansion change", not "did the policy":
+        // switching to a wrap that joins no rows back is not a change, and
+        // saying so would rebuild the order table for nothing.
+        let raw = format!(
+            "diff --git a/a.rs b/a.rs\n@@ -1,1 +1,1 @@\n-{}\n+b\n",
+            "word ".repeat(30)
+        );
+        let mut h = Harness::new(&raw, 80, &Word);
         let host = Host::new();
-        assert!(!h.owners[0].reflow(60, &host, &Word));
-        assert!(h.owners[0].reflow(60, &host, &Off));
+        assert!(!h.owners[0].reflow(80, &host, &Word), "same width, same policy");
+        // Off pulls the wrapped line back together — the order table must hear.
+        assert!(h.owners[0].reflow(80, &host, &Off));
+        // And off to off changed nothing at all.
+        assert!(!h.owners[0].reflow(80, &host, &Off));
+        assert!(h.owners[0].reflow(80, &host, &Word), "and apart again");
+
+        // A diff with nothing long enough to wrap never comes apart, so neither
+        // direction of the switch is a structural change.
+        let mut h = Harness::new(DIFF, 60, &Word);
+        assert!(!h.owners[0].reflow(60, &host, &Off));
     }
 }

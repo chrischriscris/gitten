@@ -176,7 +176,10 @@ impl Layouts {
     pub fn builtin() -> Self {
         let mut l = Self(Vec::new());
         l.register("unified", |_| vec![Box::new(TextRows::default())]);
-        l.register("side-by-side", |_| vec![Box::new(crate::split::SplitRows::default())]);
+        // The same name the desktop registers and `plait.toml` documents:
+        // `diff.layout` is data, and one value has to open this presentation
+        // from every client that reads the file.
+        l.register("split", |_| vec![Box::new(crate::split::SplitRows::default())]);
         l
     }
 

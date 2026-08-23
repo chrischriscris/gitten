@@ -16,11 +16,11 @@
 //!
 //! # One column width for the whole diff
 //!
-//! Half the window each, less the rule between them, whatever the diff holds and
-//! whatever the wrap is doing — so the divider is one straight vertical line from
-//! the first row to the last and it is in the same place in every diff. Per-file
-//! widths move the divider as you scroll, and a boundary that drifts is worse
-//! than one that is too far right.
+//! Half of what is left after the page padding and the rule between them,
+//! whatever the diff holds and whatever the wrap is doing — so the divider is
+//! one straight vertical line from the first row to the last and it is in the
+//! same place in every diff. Per-file widths move the divider as you scroll, and
+//! a boundary that drifts is worse than one that is too far right.
 //!
 //! **Wrapping on**, everything fits: a line too wide for a column continues on
 //! the row below and a pair row is as tall as its taller side. **Wrapping off**,
@@ -80,6 +80,14 @@ impl Column {
             Column::New => 1,
         }
     }
+
+    /// The name, for a debug selector.
+    fn name(self) -> &'static str {
+        match self {
+            Column::Old => "old",
+            Column::New => "new",
+        }
+    }
 }
 
 /// Width of one column's line-number gutter, including the air after the digits.
@@ -105,11 +113,18 @@ const RULE_W: f32 = 1.0;
 /// width can come out a pixel or two over and clip its last character.
 const SLACK: f32 = 2.0;
 
-/// Everything drawn besides the two columns of text: a gutter and a sign column
-/// on each side, and the rule between them. Half of what is left is one column,
-/// which is what makes a wrapped line here break at half the width it would in
-/// the unified presentation.
-const CHROME: f32 = 2.0 * (GUTTER_W + SIGN_W) + RULE_W;
+/// Everything drawn besides the two columns of text: the page padding at each
+/// edge, a gutter and a sign column on each side, and the rule between them.
+/// Half of what is left is one column, which is what makes a wrapped line here
+/// break at half the width it would in the unified presentation.
+///
+/// The padding is the unified view's [`PAD`] and not zero, for the same reasons
+/// that view has it: the headers this presentation shares are drawn at `PAD`,
+/// and a gutter starting left of them reads as a mistake; and the vertical
+/// scrollbar overlays the right edge, so an unwrapped right-hand column without
+/// a right pad runs under it. The divider stays one straight line — every row
+/// loses the same two strips.
+const CHROME: f32 = 2.0 * PAD + 2.0 * (GUTTER_W + SIGN_W) + RULE_W;
 
 /// One prepared line, ready to draw. Held in a flat table so that a context
 /// line, which appears in both columns, is stored once.
@@ -319,9 +334,9 @@ impl Rows for SplitRows {
             Row::File { path, .. } => Some(header_hit(path, x, host, shift)),
             Row::Hunk(h) => Some(header_hit(h, x, host, shift)),
             Row::Pair { old, new } => {
-                let cell = self.cell_px(self.width);
+                let cell = PAD + self.cell_px(self.width);
                 let (part, from) = match x < cell + RULE_W {
-                    true => (Column::Old, 0.0),
+                    true => (Column::Old, PAD),
                     false => (Column::New, cell + RULE_W),
                 };
                 let line = match part {
@@ -387,12 +402,19 @@ impl Rows for SplitRows {
             }
             Row::Hunk(header) => hunk_header(header, theme, sel, shift),
             Row::Pair { old, new } => {
-                // No pixel width for the columns: two flex halves and a fixed
-                // rule between them come out at exactly `cell_px` each, which is
-                // what the hit test measures the divider at.
+                // Page padding, then two columns of *measured* width and a
+                // fixed rule. The width is `cell_px` — the number the hit test
+                // divides clicks at — and not a flex share: as a direct child
+                // of a `uniform_list` item, two `flex_1` halves do not come out
+                // equal (the list measures its items against their content, and
+                // the distribution goes content-driven; measured, not guessed —
+                // see `list_layout_tests`). Fixed pixels cannot drift, and they
+                // make drawing and hit test the same number by construction.
+                let cell = px(self.cell_px(self.width));
                 row_frame()
                     .items_center()
-                    .child(self.cell(*old, seg, Column::Old, theme, sel, shift))
+                    .px(px(PAD))
+                    .child(self.cell(*old, seg, Column::Old, theme, sel, shift, index, cell))
                     .child(
                         div()
                             .flex_none()
@@ -404,7 +426,7 @@ impl Rows for SplitRows {
                             // text floor is a bright seam down the window.
                             .bg(rgb(theme.diff.rule)),
                     )
-                    .child(self.cell(*new, seg, Column::New, theme, sel, shift))
+                    .child(self.cell(*new, seg, Column::New, theme, sel, shift, index, cell))
                     .into_any_element()
             }
         }
@@ -412,15 +434,16 @@ impl Rows for SplitRows {
 }
 
 impl SplitRows {
-    /// How wide one column is, gutter and sign included: half of what is left of
-    /// the window after the rule.
+    /// How wide one column is, gutter and sign included: half of what is left
+    /// of the window after the page padding and the rule.
     ///
     /// Shared by the drawing and the hit test so the divider is in the same place
     /// in both — the click that lands on the wrong side of it is the whole bug
-    /// this one function prevents. The drawing gets it as two flex halves rather
-    /// than as this number, which is the same arithmetic done by the layout.
+    /// this one function prevents. The drawing takes it as a literal pixel
+    /// width, so the divider *is* this number rather than the same arithmetic
+    /// done twice.
     fn cell_px(&self, width: f32) -> f32 {
-        ((width - RULE_W) / 2.0).max(0.0)
+        ((width - 2.0 * PAD - RULE_W) / 2.0).max(0.0)
     }
 
     /// How wide one column's *text* is, in pixels: the column less its own gutter
@@ -455,6 +478,8 @@ impl SplitRows {
         theme: &Theme,
         sel: Option<Selected>,
         shift: f32,
+        row: usize,
+        width: gpui::Pixels,
     ) -> AnyElement {
         let p = &theme.diff;
         // Past the end of *this* side of a pair whose other side wrapped
@@ -464,7 +489,10 @@ impl SplitRows {
         let Some(index) = self.present(line, seg) else {
             // Nothing opposite: a flat, darker block, so a run of them reads as
             // a hole in the column rather than as unchanged content.
-            return column_frame().bg(rgb(p.absent_bg)).into_any_element();
+            return cell_frame(width)
+                .debug_selector(move || format!("cell-{}-{row}", column.name()))
+                .bg(rgb(p.absent_bg))
+                .into_any_element();
         };
         let line = &self.lines[index as usize];
         let (bg, fg, sign) = line_colors(line.kind, line.moved, p);
@@ -478,7 +506,8 @@ impl SplitRows {
         // One borrow per cell: the number formats into it and the run list
         // sweeps through it, both copied out as the elements take them.
         let mut sc = self.scratch.borrow_mut();
-        column_frame()
+        cell_frame(width)
+            .debug_selector(move || format!("cell-{}-{row}", column.name()))
             .items_center()
             .bg(rgb(bg))
             // Right-aligned, for the reason the unified view's is: a column of
@@ -523,23 +552,26 @@ impl SplitRows {
     }
 }
 
-/// One column of one row: half of what the rule leaves, whatever is in it.
+/// One column of one row: its measured half, whatever is in it.
 ///
-/// `flex_1` and not a measured width, so the two columns and the rule come out at
-/// exactly the row's width however the window is dragged — and `min_w(0)`,
-/// because a flex item is otherwise no narrower than its content and a
-/// 2000-character line would push the new file off the screen. The clipping is
-/// [`scrolled`]'s, one level in: the gutter and the sign are in here too and they
-/// are the things that must not move.
-fn column_frame() -> Div {
-    div().flex().flex_1().min_w(px(0.)).h(px(ROW_H))
+/// A pixel width and not `flex_1`: as a direct child of a `uniform_list` item,
+/// two flex halves of the same row do not come out equal — the list measures
+/// its items against their content and the distribution goes content-driven,
+/// which staggered the right-hand column by whatever the left-hand text was.
+/// Measured repeatedly in [`list_layout_tests`]; fixed widths also make the
+/// drawn divider *be* the number `hit` divides clicks at, rather than the same
+/// arithmetic done twice. The clipping is [`scrolled`]'s, one level in: the
+/// gutter and the sign are in here too and they are the things that must not
+/// move.
+fn cell_frame(width: gpui::Pixels) -> Div {
+    div().flex().flex_none().w(width).min_w(px(0.)).h(px(ROW_H))
 }
 
 #[cfg(test)]
 mod tests {
     // By name, not a glob: `use gpui::*` in the parent shadows `#[test]` with
     // GPUI's own attribute macro and every test in here fails to expand.
-    use super::{Column, Row, Rows, SplitRows, GUTTER_W, RULE_W, SIGN_W};
+    use super::{Column, Row, Rows, SplitRows, GUTTER_W, RULE_W, SIGN_W, PAD};
     use plait_core::host::Host;
     use plait_core::prepared::prepare;
     use plait_core::parse_unified_diff;
@@ -717,15 +749,18 @@ diff --git a/a.rs b/a.rs
         let mut r = built();
         r.reflow(900.0, &host, host.wrap.current());
         let pair = (0..r.len()).find(|i| matches!(r.rows[*i], Row::Pair { .. })).unwrap();
-        let cell = r.cell_px(900.0);
+        let rule_at = PAD + r.cell_px(900.0);
 
-        let left = r.hit(pair, 0, GUTTER_W + SIGN_W + 2.0, &host, 0.0).unwrap();
+        let left = r.hit(pair, 0, PAD + GUTTER_W + SIGN_W + 2.0, &host, 0.0).unwrap();
         assert_eq!(left.part, Column::Old.part());
-        let right = r.hit(pair, 0, cell + RULE_W + GUTTER_W + SIGN_W + 2.0, &host, 0.0).unwrap();
+        let right = r.hit(pair, 0, rule_at + RULE_W + GUTTER_W + SIGN_W + 2.0, &host, 0.0).unwrap();
         assert_eq!(right.part, Column::New.part());
         // Either side of the rule itself, and nothing in between.
-        assert_eq!(r.hit(pair, 0, cell - 1.0, &host, 0.0).unwrap().part, 0);
-        assert_eq!(r.hit(pair, 0, cell + RULE_W + 1.0, &host, 0.0).unwrap().part, 1);
+        assert_eq!(r.hit(pair, 0, rule_at - 1.0, &host, 0.0).unwrap().part, 0);
+        assert_eq!(r.hit(pair, 0, rule_at + RULE_W + 1.0, &host, 0.0).unwrap().part, 1);
+        // The page padding is the left column's too: a click on it is a click in
+        // the old half, not a miss.
+        assert_eq!(r.hit(pair, 0, PAD - 1.0, &host, 0.0).unwrap().part, 0);
     }
 
     #[test]
@@ -766,13 +801,13 @@ diff --git a/a.rs b/a.rs
         // A fifth of a character in, and not half: `column_at` rounds, so a
         // click exactly on a boundary is a coin toss between two answers and
         // neither of them is what this test is about.
-        let text = GUTTER_W + SIGN_W + 0.2 * cw;
+        let into = GUTTER_W + SIGN_W + 0.2 * cw;
 
-        assert_eq!(r.hit(pair, 0, text, &host, 0.0).unwrap().off, 0);
-        assert_eq!(r.hit(pair, 0, text, &host, shift).unwrap().off, 4);
-        // The right-hand column too, from its own edge, and still part 1: the
-        // divider did not move.
-        let across = r.cell_px(900.0) + RULE_W + text;
+        assert_eq!(r.hit(pair, 0, PAD + into, &host, 0.0).unwrap().off, 0);
+        assert_eq!(r.hit(pair, 0, PAD + into, &host, shift).unwrap().off, 4);
+        // The right-hand column too, from its own edge — past the padding and
+        // the rule — and still part 1: the divider did not move.
+        let across = PAD + r.cell_px(900.0) + RULE_W + into;
         let right = r.hit(pair, 0, across, &host, shift).unwrap();
         assert_eq!((right.part, right.off), (1, 4));
         // A click on a line number is the first character there is to see, not
@@ -788,5 +823,199 @@ diff --git a/a.rs b/a.rs
         assert_eq!(r.selectable(0, 0), Some("a.rs"));
         assert_eq!(r.selectable(0, 1), Some("a.rs"));
         assert_eq!(r.selectable(1, 0), r.selectable(1, 1));
+    }
+}
+
+/// The presentation laid out by the real list, measured.
+///
+/// The isolated row lays out correctly (see `tests/pair_layout.rs`), so when
+/// real use staggers rows across the window, what is left is this: the
+/// presentation through [`uniform_list`], at the widths and in the sequence the
+/// view actually drives it. This opens a headless window, paints both the
+/// pre-reflow frame the first paint gets and the reflowed one after, and reads
+/// every visible row's bounds back.
+#[cfg(test)]
+mod list_layout_tests {
+    use std::rc::Rc;
+
+    use super::{Rows, SplitRows, RULE_W, PAD};
+    use gpui::{
+        px, size, AppContext, Bounds, Context, IntoElement, Render, Styled, WindowBounds,
+        WindowOptions,
+    };
+    use plait_core::host::Host;
+    use plait_core::parse_unified_diff;
+    use plait_core::prepared::prepare;
+
+    // The parent's `use gpui::*` shadows `#[test]` with GPUI's own macro; these
+    // tests are named through it on purpose and keep it fully qualified.
+
+    const W: f32 = 1536.0;
+
+    // check.yml's shape: a hunk of long additions (each wraps), then a hunk of
+    // pairs and holes. Whatever makes rows wander should wander here too.
+    const SRC: &str = "\
+diff --git a/.github/workflows/check.yml b/.github/workflows/check.yml
+@@ -0,0 +1,4 @@
++name: check
++# Everything that can be checked without opening a window - the CI half of ./check.sh. Two jobs, deliberately small:
++jobs:
++  check:
+@@ -10,3 +14,6 @@
+ context one
+-old line that is quite long indeed and will not fit into half of any reasonable window width without wrapping somewhere
++new line that is also quite long indeed and will not fit into half of any reasonable window width either
++lone addition opposite nothing at all
+ context two
+";
+
+    struct Probe {
+        rows: Rc<SplitRows>,
+        host: Rc<Host>,
+        flat: Rc<Vec<(usize, u16)>>,
+    }
+
+    impl Render for Probe {
+        fn render(
+            &mut self,
+            _window: &mut gpui::Window,
+            _cx: &mut Context<Self>,
+        ) -> impl IntoElement {
+            let rows = self.rows.clone();
+            let host = self.host.clone();
+            let flat = self.flat.clone();
+            gpui::uniform_list("probe", flat.len(), move |range, _, _| {
+                range
+                    .map(|k| {
+                        let (i, seg) = flat[k];
+                        rows.render(i, seg as usize, &host, None, 0.0)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .size_full()
+        }
+    }
+
+    /// Build → build files → **reflow**, which is where every real session
+    /// converges after the probe reports the width.
+    fn ready() -> (Rc<SplitRows>, Rc<Host>, Vec<(usize, u16)>) {
+        let host = Host::new();
+        let mut r = SplitRows::default();
+        let mut p = prepare(&parse_unified_diff(SRC), &host.syntax, 2000);
+        for f in p.files.drain(..) {
+            r.build(f);
+        }
+        r.reflow(W, &host, host.wrap.current());
+        let mut flat = Vec::new();
+        for i in 0..r.len() {
+            for seg in 0..r.rows(i) {
+                flat.push((i, seg as u16));
+            }
+        }
+        assert!(flat.len() > 6, "nothing wrapped; the fixture is not exercising the bug");
+        (Rc::new(r), Rc::new(host), flat)
+    }
+
+    #[gpui::test]
+    fn every_row_spans_the_viewport_from_x_zero(cx: &mut gpui::TestAppContext) {
+        let (rows, host, flat) = ready();
+        let n = flat.len().min(9);
+        let handle = cx.update(|cx| {
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Default::default(),
+                        size: size(px(W), px(300.)),
+                    })),
+                    ..Default::default()
+                },
+                |_window, cx| {
+                    cx.new(|_| Probe { rows, host, flat: Rc::new(flat[..n].to_vec()) })
+                },
+            )
+            .unwrap()
+        });
+        let mut cx = gpui::VisualTestContext::from_window(handle.into(), cx);
+
+        // The cells inside the rows. With no wrapper between list and row this
+        // is exactly how the real view lays them out, and it is where the
+        // flex halves went unequal — asserted equal now that they are pixels.
+        let half = (W - 2.0 * PAD - RULE_W) / 2.0;
+        let mut checked = 0;
+        for k in 0..n {
+            let o_sel: &'static str = Box::leak(format!("cell-old-{k}").into_boxed_str());
+            let n_sel: &'static str = Box::leak(format!("cell-new-{k}").into_boxed_str());
+            let (Some(o), Some(nw)) = (cx.debug_bounds(o_sel), cx.debug_bounds(n_sel)) else {
+                continue;
+            };
+            checked += 1;
+            assert!(
+                (f32::from(o.size.width) - half).abs() < 1.0,
+                "row {k} old cell {} != {half}",
+                o.size.width
+            );
+            assert!(
+                (f32::from(nw.size.width) - half).abs() < 1.0,
+                "row {k} new cell {} != {half}",
+                nw.size.width
+            );
+            assert_eq!(nw.origin.x, px(PAD + half + RULE_W), "row {k} new column drifted");
+        }
+        assert!(checked >= 3, "only {checked} rows laid out cells");
+    }
+
+    /// The whole view — [`Diff::new`], its list, its probe, its reflow — with
+    /// nothing hand-rolled. If real use staggers the columns, this sees it.
+    #[gpui::test]
+    fn the_real_view_holds_two_columns(cx: &mut gpui::TestAppContext) {
+        let handle = cx.update(|cx| {
+            gpui_component::init(cx);
+            let mut host = Host::new();
+            host.layout = "split".into();
+            let host = Rc::new(host);
+            cx.set_global(crate::config::Active(host.clone()));
+            let files = parse_unified_diff(SRC);
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Default::default(),
+                        size: size(px(W), px(600.)),
+                    })),
+                    ..Default::default()
+                },
+                |_window, cx| cx.new(|cx| crate::views::diff::Diff::new(files, host, cx)),
+            )
+            .unwrap()
+        });
+        // The probe reports the width one frame late and notifies; park until
+        // the reflow that follows has been painted.
+        let mut cx = gpui::VisualTestContext::from_window(handle.into(), cx);
+        cx.run_until_parked();
+
+        let half = (W - 2.0 * PAD - RULE_W) / 2.0;
+        let mut checked = 0;
+        for k in 0..13 {
+            let old: &'static str = Box::leak(format!("cell-old-{k}").into_boxed_str());
+            let new: &'static str = Box::leak(format!("cell-new-{k}").into_boxed_str());
+            let (Some(o), Some(n)) = (cx.debug_bounds(old), cx.debug_bounds(new)) else {
+                continue; // past what the window painted
+            };
+            checked += 1;
+            let drift = |actual: f32, expected: f32, what: String| {
+                assert!(
+                    (actual - expected).abs() < 1.5,
+                    "{what}: {actual} != {expected}"
+                );
+            };
+            drift(f32::from(o.origin.x), PAD, format!("row {k} old column drifted"));
+            drift(
+                f32::from(n.origin.x),
+                PAD + half + RULE_W,
+                format!("row {k} new column drifted"),
+            );
+            drift(f32::from(o.size.width), half, format!("row {k} old cell width"));
+            drift(f32::from(n.size.width), half, format!("row {k} new cell width"));
+        }
+        assert!(checked >= 5, "only {checked} rows painted; the fixture shrank");
     }
 }

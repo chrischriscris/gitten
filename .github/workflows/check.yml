@@ -1,14 +1,12 @@
 # Everything that can be checked without opening a window — the CI half of
 # ./check.sh. Two jobs, deliberately small:
 #
-#   test   — the correctness section of check.sh verbatim. Every one of these
-#            crates is headless by design: core has no dependencies at all,
-#            web's tests are payloads and row indexes, tui's screen is a cell
-#            buffer. Ubuntu because it is cheap, and green here doubles as the
-#            Linux canary for every crate but the window.
+#   test   — the portable part of check.sh's correctness section. Core has no
+#            dependencies at all, web's tests are payloads and row indexes, and
+#            tui's screen is a cell buffer.
 #   linux  — "nothing may be *written* in a way that makes Linux impossible."
-#            GPUI compiles there today; this keeps that true. Compile only —
-#            drawing needs a display, so tests live in `test`.
+#            GPUI compiles there today; this keeps that true. Its native headers
+#            also make this the cheap place to run shell's headless GPUI tests.
 #
 # What is deliberately absent, and why, is decision 0024.
 name: check
@@ -51,3 +49,4 @@ jobs:
             libwayland-dev libudev-dev libvulkan-dev
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets --locked
+      - run: cargo test -q --locked -p plait-shell

@@ -28,6 +28,9 @@ cargo test -q -p plait-web 2>&1 | grep -E "^test result|^error" || true
 # is a cell buffer, so "this row is a removal, red on dark red, with the changed
 # word lit" is an assertion and not something to go and look at.
 cargo test -q -p plait-tui 2>&1 | grep -E "^test result|^error" || true
+# The desktop drawing tests use GPUI's headless test context: no window appears,
+# but the real uniform list is laid out and its visible rows are measured.
+cargo test -q -p plait-shell 2>&1 | grep -E "^test result|^error" || true
 
 echo
 echo "── trees ───────────────────────────────────────────────"
@@ -79,7 +82,7 @@ for view in commits diff; do
   COLS=120 ROWS=40 cargo run -q -p plait-tui --example dump --release -- "$view" . \
     2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | tail -1
 done
-for layout in unified side-by-side; do
+for layout in unified split; do
   printf '%s' "  $layout "
   COLS=120 ROWS=40 LAYOUT=$layout cargo run -q -p plait-tui --example dump --release -- \
     diff --fixtures 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | tail -1

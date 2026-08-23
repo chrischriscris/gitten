@@ -8,19 +8,23 @@
 The repository had no CI. The checks that matter are already scripted
 (`./check.sh` — "everything headless"), but two promises were kept by memory
 alone: that nothing is written in a way that makes Linux impossible, and that
-the four headless test crates stay green before a push lands.
+the headless test crates stay green before a push lands.
 
 ## Decision
 
 One workflow, `.github/workflows/check.yml`, two jobs, both ubuntu:
 
-- **test** — the correctness section of `check.sh` verbatim: `cargo test` over
-  `plait-core`, `plait-app`, `plait-web`, `plait-tui`. Each is headless by
-  design, so they run unmodified. `--locked`, because `Cargo.lock` is committed
-  and a push without its lockfile entry should fail loudly.
+- **test** — the portable part of `check.sh`'s correctness section: `cargo test`
+  over `plait-core`, `plait-app`, `plait-web` and `plait-tui`. Each is headless
+  by design, so they run unmodified.
 - **linux** — `cargo check --workspace --all-targets` after installing the
   packages a Linux GPUI build needs. This is the enforcement of the Linux rule;
-  nothing else checks it between writing a macOS-ism and pushing it.
+  nothing else checks it between writing a macOS-ism and pushing it. The same
+  job runs `plait-shell`'s headless GPUI tests after the check: they open no real
+  window, but need the native packages already installed here.
+
+Both jobs use `--locked`, because `Cargo.lock` is committed and a push without
+its lockfile entry should fail loudly.
 
 The toolchain is not pinned in the workflow: `rust-toolchain.toml` says
 1.97.1 and rustup honours it on the runner exactly as it does locally, so there

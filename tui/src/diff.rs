@@ -903,7 +903,7 @@ mod tests {
         d.to_bottom();
         let before = d.cursor() as f32 / d.rows() as f32;
         d.cycle_layout(&host);
-        assert_eq!(d.layout_name(), "side-by-side");
+        assert_eq!(d.layout_name(), "split");
         let after = d.cursor() as f32 / d.rows() as f32;
         assert!((before - after).abs() < 0.2, "{before} -> {after}");
         assert!(d.cursor() < d.rows());
