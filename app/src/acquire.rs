@@ -181,6 +181,7 @@ mod tests {
     use plait_core::status::Status;
     use plait_git::{Handle, Pair};
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     /// A repository that exists only as this struct. Every assertion these
@@ -306,6 +307,77 @@ mod tests {
         };
         assert_eq!(count(1), 2, "narrow context keeps two hunks apart");
         assert_eq!(count(12), 1, "wide context merges them");
+    }
+
+    /// A differ that counts how often it was asked, and answers with one
+    /// whole-file replace. Shared counter, because the registry takes
+    /// ownership of the implementation it is handed.
+    struct Counting(Arc<AtomicUsize>);
+
+    impl plait_core::differ::Differ for Counting {
+        fn name(&self) -> &'static str {
+            "counting"
+        }
+
+        fn diff(
+            &self,
+            _path: &str,
+            old: &[Arc<str>],
+            new: &[Arc<str>],
+        ) -> Vec<plait_core::differ::Edit> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            vec![plait_core::differ::Edit {
+                old_start: 0,
+                old_end: old.len() as u32,
+                new_start: 0,
+                new_end: new.len() as u32,
+            }]
+        }
+    }
+
+    #[test]
+    fn no_repo_can_replace_the_configured_differ() {
+        // The fake's `pairs` could answer with anything, but a `Repo` has no
+        // way to say *which lines correspond* — that decision happens after
+        // acquisition, through the host's registry. Registering a counting
+        // differ and selecting it makes the authority observable: the count
+        // moves, and the hunks are the counting differ's shape (one edit, so
+        // one hunk at any context), which nothing in `pairs` chose.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut host = Host::new();
+        host.differ.register(Counting(Arc::clone(&calls)));
+        assert!(
+            host.differ.select("counting"),
+            "a registered extension algorithm is selectable"
+        );
+
+        for context in [0, 1, 12] {
+            host.differ.context = context;
+            let loaded = acquire(
+                View::Diff,
+                &Source::Repo {
+                    path: PathBuf::from("/nonexistent"),
+                    arg: String::new(),
+                },
+                &host,
+                Some(&Fake::default()),
+            )
+            .unwrap();
+            let Data::Diff(files) = loaded.data else {
+                panic!("a diff view loads files");
+            };
+            assert_eq!(files.len(), 1);
+            assert_eq!(
+                files[0].hunks.len(),
+                1,
+                "context {context}: one whole-file edit assembles to one hunk"
+            );
+        }
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            3,
+            "every file went through the configured differ, once per acquire"
+        );
     }
 
     #[test]

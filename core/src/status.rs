@@ -144,15 +144,26 @@ pub enum ConflictKind {
     BothModified,
 }
 
-/// Why a submodule is in the list at all.
+/// How a borrowed submodule sits in the **working tree**, as git's `S<C><M><U>`
+/// state field spells out.
 ///
-/// Three independent facts git reports in its `S<C><M><U>` state field, and
-/// the ones a submodule row has to explain: the borrowed commit is not the one
-/// recorded, files inside it were edited, or files inside it are not tracked
-/// by it. All false is a clean submodule — which appears in no list at all.
+/// Its checked-out commit is not the commit the parent's index records
+/// ([`Self::commit_changed`]), tracked files inside it were edited
+/// ([`Self::modified`]), or files inside it are not tracked by it
+/// ([`Self::untracked`]). All false is a clean borrow — which appears in no
+/// list at all.
+///
+/// All three facts compare the submodule against the parent's *index* or
+/// against the submodule itself; not one of them says anything about the
+/// index against `HEAD`, which is the staged side's whole subject. So they
+/// ride on the entries that describe the working tree — [`UnstagedEntry`] and
+/// [`ConflictEntry`] — and a [`StagedEntry`] carries [`Self::default`]:
+/// copying worktree state onto a staged row would answer a worktree question
+/// under a staged heading.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Submodule {
-    /// Its checked-out commit differs from the recorded one.
+    /// Its checked-out commit differs from the commit the parent's index
+    /// records.
     pub commit_changed: bool,
     /// Tracked files inside it have local modifications.
     pub modified: bool,
@@ -178,7 +189,10 @@ pub struct StagedEntry {
     pub old_path: Option<PathBytes>,
     /// What it is, from the mode recorded in the index.
     pub kind: Kind,
-    /// Set when it is a submodule; see [`Submodule`].
+    /// Present because the entry shapes share a body, and always
+    /// [`Submodule::default`] here: the submodule state field describes the
+    /// working tree, and a staged entry describes the index. See
+    /// [`Submodule`].
     pub submodule: Submodule,
 }
 
@@ -194,8 +208,12 @@ pub struct UnstagedEntry {
     /// type changes can originate here; an addition the index never heard of
     /// is untracked, not unstaged.
     pub change: Change,
-    /// What it is on disk, from the worktree mode.
+    /// What it is on disk, from the worktree mode. A side that does not exist
+    /// prints `000000`, which is where a deletion's kind comes from the side
+    /// that did — see the parser.
     pub kind: Kind,
+    /// The submodule state field, which describes exactly this: the working
+    /// tree against the index.
     pub submodule: Submodule,
 }
 
@@ -220,6 +238,8 @@ pub struct ConflictEntry {
     /// What it is in the working tree right now — both-added conflicts have
     /// content, both-deleted ones have not.
     pub kind: Kind,
+    /// The submodule state field, which describes exactly this: the working
+    /// tree against the index. See [`Submodule`].
     pub submodule: Submodule,
 }
 

@@ -85,6 +85,20 @@ fn run(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
+/// Joins a raw pathname onto the repository root, byte for byte.
+///
+/// Unix keeps pathnames as opaque bytes and macOS and Linux agree on that, so
+/// the bytes go straight into an [`std::ffi::OsStr`] and through to the
+/// filesystem. Decoding lossily first — the obvious `root.join(path.to_string_lossy())`
+/// — stats a *different* file than git named whenever a name carries a byte
+/// that is not UTF-8: the read misses, and the diff silently shows nothing
+/// where somebody's file is. Display is the only place a decode belongs; this
+/// is the addressing form.
+fn join_raw(root: &Path, path: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    root.join(std::ffi::OsStr::from_bytes(path))
+}
+
 // ------------------------------------------------------------------- the seam
 
 /// One repository, as everything behind a client sees it.
@@ -192,7 +206,7 @@ impl Repo for Binary {
             )?
         };
 
-        let changes = parse_raw(&String::from_utf8_lossy(&raw));
+        let changes = parse_raw(&raw);
 
         // Every blob the whole diff needs, fetched by one `cat-file --batch` —
         // but held one file at a time. The batch answers strictly in request
@@ -277,12 +291,19 @@ impl Repo for Binary {
             let old = RawChange::synthetic(&c.old_mode, &c.old_oid).or(fetched_old);
             let new = RawChange::synthetic(&c.new_mode, &c.new_oid)
                 .or(fetched_new)
-                .or_else(|| new_side(&c.new_oid, &self.root, &c.path));
+                .or_else(|| new_side(&c.new_oid, &self.root, c.path.as_bytes()));
             let binary = old.as_ref().is_some_and(|b| is_binary(b))
                 || new.as_ref().is_some_and(|b| is_binary(b));
+            // The lossy decode happens here and only here: everything above —
+            // the record, the batch alignment, the working-tree read — went
+            // through the raw bytes, so what reaches a frontend is the display
+            // form of the path git actually named.
             out.push(Pair {
-                path: c.path,
-                old_path: c.old_path,
+                path: c.path.to_string_lossy().into_owned(),
+                old_path: c
+                    .old_path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned()),
                 status: c.status,
                 old: if binary {
                     Vec::new()
@@ -455,15 +476,25 @@ pub fn diff(
 /// again is `1 MM`, staged *and* unstaged for the same path — and a conflicted
 /// path feeds neither, because its truth lives in three index stages no single
 /// X or Y could name.
+///
+/// Empty fields are preserved, not filtered: the field after a type-2 record
+/// is its old name *by position*, and an empty one is a real answer ("no old
+/// name arrived") rather than noise. Filtering empties would slide every later
+/// record into that slot and swallow it.
 fn parse_status(raw: &[u8]) -> Status {
     let mut out = Status::default();
-    let mut records = raw.split(|b| *b == 0).filter(|r| !r.is_empty());
+    let mut records = raw.split(|b| *b == 0);
     while let Some(rec) = records.next() {
+        // A trailing or doubled NUL makes an empty piece; nothing to read.
+        if rec.is_empty() {
+            continue;
+        }
         if rec.starts_with(b"1 ") {
             ordinary(rec, &mut out);
         } else if rec.starts_with(b"2 ") {
             // The old name is the next field, taken whether this record parses
-            // or not: skipping a broken one must not leave the cursor sitting
+            // or not — empty included, because *that* is what an empty field
+            // is for. Skipping a broken one must not leave the cursor sitting
             // on somebody else's path, or one bad record corrupts two.
             let old = records.next();
             renamed(rec, old, &mut out);
@@ -525,12 +556,44 @@ fn mode(field: &[u8]) -> Kind {
     Kind::from_git_mode(std::str::from_utf8(field).unwrap_or(""))
 }
 
-/// The submodule state field: `N...` when the entry is not a submodule, else
-/// `S<C><M><U>` with each flag a letter or a dot.
+/// The mode column of a side that does not exist. Porcelain v2 prints six
+/// zeros wherever a mode is called for and the thing is gone.
+const ABSENT_MODE: &[u8] = b"000000";
+
+fn exists(field: &[u8]) -> bool {
+    field != ABSENT_MODE
+}
+
+/// The kind of one side of a record: from its own column's mode when that
+/// side exists, else from a column that did.
 ///
-/// Anything shorter or stranger parses as "no flags claimed" — a state nobody
-/// has seen yet is not a reason to drop the entry, and [`Kind`] still says
-/// whether the path is a submodule from its mode.
+/// A destination that does not exist prints [`ABSENT_MODE`] — nothing in the
+/// index for a staged deletion, nothing in the working tree for an unstaged
+/// one, nothing anywhere for a conflict resolved away — and `000000` parses
+/// as a plain file, which would quietly relabel every deleted symlink and
+/// every deleted submodule as something to read or stage as text. The
+/// fallbacks are the columns of the sides that *did* exist, most local first:
+/// what a path was is knowable from its own record even when where it ended
+/// up is not. Nothing anywhere is guessed low — [`Kind::File`] — exactly as
+/// [`Kind::from_git_mode`] guesses on a malformed mode.
+fn kind_of(primary: &[u8], fallbacks: &[&[u8]]) -> Kind {
+    if exists(primary) {
+        return mode(primary);
+    }
+    match fallbacks.iter().find(|f| exists(f)) {
+        Some(f) => mode(f),
+        None => Kind::File,
+    }
+}
+
+/// The submodule state field, as bytes: `N...` when the entry is not a
+/// submodule, else `S<C><M><U>` with each flag a letter or a dot.
+///
+/// What the flags *mean* is a working-tree question and lives on
+/// [`Submodule`] in `core` — including why they never ride on a staged
+/// entry. Anything shorter or stranger parses as "no flags claimed" — a state
+/// nobody has seen yet is not a reason to drop the entry, and [`Kind`]
+/// still says whether the path is a submodule from its mode.
 fn submodule_state(field: &[u8]) -> Submodule {
     if field.first() != Some(&b'S') || field.len() < 4 {
         return Submodule::default();
@@ -555,15 +618,17 @@ fn ordinary(rec: &[u8], out: &mut Status) {
             path: PathBytes::from_bytes(path),
             change: c,
             old_path: None,
-            kind: mode(f[4]), // mI — the mode recorded in the index
-            submodule: sub,
+            kind: kind_of(f[4], &[f[3]]), // mI; a staged deletion falls back to mH
+            // The submodule state field describes the working tree, and a
+            // staged entry describes the index — see [`Submodule`].
+            submodule: Submodule::default(),
         });
     }
     if let Some(c) = y {
         out.unstaged.push(UnstagedEntry {
             path: PathBytes::from_bytes(path),
             change: c,
-            kind: mode(f[5]), // mW — the mode found in the working tree
+            kind: kind_of(f[5], &[f[4]]), // mW; an unstaged deletion falls back to mI
             submodule: sub,
         });
     }
@@ -589,15 +654,15 @@ fn renamed(rec: &[u8], old: Option<&[u8]>, out: &mut Status) {
             path: PathBytes::from_bytes(path),
             change: c,
             old_path,
-            kind: mode(f[4]),
-            submodule: sub,
+            kind: kind_of(f[4], &[f[3]]),
+            submodule: Submodule::default(),
         });
     }
     if let Some(c) = y {
         out.unstaged.push(UnstagedEntry {
             path: PathBytes::from_bytes(path),
             change: c,
-            kind: mode(f[5]),
+            kind: kind_of(f[5], &[f[4]]),
             submodule: sub,
         });
     }
@@ -615,7 +680,11 @@ fn unmerged(rec: &[u8], out: &mut Status) {
     out.conflicts.push(ConflictEntry {
         path: PathBytes::from_bytes(path),
         state,
-        kind: mode(f[6]), // mW — what the working tree holds right now
+        // mW is what the working tree holds right now. A conflict can resolve
+        // the worktree side away (a file removed mid-merge, both sides having
+        // deleted it) while the stages still say what existed — fall back
+        // through those, base then ours then theirs.
+        kind: kind_of(f[6], &[f[3], f[4], f[5]]),
         submodule: submodule_state(f[2]),
     });
 }
@@ -659,17 +728,19 @@ fn loose(rec: &[u8], out: &mut Status) {
 ///
 /// **`git diff` cannot see these and never will** — see [`Status::untracked`]
 /// in `core` for why the status pass is what sources them.
+///
+/// The read goes through the entry's raw bytes, not their lossy spelling:
+/// a name git reported is a name on disk, and joining through a decode would
+/// look for a file that is not there. An unreadable file skips rather than
+/// fails — a broken symlink, a socket and a file deleted between the two git
+/// calls are all untracked, and none of them is worth refusing to show the
+/// rest of the diff over.
 fn loose_pair(entry: &UntrackedEntry, root: &Path) -> Option<Pair> {
-    // Joined through the lossy spelling, which is the portable way to turn
-    // bytes into something `Path` accepts. A path that only misbehaves past
-    // its first bad byte was already unreadable here before the status model
-    // existed; the entry keeps the true bytes for whoever displays or stages
-    // it, and an unreadable file skips rather than fails — a broken symlink, a
-    // socket and a file deleted between the two git calls are all untracked,
-    // and none of them is worth refusing to show the rest of the diff over.
-    let content = std::fs::read(root.join(entry.path.to_string_lossy().as_ref())).ok()?;
+    let content = std::fs::read(join_raw(root, entry.path.as_bytes())).ok()?;
     let binary = is_binary(&content);
     Some(Pair {
+        // The one decode on this path: the pair's paths are display forms, and
+        // everything that addressed the filesystem above was bytes.
         path: entry.path.to_string_lossy().into_owned(),
         old_path: None,
         // The same letter `git diff --raw` uses for a file that was added, so
@@ -692,10 +763,15 @@ fn loose_pair(entry: &UntrackedEntry, root: &Path) -> Option<Pair> {
 const GITLINK: &str = "160000";
 
 /// One `--raw` record, before its blobs have been fetched.
+///
+/// The paths are [`PathBytes`] — raw, undecoded — because the working-tree
+/// read on the new side of a null-OID record addresses the filesystem with
+/// them, and a decode there would look for a file git never named. The modes
+/// and OIDs are ASCII by git's own grammar.
 #[derive(Debug, PartialEq, Eq)]
 struct RawChange {
-    path: String,
-    old_path: Option<String>,
+    path: PathBytes,
+    old_path: Option<PathBytes>,
     status: char,
     old_mode: String,
     new_mode: String,
@@ -727,19 +803,38 @@ impl RawChange {
 /// NUL-terminated, and a rename or copy carries two of them. Anything that does
 /// not start with `:` is skipped rather than guessed at — `git show` prefixes a
 /// commit header that `--format=` does not always suppress.
-fn parse_raw(raw: &str) -> Vec<RawChange> {
+///
+/// Bytes end to end, with the same framing discipline as the porcelain v2
+/// parser: every path slot is consumed exactly once, present or not, so one
+/// malformed record can never shift the stream and rename somebody else's
+/// file. A path is whatever bytes git emitted — no decode happens until a
+/// [`Pair`] is built for display.
+fn parse_raw(raw: &[u8]) -> Vec<RawChange> {
+    let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
     let mut out = Vec::new();
-    let mut fields = raw.split('\0').peekable();
+    let mut fields = raw.split(|b| *b == 0);
     while let Some(meta) = fields.next() {
-        let Some(meta) = meta.rsplit('\n').next().and_then(|m| m.strip_prefix(':')) else {
+        // The record proper starts after the last line break in this piece:
+        // `git show` prefixes a newline (or more) before the first record.
+        let Some(meta) = meta
+            .rsplit(|b| *b == b'\n')
+            .next()
+            .and_then(|m| m.strip_prefix(b":"))
+        else {
             continue;
         };
-        let parts: Vec<&str> = meta.split_whitespace().collect();
+        let parts: Vec<&[u8]> = meta
+            .split(|b| *b == b' ')
+            .filter(|p| !p.is_empty())
+            .collect();
         // mode_old mode_new oid_old oid_new status
         if parts.len() < 5 {
             continue;
         }
-        let status = parts[4].chars().next().unwrap_or('M');
+        let status = parts[4].first().copied().unwrap_or(b'M') as char;
+        // One path field per record, consumed whether it parses or not; an
+        // empty field is an absent path, and the record behind it is skipped —
+        // but never left for the next record to trip over.
         let Some(first) = fields.next().filter(|p| !p.is_empty()) else {
             continue;
         };
@@ -747,19 +842,22 @@ fn parse_raw(raw: &str) -> Vec<RawChange> {
         // the file is called now.
         let (old_path, path) = match status {
             'R' | 'C' => match fields.next().filter(|p| !p.is_empty()) {
-                Some(second) => (Some(first.to_string()), second.to_string()),
-                None => (None, first.to_string()),
+                Some(second) => (
+                    Some(PathBytes::from_bytes(first)),
+                    PathBytes::from_bytes(second),
+                ),
+                None => (None, PathBytes::from_bytes(first)),
             },
-            _ => (None, first.to_string()),
+            _ => (None, PathBytes::from_bytes(first)),
         };
         out.push(RawChange {
             path,
             old_path,
             status,
-            old_mode: parts[0].trim_start_matches(':').to_string(),
-            new_mode: parts[1].to_string(),
-            old_oid: parts[2].to_string(),
-            new_oid: parts[3].to_string(),
+            old_mode: text(parts[0].strip_prefix(b":").unwrap_or(parts[0])),
+            new_mode: text(parts[1]),
+            old_oid: text(parts[2]),
+            new_oid: text(parts[3]),
         });
     }
     out
@@ -930,11 +1028,11 @@ impl Drop for BlobStream {
 /// The old side has no equivalent. A null OID there means the file did not
 /// exist, and reading the working tree for it would diff an added file against
 /// itself and report that nothing changed.
-fn new_side(oid: &str, repo: &Path, path: &str) -> Option<Vec<u8>> {
+fn new_side(oid: &str, repo: &Path, path: &[u8]) -> Option<Vec<u8>> {
     if !is_null_oid(oid) {
         return None;
     }
-    std::fs::read(repo.join(path)).ok()
+    std::fs::read(join_raw(repo, path)).ok()
 }
 
 /// A NUL byte in the first 8 KB, which is git's own test. A real text file does
@@ -971,7 +1069,25 @@ mod tests {
     /// A throwaway repository, because untracked files and conflicts are the
     /// things that cannot be tested against a canned string: they exist only
     /// relative to a real working tree.
+    ///
+    /// Every repository is initialized on `main` explicitly, so no test can
+    /// inherit whatever a machine's `init.defaultBranch` says; every command
+    /// pins identity and signing off, so nothing leaks in from a global or
+    /// system config either.
     struct Scratch(std::path::PathBuf);
+
+    /// The flags every scratch command runs under, so a test sees only what it
+    /// set up itself: identity (no ambient user), signing off (a machine with
+    /// `commit.gpgsign` must not fail these), and the local-file protocol
+    /// (submodules over a path, which modern git disables by default).
+    const SCRATCH_CONFIG: [&str; 6] = [
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "user.name=t",
+        "-c",
+        "commit.gpgsign=false",
+    ];
 
     impl Scratch {
         fn new(name: &str) -> Self {
@@ -979,31 +1095,35 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).expect("a temp dir");
             let me = Scratch(dir);
-            me.git(&["init", "-q", "."]);
+            me.git(&["init", "-q", "-b", "main", "."]);
             me
         }
 
         fn git(&self, args: &[&str]) {
-            // Submodules over a local path need the file protocol allowed,
-            // which every modern git disables by default; harmless everywhere
-            // else, so it rides along on all of these.
-            let out = Command::new("git")
-                .arg("-C")
-                .arg(&self.0)
-                .args([
-                    "-c",
-                    "user.email=t@t",
-                    "-c",
-                    "user.name=t",
-                    // Submodules over a local path need the file protocol
-                    // allowed, which every modern git disables by default;
-                    // harmless everywhere else.
-                    "-c",
-                    "protocol.file.allow=always",
-                ])
-                .args(args)
-                .output()
-                .expect("git runs");
+            self.git_os(
+                &args
+                    .iter()
+                    .map(|a| std::ffi::OsStr::new(*a).to_owned())
+                    .collect::<Vec<_>>(),
+            );
+        }
+
+        /// Every scratch command runs under [`SCRATCH_CONFIG`] plus the local-
+        /// file protocol allowance; this is where the two are attached.
+        fn cmd(&self, args: &[std::ffi::OsString]) -> Command {
+            let mut cmd = Command::new("git");
+            cmd.arg("-C").arg(&self.0);
+            cmd.args(SCRATCH_CONFIG);
+            cmd.args(["-c", "protocol.file.allow=always"]);
+            cmd.args(args);
+            cmd
+        }
+
+        /// The same, for arguments that are paths rather than text: git takes
+        /// filenames as bytes on Unix, and a non-UTF-8 name is exactly what
+        /// some of these tests are about.
+        fn git_os(&self, args: &[std::ffi::OsString]) {
+            let out = self.cmd(args).output().expect("git runs");
             assert!(
                 out.status.success(),
                 "git {args:?}: {}",
@@ -1017,18 +1137,59 @@ mod tests {
             let _ = Command::new("git")
                 .arg("-C")
                 .arg(&self.0)
-                .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+                .args(SCRATCH_CONFIG)
                 .args(args)
                 .output()
                 .expect("git runs");
         }
 
         fn write(&self, path: &str, content: &[u8]) {
-            let at = self.0.join(path);
+            self.write_bytes(path.as_bytes(), content);
+        }
+
+        /// A file whose *name* is bytes, not text — the shape a non-UTF-8
+        /// pathname actually has on disk.
+        ///
+        /// False where the volume refuses the name outright. A filesystem that
+        /// validates UTF-8 — macOS's APFS — answers `EILSEQ` for any name that
+        /// is not text, which is a property of the volume and not of this
+        /// code; byte-preserving Unix filesystems take the bytes as they come.
+        /// Where it refuses there is nothing on disk to read, and the test
+        /// falls back to what the machine makes possible.
+        fn plant_raw(&self, path: &[u8], content: &[u8]) -> bool {
+            let at = join_raw(&self.0, path);
             if let Some(parent) = at.parent() {
                 std::fs::create_dir_all(parent).expect("a parent");
             }
-            std::fs::write(at, content).expect("a file");
+            match std::fs::write(at, content) {
+                Ok(()) => true,
+                Err(e) if refused_name(&e) => false,
+                Err(e) => panic!("a file: {e}"),
+            }
+        }
+
+        fn write_bytes(&self, path: &[u8], content: &[u8]) {
+            assert!(self.plant_raw(path, content), "the name was refused");
+        }
+
+        /// git with byte arguments, tolerating failure: true when it ran
+        /// clean. A `git mv` *onto* a non-UTF-8 name fails the same way
+        /// creating one does on a UTF-8-validating volume, and the caller has
+        /// the same fallback.
+        fn git_os_try(&self, args: &[std::ffi::OsString]) -> bool {
+            self.cmd(args).output().expect("git runs").status.success()
+        }
+
+        /// git with byte arguments, output captured: for the plumbing calls
+        /// that answer a question (`hash-object`).
+        fn git_os_out(&self, args: &[std::ffi::OsString]) -> Vec<u8> {
+            let out = self.cmd(args).output().expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out.stdout
         }
 
         fn open(&self) -> Handle {
@@ -1044,6 +1205,20 @@ mod tests {
 
     fn paths(pairs: &[Pair]) -> Vec<&str> {
         pairs.iter().map(|p| p.path.as_str()).collect()
+    }
+
+    /// `EILSEQ`, the errno a UTF-8-validating filesystem answers when asked
+    /// for a pathname that is not valid UTF-8 — 92 on the BSD lineage (macOS),
+    /// 84 on Linux. Two integers nobody renumbers, and not worth a libc
+    /// dependency to spell.
+    const EILSEQ_BSD: i32 = 92;
+    const EILSEQ_LINUX: i32 = 84;
+
+    /// Whether the volume itself refused a pathname. APFS validates UTF-8 and
+    /// there is nowhere for such bytes to go; a byte-preserving filesystem
+    /// never answers this.
+    fn refused_name(e: &std::io::Error) -> bool {
+        matches!(e.raw_os_error(), Some(EILSEQ_BSD | EILSEQ_LINUX))
     }
 
     /// The lines as plain slices, for assertions.
@@ -1134,6 +1309,157 @@ mod tests {
         assert_eq!(paths(&got), vec!["blob.png"]);
         assert!(got[0].binary);
         assert!(got[0].new.is_empty(), "a binary carries no lines");
+    }
+
+    #[test]
+    fn a_non_utf8_untracked_file_is_found_and_read_through_its_real_name() {
+        // Latin-1 é in an on-disk name. If the working-tree read joined
+        // through the lossy spelling it would stat `caf\u{FFFD}.txt` — a file
+        // nobody ever created — miss, and drop the file from the diff
+        // entirely. Its presence below IS the proof of byte-exact addressing,
+        // and its contents are the proof of a successful read.
+        let r = Scratch::new("raw-untracked");
+        r.write("seed.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        if !r.plant_raw(b"nouveau caf\xe9.txt", b"from disk\n") {
+            // This volume validates UTF-8 (APFS) and refused the name; the
+            // assertions below need the file to exist somewhere. The pipeline
+            // itself is still proven byte-exact by the plumbed test and the
+            // parser tests.
+            return;
+        }
+
+        let got = r.open().pairs("").unwrap();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].status, 'A');
+        assert_eq!(
+            got[0].path, "nouveau caf\u{FFFD}.txt",
+            "display decodes lossily"
+        );
+        assert_eq!(
+            strs(&got[0].new),
+            ["from disk"],
+            "read through the name git reported, not a decoded near-miss"
+        );
+    }
+
+    #[test]
+    fn a_non_utf8_tracked_modification_reads_both_sides() {
+        let r = Scratch::new("raw-tracked");
+        if !r.plant_raw(b"caf\xe9.txt", b"before\n") {
+            // Refused by this volume; see the untracked test. The tracked
+            // path through the object database is proven everywhere by
+            // `a_non_utf8_path_in_history_arrives_whole`.
+            return;
+        }
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        r.plant_raw(b"caf\xe9.txt", b"after\n");
+
+        let got = r.open().pairs("").unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].status, 'M');
+        assert_eq!(got[0].path, "caf\u{FFFD}.txt");
+        assert_eq!(strs(&got[0].old), ["before"], "blob fetch keyed on the OID");
+        assert_eq!(
+            strs(&got[0].new),
+            ["after"],
+            "the null-OID side was read off disk by its real bytes"
+        );
+    }
+
+    #[test]
+    fn a_non_utf8_path_in_history_arrives_whole_from_the_object_database() {
+        // The one shape every filesystem can produce: git's index and trees
+        // carry pathnames as bytes regardless of what the working volume
+        // accepts, so plumbing can record a path here that no `creat` on this
+        // volume would. From there it is the whole acquisition pipeline under
+        // test — raw parse, batch alignment, pair labelling — with no
+        // filesystem read in the way.
+        use std::os::unix::ffi::OsStrExt;
+        let r = Scratch::new("raw-plumbed");
+        r.write("seed.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+
+        // Hash the blob from an ordinary file, then attach that OID to the
+        // raw-byte pathname in the index; the value argument is built as
+        // bytes so the path rides inside it verbatim.
+        r.write("content.tmp", b"planted\n");
+        let oid = String::from_utf8(r.git_os_out(&[
+            "hash-object".into(),
+            "-w".into(),
+            "content.tmp".into(),
+        ]))
+        .unwrap();
+        let mut value: Vec<u8> = format!("100644,{},", oid.trim()).into_bytes();
+        value.extend_from_slice(b"caf\xe9.txt");
+        let add = [
+            std::ffi::OsStr::new("update-index").to_owned(),
+            std::ffi::OsStr::new("--add").to_owned(),
+            std::ffi::OsStr::new("--cacheinfo").to_owned(),
+            std::ffi::OsStr::from_bytes(&value).to_owned(),
+        ];
+        r.git_os(&add);
+        r.git(&["commit", "-qm", "planted"]);
+
+        let got = r.open().pairs("HEAD~1..HEAD").unwrap();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].status, 'A');
+        assert_eq!(
+            got[0].path, "caf\u{FFFD}.txt",
+            "display decodes lossily, once, at the pair"
+        );
+        assert_eq!(
+            strs(&got[0].new),
+            ["planted"],
+            "the blob landed on the file whose bytes named it"
+        );
+    }
+
+    #[test]
+    fn a_rename_to_a_non_utf8_name_keeps_identity_through_the_read() {
+        // Renamed in the index, then edited outside it: the raw record is an
+        // R carrying both names, the new side's OID is null, and reading it
+        // means addressing the filesystem with the new name's exact bytes.
+        use std::os::unix::ffi::OsStrExt;
+        let r = Scratch::new("raw-rename");
+        r.write("before.txt", b"moved contents\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+
+        let to: std::ffi::OsString = std::ffi::OsStr::from_bytes(b"aft\xe9r.txt").to_owned();
+        let moved = r.git_os_try(&["mv".into(), "before.txt".into(), to.clone()]);
+        if !moved {
+            // This volume validates UTF-8 and refused the destination; both
+            // names byte-exact is still proven at the parser, and the whole
+            // pipeline by the plumbed test.
+            return;
+        }
+        r.plant_raw(b"aft\xe9r.txt", b"moved contents\nedited\n");
+
+        let g = r.open();
+        let got = g.pairs("").unwrap();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].status, 'R');
+        assert_eq!(got[0].old_path.as_deref(), Some("before.txt"));
+        assert_eq!(got[0].path, "aft\u{FFFD}r.txt", "display decodes lossily");
+        assert_eq!(
+            strs(&got[0].new),
+            ["moved contents", "edited"],
+            "read through the renamed file's real bytes"
+        );
+
+        // And the model keeps both names byte-exact for whoever addresses or
+        // stages them later.
+        let s = g.status().unwrap();
+        assert_eq!(s.staged.len(), 1);
+        assert_eq!(s.staged[0].path.as_bytes(), b"aft\xe9r.txt".as_slice());
+        assert_eq!(
+            s.staged[0].old_path.as_ref().map(PathBytes::as_bytes),
+            Some(b"before.txt".as_slice())
+        );
     }
 
     #[test]
@@ -1357,6 +1683,62 @@ mod tests {
     }
 
     #[test]
+    fn a_staged_gitlink_change_does_not_inherit_the_worktrees_flags() {
+        // The parent borrows the upstream's *newer* commit, moves the borrow
+        // back and stages that, then dirties a file inside. One record —
+        // `1 MM S.M.` — and the flags belong to the unstaged side alone:
+        // C/M/U compare the submodule against the index or itself, which is
+        // worktree business, so the staged entry (index against HEAD) carries
+        // none of them.
+        let up = Scratch::new("sub-up2");
+        up.write("f.txt", b"one\n");
+        up.git(&["add", "-A"]);
+        up.git(&["commit", "-qm", "one"]);
+        up.write("f.txt", b"one\ntwo\n");
+        up.git(&["commit", "-qam", "two"]);
+
+        let r = Scratch::new("sub-parent2");
+        r.write("base.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        r.git(&[
+            "submodule",
+            "add",
+            "-q",
+            &format!("{}", up.0.display()),
+            "kid",
+        ]);
+        r.git(&["commit", "-qm", "borrow"]);
+        // The borrow moves back and that move is staged; then a file inside
+        // is edited, which only the worktree knows about.
+        r.git(&["-C", "kid", "checkout", "-q", "HEAD~1"]);
+        r.git(&["add", "kid"]);
+        r.write("kid/f.txt", b"one\ntwo\nthree\n");
+
+        let s = r.open().status().unwrap();
+        assert_eq!(s.staged.len(), 1, "{s:?}");
+        let staged = &s.staged[0];
+        assert_eq!(staged.change, Change::Modified);
+        assert_eq!(staged.kind, Kind::Submodule);
+        assert_eq!(
+            staged.submodule,
+            Submodule::default(),
+            "nothing in S<C><M><U> says anything about index vs HEAD"
+        );
+
+        assert_eq!(s.unstaged.len(), 1);
+        let unstaged = &s.unstaged[0];
+        assert!(
+            unstaged.submodule.modified,
+            "the dirty file inside shows on the side that describes it"
+        );
+        assert!(
+            !unstaged.submodule.commit_changed,
+            "checkout now matches what the index records"
+        );
+    }
+
+    #[test]
     fn an_ordinary_record_lands_on_the_side_that_changed() {
         let mut s = Status::default();
         ordinary(b"1 M. N... 100644 100644 100644 aa bb tracked.txt", &mut s);
@@ -1387,6 +1769,64 @@ mod tests {
             "the index still records it"
         );
         assert_eq!(s.unstaged[0].kind, Kind::File, "the worktree replaced it");
+    }
+
+    #[test]
+    fn a_deletion_keeps_the_kind_of_the_side_that_existed() {
+        // A deletion's destination column prints 000000, which parses as a
+        // plain file — and would quietly relabel every deleted symlink and
+        // every deleted submodule as text to read. The side that *did* exist
+        // is in the same record.
+        let mut s = Status::default();
+        ordinary(b"1 .D N... 120000 120000 000000 aa bb link", &mut s);
+        assert_eq!(s.unstaged[0].change, Change::Deleted);
+        assert_eq!(
+            s.unstaged[0].kind,
+            Kind::Symlink,
+            "deleted from the worktree; the index still said what it was"
+        );
+
+        s = Status::default();
+        ordinary(b"1 D. N... 100644 000000 000000 aa 00 gone.txt", &mut s);
+        assert_eq!(s.staged[0].change, Change::Deleted);
+        assert_eq!(s.staged[0].kind, Kind::File);
+
+        s = Status::default();
+        ordinary(b"1 D. S... 160000 000000 000000 aa 00 kid", &mut s);
+        assert_eq!(s.staged[0].change, Change::Deleted);
+        assert_eq!(
+            s.staged[0].kind,
+            Kind::Submodule,
+            "a deleted gitlink is not a file to read"
+        );
+    }
+
+    #[test]
+    fn a_conflict_without_a_worktree_side_falls_back_to_the_stages() {
+        // A file removed mid-merge (or both sides having deleted it) prints
+        // mW as 000000 while the stages still say what existed. Base, ours,
+        // theirs, in that order; nothing anywhere guesses low.
+        let mut s = Status::default();
+        unmerged(
+            b"u UU N... 120000 100644 100644 000000 h1 h2 h3 rm-during-merge",
+            &mut s,
+        );
+        assert_eq!(
+            s.conflicts[0].kind,
+            Kind::Symlink,
+            "the base stage says what the path was"
+        );
+
+        s = Status::default();
+        unmerged(
+            b"u DD N... 000000 000000 000000 000000 00 00 00 both-deleted.txt",
+            &mut s,
+        );
+        assert_eq!(
+            s.conflicts[0].kind,
+            Kind::File,
+            "nothing anywhere existed; the conservative guess stands"
+        );
     }
 
     #[test]
@@ -1526,6 +1966,31 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_origpath_field_is_consumed_exactly_and_not_swallowed() {
+        // Regression: empty NUL fields used to be filtered out wholesale,
+        // which made an *empty* origPath invisible — and the next valid
+        // record slid into its slot and vanished with it. By position the
+        // field after any `2` record is the old name; an empty one is a real
+        // answer ("nothing arrived"), consumed like any other.
+        let mut raw = b"2 XZ N... bad bad bad aa bb R99 x".to_vec();
+        raw.push(0);
+        // The empty field itself:
+        raw.push(0);
+        raw.extend_from_slice(b"1 M. N... 100644 100644 100644 aa bb next.txt");
+        raw.push(0);
+        let s = parse_status(&raw);
+        assert_eq!(
+            s.staged
+                .iter()
+                .map(|e| e.path.as_bytes())
+                .collect::<Vec<_>>(),
+            [b"next.txt".as_slice()],
+            "the good record behind the empty field survived"
+        );
+        assert!(s.staged[0].old_path.is_none());
+    }
+
+    #[test]
     fn spaces_and_newlines_in_paths_arrive_whole() {
         // The reason for `-z`: a path may contain anything a filesystem allows,
         // including a newline, and only NUL ends it.
@@ -1605,11 +2070,11 @@ mod tests {
 
     #[test]
     fn a_modified_file_is_one_record() {
-        let raw = ":100644 100644 aaa bbb M\0src/main.rs\0";
+        let raw: &[u8] = b":100644 100644 aaa bbb M\0src/main.rs\0";
         assert_eq!(
             parse_raw(raw),
             vec![RawChange {
-                path: "src/main.rs".into(),
+                path: PathBytes::from("src/main.rs"),
                 old_path: None,
                 status: 'M',
                 old_mode: "100644".into(),
@@ -1622,12 +2087,29 @@ mod tests {
 
     #[test]
     fn a_rename_carries_both_names() {
-        let raw = ":100644 100644 aaa bbb R096\0old/name.rs\0new/name.rs\0";
+        let raw: &[u8] = b":100644 100644 aaa bbb R096\0old/name.rs\0new/name.rs\0";
         let c = parse_raw(raw);
         assert_eq!(c.len(), 1);
-        assert_eq!(c[0].old_path.as_deref(), Some("old/name.rs"));
-        assert_eq!(c[0].path, "new/name.rs");
+        assert_eq!(
+            c[0].old_path.as_ref().map(PathBytes::as_bytes),
+            Some(b"old/name.rs".as_slice())
+        );
+        assert_eq!(c[0].path.as_bytes(), b"new/name.rs");
         assert_eq!(c[0].status, 'R');
+    }
+
+    #[test]
+    fn a_raw_path_with_a_non_utf8_byte_stays_byte_exact() {
+        // Latin-1 é in the path field of a deletion. A lossy decode at this
+        // boundary would rename the file before anyone even read it.
+        let mut raw = b":100644 000000 aaa 00 D".to_vec();
+        raw.push(0);
+        raw.extend_from_slice(b"caf\xe9.txt");
+        raw.push(0);
+        let c = parse_raw(&raw);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].path.as_bytes(), b"caf\xe9.txt".as_slice());
+        assert_eq!(c[0].status, 'D');
     }
 
     #[test]
@@ -1644,36 +2126,39 @@ mod tests {
     fn several_records_run_together() {
         // The trap `-z` sets: records are not newline-separated, so the next
         // record's `:` arrives immediately after the previous path's NUL.
-        let raw = ":100644 100644 a b M\0one.rs\0:000000 100644 0000000000000000000000000000000000000000 c A\0two.rs\0:100644 000000 d 0000000000000000000000000000000000000000 D\0three.rs\0";
+        let raw: &[u8] = b":100644 100644 a b M\0one.rs\0:000000 100644 0000000000000000000000000000000000000000 c A\0two.rs\0:100644 000000 d 0000000000000000000000000000000000000000 D\0three.rs\0";
         let c = parse_raw(raw);
         assert_eq!(c.len(), 3);
         assert_eq!(
             c.iter().map(|r| r.status).collect::<Vec<_>>(),
             vec!['M', 'A', 'D']
         );
-        assert_eq!(c[2].path, "three.rs");
+        assert_eq!(c[2].path.as_bytes(), b"three.rs");
     }
 
     #[test]
     fn a_commit_header_before_the_records_is_skipped() {
         // `git show --format=` still emits a newline before the first record.
-        let raw = "\n:100644 100644 a b M\0x.rs\0";
+        let raw: &[u8] = b"\n:100644 100644 a b M\0x.rs\0";
         assert_eq!(parse_raw(raw).len(), 1);
     }
 
     #[test]
     fn nothing_changed_is_no_records_rather_than_an_error() {
-        assert!(parse_raw("").is_empty());
-        assert!(parse_raw("\0").is_empty());
-        assert!(parse_raw("not a record\0").is_empty());
+        assert!(parse_raw(b"").is_empty());
+        assert!(parse_raw(b"\0").is_empty());
+        assert!(parse_raw(b"not a record\0").is_empty());
     }
 
     #[test]
     fn a_raw_path_with_a_space_survives() {
         // The whole reason for `-z`. Splitting the metadata on whitespace is
         // safe only because the path is not in it.
-        let raw = ":100644 100644 a b M\0dir with spaces/a file.rs\0";
-        assert_eq!(parse_raw(raw)[0].path, "dir with spaces/a file.rs");
+        let raw: &[u8] = b":100644 100644 a b M\0dir with spaces/a file.rs\0";
+        assert_eq!(
+            parse_raw(raw)[0].path.as_bytes(),
+            b"dir with spaces/a file.rs"
+        );
     }
 
     #[test]
@@ -1681,7 +2166,7 @@ mod tests {
         // A gitlink's OID is a commit in another repository. Fetching it as a
         // blob gets "missing", which reads on screen as a file that changed and
         // shows nothing — so it is synthesised the way git does.
-        let raw = ":160000 160000 34cbf180d 5697db813 M\0ghostty\0";
+        let raw: &[u8] = b":160000 160000 34cbf180d 5697db813 M\0ghostty\0";
         let c = &parse_raw(raw)[0];
         assert_eq!(c.old_mode, "160000");
         let old = RawChange::synthetic(&c.old_mode, &c.old_oid).expect("a gitlink is synthetic");

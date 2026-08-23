@@ -57,6 +57,7 @@ pub mod config;
 
 use cli::{Request, Source, View};
 use plait_core::host::Host;
+use std::path::Path;
 use std::time::Instant;
 
 /// How wide a row may get before it is clipped.
@@ -74,6 +75,33 @@ pub const MAX_LINE_CHARS: usize = 2000;
 /// without bound. Overflowing the edge is the better failure.
 pub const MIN_WRAP_COLS: usize = 8;
 
+/// Where a startup's repository handles come from.
+///
+/// One method, because that is all a factory is: a path in, a [`Handle`] out.
+/// The seam exists so a client — or a test — can put its own implementation of
+/// acquisition behind the same shared startup instead of hardcoding this
+/// crate's; everything downstream keeps holding `Arc<dyn Repo>` and cannot
+/// tell which factory ran. Object-safe for the same reason [`Repo`](plait_git::Repo)
+/// is: the value crosses threads and outlives the call.
+pub trait Opener: Send + Sync {
+    /// Opens (or claims) the repository at `root`.
+    ///
+    /// Infallible like the default it may replace: opening runs nothing, and
+    /// a path that is not a repository fails at the first read.
+    fn open(&self, root: &Path) -> plait_git::Handle;
+}
+
+/// The shipped opener: `plait-git`'s binary-backed implementation.
+///
+/// What every client gets when it says nothing about the matter.
+pub struct GitOpener;
+
+impl Opener for GitOpener {
+    fn open(&self, root: &Path) -> plait_git::Handle {
+        plait_git::open(root)
+    }
+}
+
 /// The shared startup: arguments, config, acquisition.
 ///
 /// A builder rather than a function of six arguments, because what differs
@@ -86,6 +114,9 @@ pub struct Startup {
     blurb: String,
     extra: String,
     args: Vec<String>,
+    /// Where repository handles come from. The binary opener unless a client
+    /// replaces it; see [`Opener`].
+    opener: std::sync::Arc<dyn Opener>,
 }
 
 /// Everything the startup produced.
@@ -217,6 +248,7 @@ impl Startup {
             blurb: "a git client".into(),
             extra: String::new(),
             args: std::env::args().skip(1).collect(),
+            opener: std::sync::Arc::new(GitOpener),
         }
     }
 
@@ -237,6 +269,17 @@ impl Startup {
     /// took its own flags out first.
     pub fn args(mut self, args: Vec<String>) -> Self {
         self.args = args;
+        self
+    }
+
+    /// Opens repositories with `opener` instead of [`GitOpener`].
+    ///
+    /// The one seam a client needs to put its own acquisition behind the
+    /// shared startup — a wrapper around another binary, an embedded
+    /// implementation, a test's fake — without any of the rest of this crate
+    /// changing hands.
+    pub fn opener(mut self, opener: std::sync::Arc<dyn Opener>) -> Self {
+        self.opener = opener;
         self
     }
 
@@ -280,12 +323,14 @@ impl Startup {
             Request::Help => unreachable!("returned above"),
         };
 
-        // One handle for every read this client makes. Opening runs nothing,
-        // so a directory that is not a repository fails at the first read —
-        // in the same words it always failed there — and nothing is put on
-        // the road to the first frame to learn that early.
+        // One handle for every read this client makes, from whichever opener
+        // was injected. Opening runs nothing, so a directory that is not a
+        // repository fails at the first read — in the same words it always
+        // failed there — and nothing is put on the road to the first frame to
+        // learn that early. Help and config returned above: neither opens a
+        // repository, so neither invokes the factory.
         let repo = match &source {
-            Source::Repo { path, .. } => Some(plait_git::open(path)),
+            Source::Repo { path, .. } => Some(self.opener.open(path)),
             Source::Fixtures => None,
         };
 
@@ -313,11 +358,71 @@ impl Startup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use plait_core::status::Status;
+    use plait_git::{Pair, Repo};
+    use std::sync::Arc;
 
     fn start(line: &str) -> Result<Started, Exit> {
         Startup::new("plait-test", View::Commits)
             .args(line.split_whitespace().map(String::from).collect())
             .go()
+    }
+
+    /// A repository that exists only as this struct: every read answers from
+    /// it, and its path need not exist at all.
+    struct Fake;
+
+    impl Repo for Fake {
+        fn log(&self, limit: usize) -> plait_git::Result<Vec<plait_core::Commit>> {
+            Ok((0..limit.min(1))
+                .map(|_| plait_core::Commit {
+                    sha: "f0".into(),
+                    short: "f0".into(),
+                    parents: Box::from(&[][..]),
+                    author: "fake".into(),
+                    timestamp: 0,
+                    subject: "from the fake".into(),
+                })
+                .collect())
+        }
+
+        fn pairs(&self, _revspec: &str) -> plait_git::Result<Vec<Pair>> {
+            Ok(vec![Pair {
+                path: "fake.txt".into(),
+                old_path: None,
+                status: 'A',
+                old: Vec::new(),
+                new: vec!["fake contents".into()],
+                binary: false,
+            }])
+        }
+
+        fn status(&self) -> plait_git::Result<Status> {
+            Ok(Status::default())
+        }
+
+        fn describe(&self) -> String {
+            "fake (main)".into()
+        }
+    }
+
+    /// An opener with exactly one answer, handed out by clone so a test can
+    /// prove identity against whatever came back on `Started`.
+    struct OneFake(plait_git::Handle);
+
+    impl Opener for OneFake {
+        fn open(&self, _root: &Path) -> plait_git::Handle {
+            Arc::clone(&self.0)
+        }
+    }
+
+    /// An opener that must never be reached.
+    struct Exploding;
+
+    impl Opener for Exploding {
+        fn open(&self, _root: &Path) -> plait_git::Handle {
+            panic!("nothing before acquisition should open a repository")
+        }
     }
 
     #[test]
@@ -383,5 +488,47 @@ mod tests {
         assert_eq!(port.as_deref(), Some("9000"));
         let started = s.go().unwrap_or_else(|_| panic!("start"));
         assert_eq!(started.view, View::Diff);
+    }
+
+    #[test]
+    fn an_injected_opener_opens_and_whatever_it_opens_is_retained() {
+        // `/nonexistent` cannot be read by anything. If startup succeeds, the
+        // acquisition went through the fake — and if the handle it kept is
+        // *this* Arc, every later read a client makes goes through it too.
+        let fake: plait_git::Handle = Arc::new(Fake);
+        let started = Startup::new("plait-test", View::Commits)
+            .args(vec!["commits".into(), "/nonexistent".into()])
+            .opener(Arc::new(OneFake(Arc::clone(&fake))))
+            .go()
+            .unwrap_or_else(|_| panic!("the fake has history"));
+        assert_eq!(started.loaded.label, "fake (main)", "acquired from it");
+        match &started.loaded.data {
+            acquire::Data::Commits(commits) => {
+                assert_eq!(commits[0].subject, "from the fake");
+            }
+            other => panic!("a commits view loads commits, got {other:?}"),
+        }
+        assert!(
+            Arc::ptr_eq(started.repo.as_ref().expect("retained"), &fake),
+            "the same handle comes back on Started"
+        );
+    }
+
+    #[test]
+    fn help_and_config_never_touch_the_opener() {
+        for line in ["--help", "config"] {
+            let result = Startup::new("plait-test", View::Commits)
+                .args(vec![line.into()])
+                .opener(Arc::new(Exploding))
+                .go();
+            assert!(
+                !matches!(result, Err(Exit::Failed(_))),
+                "{line} must not fail, and must not have opened anything"
+            );
+            assert!(
+                matches!(result, Err(Exit::Help(_)) | Err(Exit::Config(_))),
+                "{line} is a success with nothing to draw"
+            );
+        }
     }
 }
