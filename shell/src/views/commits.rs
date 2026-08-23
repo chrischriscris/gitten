@@ -1,3 +1,4 @@
+use super::{accept_deferred_scroll, DeferredScrollbar, PendingScroll};
 use crate::graph;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
@@ -39,6 +40,8 @@ pub struct Commits {
     view: Rc<Cell<Viewport>>,
     /// The vertical offset this view last wrote — see the diff view's note.
     synced: Rc<Cell<f32>>,
+    /// A strict row waiting for prepaint, plus exact wheel pixels meanwhile.
+    pending_scroll: PendingScroll,
     /// Instrumentation the view owns and anyone may read. The view does not
     /// know the stats overlay exists.
     pub rendered: Rc<Cell<usize>>,
@@ -76,8 +79,7 @@ impl Commits {
         let mut v = self.live_view(host);
         v.scroll_to(row);
         self.view.set(v);
-        self.top.set(v.top());
-        self.scroll.scroll_to_item_strict(row, ScrollStrategy::Top);
+        self.defer_show(v);
     }
 
     pub fn total(&self) -> usize {
@@ -107,6 +109,22 @@ impl Commits {
     /// `[keys]` but whose delta is pixels. The cursor comes along when pushed
     /// off screen, exactly as [`Viewport::scroll_by`] does in the terminal.
     pub fn scroll_pixels(&mut self, dy: f32, host: &Host) -> bool {
+        let deferred = self.scroll.0.borrow().deferred_scroll_to_item;
+        if let Some(request) = deferred {
+            if self.pending_scroll.is_awaiting() {
+                let pixels = self.pending_scroll.wheel(dy);
+                let mut v = self.live_view(host);
+                let y = -(request.item_index as f32 * graph::ROW_H) + pixels;
+                v.scroll_to((-y / graph::ROW_H).round().max(0.0) as usize);
+                self.view.set(v);
+                self.top.set(v.top());
+                return true;
+            }
+            // A request not paired with our marker belongs to another
+            // interaction. The newer wheel wins rather than donating pixels to
+            // a request `accept_deferred_scroll` will deliberately ignore.
+            self.scroll.0.borrow_mut().deferred_scroll_to_item = None;
+        }
         let (offset, max) = {
             let s = self.scroll.0.borrow();
             (s.base_handle.offset(), s.base_handle.max_offset())
@@ -132,6 +150,9 @@ impl Commits {
     /// screen now. [`Commits::synced`] separates "the list moved under us" from
     /// "we moved the list" — see the diff view's `reconcile`.
     pub fn reconcile(&mut self, host: &Host) {
+        if self.scroll.0.borrow().deferred_scroll_to_item.is_some() {
+            return;
+        }
         let shown_y = f32::from(self.scroll.0.borrow().base_handle.offset().y);
         if (shown_y - self.synced.get()).abs() < 0.5 {
             return;
@@ -173,19 +194,28 @@ impl Commits {
         true
     }
 
-    /// Puts row `v.top()` at the top of the viewport, exactly. Direct offset
-    /// arithmetic rather than a deferred request — this runs against geometry
-    /// the list has already measured — and it cancels anything still parked in
-    /// the handle, so a restore's pending request cannot override a command
-    /// that has since moved the list. See the diff view's `show`.
+    /// Puts row `v.top()` at the top of the viewport, exactly. If the list still
+    /// has a deferred position, its geometry is not current yet; replace that
+    /// target instead of clamping against stale bounds.
     fn show(&self, v: Viewport) {
         let target = v.top();
-        self.scroll.0.borrow_mut().deferred_scroll_to_item = None;
+        if self.scroll.0.borrow().deferred_scroll_to_item.is_some() {
+            self.defer_show(v);
+            return;
+        }
         let s = self.scroll.0.borrow();
         let cur = s.base_handle.offset();
         let y = -(target as f32 * graph::ROW_H).clamp(0.0, f32::from(s.base_handle.max_offset().y));
         s.base_handle.set_offset(point(cur.x, px(y)));
         self.synced.set(y);
+        self.top.set(target);
+    }
+
+    fn defer_show(&self, v: Viewport) {
+        let target = v.top();
+        self.pending_scroll.begin();
+        self.scroll
+            .scroll_to_item_strict(target, ScrollStrategy::Top);
         self.top.set(target);
     }
 
@@ -270,6 +300,7 @@ impl Commits {
             scroll: UniformListScrollHandle::new(),
             view: Rc::new(Cell::new(Viewport::new())),
             synced: Rc::new(Cell::new(0.0)),
+            pending_scroll: PendingScroll::default(),
             rendered: Rc::new(Cell::new(0)),
             top: Rc::new(Cell::new(0)),
             load,
@@ -291,12 +322,27 @@ impl Render for Commits {
         let rendered = self.rendered.clone();
         let top = self.top.clone();
         let view = self.view.clone();
+        let scroll = self.scroll.clone();
+        let synced = self.synced.clone();
+        let pending_scroll = self.pending_scroll.clone();
         // Read per batch, not captured at construction — see the note in the
         // diff view: this is what makes a saved config apply on the next frame.
         let list = uniform_list("commits", data.commits.len(), move |range, _, cx| {
             rendered.set(range.len());
             top.set(range.start);
             let host = crate::config::host(cx);
+            if let Some(accepted) = accept_deferred_scroll(&scroll, &pending_scroll, &synced) {
+                if accepted.wheeled {
+                    let mut v = view.get();
+                    v.set_len(data.commits.len());
+                    v.set_height(range.len());
+                    v.set_scrolloff(host.view.scrolloff);
+                    v.scroll_to((-accepted.y / graph::ROW_H).round().max(0.0) as usize);
+                    view.set(v);
+                    top.set(v.top());
+                    cx.refresh_windows();
+                }
+            }
             let cursor = view.get().cursor();
             range
                 .map(|i| {
@@ -324,8 +370,11 @@ impl Render for Commits {
         // two things in two clients is a knob nobody trusts.
         let bars = crate::config::host(cx).view.scrollbar;
         div().relative().size_full().child(list).when(bars, |d| {
-            d.child(Scrollbar::vertical(&self.scroll))
-                .child(Scrollbar::horizontal(&self.scroll))
+            d.child(Scrollbar::vertical(&DeferredScrollbar::new(
+                &self.scroll,
+                &self.pending_scroll,
+            )))
+            .child(Scrollbar::horizontal(&self.scroll))
         })
     }
 }
@@ -514,13 +563,86 @@ mod tests {
         assert!(request.scroll_strict, "visible-in-range is exactly the bug");
         assert_eq!(c.view.get().top(), 5, "and the model says so too");
 
-        // A command before the list lays out cancels the parked request rather
-        // than being overridden by it.
+        // A command before layout replaces the target. Writing immediately
+        // would clamp against geometry that still describes the empty list.
         assert!(c.run_view("view.down", &host));
+        let request = c
+            .scroll
+            .0
+            .borrow()
+            .deferred_scroll_to_item
+            .expect("the updated target was not deferred");
+        assert_eq!(request.item_index, c.view.get().top());
+        assert!(request.scroll_strict);
+        assert_eq!(f32::from(c.scroll.0.borrow().base_handle.offset().y), 0.0);
+
+        let before = request.item_index;
+        assert!(c.scroll_pixels(-0.25, &host));
+        let request = c
+            .scroll
+            .0
+            .borrow()
+            .deferred_scroll_to_item
+            .expect("the wheel discarded the deferred target");
+        assert_eq!(request.item_index, before, "the strict baseline moved");
+        assert_eq!(c.pending_scroll.0.wheel.get(), -0.25);
+        assert_eq!(f32::from(c.scroll.0.borrow().base_handle.offset().y), 0.0);
+    }
+
+    #[test]
+    fn consuming_a_deferred_restore_is_not_reconciled_as_a_drag() {
+        let host = Rc::new(Host::new());
+        let mut c = Commits::new(commits(100), host.clone());
+        c.scroll_to(40, &host);
+        c.go_to(40, &host);
+
+        // Measurement calls the row callback before prepaint takes the request;
+        // that must not accept the old offset.
         assert!(
-            c.scroll.0.borrow().deferred_scroll_to_item.is_none(),
-            "a command left a stale deferred scroll behind it"
+            crate::views::accept_deferred_scroll(&c.scroll, &c.pending_scroll, &c.synced).is_none()
         );
+        assert!(c.pending_scroll.0.awaiting.get());
+        assert_eq!(c.synced.get(), 0.0);
+
+        // What strict prepaint does: consume the request and write its offset.
+        {
+            let mut state = c.scroll.0.borrow_mut();
+            state.deferred_scroll_to_item = None;
+            state
+                .base_handle
+                .set_offset(gpui::point(gpui::px(0.0), gpui::px(-40.0 * 22.0)));
+        }
+        let accepted =
+            crate::views::accept_deferred_scroll(&c.scroll, &c.pending_scroll, &c.synced)
+                .expect("prepaint's offset was not accepted");
+        assert!(!accepted.wheeled);
+        assert!(!c.pending_scroll.0.awaiting.get());
+        assert_eq!(c.synced.get(), -40.0 * 22.0);
+
+        // Without accepting the offset, reconcile treats row 40 as a thumb drag
+        // and moves the cursor to the scrolloff margin before applying this key.
+        c.rendered.set(20);
+        assert!(c.run_view("view.down", &host));
+        assert_eq!(c.view.get().cursor(), 41);
+    }
+
+    #[test]
+    fn a_thumb_drag_cancels_a_parked_strict_position() {
+        let host = Rc::new(Host::new());
+        let mut c = Commits::new(commits(100), host.clone());
+        c.scroll_to(40, &host);
+        assert!(c.scroll_pixels(-0.25, &host));
+
+        let bar = crate::views::DeferredScrollbar::new(&c.scroll, &c.pending_scroll);
+        gpui_component::scroll::ScrollbarHandle::set_offset(
+            &bar,
+            gpui::point(gpui::px(0.0), gpui::px(-9.5)),
+        );
+
+        assert!(c.scroll.0.borrow().deferred_scroll_to_item.is_none());
+        assert!(!c.pending_scroll.0.awaiting.get());
+        assert_eq!(c.pending_scroll.0.wheel.get(), 0.0);
+        assert_eq!(f32::from(c.scroll.0.borrow().base_handle.offset().y), -9.5);
     }
 
     #[test]

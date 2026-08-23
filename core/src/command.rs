@@ -392,14 +392,13 @@ impl Keymap {
             chord,
             command: command.into(),
         };
-        match self
-            .bindings
-            .iter()
-            .position(|b| b.mode == mode && b.chord == binding.chord)
-        {
-            Some(i) => self.bindings[i] = binding,
-            None => self.bindings.push(binding),
-        }
+        // A replacement is the newest binding too. This matters when one
+        // physical press has two spellings: resolution walks a mode newest
+        // first, just as GPUI does, so replacing an older logical spelling must
+        // move it past a physical alternative added in between.
+        self.bindings
+            .retain(|b| !(b.mode == mode && b.chord == binding.chord));
+        self.bindings.push(binding);
         Ok(())
     }
 
@@ -458,14 +457,12 @@ impl Keymap {
     /// binding wins whichever spelling it was written in, exactly as one pass
     /// over GPUI's bindings in map order would land.
     ///
-    /// Within a mode, a chord that continues beats a binding that ends — the
-    /// order GPUI's own dispatcher uses, where pending outranks a full match.
-    /// One spelling alone can never need this: [`bind`](Self::bind) refuses
-    /// prefixes, so an exact match and a longer chord cannot share a mode.
-    /// Spellings can, though — `ß` and the `alt-s` that inserts it are
-    /// different chords to `bind` and the same press to a German keyboard —
-    /// and the chord keeps waiting, which is also the only way its second key
-    /// is ever reachable.
+    /// Within a mode, an exact binding wins before a chord that could continue,
+    /// preserving [`Self::resolve`]'s clockless contract. GPUI can defer the
+    /// exact binding and replay it after a timeout; core owns no clock or replay
+    /// queue, so waiting here would swallow the exact command forever. When
+    /// alternate spellings make two exact bindings match, the later binding
+    /// wins, as GPUI's keymap does for user bindings over defaults.
     ///
     /// `pending[i]` must be non-empty; [`Self::resolve`] is the
     /// single-spelling case.
@@ -482,19 +479,20 @@ impl Keymap {
                 && chord.iter().zip(pending).all(|(k, alts)| alts.contains(k))
         };
         for mode in modes.as_slice().iter().rev() {
+            if let Some(b) = self
+                .bindings
+                .iter()
+                .rev()
+                .find(|b| b.mode == *mode && matches(&b.chord))
+            {
+                return Resolve::Run(&b.command);
+            }
             if self
                 .bindings
                 .iter()
                 .any(|b| b.mode == *mode && prefixes(&b.chord))
             {
                 return Resolve::Pending;
-            }
-            if let Some(b) = self
-                .bindings
-                .iter()
-                .find(|b| b.mode == *mode && matches(&b.chord))
-            {
-                return Resolve::Run(&b.command);
             }
         }
         Resolve::None
@@ -1050,29 +1048,48 @@ mod tests {
     }
 
     #[test]
-    fn a_chord_waits_with_alternatives_in_its_first_key() {
-        // Pending has to keep *both* spellings alive: which one completes the
-        // chord is decided by the second key's map lookup, and throwing either
-        // away at prefix time loses a binding that exists.
+    fn an_exact_alternate_wins_without_a_clock_and_a_lone_chord_still_waits() {
+        // GPUI can wait and replay an exact binding after a timeout. Core has
+        // neither facility, so an exact logical spelling must not disappear
+        // forever behind a physical spelling's longer chord.
         let mut k = Keymap::empty();
         k.bind(GLOBAL, "ß", "insert.ssharp").unwrap();
         k.bind(GLOBAL, "alt-s n", "pane.next").unwrap();
         let modes = Modes::new();
 
-        // A plain `ß` binding must NOT fire here: alt-s is also alive, and
-        // until the second key arrives the press is a prefix of it.
+        assert_eq!(
+            k.resolve_any(&modes, &[&option_s()]),
+            Resolve::Run("insert.ssharp")
+        );
+
+        // With no exact binding, both spellings remain alive while the chord
+        // waits and its physical branch can complete.
+        let mut k = Keymap::empty();
+        k.bind(GLOBAL, "alt-s n", "pane.next").unwrap();
         assert_eq!(k.resolve_any(&modes, &[&option_s()]), Resolve::Pending);
         let n = [Key::char('n')];
         assert_eq!(
             k.resolve_any(&modes, &[&option_s(), &n]),
             Resolve::Run("pane.next")
         );
+    }
 
-        // ...and the other branch of the fork still resolves on its own key.
-        let sharp = [Key::char('ß')];
+    #[test]
+    fn a_later_binding_wins_when_two_spellings_match_in_one_mode() {
+        let mut k = Keymap::empty();
+        k.bind(GLOBAL, "[", "default.logical").unwrap();
+        k.bind(GLOBAL, "alt-5", "user.physical").unwrap();
+        let candidates = [Key::char('['), Key::parse("alt-5").unwrap()];
         assert_eq!(
-            k.resolve_any(&modes, &[&sharp]),
-            Resolve::Run("insert.ssharp")
+            k.resolve_any(&Modes::new(), &[&candidates]),
+            Resolve::Run("user.physical")
+        );
+
+        // Replacing the older chord is itself the newest registration.
+        k.bind(GLOBAL, "[", "user.logical").unwrap();
+        assert_eq!(
+            k.resolve_any(&Modes::new(), &[&candidates]),
+            Resolve::Run("user.logical")
         );
     }
 

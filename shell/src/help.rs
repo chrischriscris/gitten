@@ -47,6 +47,9 @@ pub fn overlay(host: &Host, modes: &plait_core::command::Modes) -> AnyElement {
     div()
         .absolute()
         .inset_0()
+        // The whole overlay, not only its panel: a wheel in the dim space
+        // around it must not find the list underneath.
+        .occlude()
         .flex()
         .items_center()
         .justify_center()

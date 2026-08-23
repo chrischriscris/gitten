@@ -739,13 +739,11 @@ impl DevShell {
         // half-typed when the fingers touch the wheel is not half-typed any
         // more. The same rule the focus and host checks apply, one line each.
         self.pending.clear();
-        // Help is up, or a picker menu: both occlude the rows below them —
-        // clicks included — so the shell swallows the event rather than
-        // scrolling what cannot be seen or acting behind what is on top. The
-        // axis lock is simply left as it stands; the gesture's axis belongs to
-        // whatever is under the pointer once this one ends.
+        // Help is up, or a picker menu: their full-window occluding surfaces
+        // keep the rows out of the hit path, while this capture interceptor
+        // stands aside so a handler on the visible panel can still see the
+        // event. Stopping propagation here would prevent that bubble handler.
         if self.help || self.open.is_some() {
-            cx.stop_propagation();
             return;
         }
         // Over the rows, and not over the title bar or a dropdown above them. A
@@ -1166,6 +1164,11 @@ impl Render for DevShell {
                     .or_else(|| notice.map(|n| band(&c, SharedString::from(n), c.dim))),
             )
             .child(div().flex_grow(1.0).overflow_hidden().child(view))
+            // The menu itself is deferred at priority 1. Its transparent
+            // priority-0 backdrop blocks the rest of the window without
+            // covering the menu, so capture can leave overlay wheel ownership
+            // alone without exposing the native list scroller underneath.
+            .children(self.open.is_some().then(controls::picker_backdrop))
             .children(overlay.map(|(frames, rows, heap, load)| {
                 div()
                     .flex_none()

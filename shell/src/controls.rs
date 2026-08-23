@@ -233,6 +233,17 @@ pub fn picker(
     root.into_any_element()
 }
 
+/// The transparent surface behind an open picker.
+///
+/// Picker lists paint at deferred priority 1. This paints first at priority 0,
+/// occluding the rest of the window so a wheel outside the list cannot reach the
+/// diff underneath, while the list remains the target inside its own bounds.
+pub fn picker_backdrop() -> AnyElement {
+    deferred(div().absolute().inset_0().occlude())
+        .with_priority(0)
+        .into_any_element()
+}
+
 #[cfg(test)]
 mod tests {
     // By name, not a glob: `use gpui::*` in the parent shadows `#[test]` with

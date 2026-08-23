@@ -31,8 +31,9 @@
 //!   When the two spellings agree — an unshifted letter, a plain symbol — there
 //!   is nothing to choose and one candidate comes back, carrying its own
 //!   modifiers exactly as GPUI's physical fallback compares them. A shifted
-//!   letter keeps only its capital: shift cannot ride on a character anywhere
-//!   in this map, so no second candidate is invented from the physical half.
+//!   physical ASCII letter is represented by its capital, the same spelling
+//!   every other client and this map use; shifted punctuation has no lossless
+//!   physical representation and therefore adds no fallback.
 //!   An insert that is not one character is IME composition state: nothing is
 //!   invented from it, and if the physical half is no single character either,
 //!   the press translates to nothing.
@@ -84,10 +85,14 @@ pub fn translate(k: &Keystroke) -> Vec<Key> {
         "pagedown" => Code::PageDown,
         "enter" | "return" => Code::Enter,
         // Shift-tab is backtab everywhere else; GPUI reports tab with shift set,
-        // and the shift goes no further — a terminal folds it into the code the
-        // same way, so `[keys]` says `backtab` and nothing else.
+        // and the shift goes no further. Ctrl and alt still belong to the press.
         "tab" if k.modifiers.shift => {
-            return vec![Key::plain(Code::BackTab)];
+            return vec![Key::new(
+                Code::BackTab,
+                k.modifiers.control,
+                k.modifiers.alt,
+                false,
+            )];
         }
         "tab" => Code::Tab,
         "backspace" => Code::Backspace,
@@ -116,11 +121,9 @@ pub fn translate(k: &Keystroke) -> Vec<Key> {
 /// insert against — control, because ctrl-a is still a command and not a
 /// character anybody typed; shift is already inside the character and alt went
 /// into composing it. The physical candidate then falls back exactly as
-/// GPUI's own comparison does, with every modifier it was pressed with —
-/// unless shift was among them, which no character in this map can hold: the
-/// candidate would come back unshifted and fire a binding GPUI would never
-/// fire, so where the capital is not already the character there is nothing to
-/// fall back *to*.
+/// GPUI's own comparison does, with every modifier it was pressed with. Shift
+/// cannot ride on a character in this map, so an ASCII letter folds it into its
+/// capital; shifted punctuation has no lossless fallback.
 fn characters(physical: Option<char>, inserted: Option<char>, mods: &gpui::Modifiers) -> Vec<Key> {
     let Some(c) = inserted.or(physical) else {
         return Vec::new();
@@ -128,11 +131,16 @@ fn characters(physical: Option<char>, inserted: Option<char>, mods: &gpui::Modif
     match inserted.is_some() {
         true => {
             let mut out = vec![Key::new(Code::Char(c), mods.control, false, false)];
-            // The physical half answers only when this map could still hold a
-            // binding it would match: shift cannot ride on a character.
-            if !mods.shift {
-                if let Some(p) = physical {
-                    out.push(Key::new(Code::Char(p), mods.control, mods.alt, false));
+            if let Some(mut p) = physical {
+                if mods.shift {
+                    if !p.is_ascii_lowercase() {
+                        return out;
+                    }
+                    p.make_ascii_uppercase();
+                }
+                let fallback = Key::new(Code::Char(p), mods.control, mods.alt, false);
+                if !out.contains(&fallback) {
+                    out.push(fallback);
                 }
             }
             out
@@ -301,6 +309,8 @@ mod tests {
     #[test]
     fn shift_tab_is_backtab_like_everywhere_else() {
         assert_eq!(t("tab", "shift"), "backtab");
+        assert_eq!(t("tab", "ctrl-shift"), "ctrl-backtab");
+        assert_eq!(t("tab", "alt-shift"), "alt-backtab");
         assert_eq!(t("tab", ""), "tab");
     }
 
@@ -360,9 +370,16 @@ mod tests {
         let got = typed("x", Some("X"), plain("ctrl-shift"));
         assert_eq!(got[0], Key::ctrl(Code::Char('X')));
         assert!(got[0].ctrl && !got[0].shift);
-        // ...and no physical fallback under shift: this map cannot hold
-        // `shift-x`, so a second candidate would fire something GPUI would not.
+        // The physical fallback folds onto the same capital and is deduplicated.
         assert_eq!(got.len(), 1, "{got:?}");
+
+        // On a non-Latin layout the logical character and shifted physical key
+        // differ. Both the typed character and the map's capital binding work.
+        let got = typed("g", Some("Γ"), plain("shift"));
+        assert_eq!(got, vec![Key::char('Γ'), Key::char('G')]);
+        let got = typed("g", Some("Γ"), plain("ctrl-alt-shift"));
+        assert_eq!(got[0], Key::ctrl(Code::Char('Γ')));
+        assert_eq!(got[1], Key::parse("ctrl-alt-G").unwrap());
     }
 
     #[test]
