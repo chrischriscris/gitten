@@ -29,7 +29,11 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # Full history, not the default depth-1 clone: the acquisition tests use
+      # this repository as their fixture and diff HEAD~1..HEAD.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -q --locked -p plait-core
       - run: cargo test -q --locked -p plait-app
@@ -39,7 +43,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # The set Zed's own install script hands a Linux builder: gpui needs the
       # headers even to compile, and blade wants vulkan present.
       - run: |
