@@ -1578,6 +1578,9 @@ mod tests {
         r.git(&["add", "-A"]);
         r.git(&["commit", "-qm", "init"]);
         r.git(&["mv", "before.txt", "after.txt"]);
+        // The application asks for renames explicitly. A user's contrary
+        // status preference must not split this into an unrelated add/delete.
+        r.git(&["config", "status.renames", "false"]);
 
         let s = r.open().status().unwrap();
         assert_eq!(s.staged.len(), 1);
