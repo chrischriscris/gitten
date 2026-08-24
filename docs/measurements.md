@@ -566,6 +566,32 @@ why the guarantee is order-for-order identity and not just set equality.
 A **single-file** diff gets nothing: the unit of work is a file. Stealing hunks
 instead would fix that and needs the per-file timing accumulation to move.
 
+### Acquisition peak, streamed vs collected
+
+`pairs` built a `Vec<Pair>` holding both sides of every changed file at once,
+which put back exactly the peak `BlobStream` was written to avoid. `each_pair`
+hands each pair to `diff`, which diffs it and drops it, so the peak is one file's
+content plus the whole edit script rather than every file's content plus the edit
+script.
+
+```sh
+COLS=120 ROWS=40 /usr/bin/time -l \
+  ./target/release/examples/dump diff ~/Projects/cmux HEAD~40..HEAD   # peak footprint
+```
+
+Peak memory footprint, `main` against the change:
+
+| input | changed files | before | after |
+|---|---|---|---|
+| `cmux HEAD~40..HEAD` | 482 | 113 MB | **81 MB** |
+| this repo, whole history | 94 | 24 MB | **21 MB** |
+
+The win tracks how much of each file is context rather than change: a `FileDiff`
+keeps only changed lines and their surroundings, so the 990 untouched lines of a
+1,000-line file are read, compared, and freed — which only happens if the pair
+they came in is freed too. `pairs` is kept for the test and `diffcheck`, which
+want the list and are small enough that the pile is free.
+
 ### Topology
 
 `shape`, on the two real repositories:

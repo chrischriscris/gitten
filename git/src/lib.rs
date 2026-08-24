@@ -124,7 +124,52 @@ impl Pair {
 ///
 /// `revspec` is anything git accepts — `HEAD~50..HEAD`, a single sha,
 /// `main..feature`. Empty means the working tree against HEAD.
+///
+/// **Collects.** Which means it holds the full text of both sides of every
+/// changed file at once, and a whole-history diff of a large repository is
+/// gigabytes of that. [`each_pair`] is the same work without the pile, and is
+/// what [`diff`] uses; this stays because a test and `diffcheck` genuinely want
+/// the list, and at their sizes the pile is free.
 pub fn pairs(repo: &Path, revspec: &str) -> Result<Vec<Pair>> {
+    let mut out = Vec::new();
+    each_pair(repo, revspec, |p| {
+        out.push(p);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// Every changed file for `revspec`, one at a time, dropped before the next is
+/// read.
+///
+/// # Why this is a callback and not a `Vec`
+///
+/// [`BlobStream`] is written to hold one file's blobs at a time — the comment on
+/// it says the map it replaced "was tens of MB of pure peak overlap" — and then
+/// [`pairs`] piled every [`Pair`] into a `Vec` anyway, which put all of it back.
+/// Measured, a 29 MB patch peaked at 338 MB and 38 MB of blob content peaked at
+/// 107 MB; the incremental read was buying nothing it was not immediately
+/// spending.
+///
+/// It matters most for the shape a diff usually has. A `FileDiff` keeps only the
+/// changed lines and their context, so for a one-line fix in a thousand-line file
+/// the other 990 lines exist solely to be compared and are garbage the moment the
+/// differ has run. Handing the pair over and taking it back is what lets them go.
+///
+/// A callback rather than an `Iterator` because the work is a state machine over
+/// a child process: an iterator would have to own the `BlobStream`, surface its
+/// errors per item, and stay alive exactly as long as the borrow of `repo` — all
+/// of which is real API surface for a caller that just wants each file once.
+/// `f`'s error stops the walk and comes back as this function's, so a consumer
+/// can give up early without the process being left half-drained.
+///
+/// This is also the shape the [roadmap's `Repo` trait](../../docs/roadmap.md)
+/// wants: a method that streams what it acquires cannot be retrofitted into one
+/// that collects, and the other way round is one line.
+pub fn each_pair<F>(repo: &Path, revspec: &str, mut on_pair: F) -> Result<()>
+where
+    F: FnMut(Pair) -> Result<()>,
+{
     // `-z` for NUL-separated paths, because a path may contain anything a
     // filesystem allows and git otherwise quotes and escapes it. `-M` so a
     // rename arrives as one file with two names instead of a delete and an add
@@ -194,12 +239,18 @@ pub fn pairs(repo: &Path, revspec: &str) -> Result<Vec<Pair>> {
     };
     let mut blobs = blobs?;
 
-    let mut out = Vec::with_capacity(changes.len());
     // Untracked files first, so they read as new before the modifications —
     // `git status` lists them last and that is the wrong way round for a diff,
     // where the thing you just created is the thing you are looking for.
     // Fetching them early changed when they arrive, not where they land.
-    out.extend(loose?);
+    //
+    // These are the one set still gathered before being handed over: `untracked`
+    // reads them on another thread while the batch starts, so it has nowhere to
+    // hand them to yet. A checkout with thousands of new files is the case that
+    // would want the same treatment.
+    for p in loose? {
+        on_pair(p)?;
+    }
     for c in changes {
         // Both sides pull in request order — old, then new — which is what
         // keeps this loop aligned with the stream.
@@ -228,7 +279,9 @@ pub fn pairs(repo: &Path, revspec: &str) -> Result<Vec<Pair>> {
             .or_else(|| new_side(&c.new_oid, repo, &c.path));
         let binary = old.as_ref().is_some_and(|b| is_binary(b))
             || new.as_ref().is_some_and(|b| is_binary(b));
-        out.push(Pair {
+        // Handed over and gone. What the consumer keeps is its business; what
+        // this loop keeps is nothing, which is the whole point.
+        on_pair(Pair {
             path: c.path,
             old_path: c.old_path,
             status: c.status,
@@ -243,10 +296,10 @@ pub fn pairs(repo: &Path, revspec: &str) -> Result<Vec<Pair>> {
                 lines(new.as_deref().unwrap_or_default())
             },
             binary,
-        });
+        })?;
     }
     blobs.finish()?;
-    Ok(out)
+    Ok(())
 }
 
 /// Every untracked file, as a pair with nothing on its old side.
@@ -336,9 +389,13 @@ pub fn diff(
     differs: &Differs,
     over: &Overrides,
 ) -> Result<Vec<FileDiff>> {
-    Ok(pairs(repo, revspec)?
-        .iter()
-        .map(|p| match p.binary {
+    // Streamed, not collected. Each pair is diffed and then dropped, so the peak
+    // is one file's content plus the whole edit script rather than every file's
+    // content plus the whole edit script — see `each_pair` for why that is most
+    // of it on a real diff.
+    let mut out = Vec::new();
+    each_pair(repo, revspec, |p| {
+        out.push(match p.binary {
             // Modelled as a file with no hunks rather than skipped: the diff
             // still has to say the file changed, and "binary" is the honest
             // thing for it to say.
@@ -350,8 +407,10 @@ pub fn diff(
                 path: p.label(),
                 ..differs.file_using(over, &p.path, &p.old, &p.new)
             },
-        })
-        .collect())
+        });
+        Ok(())
+    })?;
+    Ok(out)
 }
 
 /// A short label for the window title.
