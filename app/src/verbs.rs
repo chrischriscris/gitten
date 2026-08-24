@@ -117,6 +117,49 @@ impl Write {
             r.commit(&message).map(|_| ())
         })
     }
+
+    /// Moves HEAD onto the named branch. The name is bytes end to end — what
+    /// the panel read is what git is aimed at.
+    pub fn checkout(repo: &Handle, name: Vec<u8>) -> Self {
+        let shown = String::from_utf8_lossy(&name).into_owned();
+        Self::named(format!("checkout {shown}"), repo, move |r| {
+            r.checkout(&name)
+        })
+    }
+
+    /// Creates a local branch at `start`, or at HEAD when there is none.
+    /// Nothing is checked out; HEAD stays where it was.
+    pub fn create_branch(repo: &Handle, name: Vec<u8>, start: Option<Vec<u8>>) -> Self {
+        let shown = String::from_utf8_lossy(&name).into_owned();
+        Self::named(format!("branch {shown}"), repo, move |r| {
+            r.create_branch(&name, start.as_deref())
+        })
+    }
+
+    /// Deletes a local branch. Merged work only unless `force` — an unmerged
+    /// one comes back refused in git's own words.
+    pub fn delete_branch(repo: &Handle, name: Vec<u8>, force: bool) -> Self {
+        let shown = String::from_utf8_lossy(&name).into_owned();
+        let word = match force {
+            true => "force-delete branch",
+            false => "delete branch",
+        };
+        Self::named(format!("{word} {shown}"), repo, move |r| {
+            r.delete_branch(&name, force)
+        })
+    }
+
+    /// Renames a local branch — git's `-m`, which moves ref, config and
+    /// upstream link together.
+    pub fn rename_branch(repo: &Handle, from: Vec<u8>, to: Vec<u8>) -> Self {
+        let from_shown = String::from_utf8_lossy(&from).into_owned();
+        let to_shown = String::from_utf8_lossy(&to).into_owned();
+        Self::named(
+            format!("rename {from_shown} → {to_shown}"),
+            repo,
+            move |r| r.rename_branch(&from, &to),
+        )
+    }
 }
 
 impl Job for Write {
@@ -212,6 +255,41 @@ mod tests {
         fn commit(&self, message: &str) -> gitten_git::Result<String> {
             self.0.lock().unwrap().push(format!("commit {message}"));
             Ok("f00d".into())
+        }
+        fn checkout(&self, name: &[u8]) -> gitten_git::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("checkout {}", String::from_utf8_lossy(name)));
+            Ok(())
+        }
+        fn create_branch(&self, name: &[u8], start: Option<&[u8]>) -> gitten_git::Result<()> {
+            let start = start.map(|s| format!(" at {}", String::from_utf8_lossy(s)));
+            self.0.lock().unwrap().push(format!(
+                "branch {}{}",
+                String::from_utf8_lossy(name),
+                start.unwrap_or_default()
+            ));
+            Ok(())
+        }
+        fn delete_branch(&self, name: &[u8], force: bool) -> gitten_git::Result<()> {
+            let word = match force {
+                true => "force-delete",
+                false => "delete",
+            };
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("{word} {}", String::from_utf8_lossy(name)));
+            Ok(())
+        }
+        fn rename_branch(&self, from: &[u8], to: &[u8]) -> gitten_git::Result<()> {
+            self.0.lock().unwrap().push(format!(
+                "rename {} {}",
+                String::from_utf8_lossy(from),
+                String::from_utf8_lossy(to)
+            ));
+            Ok(())
         }
     }
 
@@ -353,11 +431,145 @@ mod tests {
             fn commit(&self, _: &str) -> gitten_git::Result<String> {
                 Err("hook declined".into())
             }
+            fn delete_branch(&self, _: &[u8], _: bool) -> gitten_git::Result<()> {
+                Err("git branch -d feature: not fully merged".into())
+            }
         }
         let repo: Handle = Arc::new(Broken);
         // The error text is the repository's own, verbatim — the layer that
         // knows why a write failed is the layer that says so.
         let job: Box<dyn Job> = Box::new(Write::commit(&repo, "m".into()));
         assert_eq!(job.run(), Err("hook declined".into()));
+        let job: Box<dyn Job> = Box::new(Write::delete_branch(&repo, b"feature".to_vec(), false));
+        assert_eq!(
+            job.run(),
+            Err("git branch -d feature: not fully merged".into())
+        );
+    }
+
+    #[test]
+    fn the_branch_verbs_reach_the_trait_bytes_intact() {
+        // A Latin-1 branch name is legal git and illegal UTF-8; the verb's
+        // one job on the way through is to not touch it. Recorded as raw
+        // bytes for exactly that reason — a lossy log could never tell a
+        // pass-through from a mangling.
+        #[derive(Default)]
+        struct Bytes(Arc<Mutex<Vec<Vec<u8>>>>);
+
+        impl Bytes {
+            fn push(&self, parts: &[&[u8]]) {
+                let mut line = Vec::new();
+                for (i, part) in parts.iter().enumerate() {
+                    if i > 0 {
+                        line.push(b' ');
+                    }
+                    line.extend_from_slice(part);
+                }
+                self.0.lock().unwrap().push(line);
+            }
+        }
+
+        impl Repo for Bytes {
+            fn log(&self, _: usize) -> gitten_git::Result<Vec<Commit>> {
+                Ok(Vec::new())
+            }
+            fn pairs(&self, _: &str) -> gitten_git::Result<Vec<gitten_git::Pair>> {
+                Ok(Vec::new())
+            }
+            fn status(&self) -> gitten_git::Result<Status> {
+                Ok(Status::default())
+            }
+            fn describe(&self) -> String {
+                "bytes".into()
+            }
+            fn checkout(&self, name: &[u8]) -> gitten_git::Result<()> {
+                self.push(&[b"checkout", name]);
+                Ok(())
+            }
+            fn create_branch(&self, name: &[u8], start: Option<&[u8]>) -> gitten_git::Result<()> {
+                match start {
+                    Some(start) => self.push(&[b"branch", name, b"at", start]),
+                    None => self.push(&[b"branch", name]),
+                }
+                Ok(())
+            }
+            fn delete_branch(&self, name: &[u8], force: bool) -> gitten_git::Result<()> {
+                match force {
+                    true => self.push(&[b"delete!", name]),
+                    false => self.push(&[b"delete", name]),
+                }
+                Ok(())
+            }
+            fn rename_branch(&self, from: &[u8], to: &[u8]) -> gitten_git::Result<()> {
+                self.push(&[b"rename", from, to]);
+                Ok(())
+            }
+        }
+
+        let bytes = Arc::default();
+        let repo: Handle = Arc::new(Bytes(Arc::clone(&bytes)));
+        let runner = Runner::new();
+        let submit = runner.submitter();
+        let mut jobs: Vec<Box<dyn Job>> = vec![
+            Box::new(Write::checkout(&repo, b"f\xe9ature".to_vec())),
+            Box::new(Write::create_branch(&repo, b"feature".to_vec(), None)),
+            Box::new(Write::create_branch(
+                &repo,
+                b"pinned".to_vec(),
+                Some(b"HEAD~1".to_vec()),
+            )),
+            Box::new(Write::delete_branch(&repo, b"old".to_vec(), false)),
+            Box::new(Write::delete_branch(&repo, b"stubborn".to_vec(), true)),
+            Box::new(Write::rename_branch(
+                &repo,
+                b"a".to_vec(),
+                b"b\xe9".to_vec(),
+            )),
+        ];
+        for job in jobs.drain(..) {
+            assert!(submit.submit(job).is_ok());
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while bytes.lock().unwrap().len() < 6 {
+            assert!(
+                Instant::now() < deadline,
+                "jobs did not run: {:?}",
+                bytes.lock().unwrap()
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            *bytes.lock().unwrap(),
+            vec![
+                b"checkout f\xe9ature".to_vec(),
+                b"branch feature".to_vec(),
+                b"branch pinned at HEAD~1".to_vec(),
+                b"delete old".to_vec(),
+                b"delete! stubborn".to_vec(),
+                b"rename a b\xe9".to_vec(),
+            ],
+            "every byte arrived undecoded"
+        );
+
+        // And the band names are the verbs' own words over the display
+        // spelling of the same bytes.
+        let mut names = Vec::new();
+        while let Some(event) = runner.try_next() {
+            if let Event::Started { name } = event {
+                names.push(name);
+            }
+        }
+        assert_eq!(
+            names,
+            vec![
+                "checkout f\u{FFFD}ature",
+                "branch feature",
+                "branch pinned",
+                "delete branch old",
+                "force-delete branch stubborn",
+                "rename a → b\u{FFFD}",
+            ]
+        );
     }
 }
