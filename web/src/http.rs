@@ -29,8 +29,9 @@
 //! origin even if something downstream is escaped wrong, and `nosniff` stops a
 //! diff of an HTML file being re-interpreted as one.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -284,8 +285,15 @@ where
     // The handler's whole life, on one thread. Ends when every connection
     // thread and the accept loop have dropped their sender, which is to say
     // never — the process is what ends this.
+    //
+    // A panic reachable from routing — a third-party `Wrap` or `Highlighter`
+    // bug, an index slip — would otherwise unwind out of `serve` and end the
+    // process, stalling every browser tab. Catch it here and answer 500 with no
+    // internal detail: this thread is the whole server, so its death is the
+    // server's, and one bad request is not the others' to pay for.
     for job in jobs {
-        let response = handler(&job.request);
+        let response = catch_unwind(AssertUnwindSafe(|| handler(&job.request)))
+            .unwrap_or_else(|_| Response::status(500, "internal error"));
         let _ = job.reply.send(response);
     }
     Ok(())
@@ -374,13 +382,23 @@ enum Head {
 }
 
 /// Reads up to the blank line that ends the request head.
-fn read_head(reader: &mut BufReader<TcpStream>) -> std::io::Result<Head> {
+///
+/// Generic over the reader so a test can drive it from a byte slice rather than
+/// a live socket; `connection` still hands it a `BufReader<TcpStream>`.
+fn read_head<R: Read>(reader: &mut BufReader<R>) -> std::io::Result<Head> {
     let mut head = String::new();
     loop {
         let mut line = String::new();
         // `read_line` on non-UTF-8 is an error, and a request head that is not
         // UTF-8 is not one we serve.
-        let n = match reader.read_line(&mut line) {
+        //
+        // Bounded at `MAX_HEAD`: `read_line` on its own grows `line` until a
+        // newline arrives, so one connection sending bytes with no `\n` is an
+        // unbounded allocation on loopback that ends in an OOM kill. `take`
+        // stops the read at the cap, and a line that hits it is over-long by the
+        // check just below — a whole request head fits in far less than one
+        // `MAX_HEAD` line.
+        let n = match (&mut *reader).take(MAX_HEAD as u64).read_line(&mut line) {
             Ok(n) => n,
             Err(_) => return Ok(Head::Closed),
         };
@@ -537,5 +555,16 @@ mod tests {
         }
         // No inline script anywhere in the page, so none is allowed.
         assert!(!CSP.contains("script-src 'self' 'unsafe-inline'"));
+    }
+
+    #[test]
+    fn a_head_line_with_no_newline_is_bounded_not_grown_forever() {
+        // A single line longer than the cap and with no `\n`: the `take` stops
+        // the read at `MAX_HEAD` so the buffer never grows without bound, and
+        // the accumulated-head check then reports it as too large rather than
+        // parsing a flood as a request.
+        let flood = vec![b'a'; MAX_HEAD + 100];
+        let mut reader = BufReader::new(&flood[..]);
+        assert!(matches!(read_head(&mut reader), Ok(Head::TooLarge)));
     }
 }

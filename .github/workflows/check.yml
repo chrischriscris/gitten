@@ -85,6 +85,43 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
         # Online for the same reason the test job is: see there.
 
+  # The desktop crate's tests — the largest tested surface in the repo, and the
+  # one the plain `test` job leaves out because it is the only crate that needs
+  # the GPUI Linux headers. Clippy already proves these compile on ubuntu (see
+  # `lint`); this runs them. Almost all are ordinary `#[test]` functions with no
+  # window; the two `#[gpui::test]` cases are why the job opened under
+  # continue-on-error — a headless GPUI run on ubuntu was unproven, and a
+  # first-time flake should not have turned main red before the signal was
+  # established. Observed green on its second run (the first died linking for
+  # want of libxkbcommon-x11-dev), so it gates like the rest.
+  test-shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 3
+      - uses: Swatinem/rust-cache@v2
+      # Not gated on a cache hit, unlike lint's copy of this list: rust-cache
+      # keys on the Cargo tree and knows nothing about apt, so a full match is
+      # exactly the run that still needs these. The rlibs restore warm, the
+      # final link is the first thing to consult the system .so files, and a
+      # skipped install left rust-lld finding no xcb, fontconfig, freetype,
+      # xkbcommon or xkbcommon-x11 — the second test-shell failure, one green
+      # run after the first.
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            fontconfig libfontconfig1-dev \
+            libxcb1-dev libxcb-util-dev \
+            libxkbcommon-dev libxkbcommon-x11-0 libxkbcommon-x11-dev \
+            libwayland-dev libudev-dev libvulkan-dev
+      # One package beyond lint's list, and only here: linking the test binary
+      # resolves `-lxkbcommon-x11`, which needs the unversioned .so symlink the
+      # -dev package carries — the -0 runtime library alone leaves rust-lld
+      # unable to find it.
+      - run: cargo test -q --locked -p gitten-shell
+
   # RUSTSEC advisories against the locked tree. Advisory, not a gate: this repo
   # is ~99% transitive gpui dependencies, and a blocking job would turn main red
   # for an advisory in a crate nobody here can bump without moving the whole GPUI

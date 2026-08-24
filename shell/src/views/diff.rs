@@ -582,6 +582,12 @@ pub struct Diff {
     /// load, whether or not anybody ever presses the key, and re-acquiring means
     /// the view needs a repository, which it does not have and should not.
     files: Rc<Vec<FileDiff>>,
+    /// The expensive half, run once per diff and kept: clip, intraline and
+    /// syntax behind an `Rc`, so a layout toggle pays [`arrange`] — renderer
+    /// selection, the order table, one clone per drawn file — and not the two
+    /// passes over every line. Rebuilt only where the diff itself changes:
+    /// [`Diff::swap`] and [`Diff::replace_prepared`].
+    prepared: Rc<Prepared>,
     layouts: Rc<Layouts>,
     current: usize,
     /// Which entry of `host.wrap` is in use.
@@ -1136,11 +1142,12 @@ impl Diff {
         self.files = Rc::new(files);
         self.sel = None;
         self.dragging = false;
-        let (built, headers) = assemble_prepared(prepared, host, &self.layouts, self.current);
+        self.prepared = Rc::new(prepared);
+        let built = arrange(&self.prepared, host, &self.layouts, self.current);
         self.order = Rc::new(built.order);
         *self.renderers.borrow_mut() = built.renderers;
         self.widest = built.widest;
-        self.headers = Rc::new(headers);
+        self.headers = Rc::new(built.headers);
         self.load = built.load;
         self.total.set(self.order.len());
         self.applied = (0.0, "");
@@ -1257,7 +1264,8 @@ impl Diff {
             }
         };
         let files = Rc::new(files);
-        let (built, headers) = assemble(&files, host, &layouts, current);
+        let prepared = Rc::new(prepare_files(&files, host));
+        let built = arrange(&prepared, host, &layouts, current);
         // The host names the wrap this opens on, exactly as it names the layout.
         // An unknown name is reported by the config layer, which is the layer
         // that knows it came from a file somebody is editing.
@@ -1266,6 +1274,7 @@ impl Diff {
         let view = Viewport::new();
         Self {
             files,
+            prepared,
             layouts: Rc::new(layouts),
             current,
             wrap,
@@ -1276,7 +1285,7 @@ impl Diff {
             sel: None,
             dragging: false,
             widest: built.widest,
-            headers: Rc::new(headers),
+            headers: Rc::new(built.headers),
             scroll: UniformListScrollHandle::new(),
             pan: Pan::default(),
             view: Rc::new(Cell::new(view)),
@@ -1301,11 +1310,11 @@ impl Diff {
         // way to carry a selection across two presentations of the same diff —
         // a replace pair is one row here and two there — so it goes.
         self.sel = None;
-        let (built, headers) = assemble(&self.files, host, &self.layouts, index);
+        let built = arrange(&self.prepared, host, &self.layouts, index);
         self.order = Rc::new(built.order);
         *self.renderers.borrow_mut() = built.renderers;
         self.widest = built.widest;
-        self.headers = Rc::new(headers);
+
         self.load = built.load;
         self.total.set(self.order.len());
         // Fresh implementations hold no wrap, so the next frame reflows them.
@@ -1328,30 +1337,18 @@ struct Built {
     renderers: Vec<Box<dyn Rows>>,
     order: Vec<RowRef>,
     widest: usize,
+    /// Where each file header landed in visual rows — what jump-to-file and
+    /// the widest-row search read. Produced by the same [`expand`] that built
+    /// `order`, so it can never disagree with it.
+    headers: Vec<usize>,
     load: String,
 }
 
-/// Prepare the diff, hand each file to the implementation that claims it, and
-/// build the order table.
 ///
-/// A free function rather than a method because it runs before a `Diff` exists
-/// and again after one does, and both callers want exactly this. Returns the
-/// built rows plus where the file headers are, in visual rows.
-fn assemble(
-    files: &[FileDiff],
-    host: &Host,
-    layouts: &Layouts,
-    current: usize,
-) -> (Built, Vec<usize>) {
-    assemble_prepared(prepare_files(files, host), host, layouts, current)
-}
-
-fn assemble_prepared(
-    prepared: Prepared,
-    host: &Host,
-    layouts: &Layouts,
-    current: usize,
-) -> (Built, Vec<usize>) {
+/// Takes the [`Prepared`] by reference on purpose: the expensive half ran once,
+/// somewhere else, and sits behind an `Rc` on the view — this is the cheap half
+/// a layout toggle pays, and it must not consume what the toggle wants kept.
+fn arrange(prepared: &Prepared, host: &Host, layouts: &Layouts, current: usize) -> Built {
     let t = std::time::Instant::now();
     let mut renderers = match layouts.0.get(current) {
         Some(layout) => (layout.build)(host),
@@ -1366,26 +1363,21 @@ fn assemble_prepared(
     let name = layouts.names().get(current).copied().unwrap_or("custom");
     let mut order: Vec<RowRef> = Vec::new();
 
-    // One pass in core, shared with the CLI and the ANSI painter, before any
-    // renderer sees a row.
-    let Prepared {
-        files: prepared,
-        intraline,
-        syntax,
-        threads,
-    } = prepared;
-    let file_count = prepared.len();
+    let file_count = prepared.files.len();
 
-    for f in prepared {
+    for f in &prepared.files {
         let owner = renderers
             .iter()
             .enumerate()
             .rev()
             .find(|(_, r)| r.claims(&f.path))
             .map_or(0, |(i, _)| i);
+        // Cloned out of the shared cache: an allocation and refcount bumps, but
+        // neither the intraline diff nor the syntax scan — which is exactly why
+        // those two live behind the `Rc` and this pass does not.
         let r = &mut renderers[owner];
         let first = r.len();
-        r.build(f);
+        r.build(f.clone());
         for index in first..r.len() {
             order.push(RowRef {
                 owner: owner as u16,
@@ -1404,12 +1396,13 @@ fn assemble_prepared(
     // `cpu across N` when the pass fanned out, because these are summed across
     // workers and `build` beside them is wall clock — without the note the two
     // numbers read as a contradiction rather than as a speed-up.
-    let cpu = match threads > 1 {
-        true => format!(" cpu across {threads}"),
+    let cpu = match prepared.threads > 1 {
+        true => format!(" cpu across {}", prepared.threads),
         false => String::new(),
     };
     let mut reports: Vec<String> = vec![format!(
-        "intraline {intraline:.0?} · syntax {syntax:.0?}{cpu}"
+        "intraline {:.0?} · syntax {:.0?}{cpu}",
+        prepared.intraline, prepared.syntax
     )];
     reports.extend(
         renderers
@@ -1425,15 +1418,13 @@ fn assemble_prepared(
         reports.join(" · "),
     );
     eprintln!("{load}");
-    (
-        Built {
-            renderers,
-            order,
-            widest,
-            load,
-        },
+    Built {
+        renderers,
+        order,
+        widest,
         headers,
-    )
+        load,
+    }
 }
 
 impl Diff {

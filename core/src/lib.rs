@@ -339,12 +339,13 @@ pub fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
             false => line,
         };
         if let Some(rest) = line.strip_prefix("diff --git ") {
+            // `a/<old> b/<new>`; a path may contain spaces, so split on the
+            // ` b/` boundary rather than on whitespace. The new path is what we
+            // render. (TODO: dequote git's `"…"` path form for unusual bytes.)
             let path = rest
-                .split_whitespace()
-                .nth(1)
-                .and_then(|p| p.strip_prefix("b/"))
-                .unwrap_or("?")
-                .to_string();
+                .rfind(" b/")
+                .map(|i| rest[i + 3..].to_string())
+                .unwrap_or_else(|| "?".to_string());
             files.push(FileDiff {
                 path,
                 hunks: Vec::new(),
@@ -363,11 +364,12 @@ pub fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
             }
             continue;
         }
-        // Skip the metadata lines that would otherwise look like +/- content.
-        if line.starts_with("+++ ") || line.starts_with("--- ") || line.starts_with("index ") {
-            continue;
-        }
         let Some(hunk) = files.last_mut().and_then(|f| f.hunks.last_mut()) else {
+            // Before any hunk of the current file: the `+++`/`---`/`index`
+            // metadata lines live here, and there is nothing to attach a
+            // content line to anyway, so the guard skips them. Once inside a
+            // hunk, a `-`/`+` line is genuine content — `-- a comment` renders
+            // as a removed line, not as a header to drop.
             continue;
         };
         let (kind, text) = match line.as_bytes().first() {
@@ -424,10 +426,15 @@ pub fn hunk_parts(header: &str) -> (&str, &str) {
 }
 
 /// `@@ -41,9 +41,11 @@ ...` -> (41, 41)
+///
+/// Only the coordinate section is scanned — [`hunk_parts`] splits off the
+/// function-context tail first, so a `-1;` or a `- item` bullet in the code git
+/// appends cannot overwrite the real line numbers.
 fn parse_hunk_header(line: &str) -> (u32, u32) {
+    let (coords, _tail) = hunk_parts(line);
     let mut old = 0;
     let mut new = 0;
-    for tok in line.split_whitespace() {
+    for tok in coords.split_whitespace() {
         let num = |s: &str| s.split(',').next().unwrap_or("0").parse().unwrap_or(0);
         if let Some(s) = tok.strip_prefix('-') {
             old = num(s);
@@ -813,6 +820,78 @@ index 1111111..2222222 100644
         // context after the change: old side advanced 1, new side advanced 3
         let last = lines.last().unwrap();
         assert_eq!((last.old_no, last.new_no), (Some(43), Some(45)));
+    }
+
+    #[test]
+    fn a_function_context_tail_is_not_read_as_coordinates() {
+        // The `-1;` in the trailing declaration used to overwrite the old line
+        // number with 0, so the whole hunk's gutter was wrong.
+        let raw = "\
+diff --git a/x.rs b/x.rs
+@@ -10,4 +10,4 @@ const X: i32 = -1;
+ keep
+-old
++new
+ tail
+";
+        let f = parse_unified_diff(raw);
+        let lines = &f[0].hunks[0].lines;
+        assert_eq!((lines[0].old_no, lines[0].new_no), (Some(10), Some(10)));
+    }
+
+    #[test]
+    fn a_leading_dash_bullet_in_the_tail_is_not_read_as_coordinates() {
+        // A markdown or list-style tail whose first token is `- item` must not
+        // reset the old coordinate the way the `-1;` case did.
+        let raw = "\
+diff --git a/x.md b/x.md
+@@ -5,2 +5,2 @@ - item
+ keep
+-old
++new
+";
+        let f = parse_unified_diff(raw);
+        let lines = &f[0].hunks[0].lines;
+        assert_eq!((lines[0].old_no, lines[0].new_no), (Some(5), Some(5)));
+    }
+
+    #[test]
+    fn a_removed_comment_beginning_with_two_dashes_is_content_not_metadata() {
+        // `-- a comment` (SQL/Lua/Haskell/Ada) appears as `--- a comment` in the
+        // patch. The old metadata skip dropped it *and* failed to advance the
+        // counter, so every following line was numbered one too low.
+        let raw = "\
+diff --git a/q.sql b/q.sql
+@@ -1,3 +1,3 @@
+ keep
+--- a comment
++++ b comment
+ tail
+";
+        let f = parse_unified_diff(raw);
+        let lines = &f[0].hunks[0].lines;
+        assert_eq!(lines[1].kind, LineKind::Removed);
+        assert_eq!(&*lines[1].text, "-- a comment", "one dash stripped");
+        assert_eq!((lines[1].old_no, lines[1].new_no), (Some(2), None));
+        assert_eq!(lines[2].kind, LineKind::Added);
+        assert_eq!(&*lines[2].text, "++ b comment");
+        // The trailing context is numbered correctly, not off by one.
+        let last = lines.last().unwrap();
+        assert_eq!((last.old_no, last.new_no), (Some(3), Some(3)));
+    }
+
+    #[test]
+    fn a_path_containing_spaces_survives_the_diff_git_header() {
+        // Splitting on whitespace yielded "?" and routed the file to the
+        // fallback differ; the ` b/` boundary is what git actually delimits on.
+        let raw = "\
+diff --git a/dir with spaces/a.rs b/dir with spaces/a.rs
+@@ -1,1 +1,1 @@
+-old
++new
+";
+        let f = parse_unified_diff(raw);
+        assert_eq!(f[0].path, "dir with spaces/a.rs");
     }
 
     #[test]

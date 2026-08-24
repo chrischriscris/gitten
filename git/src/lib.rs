@@ -115,6 +115,24 @@ fn run_bytes(repo: &Path, args: &[&[u8]]) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
+/// The repository's top level. `--raw` and `--porcelain` paths are relative to
+/// it, while the `repo` a caller passes may be any subdirectory (the CLI default
+/// is the cwd), so working-tree reads must join onto this, not onto `repo`.
+fn top_level(repo: &Path) -> PathBuf {
+    match run(repo, &["rev-parse", "--show-toplevel"]) {
+        Ok(bytes) => {
+            let s = String::from_utf8_lossy(&bytes);
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                repo.to_path_buf()
+            } else {
+                PathBuf::from(trimmed)
+            }
+        }
+        Err(_) => repo.to_path_buf(),
+    }
+}
+
 /// Joins a raw pathname onto the repository root, byte for byte.
 ///
 /// Unix keeps pathnames as opaque bytes and macOS and Linux agree on that, so
@@ -546,16 +564,31 @@ impl Repo for Binary {
         let raw = if revspec.is_empty() {
             run(&self.root, &[&["diff"], &RAW[..], &["HEAD"]].concat())?
         } else if revspec.contains("..") {
-            run(&self.root, &[&["diff"], &RAW[..], &[revspec]].concat())?
+            run(
+                &self.root,
+                &[&["diff"], &RAW[..], &["--end-of-options", revspec]].concat(),
+            )?
         } else {
             // A bare revision means "what did this commit change".
             run(
                 &self.root,
-                &[&["show"], &RAW[..], &["--format=", revspec]].concat(),
+                &[
+                    &["show"],
+                    &RAW[..],
+                    &["--format=", "--end-of-options", revspec],
+                ]
+                .concat(),
             )?
         };
 
         let changes = parse_raw(&raw);
+
+        // `--raw` and `--porcelain` paths are relative to the repository's top
+        // level, while `root` may be any subdirectory of it (the CLI default is
+        // the cwd) — so every working-tree read below joins onto the top level,
+        // never onto `root` itself. Object reads do not care: `-C` finds the
+        // objects from anywhere inside.
+        let top = top_level(&self.root);
 
         // Every blob the whole diff needs, fetched by one `cat-file --batch` —
         // but held one file at a time. The batch answers strictly in request
@@ -609,12 +642,7 @@ impl Repo for Binary {
         // `git status` lists them last and that is the wrong way round for a diff,
         // where the thing you just created is the thing you are looking for.
         // Fetching them early changed when they arrive, not where they land.
-        out.extend(
-            loose?
-                .untracked
-                .iter()
-                .filter_map(|e| loose_pair(e, &self.root)),
-        );
+        out.extend(loose?.untracked.iter().filter_map(|e| loose_pair(e, &top)));
         for c in changes {
             // Both sides pull in request order — old, then new — which is what
             // keeps this loop aligned with the stream.
@@ -640,7 +668,7 @@ impl Repo for Binary {
             let old = RawChange::synthetic(&c.old_mode, &c.old_oid).or(fetched_old);
             let new = RawChange::synthetic(&c.new_mode, &c.new_oid)
                 .or(fetched_new)
-                .or_else(|| new_side(&c.new_oid, &self.root, c.path.as_bytes()));
+                .or_else(|| new_side(&c.new_oid, &top, c.path.as_bytes()));
             let binary = old.as_ref().is_some_and(|b| is_binary(b))
                 || new.as_ref().is_some_and(|b| is_binary(b));
             // The lossy decode happens here and only here: everything above —
@@ -2579,6 +2607,41 @@ mod tests {
     }
 
     #[test]
+    fn a_working_tree_diff_is_correct_from_a_subdirectory() {
+        // `--raw` and `--porcelain` paths are relative to the repo top level, but
+        // the `repo` a caller passes is the cwd by default — a subdirectory. Join
+        // a root-relative path onto that subdirectory and the on-disk read fails:
+        // a modification reads as a full deletion (empty new side) and an
+        // untracked file is skipped entirely. Both look like plausible output.
+        let r = Scratch::new("subdir");
+        r.write("sub/a.txt", b"one\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        r.write("sub/a.txt", b"two\n");
+        r.write("sub/new.txt", b"fresh\n");
+
+        // Pass the subdirectory as `repo`, the way the cwd default does.
+        let got = open(&r.0.join("sub"))
+            .pairs("")
+            .expect("a working tree diff");
+
+        let names = paths(&got);
+        assert!(
+            names.contains(&"sub/new.txt"),
+            "the untracked file must appear, not be silently skipped: {names:?}"
+        );
+        let modified = got
+            .iter()
+            .find(|p| p.path == "sub/a.txt")
+            .expect("the modified file is in the diff");
+        assert_eq!(
+            strs(&modified.new),
+            ["two"],
+            "the modification keeps its new side rather than reading as a deletion"
+        );
+    }
+
+    #[test]
     fn an_ignored_file_stays_out() {
         // `--untracked-files=all` respects `.gitignore`, which is what stops
         // `target/` arriving as forty thousand additions.
@@ -2619,6 +2682,35 @@ mod tests {
         let got = r.open().pairs("").unwrap();
         assert_eq!(paths(&got), vec!["has space.txt"]);
         assert_eq!(strs(&got[0].new), ["spaced"]);
+    }
+
+    #[test]
+    fn a_revspec_cannot_smuggle_an_option_to_git() {
+        // A revspec beginning with `-` would be parsed by git as an option
+        // without `--end-of-options`, and `--output=<path>` would make
+        // `git diff` write to an arbitrary file. The separator must turn it
+        // back into a (nonexistent) revision, so the file is never written.
+        let r = Scratch::new("smuggle");
+        r.write("seed.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+
+        let target = r.0.join("PWNED");
+        let hostile = format!("--output={}", target.display());
+
+        // The `..` (diff) arm.
+        let _ = open(&r.0).pairs(&format!("{hostile}..HEAD"));
+        assert!(
+            !target.exists(),
+            "a revspec must not be able to make git write a file"
+        );
+
+        // The bare-revision (show) arm.
+        let _ = open(&r.0).pairs(&hostile);
+        assert!(
+            !target.exists(),
+            "the bare-revision arm must guard the separator too"
+        );
     }
 
     #[test]

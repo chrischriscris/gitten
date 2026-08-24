@@ -103,14 +103,14 @@ impl State {
             ("/app.js", _) => Response::js(JS),
 
             ("/api/meta", Data::Diff(doc)) => {
-                let mut doc = doc.lock().expect("no request panics while holding the doc");
+                let mut doc = doc.lock().unwrap_or_else(|p| p.into_inner());
                 self.reflow(&mut doc, req);
                 let mut out = String::new();
                 api::meta(&mut out, &doc, &self.host, &self.label);
                 Response::json(out)
             }
             ("/api/rows", Data::Diff(doc)) => {
-                let mut doc = doc.lock().expect("no request panics while holding the doc");
+                let mut doc = doc.lock().unwrap_or_else(|p| p.into_inner());
                 self.reflow(&mut doc, req);
                 // Capped: `count` comes from a URL, and a client asking for the
                 // whole of a 714k-row diff in one response is a request that
@@ -255,5 +255,27 @@ mod tests {
         let meta = body(get(&s, "/api/meta"));
         assert!(meta.contains("\"kind\":\"commits\""), "{meta}");
         assert!(meta.contains("\"theme\":"), "the commits view got no theme");
+    }
+
+    #[test]
+    fn a_poisoned_doc_is_still_served_rather_than_re_panicked() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        let s = diff_state();
+        // Poison the doc mutex the way a handler panicking mid-reflow would: a
+        // panic unwinding out of a held guard marks it poisoned. Once the lock
+        // was `.expect(...)`, every request after this one panicked in turn.
+        if let Data::Diff(m) = &s.data {
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                let _guard = m.lock().unwrap();
+                panic!("a handler panicked while holding the doc");
+            }));
+            assert!(m.is_poisoned(), "the test did not actually poison the doc");
+        } else {
+            panic!("diff_state built the wrong Data");
+        }
+        // The next request recovers the inner `Doc` and answers as normal.
+        let r = get(&s, "/api/rows?from=0&count=10");
+        assert_eq!(r.status, 200);
+        assert!(body(r).starts_with("{\"from\":0,"));
     }
 }
