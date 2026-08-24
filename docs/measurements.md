@@ -592,6 +592,37 @@ keeps only changed lines and their surroundings, so the 990 untouched lines of a
 they came in is freed too. `pairs` is kept for the test and `diffcheck`, which
 want the list and are small enough that the pile is free.
 
+### Why the line-text arena was reverted
+
+The obvious next memory move — replace the 714k per-line `Arc<str>` with slices
+into one arena per file — was built, measured, and reverted. See
+[decision 0026](decisions/0026-line-text-is-not-the-memory-to-save.md); the
+numbers are here.
+
+A counting global allocator over the pipeline stages (`pr30683.diff --patch`,
+714k lines) attributes the peak:
+
+| stage | live | note |
+|---|---|---|
+| raw read | 27.9 MB | the patch text |
+| parsed → `Vec<FileDiff>` | 108 MB | +80 MB: `Arc<str>` text, `DiffLine`s, vecs |
+| `prepare` | 147 MB | +65 MB: **~1.06M `Box<[Token]>`/`Box<[Span]>`**, tokens, clipped text |
+
+The arena did what it claimed — parse allocations **727,987 → 13,992 (−98 %)**,
+byte-identical diffs vs git — and it still lost:
+
+| path | metric | before | after |
+|---|---|---|---|
+| patch (`pr30683 --patch`) | RSS | 330 MB | 312 MB (−5.7 %) |
+| **repo (`cmux HEAD~120..HEAD`)** | **RSS** | **149 MB** | **192 MB (+29 %)** |
+
+The repository regression is the arena pinning its whole backing buffer: one
+surviving context-line slice holds the entire file resident, un-freeing exactly
+what the streaming change above releases. And the −5.7 % on the patch path shows
+line text was never the fragmentation — the ~1.06M token/span boxes in `prepare`
+are, and the arena does not touch them. That is the target a future memory pass
+should measure against, not the line text.
+
 ### Topology
 
 `shape`, on the two real repositories:
