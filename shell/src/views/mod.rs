@@ -128,6 +128,7 @@ impl ScrollbarHandle for DeferredScrollbar {
     }
 }
 
+pub mod branches;
 pub mod commits;
 pub mod diff;
 pub mod files;

@@ -4366,11 +4366,14 @@ mod tests {
         let r = two_branches("checkout");
         let g = r.open();
 
+        // Where feature points, asked while main can still answer.
+        let feature_at = r.rev_parse("HEAD~1");
+
         assert_eq!(g.checkout(b"feature").map(|_| ()), Ok(()));
         match g.head().unwrap() {
             HeadState::Branch { name, commit } => {
                 assert_eq!(name.as_bytes(), b"feature");
-                assert_eq!(commit.as_deref(), Some(r.rev_parse("HEAD~1").as_str()));
+                assert_eq!(commit.as_deref(), Some(feature_at.as_str()));
             }
             other => panic!("attached HEAD expected, got {other:?}"),
         }

@@ -166,6 +166,22 @@ enum Prompt {
     /// [`DevShell::search_edited`]); accepting keeps the last edit standing,
     /// cancelling clears it.
     Search { target: String },
+    /// A branch name gathered over the branches pane — `branches.new` names
+    /// a branch from nothing; `branches.rename` starts from the row's own
+    /// name and accepts a replacement. The target is the pane registration
+    /// name, the same promise [`Prompt::Search`] keeps: the answer belongs
+    /// to the pane it was typed over.
+    BranchName { target: String, what: BranchPrompt },
+}
+
+/// What an accepted [`Prompt::BranchName`] does with its text.
+#[derive(Debug)]
+enum BranchPrompt {
+    /// Create a branch by this name at HEAD. Creating never checks out.
+    New,
+    /// Rename the carried branch — its bytes, exactly as the panel read
+    /// them — to the accepted text.
+    Rename { from: Vec<u8> },
 }
 
 /// The write rails, handed to every pane command: the repository this window
@@ -317,6 +333,13 @@ enum Screen {
         generation: Rc<Cell<Generation>>,
         label: Rc<RefCell<String>>,
     },
+    /// The branches. Same story as [`Screen::Files`]: repository-shaped, so
+    /// a fixture never gets one.
+    Branches {
+        view: Entity<views::branches::Branches>,
+        generation: Rc<Cell<Generation>>,
+        label: Rc<RefCell<String>>,
+    },
     Custom(Rc<dyn Pane>),
 }
 
@@ -361,11 +384,24 @@ impl Screen {
         }
     }
 
+    fn branches(
+        view: Entity<views::branches::Branches>,
+        generation: Generation,
+        label: impl Into<String>,
+    ) -> Self {
+        Self::Branches {
+            view,
+            generation: Rc::new(Cell::new(generation)),
+            label: Rc::new(RefCell::new(label.into())),
+        }
+    }
+
     fn any(&self) -> AnyView {
         match self {
             Screen::Commits { view, .. } => view.clone().into(),
             Screen::Diff { view, .. } => view.clone().into(),
             Screen::Files { view, .. } => view.clone().into(),
+            Screen::Branches { view, .. } => view.clone().into(),
             Screen::Custom(pane) => pane.any(),
         }
     }
@@ -376,6 +412,7 @@ impl Screen {
             Screen::Commits { .. } => "commits",
             Screen::Diff { .. } => "diff",
             Screen::Files { .. } => "files",
+            Screen::Branches { .. } => "branches",
             Screen::Custom(pane) => pane.mode(),
         }
     }
@@ -393,7 +430,9 @@ impl Screen {
                     None => base,
                 }
             }
-            Screen::Diff { label, .. } | Screen::Files { label, .. } => label.borrow().clone(),
+            Screen::Diff { label, .. }
+            | Screen::Files { label, .. }
+            | Screen::Branches { label, .. } => label.borrow().clone(),
             Screen::Custom(pane) => pane.label(cx),
         }
     }
@@ -541,6 +580,69 @@ impl Screen {
                     },
                 ))
             }
+            Screen::Branches {
+                view,
+                generation,
+                label,
+            } => {
+                if generation.get() >= target {
+                    return None;
+                }
+                let view = view.clone();
+                let generation = generation.clone();
+                let label = label.clone();
+                Some(Refresh::new(
+                    target,
+                    move || {
+                        // The whole of the blocking half: the two ref
+                        // listings and HEAD's state, run beside each other —
+                        // four independent processes, one spawn floor.
+                        let prepared = std::thread::scope(|s| {
+                            let title = s.spawn(|| repo.describe());
+                            let local = s.spawn(|| repo.branches());
+                            let remote = s.spawn(|| repo.remote_branches());
+                            let head = s.spawn(|| repo.head());
+                            let described = title.join().unwrap_or_default();
+                            let local = local
+                                .join()
+                                .unwrap_or_else(|p| std::panic::resume_unwind(p))?;
+                            let remote = remote
+                                .join()
+                                .unwrap_or_else(|p| std::panic::resume_unwind(p))?;
+                            // A failed HEAD read must not take the listing
+                            // down: the rows are still true, only the top
+                            // row's honesty is lost, and that loss is said.
+                            let head = match head
+                                .join()
+                                .unwrap_or_else(|p| std::panic::resume_unwind(p))
+                            {
+                                Ok(head) => Some(head),
+                                Err(e) => {
+                                    eprintln!("gitten: head read failed, showing attached: {e}");
+                                    None
+                                }
+                            };
+                            Ok::<_, String>(views::branches::prepare(
+                                local, remote, head, &described,
+                            ))
+                        });
+                        prepared
+                    },
+                    move |prepared: views::branches::Prepared, host, cx| {
+                        if generation.get() >= target {
+                            return Ok(());
+                        }
+                        let label_text = prepared.label.clone();
+                        view.update(cx, |v, cx| {
+                            v.replace_prepared(prepared, host);
+                            cx.notify();
+                        });
+                        label.replace(label_text);
+                        generation.set(target);
+                        Ok(())
+                    },
+                ))
+            }
             Screen::Custom(pane) => pane.refresh(target, host, overrides, repo),
         }
     }
@@ -551,6 +653,7 @@ impl Screen {
             Screen::Commits { view, .. } => view.read(cx).list_bounds(),
             Screen::Diff { view, .. } => view.read(cx).list_bounds(),
             Screen::Files { view, .. } => view.read(cx).list_bounds(),
+            Screen::Branches { view, .. } => view.read(cx).list_bounds(),
             Screen::Custom(pane) => pane.list_bounds(cx),
         }
     }
@@ -559,9 +662,11 @@ impl Screen {
     fn height_share(&self, cx: &App) -> Option<f32> {
         match self {
             // The working tree is context; whatever the window opened for gets
-            // an equal share and stays the star.
+            // an equal share and stays the star. The branches pane takes an
+            // equal share with it tonight — a fixed slice would want a second
+            // constant and its own argument, and nothing has asked yet.
             Screen::Files { .. } => Some(FILES_SHARE),
-            Screen::Commits { .. } | Screen::Diff { .. } => None,
+            Screen::Commits { .. } | Screen::Diff { .. } | Screen::Branches { .. } => None,
             Screen::Custom(pane) => pane.height_share(cx),
         }
     }
@@ -574,6 +679,7 @@ impl Screen {
             Screen::Commits { view, .. } => view.read(cx).pan_pixels(dx),
             Screen::Diff { view, .. } => view.read(cx).pan_pixels(dx),
             Screen::Files { view, .. } => view.read(cx).pan_pixels(dx),
+            Screen::Branches { view, .. } => view.read(cx).pan_pixels(dx),
             Screen::Custom(pane) => pane.pan_pixels(dx, cx),
         }
     }
@@ -605,6 +711,13 @@ impl Screen {
                 }
                 known
             }),
+            Screen::Branches { view, .. } => view.update(cx, |b, c| {
+                let known = b.run_view(command, host);
+                if known {
+                    c.notify();
+                }
+                known
+            }),
             Screen::Custom(pane) => pane.run(command, host, writes, cx),
         }
     }
@@ -617,6 +730,7 @@ impl Screen {
             Screen::Commits { view, .. } => view.update(cx, |v, _| v.scroll_pixels(dy, host)),
             Screen::Diff { view, .. } => view.update(cx, |v, _| v.scroll_pixels(dy, host)),
             Screen::Files { view, .. } => view.update(cx, |v, _| v.scroll_pixels(dy, host)),
+            Screen::Branches { view, .. } => view.update(cx, |b, _| b.scroll_pixels(dy, host)),
             Screen::Custom(pane) => pane.scroll_pixels(dy, host, cx),
         }
     }
@@ -640,6 +754,10 @@ impl Screen {
             Screen::Files { view, .. } => view.update(cx, |f, _| match all {
                 true => f.select_all(),
                 false => f.select_none(),
+            }),
+            Screen::Branches { view, .. } => view.update(cx, |b, _| match all {
+                true => b.select_all(),
+                false => b.select_none(),
             }),
             Screen::Custom(pane) => pane.select(all, cx),
         }
@@ -830,6 +948,12 @@ impl DevShell {
             // `esc` means "forget it", not "keep half of it".
             (_, Some(Prompt::Search { target })) => {
                 self.finish_search(&target, accept.then_some(text), cx)
+            }
+            // A name is spent only on accept, and only if the pane it was
+            // opened over still exists — the registration name in the slot
+            // is the promise about where the answer belongs.
+            (true, Some(Prompt::BranchName { target, what })) => {
+                self.branch_named(&target, what, text)
             }
             _ => {}
         }
@@ -1060,6 +1184,214 @@ impl DevShell {
             return;
         };
         let job = gitten_app::verbs::Write::ignore(&writes.repo, path.as_bytes().to_vec());
+        if !writes.send(Box::new(job)) {
+            self.set_notice("the job queue is shutting down");
+        }
+    }
+
+    // ---------------------------------------------------- the branch verbs
+
+    /// The focused branches pane's target — what the keyboard is on, as
+    /// verbs aim at it. `None` when the pane is not up at all.
+    fn branches_target(&self, cx: &App) -> Option<views::branches::Target> {
+        match self.active() {
+            Some(Screen::Branches { view, .. }) => view.read(cx).current(),
+            _ => None,
+        }
+    }
+
+    /// `branches.checkout`: move HEAD onto the row the keyboard is on.
+    ///
+    /// A remote-tracking row checks out too, and detaches onto the fetched
+    /// commit — git's own answer to "look at what the server has", and the
+    /// reason [`views::branches::Target`] carries remotes at all. The one
+    /// refusal said here is the detached row itself: already a place, not a
+    /// branch to move to. Everything else — dirty tree, unknown name — is
+    /// git's sentence, surfaced verbatim by the job.
+    fn checkout_branch(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.active(), Some(Screen::Branches { .. })) {
+            self.set_notice("branches.checkout is not supported here");
+            return;
+        }
+        let Some(target) = self.branches_target(cx) else {
+            self.set_notice("nothing selected to check out");
+            return;
+        };
+        if matches!(target, views::branches::Target::Detached) {
+            self.set_notice("HEAD is already detached here");
+            return;
+        }
+        let Some(writes) = self.writes() else {
+            self.set_notice("a fixture has no repository to check out in");
+            return;
+        };
+        let name = match target {
+            views::branches::Target::Local(name) => name,
+            views::branches::Target::Remote { remote, branch } => {
+                // The full refname git resolves: `origin/main`, joined from
+                // the halves the model keeps apart because either may hold
+                // a slash.
+                let mut full = remote.as_bytes().to_vec();
+                full.push(b'/');
+                full.extend_from_slice(branch.as_bytes());
+                gitten_core::status::PathBytes::from_bytes(&full)
+            }
+            views::branches::Target::Detached => unreachable!("refused above"),
+        };
+        let job = gitten_app::verbs::Write::checkout(&writes.repo, name.as_bytes().to_vec());
+        if !writes.send(Box::new(job)) {
+            self.set_notice("the job queue is shutting down");
+        }
+    }
+
+    /// `branches.new`: gather a name over the pane; accept creates at HEAD.
+    /// Creating never checks out — HEAD stays where it was, which is why
+    /// this needs no confirmation dance.
+    fn begin_branch_new(&mut self, cx: &mut Context<Self>) {
+        self.begin_branch_prompt(BranchPrompt::New, "branch name", "", cx);
+    }
+
+    /// `branches.rename`: the same field, pre-filled with the row's own
+    /// name — editing what is there beats retyping it, and accepting
+    /// unchanged text answers with git's "already exists", which says more
+    /// than a client-side veto would.
+    fn begin_branch_rename(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.active(), Some(Screen::Branches { .. })) {
+            self.set_notice("branches.rename is not supported here");
+            return;
+        }
+        let Some(views::branches::Target::Local(name)) = self.branches_target(cx) else {
+            self.set_notice("only a local branch can be renamed");
+            return;
+        };
+        let shown = String::from_utf8_lossy(name.as_bytes()).into_owned();
+        self.begin_branch_prompt(
+            BranchPrompt::Rename {
+                from: name.as_bytes().to_vec(),
+            },
+            "rename branch",
+            &shown,
+            cx,
+        );
+    }
+
+    /// Opens the shared field for a [`BranchPrompt`]. The slot carries the
+    /// pane registration name so the answer routes back to its pane, the
+    /// same promise `/` keeps.
+    fn begin_branch_prompt(
+        &mut self,
+        what: BranchPrompt,
+        label: &str,
+        initial: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if !matches!(self.active(), Some(Screen::Branches { .. })) {
+            self.set_notice("this command belongs to the branches pane");
+            return;
+        }
+        if self.repo.is_none() {
+            self.set_notice("a fixture has no repository to create branches in");
+            return;
+        }
+        let input = cx.new(|cx| {
+            let mut input = input::Input::new(label, "branch name", initial, cx);
+            // A pre-filled name arrives selected: typing replaces it, which
+            // is what a rename wants — editing beats retyping, but keeping
+            // the old name glued to the front of whatever was typed serves
+            // nobody.
+            if !initial.is_empty() {
+                input.select_all_text(true, cx);
+            }
+            input
+        });
+        self.open_input(input, cx);
+        // After `open_input`, which may have cancelled a previous prompt.
+        self.prompt = Some(Prompt::BranchName {
+            target: self.panes.focused_name().to_string(),
+            what,
+        });
+    }
+
+    /// The accepted branch name, as a job. Empty refused again here — the
+    /// trait refuses it too, but saying so beside the field that just closed
+    /// beats making the reader find out twice.
+    fn branch_named(&mut self, target: &str, what: BranchPrompt, text: String) {
+        if text.trim().is_empty() {
+            self.set_notice("a branch needs a name");
+            return;
+        }
+        if self.panes.position(target).is_none() {
+            self.set_notice("the branches pane is gone");
+            return;
+        }
+        let Some(writes) = self.writes() else {
+            self.set_notice("a fixture has no repository to create branches in");
+            return;
+        };
+        let job = match what {
+            BranchPrompt::New => {
+                gitten_app::verbs::Write::create_branch(&writes.repo, text.into_bytes(), None)
+            }
+            BranchPrompt::Rename { from } => {
+                gitten_app::verbs::Write::rename_branch(&writes.repo, from, text.into_bytes())
+            }
+        };
+        if !writes.send(Box::new(job)) {
+            self.set_notice("the job queue is shutting down");
+        }
+    }
+
+    /// `branches.delete`: the destructive verb of this pane, confirmed on
+    /// the keyboard exactly as `files.discard` is. First press arms the row
+    /// and asks once in the band; second press on the same row deletes —
+    /// merged work only, because an unmerged branch comes back refused in
+    /// git's own words ("not fully merged") and that sentence is the force
+    /// decision's proper home, not tonight's keymap.
+    ///
+    /// Remote rows refuse outright, on purpose: a tracking ref is the
+    /// remote's shadow, and deleting it here would be a fetch's prune done
+    /// by hand under a key that reads as something stronger.
+    fn delete_branch_selected(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.active(), Some(Screen::Branches { .. })) {
+            self.set_notice("branches.delete is not supported here");
+            return;
+        }
+        let Some(target) = self.branches_target(cx) else {
+            self.set_notice("nothing selected to delete");
+            return;
+        };
+        let shown = match &target {
+            views::branches::Target::Local(name) => String::from_utf8_lossy(name.as_bytes()),
+            views::branches::Target::Remote { remote, branch } => {
+                format!("{}/{}", remote.to_string_lossy(), branch.to_string_lossy()).into()
+            }
+            views::branches::Target::Detached => {
+                self.set_notice("a detached HEAD is not a branch");
+                return;
+            }
+        };
+        if matches!(target, views::branches::Target::Remote { .. }) {
+            self.set_notice("a remote branch is its remote's to delete — fetch prunes it here");
+            return;
+        }
+        let Some(Screen::Branches { view, .. }) = self.active() else {
+            unreachable!("checked above");
+        };
+        let Some(writes) = self.writes() else {
+            self.set_notice("a fixture has no repository to delete branches from");
+            return;
+        };
+        // Arm, or spend the arm. False means the question was just asked.
+        if !view.update(cx, |b, _| b.confirm_or_arm_delete(&target)) {
+            self.set_notice(format!("delete branch {shown}? press again to confirm"));
+            return;
+        }
+        self.notice = None; // the question is spent; the running band speaks next
+        let name = match target {
+            views::branches::Target::Local(name) => name.as_bytes().to_vec(),
+            _ => unreachable!("remotes and detached refuse above"),
+        };
+        let job = gitten_app::verbs::Write::delete_branch(&writes.repo, name, false);
         if !writes.send(Box::new(job)) {
             self.set_notice("the job queue is shutting down");
         }
@@ -1394,6 +1726,7 @@ impl DevShell {
             "pane.next" => self.cycle_pane(1, cx),
             "pane.prev" => self.cycle_pane(-1, cx),
             "files.focus" => self.focus_named("files", cx),
+            "branches.focus" => self.focus_named("branches", cx),
             "commits.open-diff" => self.open_diff(cx),
             "commits.search" => self.begin_search(cx),
             // The working tree's verbs. Context comes from the focused pane,
@@ -1404,6 +1737,11 @@ impl DevShell {
             "files.discard" => self.discard_selected(cx),
             "files.stage-all" => self.stage_all(cx),
             "files.ignore" => self.ignore_selected(cx),
+            // The branches panel's verbs, over the same two rails.
+            "branches.checkout" => self.checkout_branch(cx),
+            "branches.new" => self.begin_branch_new(cx),
+            "branches.rename" => self.begin_branch_rename(cx),
+            "branches.delete" => self.delete_branch_selected(cx),
             "copy.selection" => self.copy_selection(cx),
             // Both are answered by whichever screen is up; a commit graph has no
             // selection yet, and a command nothing handles there is inert — the
@@ -1595,6 +1933,15 @@ impl DevShell {
                 if !text.is_empty() {
                     // Letters first, then the path — the spelling git itself
                     // prints, so it pastes into a shell usefully.
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+            }
+            Some(Screen::Branches { view, .. }) => {
+                let view = view.clone();
+                view.update(cx, |b, _| b.reconcile(&host));
+                // The bare refname — the spelling every git command takes.
+                let text = view.read(cx).cursor_text();
+                if !text.is_empty() {
                     cx.write_to_clipboard(ClipboardItem::new_string(text));
                 }
             }
@@ -2458,6 +2805,55 @@ fn main() {
                     // keyboard where it launched.
                     initial_panes.focus(0);
                     start::mark("files pane built");
+
+                    // The branches panel beside it — three reads run side by
+                    // side, behind the same spawn floor the files pane pays.
+                    // A failed read shows an empty panel rather than failing
+                    // the launch, for the same reason a bad status does.
+                    start::mark("branches read begin");
+                    let described = handle.describe();
+                    let prepared = std::thread::scope(|s| {
+                        let local = s.spawn(|| handle.branches());
+                        let remote = s.spawn(|| handle.remote_branches());
+                        let head = s.spawn(|| handle.head());
+                        let local = local
+                            .join()
+                            .unwrap_or_else(|p| std::panic::resume_unwind(p));
+                        let remote = remote
+                            .join()
+                            .unwrap_or_else(|p| std::panic::resume_unwind(p));
+                        let head = head.join().unwrap_or_else(|p| std::panic::resume_unwind(p));
+                        match (local, remote) {
+                            (Ok(local), Ok(remote)) => {
+                                let head = match head {
+                                    Ok(head) => Some(head),
+                                    Err(e) => {
+                                        eprintln!(
+                                            "gitten: head read failed, showing attached: {e}"
+                                        );
+                                        None
+                                    }
+                                };
+                                views::branches::prepare(local, remote, head, &described)
+                            }
+                            (Err(e), _) | (_, Err(e)) => {
+                                eprintln!("gitten: branch reads failed, empty panel: {e}");
+                                views::branches::prepare(Vec::new(), Vec::new(), None, &described)
+                            }
+                        }
+                    });
+                    start::mark("branches read done");
+                    let label = prepared.label.clone();
+                    initial_panes.register(
+                        "branches",
+                        Screen::branches(
+                            cx.new(|_| views::branches::Branches::from_prepared(prepared)),
+                            Generation::default(),
+                            label,
+                        ),
+                    );
+                    initial_panes.focus(0);
+                    start::mark("branches pane built");
                 }
                 start::mark("view built");
 
@@ -3483,11 +3879,36 @@ mod tests {
 
     struct RecordingRepo {
         calls: Arc<std::sync::Mutex<Vec<String>>>,
+        /// The ref picture verbs' reads see: two local branches (one under
+        /// HEAD) and one remote-tracking ref.
+        branches: Vec<gitten_core::refs::Branch>,
+        head: gitten_core::refs::HeadState,
     }
 
     impl RecordingRepo {
+        fn new(calls: Arc<std::sync::Mutex<Vec<String>>>) -> Self {
+            Self {
+                calls,
+                branches: vec![branch_ref("feature", false), branch_ref("main", true)],
+                head: gitten_core::refs::HeadState::Branch {
+                    name: gitten_core::refs::RefName::from("main"),
+                    commit: None,
+                },
+            }
+        }
+
         fn wrote(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
+        }
+    }
+
+    /// One modelled local branch, for the fakes' ref pictures.
+    fn branch_ref(name: &str, head: bool) -> gitten_core::refs::Branch {
+        gitten_core::refs::Branch {
+            name: gitten_core::refs::RefName::from(name),
+            commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            upstream: None,
+            head,
         }
     }
 
@@ -3598,6 +4019,56 @@ mod tests {
                 .push(format!("unstage-many {shown}"));
             Ok(())
         }
+
+        fn checkout(&self, name: &[u8]) -> gitten_git::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("checkout {}", String::from_utf8_lossy(name)));
+            Ok(())
+        }
+
+        fn create_branch(&self, name: &[u8], _start: Option<&[u8]>) -> gitten_git::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("create {}", String::from_utf8_lossy(name)));
+            Ok(())
+        }
+
+        fn delete_branch(&self, name: &[u8], force: bool) -> gitten_git::Result<()> {
+            self.calls.lock().unwrap().push(format!(
+                "delete {}{}",
+                String::from_utf8_lossy(name),
+                if force { " -D" } else { "" }
+            ));
+            Ok(())
+        }
+
+        fn rename_branch(&self, from: &[u8], to: &[u8]) -> gitten_git::Result<()> {
+            self.calls.lock().unwrap().push(format!(
+                "rename {} {}",
+                String::from_utf8_lossy(from),
+                String::from_utf8_lossy(to)
+            ));
+            Ok(())
+        }
+
+        fn branches(&self) -> gitten_git::Result<Vec<gitten_core::refs::Branch>> {
+            Ok(self.branches.clone())
+        }
+
+        fn remote_branches(&self) -> gitten_git::Result<Vec<gitten_core::refs::RemoteBranch>> {
+            Ok(vec![gitten_core::refs::RemoteBranch {
+                remote: gitten_core::refs::RefName::from("origin"),
+                branch: gitten_core::refs::RefName::from("main"),
+                commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            }])
+        }
+
+        fn head(&self) -> gitten_git::Result<gitten_core::refs::HeadState> {
+            Ok(self.head.clone())
+        }
     }
 
     /// A shell with the two startup panes and a repository behind the files
@@ -3640,9 +4111,7 @@ mod tests {
         gitten_git::Handle,
     ) {
         let calls = Arc::default();
-        let repo = Arc::new(RecordingRepo {
-            calls: Arc::clone(&calls),
-        });
+        let repo = Arc::new(RecordingRepo::new(Arc::clone(&calls)));
         let handle: gitten_git::Handle = repo.clone();
         let shell = shell(None, cx);
         shell.update(cx, |shell, cx| {
@@ -3867,6 +4336,11 @@ mod tests {
                     Screen::Files { generation, .. } => {
                         assert_eq!(generation.get(), shell.generation);
                     }
+                    // A branches pane carries no source of its own — it is
+                    // always about this window's repository, like files.
+                    Screen::Branches { generation, .. } => {
+                        assert_eq!(generation.get(), shell.generation);
+                    }
                     Screen::Commits { source, .. } => {
                         assert!(matches!(source, Source::Fixtures), "a fixture stays put")
                     }
@@ -3875,7 +4349,9 @@ mod tests {
                         match other {
                             Screen::Custom(_) => "custom",
                             Screen::Diff { .. } => "diff",
-                            Screen::Commits { .. } | Screen::Files { .. } => unreachable!(),
+                            Screen::Commits { .. }
+                            | Screen::Files { .. }
+                            | Screen::Branches { .. } => unreachable!(),
                         }
                     ),
                 }
@@ -4198,5 +4674,389 @@ mod tests {
         shell.update(cx, |shell, cx| shell.run_command("files.ignore", cx));
         pump_write(&shell, cx);
         assert_eq!(repo.wrote(), vec!["ignore loose.txt"]);
+    }
+
+    // ------------------------------------------------------- the branch verbs
+
+    /// A shell with the branches pane registered over the recording
+    /// repository — `feature` and `main` local (main under HEAD),
+    /// `origin/main` remote. The keyboard starts on `feature`, row 1.
+    fn branches_shell(
+        cx: &mut TestAppContext,
+    ) -> (
+        gpui::Entity<DevShell>,
+        Arc<RecordingRepo>,
+        gitten_git::Handle,
+    ) {
+        let calls = Arc::default();
+        let repo = Arc::new(RecordingRepo::new(Arc::clone(&calls)));
+        let handle: gitten_git::Handle = repo.clone();
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, cx| {
+            let host = Rc::new(Host::new());
+            let prepared = crate::views::branches::prepare(
+                vec![branch_ref("feature", false), branch_ref("main", true)],
+                vec![gitten_core::refs::RemoteBranch {
+                    remote: gitten_core::refs::RefName::from("origin"),
+                    branch: gitten_core::refs::RefName::from("main"),
+                    commit: "0123456789abcdef0123456789abcdef01234567".into(),
+                }],
+                Some(gitten_core::refs::HeadState::Branch {
+                    name: gitten_core::refs::RefName::from("main"),
+                    commit: None,
+                }),
+                "r",
+            );
+            let view = cx.new(|_| crate::views::branches::Branches::from_prepared(prepared));
+            view.update(cx, |b, _| {
+                b.run_view("view.down", &host); // onto feature
+            });
+            shell.panes.register(
+                "branches",
+                Screen::branches(view, Generation::default(), "r · 2 local · 1 remote"),
+            );
+            shell.sync_modes();
+            shell.repo = Some((PathBuf::from("/recorded"), handle.clone()));
+            cx.set_global(config::Active(Rc::new(Host::new())));
+        });
+        (shell, repo, handle)
+    }
+
+    /// Walks the keyboard onto a named branch row.
+    #[track_caller]
+    fn onto(shell: &gpui::Entity<DevShell>, name: &str, cx: &mut TestAppContext) {
+        shell.update(cx, |shell, cx| {
+            let Some(Screen::Branches { view, .. }) = shell.active() else {
+                panic!("branches pane lost");
+            };
+            let host = Rc::new(Host::new());
+            view.update(cx, |b, _| {
+                b.run_view("view.top", &host);
+                loop {
+                    let hit = b.current().is_some_and(|t| match t {
+                        crate::views::branches::Target::Local(n) => n.as_bytes() == name.as_bytes(),
+                        crate::views::branches::Target::Remote { remote, branch } => {
+                            format!("{}/{}", remote.to_string_lossy(), branch.to_string_lossy())
+                                == name
+                        }
+                        _ => false,
+                    });
+                    if hit || !b.run_view("view.down", &host) {
+                        break;
+                    }
+                }
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn checkout_rides_the_rails_and_every_pane_reacquires(cx: &mut TestAppContext) {
+        let (shell, repo, _handle) = branches_shell(cx);
+        // The keyboard is already on feature; space's command is what a key
+        // resolves to, run through named dispatch like every other verb.
+        shell.update(cx, |shell, cx| shell.run_command("branches.checkout", cx));
+
+        pump_write(&shell, cx);
+        assert_eq!(
+            repo.wrote(),
+            vec!["checkout feature"],
+            "the write ran off-thread against the real handle"
+        );
+        // The chain that matters: success bumped the generation, and every
+        // repository pane — the working tree included — re-acquired against
+        // the new HEAD through refresh_stale, no test help.
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.generation > Generation::default(), "no bump");
+            for screen in shell.panes.iter() {
+                match screen {
+                    Screen::Files { generation, .. } | Screen::Branches { generation, .. } => {
+                        assert_eq!(generation.get(), shell.generation);
+                    }
+                    Screen::Commits { .. } | Screen::Diff { .. } | Screen::Custom(_) => {}
+                }
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn checkout_says_so_where_it_cannot_act(cx: &mut TestAppContext) {
+        // Over another pane entirely.
+        let (shell, repo, _handle) = branches_shell(cx);
+        shell.update(cx, |shell, _| {
+            shell.panes.focus(0); // the commits root
+        });
+        shell.update(cx, |shell, cx| shell.run_command("branches.checkout", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(shell
+                .notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not supported here"));
+        });
+        assert!(repo.wrote().is_empty());
+
+        // On the detached row itself: a place, not a branch to move to.
+        let (shell, repo, _handle) = branches_shell(cx);
+        shell.update(cx, |shell, cx| {
+            let host = config::host(cx);
+            let Some(Screen::Branches { view, .. }) = shell.active() else {
+                panic!("branches pane lost");
+            };
+            view.update(cx, |b, _| {
+                b.replace_prepared(
+                    crate::views::branches::prepare(
+                        vec![branch_ref("main", false)],
+                        Vec::new(),
+                        Some(gitten_core::refs::HeadState::Detached {
+                            commit: "0123456789abcdef".into(),
+                        }),
+                        "",
+                    ),
+                    &host,
+                );
+            });
+        });
+        shell.update(cx, |shell, cx| {
+            // The fixture above carries one local branch, so row 1 is it;
+            // back up to the detached row itself.
+            let host = Rc::new(Host::new());
+            let Some(Screen::Branches { view, .. }) = shell.active() else {
+                panic!("branches pane lost");
+            };
+            view.update(cx, |b, _| {
+                b.run_view("view.top", &host); // the detached row
+            });
+        });
+        shell.update(cx, |shell, cx| shell.run_command("branches.checkout", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(shell
+                .notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("detached"));
+        });
+        assert!(repo.wrote().is_empty());
+
+        // No repository behind the window at all.
+        let (shell, repo, _handle) = branches_shell(cx);
+        shell.update(cx, |shell, _| shell.repo = None);
+        shell.update(cx, |shell, cx| shell.run_command("branches.checkout", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(shell
+                .notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("fixture"));
+        });
+        assert!(repo.wrote().is_empty());
+    }
+
+    #[gpui::test]
+    fn new_branch_opens_a_field_and_the_accepted_name_becomes_the_job(cx: &mut TestAppContext) {
+        let (shell, repo, _handle) = branches_shell(cx);
+
+        shell.update(cx, |shell, cx| shell.run_command("branches.new", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.input.is_some(), "no field opened");
+            assert!(matches!(
+                shell.prompt,
+                Some(super::Prompt::BranchName { .. })
+            ));
+        });
+
+        // Typed as the platform would leave it, then accepted through the
+        // real accept path.
+        let typed = shell.read_with(cx, |shell, _| shell.input.clone().unwrap());
+        typed.update(cx, |field, cx| field.replace(None, "hotfix", cx));
+        shell.update(cx, |shell, cx| shell.run_command("input.accept", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["create hotfix"]);
+        shell.read_with(cx, |shell, _| assert!(shell.input.is_none()));
+    }
+
+    #[gpui::test]
+    fn rename_pre_fills_the_rows_own_name_and_accepts_a_replacement(cx: &mut TestAppContext) {
+        let (shell, repo, _handle) = branches_shell(cx);
+        // The keyboard sits on feature.
+
+        shell.update(cx, |shell, cx| shell.run_command("branches.rename", cx));
+        let typed = shell.read_with(cx, |shell, _app| shell.input.clone().unwrap());
+        assert_eq!(
+            typed.read_with(cx, |field, _| field.value().to_string()),
+            "feature",
+            "the field started from the row's own name"
+        );
+
+        typed.update(cx, |field, cx| field.replace(None, "f2", cx));
+        shell.update(cx, |shell, cx| shell.run_command("input.accept", cx));
+        pump_write(&shell, cx);
+        assert_eq!(
+            repo.wrote(),
+            vec!["rename feature f2"],
+            "the old bytes travelled with the job"
+        );
+
+        // A remote row refuses to be renamed before any field opens.
+        let (shell, repo, _handle) = branches_shell(cx);
+        onto(&shell, "origin/main", cx);
+        shell.update(cx, |shell, cx| shell.run_command("branches.rename", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.input.is_none(), "a prompt opened over a remote");
+            assert!(shell
+                .notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("local"));
+        });
+        assert!(repo.wrote().is_empty());
+
+        // An empty accept is refused without submitting anything.
+        let (shell, repo, _handle) = branches_shell(cx);
+        shell.update(cx, |shell, cx| shell.run_command("branches.new", cx));
+        shell.update(cx, |shell, cx| shell.run_command("input.accept", cx));
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(repo.wrote().is_empty(), "an unnamed branch was submitted");
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.notice.as_deref().unwrap_or_default().contains("name"));
+        });
+    }
+
+    #[gpui::test]
+    fn delete_asks_once_then_acts_and_remote_rows_refuse_outright(cx: &mut TestAppContext) {
+        let (shell, repo, _handle) = branches_shell(cx);
+
+        // First press on feature: asked, in the band, nothing queued.
+        shell.update(cx, |shell, cx| shell.run_command("branches.delete", cx));
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(
+                shell.notice.as_deref(),
+                Some("delete branch feature? press again to confirm"),
+                "{:?}",
+                shell.notice
+            );
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(repo.wrote().is_empty());
+
+        // Second press on the same row spends the arm.
+        shell.update(cx, |shell, cx| shell.run_command("branches.delete", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["delete feature"]);
+
+        // A remote row refuses before arming — deliberate scope tonight:
+        // a tracking ref is its remote's shadow, pruned by fetch.
+        let (shell, repo, _handle) = branches_shell(cx);
+        onto(&shell, "origin/main", cx);
+        shell.update(cx, |shell, cx| shell.run_command("branches.delete", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(shell
+                .notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("remote"));
+        });
+        assert!(repo.wrote().is_empty());
+
+        // And a cursor move between presses disarms, exactly as discard does.
+        let (shell, repo, _handle) = branches_shell(cx);
+        shell.update(cx, |shell, cx| shell.run_command("branches.delete", cx)); // arm feature
+        onto(&shell, "main", cx); // move
+        shell.update(cx, |shell, cx| shell.run_command("branches.delete", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                shell.notice.as_deref().unwrap_or_default().contains("main"),
+                "the question moved to the new row: {:?}",
+                shell.notice
+            );
+        });
+        assert!(repo.wrote().is_empty(), "the stale arm never fired");
+    }
+
+    #[gpui::test]
+    fn branches_focus_reaches_its_registered_pane(cx: &mut TestAppContext) {
+        let (shell, _repo, _handle) = branches_shell(cx);
+        // Registration focused the branches pane; go back to the root first.
+        shell.update(cx, |shell, cx| shell.run_command("pane.prev", cx));
+        shell.read_with(cx, |shell, _| {
+            assert_ne!(shell.active_view_name(), "branches");
+        });
+
+        // Named dispatch — the same path the `3` key resolves through.
+        shell.update(cx, |shell, cx| shell.run_command("branches.focus", cx));
+        shell.read_with(cx, |shell, app| {
+            assert_eq!(shell.panes.focused_index(), 1);
+            assert_eq!(shell.modes.top(), "branches");
+            assert_eq!(
+                shell.active_label(app).as_ref(),
+                "r · 2 local · 1 remote",
+                "the label carries the count"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn a_refresh_reanchors_the_keyboard_on_its_branch(cx: &mut TestAppContext) {
+        let (shell, _repo, _handle) = branches_shell(cx);
+        onto(&shell, "feature", cx);
+
+        // A refresh that adds a branch above shifts every row; the keyboard
+        // follows its branch, not its index.
+        shell.update(cx, |shell, cx| {
+            let Some(Screen::Branches { view, .. }) = shell.active() else {
+                panic!("branches pane lost");
+            };
+            view.update(cx, |b, cx| {
+                let prepared = crate::views::branches::prepare(
+                    vec![
+                        branch_ref("aaa", false),
+                        branch_ref("feature", false),
+                        branch_ref("main", true),
+                    ],
+                    Vec::new(),
+                    Some(gitten_core::refs::HeadState::Branch {
+                        name: gitten_core::refs::RefName::from("main"),
+                        commit: None,
+                    }),
+                    "",
+                );
+                b.replace_prepared(prepared, &config::host(cx));
+            });
+        });
+
+        shell.read_with(cx, |shell, cx| {
+            let Some(Screen::Branches { view, .. }) = shell.active() else {
+                panic!("branches pane lost");
+            };
+            match view.read(cx).current() {
+                Some(crate::views::branches::Target::Local(name)) => {
+                    assert_eq!(name.as_bytes(), b"feature", "the anchor held");
+                }
+                other => panic!("still on a branch, got {other:?}"),
+            }
+        });
+
+        // And a refresh whose branch vanished clamps instead of lying.
+        shell.update(cx, |shell, cx| {
+            let Some(Screen::Branches { view, .. }) = shell.active() else {
+                panic!("branches pane lost");
+            };
+            view.update(cx, |b, cx| {
+                b.replace_prepared(
+                    crate::views::branches::prepare(
+                        vec![branch_ref("main", true)],
+                        Vec::new(),
+                        None,
+                        "",
+                    ),
+                    &config::host(cx),
+                );
+            });
+        });
+        shell.read_with(cx, |shell, cx| {
+            let Some(Screen::Branches { view, .. }) = shell.active() else {
+                panic!("branches pane lost");
+            };
+            assert!(view.read(cx).current().is_some(), "clamped onto a row");
+        });
     }
 }
