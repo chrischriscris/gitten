@@ -31,7 +31,7 @@
 use gitten_core::differ::{Differs, Overrides};
 use gitten_core::{parse_log, Commit, FileDiff};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -64,6 +64,24 @@ fn run(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
         return Err(format!("git {}: {}", args.join(" "), err.trim()));
     }
     Ok(out.stdout)
+}
+
+/// The repository's top level. `--raw` and `--porcelain` paths are relative to
+/// it, while the `repo` a caller passes may be any subdirectory (the CLI default
+/// is the cwd), so working-tree reads must join onto this, not onto `repo`.
+fn top_level(repo: &Path) -> PathBuf {
+    match run(repo, &["rev-parse", "--show-toplevel"]) {
+        Ok(bytes) => {
+            let s = String::from_utf8_lossy(&bytes);
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                repo.to_path_buf()
+            } else {
+                PathBuf::from(trimmed)
+            }
+        }
+        Err(_) => repo.to_path_buf(),
+    }
 }
 
 /// Commit history, newest first.
@@ -184,12 +202,20 @@ where
     let raw = if revspec.is_empty() {
         run(repo, &[&["diff"], &RAW[..], &["HEAD"]].concat())?
     } else if revspec.contains("..") {
-        run(repo, &[&["diff"], &RAW[..], &[revspec]].concat())?
+        run(
+            repo,
+            &[&["diff"], &RAW[..], &["--end-of-options", revspec]].concat(),
+        )?
     } else {
         // A bare revision means "what did this commit change".
         run(
             repo,
-            &[&["show"], &RAW[..], &["--format=", revspec]].concat(),
+            &[
+                &["show"],
+                &RAW[..],
+                &["--format=", "--end-of-options", revspec],
+            ]
+            .concat(),
         )?
     };
 
@@ -251,6 +277,10 @@ where
     for p in loose? {
         on_pair(p)?;
     }
+    // Working-tree paths from `--raw` are relative to the repo top level, which
+    // is not `repo` when the caller passed a subdirectory. Resolve it once here,
+    // not per file, and hand it to `new_side` for the on-disk read.
+    let root = top_level(repo);
     for c in changes {
         // Both sides pull in request order — old, then new — which is what
         // keeps this loop aligned with the stream.
@@ -276,7 +306,7 @@ where
         let old = Change::synthetic(&c.old_mode, &c.old_oid).or(fetched_old);
         let new = Change::synthetic(&c.new_mode, &c.new_oid)
             .or(fetched_new)
-            .or_else(|| new_side(&c.new_oid, repo, &c.path));
+            .or_else(|| new_side(&c.new_oid, &root, &c.path));
         let binary = old.as_ref().is_some_and(|b| is_binary(b))
             || new.as_ref().is_some_and(|b| is_binary(b));
         // Handed over and gone. What the consumer keeps is its business; what
@@ -325,6 +355,7 @@ where
 /// - **A binary file says so** rather than becoming a screenful of NULs, through
 ///   the same [`is_binary`] test the tracked side uses.
 fn untracked(repo: &Path) -> Result<Vec<Pair>> {
+    let root = top_level(repo);
     // `-z` for NUL-separated paths, for the reason `--raw -z` has it: a path may
     // contain anything a filesystem allows, and git otherwise quotes and escapes
     // it. `--no-renames` because a rename needs an old side and these have none.
@@ -353,7 +384,7 @@ fn untracked(repo: &Path) -> Result<Vec<Pair>> {
         // Unreadable is skipped rather than an error: a broken symlink, a socket
         // and a file deleted between the two git calls are all untracked, and
         // none of them is worth refusing to show the rest of the diff over.
-        let Ok(content) = std::fs::read(repo.join(path)) else {
+        let Ok(content) = std::fs::read(root.join(path)) else {
             continue;
         };
         let binary = is_binary(&content);
@@ -686,11 +717,11 @@ impl Drop for BlobStream {
 /// The old side has no equivalent. A null OID there means the file did not
 /// exist, and reading the working tree for it would diff an added file against
 /// itself and report that nothing changed.
-fn new_side(oid: &str, repo: &Path, path: &str) -> Option<Vec<u8>> {
+fn new_side(oid: &str, root: &Path, path: &str) -> Option<Vec<u8>> {
     if !is_null_oid(oid) {
         return None;
     }
-    std::fs::read(repo.join(path)).ok()
+    std::fs::read(root.join(path)).ok()
 }
 
 /// A NUL byte in the first 8 KB, which is git's own test. A real text file does
@@ -823,6 +854,39 @@ mod tests {
     }
 
     #[test]
+    fn a_working_tree_diff_is_correct_from_a_subdirectory() {
+        // `--raw` and `--porcelain` paths are relative to the repo top level, but
+        // the `repo` a caller passes is the cwd by default — a subdirectory. Join
+        // a root-relative path onto that subdirectory and the on-disk read fails:
+        // a modification reads as a full deletion (empty new side) and an
+        // untracked file is skipped entirely. Both look like plausible output.
+        let r = Scratch::new("subdir");
+        r.write("sub/a.txt", b"one\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        r.write("sub/a.txt", b"two\n");
+        r.write("sub/new.txt", b"fresh\n");
+
+        // Pass the subdirectory as `repo`, the way the cwd default does.
+        let got = pairs(&r.0.join("sub"), "").expect("a working tree diff");
+
+        let names = paths(&got);
+        assert!(
+            names.contains(&"sub/new.txt"),
+            "the untracked file must appear, not be silently skipped: {names:?}"
+        );
+        let modified = got
+            .iter()
+            .find(|p| p.path == "sub/a.txt")
+            .expect("the modified file is in the diff");
+        assert_eq!(
+            strs(&modified.new),
+            ["two"],
+            "the modification keeps its new side rather than reading as a deletion"
+        );
+    }
+
+    #[test]
     fn an_ignored_file_stays_out() {
         // `--untracked-files=all` respects `.gitignore`, which is what stops
         // `target/` arriving as forty thousand additions.
@@ -864,6 +928,35 @@ mod tests {
         let got = pairs(&r.0, "").unwrap();
         assert_eq!(paths(&got), vec!["has space.txt"]);
         assert_eq!(strs(&got[0].new), ["spaced"]);
+    }
+
+    #[test]
+    fn a_revspec_cannot_smuggle_an_option_to_git() {
+        // A revspec beginning with `-` would be parsed by git as an option
+        // without `--end-of-options`, and `--output=<path>` would make
+        // `git diff` write to an arbitrary file. The separator must turn it
+        // back into a (nonexistent) revision, so the file is never written.
+        let r = Scratch::new("smuggle");
+        r.write("seed.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+
+        let target = r.0.join("PWNED");
+        let hostile = format!("--output={}", target.display());
+
+        // The `..` (diff) arm.
+        let _ = pairs(&r.0, &format!("{hostile}..HEAD"));
+        assert!(
+            !target.exists(),
+            "a revspec must not be able to make git write a file"
+        );
+
+        // The bare-revision (show) arm.
+        let _ = pairs(&r.0, &hostile);
+        assert!(
+            !target.exists(),
+            "the bare-revision arm must guard the separator too"
+        );
     }
 
     #[test]
