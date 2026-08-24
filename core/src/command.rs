@@ -358,6 +358,10 @@ impl Keymap {
         bind(GLOBAL, "l", "view.right");
         bind(GLOBAL, "right", "view.right");
 
+        // lazygit's panel number for files. A direct jump is global so it works
+        // whatever is focused; cycling between panes stays in [panes].
+        bind(GLOBAL, "2", "files.focus");
+
         bind("diff", "s", "diff.cycle-layout");
         bind("diff", "w", "diff.cycle-wrap");
         bind("diff", "]", "diff.next-file");
@@ -714,6 +718,7 @@ impl Commands {
             ("diff.cycle-wrap", "the next wrap"),
             ("theme.cycle", "the next theme"),
             ("commits.open-diff", "the diff for this commit"),
+            ("files.focus", "focus the working-tree pane"),
             ("input.accept", "accept the text"),
             ("input.cancel", "discard the text"),
             ("pane.next", "focus the next pane"),

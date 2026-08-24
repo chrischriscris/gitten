@@ -98,6 +98,10 @@ const LIGHTS_W: f32 = 72.0;
 /// The error band under the title bar. Shorter than a title bar because it is
 /// one sentence, and it is only there when something has to be said.
 const BAND_H: f32 = 22.0;
+/// The slice of the pane column the working tree claims before the rest of the
+/// panes divide what is left — see [`Pane::height_share`]. A code constant on
+/// purpose tonight; a drag handle between panes would own this properly.
+const FILES_SHARE: f32 = 0.3;
 
 /// What only this client has. The two views, the arguments and `gitten.toml` are
 /// documented once, in `gitten_app::cli::usage`, because they are the same in
@@ -204,6 +208,15 @@ trait Pane {
         Bounds::default()
     }
 
+    /// The fraction of the pane column this tenant claims before the rest
+    /// divide what is left. `None` — every pane built before this existed — is
+    /// an equal share, unchanged. A viewer that is context rather than content
+    /// (the working tree) claims a fixed slice; whatever the window opens *for*
+    /// keeps `None` and stays the star.
+    fn height_share(&self, _cx: &App) -> Option<f32> {
+        None
+    }
+
     fn pan_pixels(&self, _dx: f32, _cx: &App) -> bool {
         false
     }
@@ -243,6 +256,14 @@ enum Screen {
         generation: Rc<Cell<Generation>>,
         label: Rc<RefCell<String>>,
     },
+    /// The working tree. No `Source`: it is always about the repository the
+    /// window opened on, and a fixture — which has no working tree at all —
+    /// simply never gets one registered.
+    Files {
+        view: Entity<views::files::Files>,
+        generation: Rc<Cell<Generation>>,
+        label: Rc<RefCell<String>>,
+    },
     Custom(Rc<dyn Pane>),
 }
 
@@ -275,10 +296,23 @@ impl Screen {
         }
     }
 
+    fn files(
+        view: Entity<views::files::Files>,
+        generation: Generation,
+        label: impl Into<String>,
+    ) -> Self {
+        Self::Files {
+            view,
+            generation: Rc::new(Cell::new(generation)),
+            label: Rc::new(RefCell::new(label.into())),
+        }
+    }
+
     fn any(&self) -> AnyView {
         match self {
             Screen::Commits { view, .. } => view.clone().into(),
             Screen::Diff { view, .. } => view.clone().into(),
+            Screen::Files { view, .. } => view.clone().into(),
             Screen::Custom(pane) => pane.any(),
         }
     }
@@ -288,13 +322,16 @@ impl Screen {
         match self {
             Screen::Commits { .. } => "commits",
             Screen::Diff { .. } => "diff",
+            Screen::Files { .. } => "files",
             Screen::Custom(pane) => pane.mode(),
         }
     }
 
     fn label(&self) -> String {
         match self {
-            Screen::Commits { label, .. } | Screen::Diff { label, .. } => label.borrow().clone(),
+            Screen::Commits { label, .. }
+            | Screen::Diff { label, .. }
+            | Screen::Files { label, .. } => label.borrow().clone(),
             Screen::Custom(pane) => pane.label(),
         }
     }
@@ -399,6 +436,49 @@ impl Screen {
                     },
                 ))
             }
+            Screen::Files {
+                view,
+                generation,
+                label,
+            } => {
+                if generation.get() >= target {
+                    return None;
+                }
+                let view = view.clone();
+                let generation = generation.clone();
+                let label = label.clone();
+                Some(Refresh::new(
+                    target,
+                    move || {
+                        // The whole of the blocking half: one `git status`.
+                        // The describe rides along beside it so the label
+                        // keeps naming the repository, the way acquisition
+                        // overlaps its own pieces.
+                        let described = std::thread::scope(|s| {
+                            let title = s.spawn(|| repo.describe());
+                            let status = repo.status()?;
+                            Ok::<_, String>(views::files::prepare(
+                                status,
+                                &title.join().unwrap_or_default(),
+                            ))
+                        })?;
+                        Ok(described)
+                    },
+                    move |prepared: views::files::Prepared, host, cx| {
+                        if generation.get() >= target {
+                            return Ok(());
+                        }
+                        let label_text = prepared.label.clone();
+                        view.update(cx, |v, cx| {
+                            v.replace_prepared(prepared, host);
+                            cx.notify();
+                        });
+                        label.replace(label_text);
+                        generation.set(target);
+                        Ok(())
+                    },
+                ))
+            }
             Screen::Custom(pane) => pane.refresh(target, host, overrides, repo),
         }
     }
@@ -408,7 +488,19 @@ impl Screen {
         match self {
             Screen::Commits { view, .. } => view.read(cx).list_bounds(),
             Screen::Diff { view, .. } => view.read(cx).list_bounds(),
+            Screen::Files { view, .. } => view.read(cx).list_bounds(),
             Screen::Custom(pane) => pane.list_bounds(cx),
+        }
+    }
+
+    /// The slice of the pane column this screen claims — see [`Pane::height_share`].
+    fn height_share(&self, cx: &App) -> Option<f32> {
+        match self {
+            // The working tree is context; whatever the window opened for gets
+            // an equal share and stays the star.
+            Screen::Files { .. } => Some(FILES_SHARE),
+            Screen::Commits { .. } | Screen::Diff { .. } => None,
+            Screen::Custom(pane) => pane.height_share(cx),
         }
     }
 
@@ -419,6 +511,7 @@ impl Screen {
         match self {
             Screen::Commits { view, .. } => view.read(cx).pan_pixels(dx),
             Screen::Diff { view, .. } => view.read(cx).pan_pixels(dx),
+            Screen::Files { view, .. } => view.read(cx).pan_pixels(dx),
             Screen::Custom(pane) => pane.pan_pixels(dx, cx),
         }
     }
@@ -443,6 +536,13 @@ impl Screen {
                 }
                 known
             }),
+            Screen::Files { view, .. } => view.update(cx, |f, c| {
+                let known = f.run_view(command, host);
+                if known {
+                    c.notify();
+                }
+                known
+            }),
             Screen::Custom(pane) => pane.run(command, host, cx),
         }
     }
@@ -454,6 +554,7 @@ impl Screen {
         match self {
             Screen::Commits { view, .. } => view.update(cx, |v, _| v.scroll_pixels(dy, host)),
             Screen::Diff { view, .. } => view.update(cx, |v, _| v.scroll_pixels(dy, host)),
+            Screen::Files { view, .. } => view.update(cx, |v, _| v.scroll_pixels(dy, host)),
             Screen::Custom(pane) => pane.scroll_pixels(dy, host, cx),
         }
     }
@@ -473,6 +574,10 @@ impl Screen {
                     true
                 }
                 false => d.select_none(cx),
+            }),
+            Screen::Files { view, .. } => view.update(cx, |f, _| match all {
+                true => f.select_all(),
+                false => f.select_none(),
             }),
             Screen::Custom(pane) => pane.select(all, cx),
         }
@@ -891,6 +996,7 @@ impl DevShell {
             "input.cancel" => self.close_input(false, cx),
             "pane.next" => self.cycle_pane(1, cx),
             "pane.prev" => self.cycle_pane(-1, cx),
+            "files.focus" => self.focus_named("files", cx),
             "commits.open-diff" => self.open_diff(cx),
             "copy.selection" => self.copy_selection(cx),
             // Both are answered by whichever screen is up; a commit graph has no
@@ -979,6 +1085,17 @@ impl DevShell {
         }
     }
 
+    /// Focuses a tenant by its stable registration name — what `files.focus`
+    /// runs. Said, not swallowed, when nothing is registered under the name: a
+    /// fixture has no working tree to show, and the honest answer to the key
+    /// is the same sentence an unbound one gets.
+    fn focus_named(&mut self, name: &str, cx: &mut Context<Self>) {
+        match self.panes.position(name) {
+            Some(at) => self.focus_pane(at, cx),
+            None => self.set_notice(format!("no {name} pane")),
+        }
+    }
+
     /// Opens the diff of the commit under the cursor in its registered pane.
     ///
     /// The I/O is here and not in the view — the same rule the terminal follows:
@@ -1061,6 +1178,16 @@ impl DevShell {
                 view.update(cx, |v, _| v.reconcile(&host));
                 let text = view.read(cx).cursor_text();
                 if !text.is_empty() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+            }
+            Some(Screen::Files { view, .. }) => {
+                let view = view.clone();
+                view.update(cx, |f, _| f.reconcile(&host));
+                let text = view.read(cx).cursor_text();
+                if !text.is_empty() {
+                    // Letters first, then the path — the spelling git itself
+                    // prints, so it pastes into a shell usefully.
                     cx.write_to_clipboard(ClipboardItem::new_string(text));
                 }
             }
@@ -1470,10 +1597,16 @@ impl Render for DevShell {
             .enumerate()
             .map(|(at, screen)| {
                 let focused = at == focused_pane;
-                div()
+                // Equal shares by default. A tenant that claims a fixed slice
+                // of the column gets it as a basis; the equal-share panes grow
+                // into whatever is left.
+                let sized = match screen.height_share(cx) {
+                    Some(share) => div().flex_basis(relative(share)),
+                    None => div().flex_1(),
+                };
+                sized
                     .id(("pane", at))
                     .relative()
-                    .flex_1()
                     .min_h_0()
                     .overflow_hidden()
                     .border_1()
@@ -1876,7 +2009,48 @@ fn main() {
                         )
                     }
                 };
-                let initial_panes = panes::Panes::new(which_name, screen);
+                let mut initial_panes = panes::Panes::new(which_name, screen);
+
+                // The working tree gets its compact pane, above wherever a
+                // diff later opens. One blocking `git status` here, beside the
+                // rest of startup acquisition; from the next write on, the
+                // generation-guarded refresh path keeps it current. A fixture
+                // has no repository and so no pane at all.
+                if let Some((_, handle)) = &repo {
+                    start::mark("files status begin");
+                    let described = std::thread::scope(|s| {
+                        // Beside, not behind — describe spawns and runs while
+                        // status blocks, and is joined only once status is
+                        // back. Joining before would put two git processes in
+                        // sequence on the launch path.
+                        let title = s.spawn(|| handle.describe());
+                        let status = handle.status();
+                        let title = title.join().unwrap_or_default();
+                        match status {
+                            Ok(status) => views::files::prepare(status, &title),
+                            // Shown as a clean tree rather than failing the
+                            // window: one bad status must not take the launch.
+                            Err(e) => {
+                                eprintln!("gitten: status failed, showing an empty pane: {e}");
+                                views::files::prepare(Default::default(), &title)
+                            }
+                        }
+                    });
+                    start::mark("files status done");
+                    let label = described.label.clone();
+                    initial_panes.register(
+                        "files",
+                        Screen::files(
+                            cx.new(|_| views::files::Files::from_prepared(described)),
+                            Generation::default(),
+                            label,
+                        ),
+                    );
+                    // Registration focuses what it adds; startup keeps the
+                    // keyboard where it launched.
+                    initial_panes.focus(0);
+                    start::mark("files pane built");
+                }
                 start::mark("view built");
 
                 // First-paint evidence, and only when logging: the views count
@@ -2514,6 +2688,51 @@ mod tests {
     }
 
     #[gpui::test]
+    fn files_focus_reaches_the_registered_pane_and_says_so_when_there_is_none(
+        cx: &mut TestAppContext,
+    ) {
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, cx| {
+            let files = cx.new(|_| {
+                crate::views::files::Files::from_prepared(crate::views::files::prepare(
+                    Status::default(),
+                    "gitten (main)",
+                ))
+            });
+            shell.panes.register(
+                "files",
+                Screen::files(files, Generation::default(), "gitten (main) · 0 changed"),
+            );
+            // Registration focuses what it adds; a launch starts on the root.
+            shell.panes.focus(0);
+            shell.sync_modes();
+        });
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.active_view_name(), "commits")
+        });
+
+        // Named dispatch — the same path the `2` key resolves through.
+        shell.update(cx, |shell, cx| shell.run_command("files.focus", cx));
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.panes.focused_index(), 1);
+            assert_eq!(shell.modes.top(), "files");
+            assert_eq!(shell.active_label().as_ref(), "gitten (main) · 0 changed");
+        });
+
+        // And with the pane gone again, the key is answered with a sentence,
+        // not silence.
+        shell.update(cx, |shell, cx| {
+            shell.panes.close_focused();
+            shell.sync_modes();
+            shell.notice = None;
+            shell.run_command("files.focus", cx);
+        });
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.notice.is_some(), "a missing pane went unsaid");
+        });
+    }
+
+    #[gpui::test]
     fn native_input_owns_the_innermost_mode_until_it_closes(cx: &mut TestAppContext) {
         let shell = shell(None, cx);
         let input = cx.new(|cx| input::Input::new("message", "type", "draft", cx));
@@ -2533,6 +2752,69 @@ mod tests {
             assert!(shell.input.is_none());
             assert_eq!(shell.modes.top(), "commits");
         });
+    }
+
+    #[gpui::test]
+    fn the_files_pane_claims_a_fixed_slice_and_equal_shares_split_the_rest(
+        cx: &mut TestAppContext,
+    ) {
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, cx| {
+            let commits = cx.new(|_| Commits::new(Vec::new(), Rc::new(Host::new())));
+            shell.panes.register(
+                "second",
+                Screen::commits(commits, Source::Fixtures, Generation::default(), "second"),
+            );
+            let files = cx.new(|_| {
+                crate::views::files::Files::from_prepared(crate::views::files::prepare(
+                    Status::default(),
+                    "",
+                ))
+            });
+            shell.panes.register(
+                "files",
+                Screen::files(files, Generation::default(), "files"),
+            );
+            shell.sync_modes();
+        });
+        let handle = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_global(config::Active(Rc::new(Host::new())));
+            cx.open_window(
+                gpui::WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds {
+                        origin: Default::default(),
+                        size: gpui::size(gpui::px(800.0), gpui::px(600.0)),
+                    })),
+                    ..Default::default()
+                },
+                move |_, _| shell,
+            )
+            .unwrap()
+        });
+        let mut cx = gpui::VisualTestContext::from_window(handle.into(), cx);
+        cx.run_until_parked();
+        let first = cx.debug_bounds("pane-0").expect("first pane was not drawn");
+        let second = cx
+            .debug_bounds("pane-1")
+            .expect("second pane was not drawn");
+        let files = cx.debug_bounds("pane-2").expect("files pane was not drawn");
+
+        // The two unclaimed panes stay equal, and the working tree sits in its
+        // slice — 0.3 of the column against their 0.35 each.
+        assert!(
+            (f32::from(first.size.height) - f32::from(second.size.height)).abs() < 1.0,
+            "equal shares diverged"
+        );
+        let ratio = f32::from(files.size.height) / f32::from(first.size.height);
+        assert!(
+            (ratio - 0.3 / 0.35).abs() < 0.02,
+            "the files pane took {ratio} of an equal share"
+        );
+        // Stacked in registration order, touching, full width.
+        assert_eq!(files.origin.y, second.bottom());
+        assert_eq!(files.origin.x, first.origin.x);
+        assert_eq!(files.size.width, first.size.width);
     }
 
     #[test]

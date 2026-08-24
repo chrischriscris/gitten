@@ -44,6 +44,12 @@ impl<T> Panes<T> {
         self.entries.iter().map(|entry| &entry.value)
     }
 
+    /// Where a tenant lives, by its stable registration name — what a
+    /// focus-by-name command (`files.focus`) needs to find it.
+    pub fn position(&self, name: &str) -> Option<usize> {
+        self.entries.iter().position(|entry| entry.name == name)
+    }
+
     /// Adds a tenant, or replaces one already registered under `name`, and
     /// focuses it. Returns the replaced tenant when there was one.
     pub fn register(&mut self, name: impl Into<String>, value: T) -> Option<T> {
@@ -115,6 +121,20 @@ mod tests {
         assert!(panes.cycle(-1));
         assert_eq!(*panes.focused(), 3, "previous did not wrap");
         assert!(!panes.focus(99));
+    }
+
+    #[test]
+    fn a_tenant_is_found_by_its_stable_name() {
+        let mut panes = Panes::new("commits", 1);
+        panes.register("files", 2);
+        assert_eq!(panes.position("files"), Some(1));
+        assert_eq!(panes.position("commits"), Some(0));
+        // Replacing keeps the name where it was, so a focus command does not
+        // have to care whether the tenant is new.
+        panes.register("diff", 3);
+        panes.register("files", 4);
+        assert_eq!(panes.position("files"), Some(1));
+        assert_eq!(panes.position("branches"), None);
     }
 
     #[test]
