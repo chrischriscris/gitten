@@ -224,6 +224,72 @@ pub trait Repo: Send + Sync {
         Err(unserved("unstaging"))
     }
 
+    /// Checks out one path's working-tree state away —
+    /// `git checkout -- <path>`.
+    ///
+    /// The destructive half of staging's opposite: the working tree returns
+    /// to whatever the *index* holds, which is why a staged modification
+    /// survives and an unstaged one does not. Nothing staged is touched, so
+    /// this is one verb short of lazygit's whole-file discard — unstage first
+    /// when the index has to lose it too. Bytes throughout, exactly as
+    /// [`status`](Self::status) named the path.
+    fn discard(&self, _path: &[u8]) -> Result<()> {
+        Err(unserved("discarding"))
+    }
+
+    /// Deletes one untracked file from the working tree.
+    ///
+    /// A separate word and not a branch of [`discard`](Self::discard)
+    /// because it is a different destruction with no git plumbing behind it:
+    /// an untracked file is in no commit and no index, so there is nothing
+    /// to check out — the file simply stops existing. The caller knows which
+    /// kind it holds from [`status`](Self::status) and aims accordingly;
+    /// folding both under one name would hide "this press deletes the file"
+    /// inside a verb whose usual mechanics are reversible.
+    fn remove_untracked(&self, _path: &[u8]) -> Result<()> {
+        Err(unserved("untracked removal"))
+    }
+
+    /// Appends one path to the repository's root `.gitignore`, creating the
+    /// file when it does not exist.
+    ///
+    /// The line is anchored (`/name`) so it matches from the root rather
+    /// than at any depth, escaped where git would otherwise read pattern
+    /// syntax into it, and written only once — ignoring twice leaves the
+    /// file byte-identical. A name holding a line break is refused in
+    /// words rather than answered with a pattern that cannot match
+    /// anything. Nothing else happens here: the entry stays on disk,
+    /// untracked but now ignored, and disappears from
+    /// [`status`](Self::status)'s untracked list on the next read because
+    /// git stops listing ignored files on its own.
+    fn ignore(&self, _path: &[u8]) -> Result<()> {
+        Err(unserved("ignoring"))
+    }
+
+    /// Stages every path in one call.
+    ///
+    /// Bulk spelling of [`stage`](Self::stage), for the stage-everything
+    /// command: the binary-backed implementation answers it with one `add`
+    /// process over the whole list instead of one process per path, and a
+    /// backend that does not need the distinction gets the loop free through
+    /// this default. Empty is a quiet no-op.
+    fn stage_many(&self, paths: &[&[u8]]) -> Result<()> {
+        for path in paths {
+            self.stage(path)?;
+        }
+        Ok(())
+    }
+
+    /// Unstages every path in one call — the bulk spelling of
+    /// [`unstage`](Self::unstage), on the same terms as
+    /// [`stage_many`](Self::stage_many).
+    fn unstage_many(&self, paths: &[&[u8]]) -> Result<()> {
+        for path in paths {
+            self.unstage(path)?;
+        }
+        Ok(())
+    }
+
     /// Commits what the index holds with `message`, returning the new
     /// commit's OID.
     ///
@@ -671,6 +737,77 @@ impl Repo for Binary {
         run_bytes(&self.root, &[b"reset", b"-q", b"HEAD", b"--", path]).map(|_| ())
     }
 
+    fn discard(&self, path: &[u8]) -> Result<()> {
+        // `checkout --`, not bare `checkout`: the `--` is what stops a path
+        // that begins with `-` reading as a flag, and [`run_bytes`] keeps
+        // the name byte-exact — the file restored is the one status named.
+        // The index is the source, so a staged version survives; see the
+        // trait method for where that line sits.
+        run_bytes(&self.root, &[b"checkout", b"--", path]).map(|_| ())
+    }
+
+    fn remove_untracked(&self, path: &[u8]) -> Result<()> {
+        // A filesystem deletion and deliberately not a git command: nothing
+        // about an untracked file lives in git's object database. Bytes
+        // through [`join_raw`], or the read would stat a decoded near-miss
+        // of somebody's real filename; the message decodes lossily because
+        // it is human text and never aimed back at anything.
+        let at = join_raw(&self.root, path);
+        std::fs::remove_file(&at).map_err(|e| format!("could not delete {}: {e}", at.display()))
+    }
+
+    fn ignore(&self, path: &[u8]) -> Result<()> {
+        let Some(line) = ignore_line(path) else {
+            // No spelling exists, so nothing honest can be written: said,
+            // where errors are shown, instead of a line that ignores
+            // nothing. The name decodes lossily because it is prose in an
+            // error message and never aimed back at the filesystem.
+            return Err(format!(
+                "gitignore matches a line at a time; a name with a line \
+                 break cannot be ignored ({})",
+                String::from_utf8_lossy(path)
+            ));
+        };
+        let at = join_raw(&self.root, b".gitignore");
+        // Absent and unreadable are the same answer here: an empty file to
+        // append to. A .gitignore this process cannot read it can hardly
+        // have written, and refusing to ignore over it would be noise.
+        let mut next = std::fs::read(&at).unwrap_or_default();
+        if next.split(|b| *b == b'\n').any(|existing| existing == line) {
+            return Ok(());
+        }
+        // Whatever the file ended with, the new line starts on its own: a
+        // missing final newline is the ordinary state of a hand-edited one,
+        // and gluing onto it would silently extend somebody's last pattern.
+        if !next.is_empty() && !next.ends_with(b"\n") {
+            next.push(b'\n');
+        }
+        next.extend_from_slice(&line);
+        next.push(b'\n');
+        std::fs::write(&at, next).map_err(|e| format!("could not write {}: {e}", at.display()))
+    }
+
+    fn stage_many(&self, paths: &[&[u8]]) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        // One process over every path — the spelling git itself uses, and
+        // the difference between a stage-all keypress on a fresh repository
+        // costing one fork and costing one per untracked file.
+        let mut args: Vec<&[u8]> = vec![b"add", b"--"];
+        args.extend(paths.iter().copied());
+        run_bytes(&self.root, &args).map(|_| ())
+    }
+
+    fn unstage_many(&self, paths: &[&[u8]]) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let mut args: Vec<&[u8]> = vec![b"reset", b"-q", b"HEAD", b"--"];
+        args.extend(paths.iter().copied());
+        run_bytes(&self.root, &args).map(|_| ())
+    }
+
     fn commit(&self, message: &str) -> Result<String> {
         if message.trim().is_empty() {
             return Err("a commit needs a message".into());
@@ -747,6 +884,54 @@ impl Binary {
             _ => (None, None),
         }
     }
+}
+
+/// The `.gitignore` spelling of one path: anchored at the repository root,
+/// with every character git would otherwise read as pattern syntax made
+/// literal — or [`None`] for a name no `.gitignore` line can match.
+///
+/// Three layers, because `.gitignore` is a pattern language and a filename
+/// is not:
+///
+/// - **A leading `/`** pins the name to the root — without it, `log.txt`
+///   would match at any depth and hide files nobody meant to ignore. It also
+///   takes `#` and `!` out of their special first positions for free.
+/// - **Glob characters** (`*`, `?`, `[`, `]`) and the name's own backslashes
+///   are backslash-escaped wherever they occur; `weird[name].txt` is a name,
+///   not a class. Quotes and tabs need nothing — mid-line they are ordinary
+///   bytes to git, checked against the binary rather than assumed.
+/// - **Trailing spaces** are trimmed from every line unless escaped, so each
+///   one rides behind a backslash.
+///
+/// What has no spelling is a line break: patterns are read one line at a
+/// time, so a name holding a newline can be matched by nothing this file can
+/// hold — checked, not argued. `None` there is what keeps the verb from
+/// writing a line that looks done and ignores nothing.
+fn ignore_line(path: &[u8]) -> Option<Vec<u8>> {
+    if path.iter().any(|b| matches!(b, b'\n' | b'\r')) {
+        return None;
+    }
+    let mut body = Vec::with_capacity(path.len() + 1);
+    body.push(b'/');
+    for &b in path {
+        if matches!(b, b'*' | b'?' | b'[' | b']' | b'\\') {
+            body.push(b'\\');
+        }
+        body.push(b);
+    }
+    // Everything from the last non-space onwards is trailing space to git;
+    // escape each rather than only the run's head, which is what keeps two
+    // trailing blanks both. The leading `/` is a non-space, so the position
+    // below is always found.
+    let keep = body.iter().rposition(|b| *b != b' ').unwrap_or(0) + 1;
+    if keep < body.len() {
+        let spaces = body.len() - keep;
+        body.truncate(keep);
+        for _ in 0..spaces {
+            body.extend_from_slice(b"\\ ");
+        }
+    }
+    Some(body)
 }
 
 // ------------------------------------------------------------------- the pair
@@ -3379,6 +3564,29 @@ mod tests {
             "this repository does not serve unstaging"
         );
         assert_eq!(
+            ReadsOnly.discard(b"x").unwrap_err(),
+            "this repository does not serve discarding"
+        );
+        assert_eq!(
+            ReadsOnly.remove_untracked(b"x").unwrap_err(),
+            "this repository does not serve untracked removal"
+        );
+        assert_eq!(
+            ReadsOnly.ignore(b"x").unwrap_err(),
+            "this repository does not serve ignoring"
+        );
+        // The bulk spellings default to their singulars, so a partial backend
+        // that serves one path at a time still answers a stage-all — one
+        // unserved word per path rather than per call.
+        assert_eq!(
+            ReadsOnly.stage_many(&[b"a", b"b"]).unwrap_err(),
+            "this repository does not serve staging"
+        );
+        assert_eq!(
+            ReadsOnly.unstage_many(&[b"a"]).unwrap_err(),
+            "this repository does not serve unstaging"
+        );
+        assert_eq!(
             ReadsOnly.commit("hi").unwrap_err(),
             "this repository does not serve committing"
         );
@@ -3497,6 +3705,307 @@ mod tests {
                 .map(|e| e.path.to_string())
                 .collect::<Vec<_>>(),
             vec!["first.txt"]
+        );
+    }
+
+    #[test]
+    fn discarding_a_modified_file_restores_what_the_index_holds() {
+        let r = Scratch::new("discard-modified");
+        r.write("f.txt", b"one\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        r.write("f.txt", b"ruined\n");
+
+        let g = r.open();
+        assert_eq!(g.status().unwrap().unstaged.len(), 1);
+        g.discard(b"f.txt").expect("discards");
+        let s = g.status().unwrap();
+        assert!(s.is_empty(), "the working tree came back clean: {s:?}");
+        assert_eq!(std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(), b"one\n");
+    }
+
+    #[test]
+    fn a_staged_version_survives_a_discard_of_the_worktree_side() {
+        // The line `checkout --` draws: index against worktree. Edited,
+        // staged, edited again — discarding takes the second edit only, and
+        // the first stays in the index exactly as stage left it.
+        let r = Scratch::new("discard-staged");
+        r.write("f.txt", b"original\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        r.write("f.txt", b"staged version\n");
+        r.git(&["add", "f.txt"]);
+        r.write("f.txt", b"staged version\nand more\n");
+
+        let g = r.open();
+        g.discard(b"f.txt").expect("discards");
+        let s = g.status().unwrap();
+        assert!(s.unstaged.is_empty(), "{s:?}");
+        assert_eq!(s.staged.len(), 1, "the index kept its copy");
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"staged version\n",
+            "the worktree went back to the index, not to HEAD"
+        );
+    }
+
+    #[test]
+    fn discarding_addresses_the_path_by_its_bytes() {
+        // Spaces plus a Latin-1 byte, modified then discarded through the
+        // exact name status reported — the same discipline staging keeps.
+        let r = Scratch::new("discard-raw");
+        r.write("seed.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        if !r.plant_raw(b"has space \xe9.txt", b"before\n") {
+            return; // this volume validates UTF-8; see the staging read test
+        }
+
+        let g = r.open();
+        r.plant_raw(b"has space \xe9.txt", b"after\n");
+        g.discard(b"has space \xe9.txt").expect("discards");
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"has space \xe9.txt")).unwrap(),
+            b"before\n",
+            "restored by the real bytes, not a decoded near-miss"
+        );
+    }
+
+    #[test]
+    fn an_untracked_file_is_deleted_by_its_own_verb() {
+        // Discard's other mechanics: nothing to check out, so the file just
+        // stops existing — off the disk and out of status with one call.
+        let r = Scratch::new("discard-untracked");
+        r.write("seed.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        r.write("notes.md", b"draft\n");
+
+        let g = r.open();
+        assert_eq!(g.status().unwrap().untracked.len(), 1);
+        g.remove_untracked(b"notes.md").expect("deletes");
+        let s = g.status().unwrap();
+        assert!(s.is_empty(), "{s:?}");
+        assert!(!join_raw(&r.0, b"notes.md").exists());
+    }
+
+    #[test]
+    fn bulk_stage_and_unstage_take_every_path_in_one_call() {
+        let r = Scratch::new("bulk");
+        r.write("a.txt", b"a\n");
+        r.write("b.txt", b"b\n");
+        r.write("c.txt", b"c\n");
+        let g = r.open();
+
+        // Stage-all on a fresh tree: everything lands in the index at once,
+        // including the untracked files `git diff` cannot see.
+        g.stage_many(&[b"a.txt", b"b.txt", b"c.txt"])
+            .expect("stages all");
+        let s = g.status().unwrap();
+        assert!(s.untracked.is_empty() && s.staged.len() == 3, "{s:?}");
+
+        // And the mirror: every path back out of the index, one process.
+        g.unstage_many(&[b"a.txt", b"b.txt", b"c.txt"])
+            .expect("unstages all");
+        let s = g.status().unwrap();
+        assert!(s.staged.is_empty() && s.untracked.len() == 3, "{s:?}");
+    }
+
+    #[test]
+    fn ignoring_creates_the_gitignore_and_git_stops_listing_the_file() {
+        // The whole honest chain: the file stays on disk, untracked but now
+        // ignored — the entry leaves status because git itself stops listing
+        // ignored files, not because anything moved.
+        let r = Scratch::new("ignore-create");
+        r.write("seed.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        r.write("log.txt", b"noise\n");
+
+        let g = r.open();
+        g.ignore(b"log.txt").expect("ignores");
+
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b".gitignore")).unwrap(),
+            b"/log.txt\n",
+            "anchored at the root, one line, terminated"
+        );
+        assert!(join_raw(&r.0, b"log.txt").exists(), "nothing was deleted");
+        let s = g.status().unwrap();
+        // And .gitignore itself is now the tree's one untracked file — the
+        // user commits it or not, as they like.
+        assert_eq!(
+            s.untracked
+                .iter()
+                .map(|e| e.path.to_string())
+                .collect::<Vec<_>>(),
+            vec![".gitignore"],
+            "{s:?}"
+        );
+    }
+
+    #[test]
+    fn ignoring_survives_a_gitignore_without_a_trailing_newline() {
+        // The ordinary state of a hand-edited .gitignore: no final newline.
+        // Gluing onto it would silently extend somebody's last pattern.
+        let r = Scratch::new("ignore-newline");
+        r.write("seed.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        r.write(".gitignore", b"build/");
+
+        r.open().ignore(b"x.txt").expect("ignores");
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b".gitignore")).unwrap(),
+            b"build/\n/x.txt\n",
+            "the new line started on its own"
+        );
+    }
+
+    #[test]
+    fn ignoring_twice_writes_one_line() {
+        let r = Scratch::new("ignore-idempotent");
+        r.write("seed.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+
+        let g = r.open();
+        g.ignore(b"junk.bin").unwrap();
+        let before = std::fs::read(join_raw(&r.0, b".gitignore")).unwrap();
+        g.ignore(b"junk.bin").unwrap();
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b".gitignore")).unwrap(),
+            before,
+            "the second ask changed nothing"
+        );
+    }
+
+    #[test]
+    fn ignoring_escapes_what_git_would_read_as_a_pattern() {
+        // `weird[name]?.txt` is a filename, not a character class — and the
+        // proof is git's own answer: after ignoring, status stops listing it,
+        // which only happens if the written pattern matches the real name.
+        // A committed empty .gitignore keeps the tree's untracked list at
+        // exactly the file under test.
+        let r = Scratch::new("ignore-glob");
+        r.write(".gitignore", b"");
+        r.write("seed.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        if !r.plant_raw(b"weird[name]?.txt", b"oddly named\n") {
+            return; // this volume validates UTF-8 and refused the name
+        }
+
+        let g = r.open();
+        g.ignore(b"weird[name]?.txt").expect("ignores");
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b".gitignore")).unwrap(),
+            b"/weird\\[name\\]\\?.txt\n",
+            "every glob character made literal"
+        );
+        assert!(g.status().unwrap().untracked.is_empty());
+    }
+
+    #[test]
+    fn a_name_the_line_cannot_carry_rides_nowhere() {
+        // Removed: an earlier draft spelled unrepresentable names C-quoted,
+        // the way git prints them — and git's own matcher does not read
+        // quotes back in .gitignore. `check-ignore` said no for every
+        // spelling tried, which is why refusal replaced it.
+        let r = Scratch::new("ignore-backslash");
+        r.write(".gitignore", b"");
+        r.write("seed.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        if !r.plant_raw(b"back\\slash.txt", b"\n") {
+            return; // refused by this volume; the escape table is pinned above
+        }
+
+        let g = r.open();
+        assert_eq!(g.status().unwrap().untracked.len(), 1);
+        g.ignore(b"back\\slash.txt").expect("ignores");
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b".gitignore")).unwrap(),
+            b"/back\\\\slash.txt\n",
+            "the name's own backslash escaped, not quoted around"
+        );
+        assert!(g.status().unwrap().untracked.is_empty());
+    }
+
+    #[test]
+    fn ignoring_a_path_with_spaces_and_non_utf8_bytes_lands_byte_exact() {
+        let r = Scratch::new("ignore-raw");
+        r.write(".gitignore", b"");
+        r.write("seed.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        if !r.plant_raw(b"caf\xe9 notes.txt", b"\n") {
+            return; // this volume validates UTF-8; see the staging read test
+        }
+
+        let g = r.open();
+        g.ignore(b"caf\xe9 notes.txt").expect("ignores");
+        // High bytes pass through raw — quoting is about the grammar, not
+        // the encoding — while the space needs nothing at all mid-line.
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b".gitignore")).unwrap(),
+            b"/caf\xe9 notes.txt\n"
+        );
+        assert!(g.status().unwrap().untracked.is_empty());
+    }
+
+    #[test]
+    fn ignore_lines_are_anchored_escaped_and_refuse_only_the_unspellable() {
+        // The plain case: anchored, nothing else.
+        assert_eq!(ignore_line(b"log.txt"), Some(b"/log.txt".to_vec()));
+        // A leading `!` or `#` loses its special meaning to the anchor alone.
+        assert_eq!(ignore_line(b"!not.txt"), Some(b"/!not.txt".to_vec()));
+        assert_eq!(ignore_line(b"#notes.md"), Some(b"/#notes.md".to_vec()));
+        // Glob characters are literal wherever they occur.
+        assert_eq!(
+            ignore_line(b"a*b?[c]d"),
+            Some(b"/a\\*b\\?\\[c\\]d".to_vec())
+        );
+        // A name's own backslash escapes like any glob character — checked
+        // against git's own matcher by the scratch test beside this one.
+        assert_eq!(
+            ignore_line(b"back\\slash"),
+            Some(b"/back\\\\slash".to_vec())
+        );
+        // Quotes and tabs mid-line are ordinary bytes to git; nothing is
+        // escaped that does not need it.
+        assert_eq!(ignore_line(b"say \"hi\""), Some(b"/say \"hi\"".to_vec()));
+        assert_eq!(ignore_line(b"tab\there"), Some(b"/tab\there".to_vec()));
+        // Trailing spaces survive only escaped, every one of them.
+        assert_eq!(ignore_line(b"end .txt "), Some(b"/end .txt\\ ".to_vec()));
+        assert_eq!(ignore_line(b"two  "), Some(b"/two\\ \\ ".to_vec()));
+        // High bytes are not grammar: they pass through raw.
+        assert_eq!(ignore_line(b"caf\xe9"), Some(b"/caf\xe9".to_vec()));
+        // A line break has no spelling — patterns are read one line at a
+        // time — so the honest answer is refusal, not a line that matches
+        // nothing. Checked against the binary below, not assumed here.
+        assert_eq!(ignore_line(b"new\nline"), None);
+        assert_eq!(ignore_line(b"old\rline"), None);
+    }
+
+    #[test]
+    fn a_name_with_a_line_break_is_refused_in_words_and_the_tree_is_untouched() {
+        let r = Scratch::new("refused");
+        r.write("seed.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        if !r.plant_raw(b"two\nlines.txt", b"\n") {
+            return;
+        }
+
+        let g = r.open();
+        let e = g.ignore(b"two\nlines.txt").unwrap_err();
+        assert!(e.contains("cannot be ignored"), "{e}");
+        assert!(!join_raw(&r.0, b".gitignore").exists(), "nothing written");
+        assert_eq!(
+            g.status().unwrap().untracked.len(),
+            1,
+            "the file still shows, as it must until it can be matched"
         );
     }
 
