@@ -98,9 +98,14 @@ jobs:
         with:
           fetch-depth: 3
       - uses: Swatinem/rust-cache@v2
-        id: cache
-      - if: steps.cache.outputs.cache-hit != 'true'
-        name: Install Linux build dependencies
+      # Not gated on a cache hit, unlike lint's copy of this list: rust-cache
+      # keys on the Cargo tree and knows nothing about apt, so a full match is
+      # exactly the run that still needs these. The rlibs restore warm, the
+      # final link is the first thing to consult the system .so files, and a
+      # skipped install left rust-lld finding no xcb, fontconfig, freetype,
+      # xkbcommon or xkbcommon-x11 — the second test-shell failure, one green
+      # run after the first.
+      - name: Install Linux build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
