@@ -367,6 +367,13 @@ impl Keymap {
         // holds. Both are particular to this pane, so they are not globals.
         bind("files", "space", "files.stage");
         bind("files", "c", "files.commit");
+        // The rest of the panel's verbs, on lazygit's keys where lazygit has
+        // one: D discards (twice-pressed — see files.discard's doc), a acts
+        // on every row by the side of the index the keyboard sits in, i
+        // stops git listing an untracked file.
+        bind("files", "D", "files.discard");
+        bind("files", "a", "files.stage-all");
+        bind("files", "i", "files.ignore");
 
         bind("diff", "s", "diff.cycle-layout");
         bind("diff", "w", "diff.cycle-wrap");
@@ -727,6 +734,18 @@ impl Commands {
             ("files.focus", "focus the working-tree pane"),
             ("files.stage", "stage or unstage the selected file"),
             ("files.commit", "commit the staged changes"),
+            (
+                "files.discard",
+                "discard the selected file's changes, asked twice",
+            ),
+            (
+                "files.stage-all",
+                "stage everything unstaged, or unstage everything staged",
+            ),
+            (
+                "files.ignore",
+                "add the selected untracked file to .gitignore",
+            ),
             ("input.accept", "accept the text"),
             ("input.cancel", "discard the text"),
             ("pane.next", "focus the next pane"),
@@ -947,6 +966,45 @@ mod tests {
             rows.iter().any(|r| r.contains("commit the staged changes")),
             "{rows:?}"
         );
+    }
+
+    #[test]
+    fn the_file_level_verbs_resolve_on_lazygits_keys_and_nowhere_else() {
+        let k = Keymap::builtin();
+        let mut modes = Modes::new();
+        modes.push("files");
+        for (chord, name) in [
+            ("D", "files.discard"),
+            ("a", "files.stage-all"),
+            ("i", "files.ignore"),
+        ] {
+            assert_eq!(
+                k.resolve(&modes, &keys(chord)),
+                Resolve::Run(name),
+                "{chord} did not reach {name} in [files]"
+            );
+            // Particular to this pane: another context keeps its own
+            // meanings, and a capital is not its lowercase twin's.
+            assert_ne!(
+                k.resolve(&Modes::new(), &keys(chord)),
+                Resolve::Run(name),
+                "{name} leaked out of [files]"
+            );
+        }
+        // The capital D is its own binding and `d` is nobody's.
+        assert_eq!(k.resolve(&modes, &keys("d")), Resolve::None);
+
+        let commands = Commands::builtin();
+        for (name, doc) in [
+            ("files.discard", Some("asked twice")),
+            ("files.stage-all", None),
+            ("files.ignore", None),
+        ] {
+            let command = commands.get(name).unwrap_or_else(|| panic!("{name}"));
+            if let Some(needle) = doc {
+                assert!(command.doc.contains(needle), "{}: {}", name, command.doc);
+            }
+        }
     }
 
     #[test]
