@@ -1,6 +1,7 @@
 use super::{accept_deferred_scroll, DeferredScrollbar, PendingScroll};
 use crate::graph;
 use gitten_core::host::Host;
+use gitten_core::search;
 use gitten_core::view::Viewport;
 use gitten_core::{assign_lanes, initials, Commit};
 use gpui::prelude::FluentBuilder as _;
@@ -28,6 +29,10 @@ struct Data {
     /// subject, and neither the graph nor the initials. Built at load with
     /// everything else that is derived once.
     lines: Vec<String>,
+    /// The same list folded for substring search — see
+    /// [`gitten_core::search::Index`] for why this is load work and not
+    /// keystroke work.
+    search: search::Index,
 }
 
 /// Repository data with every view-independent graph and row derivation already
@@ -40,6 +45,16 @@ pub(crate) struct Prepared {
 
 pub struct Commits {
     data: Rc<Data>,
+    /// Row → index into `data.commits`, ascending. Identity until a query
+    /// filters it, rebuilt only when the query changes — never per frame —
+    /// which is why the full vector is kept and this is all the list draws
+    /// from.
+    visible: Rc<Vec<usize>>,
+    /// The live filter, as the prompt last left it. `None` — or an empty
+    /// string, which [`Commits::apply_query`] folds into `None` — is every
+    /// row; kept so a second `/` edits the query rather than starting over,
+    /// and so clearing restores in one keystroke.
+    query: Option<String>,
     scroll: UniformListScrollHandle,
     /// The cursor, the top row and the height — [`gitten_core::view::Viewport`],
     /// the same model the terminal's commit list holds. Behind a shared cell so
@@ -64,7 +79,7 @@ impl Commits {
     /// *now* — see the diff view's `live_view`.
     fn live_view(&self, host: &Host) -> Viewport {
         let mut v = self.view.get();
-        v.set_len(self.data.commits.len());
+        v.set_len(self.visible.len());
         v.set_height(self.rendered.get());
         v.set_scrolloff(host.view.scrolloff);
         v
@@ -80,23 +95,46 @@ impl Commits {
     /// row near the top of the graph lands — GPUI would stay at row zero while
     /// everything else claims the restore worked.
     pub fn scroll_to(&self, row: usize, host: &Host) {
-        if self.data.commits.is_empty() {
+        if self.visible.is_empty() {
             return;
         }
-        let row = row.min(self.data.commits.len() - 1);
+        let row = row.min(self.visible.len() - 1);
         let mut v = self.live_view(host);
         v.scroll_to(row);
         self.view.set(v);
         self.defer_show(v);
     }
 
+    /// Every commit loaded — the filter narrows what is *shown*, never what
+    /// the repository holds. What the stats overlay calls total.
     pub fn total(&self) -> usize {
         self.data.commits.len()
     }
 
     /// The commit under the keyboard, for whatever opens a diff from it.
+    ///
+    /// Through the indirection and not `data.commits[cursor]`: the cursor is
+    /// a row of the *visible* list, and under a query those are not the same
+    /// vector position. Everything that acts on "this commit" — open-diff,
+    /// copy — reads through here, which is why filtering cannot desync them.
     pub fn current(&self) -> Option<&Commit> {
-        self.data.commits.get(self.view.get().cursor())
+        self.data
+            .commits
+            .get(*self.visible.get(self.view.get().cursor())?)
+    }
+
+    /// The live query, for pre-filling an edit of it. Empty means none.
+    pub fn query(&self) -> Option<&str> {
+        self.query.as_deref()
+    }
+
+    /// What the pane's label appends while filtered: shown over loaded,
+    /// `"12/4173"`. `None` unfiltered — the label then stays exactly what
+    /// acquisition named it.
+    pub fn filter_note(&self) -> Option<String> {
+        self.query
+            .is_some()
+            .then(|| format!("{}/{}", self.visible.len(), self.data.commits.len()))
     }
 
     // -------------------------------------------------------------- commands
@@ -229,10 +267,15 @@ impl Commits {
 
     /// What `copy.selection` copies here: the dragged range or, until this view
     /// grows a drag of its own, the commit the keyboard is on — sha and subject,
-    /// the two fields that name the commit to git and to a person.
+    /// the two fields that name the commit to git and to a person. Through the
+    /// indirection, like [`Commits::current`].
     pub fn cursor_text(&self) -> String {
         let v = self.view.get();
-        self.data.lines.get(v.cursor()).cloned().unwrap_or_default()
+        self.visible
+            .get(v.cursor())
+            .and_then(|i| self.data.lines.get(*i))
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Whether this view took part in `select.all` / `select.none`. It did not:
@@ -245,12 +288,74 @@ impl Commits {
     pub fn select_none(&mut self) -> bool {
         false
     }
+
+    // ----------------------------------------------------------------- search
+
+    /// Sets the filter — once per keystroke, and never anywhere else. The
+    /// visible-index vec is rebuilt here and read everywhere else.
+    ///
+    /// The keyboard stays on the same commit it was on: anchored by sha into
+    /// the next result set wherever that commit survives the narrower query,
+    /// clamped to a neighbouring row when it does not. An empty query (a
+    /// trimmed-empty one too) is no query: identity indices, so clearing
+    /// restores exactly what was on screen before.
+    ///
+    /// A strict deferred scroll parks the viewport the way every other jump
+    /// does — the list's geometry still describes the previous length until
+    /// the next prepaint, and writing an offset against it would clamp in the
+    /// wrong place.
+    pub fn apply_query(&mut self, query: &str) {
+        let next = Some(query.trim()).filter(|q| !q.is_empty());
+        if self.query.as_deref() == next {
+            return;
+        }
+        // Anchor first: named by sha, like every other re-anchor in this file,
+        // because row numbers are about to stop meaning anything.
+        let anchored = self
+            .visible
+            .get(self.view.get().cursor())
+            .and_then(|i| self.data.commits.get(*i))
+            .map(|c| c.sha.clone());
+
+        self.query = next.map(str::to_string);
+        self.visible = Rc::new(match &self.query {
+            Some(q) => self.data.search.indices(q),
+            None => Vec::from_iter(0..self.data.commits.len()),
+        });
+
+        let mut v = self.view.get();
+        let cursor = anchored
+            .as_deref()
+            .and_then(|sha| {
+                self.visible
+                    .iter()
+                    .position(|i| self.data.commits[*i].sha == sha)
+            })
+            .unwrap_or_else(|| v.cursor().min(self.visible.len().saturating_sub(1)));
+        v.set_len(self.visible.len());
+        v.go_to(cursor);
+        self.view.set(v);
+        if self.visible.is_empty() {
+            // Nothing survives the query; park nothing and leave no stale
+            // offset for a later keystroke to reconcile against.
+            self.pending_scroll.cancel();
+            let mut state = self.scroll.0.borrow_mut();
+            state.deferred_scroll_to_item = None;
+            state.base_handle.set_offset(point(px(0.0), px(0.0)));
+            self.synced.set(0.0);
+            self.top.set(0);
+        } else {
+            self.defer_show(v);
+        }
+    }
 }
 
 impl Commits {
     pub fn new(commits: Vec<Commit>, host: Rc<Host>) -> Self {
         let Prepared { data, load } = prepare(commits, &host);
         Self {
+            visible: Rc::new(Vec::from_iter(0..data.commits.len())),
+            query: None,
             data: Rc::new(data),
             scroll: UniformListScrollHandle::new(),
             view: Rc::new(Cell::new(Viewport::new())),
@@ -272,28 +377,45 @@ impl Commits {
     pub(crate) fn replace_prepared(&mut self, prepared: Prepared, host: &Host) {
         self.reconcile(host);
         let old = self.view.get();
-        let cursor_sha = self.data.commits.get(old.cursor()).map(|c| c.sha.clone());
-        let top_sha = self.data.commits.get(old.top()).map(|c| c.sha.clone());
+        let cursor_sha = self
+            .visible
+            .get(old.cursor())
+            .and_then(|i| self.data.commits.get(*i))
+            .map(|c| c.sha.clone());
+        let top_sha = self
+            .visible
+            .get(old.top())
+            .and_then(|i| self.data.commits.get(*i))
+            .map(|c| c.sha.clone());
         let old_cursor = old.cursor();
         let old_top = old.top();
         let Prepared { data, load } = prepared;
+        // The new rows under the *current* query — a refresh must not drop the
+        // filter the user is looking through, and the anchors below are found
+        // in this space, not in the full list's.
+        let visible = Rc::new(match &self.query {
+            Some(q) => data.search.indices(q),
+            None => Vec::from_iter(0..data.commits.len()),
+        });
+        let find = |sha: &str| visible.iter().position(|i| data.commits[*i].sha == sha);
         let cursor = cursor_sha
             .as_deref()
-            .and_then(|sha| data.commits.iter().position(|c| c.sha == sha))
-            .unwrap_or(old_cursor);
+            .and_then(find)
+            .unwrap_or_else(|| old_cursor.min(visible.len().saturating_sub(1)));
         let top = top_sha
             .as_deref()
-            .and_then(|sha| data.commits.iter().position(|c| c.sha == sha))
-            .unwrap_or(old_top);
+            .and_then(find)
+            .unwrap_or_else(|| old_top.min(visible.len().saturating_sub(1)));
         self.data = Rc::new(data);
+        self.visible = visible;
         self.load = load;
 
         let mut view = old;
-        view.set_len(self.data.commits.len());
+        view.set_len(self.visible.len());
         view.scroll_to(top);
         view.go_to(cursor);
         self.view.set(view);
-        if self.data.commits.is_empty() {
+        if self.visible.is_empty() {
             self.pending_scroll.cancel();
             let mut state = self.scroll.0.borrow_mut();
             state.deferred_scroll_to_item = None;
@@ -366,6 +488,7 @@ pub(crate) fn prepare(commits: Vec<Commit>, host: &Host) -> Prepared {
                 .iter()
                 .map(|c| format!("{} {}", c.short, c.subject))
                 .collect(),
+            search: search::Index::new(&commits),
             commits,
             draws,
             who,
@@ -386,14 +509,19 @@ impl Render for Commits {
         let pending_scroll = self.pending_scroll.clone();
         // Read per batch, not captured at construction — see the note in the
         // diff view: this is what makes a saved config apply on the next frame.
-        let list = uniform_list("commits", data.commits.len(), move |range, _, cx| {
+        //
+        // The list's length is the *visible* length, and every row goes through
+        // the indirection before it touches a commit: under a query, row
+        // numbers are positions in `visible`, not in `data.commits`.
+        let visible = self.visible.clone();
+        let list = uniform_list("commits", visible.len(), move |range, _, cx| {
             rendered.set(range.len());
             top.set(range.start);
             let host = crate::config::host(cx);
             if let Some(accepted) = accept_deferred_scroll(&scroll, &pending_scroll, &synced) {
                 if accepted.wheeled {
                     let mut v = view.get();
-                    v.set_len(data.commits.len());
+                    v.set_len(visible.len());
                     v.set_height(range.len());
                     v.set_scrolloff(host.view.scrolloff);
                     v.scroll_to((-accepted.y / graph::ROW_H).round().max(0.0) as usize);
@@ -405,17 +533,24 @@ impl Render for Commits {
             let cursor = view.get().cursor();
             range
                 .map(|i| {
+                    // `visible` is ascending into the full vec, so the arrays
+                    // derived at load index directly by it.
+                    let c = visible[i];
                     row(
-                        &data.commits[i],
-                        &data.who[i],
-                        &data.draws[i],
+                        &data.commits[c],
+                        &data.who[c],
+                        &data.draws[c],
                         &host,
                         i == cursor,
                     )
                 })
                 .collect()
         })
-        .with_width_from_item(Some(self.data.widest))
+        // A hidden row can still be the widest thing the filter took away;
+        // clamping keeps the one measurement inside the list that exists.
+        .with_width_from_item(Some(
+            self.data.widest.min(self.visible.len().saturating_sub(1)),
+        ))
         .track_scroll(&self.scroll)
         // Let rows exceed the viewport width instead of being clipped; this is
         // what turns on horizontal scrolling.
