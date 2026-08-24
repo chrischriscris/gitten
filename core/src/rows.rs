@@ -442,8 +442,13 @@ pub fn expand<P: Present>(logical: &[RowRef], owners: &[P], anchor: Option<RowRe
 pub struct Assembled {
     pub ordered: Ordered,
     pub files: usize,
+    /// CPU time summed across `prepare`'s workers, not wall clock — see
+    /// [`Prepared::intraline`](crate::prepared::Prepared::intraline).
     pub intraline: Duration,
+    /// CPU time summed across `prepare`'s workers. See [`Self::intraline`].
     pub syntax: Duration,
+    /// How many workers `prepare` used.
+    pub threads: usize,
 }
 
 /// Runs the shared pipeline and hands every file to the presentation that
@@ -471,6 +476,7 @@ pub fn assemble<P: Present>(
         files: prepared,
         intraline,
         syntax,
+        threads,
     } = prepare(files, hl, max_line_chars);
     let count = prepared.len();
     let mut logical: Vec<RowRef> = Vec::new();
@@ -507,6 +513,7 @@ pub fn assemble<P: Present>(
         files: count,
         intraline,
         syntax,
+        threads,
     }
 }
 

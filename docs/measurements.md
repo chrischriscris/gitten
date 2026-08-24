@@ -529,6 +529,43 @@ once by `KeyArena` into an `Arc<str>` and again by the line map. Having
 `Whitespace::keys` yield ids directly removes a whole pass and is the next thing
 here.
 
+### `prepare`, across cores
+
+A file is independent of every other file, so `prepare` was one core doing what
+ten can. Workers pull the next file off an atomic counter rather than taking a
+contiguous chunk each — files are wildly uneven and static chunking measured
+**2.1×** on `md.diff` where stealing measures 6.3×, because one of that fixture's
+229 files is most of its work.
+
+```sh
+cp fixtures/real/md.diff fixtures/big.diff
+cargo run -q -p gitten-core --example bench --release   # the `prepare` line
+```
+
+Wall clock for the whole call, 10 workers, `main` against the change:
+
+| fixture | files | lines | before | after | Δ |
+|---|---|---|---|---|---|
+| `md.diff` | 229 | 71,756 | 73.0 ms | **11.6 ms** | 6.3× |
+| `pr30698.diff` | 1,398 | 50,604 | 68.6 ms | **12.9 ms** | 5.3× |
+| `pr30683.diff` | 1,375 | 713,996 | 314.0 ms | **77.5 ms** | 4.1× |
+| `pr33933.diff` | 35 | 20,831 | 5.6 ms | **2.1 ms** | 2.7× |
+
+Two things the table does not say. **CPU time goes up**: `md.diff`'s intraline
+sum moved 55.4 → 75.9 ms across ten workers, which is contention and allocator
+pressure paid to get the wall clock down, and is the right trade for a load. And
+**the numbers stop adding up** — `prepare` is wall clock, `intraline` and
+`syntax` are summed across workers, so the example prints `×N cpu` next to them;
+without it the pass reads as a broken measurement rather than a parallel one.
+
+`parallel_and_serial_agree_exactly` compares the whole `Vec<File>` against the
+serial path on a 40-file fixture whose largest file is forty times its smallest,
+so results genuinely complete out of order. Rows address files by index, which is
+why the guarantee is order-for-order identity and not just set equality.
+
+A **single-file** diff gets nothing: the unit of work is a file. Stealing hunks
+instead would fix that and needs the per-file timing accumulation to move.
+
 ### Topology
 
 `shape`, on the two real repositories:

@@ -89,7 +89,7 @@ When the scanner's model does not fit — markup, anything needing scope or
 injections — implement the trait and route the paths to it:
 
 ```rust
-struct TreeSitter { /* grammars, queries, a blob cache */ }
+struct TreeSitter { /* grammars, queries */ }
 
 impl Highlighter for TreeSitter {
     fn highlight(&self, path: &str, lines: &[&str]) -> Vec<Vec<Token>> {
@@ -111,6 +111,18 @@ route is real.
 The contract, in full: ranges index their own line, are sorted, never overlap, and
 land on char boundaries. Break the last one and a debug build panics in GPUI's
 text layout.
+
+**`Highlighter` is `Sync`, so a cache needs a lock.** `prepare` highlights files
+on every core it can find and shares one `&dyn Highlighter` between them, which
+is where the bound comes from — it bought 6.3× on `md.diff`
+([measurements](measurements.md#prepare-across-cores)) and it is the one thing
+this trait asks of you that the others do not. `&self` was always the signature,
+so an implementation that is a pure function of its arguments — which a grammar
+and a query set are — satisfies it with no change. One that wants to memoize
+across calls needs a `Mutex` or a `RwLock` around the cache and not a `Cell`.
+Note what that means for a *blob* cache in particular: contention on one lock,
+ten workers deep, can cost more than the highlighting it saves. Measure it before
+keeping it.
 
 ## 3. A diff algorithm
 

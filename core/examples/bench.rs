@@ -117,11 +117,16 @@ fn main() {
         "  read {:>9.1?}   parse {:>9.1?}   intraline {:>9.1?}",
         read, parse, intra
     );
+    // `prepare` is wall clock and the two beside it are CPU summed across
+    // workers, so above one worker they deliberately do not add up. Printing the
+    // count is what keeps that from reading as a broken measurement — and the
+    // MB/s figure is throughput per core for the same reason.
     println!(
-        "  prepare {:>6.1?}   intraline {:>7.1?}  syntax {:>7.1?}  {} tokens  {:.1} MB scanned ({:.0} MB/s)",
+        "  prepare {:>6.1?}   intraline {:>7.1?}  syntax {:>7.1?}  ×{} cpu  {} tokens  {:.1} MB scanned ({:.0} MB/s/core)",
         build,
         p.intraline,
         p.syntax,
+        p.threads,
         tokens,
         bytes as f64 / 1e6,
         (bytes as f64 / 1e6) / p.syntax.as_secs_f64()

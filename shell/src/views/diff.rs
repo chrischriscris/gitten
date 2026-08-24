@@ -1056,6 +1056,7 @@ fn assemble(files: &[FileDiff], host: &Host, layouts: &Layouts, current: usize) 
         files: prepared,
         intraline,
         syntax,
+        threads,
     } = prepare(files, &host.syntax, MAX_LINE_CHARS);
     let file_count = prepared.len();
 
@@ -1083,7 +1084,16 @@ fn assemble(files: &[FileDiff], host: &Host, layouts: &Layouts, current: usize) 
     // finds the widest row; the first frame reflows and runs it again.
     let Ordered { order, widest, .. } = expand(&order, &renderers, None);
 
-    let mut reports: Vec<String> = vec![format!("intraline {intraline:.0?} · syntax {syntax:.0?}")];
+    // `cpu across N` when the pass fanned out, because these are summed across
+    // workers and `build` beside them is wall clock — without the note the two
+    // numbers read as a contradiction rather than as a speed-up.
+    let cpu = match threads > 1 {
+        true => format!(" cpu across {threads}"),
+        false => String::new(),
+    };
+    let mut reports: Vec<String> = vec![format!(
+        "intraline {intraline:.0?} · syntax {syntax:.0?}{cpu}"
+    )];
     reports.extend(
         renderers
             .iter()
