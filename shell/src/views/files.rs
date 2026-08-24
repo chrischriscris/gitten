@@ -21,6 +21,7 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::scroll::Scrollbar;
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::rc::Rc;
 
 /// One flat row of the pane: a section heading or one file.
@@ -244,10 +245,21 @@ fn file(
 /// [`flatten`] plus what the title strip says about it. The load line goes to
 /// stderr like every other view's, and nothing is stored for an overlay that
 /// does not read panes.
+///
+/// The count is **distinct paths**: one file edited, staged and edited again
+/// sits in two lists and is still one change to a person.
 pub(crate) fn prepare(status: Status, describe: &str) -> Prepared {
     let t = std::time::Instant::now();
     let rows = flatten(&status);
-    let changed = rows.iter().filter(|r| matches!(r, Entry::File(_))).count();
+    let mut seen = HashSet::new();
+    let changed = rows
+        .iter()
+        .filter_map(|r| match r {
+            Entry::File(f) => Some(f),
+            _ => None,
+        })
+        .filter(|f| seen.insert(&f.path))
+        .count();
     eprintln!("files: {changed} entries · flatten {:.0?}", t.elapsed());
     Prepared {
         rows,
@@ -955,7 +967,9 @@ mod tests {
     #[test]
     fn the_label_counts_what_changed_and_the_load_line_says_how_long_it_took() {
         let prepared = prepare(sample_status(), "gitten (main)");
-        assert_eq!(prepared.label, "gitten (main) · 5 changed");
+        // Five entries, four paths: src/main.rs sits in staged and unstaged
+        // and counts once.
+        assert_eq!(prepared.label, "gitten (main) · 4 changed");
 
         let clean = prepare(Status::default(), "gitten (main)");
         assert_eq!(clean.label, "gitten (main) · 0 changed");
