@@ -55,6 +55,7 @@ pub mod acquire;
 pub mod cli;
 pub mod config;
 pub mod jobs;
+pub mod verbs;
 
 use cli::{Request, Source, View};
 use gitten_core::host::Host;
