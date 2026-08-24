@@ -82,6 +82,36 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
         # Online for the same reason the test job is: see there.
 
+  # The desktop crate's tests — the largest tested surface in the repo, and the
+  # one the plain `test` job leaves out because it is the only crate that needs
+  # the GPUI Linux headers. Clippy already proves these compile on ubuntu (see
+  # `lint`); this runs them. Almost all are ordinary `#[test]` functions with no
+  # window; the two `#[gpui::test]` cases are the reason for the caution below.
+  #
+  # continue-on-error until observed green: a headless GPUI test run on ubuntu is
+  # unproven, and a first-time flake should not turn main red before the signal
+  # is established. Remove this line once a run is seen passing — same promotion
+  # path as the audit job below.
+  test-shell:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 3
+      - uses: Swatinem/rust-cache@v2
+        id: cache
+      - if: steps.cache.outputs.cache-hit != 'true'
+        name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            fontconfig libfontconfig1-dev \
+            libxcb1-dev libxcb-util-dev \
+            libxkbcommon-dev libxkbcommon-x11-0 \
+            libwayland-dev libudev-dev libvulkan-dev
+      - run: cargo test -q --locked -p gitten-shell
+
   # RUSTSEC advisories against the locked tree. Advisory, not a gate: this repo
   # is ~99% transitive gpui dependencies, and a blocking job would turn main red
   # for an advisory in a crate nobody here can bump without moving the whole GPUI
