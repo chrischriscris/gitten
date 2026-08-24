@@ -2019,11 +2019,14 @@ fn main() {
                 if let Some((_, handle)) = &repo {
                     start::mark("files status begin");
                     let described = std::thread::scope(|s| {
-                        // Beside, not behind — acquisition overlaps these the
-                        // same way, and the label wants the name.
+                        // Beside, not behind — describe spawns and runs while
+                        // status blocks, and is joined only once status is
+                        // back. Joining before would put two git processes in
+                        // sequence on the launch path.
                         let title = s.spawn(|| handle.describe());
+                        let status = handle.status();
                         let title = title.join().unwrap_or_default();
-                        match handle.status() {
+                        match status {
                             Ok(status) => views::files::prepare(status, &title),
                             // Shown as a clean tree rather than failing the
                             // window: one bad status must not take the launch.
