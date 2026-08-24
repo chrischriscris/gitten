@@ -21,6 +21,9 @@ cargo test -q -p gitten-core 2>&1 | grep -E "^test result|^error" || true
 # The shared startup: the config file, the command line, acquisition. Every
 # client depends on it, so a break here breaks all of them at once.
 cargo test -q -p gitten-app 2>&1 | grep -E "^test result|^error" || true
+# Repository acquisition is headless too. Its scratch repositories exercise
+# real git status, log and content reads rather than canned parser input alone.
+cargo test -q -p gitten-git 2>&1 | grep -E "^test result|^error" || true
 # The browser door. Headless too — every test in it is a payload or a row
 # index, and neither needs a socket.
 cargo test -q -p gitten-web 2>&1 | grep -E "^test result|^error" || true

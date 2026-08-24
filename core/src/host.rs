@@ -20,6 +20,7 @@ use crate::theme::{Theme, Themes};
 use crate::view::Scrolling;
 use crate::wrap::Wraps;
 
+#[derive(Clone)]
 pub struct Host {
     /// Which highlighter each path gets. Route a language elsewhere, or replace
     /// the fallback for all of them.

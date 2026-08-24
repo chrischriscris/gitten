@@ -23,6 +23,7 @@
 
 use crate::LineKind;
 use std::ops::Range;
+use std::sync::Arc;
 
 /// What a token is, coarsely. Deliberately small: these are the classes a
 /// scanner can identify without a parse, and a dense diff should not be
@@ -331,7 +332,9 @@ impl Languages {
 /// Lines, not a file, because that is what a diff has. Implementations that
 /// want a whole file (a tree-sitter one, say) can still stitch these together
 /// or fetch the blob themselves; the frontend never learns which happened.
-pub trait Highlighter {
+/// Thread safety lets diff preparation retain the configured implementation
+/// while it runs in a pane's background refresh.
+pub trait Highlighter: Send + Sync {
     fn highlight(&self, path: &str, lines: &[&str]) -> Vec<Vec<Token>>;
 }
 
@@ -366,17 +369,19 @@ impl Highlighter for Lexer {
 /// and rather than teach it to guess, those paths go somewhere else. A
 /// tree-sitter highlighter — its own crate, its own dependencies, none of them
 /// reaching `core` — registers here exactly the way [`Markdown`] does below.
+#[derive(Clone)]
 pub struct Highlighters {
-    routes: Vec<(Vec<String>, Box<dyn Highlighter>)>,
+    routes: Vec<(Vec<String>, Arc<dyn Highlighter>)>,
     fallback: Fallback,
 }
 
 /// The fallback is kept concrete while it is still the scanner, so that
 /// registering a language — much the most common extension there is — does not
 /// mean rebuilding it.
+#[derive(Clone)]
 enum Fallback {
     Scanner(Lexer),
-    Custom(Box<dyn Highlighter>),
+    Custom(Arc<dyn Highlighter>),
 }
 
 impl Fallback {
@@ -408,7 +413,7 @@ impl Highlighters {
     pub fn with_fallback(fallback: impl Highlighter + 'static) -> Self {
         Self {
             routes: Vec::new(),
-            fallback: Fallback::Custom(Box::new(fallback)),
+            fallback: Fallback::Custom(Arc::new(fallback)),
         }
     }
 
@@ -432,11 +437,11 @@ impl Highlighters {
     /// can be replaced rather than only added to.
     pub fn route(&mut self, keys: &[&str], hl: impl Highlighter + 'static) {
         let keys: Vec<String> = keys.iter().map(|k| k.to_ascii_lowercase()).collect();
-        self.routes.push((keys, Box::new(hl)));
+        self.routes.push((keys, Arc::new(hl)));
     }
 
     pub fn set_fallback(&mut self, hl: impl Highlighter + 'static) {
-        self.fallback = Fallback::Custom(Box::new(hl));
+        self.fallback = Fallback::Custom(Arc::new(hl));
     }
 
     pub fn for_path(&self, path: &str) -> &dyn Highlighter {

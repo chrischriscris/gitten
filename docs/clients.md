@@ -26,7 +26,7 @@ reimplement.
 ```
    gitten-core   the pipeline. no dependencies, no I/O, no idea a UI exists
    gitten-git    acquisition. the only crate that talks to a repository
-   gitten-app    gitten.toml, the command line, loading
+   gitten-app    gitten.toml, the command line, loading, background jobs
    ──────────────────────────────────────────────────────────────────────
    a client     drawing, and input
 ```
@@ -206,11 +206,6 @@ notice a panic in a presentation.
 
 ## Not there yet
 
-- **`gitten-shell` does not read `[keys]`.** `core::command` is built and the
-  terminal dispatches through it; the window still binds `s`, `w`, `cmd-c`,
-  `cmd-a` and `escape` with `KeyBinding::new`. Porting it is a `match` on a
-  command name — the same one `gitten-tui/src/main.rs` has. `copy.selection`,
-  `select.all` and `select.none` are registered commands already, waiting for it.
 - **`gitten-web` has no selection of its own**, and does not need one: a browser
   selects text for free. The window and the terminal both drive `core::select`,
   and the terminal's half of it turned out to be exactly what this entry

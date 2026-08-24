@@ -105,7 +105,7 @@ fn main() {
                 repo => {
                     let spec = rest.unwrap_or_default();
                     match gitten_git::diff(
-                        &PathBuf::from(repo),
+                        gitten_git::open(&PathBuf::from(repo)).as_ref(),
                         &spec,
                         &host.differ,
                         &Default::default(),
@@ -149,7 +149,7 @@ fn main() {
                 }
                 repo => {
                     let limit = rest.and_then(|n| n.parse().ok()).unwrap_or(5000);
-                    match gitten_git::log(&PathBuf::from(repo), limit) {
+                    match gitten_git::open(&PathBuf::from(repo)).log(limit) {
                         Ok(c) => c,
                         Err(e) => {
                             eprintln!("gitten: {e}");

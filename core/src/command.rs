@@ -366,6 +366,15 @@ impl Keymap {
         bind("diff", "backtab", "diff.prev-file");
 
         bind("commits", "enter", "commits.open-diff");
+
+        // Text itself belongs to the platform input service. These are the two
+        // transitions around it, kept as named commands so a config file can
+        // move them without teaching a client another keymap.
+        bind("input", "enter", "input.accept");
+        bind("input", "esc", "input.cancel");
+
+        bind("panes", "ctrl-j", "pane.next");
+        bind("panes", "ctrl-k", "pane.prev");
         k
     }
 
@@ -392,14 +401,13 @@ impl Keymap {
             chord,
             command: command.into(),
         };
-        match self
-            .bindings
-            .iter()
-            .position(|b| b.mode == mode && b.chord == binding.chord)
-        {
-            Some(i) => self.bindings[i] = binding,
-            None => self.bindings.push(binding),
-        }
+        // A replacement is the newest binding too. This matters when one
+        // physical press has two spellings: resolution walks a mode newest
+        // first, just as GPUI does, so replacing an older logical spelling must
+        // move it past a physical alternative added in between.
+        self.bindings
+            .retain(|b| !(b.mode == mode && b.chord == binding.chord));
+        self.bindings.push(binding);
         Ok(())
     }
 
@@ -429,22 +437,88 @@ impl Keymap {
     /// Innermost mode first, falling through outwards, so a mode overrides
     /// [`GLOBAL`] by binding the same chord and inherits everything it does not.
     pub fn resolve(&self, modes: &Modes, pending: &[Key]) -> Resolve<'_> {
-        if pending.is_empty() {
+        self.resolve_any(
+            modes,
+            &pending
+                .iter()
+                .map(std::slice::from_ref)
+                .collect::<Vec<&[Key]>>(),
+        )
+    }
+
+    /// [`resolve`](Self::resolve) when a press may carry more than one
+    /// spelling.
+    ///
+    /// A window's keystroke names a physical key *and* the character it would
+    /// insert, and on anything but a US layout those part ways: option-s on a
+    /// German keyboard inserts `ß`. GPUI's own matcher,
+    /// `Keystroke::should_match`, answers for *each binding* whether it
+    /// matches either spelling — logical first, then physical — so which one
+    /// wins is decided by the map, never by the client picking a favourite
+    /// before asking.
+    ///
+    /// So this takes one candidate list per press and matches each binding
+    /// against **any** of its spellings, per position. Trying whole candidates
+    /// in order instead would be wrong twice over: a global `ß` would beat a
+    /// diff-mode `alt-s` because the logical spelling went first, and mode
+    /// precedence — the walk below — is the invariant every other test here
+    /// rests on. With the disjunction inside the match, the innermost mode's
+    /// binding wins whichever spelling it was written in, exactly as one pass
+    /// over GPUI's bindings in map order would land.
+    ///
+    /// Within a mode, an exact binding wins before a chord that could continue,
+    /// preserving [`Self::resolve`]'s clockless contract. GPUI can defer the
+    /// exact binding and replay it after a timeout; core owns no clock or replay
+    /// queue, so waiting here would swallow the exact command forever. When
+    /// alternate spellings make two exact bindings match, the later binding
+    /// wins, as GPUI's keymap does for user bindings over defaults.
+    ///
+    /// `pending[i]` must be non-empty; [`Self::resolve`] is the
+    /// single-spelling case.
+    pub fn resolve_any(&self, modes: &Modes, pending: &[&[Key]]) -> Resolve<'_> {
+        if pending.is_empty() || pending.iter().any(|alts| alts.is_empty()) {
             return Resolve::None;
         }
         for mode in modes.as_slice().iter().rev() {
-            if let Some(b) = self
-                .bindings
-                .iter()
-                .find(|b| b.mode == *mode && b.chord == pending)
-            {
-                return Resolve::Run(&b.command);
+            let resolved = self.resolve_mode_any(mode, pending);
+            if resolved != Resolve::None {
+                return resolved;
             }
-            if self.bindings.iter().any(|b| {
-                b.mode == *mode && b.chord.len() > pending.len() && b.chord.starts_with(pending)
-            }) {
-                return Resolve::Pending;
-            }
+        }
+        Resolve::None
+    }
+
+    /// Resolves against exactly one mode, without inheriting [`GLOBAL`].
+    ///
+    /// A native text field needs this distinction: `j` is text while the field
+    /// is focused, not the global `view.down`, while an explicit binding in
+    /// `[keys.input]` still has to win before the platform inserts anything.
+    pub fn resolve_mode_any<'a>(&'a self, mode: &str, pending: &[&[Key]]) -> Resolve<'a> {
+        if pending.is_empty() || pending.iter().any(|alts| alts.is_empty()) {
+            return Resolve::None;
+        }
+        let matches = |chord: &[Key]| {
+            chord.len() == pending.len()
+                && chord.iter().zip(pending).all(|(k, alts)| alts.contains(k))
+        };
+        let prefixes = |chord: &[Key]| {
+            chord.len() > pending.len()
+                && chord.iter().zip(pending).all(|(k, alts)| alts.contains(k))
+        };
+        if let Some(b) = self
+            .bindings
+            .iter()
+            .rev()
+            .find(|b| b.mode == mode && matches(&b.chord))
+        {
+            return Resolve::Run(&b.command);
+        }
+        if self
+            .bindings
+            .iter()
+            .any(|b| b.mode == mode && prefixes(&b.chord))
+        {
+            return Resolve::Pending;
         }
         Resolve::None
     }
@@ -461,6 +535,126 @@ impl Keymap {
             .map(|b| chord_string(&b.chord))
             .collect()
     }
+
+    /// Whether anything typed so far as `chord` could still reach a binding in
+    /// mode `at` of `active`: an inner mode that binds the chord exactly, or a
+    /// longer chord starting with it, or a prefix of it, answers first or keeps
+    /// the keys waiting — the three ways [`resolve`] never arrives here.
+    ///
+    /// This is [`prefix_conflict`](Self::prefix_conflict) across modes instead
+    /// of within one, which is why the same relation appears: a conflict inside
+    /// a mode is refused at `bind` time, but between modes it is the whole
+    /// point — it is how a mode overrides the globals it inherits.
+    fn shadowed(&self, active: &[String], at: usize, chord: &[Key]) -> bool {
+        active[at + 1..].iter().any(|inner| {
+            self.bindings.iter().any(|o| {
+                o.mode == *inner && (o.chord.starts_with(chord) || chord.starts_with(&o.chord))
+            })
+        })
+    }
+
+    /// The chords that run `command` **right now**, with `modes` active.
+    ///
+    /// [`keys_for`](Self::keys_for) lists everything ever bound; this walks the
+    /// modes the way [`resolve`] does, innermost first, and drops every chord an
+    /// inner mode shadows. What a close hint is written from: naming a key that
+    /// would not fire is worse than naming none.
+    pub fn live_keys_for(&self, command: &str, modes: &Modes) -> Vec<String> {
+        let active = modes.as_slice();
+        let mut out: Vec<String> = Vec::new();
+        for (at, mode) in active.iter().enumerate().rev() {
+            for b in self
+                .bindings
+                .iter()
+                .filter(|b| b.mode == *mode && b.command == command)
+            {
+                if self.shadowed(active, at, &b.chord) {
+                    continue;
+                }
+                let spelled = chord_string(&b.chord);
+                if !out.contains(&spelled) {
+                    out.push(spelled);
+                }
+            }
+        }
+        out
+    }
+
+    /// What the help screen shows with `modes` active: which key runs what,
+    /// **now**.
+    ///
+    /// A projection and not a drawing — no colours, no widths, no panel —
+    /// because what it says is a property of the keymap, the registry and the
+    /// mode stack alone, and all three are the same in every client. The window
+    /// and the terminal draw it differently; neither of them may say something
+    /// different. That is also why it takes the *effective* modes rather than a
+    /// screen: which bindings are live is decided by [`Keymap::resolve`]'s same
+    /// innermost-first walk, so a key listed here is a key that would actually
+    /// fire.
+    pub fn help(&self, commands: &Commands, modes: &Modes) -> Vec<HelpRow> {
+        let active = modes.as_slice();
+        let mut out = Vec::new();
+        for (at, mode) in active.iter().enumerate() {
+            // Grouped by command, in the order this map holds them, so a config
+            // file's own order survives into the help. A command bound to several
+            // keys is one row with them joined, because that is one thing you can
+            // do and not three.
+            //
+            // A chord an inner mode shadows is left out entirely: a key listed
+            // here that would not fire is a lie in the one place that exists to
+            // stop you guessing — and if every chord of a command is shadowed,
+            // the command has no row and its mode may have no heading.
+            let mut seen: Vec<&str> = Vec::new();
+            let mut rows: Vec<HelpRow> = Vec::new();
+            for b in self.bindings().iter().filter(|b| b.mode == *mode) {
+                if seen.contains(&b.command.as_str()) {
+                    continue;
+                }
+                seen.push(&b.command);
+                let all = self
+                    .bindings()
+                    .iter()
+                    .filter(|o| o.mode == *mode && o.command == b.command)
+                    .filter(|o| !self.shadowed(active, at, &o.chord))
+                    .map(|o| chord_string(&o.chord))
+                    .collect::<Vec<_>>()
+                    .join(" / ");
+                if all.is_empty() {
+                    continue;
+                }
+                let doc = commands
+                    .get(&b.command)
+                    .map(|c| c.doc.clone())
+                    .unwrap_or_default();
+                rows.push(HelpRow::Command { keys: all, doc });
+            }
+            if rows.is_empty() {
+                continue;
+            }
+            if !out.is_empty() {
+                out.push(HelpRow::Blank);
+            }
+            out.push(HelpRow::Mode(mode.clone()));
+            out.extend(rows);
+        }
+        out
+    }
+}
+
+/// One row of a help screen, as [`Keymap::help`] projects it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HelpRow {
+    /// Which mode the rows under it (until the next heading) are bound in.
+    Mode(String),
+    /// Every key that runs one command there, joined, and what it does.
+    Command {
+        /// The chords that run it, joined with `" / "` in keymap order.
+        keys: String,
+        /// The command's own one-liner, from [`Commands`].
+        doc: String,
+    },
+    /// Air between two modes.
+    Blank,
 }
 
 /// One command a client can be asked to run.
@@ -520,6 +714,10 @@ impl Commands {
             ("diff.cycle-wrap", "the next wrap"),
             ("theme.cycle", "the next theme"),
             ("commits.open-diff", "the diff for this commit"),
+            ("input.accept", "accept the text"),
+            ("input.cancel", "discard the text"),
+            ("pane.next", "focus the next pane"),
+            ("pane.prev", "focus the previous pane"),
             ("select.all", "select the whole view"),
             ("select.none", "drop the selection"),
             (
@@ -635,6 +833,19 @@ mod tests {
         );
         assert_eq!(k.resolve(&modes, &keys("G")), Resolve::Run("view.bottom"));
         assert_eq!(k.resolve(&modes, &keys("z")), Resolve::None);
+    }
+
+    #[test]
+    fn exact_mode_resolution_does_not_turn_text_into_global_commands() {
+        let k = Keymap::builtin();
+        assert_eq!(
+            k.resolve_mode_any("input", &[&[Key::char('j')]]),
+            Resolve::None
+        );
+        assert_eq!(
+            k.resolve_mode_any("input", &[&[Key::plain(Code::Enter)]]),
+            Resolve::Run("input.accept")
+        );
     }
 
     #[test]
@@ -818,5 +1029,358 @@ mod tests {
     #[test]
     fn an_empty_press_resolves_to_nothing() {
         assert_eq!(Keymap::builtin().resolve(&Modes::new(), &[]), Resolve::None);
+    }
+
+    // ------------------------------------------------- alternate spellings
+    //
+    // The window client reports a keystroke as a physical key *and* an insert;
+    // where they differ, GPUI matches a binding against either. These hold the
+    // contract `resolve_any` exists for: the map decides, never the spelling.
+
+    /// Option-s on a German layout: insert `ß`, physical `s` with alt.
+    fn option_s() -> Vec<Key> {
+        vec![Key::char('ß'), Key::parse("alt-s").unwrap()]
+    }
+
+    #[test]
+    fn either_spelling_of_a_press_fires_whichever_binding_exists() {
+        let mut modes = Modes::new();
+        modes.push("diff");
+
+        // The logical spelling is bound: it runs.
+        let mut k = Keymap::empty();
+        k.bind("diff", "ß", "layout.ssharp").unwrap();
+        assert_eq!(
+            k.resolve_any(&modes, &[&option_s()]),
+            Resolve::Run("layout.ssharp")
+        );
+
+        // Only the physical one is bound: it runs too — the press is not lost
+        // for lack of the character.
+        let mut k = Keymap::empty();
+        k.bind("diff", "alt-s", "layout.alts").unwrap();
+        assert_eq!(
+            k.resolve_any(&modes, &[&option_s()]),
+            Resolve::Run("layout.alts")
+        );
+    }
+
+    #[test]
+    fn mode_precedes_spelling_order() {
+        // The trap a candidate *order* would fall into: `ß` is the logical
+        // spelling and would be tried first, and a global binding on it would
+        // beat a diff-mode binding on alt-s. GPUI checks bindings, not
+        // spellings — so does this walk.
+        let mut k = Keymap::builtin();
+        k.bind(GLOBAL, "ß", "global.ssharp").unwrap();
+        k.bind("diff", "alt-s", "diff.alts").unwrap();
+        let mut modes = Modes::new();
+        modes.push("diff");
+        assert_eq!(
+            k.resolve_any(&modes, &[&option_s()]),
+            Resolve::Run("diff.alts"),
+            "the inner mode won with its own spelling"
+        );
+
+        // Outside the mode the same press reaches the global after all.
+        assert_eq!(
+            k.resolve_any(&Modes::new(), &[&option_s()]),
+            Resolve::Run("global.ssharp")
+        );
+    }
+
+    #[test]
+    fn an_exact_alternate_wins_without_a_clock_and_a_lone_chord_still_waits() {
+        // GPUI can wait and replay an exact binding after a timeout. Core has
+        // neither facility, so an exact logical spelling must not disappear
+        // forever behind a physical spelling's longer chord.
+        let mut k = Keymap::empty();
+        k.bind(GLOBAL, "ß", "insert.ssharp").unwrap();
+        k.bind(GLOBAL, "alt-s n", "pane.next").unwrap();
+        let modes = Modes::new();
+
+        assert_eq!(
+            k.resolve_any(&modes, &[&option_s()]),
+            Resolve::Run("insert.ssharp")
+        );
+
+        // With no exact binding, both spellings remain alive while the chord
+        // waits and its physical branch can complete.
+        let mut k = Keymap::empty();
+        k.bind(GLOBAL, "alt-s n", "pane.next").unwrap();
+        assert_eq!(k.resolve_any(&modes, &[&option_s()]), Resolve::Pending);
+        let n = [Key::char('n')];
+        assert_eq!(
+            k.resolve_any(&modes, &[&option_s(), &n]),
+            Resolve::Run("pane.next")
+        );
+    }
+
+    #[test]
+    fn a_later_binding_wins_when_two_spellings_match_in_one_mode() {
+        let mut k = Keymap::empty();
+        k.bind(GLOBAL, "[", "default.logical").unwrap();
+        k.bind(GLOBAL, "alt-5", "user.physical").unwrap();
+        let candidates = [Key::char('['), Key::parse("alt-5").unwrap()];
+        assert_eq!(
+            k.resolve_any(&Modes::new(), &[&candidates]),
+            Resolve::Run("user.physical")
+        );
+
+        // Replacing the older chord is itself the newest registration.
+        k.bind(GLOBAL, "[", "user.logical").unwrap();
+        assert_eq!(
+            k.resolve_any(&Modes::new(), &[&candidates]),
+            Resolve::Run("user.logical")
+        );
+    }
+
+    #[test]
+    fn resolve_and_resolve_any_agree_on_a_single_spelling() {
+        let k = Keymap::builtin();
+        let mut modes = Modes::new();
+        modes.push("commits");
+        for chord in ["j", "?", "enter", "ctrl-d", "z"] {
+            let keys = keys(chord);
+            let singles: Vec<&[Key]> = keys.iter().map(std::slice::from_ref).collect();
+            assert_eq!(
+                k.resolve(&modes, &keys),
+                k.resolve_any(&modes, &singles),
+                "{chord} resolved differently through alternatives"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_candidate_list_resolves_to_nothing() {
+        // A press no client can bind translates to nothing; feeding that
+        // nothing onward must not read as "the first key of every chord".
+        let k = Keymap::builtin();
+        let j = [Key::char('j')];
+        assert_eq!(k.resolve_any(&Modes::new(), &[&[]]), Resolve::None);
+        assert_eq!(k.resolve_any(&Modes::new(), &[&[], &j]), Resolve::None);
+    }
+
+    fn shown(keys: &Keymap, commands: &Commands, modes: &Modes) -> Vec<String> {
+        keys.help(commands, modes)
+            .iter()
+            .map(|row| match row {
+                HelpRow::Mode(name) => format!("[{name}]"),
+                HelpRow::Command { keys, doc } => format!("{keys} · {doc}"),
+                HelpRow::Blank => String::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_projection_lists_keys_and_what_they_do() {
+        let rows = shown(&Keymap::builtin(), &Commands::builtin(), &Modes::new());
+        // Keys and descriptions, both.
+        assert!(rows
+            .iter()
+            .any(|r| r.contains("j / down") || r.contains("down / j")));
+        assert!(rows.iter().any(|r| r.contains("one row down")));
+        assert!(
+            rows.iter().any(|r| r.contains("leave")),
+            "no description for quit"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("ctrl-d")),
+            "a modified key was not spelled out"
+        );
+        // The mode is named.
+        assert!(rows.iter().any(|r| r == "[global]"));
+    }
+
+    #[test]
+    fn the_projection_shows_only_the_active_modes() {
+        // A key bound in `commits` is not a key you can press in a diff, and
+        // listing it is a lie in the one place that exists to stop you guessing.
+        let (k, c) = (Keymap::builtin(), Commands::builtin());
+        let global = shown(&k, &c, &Modes::new());
+        assert!(!global.iter().any(|r| r.contains("the next presentation")));
+
+        let mut modes = Modes::new();
+        modes.push("diff");
+        let in_diff = shown(&k, &c, &modes);
+        assert!(in_diff.iter().any(|r| r.contains("the next presentation")));
+        assert!(
+            in_diff.iter().any(|r| r == "[diff]"),
+            "the mode is not named"
+        );
+        assert!(
+            !in_diff
+                .iter()
+                .any(|r| r.contains("the diff for this commit")),
+            "a commits key leaked in"
+        );
+        // ...and the mode's rows come after the globals they resolve through,
+        // which is the order the bindings resolve in reversed.
+        let g = in_diff.iter().position(|r| r == "[global]").unwrap();
+        let d = in_diff.iter().position(|r| r == "[diff]").unwrap();
+        assert!(g < d);
+    }
+
+    #[test]
+    fn a_command_with_several_keys_is_one_projected_row() {
+        let k = Keymap::builtin();
+        let rows = k.help(&Commands::builtin(), &Modes::new());
+        let hits = rows
+            .iter()
+            .filter(|r| matches!(r, HelpRow::Command { doc, .. } if doc == "one row down"))
+            .count();
+        assert_eq!(hits, 1, "one command, one row");
+    }
+
+    #[test]
+    fn a_binding_from_the_config_file_is_projected_without_being_told_to() {
+        // The whole point of the projection being a function of the registry.
+        let mut k = Keymap::builtin();
+        let mut c = Commands::builtin();
+        c.register("blame.toggle", "show blame beside the diff");
+        k.bind("global", "b", "blame.toggle").unwrap();
+        assert!(shown(&k, &c, &Modes::new())
+            .iter()
+            .any(|r| r.contains("show blame beside the diff")));
+    }
+
+    #[test]
+    fn an_inner_mode_shadows_an_outer_binding_out_of_the_projection() {
+        // `?` is bound globally, and a mode that binds it too answers first —
+        // resolve says so, so the help has to agree or it lists a key that
+        // does nothing.
+        let mut k = Keymap::empty();
+        k.bind(GLOBAL, "?", "help").unwrap();
+        k.bind(GLOBAL, "y", "copy.selection").unwrap();
+        k.bind(GLOBAL, "h", "view.left").unwrap();
+        let mut c = Commands::builtin();
+        c.register("diff.where", "where am I");
+        k.bind("diff", "?", "diff.where").unwrap();
+        // A chord is shadowed by an inner *prefix* as well: typing `y` waits
+        // for the mode's second key and never reaches the global binding.
+        k.bind("diff", "y n", "diff.next").unwrap();
+        c.register("diff.next", "the next one");
+
+        let mut modes = Modes::new();
+        modes.push("diff");
+        let rows = shown(&k, &c, &modes);
+
+        // The global rows are gone; the mode's own are there.
+        let global = rows.iter().position(|r| r == "[global]").unwrap();
+        let diff = rows.iter().position(|r| r == "[diff]").unwrap();
+        assert!(
+            !rows[global..diff].iter().any(|r| r.contains("leave")),
+            "a shadowed key was still projected: {rows:?}"
+        );
+        assert!(
+            rows[global..diff]
+                .iter()
+                .any(|r| r.contains("scroll the text left")),
+            "an unshadowed global row must survive beside the shadowed ones"
+        );
+        assert!(
+            !rows[..global].iter().any(|r| !r.is_empty()),
+            "nothing is projected before the outermost mode"
+        );
+        assert!(rows[diff..].iter().any(|r| r.contains("where am I")));
+
+        // ...and without the mode pushed, nothing was shadowed.
+        assert_eq!(shown(&k, &c, &Modes::new()).len(), rows.len() - 2);
+    }
+
+    #[test]
+    fn a_chord_shadowed_by_a_shorter_inner_binding_leaves_too() {
+        // The other direction of the same relation: the mode binds the prefix,
+        // the globals bind the chord. Typing `g` fires the mode's command
+        // before `g g` can ever complete.
+        let mut k = Keymap::empty();
+        k.bind(GLOBAL, "g g", "view.top").unwrap();
+        k.bind("diff", "g", "goto.line").unwrap();
+        let mut c = Commands::builtin();
+        c.register("goto.line", "a line by number");
+
+        let mut modes = Modes::new();
+        modes.push("diff");
+        let rows = shown(&k, &c, &modes);
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.contains("the first row") || r.contains("g g")),
+            "the two-key chord survived its own prefix: {rows:?}"
+        );
+        assert!(rows.iter().any(|r| r.contains("a line by number")));
+    }
+
+    #[test]
+    fn a_fully_shadowed_command_takes_its_row_and_heading_with_it() {
+        let mut k = Keymap::builtin();
+        k.bind("diff", "?", "help").unwrap(); // rebinds the only `?`
+        let mut modes = Modes::new();
+        modes.push("diff");
+        let rows = shown(&k, &Commands::builtin(), &modes);
+        // `show the keys` still appears — from the *diff* row now, which is the
+        // one that would fire — but `q`'s twin below it did not move.
+        assert!(rows.iter().filter(|r| r.contains("show the keys")).count() == 1);
+
+        // Every global binding shadowed: the heading goes with them.
+        let mut all = Keymap::builtin();
+        for b in Keymap::builtin().bindings() {
+            if b.mode == GLOBAL {
+                let chord = chord_string(&b.chord);
+                all.bind("diff", &chord, "diff.take")
+                    .expect("shipped chords are single keys and do not collide");
+            }
+        }
+        let rows = shown(&all, &Commands::builtin(), &modes);
+        assert!(
+            !rows.iter().any(|r| r == "[global]"),
+            "nothing under it fires any more: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn the_live_keys_for_a_command_follow_the_modes() {
+        // What a close hint is written from: with help open, the key that
+        // closes it is whatever runs `help` through the modes actually live.
+        let k = Keymap::builtin();
+        assert_eq!(k.live_keys_for("help", &Modes::new()), vec!["?"]);
+
+        let mut open = Modes::new();
+        open.push("help");
+        assert_eq!(
+            k.live_keys_for("help", &open),
+            vec!["?"],
+            "help itself binds nothing"
+        );
+
+        // A mode that takes `?` over leaves the hint nothing to say.
+        let mut k = Keymap::builtin();
+        k.bind("diff", "?", "diff.cycle-layout").unwrap();
+        let mut in_diff = Modes::new();
+        in_diff.push("diff");
+        in_diff.push("help");
+        assert!(k.live_keys_for("help", &in_diff).is_empty());
+        // And the same map outside the mode still names it.
+        assert_eq!(k.live_keys_for("help", &Modes::new()), vec!["?"]);
+    }
+
+    #[test]
+    fn an_unbound_key_leaves_the_projection_and_an_unknown_mode_is_silent() {
+        let mut k = Keymap::builtin();
+        let c = Commands::builtin();
+        assert!(shown(&k, &c, &Modes::new())
+            .iter()
+            .any(|r| r.contains("one row down")));
+        k.unbind("global", "j");
+        k.unbind("global", "down");
+        assert!(!shown(&k, &c, &Modes::new())
+            .iter()
+            .any(|r| r.contains("one row down")));
+
+        // A pushed mode with no bindings of its own adds nothing, not even a
+        // heading — it inherits everything and repeats nothing.
+        let mut modes = Modes::new();
+        modes.push("empty-mode");
+        assert_eq!(k.help(&c, &modes), k.help(&c, &Modes::new()));
     }
 }

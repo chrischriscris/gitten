@@ -44,7 +44,7 @@ fn main() {
     let revspec = args.next().unwrap_or_default();
 
     let t = Instant::now();
-    let pairs = match gitten_git::pairs(&repo, &revspec) {
+    let pairs = match gitten_git::open(&repo).pairs(&revspec) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("{e}");

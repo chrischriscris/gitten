@@ -44,10 +44,9 @@
 //! generated file with a repeating structure produces exactly it.
 
 use crate::{DiffLine, FileDiff, Hunk, LineKind};
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::Hasher;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 // ------------------------------------------------------------- the edit script
 
@@ -94,7 +93,9 @@ impl Edit {
 ///
 /// The name is what a config file and a keybinding refer to, which is why it is
 /// `&'static str` and part of the trait rather than a wrapper's business.
-pub trait Differ {
+/// Implementations are thread-safe so a configured registry can be cloned into
+/// a pane's background refresh rather than rebuilt from built-ins there.
+pub trait Differ: Send + Sync {
     fn name(&self) -> &'static str;
 
     fn diff(&self, path: &str, old: &[Arc<str>], new: &[Arc<str>]) -> Vec<Edit>;
@@ -158,7 +159,7 @@ pub const MAX_ANCHOR_OCCURRENCES: u32 = 64;
 /// `docs/decisions/0001-histogram-not-myers.md`.
 #[derive(Debug, Default)]
 pub struct Histogram {
-    scratch: RefCell<Ctx>,
+    scratch: Mutex<Ctx>,
 }
 
 /// Anchors only on lines appearing *exactly* once, and falls back to [`Myers`]
@@ -176,7 +177,7 @@ pub struct Histogram {
 /// Histogram and not by this, and which reads better depends on the file.
 #[derive(Debug, Default)]
 pub struct Patience {
-    scratch: RefCell<Ctx>,
+    scratch: Mutex<Ctx>,
 }
 
 /// The minimal edit script, by Myers' 1986 algorithm with the linear-space
@@ -188,7 +189,7 @@ pub struct Patience {
 /// did not touch anything else.
 #[derive(Debug, Default)]
 pub struct Myers {
-    scratch: RefCell<Ctx>,
+    scratch: Mutex<Ctx>,
 }
 
 impl Differ for Histogram {
@@ -198,7 +199,8 @@ impl Differ for Histogram {
 
     fn diff(&self, _path: &str, old: &[Arc<str>], new: &[Arc<str>]) -> Vec<Edit> {
         self.scratch
-            .borrow_mut()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .diffed(old, new, Some(MAX_ANCHOR_OCCURRENCES))
     }
 }
@@ -209,7 +211,10 @@ impl Differ for Patience {
     }
 
     fn diff(&self, _path: &str, old: &[Arc<str>], new: &[Arc<str>]) -> Vec<Edit> {
-        self.scratch.borrow_mut().diffed(old, new, Some(1))
+        self.scratch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .diffed(old, new, Some(1))
     }
 }
 
@@ -219,7 +224,10 @@ impl Differ for Myers {
     }
 
     fn diff(&self, _path: &str, old: &[Arc<str>], new: &[Arc<str>]) -> Vec<Edit> {
-        self.scratch.borrow_mut().diffed(old, new, None)
+        self.scratch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .diffed(old, new, None)
     }
 }
 
@@ -1487,8 +1495,9 @@ fn score_cmp(a: &Score, b: &Score) -> i64 {
 /// generalist knowing it exists. Selection is by *name* rather than by value
 /// because a config file has to be able to express it — see
 /// `docs/decisions/0012-config-is-data-behaviour-is-not.md`.
+#[derive(Clone)]
 pub struct Differs {
-    impls: Vec<Box<dyn Differ>>,
+    impls: Vec<Arc<dyn Differ>>,
     routes: Vec<(Vec<String>, usize)>,
     fallback: usize,
     /// Unchanged lines shown around each change. git's default is 3.
@@ -1532,8 +1541,8 @@ impl Differs {
     /// as a language table can.
     pub fn register(&mut self, differ: impl Differ + 'static) {
         match self.impls.iter().position(|d| d.name() == differ.name()) {
-            Some(i) => self.impls[i] = Box::new(differ),
-            None => self.impls.push(Box::new(differ)),
+            Some(i) => self.impls[i] = Arc::new(differ),
+            None => self.impls.push(Arc::new(differ)),
         }
     }
 

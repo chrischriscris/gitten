@@ -292,10 +292,12 @@ impl Screens {
 
 struct App {
     host: Host,
-    /// Where to acquire more from, for opening a commit's diff. `None` for a
+    /// Where to acquire more from, for opening a commit's diff: the path the
+    /// view is named after, and the one handle the startup opened, so every
+    /// diff this process shows came through the same repository. `None` for a
     /// fixture, which has no repository behind it — and the key then does
     /// nothing, which is what an unbound key does too.
-    repo: Option<std::path::PathBuf>,
+    repo: Option<(std::path::PathBuf, gitten_git::Handle)>,
     stack: Vec<Screens>,
     label: String,
     screen: Screen,
@@ -338,7 +340,7 @@ struct App {
 impl App {
     fn new(started: gitten_app::Started, glyphs: Glyphs) -> Self {
         let repo = match &started.source {
-            Source::Repo { path, .. } => Some(path.clone()),
+            Source::Repo { path, .. } => started.repo.clone().map(|h| (path.clone(), h)),
             Source::Fixtures | Source::Patch { .. } => None,
         };
         let label = started.loaded.label.clone();
@@ -686,7 +688,7 @@ impl App {
     /// The I/O is here and not in the view, which is the same rule the GPUI
     /// client follows: a view takes already-loaded data and never learns what a
     /// repository is. A bare revision is "what did this commit change" to
-    /// `gitten_git::pairs`, merges included.
+    /// [`gitten_git::Repo::pairs`], merges included.
     fn open_diff(&mut self) {
         let Some(Screens::Commits(list)) = self.stack.last() else {
             self.message = "no commit selected".into();
@@ -694,15 +696,15 @@ impl App {
         };
         let Some(commit) = list.current() else { return };
         let (sha, subject) = (commit.sha.clone(), commit.subject.clone());
-        let Some(repo) = self.repo.clone() else {
+        let Some((path, repo)) = self.repo.clone() else {
             self.message = "a fixture has no repository to diff against".into();
             return;
         };
         let source = Source::Repo {
-            path: repo,
+            path,
             arg: sha.clone(),
         };
-        match acquire::acquire(View::Diff, &source, &self.host) {
+        match acquire::acquire(View::Diff, &source, &self.host, Some(repo.as_ref())) {
             Ok(loaded) => {
                 let mut diff = Diff::new(
                     match loaded.data {

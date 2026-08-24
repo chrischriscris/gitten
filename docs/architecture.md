@@ -8,7 +8,7 @@ and anyone can write another.
    │  gitten-core                                              zero deps   │
    │  parse_log  assign_lanes  differ::{Histogram, Myers}  align  wrap    │
    │  prepared::prepare  rows::{Flat, Present, expand}  runs  markdown    │
-   │  syntax  graph::Hues  command::{Key, Keymap, Modes}  select  theme   │
+   │  syntax  graph::Hues  command::{Key, Keymap, Modes}  status  select │
    │  font  host::Host — every swappable piece, in one struct             │
    └───────────────────────────────┬──────────────────────────────────────┘
    ┌───────────────────────────────┴──────────────────────────────────────┐
@@ -57,6 +57,7 @@ because it compiles in a second and its tests need no window.
 | `prepared.rs` | a diff assembled into drawable rows: clip → intraline → syntax |
 | `markdown.rs` | a `.md` diff as blocks, with the markers cut and the ranges moved |
 | `syntax.rs` | the scanner, the language tables, the `Highlighter` trait, routing, Markdown |
+| `status.rs` | staged, unstaged, untracked and conflicted entries with byte-preserving paths |
 | `theme.rs` | every colour as `0xRRGGBB` data, the three shipped palettes, contrast resolution |
 | `font.rs` | the face as data: family, size, and whether a char is a column |
 | `host.rs` | the struct that holds the swappable pieces |
@@ -80,8 +81,13 @@ The only crate that talks to a repository. Everything currently shells out to th
 permanently, because shelling out is what gets hooks, credential helpers and
 `.gitconfig` semantics exactly right.
 
-Today: `log`, `pairs`, `diff`, `describe`. All behind one surface, so a frontend
-never learns which path ran.
+Today: `Repo::{log,pairs,status,describe}`, plus `diff` over that content. A
+client holds one persistent `Handle`; a fake, the binary implementation and a
+future gix implementation all enter through the same object-safe surface.
+
+`status` parses porcelain v2 into staged, unstaged, untracked and conflicted
+lists. Paths remain bytes through the model and repository layer; lossy decoding
+is a display operation, never the address handed back to git.
 
 **Untracked files come from `git status`, not `git diff`.** `git diff` compares
 the index and the working tree against a commit, and an untracked file is in none
@@ -111,7 +117,8 @@ before it can draw, and nothing that draws.
 |---|---|
 | `config.rs` | `gitten.toml`: parse, apply, write out, watch |
 | `cli.rs` | `View`, `Source`, `Request`, the usage text, a client's own flags |
-| `acquire.rs` | one view of one source into `Vec<FileDiff>` or `Vec<Commit>` |
+| `acquire.rs` | one view of one source into `Vec<FileDiff>` or `Vec<Commit>`, and re-acquisition after writes |
+| `jobs.rs` | serial blocking jobs, lifecycle events and successful-write generations |
 | `lib.rs` | `Startup` — the four lines a client's `main` starts with |
 
 It exists because all of that was written twice and about to be written a third
@@ -179,7 +186,9 @@ GPUI. Drawing and input, and as little else as possible.
 
 | file | what lives there |
 |---|---|
-| `main.rs` | argument parsing, data loading, the window, the `Host` |
+| `main.rs` | the window, named command dispatch, pane assembly and job-event draining |
+| `input.rs` | native GPUI text input: IME composition, UTF-16 selection and grapheme editing |
+| `panes.rs` | stable pane registration, replacement and logical focus |
 | `views/diff.rs` | the `Rows` seam, `TextRows`, run-list merging, the shared row furniture |
 | `views/diff.rs` | …and `Layouts`, the registry of whole-diff presentations |
 | `views/markdown.rs` | `MarkdownRows`: the rendered-Markdown presentation, and its metrics |
@@ -187,7 +196,7 @@ GPUI. Drawing and input, and as little else as possible.
 | `views/commits.rs` | the commit list, author initials, row layout |
 | `graph.rs` | lane geometry and painting: quads, paths, one canvas per row |
 | `controls.rs` | the title-bar pickers: a label, a value, and the registered alternatives |
-| `config.rs` | `gitten.toml`: parse, apply, watch, and the live `Host` global |
+| `config.rs` | config reload wiring, widget-theme sync and the live `Host` global |
 | `session.rs` | the row you were on, so `./dev desktop` can put you back after a restart |
 | `stats.rs` | the counting allocator and the `GITTEN_STATS` overlay |
 | `assets/icon.svg` | the mark: three lanes weaving. `./dev bundle` renders the iconset from it |
@@ -214,6 +223,13 @@ GPUI. Drawing and input, and as little else as possible.
 Nothing flows backwards, but the tail is re-run: cycling the layout replays
 everything from `prepare` against the same `Vec<FileDiff>`, which is why the view
 keeps it.
+
+A successful background job advances `app::jobs::Generation`. Every visible
+repository pane re-acquires through the retained `Repo` handle and replaces its
+data in place while preserving its semantic cursor anchors. Each pane supplies a
+type-erased `Refresh`: blocking acquisition and pure row/graph preparation run on
+the background executor, then a generation-guarded apply touches its GPUI entity. A
+failed or panicked write emits an error and does not advance the generation.
 
 A view never mutates what it was handed, which is why every stage above is
 testable without a window and why `paint.rs` can join the pipeline one stage from
@@ -246,14 +262,10 @@ Listed so nobody reads an intention as a description:
   components: every action is a method and nothing in the crate knows what a
   keypress is. There is no `main`, no event loop and no keymap, because a keymap
   written there is one `cli/` would have to duplicate — see the next item.
-- **Command dispatch and the mode stack.** `Host` is where they belong. `s`
-  cycling the diff layout and `w` cycling the wrap are the only key bindings that
-  are not `cmd-q`, and both are shaped so dispatch has something to attach to
-  rather than something to replace.
-- **Configurable keybindings, and a settings panel.** The title-bar pickers are
-  the interim answer: a control per registry, driven by the same names
-  `gitten.toml` uses. When the panel exists it should read the same registries and
-  these should collapse into it.
+- **A settings panel.** Configurable keybindings and the shared command/help
+  registries exist. The title-bar pickers remain the interim answer for the
+  other registries; a panel should read those same names and collapse them into
+  one surface.
 - **Code hot reload.** The config file reloads *data* live, and `./dev` removes
   everything either side of a code rebuild — but the rebuild itself remains, 3–5 s.
   A dylib swap was investigated and rejected, and the reasons are specific enough
@@ -301,13 +313,6 @@ Listed so nobody reads an intention as a description:
   fix it and unifies onto every build — proptest and a leak detector on a
   three-second rebuild loop — so it has not been taken. The two GPUI traps in
   AGENTS.md's notes are what that costs.
-- **Panes.** One view fills the window, so a presentation needing its own layout
-  has nowhere to go yet — the reason the `Rows` seam is row-shaped. A rendered
-  Markdown *row* exists ([decisions/0010](decisions/0010-markdown-rendered-rows.md));
-  a rendered Markdown *document*, reflowed and variably tall, is what needs the pane.
-  The diff view already measures its own box rather than reading the window's, so
-  it is a pane's tenant already — see
-  [decisions/0017](decisions/0017-wrapping-is-more-rows-not-taller-ones.md).
 - **Code-block injection.** A fenced block in a `.md` diff knows it said `rust` and
   is still drawn as one string. See
   [decisions/0010](decisions/0010-markdown-rendered-rows.md).

@@ -3,9 +3,10 @@
 #
 #   test  — the correctness section of check.sh verbatim. Every one of these
 #           crates is headless by design: core has no dependencies at all,
-#           web's tests are payloads and row indexes, tui's screen is a cell
-#           buffer. Ubuntu because it is cheap, and green here doubles as the
-#           Linux canary for every crate but the window.
+#           git's fixtures are throwaway repositories, web's tests are payloads
+#           and row indexes, tui's screen is a cell buffer. Ubuntu because it is
+#           cheap, and green here doubles as the Linux canary for every crate
+#           but the window.
 #   lint  — formatting and clippy, the same two commands ./.githooks/pre-commit
 #           runs before a commit exists. Clippy type-checks the whole
 #           workspace, so this is also the Linux canary that the old plain
@@ -51,7 +52,9 @@ jobs:
       # the part worth having.
       - run: >-
           cargo test -q --locked
-          -p gitten-core -p gitten-app -p gitten-web -p gitten-tui
+      - run: >-
+          cargo test -q --locked
+          -p gitten-core -p gitten-app -p gitten-git -p gitten-web -p gitten-tui
 
   lint:
     runs-on: ubuntu-latest
