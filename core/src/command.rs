@@ -362,6 +362,12 @@ impl Keymap {
         // whatever is focused; cycling between panes stays in [panes].
         bind(GLOBAL, "2", "files.focus");
 
+        // lazygit's files panel: space acts on the row the keyboard is on, by
+        // the side of the index it sits on, and c commits what the index
+        // holds. Both are particular to this pane, so they are not globals.
+        bind("files", "space", "files.stage");
+        bind("files", "c", "files.commit");
+
         bind("diff", "s", "diff.cycle-layout");
         bind("diff", "w", "diff.cycle-wrap");
         bind("diff", "]", "diff.next-file");
@@ -719,6 +725,8 @@ impl Commands {
             ("theme.cycle", "the next theme"),
             ("commits.open-diff", "the diff for this commit"),
             ("files.focus", "focus the working-tree pane"),
+            ("files.stage", "stage or unstage the selected file"),
+            ("files.commit", "commit the staged changes"),
             ("input.accept", "accept the text"),
             ("input.cancel", "discard the text"),
             ("pane.next", "focus the next pane"),
@@ -899,6 +907,46 @@ mod tests {
         let k = Keymap::builtin();
         assert_eq!(k.resolve(&Modes::new(), &keys("s")), Resolve::None);
         assert_eq!(k.resolve(&Modes::new(), &keys("enter")), Resolve::None);
+    }
+
+    #[test]
+    fn the_files_verbs_resolve_in_files_mode_and_nowhere_else() {
+        let k = Keymap::builtin();
+        let mut modes = Modes::new();
+        modes.push("files");
+        assert_eq!(
+            k.resolve(&modes, &keys("space")),
+            Resolve::Run("files.stage")
+        );
+        assert_eq!(k.resolve(&modes, &keys("c")), Resolve::Run("files.commit"));
+        // Particular to the pane, so another context keeps its own meanings —
+        // `c` is unbound globally and space belongs to no list.
+        assert_eq!(k.resolve(&Modes::new(), &keys("space")), Resolve::None);
+        assert_eq!(k.resolve(&Modes::new(), &keys("c")), Resolve::None);
+
+        let commands = Commands::builtin();
+        for (name, key) in [("files.stage", "space"), ("files.commit", "c")] {
+            assert!(commands.known(name), "{name} is not registered");
+            assert_eq!(k.keys_for(name), vec![key]);
+        }
+        // The spellings round-trip through a config file's.
+        assert_eq!(Key::parse("space"), Some(Key::plain(Code::Char(' '))));
+    }
+
+    #[test]
+    fn the_files_verbs_project_into_the_help_with_no_help_specific_code() {
+        let mut modes = Modes::new();
+        modes.push("files");
+        let rows = shown(&Keymap::builtin(), &Commands::builtin(), &modes);
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("space · stage or unstage the selected file")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("commit the staged changes")),
+            "{rows:?}"
+        );
     }
 
     #[test]
