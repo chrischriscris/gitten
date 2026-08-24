@@ -868,8 +868,11 @@ mod tests {
         assert!(f.run_view("view.left", &host));
         assert!(f.run_view("view.right", &host));
         assert!(!f.pan_pixels(40.0));
-        // And an unknown command says so rather than pretending.
-        assert!(!f.run_view("files.stage", &host));
+        // And an unknown command says so rather than pretending. The write
+        // verbs (`files.stage`, `files.commit`) are not in that company any
+        // more — dispatch answers them before they ever reach this method,
+        // because their work belongs to the job queue, not to a view.
+        assert!(!f.run_view("files.discard", &host));
     }
 
     #[test]

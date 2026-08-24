@@ -86,7 +86,6 @@ pub struct Input {
 }
 
 impl Input {
-    #[allow(dead_code)] // Phase A installs the seam before commit/search consume it.
     pub fn new(
         label: impl Into<SharedString>,
         placeholder: impl Into<SharedString>,
@@ -109,7 +108,7 @@ impl Input {
         }
     }
 
-    #[allow(dead_code)] // Read by the first prompt consumer, not by the shell frame.
+    /// The text as it stands — what a prompt's consumer reads on accept.
     pub fn value(&self) -> &str {
         &self.content
     }

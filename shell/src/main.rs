@@ -152,6 +152,15 @@ enum Open {
 type RefreshValue = Box<dyn std::any::Any + Send>;
 type ApplyRefresh = dyn FnOnce(RefreshValue, &Host, &mut App) -> Result<(), String>;
 
+/// What the open input's accept means, and the only thing the shell's prompt
+/// slot can hold tonight. A second consumer — `/` search is planned — becomes
+/// a second variant and nothing else changes: the field routes by what it was
+/// opened *for*, never by who is listening.
+enum Prompt {
+    /// The message a `files.commit` accept turns into a commit job.
+    CommitMessage,
+}
+
 /// A pane-owned refresh split at the thread boundary: pure blocking load, then
 /// GPUI apply. The shell schedules both halves without knowing the tenant's data
 /// type, which is what lets a files or extension pane refresh without joining a
@@ -617,6 +626,10 @@ struct DevShell {
     /// The one native text field over the active screen, if a command is
     /// gathering input. Consumers subscribe to its accepted/cancelled event.
     input: Option<Entity<input::Input>>,
+    /// What accepting that input is for — set by whoever opened it, consumed
+    /// by [`DevShell::close_input`]. One at a time, because there is one
+    /// field; a second prompt replaces the first and says what it means.
+    prompt: Option<Prompt>,
     /// The live picks. Every field `None` means "whatever the config selected",
     /// which is what the controls show until somebody changes one — so the strip
     /// agrees with `gitten.toml` rather than with a copy of it taken at startup.
@@ -724,7 +737,6 @@ impl DevShell {
         self.notice = Some(message.into());
     }
 
-    #[allow(dead_code)]
     fn open_input(&mut self, input: Entity<input::Input>, cx: &mut Context<Self>) {
         if let Some(previous) = self.input.replace(input) {
             previous.update(cx, |input, cx| input.cancel(cx));
@@ -733,16 +745,105 @@ impl DevShell {
         cx.notify();
     }
 
+    /// Closes the field, accepting or cancelling it — and hands the accepted
+    /// text to whatever opened it. The consumer is a slot rather than a
+    /// subscription because the answer has exactly one destination: the
+    /// prompt that is closing as it fires.
     fn close_input(&mut self, accept: bool, cx: &mut Context<Self>) {
         let Some(input) = self.input.take() else {
             return;
         };
+        // Read before the entity confirms its own event: the value is what the
+        // consumer asked for; accept only closes.
+        let text = input.read(cx).value().to_string();
         input.update(cx, |input, cx| match accept {
             true => input.accept(cx),
             false => input.cancel(cx),
         });
         self.sync_modes();
+        if let (true, Some(Prompt::CommitMessage)) = (accept, self.prompt.take()) {
+            self.commit_message(text);
+        }
         cx.notify();
+    }
+
+    /// Queues one job through the shared [`Submitter`], saying so if the queue
+    /// is gone — the only rejection a live shell sees, and the same rails an
+    /// extension's job rides.
+    fn enqueue(&mut self, job: Box<dyn Job>) {
+        if self.submit(job).is_err() {
+            self.set_notice("the job queue is shutting down");
+        }
+    }
+
+    /// `files.stage`: act on the row the keyboard is on, by the side of the
+    /// index it sits on. Staged means unstage; everything else — unstaged,
+    /// untracked, a conflict whose resolution is being recorded — means stage.
+    /// That is lazygit's rule and git's own asymmetry: `add` is the one word
+    /// for "the index should hold this".
+    ///
+    /// Like every verb's I/O, this reads its context from the focused view and
+    /// then leaves the screen alone: the write runs on the job thread, and a
+    /// successful finish bumps the generation so all repository panes
+    /// re-acquire at once.
+    fn stage_or_unstage(&mut self, cx: &mut Context<Self>) {
+        let Some(Screen::Files { view, .. }) = self.active() else {
+            self.set_notice("files.stage is not supported here");
+            return;
+        };
+        let under = view
+            .read(cx)
+            .current_file()
+            .map(|f| (f.section, f.path.clone()));
+        let Some((section, path)) = under else {
+            self.set_notice("nothing selected to stage");
+            return;
+        };
+        let Some((_, repo)) = self.repo.clone() else {
+            self.set_notice("a fixture has no working tree to stage in");
+            return;
+        };
+        let bytes = path.as_bytes().to_vec();
+        let job = match section {
+            views::files::Section::Staged => gitten_app::verbs::Write::unstage(&repo, bytes),
+            _ => gitten_app::verbs::Write::stage(&repo, bytes),
+        };
+        self.enqueue(Box::new(job));
+    }
+
+    /// `files.commit`: gather a message over the pane, then commit on accept.
+    ///
+    /// The input owns the keyboard while it is open — [`input::MODE`] sits on
+    /// top of the pane stack — and [`DevShell::close_input`] routes the text
+    /// back here through the prompt slot.
+    fn begin_commit_message(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.active(), Some(Screen::Files { .. })) {
+            self.set_notice("files.commit is not supported here");
+            return;
+        }
+        if self.repo.is_none() {
+            self.set_notice("a fixture has no repository to commit in");
+            return;
+        }
+        let input = cx.new(|cx| input::Input::new("commit", "commit message", "", cx));
+        self.open_input(input, cx);
+        // After `open_input`, which may have cancelled a previous prompt.
+        self.prompt = Some(Prompt::CommitMessage);
+    }
+
+    /// The accepted commit text, as a job. Empty refused again here — the
+    /// trait refuses it too, but saying so beside the field that just closed
+    /// beats making the reader find out twice.
+    fn commit_message(&mut self, message: String) {
+        if message.trim().is_empty() {
+            self.set_notice("a commit needs a message");
+            return;
+        }
+        let Some((_, repo)) = self.repo.clone() else {
+            self.set_notice("a fixture has no repository to commit in");
+            return;
+        };
+        self.enqueue(Box::new(gitten_app::verbs::Write::commit(&repo, message)));
     }
 
     /// The one registration path built-ins and compiled-in extensions share.
@@ -998,6 +1099,11 @@ impl DevShell {
             "pane.prev" => self.cycle_pane(-1, cx),
             "files.focus" => self.focus_named("files", cx),
             "commits.open-diff" => self.open_diff(cx),
+            // The working tree's verbs. Context comes from the focused pane,
+            // the write from the job queue — and where either is missing, the
+            // same honest sentence an unknown command gets.
+            "files.stage" => self.stage_or_unstage(cx),
+            "files.commit" => self.begin_commit_message(cx),
             "copy.selection" => self.copy_selection(cx),
             // Both are answered by whichever screen is up; a commit graph has no
             // selection yet, and a command nothing handles there is inert — the
@@ -2118,6 +2224,7 @@ fn main() {
                     refresh_error: None,
                     running: None,
                     input: None,
+                    prompt: None,
                     over: Overrides::default(),
                     open: None,
                     error: None,
@@ -2415,6 +2522,7 @@ mod tests {
                 refresh_error: None,
                 running: None,
                 input: None,
+                prompt: None,
                 over: Default::default(),
                 open: which,
                 error: None,
@@ -2848,5 +2956,334 @@ mod tests {
         // event's pixels out of it and goes through named dispatch instead.
         assert_eq!(DevShell::smooth_pixels("view.page-down", 30.0, 1), None);
         assert_eq!(DevShell::smooth_pixels("blame.toggle", 30.0, 1), None);
+    }
+
+    // ---------------------------------------------------------- the file verbs
+
+    struct RecordingRepo {
+        calls: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl RecordingRepo {
+        fn wrote(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    /// Serves every verb by writing down what was asked of it — the fake a
+    /// dispatch test needs, standing where the binary implementation stands in
+    /// a live window.
+    impl Repo for RecordingRepo {
+        fn log(&self, _: usize) -> gitten_git::Result<Vec<Commit>> {
+            Ok(Vec::new())
+        }
+
+        fn pairs(&self, _: &str) -> gitten_git::Result<Vec<Pair>> {
+            Ok(Vec::new())
+        }
+
+        fn status(&self) -> gitten_git::Result<Status> {
+            // A standing tree rather than an empty answer: a real repository
+            // still has changes after a write, and the re-acquire a successful
+            // job schedules must find rows to put the keyboard back on.
+            let mut tree = Status::default();
+            tree.staged.push(gitten_core::status::StagedEntry {
+                path: "gone.txt".into(),
+                change: gitten_core::status::Change::Deleted,
+                old_path: None,
+                kind: gitten_core::status::Kind::File,
+                submodule: Default::default(),
+            });
+            tree.unstaged.push(gitten_core::status::UnstagedEntry {
+                path: "notes.md".into(),
+                change: gitten_core::status::Change::Modified,
+                kind: gitten_core::status::Kind::File,
+                submodule: Default::default(),
+            });
+            Ok(tree)
+        }
+
+        fn describe(&self) -> String {
+            "recorded".into()
+        }
+
+        fn stage(&self, path: &[u8]) -> gitten_git::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("stage {}", String::from_utf8_lossy(path)));
+            Ok(())
+        }
+
+        fn unstage(&self, path: &[u8]) -> gitten_git::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("unstage {}", String::from_utf8_lossy(path)));
+            Ok(())
+        }
+
+        fn commit(&self, message: &str) -> gitten_git::Result<String> {
+            self.calls.lock().unwrap().push(format!("commit {message}"));
+            Ok("f00d".into())
+        }
+    }
+
+    /// A shell with the two startup panes and a repository behind the files
+    /// pane, whose tree carries one staged change and one unstaged one.
+    /// Registration leaves the keyboard on the working tree.
+    fn files_shell(cx: &mut TestAppContext) -> (gpui::Entity<DevShell>, Arc<RecordingRepo>) {
+        let calls = Arc::default();
+        let repo = Arc::new(RecordingRepo {
+            calls: Arc::clone(&calls),
+        });
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, cx| {
+            let host = Rc::new(Host::new());
+            let mut tree = Status::default();
+            tree.staged.push(gitten_core::status::StagedEntry {
+                path: "gone.txt".into(),
+                change: gitten_core::status::Change::Deleted,
+                old_path: None,
+                kind: gitten_core::status::Kind::File,
+                submodule: Default::default(),
+            });
+            tree.unstaged.push(gitten_core::status::UnstagedEntry {
+                path: "notes.md".into(),
+                change: gitten_core::status::Change::Modified,
+                kind: gitten_core::status::Kind::File,
+                submodule: Default::default(),
+            });
+            let files = cx.new(|_| {
+                crate::views::files::Files::from_prepared(crate::views::files::prepare(tree, "r"))
+            });
+            files.update(cx, |f, _| {
+                f.run_view("view.bottom", &host); // onto the last row: a file
+            });
+            shell.panes.register(
+                "files",
+                Screen::files(files, Generation::default(), "files"),
+            );
+            shell.sync_modes();
+            shell.repo = Some((
+                PathBuf::from("/recorded"),
+                repo.clone() as gitten_git::Handle,
+            ));
+            cx.set_global(config::Active(Rc::new(Host::new())));
+        });
+        (shell, repo)
+    }
+
+    /// Waits for one successful finish off the job thread, then drains the
+    /// events the way the live window's pump does — so a generation bump and
+    /// the re-acquire it schedules happen through the real rails.
+    #[track_caller]
+    fn wait_finished(shell: &gpui::Entity<DevShell>, cx: &mut TestAppContext) -> Generation {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut done = None;
+        while done.is_none() {
+            assert!(Instant::now() < deadline, "no job finished in time");
+            shell.update(cx, |shell, _| {
+                while let Some(event) = shell.jobs.try_next() {
+                    match event {
+                        JobEvent::Started { .. } => {}
+                        JobEvent::Finished {
+                            outcome: Ok(generation),
+                            ..
+                        } => done = Some(generation),
+                        JobEvent::Finished {
+                            outcome: Err(error),
+                            ..
+                        } => panic!("job failed: {error}"),
+                    }
+                }
+            });
+            if done.is_none() {
+                std::thread::yield_now();
+            }
+        }
+        let generation = done.unwrap();
+        shell.update(cx, |shell, cx| {
+            shell.generation = generation;
+            shell.refresh_stale(cx);
+        });
+        cx.run_until_parked();
+        generation
+    }
+
+    #[gpui::test]
+    fn space_acts_on_the_row_by_the_side_it_sits_on(cx: &mut TestAppContext) {
+        let (shell, repo) = files_shell(cx);
+        // The cursor starts on the last row: notes.md, under *unstaged*.
+        shell.update(cx, |shell, cx| shell.run_command("files.stage", cx));
+        wait_finished(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["stage notes.md"]);
+        // The refresh rails ran: the pane re-acquired against the (empty)
+        // post-write tree, which is what makes the file visibly move.
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.generation.get() > 0);
+        });
+
+        // Back to the top, down onto gone.txt under *staged*: same key, other
+        // direction.
+        shell.update(cx, |shell, cx| {
+            let Some(Screen::Files { view, .. }) = shell.active() else {
+                panic!("files pane lost");
+            };
+            let host = Rc::new(Host::new());
+            view.update(cx, |f, _| {
+                f.run_view("view.top", &host);
+                f.run_view("view.down", &host);
+            });
+        });
+        shell.update(cx, |shell, cx| shell.run_command("files.stage", cx));
+        wait_finished(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["stage notes.md", "unstage gone.txt"]);
+    }
+
+    #[gpui::test]
+    fn commit_opens_the_field_and_the_accepted_text_becomes_the_job(cx: &mut TestAppContext) {
+        let (shell, repo) = files_shell(cx);
+
+        shell.update(cx, |shell, cx| shell.run_command("files.commit", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.input.is_some(), "no field opened");
+            assert_eq!(
+                shell.modes.top(),
+                input::MODE,
+                "the field did not own the keyboard"
+            );
+        });
+
+        // Typed text, as the platform would have left it; the rest of this
+        // test drives the real accept path.
+        shell.update(cx, |shell, cx| {
+            let text = "fix: the \"thing\"\n\nand a body";
+            let field = cx.new(|cx| input::Input::new("commit", "commit message", text, cx));
+            shell.open_input(field, cx);
+            shell.prompt = Some(super::Prompt::CommitMessage);
+        });
+        shell.update(cx, |shell, cx| shell.run_command("input.accept", cx));
+
+        wait_finished(&shell, cx);
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.input.is_none(), "the field stayed open");
+        });
+        assert_eq!(
+            repo.wrote(),
+            vec![format!("commit fix: the \"thing\"\n\nand a body")],
+            "the message arrived byte-for-byte"
+        );
+    }
+
+    #[gpui::test]
+    fn an_empty_commit_refuses_at_accept_without_submitting_anything(cx: &mut TestAppContext) {
+        let (shell, repo) = files_shell(cx);
+        shell.update(cx, |shell, cx| shell.run_command("files.commit", cx));
+        // The field opens empty and is accepted empty — the shape of hitting
+        // enter on an untouched prompt.
+        shell.update(cx, |shell, cx| shell.run_command("input.accept", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.input.is_none());
+            assert!(
+                shell
+                    .notice
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("message"),
+                "the refusal went unsaid: {:?}",
+                shell.notice
+            );
+        });
+        // Nothing ever reached the queue, however long the worker waits.
+        std::thread::sleep(Duration::from_millis(100));
+        shell.read_with(cx, |shell, _| {
+            if let Some(event) = shell.jobs.try_next() {
+                panic!("a refused commit still submitted: {event:?}");
+            }
+        });
+        assert!(repo.wrote().is_empty());
+    }
+
+    #[gpui::test]
+    fn the_file_verbs_say_so_where_they_cannot_act(cx: &mut TestAppContext) {
+        // No repository at all (a fixture), commits pane focused.
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, cx| shell.run_command("files.stage", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(shell
+                .notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not supported here"));
+        });
+        shell.update(cx, |shell, cx| {
+            shell.notice = None;
+            shell.run_command("files.commit", cx);
+        });
+        shell.read_with(cx, |shell, _| {
+            assert!(shell
+                .notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not supported here"));
+        });
+
+        // A files pane over a fixture: the pane is right, the repository is
+        // still missing. The tree carries one untracked file so there is a
+        // row to act on — the missing repository is what this wants to hear
+        // about, not an empty tree.
+        shell.update(cx, |shell, cx| {
+            let mut tree = Status::default();
+            tree.untracked.push(gitten_core::status::UntrackedEntry {
+                path: "loose.txt".into(),
+            });
+            let host = Rc::new(Host::new());
+            let files = cx.new(|_| {
+                crate::views::files::Files::from_prepared(crate::views::files::prepare(tree, ""))
+            });
+            files.update(cx, |f, _| {
+                f.run_view("view.bottom", &host); // onto loose.txt
+            });
+            shell.panes.register(
+                "files",
+                Screen::files(files, Generation::default(), "files"),
+            );
+            shell.sync_modes();
+        });
+        shell.update(cx, |shell, cx| shell.run_command("files.stage", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                shell
+                    .notice
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("fixture"),
+                "{:?}",
+                shell.notice
+            );
+        });
+
+        // And a clean tree: nothing under the keyboard to act on.
+        let (shell, repo) = files_shell(cx);
+        shell.update(cx, |shell, cx| {
+            let Some(Screen::Files { view, .. }) = shell.active() else {
+                panic!("files pane lost");
+            };
+            view.update(cx, |f, _| f.run_view("view.top", &Rc::new(Host::new())));
+        });
+        shell.update(cx, |shell, cx| shell.run_command("files.stage", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                shell
+                    .notice
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("nothing selected"),
+                "{:?}",
+                shell.notice
+            );
+        });
+        assert!(repo.wrote().is_empty());
     }
 }
