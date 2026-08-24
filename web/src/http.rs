@@ -31,6 +31,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -284,8 +285,15 @@ where
     // The handler's whole life, on one thread. Ends when every connection
     // thread and the accept loop have dropped their sender, which is to say
     // never — the process is what ends this.
+    //
+    // A panic reachable from routing — a third-party `Wrap` or `Highlighter`
+    // bug, an index slip — would otherwise unwind out of `serve` and end the
+    // process, stalling every browser tab. Catch it here and answer 500 with no
+    // internal detail: this thread is the whole server, so its death is the
+    // server's, and one bad request is not the others' to pay for.
     for job in jobs {
-        let response = handler(&job.request);
+        let response = catch_unwind(AssertUnwindSafe(|| handler(&job.request)))
+            .unwrap_or_else(|_| Response::status(500, "internal error"));
         let _ = job.reply.send(response);
     }
     Ok(())
