@@ -58,9 +58,6 @@
 //! nothing outside it can hold one of them still. What the list keeps is the
 //! vertical axis, which is the one that has to virtualize.
 
-use gpui::prelude::FluentBuilder as _;
-use gpui::*;
-use gpui_component::scroll::{Scrollbar, ScrollbarHandle};
 use gitten_core::host::Host;
 use gitten_core::prepared::{prepare, Prepared};
 use gitten_core::rows::{Ordered, RowRef};
@@ -70,6 +67,9 @@ use gitten_core::syntax::Token;
 use gitten_core::theme::{DiffPalette, Rgb, Surface, Theme};
 use gitten_core::wrap::{Wrap, Wrapped};
 use gitten_core::{FileDiff, LineKind, Span};
+use gpui::prelude::FluentBuilder as _;
+use gpui::*;
+use gpui_component::scroll::{Scrollbar, ScrollbarHandle};
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::rc::Rc;
@@ -2301,15 +2301,15 @@ mod tests {
     // By name, not a glob: `use gpui::*` in the parent shadows `#[test]` with
     // GPUI's own attribute macro and every test in here fails to expand.
     use super::{line_colors, locked, Diff, Layouts, Pan, Row, Rows, TextRows, PAD, TEXT_CHROME};
-    use gpui::{
-        div, rgb, AnyElement, FontStyle, FontWeight, HighlightStyle, IntoElement, ParentElement,
-    };
     use gitten_core::host::Host;
     use gitten_core::prepared::{prepare, File as PreparedFile};
     use gitten_core::select::{Caret, Selected, Selection};
     use gitten_core::syntax::{Kind, Token};
     use gitten_core::theme::{Style, Surface, Theme};
     use gitten_core::{parse_unified_diff, LineKind, Span};
+    use gpui::{
+        div, rgb, AnyElement, FontStyle, FontWeight, HighlightStyle, IntoElement, ParentElement,
+    };
     use std::rc::Rc;
 
     fn tok(start: u32, end: u32, kind: Kind) -> Token {

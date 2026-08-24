@@ -63,7 +63,6 @@ use super::diff::{
     row_frame, scrolled, selected, slice, slice_shared, Hit, Rows, Scratch, PAD, ROW_H, SIGN_W,
     TEXT_CHROME,
 };
-use gpui::*;
 use gitten_core::host::Host;
 use gitten_core::markdown::{flow_table, lay_out_tables, Block, Grid, Layout, TableRow};
 use gitten_core::runs::surfaces;
@@ -72,6 +71,7 @@ use gitten_core::syntax::Token;
 use gitten_core::theme::Rgb;
 use gitten_core::wrap::{Break, Budget, Wrap, Wrapped};
 use gitten_core::{LineKind, Span};
+use gpui::*;
 
 /// How a rendered markdown row is proportioned. A struct rather than constants
 /// because these are the numbers someone will want to disagree with — and rule 1

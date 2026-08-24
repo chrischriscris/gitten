@@ -13,10 +13,10 @@
 //! door, and where a branch begins and ends, because that is what colour
 //! follows (see [`gitten_core::graph::Hues`]) rather than the column it happens to occupy.
 
-use gpui::*;
 use gitten_core::graph::MAX_LANES;
 use gitten_core::host::Host;
 use gitten_core::theme::Theme;
+use gpui::*;
 use std::rc::Rc;
 
 pub const ROW_H: f32 = 22.0;

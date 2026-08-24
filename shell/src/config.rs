@@ -12,9 +12,9 @@
 
 pub use gitten_app::config::{load, watch};
 
-use gpui::{px, App, Global, Hsla};
 use gitten_core::host::Host;
 use gitten_core::theme::Rgb;
+use gpui::{px, App, Global, Hsla};
 use std::path::Path;
 use std::rc::Rc;
 

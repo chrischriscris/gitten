@@ -672,7 +672,8 @@ mod tests {
 
     impl Scratch {
         fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("gitten-git-{name}-{}", std::process::id()));
+            let dir =
+                std::env::temp_dir().join(format!("gitten-git-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).expect("a temp dir");
             let me = Scratch(dir);

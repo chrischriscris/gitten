@@ -32,10 +32,10 @@ pub mod json;
 pub mod log;
 pub mod rows;
 
-use http::{Request, Response};
-use log::Log;
 use gitten_app::MIN_WRAP_COLS;
 use gitten_core::host::Host;
+use http::{Request, Response};
+use log::Log;
 use rows::Doc;
 use std::sync::Mutex;
 

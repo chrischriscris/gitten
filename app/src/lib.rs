@@ -337,7 +337,9 @@ mod tests {
             start("diff . HEAD~1..HEAD").unwrap_or_else(|_| panic!("this repo has history"));
         assert_eq!(started.view, View::Diff);
         assert!(!started.loaded.data.is_empty());
-        assert!(started.title("gitten-test").contains("gitten-test · diff · "));
+        assert!(started
+            .title("gitten-test")
+            .contains("gitten-test · diff · "));
         assert!(started.session_key().starts_with("diff:"));
         // The host is the configured one, not `Host::new()` handed back.
         assert!(!started.host.differ.selected().is_empty());

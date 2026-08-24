@@ -1,9 +1,9 @@
 use crate::graph;
+use gitten_core::host::Host;
+use gitten_core::{assign_lanes, initials, Commit};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::scroll::Scrollbar;
-use gitten_core::host::Host;
-use gitten_core::{assign_lanes, initials, Commit};
 use std::cell::Cell;
 use std::rc::Rc;
 

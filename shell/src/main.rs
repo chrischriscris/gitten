@@ -5,14 +5,14 @@ mod session;
 mod stats;
 mod views;
 
-use gpui::*;
-use gpui_component::*;
 use gitten_app::acquire::Data;
 use gitten_app::cli::{Source, View};
 use gitten_app::{Started, Startup};
 use gitten_core::differ::{Overrides, Whitespace};
 use gitten_core::host::Host;
 use gitten_core::FileDiff;
+use gpui::*;
+use gpui_component::*;
 use stats::Stats;
 use std::cell::Cell;
 use std::rc::Rc;

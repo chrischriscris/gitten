@@ -43,9 +43,9 @@
 //! `cx.listener` closures from that same entity. So this file has no lifecycle
 //! to get wrong, and it is a pure function of a `Picker` plus a bool.
 
-use gpui::*;
 use gitten_core::font::Font;
 use gitten_core::theme::Theme;
+use gpui::*;
 use std::rc::Rc;
 
 /// Height of the control, and of the strip it sits in.
