@@ -102,6 +102,9 @@ const BAND_H: f32 = 22.0;
 /// panes divide what is left — see [`Pane::height_share`]. A code constant on
 /// purpose tonight; a drag handle between panes would own this properly.
 const FILES_SHARE: f32 = 0.3;
+/// The stash stack's slice — smaller than the working tree's because parked
+/// work is context you glance at, not content you work in. Same caveat.
+const STASHES_SHARE: f32 = 0.15;
 
 /// What only this client has. The two views, the arguments and `gitten.toml` are
 /// documented once, in `gitten_app::cli::usage`, because they are the same in
@@ -317,6 +320,13 @@ enum Screen {
         generation: Rc<Cell<Generation>>,
         label: Rc<RefCell<String>>,
     },
+    /// The stash stack. Same story as [`Screen::Files`]: always about this
+    /// window's repository, so no `Source`, and a fixture gets none.
+    Stashes {
+        view: Entity<views::stashes::Stashes>,
+        generation: Rc<Cell<Generation>>,
+        label: Rc<RefCell<String>>,
+    },
     Custom(Rc<dyn Pane>),
 }
 
@@ -361,11 +371,24 @@ impl Screen {
         }
     }
 
+    fn stashes(
+        view: Entity<views::stashes::Stashes>,
+        generation: Generation,
+        label: impl Into<String>,
+    ) -> Self {
+        Self::Stashes {
+            view,
+            generation: Rc::new(Cell::new(generation)),
+            label: Rc::new(RefCell::new(label.into())),
+        }
+    }
+
     fn any(&self) -> AnyView {
         match self {
             Screen::Commits { view, .. } => view.clone().into(),
             Screen::Diff { view, .. } => view.clone().into(),
             Screen::Files { view, .. } => view.clone().into(),
+            Screen::Stashes { view, .. } => view.clone().into(),
             Screen::Custom(pane) => pane.any(),
         }
     }
@@ -376,6 +399,7 @@ impl Screen {
             Screen::Commits { .. } => "commits",
             Screen::Diff { .. } => "diff",
             Screen::Files { .. } => "files",
+            Screen::Stashes { .. } => "stashes",
             Screen::Custom(pane) => pane.mode(),
         }
     }
@@ -393,11 +417,12 @@ impl Screen {
                     None => base,
                 }
             }
-            Screen::Diff { label, .. } | Screen::Files { label, .. } => label.borrow().clone(),
+            Screen::Diff { label, .. }
+            | Screen::Files { label, .. }
+            | Screen::Stashes { label, .. } => label.borrow().clone(),
             Screen::Custom(pane) => pane.label(cx),
         }
     }
-
     fn refresh(
         &self,
         target: Generation,
@@ -541,6 +566,47 @@ impl Screen {
                     },
                 ))
             }
+            Screen::Stashes {
+                view,
+                generation,
+                label,
+            } => {
+                if generation.get() >= target {
+                    return None;
+                }
+                let view = view.clone();
+                let generation = generation.clone();
+                let label = label.clone();
+                Some(Refresh::new(
+                    target,
+                    move || {
+                        // The whole of the blocking half: one `git stash list`
+                        // beside the describe the label keeps naming.
+                        let described = std::thread::scope(|s| {
+                            let title = s.spawn(|| repo.describe());
+                            let stashes = repo.stashes()?;
+                            Ok::<_, String>(views::stashes::prepare(
+                                &stashes,
+                                &title.join().unwrap_or_default(),
+                            ))
+                        })?;
+                        Ok(described)
+                    },
+                    move |prepared: views::stashes::Prepared, host, cx| {
+                        if generation.get() >= target {
+                            return Ok(());
+                        }
+                        let label_text = prepared.label.clone();
+                        view.update(cx, |v, cx| {
+                            v.replace_prepared(prepared, host);
+                            cx.notify();
+                        });
+                        label.replace(label_text);
+                        generation.set(target);
+                        Ok(())
+                    },
+                ))
+            }
             Screen::Custom(pane) => pane.refresh(target, host, overrides, repo),
         }
     }
@@ -551,6 +617,7 @@ impl Screen {
             Screen::Commits { view, .. } => view.read(cx).list_bounds(),
             Screen::Diff { view, .. } => view.read(cx).list_bounds(),
             Screen::Files { view, .. } => view.read(cx).list_bounds(),
+            Screen::Stashes { view, .. } => view.read(cx).list_bounds(),
             Screen::Custom(pane) => pane.list_bounds(cx),
         }
     }
@@ -561,6 +628,8 @@ impl Screen {
             // The working tree is context; whatever the window opened for gets
             // an equal share and stays the star.
             Screen::Files { .. } => Some(FILES_SHARE),
+            // The stack, more context still.
+            Screen::Stashes { .. } => Some(STASHES_SHARE),
             Screen::Commits { .. } | Screen::Diff { .. } => None,
             Screen::Custom(pane) => pane.height_share(cx),
         }
@@ -574,6 +643,7 @@ impl Screen {
             Screen::Commits { view, .. } => view.read(cx).pan_pixels(dx),
             Screen::Diff { view, .. } => view.read(cx).pan_pixels(dx),
             Screen::Files { view, .. } => view.read(cx).pan_pixels(dx),
+            Screen::Stashes { view, .. } => view.read(cx).pan_pixels(dx),
             Screen::Custom(pane) => pane.pan_pixels(dx, cx),
         }
     }
@@ -605,6 +675,13 @@ impl Screen {
                 }
                 known
             }),
+            Screen::Stashes { view, .. } => view.update(cx, |s, c| {
+                let known = s.run_view(command, host);
+                if known {
+                    c.notify();
+                }
+                known
+            }),
             Screen::Custom(pane) => pane.run(command, host, writes, cx),
         }
     }
@@ -617,6 +694,7 @@ impl Screen {
             Screen::Commits { view, .. } => view.update(cx, |v, _| v.scroll_pixels(dy, host)),
             Screen::Diff { view, .. } => view.update(cx, |v, _| v.scroll_pixels(dy, host)),
             Screen::Files { view, .. } => view.update(cx, |v, _| v.scroll_pixels(dy, host)),
+            Screen::Stashes { view, .. } => view.update(cx, |v, _| v.scroll_pixels(dy, host)),
             Screen::Custom(pane) => pane.scroll_pixels(dy, host, cx),
         }
     }
@@ -640,6 +718,10 @@ impl Screen {
             Screen::Files { view, .. } => view.update(cx, |f, _| match all {
                 true => f.select_all(),
                 false => f.select_none(),
+            }),
+            Screen::Stashes { view, .. } => view.update(cx, |s, _| match all {
+                true => s.select_all(),
+                false => s.select_none(),
             }),
             Screen::Custom(pane) => pane.select(all, cx),
         }
@@ -1065,6 +1147,66 @@ impl DevShell {
         }
     }
 
+    /// `files.stash`: park what the tracked working tree holds on the stash
+    /// stack and start again from HEAD. No message tonight — the entry gets
+    /// git's own `WIP on …`, which is honest about what it was; a prompt for
+    /// one is future work. Nothing here reads the pane: parking addresses the
+    /// repository, whatever pane the key was pressed over.
+    fn stash_working_tree(&mut self, _cx: &mut Context<Self>) {
+        let Some(writes) = self.writes() else {
+            self.set_notice("a fixture has no working tree to park");
+            return;
+        };
+        if !writes.send(Box::new(gitten_app::verbs::Write::stash_push(
+            &writes.repo,
+            None,
+        ))) {
+            self.set_notice("the job queue is shutting down");
+        }
+    }
+
+    /// `stashes.apply` / `stashes.pop` / `stashes.drop`: act on the row the
+    /// keyboard is on, addressed by its index — which is also why only the
+    /// drop asks twice. Apply and pop are recoverable in every direction that
+    /// matters (a kept entry, an apply that refused); a drop is final, so it
+    /// arms like a discard and any cursor move, wheel or refresh disarms it —
+    /// after a drop the numbers shift, and a yes aimed at yesterday's
+    /// numbering is exactly the accident the double press exists to prevent.
+    fn stash_selected(&mut self, command: &str, cx: &mut Context<Self>) {
+        let Some(Screen::Stashes { view, .. }) = self.active() else {
+            self.set_notice(format!("{command} is not supported here"));
+            return;
+        };
+        let under = view
+            .read(cx)
+            .current()
+            .map(|r| (r.index, r.title.to_string()));
+        let Some((index, shown)) = under else {
+            self.set_notice("nothing selected on the stash stack");
+            return;
+        };
+        let Some(writes) = self.writes() else {
+            self.set_notice("a fixture has no stash stack to act on");
+            return;
+        };
+        if command == "stashes.drop" && !view.update(cx, |s, _| s.confirm_or_arm_drop(index)) {
+            // First press on this row: asked, not acted.
+            self.set_notice(views::stashes::drop_question(&shown));
+            return;
+        }
+        if command == "stashes.drop" {
+            self.notice = None; // the question is spent; the running band speaks next
+        }
+        let job = match command {
+            "stashes.apply" => gitten_app::verbs::Write::stash_apply(&writes.repo, index),
+            "stashes.pop" => gitten_app::verbs::Write::stash_pop(&writes.repo, index),
+            _ => gitten_app::verbs::Write::stash_drop(&writes.repo, index),
+        };
+        if !writes.send(Box::new(job)) {
+            self.set_notice("the job queue is shutting down");
+        }
+    }
+
     /// `commits.search`: gather a query over the focused commits pane.
     ///
     /// While the field is open every edit filters that pane's list live — the
@@ -1394,6 +1536,7 @@ impl DevShell {
             "pane.next" => self.cycle_pane(1, cx),
             "pane.prev" => self.cycle_pane(-1, cx),
             "files.focus" => self.focus_named("files", cx),
+            "stashes.focus" => self.focus_named("stashes", cx),
             "commits.open-diff" => self.open_diff(cx),
             "commits.search" => self.begin_search(cx),
             // The working tree's verbs. Context comes from the focused pane,
@@ -1404,6 +1547,9 @@ impl DevShell {
             "files.discard" => self.discard_selected(cx),
             "files.stage-all" => self.stage_all(cx),
             "files.ignore" => self.ignore_selected(cx),
+            "files.stash" => self.stash_working_tree(cx),
+            // The stash stack's verbs.
+            "stashes.apply" | "stashes.pop" | "stashes.drop" => self.stash_selected(command, cx),
             "copy.selection" => self.copy_selection(cx),
             // Both are answered by whichever screen is up; a commit graph has no
             // selection yet, and a command nothing handles there is inert — the
@@ -1595,6 +1741,15 @@ impl DevShell {
                 if !text.is_empty() {
                     // Letters first, then the path — the spelling git itself
                     // prints, so it pastes into a shell usefully.
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+            }
+            Some(Screen::Stashes { view, .. }) => {
+                let view = view.clone();
+                view.update(cx, |s, _| s.reconcile(&host));
+                let text = view.read(cx).cursor_text();
+                if !text.is_empty() {
+                    // The address first, then the message — same rule.
                     cx.write_to_clipboard(ClipboardItem::new_string(text));
                 }
             }
@@ -2427,14 +2582,19 @@ fn main() {
                 if let Some((_, handle)) = &repo {
                     start::mark("files status begin");
                     let described = std::thread::scope(|s| {
-                        // Beside, not behind — describe spawns and runs while
-                        // status blocks, and is joined only once status is
-                        // back. Joining before would put two git processes in
-                        // sequence on the launch path.
+                        // Beside, not behind — describe, status and the stash
+                        // stack spawn together and are joined only once all
+                        // three are back. Joining each in sequence would put
+                        // three git processes on the launch path one after
+                        // another.
                         let title = s.spawn(|| handle.describe());
-                        let status = handle.status();
+                        let status = s.spawn(|| handle.status());
+                        let parked = s.spawn(|| handle.stashes());
                         let title = title.join().unwrap_or_default();
-                        match status {
+                        let files_prepared = match status
+                            .join()
+                            .unwrap_or_else(|p| std::panic::resume_unwind(p))
+                        {
                             Ok(status) => views::files::prepare(status, &title),
                             // Shown as a clean tree rather than failing the
                             // window: one bad status must not take the launch.
@@ -2442,16 +2602,39 @@ fn main() {
                                 eprintln!("gitten: status failed, showing an empty pane: {e}");
                                 views::files::prepare(Default::default(), &title)
                             }
-                        }
+                        };
+                        // The same trade for the stack: a failed read is an
+                        // empty pane and a line on stderr, not a lost launch.
+                        let stashes_prepared = match parked
+                            .join()
+                            .unwrap_or_else(|p| std::panic::resume_unwind(p))
+                        {
+                            Ok(stashes) => views::stashes::prepare(&stashes, &title),
+                            Err(e) => {
+                                eprintln!("gitten: stashes failed, showing an empty pane: {e}");
+                                views::stashes::prepare(&[], &title)
+                            }
+                        };
+                        (files_prepared, stashes_prepared)
                     });
                     start::mark("files status done");
-                    let label = described.label.clone();
+                    let (files_prepared, stashes_prepared) = described;
+                    let stashes_label = stashes_prepared.label.clone();
+                    initial_panes.register(
+                        "stashes",
+                        Screen::stashes(
+                            cx.new(|_| views::stashes::Stashes::from_prepared(stashes_prepared)),
+                            Generation::default(),
+                            stashes_label,
+                        ),
+                    );
+                    let files_label = files_prepared.label.clone();
                     initial_panes.register(
                         "files",
                         Screen::files(
-                            cx.new(|_| views::files::Files::from_prepared(described)),
+                            cx.new(|_| views::files::Files::from_prepared(files_prepared)),
                             Generation::default(),
-                            label,
+                            files_label,
                         ),
                     );
                     // Registration focuses what it adds; startup keeps the
@@ -3598,6 +3781,38 @@ mod tests {
                 .push(format!("unstage-many {shown}"));
             Ok(())
         }
+
+        fn stash_push(&self, message: Option<&str>) -> gitten_git::Result<usize> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("stash push {message:?}"));
+            Ok(0)
+        }
+
+        fn stash_apply(&self, index: usize) -> gitten_git::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("stash apply stash@{index}"));
+            Ok(())
+        }
+
+        fn stash_pop(&self, index: usize) -> gitten_git::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("stash pop stash@{index}"));
+            Ok(())
+        }
+
+        fn stash_drop(&self, index: usize) -> gitten_git::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("stash drop stash@{index}"));
+            Ok(())
+        }
     }
 
     /// A shell with the two startup panes and a repository behind the files
@@ -3662,6 +3877,59 @@ mod tests {
             cx.set_global(config::Active(Rc::new(Host::new())));
         });
         (shell, repo, handle)
+    }
+
+    /// A shell over a two-entry stash stack, with the repository recording
+    /// behind it and the keyboard on the stash pane's newest row. The same
+    /// shape startup builds: root pane, then files, then the stack.
+    fn stashes_shell(cx: &mut TestAppContext) -> (gpui::Entity<DevShell>, Arc<RecordingRepo>) {
+        let stashes = vec![
+            gitten_core::refs::Stash {
+                index: 0,
+                commit: "c0ffee0".into(),
+                message: "On main: hand written".into(),
+            },
+            gitten_core::refs::Stash {
+                index: 1,
+                commit: "c0ffee1".into(),
+                message: "WIP on main: abc1234 seed".into(),
+            },
+        ];
+        let calls = Arc::default();
+        let repo = Arc::new(RecordingRepo {
+            calls: Arc::clone(&calls),
+        });
+        let handle: gitten_git::Handle = repo.clone();
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, cx| {
+            let host = Rc::new(Host::new());
+            let view = cx.new(|_| {
+                crate::views::stashes::Stashes::from_prepared(crate::views::stashes::prepare(
+                    &stashes, "r",
+                ))
+            });
+            view.update(cx, |s, _| {
+                s.run_view("view.top", &host);
+            });
+            let files = cx.new(|_| {
+                crate::views::files::Files::from_prepared(crate::views::files::prepare(
+                    Status::default(),
+                    "r",
+                ))
+            });
+            shell.panes.register(
+                "files",
+                Screen::files(files, Generation::default(), "r · 0 changed"),
+            );
+            shell.panes.register(
+                "stashes",
+                Screen::stashes(view, Generation::default(), "r · 2 parked"),
+            );
+            shell.sync_modes();
+            shell.repo = Some((PathBuf::from("/recorded"), handle));
+            cx.set_global(config::Active(Rc::new(Host::new())));
+        });
+        (shell, repo)
     }
 
     /// Puts a caller-visible runner pair into the shell, so a test submits
@@ -3748,6 +4016,192 @@ mod tests {
         shell.update(cx, |shell, cx| shell.run_command("files.stage", cx));
         pump_write(&shell, cx);
         assert_eq!(repo.wrote(), vec!["stage notes.md", "unstage gone.txt"]);
+    }
+
+    // ------------------------------------------------------- the stash verbs
+
+    #[gpui::test]
+    fn space_applies_the_stash_row_through_the_pump(cx: &mut TestAppContext) {
+        let (shell, repo) = stashes_shell(cx);
+        // The keyboard starts on stash@{0}, the newest entry.
+        shell.update(cx, |shell, cx| shell.run_command("stashes.apply", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["stash apply stash@0"]);
+        // And the generation rails ran, as they do after every write.
+        shell.read_with(cx, |shell, _| assert!(shell.generation.get() > 0));
+    }
+
+    #[gpui::test]
+    fn pop_runs_without_asking_and_names_its_own_index(cx: &mut TestAppContext) {
+        let (shell, repo) = stashes_shell(cx);
+        shell.update(cx, |shell, cx| {
+            let Some(Screen::Stashes { view, .. }) = shell.active() else {
+                panic!("stashes pane lost");
+            };
+            let host = Rc::new(Host::new());
+            view.update(cx, |v, _| {
+                v.run_view("view.bottom", &host); // onto stash@{1}
+            });
+        });
+        shell.update(cx, |shell, cx| shell.run_command("stashes.pop", cx));
+        pump_write(&shell, cx);
+        assert_eq!(
+            repo.wrote(),
+            vec!["stash pop stash@1"],
+            "the index travels, whatever row it came from"
+        );
+    }
+
+    #[gpui::test]
+    fn a_drop_arms_then_confirms_on_the_second_press_of_the_same_row(cx: &mut TestAppContext) {
+        let (shell, repo) = stashes_shell(cx);
+
+        // First press: asked, in the band; nothing written.
+        shell.update(cx, |shell, cx| shell.run_command("stashes.drop", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(repo.wrote().is_empty());
+            assert!(
+                shell
+                    .notice
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("drop stash@{0}? press again"),
+                "{:?}",
+                shell.notice
+            );
+        });
+
+        // Second press on the same row: spent, written, question cleared.
+        shell.update(cx, |shell, cx| shell.run_command("stashes.drop", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["stash drop stash@0"]);
+        shell.read_with(cx, |shell, _| assert!(shell.notice.is_none()));
+    }
+
+    #[gpui::test]
+    fn a_cursor_move_disarms_an_armed_stash_drop(cx: &mut TestAppContext) {
+        let (shell, repo) = stashes_shell(cx);
+        shell.update(cx, |shell, cx| {
+            let Some(Screen::Stashes { view, .. }) = shell.active() else {
+                panic!("stashes pane lost");
+            };
+            let host = Rc::new(Host::new());
+            view.update(cx, |v, _| {
+                v.run_view("view.bottom", &host); // arm target: stash@{1}
+            });
+        });
+        shell.update(cx, |shell, cx| shell.run_command("stashes.drop", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                shell
+                    .notice
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("drop stash@{1}?"),
+                "{:?}",
+                shell.notice
+            );
+        });
+
+        // One step up: the keyboard left the question's row, so the next
+        // press asks about the row it lands on instead of executing.
+        shell.update(cx, |shell, cx| {
+            let Some(Screen::Stashes { view, .. }) = shell.active() else {
+                panic!("stashes pane lost");
+            };
+            let host = Rc::new(Host::new());
+            view.update(cx, |v, _| {
+                v.run_view("view.up", &host);
+            });
+        });
+        shell.update(cx, |shell, cx| shell.run_command("stashes.drop", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(repo.wrote().is_empty(), "nothing was dropped");
+            assert!(
+                shell
+                    .notice
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("drop stash@{0}?"),
+                "the question followed the keyboard: {:?}",
+                shell.notice
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn the_stash_verbs_say_so_outside_the_stash_pane(cx: &mut TestAppContext) {
+        let (shell, repo, _handle) = files_shell(cx);
+        shell.update(cx, |shell, cx| shell.run_command("stashes.apply", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(repo.wrote().is_empty());
+            assert!(
+                shell
+                    .notice
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("not supported here"),
+                "{:?}",
+                shell.notice
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn files_stash_parks_the_tree_and_the_refresh_rails_run(cx: &mut TestAppContext) {
+        let (shell, repo, _handle) = files_shell(cx);
+        shell.update(cx, |shell, cx| shell.run_command("files.stash", cx));
+        // The whole production path: job queued, drained by the same pump the
+        // window runs, generation bumped, every repository pane re-acquired.
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["stash push None"]);
+        shell.read_with(cx, |shell, _| assert!(shell.generation.get() > 0));
+
+        // Over a fixture there is nothing to park, and the key says so.
+        shell.update(cx, |shell, _| shell.repo = None);
+        shell.update(cx, |shell, cx| shell.run_command("files.stash", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                shell
+                    .notice
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("no working tree to park"),
+                "{:?}",
+                shell.notice
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn stashes_focus_reaches_the_registered_pane_and_says_so_when_there_is_none(
+        cx: &mut TestAppContext,
+    ) {
+        let (shell, _repo) = stashes_shell(cx);
+        // Registration left the keyboard on the stack; named dispatch gets
+        // back there from anywhere.
+        shell.update(cx, |shell, _| {
+            shell.panes.focus(0);
+            shell.sync_modes();
+        });
+        shell.update(cx, |shell, cx| shell.run_command("stashes.focus", cx));
+        shell.read_with(cx, |shell, app| {
+            assert_eq!(shell.panes.focused_name(), "stashes");
+            assert_eq!(shell.modes.top(), "stashes");
+            assert_eq!(shell.active_label(app).as_ref(), "r · 2 parked");
+        });
+
+        // And with the pane gone again, the key is answered with a sentence,
+        // not silence.
+        shell.update(cx, |shell, cx| {
+            shell.panes.close_focused();
+            shell.sync_modes();
+            shell.notice = None;
+            shell.run_command("stashes.focus", cx);
+        });
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.notice.is_some(), "a missing pane went unsaid");
+        });
     }
 
     #[gpui::test]
@@ -3875,6 +4329,7 @@ mod tests {
                         match other {
                             Screen::Custom(_) => "custom",
                             Screen::Diff { .. } => "diff",
+                            Screen::Stashes { .. } => "stashes",
                             Screen::Commits { .. } | Screen::Files { .. } => unreachable!(),
                         }
                     ),
