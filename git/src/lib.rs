@@ -4434,6 +4434,26 @@ mod tests {
     }
 
     #[test]
+    fn pushing_from_a_clean_tree_with_an_empty_stack_refuses_too() {
+        // The third shape of "nothing": both rev-parses answer None — there
+        // was no stack before and none after. `None == None` must read as
+        // refusal, never as Ok(0) naming a top that does not exist.
+        let r = Scratch::new("stash-noop-empty");
+        r.write("f.txt", b"one\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        let g = r.open();
+
+        assert!(g.stashes().unwrap().is_empty());
+        let e = g.stash_push(None).unwrap_err();
+        assert!(e.contains("nothing to stash"), "{e}");
+        assert!(
+            g.stashes().unwrap().is_empty(),
+            "still nothing on the stack"
+        );
+    }
+
+    #[test]
     fn applying_restores_the_work_and_keeps_the_entry() {
         let r = with_dirty_tree("stash-apply");
         let g = r.open();
