@@ -50,6 +50,12 @@ jobs:
       # the index on a hit for seconds; offline turned an imperfect save into
       # a red main. A cache hit still skips all the compile work, which is
       # the part worth having.
+      #
+      # `gitten-git` is in this list and was missing from it for a long time.
+      # It is the only crate that talks to a repository — `parse_raw`, the
+      # `cat-file` batch protocol, untracked status, CRLF — and its tests build
+      # their own scratch repositories, so they are as headless as the rest.
+      # They passed the whole time; nothing ran them.
       - run: >-
           cargo test -q --locked
       - run: >-
@@ -78,3 +84,23 @@ jobs:
             libwayland-dev libudev-dev libvulkan-dev
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
         # Online for the same reason the test job is: see there.
+
+  # RUSTSEC advisories against the locked tree. Advisory, not a gate: this repo
+  # is ~99% transitive gpui dependencies, and a blocking job would turn main red
+  # for an advisory in a crate nobody here can bump without moving the whole GPUI
+  # pin. `continue-on-error` keeps the report a report — the summary shows a
+  # yellow ✗ worth reading, not a red one that blocks a merge for something
+  # unactionable. Promote it to a gate the day the dependency tree is ours to fix.
+  audit:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      # The binary is the whole tool; installing from crates.io is a minute cold
+      # and cached after. `--locked` so the audit tool itself does not drift.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      # `Cargo.lock` is what is audited, so no build and no Linux GPUI headers
+      # are needed — just the resolved graph.
+      - run: cargo audit

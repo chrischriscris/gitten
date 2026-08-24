@@ -136,15 +136,56 @@ const KINDS: [(&str, Kind); Kind::COUNT] = [
     ("link", Kind::Link),
 ];
 
-/// Where the config lives: `$GITTEN_CONFIG`, else `./gitten.toml`.
+/// Where the config lives, most specific first:
 ///
-/// The working directory rather than a home directory, deliberately for now — a
-/// dev loop wants the file next to the code it is describing, and a per-user
-/// location is a product decision this does not need to make yet.
+/// 1. `$GITTEN_CONFIG` — an explicit path wins over everything, for a script or
+///    a test that wants to say exactly which file.
+/// 2. `./gitten.toml` — a project-local file, **when it exists**. This is the
+///    dev loop (`./dev` runs from the repo root, where a gitignored `gitten.toml`
+///    sits beside the code it themes) and the escape hatch for a repository that
+///    wants to ship its own palette. It only wins when present, so it is an
+///    override and not a requirement.
+/// 3. `$XDG_CONFIG_HOME/gitten/gitten.toml`, else `~/.config/gitten/gitten.toml`
+///    — the per-user home, which is where a normal install keeps it.
+///
+/// The cwd file used to be the *only* location, which meant a user who ran
+/// `gitten` from anywhere but a directory they had dropped a `gitten.toml` into
+/// got the built-in defaults and no way to change them — and from a bundled
+/// `.app`, whose working directory is `/`, that was every launch.
 pub fn path() -> PathBuf {
-    std::env::var_os("GITTEN_CONFIG")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| "gitten.toml".into())
+    resolve(
+        std::env::var_os("GITTEN_CONFIG").map(PathBuf::from),
+        PathBuf::from("gitten.toml").exists(),
+        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+}
+
+/// The resolution rule as a pure function of the four inputs, so the precedence
+/// is a test rather than something only a particular machine's environment
+/// exercises. `path()` is the one-line call of this over the real environment.
+fn resolve(
+    explicit: Option<PathBuf>,
+    local_exists: bool,
+    xdg: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> PathBuf {
+    let local = PathBuf::from("gitten.toml");
+    if let Some(explicit) = explicit {
+        return explicit;
+    }
+    if local_exists {
+        return local;
+    }
+    // XDG says a relative `XDG_CONFIG_HOME` is invalid and to be ignored, which
+    // is why it is filtered rather than joined onto the cwd.
+    let base = xdg
+        .filter(|p| p.is_absolute())
+        .or_else(|| home.map(|h| h.join(".config")));
+    match base {
+        Some(base) => base.join("gitten").join("gitten.toml"),
+        None => local,
+    }
 }
 
 /// Reads and applies the config, if there is one.
@@ -823,6 +864,17 @@ fn hex_list(cs: &[Rgb]) -> String {
 /// temporary file over the original rather than writing it in place, which
 /// destroys the inode a file watch is holding, and the save after the first one
 /// then goes unnoticed.
+///
+/// The **nearest existing** ancestor, not the file's immediate parent. The
+/// per-user config lives at `~/.config/gitten/gitten.toml`, and a user who has
+/// never written one has no `~/.config/gitten` to watch — watching it would
+/// error, and every client turns that into a "config reload is off" line on a
+/// launch where nothing was wrong. Walking up to the first directory that exists
+/// (`~/.config`, or `~`, or `/` in the limit) always succeeds; the filename
+/// filter below is what keeps it from firing on anything but our file, exactly as
+/// before. A config created after launch is then picked up on the next start
+/// rather than live, which is the right trade for never having watched a config
+/// most people will not write.
 pub fn watch(
     path: &Path,
     mut on_change: impl FnMut() + Send + 'static,
@@ -830,10 +882,7 @@ pub fn watch(
     use notify::{EventKind, RecursiveMode, Watcher};
 
     let file = path.file_name().map(|f| f.to_owned());
-    let dir = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
+    let dir = nearest_existing_dir(path);
 
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         let Ok(event) = res else { return };
@@ -851,8 +900,23 @@ pub fn watch(
             on_change();
         }
     })?;
-    watcher.watch(dir, RecursiveMode::NonRecursive)?;
+    watcher.watch(&dir, RecursiveMode::NonRecursive)?;
     Ok(Box::new(watcher))
+}
+
+/// The first directory at or above `path`'s parent that exists on disk, so a
+/// watch of it cannot fail for a config whose directory has not been created.
+/// `.` for a bare filename, and `/` (or the root that exists) in the limit —
+/// which always exists, so this returns a real directory in every case.
+fn nearest_existing_dir(path: &Path) -> PathBuf {
+    let mut dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+    while let Some(d) = dir {
+        if d.is_dir() {
+            return d.to_path_buf();
+        }
+        dir = d.parent();
+    }
+    PathBuf::from(".")
 }
 
 #[cfg(test)]
@@ -862,6 +926,66 @@ mod tests {
 
     fn host() -> Host {
         Host::new()
+    }
+
+    #[test]
+    fn config_resolution_is_most_specific_first() {
+        let p = |s: &str| PathBuf::from(s);
+        let home = Some(p("/home/u"));
+        let xdg = Some(p("/xdg"));
+
+        // An explicit path wins over everything, even a present cwd file.
+        assert_eq!(
+            resolve(Some(p("/tmp/x.toml")), true, xdg.clone(), home.clone()),
+            p("/tmp/x.toml")
+        );
+        // A cwd file is the override when it exists — the dev loop.
+        assert_eq!(
+            resolve(None, true, xdg.clone(), home.clone()),
+            p("gitten.toml")
+        );
+        // Otherwise XDG, and gitten gets its own subdirectory.
+        assert_eq!(
+            resolve(None, false, xdg.clone(), home.clone()),
+            p("/xdg/gitten/gitten.toml")
+        );
+        // No XDG: ~/.config.
+        assert_eq!(
+            resolve(None, false, None, home.clone()),
+            p("/home/u/.config/gitten/gitten.toml")
+        );
+        // A relative XDG_CONFIG_HOME is invalid per the spec and ignored.
+        assert_eq!(
+            resolve(None, false, Some(p("relative/xdg")), home),
+            p("/home/u/.config/gitten/gitten.toml")
+        );
+        // Nothing to hang it off: the cwd name, so a stripped environment still
+        // gets a usable default rather than a panic.
+        assert_eq!(resolve(None, false, None, None), p("gitten.toml"));
+    }
+
+    #[test]
+    fn a_watch_dir_is_the_nearest_ancestor_that_exists() {
+        let root = std::env::temp_dir().join(format!("gitten-watchdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // The immediate parent exists: watch it.
+        let here = root.join("gitten.toml");
+        assert_eq!(nearest_existing_dir(&here), root);
+
+        // The parent does not exist yet (a config whose ~/.config/gitten has
+        // never been created): walk up to the first that does.
+        let deep = root.join("gitten").join("gitten.toml");
+        assert_eq!(nearest_existing_dir(&deep), root);
+
+        // A bare filename has no ancestor to speak of: the current directory.
+        assert_eq!(
+            nearest_existing_dir(Path::new("gitten.toml")),
+            PathBuf::from(".")
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

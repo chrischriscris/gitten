@@ -1336,16 +1336,6 @@ impl Pair {
     }
 }
 
-/// A diff, through whichever [`Differ`](gitten_core::differ::Differ) the host
-/// routed each path to.
-///
-/// `over` carries a frontend's live picks — the title-bar dropdowns — and
-/// `Overrides::default()` is the configured behaviour. It is here rather than
-/// folded into `differs` because the registry belongs to the shared `Host`, which
-/// is immutable and replaced wholesale on config reload; names are the only way
-/// to say "that registry, these choices" without building a copy of it and losing
-/// whatever an extension put in.
-///
 /// A free function over *any* [`Repo`], and deliberately not a method on the
 /// trait: which lines correspond is decided by the configured registry and only
 /// by it. A `Repo` implementation that answered with its own diff would make
@@ -2296,20 +2286,35 @@ fn is_binary(content: &[u8]) -> bool {
 /// one. A file that ends without one is indistinguishable here, which loses
 /// git's `\ No newline at end of file` — a gap, and the same one
 /// `parse_unified_diff` has.
+///
+/// **The carriage return of a CRLF line stays in the line.** Stripping it here
+/// is the plausible-looking bug: `\r` is *content*, git diffs it, and acquisition
+/// is not the layer that gets to decide it does not count. A commit that
+/// converts a file's endings then arrived as a file with no changes in it — git
+/// reporting three insertions and three deletions where this reported `+0 -0`,
+/// which reads exactly like a binary file and is the one shape a diff viewer must
+/// never produce. It also disagreed with [`crate::parse_unified_diff`], which
+/// keeps the byte: the same commit read one way from a repository and another
+/// from a `.diff` of itself.
+///
+/// Which leaves the presentation of a control character to a presentation, where
+/// it belongs — the terminal already substitutes `·` for one. And it puts the
+/// *choice* where the rule says it goes: ignoring a `\r` is
+/// [`Whitespace`](gitten_core::differ::Whitespace)'s to make, and every mode
+/// above `Exact` trims it for free because `\r` is whitespace.
 fn lines(content: &[u8]) -> Vec<Arc<str>> {
     let text = String::from_utf8_lossy(content);
     let text = text.strip_suffix('\n').unwrap_or(&text);
     if text.is_empty() && content.is_empty() {
         return Vec::new();
     }
-    text.split('\n')
-        .map(|l| Arc::from(l.strip_suffix('\r').unwrap_or(l)))
-        .collect()
+    text.split('\n').map(Arc::from).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gitten_core::differ::Whitespace;
     use gitten_core::refs::RefName;
 
     /// A throwaway repository, because untracked files and conflicts are the
@@ -3520,11 +3525,46 @@ mod tests {
         assert_eq!(strs(&lines(b"a\nb")), ["a", "b"]);
         assert_eq!(lines(b""), Vec::<Arc<str>>::new());
         assert_eq!(strs(&lines(b"\n")), [""], "a file of one blank line");
-        assert_eq!(
-            strs(&lines(b"a\r\nb\r\n")),
-            ["a", "b"],
-            "CRLF is not part of the line"
-        );
+    }
+
+    #[test]
+    fn a_carriage_return_stays_in_the_line() {
+        // The whole of the CRLF bug in one assertion. Strip it here and a commit
+        // that converts a file's line endings has nothing in it: every line
+        // compares equal, the differ finds no edits, and the file draws as
+        // `+0 -0` with no hunks — indistinguishable from a binary file.
+        assert_eq!(strs(&lines(b"a\r\nb\r\n")), ["a\r", "b\r"]);
+        // And the two sides then differ, which is the point.
+        assert_ne!(lines(b"a\n"), lines(b"a\r\n"));
+    }
+
+    #[test]
+    fn ignoring_a_carriage_return_is_the_whitespace_relations_job() {
+        // `Exact` sees it — that is what makes the diff agree with git. Every
+        // mode above `Exact` trims it, because `\r` is whitespace, so
+        // `--ignore-space-at-eol` collapses a line-ending change exactly as
+        // git's does. No mode in between, and nothing hardcoded in acquisition.
+        let lf = lines(b"alpha\nbeta\n");
+        let crlf = lines(b"alpha\r\nbeta\r\n");
+        let differs = Differs::default();
+        let edits = |ws| {
+            differs
+                .file_using(
+                    &Overrides {
+                        whitespace: Some(ws),
+                        ..Default::default()
+                    },
+                    "f.txt",
+                    &lf,
+                    &crlf,
+                )
+                .hunks
+                .len()
+        };
+        assert_eq!(edits(Whitespace::Exact), 1, "exact must see the change");
+        for ws in [Whitespace::Trailing, Whitespace::Change, Whitespace::All] {
+            assert_eq!(edits(ws), 0, "{} did not trim the CR", ws.name());
+        }
     }
 
     #[test]

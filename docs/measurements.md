@@ -363,9 +363,9 @@ Two commits, reviewed together because they share a measurement session:
 borrowed graph lane IDs, a flattened LCS table and token buffer,
 allocation-free syntax routing behind lexer category gates, and a byte-length
 fast path in `clip` (`core`); labels, untracked status and the tui's watcher run
-beside acquisition instead of behind it, the desktop window opens before
-acquisition finishes, and `GITTEN_START_LOG=1` prints per-stage startup timings
-(`app`, `git`, `shell`, `tui`). Outputs are byte-identical either side: 1,000,000
+beside acquisition instead of behind it, and `GITTEN_START_LOG=1` prints per-stage
+startup timings (`app`, `git`, `shell`, `tui`). Outputs are byte-identical either
+side: 1,000,000
 commits / widest 21 lanes; 928,577 lines / 5,953 files / 142,858 replace-pairs /
 2,071,441 tokens / 0 wrap rejections.
 
@@ -482,6 +482,146 @@ unlike `align`'s usual 13–27 % CV these two rows are real effects.
 
 Diffing answers did not move: `./check.sh`'s `differs vs git` section ran on the
 merged tree and matches the tolerance profile in the section above exactly.
+
+### One hasher, everywhere
+
+`FxHasher` was written for `parse_log`'s author map and stayed there. Every other
+intern map in `core` was still on `HashMap`'s default SipHash — including the
+**line** map, which is the hottest map in the application, and which additionally
+started at zero capacity and rehashed its way up once per file.
+
+```sh
+cargo run -q -p gitten-git --example diffcheck --release . 6401fcd~4..6401fcd
+```
+
+94 files, 50,103 old lines, 50,434 new. Same binary configuration, same revspec,
+`main` against the change, back to back:
+
+| mode | before | after | Δ |
+|---|---|---|---|
+| `histogram` | 14.4 ms | 6.4 ms | **−56 %** |
+| `patience` | 14.2 ms | 5.9 ms | **−58 %** |
+| `myers` | 6.9 ms | 3.8 ms | −45 % |
+| `ws-eol` | 32.1 ms | 13.3 ms | **−59 %** |
+| `ws-change` | 44.5 ms | 20.7 ms | −53 % |
+| `ws-all` | 34.0 ms | 18.9 ms | −44 % |
+
+Per fixture, whole-file histogram diffs over both reconstructed sides:
+
+| fixture | lines | before | after |
+|---|---|---|---|
+| `pr33933.diff` | 20,877 | 1.5 ms | 0.7 ms |
+| `pr30698.diff` | 82,258 | 34.1 ms | 17.3 ms |
+| `md.diff` | 94,614 | 52.1 ms | 24.3 ms |
+| `pr30683.diff` | 715,406 | 45.7 ms | 20.9 ms |
+
+**Answers are unchanged**, which is the only reason the number counts: `diffcheck`
+reports the same changed-line counts *and the same hunk positions* against all six
+git invocations, matching the tolerance profile in
+[the differs section](#the-differs-against-git) exactly.
+
+Half the differ, for a type alias. Two things are worth taking from it rather
+than the number. The whitespace rows moved most because `KeyArena` was hashing
+**twice** — SipHash over the key to get a `u64`, then SipHash over that `u64` to
+place it — so the mode that normalises every line paid for it twice per line. And
+those rows are still 2–3× `Exact`, because a whitespace key is interned twice over:
+once by `KeyArena` into an `Arc<str>` and again by the line map. Having
+`Whitespace::keys` yield ids directly removes a whole pass and is the next thing
+here.
+
+### `prepare`, across cores
+
+A file is independent of every other file, so `prepare` was one core doing what
+ten can. Workers pull the next file off an atomic counter rather than taking a
+contiguous chunk each — files are wildly uneven and static chunking measured
+**2.1×** on `md.diff` where stealing measures 6.3×, because one of that fixture's
+229 files is most of its work.
+
+```sh
+cp fixtures/real/md.diff fixtures/big.diff
+cargo run -q -p gitten-core --example bench --release   # the `prepare` line
+```
+
+Wall clock for the whole call, 10 workers, `main` against the change:
+
+| fixture | files | lines | before | after | Δ |
+|---|---|---|---|---|---|
+| `md.diff` | 229 | 71,756 | 73.0 ms | **11.6 ms** | 6.3× |
+| `pr30698.diff` | 1,398 | 50,604 | 68.6 ms | **12.9 ms** | 5.3× |
+| `pr30683.diff` | 1,375 | 713,996 | 314.0 ms | **77.5 ms** | 4.1× |
+| `pr33933.diff` | 35 | 20,831 | 5.6 ms | **2.1 ms** | 2.7× |
+
+Two things the table does not say. **CPU time goes up**: `md.diff`'s intraline
+sum moved 55.4 → 75.9 ms across ten workers, which is contention and allocator
+pressure paid to get the wall clock down, and is the right trade for a load. And
+**the numbers stop adding up** — `prepare` is wall clock, `intraline` and
+`syntax` are summed across workers, so the example prints `×N cpu` next to them;
+without it the pass reads as a broken measurement rather than a parallel one.
+
+`parallel_and_serial_agree_exactly` compares the whole `Vec<File>` against the
+serial path on a 40-file fixture whose largest file is forty times its smallest,
+so results genuinely complete out of order. Rows address files by index, which is
+why the guarantee is order-for-order identity and not just set equality.
+
+A **single-file** diff gets nothing: the unit of work is a file. Stealing hunks
+instead would fix that and needs the per-file timing accumulation to move.
+
+### Acquisition peak, streamed vs collected
+
+`pairs` built a `Vec<Pair>` holding both sides of every changed file at once,
+which put back exactly the peak `BlobStream` was written to avoid. `each_pair`
+hands each pair to `diff`, which diffs it and drops it, so the peak is one file's
+content plus the whole edit script rather than every file's content plus the edit
+script.
+
+```sh
+COLS=120 ROWS=40 /usr/bin/time -l \
+  ./target/release/examples/dump diff ~/Projects/cmux HEAD~40..HEAD   # peak footprint
+```
+
+Peak memory footprint, `main` against the change:
+
+| input | changed files | before | after |
+|---|---|---|---|
+| `cmux HEAD~40..HEAD` | 482 | 113 MB | **81 MB** |
+| this repo, whole history | 94 | 24 MB | **21 MB** |
+
+The win tracks how much of each file is context rather than change: a `FileDiff`
+keeps only changed lines and their surroundings, so the 990 untouched lines of a
+1,000-line file are read, compared, and freed — which only happens if the pair
+they came in is freed too. `pairs` is kept for the test and `diffcheck`, which
+want the list and are small enough that the pile is free.
+
+### Why the line-text arena was reverted
+
+The obvious next memory move — replace the 714k per-line `Arc<str>` with slices
+into one arena per file — was built, measured, and reverted. See
+[decision 0026](decisions/0026-line-text-is-not-the-memory-to-save.md); the
+numbers are here.
+
+A counting global allocator over the pipeline stages (`pr30683.diff --patch`,
+714k lines) attributes the peak:
+
+| stage | live | note |
+|---|---|---|
+| raw read | 27.9 MB | the patch text |
+| parsed → `Vec<FileDiff>` | 108 MB | +80 MB: `Arc<str>` text, `DiffLine`s, vecs |
+| `prepare` | 147 MB | +65 MB: **~1.06M `Box<[Token]>`/`Box<[Span]>`**, tokens, clipped text |
+
+The arena did what it claimed — parse allocations **727,987 → 13,992 (−98 %)**,
+byte-identical diffs vs git — and it still lost:
+
+| path | metric | before | after |
+|---|---|---|---|
+| patch (`pr30683 --patch`) | RSS | 330 MB | 312 MB (−5.7 %) |
+| **repo (`cmux HEAD~120..HEAD`)** | **RSS** | **149 MB** | **192 MB (+29 %)** |
+
+The repository regression is the arena pinning its whole backing buffer: one
+surviving context-line slice holds the entire file resident, un-freeing exactly
+what the streaming change above releases. And the −5.7 % on the patch path shows
+line text was never the fragmentation — the ~1.06M token/span boxes in `prepare`
+are, and the arena does not touch them. That is the target a future memory pass
+should measure against, not the line text.
 
 ### Topology
 

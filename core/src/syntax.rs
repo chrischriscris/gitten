@@ -332,8 +332,22 @@ impl Languages {
 /// Lines, not a file, because that is what a diff has. Implementations that
 /// want a whole file (a tree-sitter one, say) can still stitch these together
 /// or fetch the blob themselves; the frontend never learns which happened.
-/// Thread safety lets diff preparation retain the configured implementation
-/// while it runs in a pane's background refresh.
+/// A highlighter turns one line of one language into styled spans.
+///
+/// # Why `Sync` (and `Send`)
+///
+/// [`prepare`](crate::prepared::prepare) highlights files in parallel, and one
+/// `&dyn Highlighter` is shared by every worker — which needs this bound and
+/// nothing else. It is a real constraint on an implementation and it is worth
+/// naming rather than discovering: a highlighter may not keep mutable state
+/// behind a `Cell`, and one that wants a cache needs a lock or one instance per
+/// call.
+///
+/// `Send` is the pane's addition: a repository pane's background refresh takes
+/// the configured implementation across a thread boundary, so the whole host
+/// must be movable. Both bounds are free for anything already written as a pure
+/// function of its input, which is what `highlight(&self, …)` already looks
+/// like. Both built-ins satisfy them without a line changing.
 pub trait Highlighter: Send + Sync {
     fn highlight(&self, path: &str, lines: &[&str]) -> Vec<Vec<Token>>;
 }

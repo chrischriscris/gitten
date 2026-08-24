@@ -1372,6 +1372,7 @@ fn assemble_prepared(
         files: prepared,
         intraline,
         syntax,
+        threads,
     } = prepared;
     let file_count = prepared.len();
 
@@ -1400,7 +1401,16 @@ fn assemble_prepared(
     // runs it again.
     let (Ordered { order, widest, .. }, headers) = expand(&order, &renderers, None);
 
-    let mut reports: Vec<String> = vec![format!("intraline {intraline:.0?} · syntax {syntax:.0?}")];
+    // `cpu across N` when the pass fanned out, because these are summed across
+    // workers and `build` beside them is wall clock — without the note the two
+    // numbers read as a contradiction rather than as a speed-up.
+    let cpu = match threads > 1 {
+        true => format!(" cpu across {threads}"),
+        false => String::new(),
+    };
+    let mut reports: Vec<String> = vec![format!(
+        "intraline {intraline:.0?} · syntax {syntax:.0?}{cpu}"
+    )];
     reports.extend(
         renderers
             .iter()
