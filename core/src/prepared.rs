@@ -14,6 +14,7 @@
 
 use crate::syntax::{highlight_hunk, Highlighter, Token};
 use crate::{intraline, replace_pairs, FileDiff, LineKind, Span};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -61,8 +62,22 @@ pub struct File {
 #[derive(Debug, Clone)]
 pub struct Prepared {
     pub files: Vec<File>,
+    /// **CPU time, summed across workers — not wall clock.** [`prepare`] runs
+    /// files in parallel, so this is what the pass cost and not how long you
+    /// waited for it; on a ten-core machine the two differ by most of an order
+    /// of magnitude, and `intraline + syntax` no longer adds up to the duration
+    /// of the `prepare` call that produced them.
+    ///
+    /// Summed rather than wall-clocked on purpose: it is the number that is
+    /// comparable between runs and between fixtures, which is what every caller
+    /// reports it for. Wall clock is the caller's own `Instant` around the call,
+    /// and [`Prepared::threads`] is what says how far apart the two should be.
     pub intraline: Duration,
+    /// CPU time, summed across workers. See [`Prepared::intraline`].
     pub syntax: Duration,
+    /// How many workers ran, so a reader can tell a slow pass from a wide one.
+    /// 1 when the diff was small enough to do in place.
+    pub threads: usize,
 }
 
 impl Prepared {
@@ -112,72 +127,191 @@ pub fn clip(s: &Arc<str>, max_chars: usize) -> Arc<str> {
     ))
 }
 
-pub fn prepare(files: &[FileDiff], hl: &dyn Highlighter, max_line_chars: usize) -> Prepared {
-    let mut out = Vec::with_capacity(files.len());
+/// Below this many lines, do it in place.
+///
+/// Spawning a handful of threads and joining them is tens of microseconds, which
+/// is worth it against a diff that takes milliseconds and pure loss against one
+/// that takes less. Lines and not *files*, because file count says nothing about
+/// the work: `md.diff` is 229 files and 94k lines, and one of those files is most
+/// of it.
+const PARALLEL_ABOVE: usize = 2_000;
+
+/// One file: clip, intraline, highlight. The whole of what [`prepare`] does,
+/// factored out because it is also the unit of work handed to a worker — and
+/// because a file is genuinely independent of every other file, which is the
+/// property the parallelism rests on and the reason it needs no locking.
+fn one_file(
+    f: &FileDiff,
+    hl: &dyn Highlighter,
+    max_line_chars: usize,
+) -> (File, Duration, Duration) {
     let mut intraline_time = Duration::ZERO;
     let mut syntax_time = Duration::ZERO;
 
-    for f in files {
-        let all = || f.hunks.iter().flat_map(|h| &h.lines);
-        let adds = all().filter(|l| l.kind == LineKind::Added).count();
-        let dels = all().filter(|l| l.kind == LineKind::Removed).count();
-        let mut hunks = Vec::with_capacity(f.hunks.len());
+    let all = || f.hunks.iter().flat_map(|h| &h.lines);
+    let adds = all().filter(|l| l.kind == LineKind::Added).count();
+    let dels = all().filter(|l| l.kind == LineKind::Removed).count();
+    let mut hunks = Vec::with_capacity(f.hunks.len());
 
-        for h in &f.hunks {
-            let mut texts: Vec<Arc<str>> = h
-                .lines
-                .iter()
-                .map(|l| clip(&l.text, max_line_chars))
-                .collect();
+    for h in &f.hunks {
+        let mut texts: Vec<Arc<str>> = h
+            .lines
+            .iter()
+            .map(|l| clip(&l.text, max_line_chars))
+            .collect();
 
-            // Second pass: only the removed/added pairs a line diff already
-            // matched get word-level spans.
-            let mut spans: Vec<Vec<Span>> = vec![Vec::new(); h.lines.len()];
-            let t = Instant::now();
-            for (d, a) in replace_pairs(h) {
-                let (o, n) = intraline(&texts[d], &texts[a]);
-                spans[d] = o;
-                spans[a] = n;
-            }
-            intraline_time += t.elapsed();
-
-            let t = Instant::now();
-            let refs: Vec<&str> = texts.iter().map(|t| &**t).collect();
-            let kinds: Vec<LineKind> = h.lines.iter().map(|l| l.kind).collect();
-            let mut tokens = highlight_hunk(hl, &f.path, &refs, &kinds);
-            syntax_time += t.elapsed();
-
-            let lines = h
-                .lines
-                .iter()
-                .enumerate()
-                .map(|(i, l)| Line {
-                    kind: l.kind,
-                    moved: l.moved,
-                    old_no: l.old_no,
-                    new_no: l.new_no,
-                    text: std::mem::take(&mut texts[i]),
-                    spans: std::mem::take(&mut spans[i]).into_boxed_slice(),
-                    tokens: std::mem::take(&mut tokens[i]).into_boxed_slice(),
-                })
-                .collect();
-            hunks.push(Hunk {
-                header: h.header.clone(),
-                lines,
-            });
+        // Second pass: only the removed/added pairs a line diff already
+        // matched get word-level spans.
+        let mut spans: Vec<Vec<Span>> = vec![Vec::new(); h.lines.len()];
+        let t = Instant::now();
+        for (d, a) in replace_pairs(h) {
+            let (o, n) = intraline(&texts[d], &texts[a]);
+            spans[d] = o;
+            spans[a] = n;
         }
-        out.push(File {
-            path: f.path.clone(),
-            adds,
-            dels,
-            hunks,
+        intraline_time += t.elapsed();
+
+        let t = Instant::now();
+        let refs: Vec<&str> = texts.iter().map(|t| &**t).collect();
+        let kinds: Vec<LineKind> = h.lines.iter().map(|l| l.kind).collect();
+        let mut tokens = highlight_hunk(hl, &f.path, &refs, &kinds);
+        syntax_time += t.elapsed();
+
+        let lines = h
+            .lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| Line {
+                kind: l.kind,
+                moved: l.moved,
+                old_no: l.old_no,
+                new_no: l.new_no,
+                text: std::mem::take(&mut texts[i]),
+                spans: std::mem::take(&mut spans[i]).into_boxed_slice(),
+                tokens: std::mem::take(&mut tokens[i]).into_boxed_slice(),
+            })
+            .collect();
+        hunks.push(Hunk {
+            header: h.header.clone(),
+            lines,
         });
     }
+    let file = File {
+        path: f.path.clone(),
+        adds,
+        dels,
+        hunks,
+    };
+    (file, intraline_time, syntax_time)
+}
 
+/// A diff into rows, one file at a time — on as many cores as there are.
+///
+/// # Why this is where the threads are
+///
+/// A file is independent of every other file: nothing in [`one_file`] reads
+/// another file's output, and the two expensive passes are pure functions of one
+/// hunk's text. So this was one core doing 179 ms of work that ten cores can do
+/// in 67, and it was the largest single thing between a keystroke and a redrawn
+/// diff.
+///
+/// Threads in `core` are not a boundary violation — the rule is that `core` may
+/// not know a UI exists, and a thread is arithmetic, not I/O. Putting them here
+/// rather than in each client is the same argument as everything else in this
+/// module: three frontends need the identical answer, and one that had to write
+/// its own fan-out is one that would get the ordering wrong.
+///
+/// # Work stealing, not chunks
+///
+/// Workers pull the next file off a shared counter rather than taking a
+/// contiguous slice each. Files are wildly uneven — `md.diff` is 229 files and
+/// one of them is most of the work — so static chunks leave nine cores idle
+/// while one finishes, and measured 2.1× where stealing measures better. It is
+/// four lines of `AtomicUsize` either way.
+///
+/// # The output is order-for-order identical to doing it serially
+///
+/// Rows address files by index and a client caches by it, so a reordered
+/// `files` is not a cosmetic difference — it is every row pointing at the wrong
+/// file. Workers therefore carry each result's index with it and the whole lot
+/// is sorted back before it is returned, which costs one sort of a few thousand
+/// small items and buys a guarantee. `parallel_and_serial_agree_exactly` is the
+/// test, and it compares the `Vec<File>`s whole rather than sampling.
+///
+/// **A single-file diff gets nothing from this.** The unit of work is a file, so
+/// one 700k-line file is still one core. Stealing hunks instead would fix that
+/// and is the next thing here; it needs the per-file timing accumulation to move,
+/// which is why it is not in this pass.
+pub fn prepare(files: &[FileDiff], hl: &dyn Highlighter, max_line_chars: usize) -> Prepared {
+    let lines: usize = files
+        .iter()
+        .flat_map(|f| &f.hunks)
+        .map(|h| h.lines.len())
+        .sum();
+    let workers = match lines > PARALLEL_ABOVE && files.len() > 1 {
+        true => std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(files.len()),
+        false => 1,
+    };
+
+    if workers <= 1 {
+        let mut out = Vec::with_capacity(files.len());
+        let (mut intra, mut syn) = (Duration::ZERO, Duration::ZERO);
+        for f in files {
+            let (file, i, s) = one_file(f, hl, max_line_chars);
+            out.push(file);
+            intra += i;
+            syn += s;
+        }
+        return Prepared {
+            files: out,
+            intraline: intra,
+            syntax: syn,
+            threads: 1,
+        };
+    }
+
+    let next = AtomicUsize::new(0);
+    let batches: Vec<Vec<(usize, File, Duration, Duration)>> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                s.spawn(|| {
+                    let mut mine = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(f) = files.get(i) else { break };
+                        let (file, intra, syn) = one_file(f, hl, max_line_chars);
+                        mine.push((i, file, intra, syn));
+                    }
+                    mine
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            // Resumed rather than swallowed, exactly as when this was one loop
+            // on the caller's thread: a panic in the highlighter is a bug to see,
+            // not a diff to silently truncate.
+            .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+            .collect()
+    });
+
+    let mut done: Vec<(usize, File, Duration, Duration)> = batches.into_iter().flatten().collect();
+    done.sort_unstable_by_key(|(i, ..)| *i);
+    let (mut intra, mut syn) = (Duration::ZERO, Duration::ZERO);
+    let mut out = Vec::with_capacity(done.len());
+    for (_, file, i, s) in done {
+        out.push(file);
+        intra += i;
+        syn += s;
+    }
     Prepared {
         files: out,
-        intraline: intraline_time,
-        syntax: syntax_time,
+        intraline: intra,
+        syntax: syn,
+        threads: workers,
     }
 }
 
@@ -198,6 +332,73 @@ index 1111111..2222222 100644
 +    let y = 1; // old
  }
 ";
+
+    /// A diff big enough to cross [`PARALLEL_ABOVE`], across enough files to
+    /// give the workers something to steal, with sizes deliberately uneven so
+    /// they finish out of order.
+    fn wide_diff() -> String {
+        let mut raw = String::new();
+        for f in 0..40 {
+            raw.push_str(&format!("diff --git a/f{f}.rs b/f{f}.rs\n"));
+            // 1 to 40 hunks: the last file is forty times the first, so whoever
+            // takes it finishes long after everyone else.
+            for h in 0..=f {
+                raw.push_str(&format!("@@ -{},3 +{},3 @@\n", h * 10 + 1, h * 10 + 1));
+                raw.push_str(&format!(" fn keep{h}() {{}}\n"));
+                raw.push_str(&format!("-    let was = {h}; // old\n"));
+                raw.push_str(&format!("+    let now = {h}; // old\n"));
+            }
+        }
+        raw
+    }
+
+    #[test]
+    fn parallel_and_serial_agree_exactly() {
+        // The property the whole fan-out rests on. Rows address files by index
+        // and a client caches by it, so a reordered `files` is not cosmetic —
+        // it is every row pointing at the wrong file. Compared whole rather
+        // than sampled, because the interesting failure is one file in forty.
+        let hl = Highlighters::builtin();
+        let files = parse_unified_diff(&wide_diff());
+        let parallel = prepare(&files, &hl, 2000);
+        assert!(
+            parallel.threads > 1,
+            "the fixture did not reach the parallel path"
+        );
+
+        // The serial path, reached the way a real caller reaches it: one file at
+        // a time, which is also what a diff under the threshold does.
+        let mut serial = Vec::new();
+        for f in &files {
+            serial.push(one_file(f, &hl, 2000).0);
+        }
+        assert_eq!(parallel.files, serial);
+    }
+
+    #[test]
+    fn a_small_diff_is_not_worth_a_thread() {
+        let hl = Highlighters::builtin();
+        let p = prepare(&parse_unified_diff(SAMPLE), &hl, 2000);
+        assert_eq!(p.threads, 1, "four lines spawned a thread pool");
+    }
+
+    #[test]
+    fn the_timings_are_cpu_time_and_say_how_many_workers_earned_them() {
+        // The one behavioural consequence a reader has to know about: these no
+        // longer sum to the wall clock of the call. Assert the relationship
+        // rather than a duration, so it holds on any machine.
+        let hl = Highlighters::builtin();
+        let files = parse_unified_diff(&wide_diff());
+        let wall = Instant::now();
+        let p = prepare(&files, &hl, 2000);
+        let wall = wall.elapsed();
+        assert!(p.threads > 1);
+        assert!(
+            p.intraline + p.syntax <= wall * p.threads as u32,
+            "summed CPU exceeded what {} workers could have spent in {wall:?}",
+            p.threads
+        );
+    }
 
     #[test]
     fn one_pass_produces_text_spans_and_tokens_together() {

@@ -213,6 +213,113 @@ mod tests {
         }
     }
 
+    /// A throwaway repository, for the one property that needs two doors and a
+    /// real commit to check.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("gitten-app-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("a temp dir");
+            let me = Scratch(dir);
+            me.git(&["init", "-q", "."]);
+            // Never rewrite endings on the way in or out: this repository exists
+            // to hold the exact bytes it was given.
+            me.git(&["config", "core.autocrlf", "false"]);
+            me
+        }
+
+        fn git(&self, args: &[&str]) -> String {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&self.0)
+                .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        }
+
+        fn commit(&self, content: &[u8]) {
+            std::fs::write(self.0.join("f.txt"), content).expect("wrote the file");
+            self.git(&["add", "f.txt"]);
+            self.git(&["commit", "-qm", "x"]);
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn lines_of(loaded: &Loaded) -> Vec<(gitten_core::LineKind, String)> {
+        match &loaded.data {
+            Data::Diff(files) => files
+                .iter()
+                .flat_map(|f| &f.hunks)
+                .flat_map(|h| &h.lines)
+                .map(|l| (l.kind, l.text.to_string()))
+                .collect(),
+            Data::Commits(_) => Vec::new(),
+        }
+    }
+
+    /// **The two doors must describe the same commit identically.** A repository
+    /// and a `.diff` of that repository are the same change arriving by different
+    /// routes, and for a long time they disagreed: acquisition stripped the `\r`
+    /// of a CRLF line and `parse_unified_diff` did too, by different mechanisms
+    /// and with different consequences. The repository door reported a changed
+    /// file with `+0 -0` and no hunks — indistinguishable from a binary file —
+    /// while the patch door reported the right counts over the wrong text.
+    ///
+    /// Line endings are what makes this checkable at all: it is the one change
+    /// git can express that lives entirely in the bytes a careless parser drops.
+    #[test]
+    fn a_line_ending_change_reads_the_same_from_a_repo_and_from_a_patch_of_it() {
+        let host = Host::new();
+        let repo = Scratch::new("crlf");
+        repo.commit(b"alpha\nbeta\ngamma\n");
+        repo.commit(b"alpha\r\nbeta\r\ngamma\r\n");
+
+        let from_repo = acquire(
+            View::Diff,
+            &Source::Repo {
+                path: repo.0.clone(),
+                arg: "HEAD~1..HEAD".into(),
+            },
+            &host,
+        )
+        .expect("the repository has the change");
+
+        // git's own answer, as the arbiter neither door gets to argue with.
+        let numstat = repo.git(&["diff", "--numstat", "HEAD~1..HEAD"]);
+        assert!(numstat.starts_with("3\t3\t"), "git said {numstat:?}");
+
+        let patch = repo.0.join("crlf.diff");
+        std::fs::write(&patch, repo.git(&["diff", "HEAD~1..HEAD"])).expect("wrote the patch");
+        let from_patch = acquire(View::Diff, &Source::Patch { file: Some(patch) }, &host)
+            .expect("the patch parses");
+
+        let expected = [
+            (gitten_core::LineKind::Removed, "alpha".to_string()),
+            (gitten_core::LineKind::Removed, "beta".to_string()),
+            (gitten_core::LineKind::Removed, "gamma".to_string()),
+            (gitten_core::LineKind::Added, "alpha\r".to_string()),
+            (gitten_core::LineKind::Added, "beta\r".to_string()),
+            (gitten_core::LineKind::Added, "gamma\r".to_string()),
+        ];
+        assert_eq!(lines_of(&from_repo), expected, "the repository door");
+        assert_eq!(lines_of(&from_patch), expected, "the patch door");
+    }
+
     #[test]
     fn a_diff_of_this_repository_arrives_as_parsed_files() {
         let host = Host::new();

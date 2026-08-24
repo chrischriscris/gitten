@@ -167,8 +167,19 @@ function rowAt(index) {
 
 // ----------------------------------------------------------------- the drawing
 
-const escape = (s) =>
-  s.replace(/[&<>]/g, (c) => (c === "&" ? "&amp;" : c === "<" ? "&lt;" : "&gt;"));
+/** Text into HTML, safe in an attribute as well as in an element.
+ *
+ *  The quotes are not decoration. This escaped `& < >` only, and a commit author
+ *  name goes into a `title="…"` — so a name containing a double quote closed the
+ *  attribute and everything after it became markup:
+ *
+ *      X" onmouseover="alert(document.domain)" x=
+ *
+ *  which is a live event handler, from a commit in a repository somebody cloned,
+ *  fired by hovering the initials. Repository content is attacker-controlled in
+ *  the only workflow this client has, so every sink takes the same five. */
+const ESCAPES = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+const escape = (s) => String(s).replace(/[&<>"']/g, (c) => ESCAPES[c]);
 
 /** Which background a piece of text lands on, and therefore which resolved
  *  syntax colour it takes. The shell's own mapping, and it has to stay the

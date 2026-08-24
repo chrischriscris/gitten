@@ -41,21 +41,30 @@ pub struct Commit {
     pub subject: String,
 }
 
-/// Parses the output of `fixtures/dump.sh` (see that script for the format).
-/// Fields are \x1f-separated, records \x1e-separated — control characters git
-/// will never emit inside a subject, so there is nothing to escape.
-/// The hash behind the author intern map: rustc's own Fx construction, a
-/// rotate-xor-multiply over eight-byte chunks. `HashMap`'s default SipHash
-/// cost more per lookup than the rest of the interning put together on short
-/// names — measured at about a third of `parse_log`'s regression before this
-/// replaced it. Not cryptographic, and it does not need to be: a collision
-/// only costs a probe, because the map compares the real bytes either way.
+/// The hash behind every intern map in this crate: rustc's own Fx construction,
+/// a rotate-xor-multiply over eight-byte chunks.
+///
+/// `HashMap`'s default SipHash cost more per lookup than the rest of the
+/// interning put together on short keys — measured at about a third of
+/// `parse_log`'s regression before this replaced it, and at **half of the
+/// differ's whole runtime** when it reached the line-intern map too (see
+/// `docs/measurements.md`). Not cryptographic, and it does not need to be: a
+/// collision only costs a probe, because the map compares the real bytes either
+/// way. Nothing here hashes anything an attacker chooses *and* keeps, which is
+/// the only reason SipHash's flooding resistance would be worth paying for.
+///
 /// The 0xff terminator keeps `"ab" + "c"` and `"abc"` apart in one stream, as
 /// `str`'s default hash does.
 #[derive(Default)]
-struct FxHasher {
+pub(crate) struct FxHasher {
     hash: u64,
 }
+
+/// A `HashMap` on [`FxHasher`]. A named alias rather than the bound spelled out
+/// at each use, because the point is that every intern map in the crate is the
+/// *same* map — the line map having quietly stayed on SipHash while the author
+/// map moved is exactly what this prevents.
+pub(crate) type FxHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
 const FX_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
 
@@ -77,6 +86,10 @@ impl Hasher for FxHasher {
     }
 }
 
+/// Parses the output of `fixtures/dump.sh` (see that script for the format).
+///
+/// Fields are \x1f-separated, records \x1e-separated — control characters git
+/// will never emit inside a subject, so there is nothing to escape.
 pub fn parse_log(raw: &str) -> Vec<Commit> {
     // Counting separators first costs one byte scan and buys a right-sized
     // vector: at 100k commits the growth path was re-copying the whole list
@@ -88,8 +101,8 @@ pub fn parse_log(raw: &str) -> Vec<Commit> {
     // and sized for a real history up front: growing this table mid-parse
     // rehashed everything parsed so far, twice, on the way to a few thousand
     // authors.
-    let mut authors: HashMap<&str, Arc<str>, BuildHasherDefault<FxHasher>> =
-        HashMap::with_capacity_and_hasher(4096, BuildHasherDefault::default());
+    let mut authors: FxHashMap<&str, Arc<str>> =
+        FxHashMap::with_capacity_and_hasher(4096, BuildHasherDefault::default());
     for rec in raw.split('\u{1e}') {
         let rec = rec.trim();
         if rec.is_empty() {
@@ -278,13 +291,50 @@ pub struct FileDiff {
     pub hunks: Vec<Hunk>,
 }
 
+/// Whether a patch's own line terminators are CRLF, decided once for the whole
+/// file rather than per line — because per line it is not decidable.
+///
+/// A content line of a CRLF *file* ends with `\r` inside the patch; so does every
+/// line of a patch that was itself saved with CRLF terminators. The two are
+/// indistinguishable in isolation, and guessing per line means a patch of a
+/// Windows file loses the very bytes it is about. The whole file settles it: if
+/// *every* line carries a `\r` then the `\r` is punctuation, and if any line does
+/// not then the ones that do are content. This is the rule `git apply` uses, and
+/// it is why the decision is taken before a single line is parsed.
+fn crlf_terminated(raw: &str) -> bool {
+    let mut any = false;
+    for line in raw.split('\n') {
+        // The empty tail after a trailing newline is not a line.
+        if line.is_empty() {
+            continue;
+        }
+        if !line.ends_with('\r') {
+            return false;
+        }
+        any = true;
+    }
+    any
+}
+
 /// Parses `git diff` unified output. Enough for the spike; binary files,
 /// renames and mode changes are skipped rather than modelled.
+///
+/// **A `\r` that is content stays in the line.** `str::lines()` was what this
+/// used, and it strips a trailing `\r` unconditionally — so every line of a patch
+/// of a CRLF file silently lost the byte the patch existed to show, and the
+/// repository door (which keeps it, see `gitten_git`) and this one disagreed
+/// about the text of the same commit. See [`crlf_terminated`] for how the
+/// ambiguity is settled.
 pub fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
     let mut files: Vec<FileDiff> = Vec::new();
     let (mut old_no, mut new_no) = (0u32, 0u32);
+    let strip_cr = crlf_terminated(raw);
 
-    for line in raw.lines() {
+    for line in raw.split('\n') {
+        let line = match strip_cr {
+            true => line.strip_suffix('\r').unwrap_or(line),
+            false => line,
+        };
         if let Some(rest) = line.strip_prefix("diff --git ") {
             let path = rest
                 .split_whitespace()
@@ -601,6 +651,60 @@ mod tests {
             timestamp: 0,
             subject: "s".into(),
         }
+    }
+
+    /// The text of every line of a parsed patch, in order.
+    fn texts(files: &[FileDiff]) -> Vec<String> {
+        files
+            .iter()
+            .flat_map(|f| &f.hunks)
+            .flat_map(|h| &h.lines)
+            .map(|l| l.text.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_carriage_return_that_is_content_survives_the_patch_parser() {
+        // A patch of a file whose endings changed: the `-` lines are LF and the
+        // `+` lines carry a CR *inside* the patch. `str::lines()` ate it, which
+        // made this door disagree with the repository door about the text of the
+        // same commit — and a patch of a CRLF file lose the byte it is about.
+        let raw = "diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n\
+                   @@ -1,2 +1,2 @@\n-alpha\n-beta\n+alpha\r\n+beta\r\n";
+        assert_eq!(
+            texts(&parse_unified_diff(raw)),
+            ["alpha", "beta", "alpha\r", "beta\r"]
+        );
+    }
+
+    #[test]
+    fn a_patch_saved_with_crlf_terminators_keeps_none_of_them() {
+        // Every line ends with `\r`, so every `\r` is punctuation — including the
+        // one on the path, which would otherwise put a control character in a
+        // file name.
+        let raw = "diff --git a/f.txt b/f.txt\r\n--- a/f.txt\r\n+++ b/f.txt\r\n\
+                   @@ -1,1 +1,1 @@\r\n-alpha\r\n+beta\r\n";
+        let files = parse_unified_diff(raw);
+        assert_eq!(files[0].path, "f.txt", "a CR reached the path");
+        assert_eq!(texts(&files), ["alpha", "beta"]);
+    }
+
+    #[test]
+    fn a_crlf_patch_of_a_crlf_file_keeps_the_inner_carriage_return() {
+        // Both at once: the terminator is stripped and the content's own `\r`
+        // stays, because there were two.
+        let raw = "diff --git a/f.txt b/f.txt\r\n@@ -1,1 +1,1 @@\r\n-alpha\r\r\n+beta\r\r\n";
+        assert_eq!(texts(&parse_unified_diff(raw)), ["alpha\r", "beta\r"]);
+    }
+
+    #[test]
+    fn deciding_the_terminator_needs_the_whole_patch() {
+        assert!(crlf_terminated("a\r\nb\r\n"));
+        assert!(crlf_terminated("a\r\nb\r"), "no final newline");
+        assert!(!crlf_terminated("a\r\nb\n"), "one bare LF settles it");
+        assert!(!crlf_terminated("a\nb\n"));
+        assert!(!crlf_terminated(""), "nothing to decide about");
+        assert!(!crlf_terminated("\n\n"));
     }
 
     #[test]

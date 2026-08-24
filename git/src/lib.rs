@@ -124,7 +124,52 @@ impl Pair {
 ///
 /// `revspec` is anything git accepts — `HEAD~50..HEAD`, a single sha,
 /// `main..feature`. Empty means the working tree against HEAD.
+///
+/// **Collects.** Which means it holds the full text of both sides of every
+/// changed file at once, and a whole-history diff of a large repository is
+/// gigabytes of that. [`each_pair`] is the same work without the pile, and is
+/// what [`diff`] uses; this stays because a test and `diffcheck` genuinely want
+/// the list, and at their sizes the pile is free.
 pub fn pairs(repo: &Path, revspec: &str) -> Result<Vec<Pair>> {
+    let mut out = Vec::new();
+    each_pair(repo, revspec, |p| {
+        out.push(p);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// Every changed file for `revspec`, one at a time, dropped before the next is
+/// read.
+///
+/// # Why this is a callback and not a `Vec`
+///
+/// [`BlobStream`] is written to hold one file's blobs at a time — the comment on
+/// it says the map it replaced "was tens of MB of pure peak overlap" — and then
+/// [`pairs`] piled every [`Pair`] into a `Vec` anyway, which put all of it back.
+/// Measured, a 29 MB patch peaked at 338 MB and 38 MB of blob content peaked at
+/// 107 MB; the incremental read was buying nothing it was not immediately
+/// spending.
+///
+/// It matters most for the shape a diff usually has. A `FileDiff` keeps only the
+/// changed lines and their context, so for a one-line fix in a thousand-line file
+/// the other 990 lines exist solely to be compared and are garbage the moment the
+/// differ has run. Handing the pair over and taking it back is what lets them go.
+///
+/// A callback rather than an `Iterator` because the work is a state machine over
+/// a child process: an iterator would have to own the `BlobStream`, surface its
+/// errors per item, and stay alive exactly as long as the borrow of `repo` — all
+/// of which is real API surface for a caller that just wants each file once.
+/// `f`'s error stops the walk and comes back as this function's, so a consumer
+/// can give up early without the process being left half-drained.
+///
+/// This is also the shape the [roadmap's `Repo` trait](../../docs/roadmap.md)
+/// wants: a method that streams what it acquires cannot be retrofitted into one
+/// that collects, and the other way round is one line.
+pub fn each_pair<F>(repo: &Path, revspec: &str, mut on_pair: F) -> Result<()>
+where
+    F: FnMut(Pair) -> Result<()>,
+{
     // `-z` for NUL-separated paths, because a path may contain anything a
     // filesystem allows and git otherwise quotes and escapes it. `-M` so a
     // rename arrives as one file with two names instead of a delete and an add
@@ -194,12 +239,18 @@ pub fn pairs(repo: &Path, revspec: &str) -> Result<Vec<Pair>> {
     };
     let mut blobs = blobs?;
 
-    let mut out = Vec::with_capacity(changes.len());
     // Untracked files first, so they read as new before the modifications —
     // `git status` lists them last and that is the wrong way round for a diff,
     // where the thing you just created is the thing you are looking for.
     // Fetching them early changed when they arrive, not where they land.
-    out.extend(loose?);
+    //
+    // These are the one set still gathered before being handed over: `untracked`
+    // reads them on another thread while the batch starts, so it has nowhere to
+    // hand them to yet. A checkout with thousands of new files is the case that
+    // would want the same treatment.
+    for p in loose? {
+        on_pair(p)?;
+    }
     for c in changes {
         // Both sides pull in request order — old, then new — which is what
         // keeps this loop aligned with the stream.
@@ -228,7 +279,9 @@ pub fn pairs(repo: &Path, revspec: &str) -> Result<Vec<Pair>> {
             .or_else(|| new_side(&c.new_oid, repo, &c.path));
         let binary = old.as_ref().is_some_and(|b| is_binary(b))
             || new.as_ref().is_some_and(|b| is_binary(b));
-        out.push(Pair {
+        // Handed over and gone. What the consumer keeps is its business; what
+        // this loop keeps is nothing, which is the whole point.
+        on_pair(Pair {
             path: c.path,
             old_path: c.old_path,
             status: c.status,
@@ -243,10 +296,10 @@ pub fn pairs(repo: &Path, revspec: &str) -> Result<Vec<Pair>> {
                 lines(new.as_deref().unwrap_or_default())
             },
             binary,
-        });
+        })?;
     }
     blobs.finish()?;
-    Ok(out)
+    Ok(())
 }
 
 /// Every untracked file, as a pair with nothing on its old side.
@@ -336,9 +389,13 @@ pub fn diff(
     differs: &Differs,
     over: &Overrides,
 ) -> Result<Vec<FileDiff>> {
-    Ok(pairs(repo, revspec)?
-        .iter()
-        .map(|p| match p.binary {
+    // Streamed, not collected. Each pair is diffed and then dropped, so the peak
+    // is one file's content plus the whole edit script rather than every file's
+    // content plus the whole edit script — see `each_pair` for why that is most
+    // of it on a real diff.
+    let mut out = Vec::new();
+    each_pair(repo, revspec, |p| {
+        out.push(match p.binary {
             // Modelled as a file with no hunks rather than skipped: the diff
             // still has to say the file changed, and "binary" is the honest
             // thing for it to say.
@@ -350,8 +407,10 @@ pub fn diff(
                 path: p.label(),
                 ..differs.file_using(over, &p.path, &p.old, &p.new)
             },
-        })
-        .collect())
+        });
+        Ok(())
+    })?;
+    Ok(out)
 }
 
 /// A short label for the window title.
@@ -650,20 +709,35 @@ fn is_binary(content: &[u8]) -> bool {
 /// one. A file that ends without one is indistinguishable here, which loses
 /// git's `\ No newline at end of file` — a gap, and the same one
 /// `parse_unified_diff` has.
+///
+/// **The carriage return of a CRLF line stays in the line.** Stripping it here
+/// is the plausible-looking bug: `\r` is *content*, git diffs it, and acquisition
+/// is not the layer that gets to decide it does not count. A commit that
+/// converts a file's endings then arrived as a file with no changes in it — git
+/// reporting three insertions and three deletions where this reported `+0 -0`,
+/// which reads exactly like a binary file and is the one shape a diff viewer must
+/// never produce. It also disagreed with [`crate::parse_unified_diff`], which
+/// keeps the byte: the same commit read one way from a repository and another
+/// from a `.diff` of itself.
+///
+/// Which leaves the presentation of a control character to a presentation, where
+/// it belongs — the terminal already substitutes `·` for one. And it puts the
+/// *choice* where the rule says it goes: ignoring a `\r` is
+/// [`Whitespace`](gitten_core::differ::Whitespace)'s to make, and every mode
+/// above `Exact` trims it for free because `\r` is whitespace.
 fn lines(content: &[u8]) -> Vec<Arc<str>> {
     let text = String::from_utf8_lossy(content);
     let text = text.strip_suffix('\n').unwrap_or(&text);
     if text.is_empty() && content.is_empty() {
         return Vec::new();
     }
-    text.split('\n')
-        .map(|l| Arc::from(l.strip_suffix('\r').unwrap_or(l)))
-        .collect()
+    text.split('\n').map(Arc::from).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gitten_core::differ::Whitespace;
 
     /// A throwaway repository, because untracked files are the one thing that
     /// cannot be tested against a canned `--raw` string: they are defined by
@@ -954,11 +1028,46 @@ mod tests {
         assert_eq!(strs(&lines(b"a\nb")), ["a", "b"]);
         assert_eq!(lines(b""), Vec::<Arc<str>>::new());
         assert_eq!(strs(&lines(b"\n")), [""], "a file of one blank line");
-        assert_eq!(
-            strs(&lines(b"a\r\nb\r\n")),
-            ["a", "b"],
-            "CRLF is not part of the line"
-        );
+    }
+
+    #[test]
+    fn a_carriage_return_stays_in_the_line() {
+        // The whole of the CRLF bug in one assertion. Strip it here and a commit
+        // that converts a file's line endings has nothing in it: every line
+        // compares equal, the differ finds no edits, and the file draws as
+        // `+0 -0` with no hunks — indistinguishable from a binary file.
+        assert_eq!(strs(&lines(b"a\r\nb\r\n")), ["a\r", "b\r"]);
+        // And the two sides then differ, which is the point.
+        assert_ne!(lines(b"a\n"), lines(b"a\r\n"));
+    }
+
+    #[test]
+    fn ignoring_a_carriage_return_is_the_whitespace_relations_job() {
+        // `Exact` sees it — that is what makes the diff agree with git. Every
+        // mode above `Exact` trims it, because `\r` is whitespace, so
+        // `--ignore-space-at-eol` collapses a line-ending change exactly as
+        // git's does. No mode in between, and nothing hardcoded in acquisition.
+        let lf = lines(b"alpha\nbeta\n");
+        let crlf = lines(b"alpha\r\nbeta\r\n");
+        let differs = Differs::default();
+        let edits = |ws| {
+            differs
+                .file_using(
+                    &Overrides {
+                        whitespace: Some(ws),
+                        ..Default::default()
+                    },
+                    "f.txt",
+                    &lf,
+                    &crlf,
+                )
+                .hunks
+                .len()
+        };
+        assert_eq!(edits(Whitespace::Exact), 1, "exact must see the change");
+        for ws in [Whitespace::Trailing, Whitespace::Change, Whitespace::All] {
+            assert_eq!(edits(ws), 0, "{} did not trim the CR", ws.name());
+        }
     }
 
     #[test]

@@ -45,7 +45,6 @@
 
 use crate::{DiffLine, FileDiff, Hunk, LineKind};
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::hash::Hasher;
 use std::sync::Arc;
 
@@ -107,7 +106,7 @@ pub trait Differ {
 /// textbook algorithms are fast enough to be shipped as written.
 pub fn intern(old: &[Arc<str>], new: &[Arc<str>]) -> (Vec<u32>, Vec<u32>) {
     // One map over both sides, so a line present in each gets one id.
-    let mut map: HashMap<&Arc<str>, u32> = HashMap::with_capacity(old.len() + new.len());
+    let mut map: LineMap = LineMap::with_capacity_and_hasher(old.len() + new.len(), <_>::default());
     let mut a = Vec::with_capacity(old.len());
     let mut b = Vec::with_capacity(new.len());
     number(&mut map, old, &mut a);
@@ -115,9 +114,19 @@ pub fn intern(old: &[Arc<str>], new: &[Arc<str>]) -> (Vec<u32>, Vec<u32>) {
     (a, b)
 }
 
+/// Line text to id, on [`crate::FxHasher`].
+///
+/// **The hottest map in the application**, and it was the last one still on
+/// SipHash — the author map in `parse_log` moved years of measurement ago and
+/// this did not, which cost *half the differ's runtime*: 52.1 ms → 24.3 ms on
+/// `md.diff`, 45.7 → 20.9 on `pr30683`, with `diffcheck` reporting the same
+/// changed-line counts and the same hunk positions as git before and after. The
+/// alias is what stops the two drifting apart again.
+type LineMap<'a> = crate::FxHashMap<&'a Arc<str>, u32>;
+
 /// Numbers `lines` into `out` through `map`. Keys borrow the caller's handles,
 /// so nothing is copied — only the pointed-at text is hashed.
-fn number<'a>(map: &mut HashMap<&'a Arc<str>, u32>, lines: &'a [Arc<str>], out: &mut Vec<u32>) {
+fn number<'a>(map: &mut LineMap<'a>, lines: &'a [Arc<str>], out: &mut Vec<u32>) {
     out.clear();
     out.reserve(lines.len());
     for line in lines {
@@ -301,8 +310,10 @@ struct Ctx {
     /// Rebuilt per region rather than per file: rarity is only meaningful
     /// relative to the region being anchored, so a `}` that appears twice in the
     /// six lines under consideration is a usable anchor even though it appears
-    /// four hundred times in the file. Git's histogram does the same.
-    occurrences: HashMap<u32, Chain>,
+    /// four hundred times in the file. Git's histogram does the same — which is
+    /// also why the hasher matters here: this is rebuilt for every region of
+    /// every file, so it is hashed more often than anything else in the pipeline.
+    occurrences: crate::FxHashMap<u32, Chain>,
     /// Myers' forward and backward frontiers, sized for the largest span seen
     /// and reused across every region of every file — including each
     /// TooCommon fallback an anchored search hands over.
@@ -340,7 +351,13 @@ impl Ctx {
         self.begin_file();
         // One map over both sides; keys borrow the caller's handles and die with
         // this call, which is why the map cannot live in `Ctx`.
-        let mut map: HashMap<&Arc<str>, u32> = HashMap::new();
+        //
+        // Sized up front. It cannot keep its capacity across files the way the
+        // buffers either side of it do — the lifetime is what forbids that — so
+        // the one thing left to avoid is rehashing on the way up, which on a
+        // 700k-line file is twenty reallocations of everything interned so far.
+        let mut map: LineMap =
+            LineMap::with_capacity_and_hasher(old.len() + new.len(), <_>::default());
         number(&mut map, old, &mut self.ids_old);
         let a = std::mem::take(&mut self.ids_old);
         number(&mut map, new, &mut self.ids_new);
@@ -985,7 +1002,12 @@ struct KeyArena {
     keys: Vec<Arc<str>>,
     /// Hash of a key to the ids that share it. Almost always one entry long;
     /// collisions extend it instead of lying.
-    buckets: HashMap<u64, Vec<u32>>,
+    ///
+    /// On [`crate::FxHasher`] like everything else, and here that saves two
+    /// hashes rather than one: the key was run through SipHash to get the `u64`,
+    /// and then the `u64` was run through SipHash again to place it. Whitespace
+    /// modes were 2–4× the cost of `Exact` and most of the gap was this.
+    buckets: crate::FxHashMap<u64, Vec<u32>>,
     /// Scratch for [`Whitespace::normalize`], reused across lines.
     norm: String,
 }
@@ -994,7 +1016,7 @@ impl KeyArena {
     /// The handle for `key`'s content, inserting it when new. The bytes are
     /// copied once, into the handle — every later equal key borrows that one.
     fn intern(&mut self, key: &str) -> Arc<str> {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut hasher = crate::FxHasher::default();
         hasher.write(key.as_bytes());
         let hash = hasher.finish();
         if let Some(ids) = self.buckets.get(&hash) {
@@ -1100,7 +1122,7 @@ pub fn moves(old: &[Arc<str>], new: &[Arc<str>], edits: &[Edit], min: usize) -> 
 
     // Where each added line's text can be found. Built over the added lines
     // only, so a line that also exists unchanged elsewhere is not a candidate.
-    let mut index: HashMap<&Arc<str>, Vec<u32>> = HashMap::new();
+    let mut index: crate::FxHashMap<&Arc<str>, Vec<u32>> = crate::FxHashMap::default();
     for (i, line) in new.iter().enumerate() {
         if added[i] && !line.trim().is_empty() {
             index.entry(line).or_default().push(i as u32);

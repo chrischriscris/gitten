@@ -731,7 +731,9 @@ impl Diff {
     }
 
     /// What the two expensive passes cost, for a stats line. Measured once at
-    /// load by `core`, not timed again here.
+    /// load by `core`, not timed again here — and **CPU time summed across
+    /// `prepare`'s workers**, not wall clock, so it does not add up to how long
+    /// the load took. See `gitten_core::prepared::Prepared::intraline`.
     pub fn timings(&self) -> (Duration, Duration) {
         (self.intraline, self.syntax)
     }

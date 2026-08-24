@@ -331,7 +331,23 @@ impl Languages {
 /// Lines, not a file, because that is what a diff has. Implementations that
 /// want a whole file (a tree-sitter one, say) can still stitch these together
 /// or fetch the blob themselves; the frontend never learns which happened.
-pub trait Highlighter {
+///
+/// # Why `Sync`
+///
+/// [`prepare`](crate::prepared::prepare) highlights files in parallel, and one
+/// `&dyn Highlighter` is shared by every worker — which needs this bound and
+/// nothing else. It is a real constraint on an implementation and it is worth
+/// naming rather than discovering: a highlighter may not keep mutable state
+/// behind a `Cell`, and one that wants a cache needs a lock or one instance per
+/// call.
+///
+/// The alternative was an instance per thread, which cannot work: the registry
+/// is `Box<dyn Highlighter>` and there is no way to clone one through the trait
+/// without putting `Clone` on it — a strictly heavier ask, since `Sync` is free
+/// for anything already written as a pure function of its input, which is what
+/// `highlight(&self, …)` already looks like. Both built-ins satisfy it without a
+/// line changing.
+pub trait Highlighter: Sync {
     fn highlight(&self, path: &str, lines: &[&str]) -> Vec<Vec<Token>>;
 }
 
