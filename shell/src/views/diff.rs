@@ -547,14 +547,26 @@ impl ScrollbarHandle for Pan {
 }
 
 pub struct Diff {
-    /// The parsed diff, kept so a layout change can rebuild the rows.
+    /// The prepared diff — clipped, intraline-diffed and highlighted — held
+    /// behind an `Rc` so a layout toggle can rebuild its rows without re-running
+    /// the two expensive passes over every line of every file.
     ///
     /// This is the memory cost of a live toggle, and it is a real one: on the
-    /// 714k-line fixture it is a second copy of every line. The alternatives are
-    /// worse — cloning the *prepared* diff pays the same memory plus the clone at
-    /// load, whether or not anybody ever presses the key, and re-acquiring means
-    /// the view needs a repository, which it does not have and should not.
-    files: Rc<Vec<FileDiff>>,
+    /// 714k-line fixture it is a second copy of every line, plus that line's span
+    /// and token boxes. It replaces the copy of the parsed `FileDiff`s this field
+    /// once held — the same order of memory — and now the copy earns its keep: a
+    /// toggle clones a `File` out of it (an allocation, but no intraline diff and
+    /// no syntax scan) instead of preparing from scratch, and pays even that only
+    /// for the files a presentation actually draws.
+    ///
+    /// Rebuilt only when the diff itself changes — see [`Diff::swap`]. Its inputs
+    /// are `(the FileDiffs, host.syntax, MAX_LINE_CHARS)`, and `host.syntax` is
+    /// always the built-in router: `gitten.toml` sets token *colours*
+    /// (`[theme.syntax]`, on `host.theme` and read live on the render path) but
+    /// never the *routing*, so a config reload never stales this. Any future
+    /// input to `prepare` that a reload can change must join the invalidation in
+    /// [`Diff::swap`].
+    prepared: Rc<Prepared>,
     layouts: Rc<Layouts>,
     current: usize,
     /// Which entry of `host.wrap` is in use.
@@ -857,7 +869,10 @@ impl Diff {
     /// The half of [`Diff::replace`] that needs no window, and therefore the
     /// half with tests.
     fn swap(&mut self, files: Vec<FileDiff>, host: &Host) {
-        self.files = Rc::new(files);
+        // The one place the diff itself changes, so the one place the prepared
+        // cache is invalidated: the two expensive passes run here, and every
+        // layout toggle after reuses the result until the next swap.
+        self.prepared = prepare_files(&files, host);
         self.apply_layout(self.current, host);
     }
 
@@ -905,7 +920,7 @@ impl Diff {
         // more than once in general and here can only be called once. A pinned
         // presentation has nothing to switch to, so once is all it gets — and if
         // it is somehow asked twice, the fallback rather than an empty list,
-        // because `assemble` indexes `renderers[0]`.
+        // because `arrange` indexes `renderers[0]`.
         let once = std::cell::RefCell::new(Some(renderers));
         layouts.register("custom", move |_| {
             once.borrow_mut()
@@ -934,15 +949,15 @@ impl Diff {
                 0
             }
         };
-        let files = Rc::new(files);
-        let built = assemble(&files, host, &layouts, current);
+        let prepared = prepare_files(&files, host);
+        let built = arrange(&prepared, host, &layouts, current);
         // The host names the wrap this opens on, exactly as it names the layout.
         // An unknown name is reported by the config layer, which is the layer
         // that knows it came from a file somebody is editing.
         let wrap = host.wrap.selected_index();
         let total = Rc::new(Cell::new(built.order.len()));
         Self {
-            files,
+            prepared,
             layouts: Rc::new(layouts),
             current,
             wrap,
@@ -975,11 +990,14 @@ impl Diff {
     /// and there is nothing to preserve exactly. The proportion through the diff
     /// is preserved instead, which lands you on the same screenful.
     ///
-    /// The whole pipeline from stage 3 runs again. That is 8 ms on a typical diff
-    /// and 289 ms on the pathological fixture, once, on a keystroke — which is
-    /// the right place to spend it. Making it instant would mean the row
-    /// implementations sharing their text behind a refcount instead of owning
-    /// it, and that is a change to `prepared::Line`, not to this function.
+    /// The rows are rebuilt, but only from the *prepared* diff, which is held
+    /// behind an `Rc` and reused across toggles — so a press pays [`arrange`]
+    /// (renderer selection, the order table, and one `File` clone per drawn file)
+    /// and not the intraline and syntax passes. Those are the 8 ms on a typical
+    /// diff and 289 ms on the pathological one that this key used to re-pay every
+    /// press; they now run once, when the diff is acquired or swapped. See
+    /// [`Diff::prepared`] for the memory that buys and [`prepare_files`] for the
+    /// half that no longer runs here.
     pub fn cycle_layout(&mut self, cx: &mut Context<Self>) {
         if self.layouts.len() < 2 {
             return;
@@ -1006,7 +1024,7 @@ impl Diff {
         // way to carry a selection across two presentations of the same diff —
         // a replace pair is one row here and two there — so it goes.
         self.sel = None;
-        let built = assemble(&self.files, host, &self.layouts, index);
+        let built = arrange(&self.prepared, host, &self.layouts, index);
         self.order = Rc::new(built.order);
         *self.renderers.borrow_mut() = built.renderers;
         self.widest = built.widest;
@@ -1030,12 +1048,32 @@ struct Built {
     load: String,
 }
 
-/// Prepare the diff, hand each file to the implementation that claims it, and
-/// build the order table.
+/// Runs the two expensive passes — clip, intraline, syntax — once, behind an
+/// `Rc` so a layout toggle can [`arrange`] the result again without paying them
+/// twice.
 ///
 /// A free function rather than a method because it runs before a `Diff` exists
-/// and again after one does, and both callers want exactly this.
-fn assemble(files: &[FileDiff], host: &Host, layouts: &Layouts, current: usize) -> Built {
+/// (in [`Diff::with_layouts`]) and again when the diff is swapped, and both
+/// callers want exactly this. Its inputs are `(files, host.syntax,
+/// MAX_LINE_CHARS)`; nothing a layout toggle changes is among them, which is the
+/// whole point of caching what it returns.
+fn prepare_files(files: &[FileDiff], host: &Host) -> Rc<Prepared> {
+    // One pass in core, shared with the CLI and the ANSI painter.
+    Rc::new(prepare(files, &host.syntax, MAX_LINE_CHARS))
+}
+
+/// Turns an already-[`prepare`]d diff into the rows one presentation draws: it
+/// selects the renderers for `current`, hands each file to the implementation
+/// that claims it, and builds the order table, the widest-row index and the load
+/// string.
+///
+/// Everything here is a pure function of the *presentation*, which is exactly
+/// what a layout toggle changes — so it is split from [`prepare_files`], which a
+/// toggle must not re-run. Each file is cloned out of the shared [`Prepared`]:
+/// the clone re-allocates that file's text refcount, spans and tokens but runs
+/// neither the intraline diff nor the syntax scan, so it is a fraction of a full
+/// prepare and is paid only for the files a presentation actually draws.
+fn arrange(prepared: &Prepared, host: &Host, layouts: &Layouts, current: usize) -> Built {
     let t = std::time::Instant::now();
     let mut renderers = match layouts.0.get(current) {
         Some(layout) => (layout.build)(host),
@@ -1050,17 +1088,9 @@ fn assemble(files: &[FileDiff], host: &Host, layouts: &Layouts, current: usize) 
     let name = layouts.names().get(current).copied().unwrap_or("custom");
     let mut order: Vec<RowRef> = Vec::new();
 
-    // One pass in core, shared with the CLI and the ANSI painter, before any
-    // renderer sees a row.
-    let Prepared {
-        files: prepared,
-        intraline,
-        syntax,
-        threads,
-    } = prepare(files, &host.syntax, MAX_LINE_CHARS);
-    let file_count = prepared.len();
+    let file_count = prepared.files.len();
 
-    for f in prepared {
+    for f in &prepared.files {
         let owner = renderers
             .iter()
             .enumerate()
@@ -1069,7 +1099,9 @@ fn assemble(files: &[FileDiff], host: &Host, layouts: &Layouts, current: usize) 
             .map_or(0, |(i, _)| i);
         let r = &mut renderers[owner];
         let first = r.len();
-        r.build(f);
+        // Cloned out of the shared cache: a `File` clone re-allocates but does no
+        // intraline diff and no syntax scan, so a toggle is not a re-prepare.
+        r.build(f.clone());
         for index in first..r.len() {
             order.push(RowRef {
                 owner: owner as u16,
@@ -1085,14 +1117,17 @@ fn assemble(files: &[FileDiff], host: &Host, layouts: &Layouts, current: usize) 
     let Ordered { order, widest, .. } = expand(&order, &renderers, None);
 
     // `cpu across N` when the pass fanned out, because these are summed across
-    // workers and `build` beside them is wall clock — without the note the two
-    // numbers read as a contradiction rather than as a speed-up.
-    let cpu = match threads > 1 {
-        true => format!(" cpu across {threads}"),
+    // workers and `arrange` beside them is wall clock — without the note the two
+    // numbers read as a contradiction rather than as a speed-up. These come from
+    // the cached `Prepared`, so on a toggle they report what the pass cost once,
+    // not a pass that just ran: `arrange` below is the cost of the press.
+    let cpu = match prepared.threads > 1 {
+        true => format!(" cpu across {}", prepared.threads),
         false => String::new(),
     };
     let mut reports: Vec<String> = vec![format!(
-        "intraline {intraline:.0?} · syntax {syntax:.0?}{cpu}"
+        "intraline {:.0?} · syntax {:.0?}{cpu}",
+        prepared.intraline, prepared.syntax
     )];
     reports.extend(
         renderers
@@ -1101,7 +1136,7 @@ fn assemble(files: &[FileDiff], host: &Host, layouts: &Layouts, current: usize) 
             .filter(|s| !s.is_empty()),
     );
     let load = format!(
-        "{} rows · {} files · {name} · build {:.0?} ({})",
+        "{} rows · {} files · {name} · arrange {:.0?} ({})",
         order.len(),
         file_count,
         t.elapsed(),
@@ -3542,6 +3577,58 @@ diff --git a/b.md b/b.md
         diff.swap(Vec::new(), &host);
         assert_eq!(diff.total(), 0);
         assert_eq!(diff.layout(), "split");
+    }
+
+    #[test]
+    fn a_toggle_reuses_the_prepared_diff_and_a_swap_rebuilds_it() {
+        // The cache this view holds must be transparent and correctly
+        // invalidated. Three claims, and a regression in any one is a bug worth
+        // catching: a toggle draws exactly the rows a fresh build at that layout
+        // would (the prepared diff is a pure input to `arrange`); a toggle reuses
+        // the prepared diff rather than re-running the two expensive passes (the
+        // stall this removes); and a swap rebuilds it (a missed invalidation is a
+        // silently-stale diff, which is worse than the stall).
+        let host = Host::new();
+        let mut diff = Diff::with_layouts(parse_unified_diff(TWO_FILES), &host, Layouts::builtin());
+        assert_eq!(diff.layout(), "unified");
+
+        // The Rc a toggle must leave untouched.
+        let prepared = diff.prepared.clone();
+
+        // Toggle, then compare against a diff that only ever built the split
+        // layout: same order table, same widest row, same row count. If the
+        // cache changed the output, these disagree.
+        diff.apply_layout(1, &host);
+        assert_eq!(diff.layout(), "split");
+        let mut split_host = Host::new();
+        split_host.layout = "split".into();
+        let direct = Diff::with_layouts(
+            parse_unified_diff(TWO_FILES),
+            &split_host,
+            Layouts::builtin(),
+        );
+        assert_eq!(direct.layout(), "split");
+        assert_eq!(
+            *diff.order, *direct.order,
+            "the cached toggle drew a different order table than a fresh build"
+        );
+        assert_eq!(diff.widest, direct.widest);
+        assert_eq!(diff.total(), direct.total());
+
+        // The toggle reused the prepared diff: `prepare` builds a fresh `Rc`, so
+        // an unchanged pointer proves the two expensive passes did not re-run.
+        assert!(
+            Rc::ptr_eq(&prepared, &diff.prepared),
+            "a layout toggle re-prepared the diff"
+        );
+
+        // A swap is new `FileDiff`s underneath, so it must rebuild the prepared
+        // diff — a new pointer.
+        diff.swap(parse_unified_diff(SAMPLE), &host);
+        assert!(
+            !Rc::ptr_eq(&prepared, &diff.prepared),
+            "a swap must invalidate the prepared cache"
+        );
     }
 
     #[test]
