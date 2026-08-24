@@ -160,6 +160,39 @@ impl Write {
             move |r| r.rename_branch(&from, &to),
         )
     }
+
+    /// Parks the tracked working tree on the stash stack — `git stash push`.
+    /// The returned index (always `0`) has no consumer here, for the same
+    /// reason [`Write::commit`]'s OID does not: a clean finish is one
+    /// generation bump and every pane re-reads.
+    pub fn stash_push(repo: &Handle, message: Option<String>) -> Self {
+        Self::named("stash push".into(), repo, move |r| {
+            r.stash_push(message.as_deref()).map(|_| ())
+        })
+    }
+
+    /// Restores stash `index`, keeping the entry.
+    pub fn stash_apply(repo: &Handle, index: usize) -> Self {
+        Self::named(format!("stash apply stash@{index}"), repo, move |r| {
+            r.stash_apply(index)
+        })
+    }
+
+    /// Restores stash `index` and drops it when the restore was clean —
+    /// git's sequencing, surfaced through this job's error when it declines.
+    pub fn stash_pop(repo: &Handle, index: usize) -> Self {
+        Self::named(format!("stash pop stash@{index}"), repo, move |r| {
+            r.stash_pop(index)
+        })
+    }
+
+    /// Deletes stash `index` off the stack. DESTRUCTIVE: the caller confirms
+    /// before this job is ever built.
+    pub fn stash_drop(repo: &Handle, index: usize) -> Self {
+        Self::named(format!("stash drop stash@{index}"), repo, move |r| {
+            r.stash_drop(index)
+        })
+    }
 }
 
 impl Job for Write {
@@ -291,6 +324,34 @@ mod tests {
             ));
             Ok(())
         }
+        fn stash_push(&self, message: Option<&str>) -> gitten_git::Result<usize> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("stash push {:?}", message));
+            Ok(0)
+        }
+        fn stash_apply(&self, index: usize) -> gitten_git::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("stash apply stash@{index}"));
+            Ok(())
+        }
+        fn stash_pop(&self, index: usize) -> gitten_git::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("stash pop stash@{index}"));
+            Ok(())
+        }
+        fn stash_drop(&self, index: usize) -> gitten_git::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("stash drop stash@{index}"));
+            Ok(())
+        }
     }
 
     fn recorded(calls: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
@@ -407,6 +468,69 @@ mod tests {
                 "ignore notes.md",
                 "stage 2 paths",
                 "unstage 1 path",
+            ],
+            "the band names are the verbs' own words"
+        );
+    }
+
+    #[test]
+    fn the_stash_verbs_reach_the_trait_and_address_by_index() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let repo: Handle = Arc::new(Recording(Arc::clone(&calls)));
+        let runner = Runner::new();
+        let submit = runner.submitter();
+
+        assert!(submit
+            .submit(Box::new(Write::stash_push(&repo, None)))
+            .is_ok());
+        assert!(submit
+            .submit(Box::new(Write::stash_push(
+                &repo,
+                Some("hand written".into())
+            )))
+            .is_ok());
+        assert!(submit
+            .submit(Box::new(Write::stash_apply(&repo, 1)))
+            .is_ok());
+        assert!(submit.submit(Box::new(Write::stash_pop(&repo, 2))).is_ok());
+        assert!(submit.submit(Box::new(Write::stash_drop(&repo, 3))).is_ok());
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while recorded(&calls).len() < 5 {
+            assert!(
+                Instant::now() < deadline,
+                "jobs did not run: {:?}",
+                recorded(&calls)
+            );
+            std::thread::yield_now();
+        }
+        // The index is the address, and it travels as a number — the refname
+        // is derived where git is called, never stored here.
+        assert_eq!(
+            recorded(&calls),
+            vec![
+                "stash push None",
+                "stash push Some(\"hand written\")",
+                "stash apply stash@1",
+                "stash pop stash@2",
+                "stash drop stash@3",
+            ]
+        );
+
+        let mut names = Vec::new();
+        while let Some(event) = runner.try_next() {
+            if let Event::Started { name } = event {
+                names.push(name);
+            }
+        }
+        assert_eq!(
+            names,
+            vec![
+                "stash push",
+                "stash push",
+                "stash apply stash@1",
+                "stash pop stash@2",
+                "stash drop stash@3",
             ],
             "the band names are the verbs' own words"
         );

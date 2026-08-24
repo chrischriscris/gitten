@@ -385,6 +385,43 @@ pub trait Repo: Send + Sync {
         Err(unserved("branch rename"))
     }
 
+    /// Parks the tracked changes of the working tree on the stash stack —
+    /// `git stash push` — returning the new entry's index, which is always
+    /// `0`: a push puts its entry at the top.
+    ///
+    /// `message` names the entry; without one git writes its own `WIP on …`.
+    /// Untracked files are deliberately out tonight: plain `push`, no `-u`,
+    /// because parking *tracked* work is the verb the files pane asks for and
+    /// `-u` quietly widens what a keypress takes away. It arrives when
+    /// something asks for it by name.
+    fn stash_push(&self, _message: Option<&str>) -> Result<usize> {
+        Err(unserved("stashing"))
+    }
+
+    /// Restores stash `index` into the working tree, keeping the entry on the
+    /// stack.
+    fn stash_apply(&self, _index: usize) -> Result<()> {
+        Err(unserved("applying a stash"))
+    }
+
+    /// Restores stash `index` into the working tree and drops the entry —
+    /// but only when the restore was clean, which git itself decides: on a
+    /// conflict it refuses, keeps the entry and says so, and those are its
+    /// words surfaced verbatim, not ours. Nothing here drops as a separate
+    /// step, so nothing here can lose a stash whose apply half failed.
+    fn stash_pop(&self, _index: usize) -> Result<()> {
+        Err(unserved("popping a stash"))
+    }
+
+    /// Deletes stash `index` off the stack. Destructive and final — the
+    /// entry's commits survive in the object database until they age out,
+    /// but no ref names them any more. Every index after it shifts down one,
+    /// which is why callers re-read [`Self::stashes`] rather than holding
+    /// positions across any of these verbs.
+    fn stash_drop(&self, _index: usize) -> Result<()> {
+        Err(unserved("dropping a stash"))
+    }
+
     /// A short label for the window title.
     ///
     /// Infallible: a repository whose branch cannot be read still has a name.
@@ -982,6 +1019,44 @@ impl Repo for Binary {
         let sha = run(&self.root, &["rev-parse", "HEAD"])?;
         Ok(lossy(trimmed(&sha)))
     }
+
+    fn stash_push(&self, message: Option<&str>) -> Result<usize> {
+        // What `stash@{0}` resolves to before the push. Git answers "nothing
+        // to stash" with exit 0 and one localized sentence on stdout — no
+        // flag makes it machine-readable — so the only honest test of whether
+        // a stash was created is whether the top of the stack moved. Two
+        // cheap rev-parses around a rare write, and no prose parsing to go
+        // wrong in another locale.
+        let before = self.stash_head();
+        match message {
+            Some(m) => run(&self.root, &["stash", "push", "-m", m])?,
+            None => run(&self.root, &["stash", "push"])?,
+        };
+        if self.stash_head() == before {
+            return Err("nothing to stash: the working tree has no tracked changes".into());
+        }
+        Ok(0)
+    }
+
+    fn stash_apply(&self, index: usize) -> Result<()> {
+        run_bytes(
+            &self.root,
+            &[b"stash", b"apply", stash_ref(index).as_slice()],
+        )
+        .map(|_| ())
+    }
+
+    fn stash_pop(&self, index: usize) -> Result<()> {
+        run_bytes(&self.root, &[b"stash", b"pop", stash_ref(index).as_slice()]).map(|_| ())
+    }
+
+    fn stash_drop(&self, index: usize) -> Result<()> {
+        run_bytes(
+            &self.root,
+            &[b"stash", b"drop", stash_ref(index).as_slice()],
+        )
+        .map(|_| ())
+    }
 }
 
 impl Binary {
@@ -998,6 +1073,17 @@ impl Binary {
             at = end;
         }
         Ok(())
+    }
+
+    /// What `stash@{0}` resolves to right now, when a stack exists at all.
+    ///
+    /// The question [`Repo::stash_push`] asks twice — around the push — and
+    /// nothing else asks. `-q --verify` so an empty stack is `None` rather
+    /// than a stderr of its own.
+    fn stash_head(&self) -> Option<String> {
+        run(&self.root, &["rev-parse", "-q", "--verify", "stash@{0}"])
+            .ok()
+            .map(|oid| lossy(trimmed(&oid)))
     }
 
     /// Ahead and behind between a branch and its upstream: one process, both
@@ -1678,6 +1764,17 @@ fn parse_remote_branches(raw: &[u8]) -> Vec<RemoteBranch> {
         });
     }
     out
+}
+
+/// The name stash `index` answers to: `stash@{n}`, bytes because it is an
+/// address and not text.
+///
+/// Derived fresh at every verb, never stored: a drop renumbers everything
+/// above it — the former `stash@{1}` *is* `stash@{0}` afterwards — and git's
+/// numbering is the only truth there is. Re-deriving per call is what keeps a
+/// held index from quietly aiming at whatever moved into its slot.
+fn stash_ref(index: usize) -> Vec<u8> {
+    format!("stash@{{{index}}}").into_bytes()
 }
 
 /// `git stash list -z --format=%H%x00%gs`, parsed.
@@ -3777,6 +3874,22 @@ mod tests {
             ReadsOnly.commit("hi").unwrap_err(),
             "this repository does not serve committing"
         );
+        assert_eq!(
+            ReadsOnly.stash_push(None).unwrap_err(),
+            "this repository does not serve stashing"
+        );
+        assert_eq!(
+            ReadsOnly.stash_apply(0).unwrap_err(),
+            "this repository does not serve applying a stash"
+        );
+        assert_eq!(
+            ReadsOnly.stash_pop(0).unwrap_err(),
+            "this repository does not serve popping a stash"
+        );
+        assert_eq!(
+            ReadsOnly.stash_drop(0).unwrap_err(),
+            "this repository does not serve dropping a stash"
+        );
     }
 
     #[test]
@@ -4398,6 +4511,19 @@ mod tests {
         r
     }
 
+    // ------------------------------------------------------ the stash verbs
+
+    /// A repository with one tracked modification in the working tree: the
+    /// least a push has to chew on.
+    fn with_dirty_tree(name: &str) -> Scratch {
+        let r = Scratch::new(name);
+        r.write("f.txt", b"one\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        r.write("f.txt", b"one\ntwo\n");
+        r
+    }
+
     #[test]
     fn checkout_moves_head_and_the_working_tree_together() {
         let r = two_branches("checkout");
@@ -4471,6 +4597,45 @@ mod tests {
             std::fs::read(join_raw(&r.0, b"shared.txt")).unwrap(),
             b"uncommitted work\n",
             "the working tree kept the uncommitted work"
+        );
+    }
+
+    #[test]
+    fn a_push_parks_the_tracked_changes_and_the_tree_goes_clean() {
+        let r = with_dirty_tree("stash-push");
+        let g = r.open();
+
+        assert_eq!(
+            g.stash_push(None).expect("pushes"),
+            0,
+            "the new entry is top"
+        );
+        assert_eq!(g.stashes().unwrap().len(), 1);
+        assert!(g.stashes().unwrap()[0].message.starts_with("WIP on main"));
+        // The point of the verb, as the files pane will show it: the parked
+        // work leaves every list, staged and unstaged alike.
+        let s = g.status().unwrap();
+        assert!(s.staged.is_empty() && s.unstaged.is_empty(), "{s:?}");
+
+        // And pop brings the work back, spending the entry.
+        g.stash_pop(0).expect("pops");
+        assert!(g.stashes().unwrap().is_empty());
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"one\ntwo\n",
+            "the working tree holds what was parked"
+        );
+    }
+
+    #[test]
+    fn a_push_can_carry_a_message() {
+        let r = with_dirty_tree("stash-message");
+        let g = r.open();
+        g.stash_push(Some("hand written")).expect("pushes");
+        assert!(
+            g.stashes().unwrap()[0].message.ends_with("hand written"),
+            "{}",
+            g.stashes().unwrap()[0].message
         );
     }
 
@@ -4689,5 +4854,138 @@ mod tests {
                 commit: None,
             }
         );
+    }
+
+    #[test]
+    fn pushing_nothing_refuses_instead_of_pointing_at_an_old_entry() {
+        // The choice: an honest error, not Ok(0). Git exits zero here, but
+        // there IS no new stash — and `Ok(0)` would name whatever already sat
+        // at the top of the stack, a success badge over nothing happening.
+        // The tree is dirty below so the first push proves the round-trip;
+        // the second push, onto a clean tree, is the refusal under test.
+        let r = Scratch::new("stash-noop");
+        r.write("f.txt", b"one\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        r.write("f.txt", b"two\n");
+        let g = r.open();
+        g.stash_push(None).expect("first push parks");
+        let stack = g.stashes().unwrap();
+
+        let e = g.stash_push(None).unwrap_err();
+        assert!(e.contains("nothing to stash"), "{e}");
+        assert_eq!(g.stashes().unwrap(), stack, "the stack did not move");
+    }
+
+    #[test]
+    fn pushing_from_a_clean_tree_with_an_empty_stack_refuses_too() {
+        // The third shape of "nothing": both rev-parses answer None — there
+        // was no stack before and none after. `None == None` must read as
+        // refusal, never as Ok(0) naming a top that does not exist.
+        let r = Scratch::new("stash-noop-empty");
+        r.write("f.txt", b"one\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        let g = r.open();
+
+        assert!(g.stashes().unwrap().is_empty());
+        let e = g.stash_push(None).unwrap_err();
+        assert!(e.contains("nothing to stash"), "{e}");
+        assert!(
+            g.stashes().unwrap().is_empty(),
+            "still nothing on the stack"
+        );
+    }
+
+    #[test]
+    fn applying_restores_the_work_and_keeps_the_entry() {
+        let r = with_dirty_tree("stash-apply");
+        let g = r.open();
+        g.stash_push(Some("keep me")).expect("pushes");
+
+        g.stash_apply(0).expect("applies");
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"one\ntwo\n"
+        );
+        assert_eq!(g.stashes().unwrap().len(), 1, "apply does not spend");
+    }
+
+    #[test]
+    fn an_apply_that_would_stomp_local_changes_refuses_in_gits_words() {
+        let r = with_dirty_tree("stash-conflict");
+        let g = r.open();
+        g.stash_push(None).expect("pushes");
+        // A different edit to the same file: restoring the stash over it
+        // would lose it, and git is the one that knows that.
+        r.write("f.txt", b"one\nthree\n");
+
+        let e = g.stash_apply(0).unwrap_err();
+        assert!(e.contains("would be overwritten by merge"), "{e}");
+    }
+
+    #[test]
+    fn a_pop_whose_apply_fails_leaves_the_stash_on_the_stack() {
+        // The sequencing pop exists for is git's own: apply, then drop only
+        // if the apply was clean. On conflict it keeps the entry and says so,
+        // and this test is what stops this crate from ever trying to drop
+        // separately — which is how a stash gets lost twice over.
+        let r = with_dirty_tree("stash-pop-conflict");
+        let g = r.open();
+        g.stash_push(None).expect("pushes");
+        r.write("f.txt", b"one\nthree\n");
+
+        assert!(g.stash_pop(0).is_err());
+        assert_eq!(g.stashes().unwrap().len(), 1, "kept, as git promised");
+    }
+
+    #[test]
+    fn dropping_renumbers_from_the_top_so_an_index_never_lies_twice() {
+        // Three pushes, two drops of index 0: what the second drop takes is
+        // the former stash@{1}, because each verb re-derives its refname from
+        // the index it is handed and git renumbers underneath. Holding the
+        // old numbers across a write is exactly the bug this pins shut.
+        let r = Scratch::new("stash-drop-renumber");
+        r.write("seed.txt", b"seed\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        for (n, text) in ["a", "b", "c"].iter().enumerate() {
+            r.write("seed.txt", format!("{text}\n").as_bytes());
+            r.git(&["stash", "push", "-q", "-m", &format!("number {n}")]);
+        }
+        let g = r.open();
+        assert_eq!(g.stashes().unwrap().len(), 3);
+        let former_two = g.stashes().unwrap()[2].commit.clone();
+
+        g.stash_drop(0).expect("drops the newest");
+        let stack = g.stashes().unwrap();
+        assert_eq!(stack.len(), 2);
+        assert_eq!(
+            stack[0].commit,
+            r.rev_parse("stash@{0}"),
+            "the read agrees with git about who is on top now"
+        );
+        g.stash_drop(0).expect("drops again");
+        let stack = g.stashes().unwrap();
+        assert_eq!(stack.len(), 1, "the former stash@{{1}} went first");
+        assert_eq!(
+            stack[0].index, 0,
+            "indices are positions, recomputed by the read"
+        );
+        assert_eq!(
+            stack[0].message, "On main: number 0",
+            "the oldest survived both drops, under git's own prefix"
+        );
+        assert_eq!(
+            stack[0].commit, former_two,
+            "stash@{{0}} IS the former stash@{{1}}"
+        );
+
+        // Dropping the last one empties the stack; addressing past its end is
+        // git's error, surfaced rather than translated.
+        g.stash_drop(0).expect("drops the last");
+        assert!(g.stashes().unwrap().is_empty());
+        let e = g.stash_drop(0).unwrap_err();
+        assert!(e.contains("git stash drop"), "{e}");
     }
 }
