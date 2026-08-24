@@ -884,6 +884,144 @@ impl DevShell {
         }
     }
 
+    /// `files.discard`: the one destructive verb, and it confirms on the
+    /// keyboard because no dialog exists to confirm anywhere else. First
+    /// press arms the row the keyboard is on and asks once, here in the
+    /// band; second press on the same row builds the job; any cursor move,
+    /// wheel or refresh disarms before it can lie (`Files` owns that state;
+    /// this side only asks whether the press was the second one).
+    ///
+    /// Two refusals said up front rather than answered badly: a staged row,
+    /// whose unstaged side may be empty and whose undo is unstage; and a
+    /// conflict, whose working-tree side is the merge's open question.
+    fn discard_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(Screen::Files { view, .. }) = self.active() else {
+            self.set_notice("files.discard is not supported here");
+            return;
+        };
+        let under = view
+            .read(cx)
+            .current_file()
+            .map(|f| (f.section, f.path.clone(), f.path_text.to_string()));
+        let Some((section, path, shown)) = under else {
+            self.set_notice("nothing selected to discard");
+            return;
+        };
+        match section {
+            views::files::Section::Staged => {
+                self.set_notice("that change is staged — unstage it before discarding");
+                return;
+            }
+            views::files::Section::Conflicts => {
+                self.set_notice("a conflicted file needs its merge resolved, not discarded");
+                return;
+            }
+            views::files::Section::Untracked | views::files::Section::Unstaged => {}
+        }
+        // The repository, held rather than borrowed — the arm question below
+        // has to be able to speak through the band either way.
+        let Some((_, repo)) = self.repo.as_ref().cloned() else {
+            self.set_notice("a fixture has no working tree to discard from");
+            return;
+        };
+        // Arm, or spend the arm. False means the question was just asked.
+        if !view.update(cx, |f, _| f.confirm_or_arm_discard(section, &path)) {
+            self.set_notice(views::files::discard_question(section, &shown));
+            return;
+        }
+        self.notice = None; // the question is spent; the running band speaks next
+        let bytes = path.as_bytes().to_vec();
+        let job = match section {
+            views::files::Section::Untracked => {
+                gitten_app::verbs::Write::remove_untracked(&repo, bytes)
+            }
+            _ => gitten_app::verbs::Write::discard(&repo, bytes),
+        };
+        if self.submitter.submit(Box::new(job)).is_err() {
+            self.set_notice("the job queue is shutting down");
+        }
+    }
+
+    /// `files.stage-all`: every row, on the side of the index the keyboard
+    /// sits in — the one rule `space` keeps for a single row, at scale.
+    /// Staged row or staged heading: unstage everything staged. Anything
+    /// else — unstaged, untracked, their headings, an empty tree: stage
+    /// everything unstaged and untracked. Deterministic and visible (you
+    /// can see where the cursor is), which is why it wins over a toggle:
+    /// pressed twice in one place, it answers the same both times.
+    ///
+    /// Conflicts belong to neither direction — staging one records a
+    /// resolution, which is its own decision. One job either way, so one
+    /// generation bump and one re-acquire wave per keypress.
+    fn stage_all(&mut self, cx: &mut Context<Self>) {
+        let Some(Screen::Files { view, .. }) = self.active() else {
+            self.set_notice("files.stage-all is not supported here");
+            return;
+        };
+        let staging = view.read(cx).cursor_section() != Some(views::files::Section::Staged);
+        let (first, second) = match staging {
+            true => (
+                views::files::Section::Unstaged,
+                Some(views::files::Section::Untracked),
+            ),
+            false => (views::files::Section::Staged, None),
+        };
+        let mut targets = view.read(cx).paths_in(first);
+        if let Some(second) = second {
+            targets.extend(view.read(cx).paths_in(second));
+        }
+        if targets.is_empty() {
+            self.set_notice(match staging {
+                true => "nothing unstaged or untracked to stage",
+                false => "nothing staged to unstage",
+            });
+            return;
+        }
+        let Some(writes) = self.writes() else {
+            self.set_notice("a fixture has no working tree to act on");
+            return;
+        };
+        let bytes = targets.iter().map(|p| p.as_bytes().to_vec()).collect();
+        let job = match staging {
+            true => gitten_app::verbs::Write::stage_many(writes.repo, bytes),
+            false => gitten_app::verbs::Write::unstage_many(writes.repo, bytes),
+        };
+        if !writes.send(Box::new(job)) {
+            self.set_notice("the job queue is shutting down");
+        }
+    }
+
+    /// `files.ignore`: append the untracked file to the root `.gitignore`,
+    /// creating that file when it is absent, and let the refresh do the
+    /// rest — git stops listing ignored files on its own, so the entry
+    /// leaves the pane without anything being deleted or moved.
+    ///
+    /// Only an untracked row answers. `.gitignore` governs files git does
+    /// not yet track, so answering over a tracked change would be a no-op
+    /// wearing a success badge.
+    fn ignore_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(Screen::Files { view, .. }) = self.active() else {
+            self.set_notice("files.ignore is not supported here");
+            return;
+        };
+        let under = view
+            .read(cx)
+            .current_file()
+            .map(|f| (f.section, f.path.clone()));
+        let Some((views::files::Section::Untracked, path)) = under else {
+            self.set_notice("only an untracked file can be ignored");
+            return;
+        };
+        let Some(writes) = self.writes() else {
+            self.set_notice("a fixture has no repository to ignore in");
+            return;
+        };
+        let job = gitten_app::verbs::Write::ignore(writes.repo, path.as_bytes().to_vec());
+        if !writes.send(Box::new(job)) {
+            self.set_notice("the job queue is shutting down");
+        }
+    }
+
     /// The one registration path built-ins and compiled-in extensions share.
     #[allow(dead_code)]
     fn register_pane(
@@ -1142,6 +1280,9 @@ impl DevShell {
             // same honest sentence an unknown command gets.
             "files.stage" => self.stage_or_unstage(cx),
             "files.commit" => self.begin_commit_message(cx),
+            "files.discard" => self.discard_selected(cx),
+            "files.stage-all" => self.stage_all(cx),
+            "files.ignore" => self.ignore_selected(cx),
             "copy.selection" => self.copy_selection(cx),
             // Both are answered by whichever screen is up; a commit graph has no
             // selection yet, and a command nothing handles there is inert — the
@@ -3086,6 +3227,56 @@ mod tests {
             self.calls.lock().unwrap().push(format!("commit {message}"));
             Ok("f00d".into())
         }
+
+        fn discard(&self, path: &[u8]) -> gitten_git::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("discard {}", String::from_utf8_lossy(path)));
+            Ok(())
+        }
+
+        fn remove_untracked(&self, path: &[u8]) -> gitten_git::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("delete {}", String::from_utf8_lossy(path)));
+            Ok(())
+        }
+
+        fn ignore(&self, path: &[u8]) -> gitten_git::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("ignore {}", String::from_utf8_lossy(path)));
+            Ok(())
+        }
+
+        fn stage_many(&self, paths: &[&[u8]]) -> gitten_git::Result<()> {
+            let shown = paths
+                .iter()
+                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("stage-many {shown}"));
+            Ok(())
+        }
+
+        fn unstage_many(&self, paths: &[&[u8]]) -> gitten_git::Result<()> {
+            let shown = paths
+                .iter()
+                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("unstage-many {shown}"));
+            Ok(())
+        }
     }
 
     /// A shell with the two startup panes and a repository behind the files
@@ -3100,6 +3291,33 @@ mod tests {
         Arc<RecordingRepo>,
         gitten_git::Handle,
     ) {
+        let mut tree = Status::default();
+        tree.staged.push(gitten_core::status::StagedEntry {
+            path: "gone.txt".into(),
+            change: gitten_core::status::Change::Deleted,
+            old_path: None,
+            kind: gitten_core::status::Kind::File,
+            submodule: Default::default(),
+        });
+        tree.unstaged.push(gitten_core::status::UnstagedEntry {
+            path: "notes.md".into(),
+            change: gitten_core::status::Change::Modified,
+            kind: gitten_core::status::Kind::File,
+            submodule: Default::default(),
+        });
+        tree_shell(cx, tree)
+    }
+
+    /// The same shell over any tree a test names — the untracked and
+    /// conflict rows the fixed fixture above does not carry.
+    fn tree_shell(
+        cx: &mut TestAppContext,
+        tree: Status,
+    ) -> (
+        gpui::Entity<DevShell>,
+        Arc<RecordingRepo>,
+        gitten_git::Handle,
+    ) {
         let calls = Arc::default();
         let repo = Arc::new(RecordingRepo {
             calls: Arc::clone(&calls),
@@ -3108,20 +3326,6 @@ mod tests {
         let shell = shell(None, cx);
         shell.update(cx, |shell, cx| {
             let host = Rc::new(Host::new());
-            let mut tree = Status::default();
-            tree.staged.push(gitten_core::status::StagedEntry {
-                path: "gone.txt".into(),
-                change: gitten_core::status::Change::Deleted,
-                old_path: None,
-                kind: gitten_core::status::Kind::File,
-                submodule: Default::default(),
-            });
-            tree.unstaged.push(gitten_core::status::UnstagedEntry {
-                path: "notes.md".into(),
-                change: gitten_core::status::Change::Modified,
-                kind: gitten_core::status::Kind::File,
-                submodule: Default::default(),
-            });
             let files = cx.new(|_| {
                 crate::views::files::Files::from_prepared(crate::views::files::prepare(tree, "r"))
             });
@@ -3473,5 +3677,205 @@ mod tests {
             );
         });
         assert!(repo.wrote().is_empty());
+    }
+
+    #[gpui::test]
+    fn discard_asks_on_the_first_press_and_acts_on_the_second(cx: &mut TestAppContext) {
+        let (shell, repo, _handle) = files_shell(cx);
+        // The keyboard starts on notes.md under *unstaged*: the question is
+        // "discard", and it is asked once in the band.
+        shell.update(cx, |shell, cx| shell.run_command("files.discard", cx));
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(
+                shell.notice.as_deref(),
+                Some("discard notes.md? press again to confirm"),
+                "{:?}",
+                shell.notice
+            );
+        });
+        // Nothing was queued for a first press, however long the worker waits.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(repo.wrote().is_empty());
+
+        // The second press on the same row spends the arm and rides the rails:
+        // job off-thread, generation bump, re-acquire — everything stage rides.
+        shell.update(cx, |shell, cx| shell.run_command("files.discard", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["discard notes.md"]);
+    }
+
+    #[gpui::test]
+    fn an_untracked_discard_says_delete_because_that_is_what_it_does(cx: &mut TestAppContext) {
+        let mut tree = Status::default();
+        tree.staged.push(gitten_core::status::StagedEntry {
+            path: "gone.txt".into(),
+            change: gitten_core::status::Change::Deleted,
+            old_path: None,
+            kind: gitten_core::status::Kind::File,
+            submodule: Default::default(),
+        });
+        tree.untracked.push(gitten_core::status::UntrackedEntry {
+            path: "loose.txt".into(),
+        });
+        let (shell, repo, _handle) = tree_shell(cx, tree);
+        // The keyboard is on loose.txt, which no earlier version exists for.
+        shell.update(cx, |shell, cx| shell.run_command("files.discard", cx));
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(
+                shell.notice.as_deref(),
+                Some("delete loose.txt? press again to confirm"),
+                "{:?}",
+                shell.notice
+            );
+        });
+
+        shell.update(cx, |shell, cx| shell.run_command("files.discard", cx));
+        pump_write(&shell, cx);
+        assert_eq!(
+            repo.wrote(),
+            vec!["delete loose.txt"],
+            "the untracked mechanics ran, not a checkout"
+        );
+    }
+
+    #[gpui::test]
+    fn moving_the_keyboard_disarms_and_a_staged_row_refuses_aloud(cx: &mut TestAppContext) {
+        let (shell, repo, _handle) = files_shell(cx);
+
+        // Arm on the unstaged row...
+        shell.update(cx, |shell, cx| shell.run_command("files.discard", cx));
+        // ...then move onto the staged twin section's file. The move itself
+        // disarmed; what lands here is a refusal, not an execution.
+        shell.update(cx, |shell, cx| {
+            let Some(Screen::Files { view, .. }) = shell.active() else {
+                panic!("files pane lost");
+            };
+            view.update(cx, |f, _| {
+                f.run_view("view.top", &Rc::new(Host::new()));
+                f.run_view("view.down", &Rc::new(Host::new())); // gone.txt, staged
+            });
+        });
+        shell.update(cx, |shell, cx| shell.run_command("files.discard", cx));
+        shell.read_with(cx, |shell, _| {
+            let notice = shell.notice.as_deref().unwrap_or_default();
+            assert!(
+                notice.contains("staged") && notice.contains("unstage"),
+                "the staged row said why it refused: {notice:?}"
+            );
+        });
+        assert!(repo.wrote().is_empty(), "a refusal queued nothing");
+
+        // Back on the unstaged row, the dance runs from the top: ask, then act.
+        shell.update(cx, |shell, cx| {
+            let Some(Screen::Files { view, .. }) = shell.active() else {
+                panic!("files pane lost");
+            };
+            view.update(cx, |f, _| {
+                f.run_view("view.bottom", &Rc::new(Host::new())); // notes.md
+            });
+        });
+        shell.update(cx, |shell, cx| shell.run_command("files.discard", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(shell
+                .notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("press again"));
+        });
+        shell.update(cx, |shell, cx| shell.run_command("files.discard", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["discard notes.md"]);
+    }
+
+    #[gpui::test]
+    fn stage_all_takes_every_row_by_the_side_the_keyboard_sits_in(cx: &mut TestAppContext) {
+        let (shell, repo, _handle) = files_shell(cx);
+
+        // Keyboard on the unstaged row: stage everything that side holds,
+        // unstaged and untracked together, as one job.
+        shell.update(cx, |shell, cx| shell.run_command("files.stage-all", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["stage-many notes.md"]);
+
+        // Onto the staged section and the same key unstages the other side.
+        shell.update(cx, |shell, cx| {
+            let Some(Screen::Files { view, .. }) = shell.active() else {
+                panic!("files pane lost");
+            };
+            view.update(cx, |f, _| {
+                f.run_view("view.top", &Rc::new(Host::new()));
+                f.run_view("view.down", &Rc::new(Host::new()));
+            });
+        });
+        shell.update(cx, |shell, cx| shell.run_command("files.stage-all", cx));
+        pump_write(&shell, cx);
+        assert_eq!(
+            repo.wrote(),
+            vec!["stage-many notes.md", "unstage-many gone.txt"],
+            "the cursor's side decided both directions"
+        );
+    }
+
+    #[gpui::test]
+    fn staging_everything_when_there_is_nothing_says_so_and_queues_nothing(
+        cx: &mut TestAppContext,
+    ) {
+        let (shell, repo, _handle) = files_shell(cx);
+        // A clean tree flattens to nothing, so the cursor sits nowhere.
+        shell.update(cx, |shell, cx| {
+            let Some(Screen::Files { view, .. }) = shell.active() else {
+                panic!("files pane lost");
+            };
+            view.update(cx, |f, cx| {
+                f.replace_prepared(
+                    crate::views::files::prepare(Status::default(), "r"),
+                    &config::host(cx),
+                );
+            });
+        });
+        shell.update(cx, |shell, cx| shell.run_command("files.stage-all", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                shell
+                    .notice
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("nothing"),
+                "{:?}",
+                shell.notice
+            );
+        });
+        assert!(repo.wrote().is_empty());
+    }
+
+    #[gpui::test]
+    fn ignore_answers_for_an_untracked_file_and_nowhere_else(cx: &mut TestAppContext) {
+        let (shell, repo, _handle) = files_shell(cx);
+        // notes.md is tracked-and-modified: .gitignore governs nothing here,
+        // and the command says so rather than succeeding at nothing.
+        shell.update(cx, |shell, cx| shell.run_command("files.ignore", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                shell
+                    .notice
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("untracked"),
+                "{:?}",
+                shell.notice
+            );
+        });
+        assert!(repo.wrote().is_empty());
+
+        // The row it does answer: an untracked file goes to .gitignore as one
+        // write job; the refresh after it drops the entry from status.
+        let mut tree = Status::default();
+        tree.untracked.push(gitten_core::status::UntrackedEntry {
+            path: "loose.txt".into(),
+        });
+        let (shell, repo, _handle) = tree_shell(cx, tree);
+        shell.update(cx, |shell, cx| shell.run_command("files.ignore", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["ignore loose.txt"]);
     }
 }
