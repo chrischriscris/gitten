@@ -15,12 +15,12 @@ the headless test crates stay green before a push lands.
 One workflow, `.github/workflows/check.yml`, two jobs, both ubuntu:
 
 - **test** — the portable part of `check.sh`'s correctness section: `cargo test`
-  over `plait-core`, `plait-app`, `plait-web` and `plait-tui`. Each is headless
+  over `gitten-core`, `gitten-app`, `gitten-web` and `gitten-tui`. Each is headless
   by design, so they run unmodified.
 - **linux** — `cargo check --workspace --all-targets` with the packages a Linux
   GPUI build needs. This is the enforcement of the Linux rule; nothing else
   checks it between writing a macOS-ism and pushing it. The same job runs
-  `plait-shell`'s headless GPUI tests after the check: they open no real window,
+  `gitten-shell`'s headless GPUI tests after the check: they open no real window,
   but need the native packages available when their dependencies are built.
 
 Both jobs use `--locked`, because `Cargo.lock` is committed and a push without

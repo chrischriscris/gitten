@@ -7,12 +7,12 @@ mod views;
 
 use gpui::*;
 use gpui_component::*;
-use plait_app::acquire::Data;
-use plait_app::cli::{Source, View};
-use plait_app::{Started, Startup};
-use plait_core::differ::{Overrides, Whitespace};
-use plait_core::host::Host;
-use plait_core::FileDiff;
+use gitten_app::acquire::Data;
+use gitten_app::cli::{Source, View};
+use gitten_app::{Started, Startup};
+use gitten_core::differ::{Overrides, Whitespace};
+use gitten_core::host::Host;
+use gitten_core::FileDiff;
 use stats::Stats;
 use std::cell::Cell;
 use std::rc::Rc;
@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Startup-stage timestamps on stderr, behind `PLAIT_START_LOG=1`.
+/// Startup-stage timestamps on stderr, behind `GITTEN_START_LOG=1`.
 ///
 /// Time-to-first-frame hides between stages nobody measures: acquisition and
 /// the config were timed, the GPUI window path never was, so a slow launch
@@ -42,7 +42,7 @@ mod start {
 
     pub fn on() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("PLAIT_START_LOG").is_some_and(|v| v != "0"))
+        *ON.get_or_init(|| std::env::var_os("GITTEN_START_LOG").is_some_and(|v| v != "0"))
     }
 
     /// Pins the epoch. Later than process start by exec and dyld, which no
@@ -70,7 +70,7 @@ mod start {
 #[global_allocator]
 static ALLOC: stats::Counting = stats::Counting;
 
-actions!(plait, [Quit, CycleTheme]);
+actions!(gitten, [Quit, CycleTheme]);
 
 use views::diff::{CopySelection, CycleLayout, CycleWrap, SelectAll, SelectNone};
 
@@ -88,8 +88,8 @@ const LIGHTS_W: f32 = 72.0;
 /// one sentence, and it is only there when something failed.
 const BAND_H: f32 = 22.0;
 
-/// What only this client has. The two views, the arguments and `plait.toml` are
-/// documented once, in `plait_app::cli::usage`, because they are the same in
+/// What only this client has. The two views, the arguments and `gitten.toml` are
+/// documented once, in `gitten_app::cli::usage`, because they are the same in
 /// every client — see that function for why that is a promise and not a
 /// convenience.
 const EXTRA: &str =
@@ -97,7 +97,7 @@ const EXTRA: &str =
   where a line too wide for the window breaks (off, word, char), the diff
   algorithm (histogram, patience, myers), how much whitespace has to match
   (exact, trailing, change, all — git's default, --ignore-space-at-eol, -b and
-  -w) and the theme (dark, light, slate, and whatever plait.toml adds). `s`
+  -w) and the theme (dark, light, slate, and whatever gitten.toml adds). `s`
   cycles the presentation, `w` the wrap and `T` the theme.
 
   The file is re-read every time it is saved, and colours and font apply on the
@@ -107,7 +107,7 @@ const EXTRA: &str =
                    on the row you were reading. Debug build and the overlay by
                    default; pass --release before trusting a timing.
 
-  PLAIT_STATS=1   frame, row and heap overlay
+  GITTEN_STATS=1   frame, row and heap overlay
 ";
 
 /// How to acquire the diff again with a different algorithm.
@@ -148,14 +148,14 @@ struct DevShell {
     rediff: Option<Rediff>,
     /// The live picks. Every field `None` means "whatever the config selected",
     /// which is what the controls show until somebody changes one — so the strip
-    /// agrees with `plait.toml` rather than with a copy of it taken at startup.
+    /// agrees with `gitten.toml` rather than with a copy of it taken at startup.
     over: Overrides,
     open: Option<Open>,
     /// A failed re-diff. Shown, not swallowed: the usual cause is a repository
     /// that moved under the window, and silently keeping the old rows would be a
     /// diff labelled with an algorithm that did not produce it.
     error: Option<SharedString>,
-    /// Where `plait.toml` is. Held because picking a theme goes through the same
+    /// Where `gitten.toml` is. Held because picking a theme goes through the same
     /// reload a save does — see [`config::reload`] for why there is only one
     /// path.
     config: std::path::PathBuf,
@@ -229,12 +229,12 @@ impl DevShell {
     /// there is no host to edit: it is an `Rc` every view is holding, replaced
     /// wholesale precisely so nobody can see half a theme. So a pick is a
     /// rebuild from the file with the pick applied on top — which is also what
-    /// makes it survive the next save, and what makes a colour in `plait.toml`
+    /// makes it survive the next save, and what makes a colour in `gitten.toml`
     /// still count after one.
     fn set_theme(&mut self, name: String, cx: &mut Context<Self>) {
         cx.set_global(config::Chosen(Some(name)));
         for w in config::reload(&self.config, cx) {
-            eprintln!("plait: {w}");
+            eprintln!("gitten: {w}");
         }
         cx.notify();
     }
@@ -274,7 +274,7 @@ impl DevShell {
         };
 
         // Straight off the registry in `core`, so a theme an extension registers
-        // — or one written in `plait.toml` — is in this menu without a line here
+        // — or one written in `gitten.toml` — is in this menu without a line here
         // changing. Outside the `diff` check below on purpose: a palette is the
         // whole window's, and the commit graph is drawn out of the same one.
         let theme_names = host.themes.names();
@@ -479,7 +479,7 @@ impl Render for DevShell {
                     .border_b_1()
                     .border_color(rgb(c.border))
                     .text_color(rgb(c.dim))
-                    .child(div().flex_none().text_color(rgb(c.fg)).child("plait"))
+                    .child(div().flex_none().text_color(rgb(c.fg)).child("gitten"))
                     .child(dot())
                     .child(div().flex_none().child(self.which))
                     .child(dot())
@@ -567,10 +567,10 @@ impl Render for DevShell {
 fn main() {
     start::begin(std::time::Instant::now());
     start::mark("main enter");
-    // Arguments, `plait.toml`, `--help`, `plait config` and acquisition, all of
-    // it shared with every other client — see `plait_app`. What is left in this
+    // Arguments, `gitten.toml`, `--help`, `gitten config` and acquisition, all of
+    // it shared with every other client — see `gitten_app`. What is left in this
     // file is a window.
-    let started = match Startup::new("plait", View::Commits)
+    let started = match Startup::new("gitten", View::Commits)
         .blurb("a git client")
         .extra(EXTRA)
         .go()
@@ -578,7 +578,7 @@ fn main() {
         Ok(started) => started,
         Err(exit) => exit.finish(),
     };
-    start::mark("startup done (args + plait.toml + acquire)");
+    start::mark("startup done (args + gitten.toml + acquire)");
     let Started {
         view: which,
         source,
@@ -601,7 +601,7 @@ fn main() {
         (View::Diff, Source::Repo { path, arg }) => {
             let (repo, revspec) = (path.clone(), arg.clone());
             Some(Rc::new(move |host: &Host, over: &Overrides| {
-                plait_git::diff(&repo, &revspec, &host.differ, over)
+                gitten_git::diff(&repo, &revspec, &host.differ, over)
             }))
         }
         _ => None,
@@ -645,7 +645,7 @@ fn main() {
         };
         if watcher.is_none() {
             eprintln!(
-                "plait: could not watch {}; config reload is off",
+                "gitten: could not watch {}; config reload is off",
                 config_path.display()
             );
         }
@@ -663,7 +663,7 @@ fn main() {
                 // The same call a theme pick makes — see `config::reload`.
                 let warnings = cx.update(|cx| config::reload(&config_path, cx));
                 for w in warnings {
-                    eprintln!("plait: {w}");
+                    eprintln!("gitten: {w}");
                 }
             }
         })
@@ -681,7 +681,7 @@ fn main() {
                 };
                 cx.set_global(config::Chosen(Some(next)));
                 for w in config::reload(&path, cx) {
-                    eprintln!("plait: {w}");
+                    eprintln!("gitten: {w}");
                 }
             }
         });
@@ -857,7 +857,7 @@ fn main() {
         // nothing; the bar just fills in while frame zero paints.
         cx.set_menus(vec![
             Menu {
-                name: "plait".into(),
+                name: "gitten".into(),
                 items: vec![MenuItem::action("Quit", Quit)],
                 disabled: false,
             },
@@ -879,7 +879,7 @@ fn main() {
 
 /// The window's own title — what macOS shows in Mission Control, the Window menu
 /// and the tab bar. Not what is drawn in the strip: that is three separate
-/// colours in [`DevShell::render`], because "plait", the view and the repository
+/// colours in [`DevShell::render`], because "gitten", the view and the repository
 /// are three different kinds of thing and one grey run of text says so about
 /// none of them.
 ///
@@ -887,7 +887,7 @@ fn main() {
 /// after the `Started` has been taken apart, and reassembling it to ask would be
 /// sillier than the two lines.
 fn started_title(view: View, label: &str) -> String {
-    format!("plait · {} · {label}", view.name())
+    format!("gitten · {} · {label}", view.name())
 }
 
 /// The window, and the one decision in it worth writing down: **there is no

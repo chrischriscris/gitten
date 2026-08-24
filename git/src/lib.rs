@@ -10,7 +10,7 @@
 //!
 //! `git diff` will happily hand over a finished unified diff, and this crate
 //! used to parse exactly that. It no longer does, because then *git* chooses the
-//! algorithm and `plait_core::differ` is decoration: a semantic or
+//! algorithm and `gitten_core::differ` is decoration: a semantic or
 //! language-aware differ could never be reached, and rule 1 says a built-in may
 //! not do anything an extension cannot.
 //!
@@ -28,8 +28,8 @@
 //! The OIDs are the reason to want it this way round anyway: a blob's content
 //! never changes, so a diff keyed on the pair of them is cacheable forever.
 
-use plait_core::differ::{Differs, Overrides};
-use plait_core::{parse_log, Commit, FileDiff};
+use gitten_core::differ::{Differs, Overrides};
+use gitten_core::{parse_log, Commit, FileDiff};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdout, Command, Stdio};
@@ -38,7 +38,7 @@ use std::thread::JoinHandle;
 
 pub type Result<T> = std::result::Result<T, String>;
 
-/// Must match `plait_core::parse_log`.
+/// Must match `gitten_core::parse_log`.
 const LOG_FORMAT: &str = "%H%x1f%h%x1f%P%x1f%an%x1f%at%x1f%s%x1e";
 
 /// An OID of all zeros is git's "not in the object database", which on the new
@@ -318,7 +318,7 @@ fn untracked(repo: &Path) -> Result<Vec<Pair>> {
     Ok(out)
 }
 
-/// A diff, through whichever [`Differ`](plait_core::differ::Differ) the host
+/// A diff, through whichever [`Differ`](gitten_core::differ::Differ) the host
 /// routed each path to.
 ///
 /// `over` carries a frontend's live picks — the title-bar dropdowns — and
@@ -672,7 +672,7 @@ mod tests {
 
     impl Scratch {
         fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("plait-git-{name}-{}", std::process::id()));
+            let dir = std::env::temp_dir().join(format!("gitten-git-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).expect("a temp dir");
             let me = Scratch(dir);

@@ -32,11 +32,11 @@ empty part of the strip moves the window and nothing here implements that.
 mode first so anything we have *not* named lands somewhere defensible, then the
 scrollbar track, thumb and radius, then `Theme::sync_base`, which is what actually
 reaches the layer that paints. It runs again on every config reload, so a
-scrollbar follows a saved `plait.toml` like every other colour in the window.
+scrollbar follows a saved `gitten.toml` like every other colour in the window.
 
 ## Why not draw our own scrollbar
 
-Rule 2 wants every colour to come from `plait_core::theme`, and this is the
+Rule 2 wants every colour to come from `gitten_core::theme`, and this is the
 cheaper way to get it: eight assignments against a thumb, a track, hover states
 and drag handling. [0015](0015-title-bar-controls-are-hand-rolled.md) hand-rolled a
 picker and gave three reasons for it; none of them apply here — there is no

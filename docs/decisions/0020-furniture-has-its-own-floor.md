@@ -32,7 +32,7 @@ number is looked up once and should recede for the rest of the time. A test
 asserts the second is lower than the first, so the day they converge one of them
 is wrong.
 
-The hunk header split follows from it. `plait_core::hunk_parts` cuts
+The hunk header split follows from it. `gitten_core::hunk_parts` cuts
 `@@ -41,9 +41,11 @@ fn dispatch() {` at the second `@@`, the coordinates take the
 furniture colour and the declaration keeps `hunk_fg` — because the coordinates
 *are* furniture, a line number with a range around it, and drawn as one run they
@@ -54,7 +54,7 @@ of furniture that is *text*, on backgrounds it does not choose. See
 ## Consequences
 
 `min_furniture` is a public field like `min_contrast`, with the same
-`rebuild()`-after-editing rule, and `plait config` writes it. One more number in
+`rebuild()`-after-editing rule, and `gitten config` writes it. One more number in
 the file, and one more table in the theme: one `Rgb` per `Surface`, computed once.
 
 `a_line_number_clears_the_furniture_floor_on_every_surface` pins it, so a new

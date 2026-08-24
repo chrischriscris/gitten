@@ -1,7 +1,7 @@
 //! Checks the lane assignment's contract against real topology.
 //!
 //! The graph is only "correct" if these hold; eyeballing pixels cannot tell you.
-use plait_core::*;
+use gitten_core::*;
 use std::collections::HashMap;
 
 fn main() {

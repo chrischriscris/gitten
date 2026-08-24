@@ -33,7 +33,7 @@ the line rather than new lines.** The line, its numbers, its tokens and its span
 are one object shared by all of its rows; a renderer draws range `k` of line `i`.
 Nothing above stage 4 of the pipeline learns that wrapping exists.
 
-**Where a line breaks is a seam.** `plait_core::wrap::Wrap` returns break points
+**Where a line breaks is a seam.** `gitten_core::wrap::Wrap` returns break points
 and nothing else. Three built-ins — `word` (selected), `char`, `off` — and
 `Wraps` is the registry, on `Host`. Everything else is shared: `Wrapped` turns
 break points into the range partition, validates them, holds them flat and

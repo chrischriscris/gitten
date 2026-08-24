@@ -1,13 +1,13 @@
-//! `plait-tui` — plait in the terminal you started it from.
+//! `gitten-tui` — gitten in the terminal you started it from.
 //!
-//! The assembly, and deliberately thin: arguments, `plait.toml` and acquisition
-//! are `plait_app`; the views are `plait_tui`; which command a key runs is
-//! `plait_core::command`. What is left here is a loop.
+//! The assembly, and deliberately thin: arguments, `gitten.toml` and acquisition
+//! are `gitten_app`; the views are `gitten_tui`; which command a key runs is
+//! `gitten_core::command`. What is left here is a loop.
 //!
 //! # Nothing in this file decides what a key does
 //!
 //! It reads one, asks the keymap what it means, and calls a method named by the
-//! answer. The keymap is on `Host`, so `plait.toml` and an extension reach it
+//! answer. The keymap is on `Host`, so `gitten.toml` and an extension reach it
 //! the same way — and the same file drives the GPUI client. A `match` on
 //! keypresses here would be a keymap this client owned alone, which is the thing
 //! `docs/architecture.md` spent two versions asking for and not getting.
@@ -21,22 +21,22 @@
 //! # The loop is idle until something happens
 //!
 //! It blocks on input with a timeout, and the timeout exists only so a saved
-//! `plait.toml` is noticed. Nothing redraws at rest — the same property the GPUI
+//! `gitten.toml` is noticed. Nothing redraws at rest — the same property the GPUI
 //! client has for free, arrived at here on purpose, and the reason the frame
 //! timing in `docs/measurements.md` is measured rather than observed.
 
-use plait_app::acquire::{self, Data};
-use plait_app::cli::{self, Source, View};
-use plait_app::{StartClock, Startup};
-use plait_core::command::{chord_string, Key, Modes, Resolve};
-use plait_core::host::Host;
-use plait_core::runs::Run;
-use plait_tui::commits::{Commits, Glyphs};
-use plait_tui::diff::Diff;
-use plait_tui::help;
-use plait_tui::screen::{Ink, Pen, Screen};
-use plait_tui::scrollbar::Bar;
-use plait_tui::term::{Input, Mouse, MouseKind, Term};
+use gitten_app::acquire::{self, Data};
+use gitten_app::cli::{self, Source, View};
+use gitten_app::{StartClock, Startup};
+use gitten_core::command::{chord_string, Key, Modes, Resolve};
+use gitten_core::host::Host;
+use gitten_core::runs::Run;
+use gitten_tui::commits::{Commits, Glyphs};
+use gitten_tui::diff::Diff;
+use gitten_tui::help;
+use gitten_tui::screen::{Ink, Pen, Screen};
+use gitten_tui::scrollbar::Bar;
+use gitten_tui::term::{Input, Mouse, MouseKind, Term};
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -44,9 +44,9 @@ use std::time::{Duration, Instant};
 
 const EXTRA: &str = "  --ascii        draw the graph and the scrollbar without box-drawing
   --no-mouse     leave the mouse to the terminal: no wheel, no click, and the
-                 emulator's own drag-to-select instead of plait's
+                 emulator's own drag-to-select instead of gitten's
 
-  `?` lists every key, from the same keymap `plait.toml` writes. Colours and the
+  `?` lists every key, from the same keymap `gitten.toml` writes. Colours and the
   keymap are re-read every time the file is saved.
 ";
 
@@ -71,8 +71,8 @@ fn main() {
     // config, acquisition. The clock below is armed where that hands over and
     // marks the ones only a terminal client has, so every number is the stage
     // itself and not the road so far.
-    let mut start = Startup::new("plait-tui", View::Commits)
-        .blurb("plait in the terminal you started it from")
+    let mut start = Startup::new("gitten-tui", View::Commits)
+        .blurb("gitten in the terminal you started it from")
         .extra(EXTRA);
     let glyphs = match cli::take_switch(start.take(), "--ascii") {
         true => Glyphs::ascii(),
@@ -90,11 +90,11 @@ fn main() {
     let dirty = Arc::new(AtomicBool::new(false));
     let watcher = {
         let (tx, rx) = std::sync::mpsc::channel();
-        let path = plait_app::config::path();
+        let path = gitten_app::config::path();
         let dirty = dirty.clone();
         std::thread::spawn(move || {
             let _ = tx.send(
-                plait_app::config::watch(&path, move || dirty.store(true, Ordering::Relaxed)).ok(),
+                gitten_app::config::watch(&path, move || dirty.store(true, Ordering::Relaxed)).ok(),
             );
         });
         rx
@@ -115,7 +115,7 @@ fn main() {
     let mut term = match Term::enter(mouse) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("plait-tui: could not take the terminal: {e}");
+            eprintln!("gitten-tui: could not take the terminal: {e}");
             std::process::exit(1);
         }
     };
@@ -131,7 +131,7 @@ fn main() {
 
     if let Err(e) = app.run(&mut term, &dirty, &config_path, &mut clock) {
         term.leave();
-        eprintln!("plait-tui: {e}");
+        eprintln!("gitten-tui: {e}");
         std::process::exit(1);
     }
     // Explicitly, before anything is printed: `Drop` would do it, but not until
@@ -146,7 +146,7 @@ enum Screens {
 }
 
 impl Screens {
-    /// Which mode's bindings are live. The name the keymap and `plait.toml` use.
+    /// Which mode's bindings are live. The name the keymap and `gitten.toml` use.
     fn mode(&self) -> &'static str {
         match self {
             Screens::Commits(_) => "commits",
@@ -251,7 +251,7 @@ impl Screens {
     /// Runs a command, or says it does not know it.
     ///
     /// The `view.*` half is the same list for both screens and is what makes
-    /// them bindable in [`plait_core::command::GLOBAL`]: a key that scrolls one
+    /// them bindable in [`gitten_core::command::GLOBAL`]: a key that scrolls one
     /// list scrolls every list, and nothing had to say so twice.
     fn run(&mut self, command: &str, host: &Host) -> bool {
         match self {
@@ -310,13 +310,13 @@ struct App {
     quit: bool,
     /// The theme `theme.cycle` picked, if anything has. `None` means the file's.
     picked_theme: Option<String>,
-    /// What the last frame cost, when `PLAIT_STATS` is set.
+    /// What the last frame cost, when `GITTEN_STATS` is set.
     ///
     /// Two numbers and no overlay: how long the draw took, and how many cells
     /// reached the terminal. The second is the one worth watching — a scroll is
     /// a screenful and a cursor move should be a handful, and a number that is
     /// always the whole grid means something is repainting ink it did not need
-    /// to. `PLAIT_STATS=1` and the same "0 is off" rule as the window.
+    /// to. `GITTEN_STATS=1` and the same "0 is off" rule as the window.
     stats: Option<(Duration, usize)>,
     /// The run-list buffer, owned across frames so drawing allocates nothing.
     runs: Vec<Run>,
@@ -336,7 +336,7 @@ struct App {
 }
 
 impl App {
-    fn new(started: plait_app::Started, glyphs: Glyphs) -> Self {
+    fn new(started: gitten_app::Started, glyphs: Glyphs) -> Self {
         let repo = match &started.source {
             Source::Repo { path, .. } => Some(path.clone()),
             Source::Fixtures => None,
@@ -459,7 +459,7 @@ impl App {
     /// all land on the next frame.
     fn reload(&mut self, path: &std::path::Path) {
         let mut next = Host::new();
-        let mut warnings = plait_app::config::load(&mut next, path);
+        let mut warnings = gitten_app::config::load(&mut next, path);
         // A theme cycled with a key outlives a save of the file, the way the
         // view's own wrap and layout indices do: the file says what this opened
         // on, and the key says what is on screen now. It loses only when the
@@ -472,7 +472,7 @@ impl App {
         }
         self.host = next;
         self.message = match warnings.is_empty() {
-            true => "plait.toml reloaded".into(),
+            true => "gitten.toml reloaded".into(),
             // On the status line rather than stderr: stderr is behind the
             // alternate screen and would be seen only after quitting.
             false => warnings.join(" · "),
@@ -495,7 +495,7 @@ impl App {
             Resolve::Run(command) => Some(command.to_string()),
             Resolve::Pending => return,
             Resolve::None => {
-                let unknown = plait_core::command::chord_string(&self.pending);
+                let unknown = gitten_core::command::chord_string(&self.pending);
                 self.pending.clear();
                 // Said, not swallowed: a key that does nothing and a key that
                 // is not bound look identical, and only one of them is worth
@@ -686,7 +686,7 @@ impl App {
     /// The I/O is here and not in the view, which is the same rule the GPUI
     /// client follows: a view takes already-loaded data and never learns what a
     /// repository is. A bare revision is "what did this commit change" to
-    /// `plait_git::pairs`, merges included.
+    /// `gitten_git::pairs`, merges included.
     fn open_diff(&mut self) {
         let Some(Screens::Commits(list)) = self.stack.last() else {
             self.message = "no commit selected".into();
@@ -778,7 +778,7 @@ impl App {
         // puts them. Only ever non-empty mid-chord.
         let pending = chord_string(&self.pending);
         if !pending.is_empty() {
-            let at = w.saturating_sub(plait_tui::screen::width(&pending) + 1);
+            let at = w.saturating_sub(gitten_tui::screen::width(&pending) + 1);
             let mut pen = self.screen.span(h - 1, at, w - at);
             pen.put(&pending, loud);
             pen.wash(ink);
@@ -800,11 +800,11 @@ fn copied(text: &str) -> String {
     }
 }
 
-/// Whether to report what a frame cost. `PLAIT_STATS=0` turns it off, so
+/// Whether to report what a frame cost. `GITTEN_STATS=0` turns it off, so
 /// `./dev` can set it and a caller can still say no — the same rule the window's
 /// overlay follows.
 fn stats_on() -> bool {
-    std::env::var("PLAIT_STATS").is_ok_and(|v| v != "0")
+    std::env::var("GITTEN_STATS").is_ok_and(|v| v != "0")
 }
 
 /// The title row: what you are looking at, and what would change it.
@@ -813,7 +813,7 @@ fn title(pen: &mut Pen, host: &Host, label: &str, mode: Option<&str>) {
     let ink = Ink::new(c.fg, c.title_bg);
     let dim = Ink::new(c.dim, c.title_bg);
     pen.put(" ", ink);
-    pen.put("plait", Ink::new(c.accent, c.title_bg).bold());
+    pen.put("gitten", Ink::new(c.accent, c.title_bg).bold());
     pen.put("  ", dim);
     if let Some(mode) = mode {
         pen.put(mode, ink);
@@ -827,7 +827,7 @@ fn title(pen: &mut Pen, host: &Host, label: &str, mode: Option<&str>) {
         Some(key) => format!("{key} keys "),
         None => String::new(),
     };
-    let pad = pen.room().saturating_sub(plait_tui::screen::width(&hint));
+    let pad = pen.room().saturating_sub(gitten_tui::screen::width(&hint));
     pen.fill(pad, ' ', dim);
     pen.put(&hint, dim);
     pen.wash(dim);

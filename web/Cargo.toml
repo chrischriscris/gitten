@@ -1,5 +1,5 @@
 [package]
-name = "plait-web"
+name = "gitten-web"
 version = "0.0.0"
 edition = "2021"
 
@@ -12,9 +12,9 @@ edition = "2021"
 # loopback is a `TcpListener` and a `Vec<u8>`; a JSON writer for types we own is
 # a `String`. Neither is worth async, and neither is worth two hundred crates.
 #
-# `plait-app` is the shared startup — arguments, `plait.toml`, acquisition —
+# `gitten-app` is the shared startup — arguments, `gitten.toml`, acquisition —
 # which is also how this client reaches the config file at all. It brings `toml`
 # and `notify` with it; both were already in the lock.
 [dependencies]
-plait-app = { path = "../app" }
-plait-core = { path = "../core" }
+gitten-app = { path = "../app" }
+gitten-core = { path = "../core" }

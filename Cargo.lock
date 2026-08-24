@@ -2230,6 +2230,60 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
 
 [[package]]
+name = "gitten-app"
+version = "0.0.0"
+dependencies = [
+ "gitten-core",
+ "gitten-git",
+ "notify",
+ "toml 0.8.23",
+]
+
+[[package]]
+name = "gitten-core"
+version = "0.0.0"
+
+[[package]]
+name = "gitten-git"
+version = "0.0.0"
+dependencies = [
+ "gitten-core",
+]
+
+[[package]]
+name = "gitten-shell"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "gitten-app",
+ "gitten-core",
+ "gitten-git",
+ "gpui",
+ "gpui-component",
+ "gpui-component-assets",
+ "gpui_platform",
+]
+
+[[package]]
+name = "gitten-tui"
+version = "0.0.0"
+dependencies = [
+ "crossterm",
+ "gitten-app",
+ "gitten-core",
+ "gitten-git",
+ "unicode-width",
+]
+
+[[package]]
+name = "gitten-web"
+version = "0.0.0"
+dependencies = [
+ "gitten-app",
+ "gitten-core",
+]
+
+[[package]]
 name = "gl_generator"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4844,60 +4898,6 @@ name = "pkg-config"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
-
-[[package]]
-name = "plait-app"
-version = "0.0.0"
-dependencies = [
- "notify",
- "plait-core",
- "plait-git",
- "toml 0.8.23",
-]
-
-[[package]]
-name = "plait-core"
-version = "0.0.0"
-
-[[package]]
-name = "plait-git"
-version = "0.0.0"
-dependencies = [
- "plait-core",
-]
-
-[[package]]
-name = "plait-shell"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "gpui",
- "gpui-component",
- "gpui-component-assets",
- "gpui_platform",
- "plait-app",
- "plait-core",
- "plait-git",
-]
-
-[[package]]
-name = "plait-tui"
-version = "0.0.0"
-dependencies = [
- "crossterm",
- "plait-app",
- "plait-core",
- "plait-git",
- "unicode-width",
-]
-
-[[package]]
-name = "plait-web"
-version = "0.0.0"
-dependencies = [
- "plait-app",
- "plait-core",
-]
 
 [[package]]
 name = "png"

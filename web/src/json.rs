@@ -6,7 +6,7 @@
 //! encoders live beside the routes, hand-written, and the one thing worth
 //! getting right is escaping.
 
-use plait_core::theme::Rgb;
+use gitten_core::theme::Rgb;
 
 /// Appends a JSON string literal, quotes included.
 ///

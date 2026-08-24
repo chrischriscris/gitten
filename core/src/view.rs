@@ -36,11 +36,11 @@ use std::ops::Range;
 ///
 /// Three, because a cursor pinned to the last row gives you no idea what you are
 /// scrolling into — the same reason `scrolloff` exists in every editor. A field
-/// rather than a constant so `plait.toml` can hold it, and so a view with three
+/// rather than a constant so `gitten.toml` can hold it, and so a view with three
 /// rows of its own can say zero.
 pub const SCROLLOFF: usize = 3;
 
-/// How a view scrolls. `[view]` in `plait.toml`, and the same two numbers in
+/// How a view scrolls. `[view]` in `gitten.toml`, and the same two numbers in
 /// every client.
 ///
 /// Here rather than in a client because both of them were a constant somebody
@@ -54,7 +54,7 @@ pub struct Scrolling {
     /// the wheel as one event per *line* of the platform's scroll delta, so
     /// three rows an event is three times whatever the user set for every other
     /// app on the machine — nine rows a notch on a mouse with macOS's default,
-    /// which reads as a page. One row an event makes plait scroll at exactly the
+    /// which reads as a page. One row an event makes gitten scroll at exactly the
     /// speed the terminal's own scrollback does, which is the number the hand
     /// already knows. A window gets pixel deltas and does its own arithmetic;
     /// this is the multiplier it applies afterwards.

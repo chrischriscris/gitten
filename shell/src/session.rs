@@ -34,16 +34,16 @@ pub struct Session {
     pub top: usize,
 }
 
-// The key for one invocation is `plait_app::cli::Source::key`: it is everything
+// The key for one invocation is `gitten_app::cli::Source::key`: it is everything
 // that changes what is on screen, and every client has to agree about it or a
 // position saved by one is restored by another into a different diff.
 
 /// Under `target/`, because that is already git-ignored and already what you
 /// delete for a clean slate. Overridable so a test never writes to a real one.
 pub fn path() -> PathBuf {
-    std::env::var_os("PLAIT_SESSION")
+    std::env::var_os("GITTEN_SESSION")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("target/plait-session"))
+        .unwrap_or_else(|| PathBuf::from("target/gitten-session"))
 }
 
 /// Two lines: the key, then the row. Hand-rolled rather than TOML because this is
@@ -81,7 +81,7 @@ pub fn save(s: &Session, path: &Path) {
 mod tests {
     use super::*;
 
-    use plait_app::cli::{Source, View};
+    use gitten_app::cli::{Source, View};
     use std::path::PathBuf;
 
     fn key(view: View, repo: &str, arg: &str) -> String {
@@ -109,7 +109,7 @@ mod tests {
     fn a_position_is_only_restored_for_the_command_that_took_it() {
         // The whole safety property: relaunching with a different revspec must
         // not drop you at row 431 of an unrelated diff.
-        let dir = std::env::temp_dir().join("plait-session-test-key");
+        let dir = std::env::temp_dir().join("gitten-session-test-key");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("state");
         let s = session();
@@ -124,7 +124,7 @@ mod tests {
     #[test]
     fn nothing_saved_means_nothing_restored() {
         assert_eq!(
-            restore("anything", Path::new("/nonexistent/plait-session")),
+            restore("anything", Path::new("/nonexistent/gitten-session")),
             None
         );
     }
@@ -158,7 +158,7 @@ mod tests {
 
     #[test]
     fn the_key_distinguishes_everything_that_changes_the_view() {
-        // The key is `plait_app`'s, shared with every client, and this is the
+        // The key is `gitten_app`'s, shared with every client, and this is the
         // property the shell depends on: a position taken in one diff is never
         // restored into another.
         let a = key(View::Diff, ".", "HEAD~1");

@@ -1,19 +1,19 @@
 //! Everything a client needs before it can draw, and nothing that draws.
 //!
-//! plait is a `core` and a set of clients. A client is a window, a browser tab,
+//! gitten is a `core` and a set of clients. A client is a window, a browser tab,
 //! a terminal — or one somebody else writes, which is the point. This crate is
 //! what stops "write your own client" meaning "reimplement the startup".
 //!
 //! ```text
-//!   plait-core   the pipeline. no dependencies, no I/O, no idea a UI exists
-//!   plait-git    acquisition. the only crate that talks to a repository
-//!   plait-app    the config file, the command line, and loading  ← you are here
+//!   gitten-core   the pipeline. no dependencies, no I/O, no idea a UI exists
+//!   gitten-git    acquisition. the only crate that talks to a repository
+//!   gitten-app    the config file, the command line, and loading  ← you are here
 //!   ─────────────────────────────────────────────────────────────────────────
 //!   a client     drawing, and input
 //! ```
 //!
 //! Before it existed, a client had to write its own argument parsing, its own
-//! `--fixtures` arm, its own error strings — and it could not read `plait.toml`
+//! `--fixtures` arm, its own error strings — and it could not read `gitten.toml`
 //! **at all**, because the parser lived behind GPUI. So the window was the only
 //! client that could be configured, which is not a property a config format
 //! should have.
@@ -21,11 +21,11 @@
 //! # What a client is now
 //!
 //! ```no_run
-//! use plait_app::{acquire, cli, Startup};
+//! use gitten_app::{acquire, cli, Startup};
 //!
-//! // Arguments, `plait.toml`, `--help`, `config`, acquisition — all of it.
-//! let start = match Startup::new("plait-tui", cli::View::Diff)
-//!     .blurb("plait in the terminal you started it from")
+//! // Arguments, `gitten.toml`, `--help`, `config`, acquisition — all of it.
+//! let start = match Startup::new("gitten-tui", cli::View::Diff)
+//!     .blurb("gitten in the terminal you started it from")
 //!     .go()
 //! {
 //!     Ok(started) => started,
@@ -39,7 +39,7 @@
 //! ```
 //!
 //! Everything above drawing has happened: the same flags, the same
-//! `plait.toml`, the same differ, the same error messages as every other
+//! `gitten.toml`, the same differ, the same error messages as every other
 //! client.
 //!
 //! # What is deliberately *not* here
@@ -56,7 +56,7 @@ pub mod cli;
 pub mod config;
 
 use cli::{Request, Source, View};
-use plait_core::host::Host;
+use gitten_core::host::Host;
 use std::time::Instant;
 
 /// How wide a row may get before it is clipped.
@@ -100,7 +100,7 @@ pub struct Started {
 }
 
 impl Started {
-    /// What a client puts in a title bar: `plait · diff · plait main HEAD~2..HEAD`.
+    /// What a client puts in a title bar: `gitten · diff · gitten main HEAD~2..HEAD`.
     ///
     /// It names the debug build, because a timing read off one is meaningless
     /// and the shell's overlay has said so since it existed.
@@ -158,11 +158,11 @@ impl Exit {
 /// [`Startup::go`] reports the stages every client shares — arguments parsed,
 /// host built, config loaded, data acquired — and a client marks the ones only
 /// it has with the same clock: the terminal takes its tty, the window its
-/// surface. One prefix, `plait-start:`, so a run's whole breakdown is one grep
+/// surface. One prefix, `gitten-start:`, so a run's whole breakdown is one grep
 /// however many crates printed it.
 ///
-/// Off unless `PLAIT_START_LOG` says otherwise (`0` off, the same rule
-/// `PLAIT_STATS` follows). Nothing costs anything then: one `getenv` at
+/// Off unless `GITTEN_START_LOG` says otherwise (`0` off, the same rule
+/// `GITTEN_STATS` follows). Nothing costs anything then: one `getenv` at
 /// construction and a `None` check per stage afterwards — no timer, no
 /// allocation.
 pub struct StartClock {
@@ -175,7 +175,7 @@ pub struct StartClock {
 impl StartClock {
     pub fn new() -> Self {
         Self {
-            at: std::env::var_os("PLAIT_START_LOG")
+            at: std::env::var_os("GITTEN_START_LOG")
                 .is_some_and(|v| v != "0")
                 .then(Instant::now),
         }
@@ -186,7 +186,7 @@ impl StartClock {
         if let Some(at) = self.at.as_mut() {
             let took = at.elapsed();
             *at = Instant::now();
-            eprintln!("plait-start: {what} in {took:.0?}");
+            eprintln!("gitten-start: {what} in {took:.0?}");
         }
     }
 }
@@ -253,7 +253,7 @@ impl Startup {
             return Err(Exit::Help(self.usage()));
         }
 
-        // The file is read for `config` too — `plait config` prints the file you
+        // The file is read for `config` too — `gitten config` prints the file you
         // have *plus* every default, which is what makes it a starting point
         // rather than a dump of the built-ins.
         let path = config::path();
@@ -295,7 +295,7 @@ mod tests {
     use super::*;
 
     fn start(line: &str) -> Result<Started, Exit> {
-        Startup::new("plait-test", View::Commits)
+        Startup::new("gitten-test", View::Commits)
             .args(line.split_whitespace().map(String::from).collect())
             .go()
     }
@@ -305,7 +305,7 @@ mod tests {
         let Err(Exit::Help(text)) = start("--help") else {
             panic!("--help did not produce usage");
         };
-        assert!(text.contains("plait-test commits"));
+        assert!(text.contains("gitten-test commits"));
     }
 
     #[test]
@@ -324,9 +324,9 @@ mod tests {
         let Err(Exit::Failed(text)) = start("commits /nonexistent") else {
             panic!("a missing repository started anyway");
         };
-        assert!(text.starts_with("plait-test: "), "{text}");
+        assert!(text.starts_with("gitten-test: "), "{text}");
         assert!(
-            text.contains("plait-test commits"),
+            text.contains("gitten-test commits"),
             "the usage was not shown"
         );
     }
@@ -337,7 +337,7 @@ mod tests {
             start("diff . HEAD~1..HEAD").unwrap_or_else(|_| panic!("this repo has history"));
         assert_eq!(started.view, View::Diff);
         assert!(!started.loaded.data.is_empty());
-        assert!(started.title("plait-test").contains("plait-test · diff · "));
+        assert!(started.title("gitten-test").contains("gitten-test · diff · "));
         assert!(started.session_key().starts_with("diff:"));
         // The host is the configured one, not `Host::new()` handed back.
         assert!(!started.host.differ.selected().is_empty());
@@ -348,7 +348,7 @@ mod tests {
         // A revspec and not the bare working tree: `diff .` is "no changes" on
         // whatever clean checkout runs the tests, and this wants an acquisition
         // that succeeds everywhere the repo has history at all.
-        let mut s = Startup::new("plait-test", View::Diff).args(
+        let mut s = Startup::new("gitten-test", View::Diff).args(
             "diff --port 9000 . HEAD~1..HEAD"
                 .split_whitespace()
                 .map(String::from)

@@ -8,12 +8,12 @@
 //! thing in both frontends.
 //!
 //! What the browser is left with is drawing, which is the whole point of
-//! `plait_core::prepared` — see its module docs.
+//! `gitten_core::prepared` — see its module docs.
 
-use plait_core::prepared::{File as PreparedFile, Prepared};
-use plait_core::syntax::{Kind, Token};
-use plait_core::wrap::{Wrap, Wrapped};
-use plait_core::{LineKind, Span};
+use gitten_core::prepared::{File as PreparedFile, Prepared};
+use gitten_core::syntax::{Kind, Token};
+use gitten_core::wrap::{Wrap, Wrapped};
+use gitten_core::{LineKind, Span};
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
@@ -81,7 +81,7 @@ impl Doc {
             moved: 0,
             intraline: p.intraline,
             syntax: p.syntax,
-            wrapped: Wrapped::build(std::iter::empty::<(&str, usize)>(), &plait_core::wrap::Off),
+            wrapped: Wrapped::build(std::iter::empty::<(&str, usize)>(), &gitten_core::wrap::Off),
             cols: 0,
             wrap: "",
             starts: Vec::new(),
@@ -296,10 +296,10 @@ pub fn pieces<'a>(line: &'a Line, at: Range<usize>, out: &mut Vec<Piece<'a>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use plait_core::host::Host;
-    use plait_core::parse_unified_diff;
-    use plait_core::prepared::prepare;
-    use plait_core::wrap::{Off, Word};
+    use gitten_core::host::Host;
+    use gitten_core::parse_unified_diff;
+    use gitten_core::prepared::prepare;
+    use gitten_core::wrap::{Off, Word};
 
     const DIFF: &str = "\
 diff --git a/a.rs b/a.rs

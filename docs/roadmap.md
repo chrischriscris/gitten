@@ -16,7 +16,7 @@ The viewer is assembled: commit graph with lanes, the diff pipeline (three
 differs, two layouts, wrapping, intraline, rendered Markdown), selection and
 copy, theming, config hot reload, command dispatch as data, three clients
 proving the boundary. The actor does not exist: **zero write verbs** in
-`plait-git`, no branch/stash/remote/tag/reflog reads, no staged/unstaged split
+`gitten-git`, no branch/stash/remote/tag/reflog reads, no staged/unstaged split
 in what `pairs()` returns, no text input anywhere in `shell/`, one view filling
 the window. Lazygit is mostly actor — staging, committing, rebasing is its
 centre of gravity, not reading logs. What follows closes that gap without
@@ -30,7 +30,7 @@ before everything else.
 
 | # | Block | Lands | Why now | Unblocks | Size |
 |---|---|---|---|---|---|
-| 1 | **Repo access trait** | `plait-git` | Five free functions today (`log`, `pairs`, …). One surface so reads (someday gix) and writes (binary) hide behind it; frontends never learn which ran | every later item plugs in here | S |
+| 1 | **Repo access trait** | `gitten-git` | Five free functions today (`log`, `pairs`, …). One surface so reads (someday gix) and writes (binary) hide behind it; frontends never learn which ran | every later item plugs in here | S |
 | 2 | **GPUI adopts `core::command` dispatch** | `shell` | Still GPUI's action system; every verb added before the migration costs three re-bindings after. Do it once, then each new command gets `[keys]`, help panel and extension reach for free | all of D | M |
 | 3 | **Job runner + invalidation generation** | `app`/`shell` (never `core` — no I/O there) | Writes are processes taking seconds; they cannot block render. Queue → run → completion event → bump a generation → affected views re-acquire → `session.rs` restores selection | every write verb | M |
 | 4 | **Text input block** | `shell`, mode on the existing mode stack | No text field exists anywhere in the shell. Consumer #1 is the commit message; #2 the search prompt (#17) | #10, #17 | M |
@@ -42,10 +42,10 @@ Panels need data before verbs. Independent of A except #6 shapes #1's surface.
 
 | # | Block | Lands | Notes | Size |
 |---|---|---|---|---|
-| 6 | **True status model** | types in `core`, parsing in `plait-git` | porcelain v1 today folds untracked into one pair set; no XY codes, no renames (`git/src/lib.rs:247`). Parse `--porcelain=v2` into staged / unstaged / untracked entries. **Do in the same pass as #1** — the model defines the trait's surface, and a seam shaped against real data beats a revised one | S/M |
-| 7 | **Branch + ref reads** | `plait-git` | Local and remote branches, upstream, ahead/behind, HEAD. Refs are gix's home turf, so this is also the honest start of the gix port — no hot path exists yet to break | M |
-| 8 | **Stash, remotes, tags, reflog reads** | `plait-git` | Each small through the trait; each feeds a panel later | S each |
-| 9 | **Diff cache keyed by blob OID** | `plait-git`/acquisition edge | Prescribed in AGENTS.md, never built; acquisition already yields both OIDs. Pays twice: repeat views free, post-commit reloads re-diff only what changed | S |
+| 6 | **True status model** | types in `core`, parsing in `gitten-git` | porcelain v1 today folds untracked into one pair set; no XY codes, no renames (`git/src/lib.rs:247`). Parse `--porcelain=v2` into staged / unstaged / untracked entries. **Do in the same pass as #1** — the model defines the trait's surface, and a seam shaped against real data beats a revised one | S/M |
+| 7 | **Branch + ref reads** | `gitten-git` | Local and remote branches, upstream, ahead/behind, HEAD. Refs are gix's home turf, so this is also the honest start of the gix port — no hot path exists yet to break | M |
+| 8 | **Stash, remotes, tags, reflog reads** | `gitten-git` | Each small through the trait; each feeds a panel later | S each |
+| 9 | **Diff cache keyed by blob OID** | `gitten-git`/acquisition edge | Prescribed in AGENTS.md, never built; acquisition already yields both OIDs. Pays twice: repeat views free, post-commit reloads re-diff only what changed | S |
 
 ## Phase C — tracer bullet
 

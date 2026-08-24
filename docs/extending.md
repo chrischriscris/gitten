@@ -29,12 +29,12 @@ against a diff.
 
 Views read it through `config::host(cx)` on the render path rather than capturing
 an `Rc` when they are built, and that is not incidental: a captured clone is a
-snapshot, and it is what makes `plait.toml` apply on the next frame instead of the
+snapshot, and it is what makes `gitten.toml` apply on the next frame instead of the
 next launch. A new view that captures the host instead will work, and will quietly
 not hot-reload.
 
-Built once in a client's `main` by `plait_app::Startup`, which reads
-`plait.toml` into it before any view exists.
+Built once in a client's `main` by `gitten_app::Startup`, which reads
+`gitten.toml` into it before any view exists.
 
 Not there yet: any way to load an implementation from outside the binary. Today
 "an extension" means code compiled in. The seams are shaped so that stops being
@@ -58,7 +58,7 @@ were.
 last one will be — the view owns a focus handle, the binding is global, the handler is a
 method — so that when dispatch arrives they have something to attach to rather
 than something to replace. Until then the title-bar pickers are how a registry is
-reachable without editing a file; they read the same names `plait.toml` does, and
+reachable without editing a file; they read the same names `gitten.toml` does, and
 should collapse into a settings panel when there is one.
 
 ## 1. A language
@@ -137,7 +137,7 @@ host.differ.context = 6;
 ```
 
 Selection is by **name**, not by value, and that is the whole point: `[diff]
-algorithm = "tree-sitter"` in `plait.toml` reaches a registered implementation the
+algorithm = "tree-sitter"` in `gitten.toml` reaches a registered implementation the
 day it exists, and an unknown name reports the ones that do — from the registry,
 so the message cannot go stale. `route` matches extensions or whole filenames the
 way `Highlighters::route` does, and a later route wins.
@@ -190,7 +190,7 @@ the menu.
 
 The registry is the only one on `Host` that holds no selection of its own: a
 theme is data the config file *edits*, so `host.theme` is the answer and
-`host.themes` is the catalogue. `plait.toml` reaches both — `[theme] name` picks
+`host.themes` is the catalogue. `gitten.toml` reaches both — `[theme] name` picks
 the base, everything under it is applied on top, and the result is registered
 under that name. Details, the contrast machinery and the ratios a second palette
 has to hit: [theming.md](theming.md).
@@ -354,7 +354,7 @@ layouts.register("inline-words", |host| {
     vec![Box::new(InlineWordRows::new(&host.font))]
 });
 
-// and then, in plait.toml:  [diff] layout = "inline-words"
+// and then, in gitten.toml:  [diff] layout = "inline-words"
 ```
 
 `build` is a closure and not a `Vec`, because a layout has to be *rebuildable*:
@@ -483,7 +483,7 @@ wrapping cannot happen before `build` and hand it to everybody free.
 
 ## 9. The same presentation, in the terminal
 
-`plait-tui` has the same two registries — a `Rows` trait claimed per path and a
+`gitten-tui` has the same two registries — a `Rows` trait claimed per path and a
 `Layouts` that `s` cycles — and the split between them and `core` is where the
 extension story got sharper.
 
@@ -491,7 +491,7 @@ The half of a presentation that has nothing to do with a UI is now a trait in
 `core`:
 
 ```rust
-pub trait Present {          // plait_core::rows
+pub trait Present {          // gitten_core::rows
     fn claims(&self, path: &str) -> bool;
     fn len(&self) -> usize;
     fn build(&mut self, file: prepared::File);
@@ -553,7 +553,7 @@ one-column-per-lane experiment are all constructors, and none of them touch
 
 `core::command`, and the shape is the whole point: **a key is data and a command
 is a name.** Nothing in the chain is a function pointer, which is what lets
-`plait.toml` hold it and a settings panel rewrite it.
+`gitten.toml` hold it and a settings panel rewrite it.
 
 ```rust
 host.commands.register("blame.toggle", "show blame beside the diff");
@@ -561,7 +561,7 @@ host.keys.bind("diff", "b", "blame.toggle")?;
 ```
 
 Two lines, and: `b` works in a diff, `?` lists it with its description, and
-`plait config` writes it back out. A client that does not know what
+`gitten config` writes it back out. A client that does not know what
 `blame.toggle` is treats it as an unbound key, which is the honest answer.
 
 The registry is validated *against itself* — `apply_keys` refuses a binding whose
@@ -579,7 +579,7 @@ not have:
   twice. `Key::new` enforces it, so no client can get it wrong.
 
 What a client writes is a translation from its own platform's event to
-`command::Key` — `plait-tui`'s is `term.rs`, and it is the only file in that
+`command::Key` — `gitten-tui`'s is `term.rs`, and it is the only file in that
 crate that imports `crossterm`. See [clients.md](clients.md).
 
 ## 11. A selection your presentation takes part in
@@ -588,9 +588,9 @@ crate that imports `crossterm`. See [clients.md](clients.md).
 /// Where a click landed inside a row. `core::select`, because two doors ask it.
 pub struct Hit { pub part: u16, pub off: usize }
 
-// plait-shell, in pixels:
+// gitten-shell, in pixels:
 fn hit(&self, index: usize, seg: usize, x: f32, host: &Host, shift: f32) -> Option<Hit>;
-// plait-tui, in columns:
+// gitten-tui, in columns:
 fn hit(&self, index: usize, seg: usize, col: usize, shift: usize) -> Option<Hit>;
 
 fn selectable(&self, index: usize, part: u16) -> Option<&str>;
@@ -643,7 +643,7 @@ StyledText::new(piece).with_highlights(runs(
 the same reason `file_header` is: a header's text starts at the page padding
 whoever owns the lines beneath it, and three presentations working that out
 separately is three places for the caret to be a gutter's width off. The terminal
-has the same three under the same names in `plait_tui::rows`, measured in columns
+has the same three under the same names in `gitten_tui::rows`, measured in columns
 — `col_at`, `header_hit`, `selected_text` — and its painting is a background on a
 run rather than a highlight on a `StyledText`:
 
@@ -669,5 +669,5 @@ If you are adding one, match what the existing four do:
 5. **A line in `AGENTS.md`** if it changes the philosophy, and a page here if it
    does not.
 6. **Reachable from a client's `main` without that client being special.**
-   `plait_app::Startup` hands back the `Host`; if a seam needs something else,
+   `gitten_app::Startup` hands back the `Host`; if a seam needs something else,
    it is not a seam three clients can use.

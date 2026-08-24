@@ -15,7 +15,7 @@ Histogram. Diffing is a `trait Differ`; the view never calls a differ directly.
 
 This originally said *`imara-diff`, Histogram* and named Histogram and Myers as
 its first two implementations, describing something that had not been built —
-`plait-git` ran `git diff` and the unified output was parsed back. The trait and
+`gitten-git` ran `git diff` and the unified output was parsed back. The trait and
 the algorithms now exist, written out in `core` rather than pulled in, and there
 are three of them. [0013](0013-differs-in-core-not-a-dependency.md) is why, and
 is also the record of a doc describing an intention being read as a description

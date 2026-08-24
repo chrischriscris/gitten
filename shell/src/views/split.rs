@@ -8,7 +8,7 @@
 //!
 //! # Which line sits opposite which
 //!
-//! Not this file's decision. `plait_core::align` makes it, because
+//! Not this file's decision. `gitten_core::align` makes it, because
 //! `replace_pairs` already makes the same one for the intraline pass and the two
 //! answers have to agree — a row showing a removal beside an addition whose
 //! changed words were computed against a *different* line highlights fragments
@@ -53,14 +53,14 @@ use super::diff::{
     scrolled, selected, slice, Hit, Rows, Scratch, PAD, ROW_H,
 };
 use gpui::*;
-use plait_core::align::align;
-use plait_core::host::Host;
-use plait_core::runs::surfaces;
-use plait_core::select::Selected;
-use plait_core::syntax::Token;
-use plait_core::theme::Theme;
-use plait_core::wrap::{Wrap, Wrapped};
-use plait_core::{LineKind, Span};
+use gitten_core::align::align;
+use gitten_core::host::Host;
+use gitten_core::runs::surfaces;
+use gitten_core::select::Selected;
+use gitten_core::syntax::Token;
+use gitten_core::theme::Theme;
+use gitten_core::wrap::{Wrap, Wrapped};
+use gitten_core::{LineKind, Span};
 use std::cell::RefCell;
 
 /// Which side of the divider a cell is being drawn on, and therefore which of
@@ -252,7 +252,7 @@ impl Rows for SplitRows {
         true
     }
 
-    fn build(&mut self, f: plait_core::prepared::File) {
+    fn build(&mut self, f: gitten_core::prepared::File) {
         self.rows.push(Row::File {
             path: f.path.into(),
             adds: f.adds,
@@ -598,9 +598,9 @@ mod tests {
     // By name, not a glob: `use gpui::*` in the parent shadows `#[test]` with
     // GPUI's own attribute macro and every test in here fails to expand.
     use super::{Column, Row, Rows, SplitRows, GUTTER_W, PAD, RULE_W, SIGN_W};
-    use plait_core::host::Host;
-    use plait_core::parse_unified_diff;
-    use plait_core::prepared::prepare;
+    use gitten_core::host::Host;
+    use gitten_core::parse_unified_diff;
+    use gitten_core::prepared::prepare;
 
     const SAMPLE: &str = "\
 diff --git a/a.rs b/a.rs
@@ -932,9 +932,9 @@ mod list_layout_tests {
         px, size, AppContext, Bounds, Context, IntoElement, Render, Styled, WindowBounds,
         WindowOptions,
     };
-    use plait_core::host::Host;
-    use plait_core::parse_unified_diff;
-    use plait_core::prepared::prepare;
+    use gitten_core::host::Host;
+    use gitten_core::parse_unified_diff;
+    use gitten_core::prepared::prepare;
 
     // The parent's `use gpui::*` shadows `#[test]` with GPUI's own macro; these
     // tests are named through it on purpose and keep it fully qualified.

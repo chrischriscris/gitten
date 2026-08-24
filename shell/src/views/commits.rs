@@ -2,8 +2,8 @@ use crate::graph;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::scroll::Scrollbar;
-use plait_core::host::Host;
-use plait_core::{assign_lanes, initials, Commit};
+use gitten_core::host::Host;
+use gitten_core::{assign_lanes, initials, Commit};
 use std::cell::Cell;
 use std::rc::Rc;
 

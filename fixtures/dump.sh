@@ -7,7 +7,7 @@
 #
 # Fields are \x1f-separated and records \x1e-separated — control characters git
 # will never put in a subject, so there is nothing to escape. Parsed by
-# plait_core::parse_log.
+# gitten_core::parse_log.
 set -euo pipefail
 
 REPO="${1:?usage: dump.sh <repo-path> [commit-count]}"

@@ -8,7 +8,7 @@
 //!
 //! # Which line sits opposite which
 //!
-//! Not this file's decision. [`plait_core::align`] makes it, because
+//! Not this file's decision. [`gitten_core::align`] makes it, because
 //! `replace_pairs` already makes the same one for the intraline pass and the two
 //! answers have to agree — a row showing a removal beside an addition whose
 //! changed words were computed against a *different* line highlights fragments
@@ -43,14 +43,14 @@ use crate::rows::{
 };
 use crate::screen::{self, Ink, Pen};
 use crate::MIN_WRAP_COLS;
-use plait_core::align::align;
-use plait_core::host::Host;
-use plait_core::prepared::{File, Line};
-use plait_core::rows::{Entry, Present};
-use plait_core::runs::Run;
-use plait_core::select::Hit;
-use plait_core::wrap::{Wrap, Wrapped};
-use plait_core::LineKind;
+use gitten_core::align::align;
+use gitten_core::host::Host;
+use gitten_core::prepared::{File, Line};
+use gitten_core::rows::{Entry, Present};
+use gitten_core::runs::Run;
+use gitten_core::select::Hit;
+use gitten_core::wrap::{Wrap, Wrapped};
+use gitten_core::LineKind;
 
 /// Which side of the divider a cell is on, and therefore which of the line's two
 /// numbers its gutter shows.
@@ -430,8 +430,8 @@ mod tests {
     use super::*;
     use crate::rows::{assemble, Layouts};
     use crate::screen::Screen;
-    use plait_core::parse_unified_diff;
-    use plait_core::wrap::{Off, Word};
+    use gitten_core::parse_unified_diff;
+    use gitten_core::wrap::{Off, Word};
 
     const DIFF: &str = "\
 diff --git a/a.rs b/a.rs
@@ -448,7 +448,7 @@ diff --git a/a.rs b/a.rs
     struct Harness {
         host: Host,
         owners: Vec<Box<dyn Rows>>,
-        order: Vec<plait_core::rows::RowRef>,
+        order: Vec<gitten_core::rows::RowRef>,
         screen: Screen,
         cols: usize,
     }
@@ -462,7 +462,7 @@ diff --git a/a.rs b/a.rs
             for o in owners.iter_mut() {
                 o.reflow(cols, &host, wrap);
             }
-            let order = plait_core::rows::expand(&a.ordered.order, &owners, None).order;
+            let order = gitten_core::rows::expand(&a.ordered.order, &owners, None).order;
             Harness {
                 host,
                 owners,
@@ -630,7 +630,7 @@ diff --git a/a.rs b/a.rs
         for o in unified.iter_mut() {
             o.reflow(80, &host, &Word);
         }
-        let flat = plait_core::rows::expand(&a.ordered.order, &unified, None);
+        let flat = gitten_core::rows::expand(&a.ordered.order, &unified, None);
         assert!(
             split.order.len() > flat.order.len(),
             "split {} rows, unified {}",

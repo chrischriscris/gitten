@@ -38,12 +38,12 @@ host.themes.names();                  // what the picker lists
 
 Unlike `Differs` and `Wraps` the registry holds **no selection**, and that is the
 one thing worth reading twice about it. A theme is the only seam whose
-implementation is *data the config file edits*: `plait.toml` sets colours on top
+implementation is *data the config file edits*: `gitten.toml` sets colours on top
 of whatever it selected, so a registry that also owned the selection would have to
 decide whether the entry or the edit is the truth. The catalogue is `themes`, the
 answer is `theme`, and `theme.name` is which.
 
-The consequence is the good one: **a theme written in `plait.toml` is a theme.**
+The consequence is the good one: **a theme written in `gitten.toml` is a theme.**
 The config layer applies the file to whatever `name` selected and then registers
 the result back under that name, so a palette somebody tuned by hand is in the
 same registry — and therefore the same title-bar menu and the same `T` — as the
@@ -66,8 +66,8 @@ palette legible, but *hierarchy* is what a reader actually learns, and hierarchy
 is a set of ratios rather than a set of colours.
 
 ```sh
-cargo run -q -p plait-core --example contrast          # every theme, every ratio
-cargo run -q -p plait-core --example contrast light
+cargo run -q -p gitten-core --example contrast          # every theme, every ratio
+cargo run -q -p gitten-core --example contrast light
 ```
 
 That is the tool the two new palettes were built with, and it is the one to run
@@ -232,10 +232,10 @@ moving its own title bar.
 ## Changing it without a rebuild
 
 ```
-plait config > plait.toml     # a complete, correct starting file
+gitten config > gitten.toml     # a complete, correct starting file
 ```
 
-`plait.toml` (or `$PLAIT_CONFIG`) is re-read every time it is saved, and colours,
+`gitten.toml` (or `$GITTEN_CONFIG`) is re-read every time it is saved, and colours,
 the font family and the font size land **on the next frame** — no rebuild, no
 relaunch, no lost scroll position. That is the payoff for colour having been data
 in a dependency-free crate all along.
@@ -288,7 +288,7 @@ Implementation is `app/src/config.rs`. It is there and not in `core` because
 reading a file is I/O and `core` does none, and not in a client because every
 client reads the same file. `apply` is a pure function of a string, which is
 why all of it is tested without a disk or a watcher — including a round-trip
-asserting that what `plait config` writes reads back identically, so the two
+asserting that what `gitten config` writes reads back identically, so the two
 directions cannot drift.
 
 ## Changing it without touching the file
@@ -306,8 +306,8 @@ The file still says what the window *opens* on. That is the same division as
 ## Seeing it without a window
 
 ```
-cargo run -q -p plait-core --example paint    --release 40    # THEME=light
-cargo run -q -p plait-core --example contrast --release       # every ratio
+cargo run -q -p gitten-core --example paint    --release 40    # THEME=light
+cargo run -q -p gitten-core --example contrast --release       # every ratio
 ./dev dump diff --fixtures                                    # THEME=slate
 ```
 

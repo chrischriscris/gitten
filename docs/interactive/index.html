@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>plait — the architecture, and the algorithms that run in it</title>
+<title>gitten — the architecture, and the algorithms that run in it</title>
 <style>
 :root{
   /* Straight out of core/src/theme.rs — Theme::dark(). */
@@ -184,7 +184,7 @@ svg text{font-family:var(--mono)}
 <a class="skip" href="#top">Skip to content</a>
 
 <nav id="rail" aria-label="Sections">
-  <div class="brand"><b>plait</b><span>architecture &amp; algorithms</span></div>
+  <div class="brand"><b>gitten</b><span>architecture &amp; algorithms</span></div>
   <ol id="navlist">
     <li><a class="nav" href="#top"      data-sec="top"><span class="dot"></span><span>The three rules</span><span class="key">0</span></a></li>
     <li><a class="nav" href="#boundary" data-sec="boundary"><span class="dot"></span><span>The boundary</span><span class="key">1</span></a></li>
@@ -206,10 +206,10 @@ svg text{font-family:var(--mono)}
 <section id="top">
   <p class="eyebrow">A desktop git client · Rust · GPUI · lazygit's keyboard model</p>
   <h1>Three crates.<br>One of them is not<br>allowed to know<br>a window exists.</h1>
-  <p class="lede">plait draws git history and diffs. Everything interesting about it follows from
+  <p class="lede">gitten draws git history and diffs. Everything interesting about it follows from
   one constraint — <b>core/ has no dependencies and no idea a UI is there</b> — and from three rules
   that break ties when they disagree. This page runs the real algorithms: the code below is ported
-  from <code>plait-core</code> and checked against it, line for line, on the same test inputs.</p>
+  from <code>gitten-core</code> and checked against it, line for line, on the same test inputs.</p>
 
   <div class="cols" style="margin:28px 0 0">
     <div class="panel"><div class="stamp"><span class="path">rule 1</span></div><div class="body">
@@ -246,10 +246,10 @@ svg text{font-family:var(--mono)}
 <section id="boundary">
   <p class="eyebrow">The boundary</p>
   <h2>Three crates, and the line that matters</h2>
-  <p>The interesting line is between the first two and the third. <code>plait-git</code> is the only
-  crate that talks to a repository. <code>plait-core</code> is pure — no GPUI, no gitoxide, no I/O,
+  <p>The interesting line is between the first two and the third. <code>gitten-git</code> is the only
+  crate that talks to a repository. <code>gitten-core</code> is pure — no GPUI, no gitoxide, no I/O,
   and <code>[dependencies]</code> is empty on purpose, so it compiles in about a second and its tests
-  need no window. <code>plait-shell</code> draws and takes input, and as little else as possible.</p>
+  need no window. <code>gitten-shell</code> draws and takes input, and as little else as possible.</p>
 
   <div class="panel">
     <div class="stamp"><span class="path">click a crate</span><span class="right">docs/architecture.md</span></div>
@@ -272,7 +272,7 @@ svg text{font-family:var(--mono)}
     <div class="panel"><div class="stamp"><span class="path">core/src/host.rs</span></div><div class="body">
       <h4>Where the swappable pieces live</h4>
       <p>Built once in <code>main.rs</code> before any view exists, then held in a GPUI global and read
-      <em>on the render path</em> — which is why <code>plait.toml</code> lands on the next frame instead
+      <em>on the render path</em> — which is why <code>gitten.toml</code> lands on the next frame instead
       of the next launch. A view that captures a clone instead will work, and will quietly not
       hot-reload.</p>
       <div id="hostbox"></div>
@@ -296,7 +296,7 @@ svg text{font-family:var(--mono)}
       <h4>Why it fetches contents, not a diff</h4>
       <p><code>git diff</code> will hand over a finished unified diff, and this crate used to parse
       exactly that. It no longer does: then <em>git</em> chooses the algorithm and
-      <code>plait_core::differ</code> is decoration — a semantic or language-aware differ could never
+      <code>gitten_core::differ</code> is decoration — a semantic or language-aware differ could never
       be reached, and rule 1 says a built-in may not do anything an extension cannot.</p>
       <p style="margin:0">So acquisition is two lists of lines per changed file, and <b>which lines
       correspond is decided in <code>core</code> afterwards</b>. <code>parse_unified_diff</code> stays
@@ -870,12 +870,12 @@ svg text{font-family:var(--mono)}
     </div></div>
   </div>
 
-  <div class="panel"><div class="stamp"><span class="path">shell/src/config.rs · plait.toml</span><span class="adr">decisions/0012</span></div><div class="body">
+  <div class="panel"><div class="stamp"><span class="path">shell/src/config.rs · gitten.toml</span><span class="adr">decisions/0012</span></div><div class="body">
     <div class="cols two">
       <div>
         <h4>Changing it without a rebuild</h4>
         <p>Colours, the font family and the font size are read on the render path, so a saved
-        <code>plait.toml</code> lands <b>on the next frame</b> — no rebuild, no relaunch, no lost scroll
+        <code>gitten.toml</code> lands <b>on the next frame</b> — no rebuild, no relaunch, no lost scroll
         position. That is the payoff for colour having been data in a dependency-free crate all along.</p>
         <p style="margin:0">The file is read <em>forgivingly</em>, because it is re-read on every save of
         something you are in the middle of typing: an unparseable file leaves the theme exactly as it
@@ -1086,7 +1086,7 @@ svg text{font-family:var(--mono)}
     </div></div>
   </div>
 
-  <div class="panel"><div class="stamp"><span class="path">shell/src/stats.rs · PLAIT_STATS=1</span></div><div class="body">
+  <div class="panel"><div class="stamp"><span class="path">shell/src/stats.rs · GITTEN_STATS=1</span></div><div class="body">
     <p><b>The overlay measures how fast we <em>can</em> redraw, not what the app costs at rest.</b> GPUI is
     reactive and idles at zero frames, so the overlay requests an animation frame every render to force a
     continuous loop.</p>
@@ -1162,13 +1162,13 @@ svg text{font-family:var(--mono)}
   <div class="panel"><div class="stamp"><span class="path">the working tree, uncommitted</span><span class="right">read off git status, not off the docs</span></div>
     <div class="body">
       <p>Three of the panels above describe code that is not in a commit yet. It is in the tree, it is
-      wired, and <code>cargo test -p plait-core</code> passes <b>139 tests in 0.55 s</b> — but a reader
+      wired, and <code>cargo test -p gitten-core</code> passes <b>139 tests in 0.55 s</b> — but a reader
       going by <code>git log</code> will not find any of it.</p>
       <table>
         <tr><th>file</th><th>state</th><th>what it is</th></tr>
         <tr><td><code>core/src/differ.rs</code></td><td><span class="pill ok">new, wired</span></td><td>The <code>Differ</code> seam: histogram, patience, myers, the shared hunk assembly, the by-name registry. Reachable as <code>host.differ</code>.</td></tr>
         <tr><td><code>core/src/align.rs</code></td><td><span class="pill ok">new, wired</span></td><td>Which removed line sits opposite which added one — <code>Slot::{Context,Replace,Removed,Added}</code>. One rule, shared with the intraline pass, because the two answers have to agree.</td></tr>
-        <tr><td><code>git/src/lib.rs</code></td><td><span class="pill ok">rewritten</span></td><td>Acquisition switched from parsing git's unified diff to fetching blob pairs, so <code>core</code> chooses the algorithm. <code>plait_git::diff</code> now takes a <code>&amp;Differs</code>.</td></tr>
+        <tr><td><code>git/src/lib.rs</code></td><td><span class="pill ok">rewritten</span></td><td>Acquisition switched from parsing git's unified diff to fetching blob pairs, so <code>core</code> chooses the algorithm. <code>gitten_git::diff</code> now takes a <code>&amp;Differs</code>.</td></tr>
         <tr><td><code>shell/src/views/split.rs</code></td><td><span class="pill ok">new</span></td><td>Side-by-side, as a third <code>Rows</code> implementation and nothing more: same prepared lines, two columns instead of one, no new trait and no edit to <code>TextRows</code>. That is the seam being paid for.</td></tr>
         <tr><td><code>shell/src/views/diff.rs</code></td><td><span class="pill ok">grew a registry</span></td><td><code>Layouts</code>: the registry of whole-diff presentations, and <code>s</code> to cycle it — the first key binding that is not <code>cmd-q</code>, shaped so command dispatch has something to attach to rather than something to replace.</td></tr>
         <tr><td><code>docs/decisions/0013</code></td><td><span class="pill ok">new</span></td><td>Why the differs are written in <code>core</code> instead of pulled in, and why acquisition hands over content rather than a diff.</td></tr>
@@ -1192,8 +1192,8 @@ svg text{font-family:var(--mono)}
   </div></div>
 
   <p style="font-family:var(--prose);color:var(--faint);font-size:12.5px;margin-top:28px;max-width:74ch">
-  Built from <code>AGENTS.md</code>, <code>docs/</code> and the source of <code>plait-core</code>,
-  <code>plait-git</code> and <code>plait-shell</code>. The interactive panels run ports of
+  Built from <code>AGENTS.md</code>, <code>docs/</code> and the source of <code>gitten-core</code>,
+  <code>gitten-git</code> and <code>gitten-shell</code>. The interactive panels run ports of
   <code>differ.rs</code>, <code>lib.rs</code>, <code>syntax.rs</code> and <code>theme.rs</code>, checked
   against the Rust on the same inputs its own tests use — the edit scripts, hunk headers, token lists and
   contrast ratios on this page are the ones the binary produces. No libraries, no network, one file:
@@ -1212,8 +1212,8 @@ svg text{font-family:var(--mono)}
 </div>
 <div class="tip" id="tip"></div>
 <script>
-/* ===== ports of plait-core. Verified against the Rust on the inputs its own tests use. ===== */
-// Ports of plait-core, for the explainer page. Faithful to the Rust where it
+/* ===== ports of gitten-core. Verified against the Rust on the inputs its own tests use. ===== */
+// Ports of gitten-core, for the explainer page. Faithful to the Rust where it
 // matters; indices are JS string indices rather than UTF-8 byte offsets.
 
 // ---------------------------------------------------------------- intraline
@@ -1935,7 +1935,7 @@ const LANGS = {
   toml: { label: 'toml', syn: {
       line: ['#'], strings: [['"""', '"""', false, true], ['"', '"', true, false], ["'", "'", false, false]],
       keywords: ['true','false'] },
-    src: `# plait config\n[font]\nfamily = "JetBrainsMono Nerd Font Mono"\nsize = 14.0\nmonospaced = true\n\n[theme.syntax]\ncomment = "#615a52 italic"` },
+    src: `# gitten config\n[font]\nfamily = "JetBrainsMono Nerd Font Mono"\nsize = 14.0\nmonospaced = true\n\n[theme.syntax]\ncomment = "#615a52 italic"` },
   c: { label: 'c', syn: {
       line: ['//'], block: [['/*', '*/']],
       strings: [['"', '"', true, false], ["'", "'", true, false]],
@@ -1964,7 +1964,7 @@ const BENCH_NEW = [
 ];
 const BENCH_PATH = 'core/src/host.rs';
 const STAGES = [
-  ['acquire', 'plait_git::pairs', 'two blobs, as two lists of lines'],
+  ['acquire', 'gitten_git::pairs', 'two blobs, as two lists of lines'],
   ['diff', 'Differs::file', 'an edit script, then hunks'],
   ['prepare', 'prepared::prepare', 'clip → intraline → syntax'],
   ['build', 'Rows::build', 'the renderer that claims the path'],
@@ -2116,7 +2116,7 @@ drawBench();
 
 /* ============================================================== crate map */
 const CRATES = {
-  core: { name: 'plait-core', deps: 'zero dependencies, and [dependencies] is empty on purpose',
+  core: { name: 'gitten-core', deps: 'zero dependencies, and [dependencies] is empty on purpose',
     files: [
       ['lib.rs', 'commit and diff parsing, assign_lanes, intraline, replace_pairs, initials'],
       ['differ.rs', 'the Differ seam: histogram, patience, myers, hunk assembly, the registry'],
@@ -2129,7 +2129,7 @@ const CRATES = {
       ['host.rs', 'the struct that holds the swappable pieces'],
     ],
     note: 'Four examples double as the headless test bench: bench (timings at fixture scale), shape (topology statistics), verify (lane invariants), paint (the diff view in ANSI). 139 tests, 0.55 s.' },
-  git: { name: 'plait-git', deps: 'the only crate that talks to a repository',
+  git: { name: 'gitten-git', deps: 'the only crate that talks to a repository',
     files: [
       ['log', '--topo-order, always. Lane assignment assumes it.'],
       ['pairs', 'git diff --raw -z -M, then one cat-file --batch for every blob'],
@@ -2137,7 +2137,7 @@ const CRATES = {
       ['describe', 'a short label for the window title'],
     ],
     note: 'Reads are meant to move to gix; writes stay on the git binary permanently, because shelling out is what gets hooks, credential helpers and .gitconfig semantics exactly right. Both behind one surface, so a frontend never learns which path ran.' },
-  shell: { name: 'plait-shell', deps: 'GPUI. Drawing and input, and as little else as possible.',
+  shell: { name: 'gitten-shell', deps: 'GPUI. Drawing and input, and as little else as possible.',
     files: [
       ['main.rs', 'argument parsing, data loading, the window, the Host'],
       ['views/diff.rs', 'the Rows seam, TextRows, run-list merging, the shared row furniture'],
@@ -2145,20 +2145,20 @@ const CRATES = {
       ['views/split.rs', 'SplitRows: the same prepared lines, in two columns'],
       ['views/commits.rs', 'the commit list, author initials, row layout'],
       ['graph.rs', 'lane geometry and painting: quads, paths, one canvas per row'],
-      ['config.rs', 'plait.toml: parse, apply, watch, and the live Host global'],
+      ['config.rs', 'gitten.toml: parse, apply, watch, and the live Host global'],
       ['session.rs', 'the row you were on, so ./dev.sh can put you back after a restart'],
-      ['stats.rs', 'the counting allocator and the PLAIT_STATS overlay'],
+      ['stats.rs', 'the counting allocator and the GITTEN_STATS overlay'],
     ],
     note: 'GPUI notes worth knowing: interactivity requires identity — .id() before .overflow_y_scroll(), clicks, hover, drag. uniform_list for anything long, and point it at the widest row with with_width_from_item, because it measures exactly ONE row to decide its scrollable width and defaults to row 0.' },
 };
 let crate_ = 'core';
 function drawCrateMap() {
   $('#cratemap').innerHTML = `<div class="rows" style="padding:10px 12px">
-    <div class="r"><span class="t"><span style="color:var(--faint)">a repository</span>  ──►  <button class="b ${crate_ === 'git' ? 'on' : ''}" data-crate="git">plait-git</button>  ──► <span style="color:var(--k-comment)">data</span> ──►  <button class="b ${crate_ === 'core' ? 'on' : ''}" data-crate="core">plait-core</button></span></div>
+    <div class="r"><span class="t"><span style="color:var(--faint)">a repository</span>  ──►  <button class="b ${crate_ === 'git' ? 'on' : ''}" data-crate="git">gitten-git</button>  ──► <span style="color:var(--k-comment)">data</span> ──►  <button class="b ${crate_ === 'core' ? 'on' : ''}" data-crate="core">gitten-core</button></span></div>
     <div class="r"><span class="t">                                                              │</span></div>
     <div class="r"><span class="t">                                          <span style="color:var(--k-comment)">rows, colours</span>       │</span></div>
     <div class="r"><span class="t">                                    ┌─────────────────────────┴──────────┐</span></div>
-    <div class="r"><span class="t">                                    <button class="b ${crate_ === 'shell' ? 'on' : ''}" data-crate="shell">plait-shell</button>  <span style="color:var(--faint)">GPUI</span>      <span style="color:var(--faint)">examples/paint.rs — ANSI, headless</span></span></div>
+    <div class="r"><span class="t">                                    <button class="b ${crate_ === 'shell' ? 'on' : ''}" data-crate="shell">gitten-shell</button>  <span style="color:var(--faint)">GPUI</span>      <span style="color:var(--faint)">examples/paint.rs — ANSI, headless</span></span></div>
     <div class="r"><span class="t">                                                                        <span style="color:var(--ghost)">(and a cli/, one day)</span></span></div>
   </div>`;
   const c = CRATES[crate_];
@@ -2986,8 +2986,8 @@ const ADRS = [
   { n: '0008', t: 'No word highlighting below 0.4 similarity', tags: ['legibility'], d: 'Dice coefficient over tokens. Below the floor, the pair gets no word highlighting; the line keeps its add/remove background. The LCS table is already built, so its corner is free.', x: 'Better pairing — by content rather than position — is a real improvement and a bigger change. The floor is six lines and removes the damage now.', e: 'Of 9,447 pairs in the zig→rust fixture none sit below 0.60. In the deletion fixture 15.6% fall below 0.4 and every one is junk by inspection.' },
   { n: '0009', t: 'Resolve foregrounds against their background', tags: ['legibility'], d: 'A contrast floor on the theme, and every class resolved against every surface once, into a 12 × 5 table.', x: 'Picking a second colour per surface loses the hue. Blending keeps it: a lifted comment is the same grey-brown, just far enough off the background to read.', e: 'The comment grey measured 1.15:1 against the old changed-word background. A screenshot found it; a test now asserts the floor for all 60 pairs.' },
   { n: '0010', t: 'Markdown renders as rows, and the markers come off in core', tags: ['seam', 'boundary'], d: 'Rendered rows, not a rendered document: row font size for headings, a left bar for blocks, drawn furniture for removed markers, space padding for tables.', x: 'A CommonMark parser was in the tree at zero build cost and was the wrong shape twice: core takes no dependencies, and a hunk is not a document — it hands you the middle of a list and half a fence, constantly.', e: '70–100 ns a row at load. Inline markup inside a heading keeps its markers, measured at under half a percent of changed rows on both fixtures — the figure that decided it.' },
-  { n: '0012', t: 'Config is data, behaviour is not', tags: ['seam'], d: 'plait.toml for data, round-tripped with toml_edit; plugins in their own files, referenced by name. Behaviour never appears in the settings file.', x: 'Lua is the tempting answer and its computed themes are a real argument. It loses on three counts, and the decisive one is that a settings panel cannot round-trip code.', e: 'Rows::render runs ~50× a frame and runs() rebuilds per visible row per redraw — neither can cross a script boundary. Lua’s territory is commands, keybindings and workflow.' },
-  { n: '0013', t: 'The differs live in core, not in a dependency', tags: ['boundary', 'seam'], d: 'Histogram, patience and myers are written in core rather than pulled in, and acquisition hands over two lists of lines instead of a finished unified diff.', x: 'Letting git diff choose the algorithm makes plait_core::differ decoration — a semantic or language-aware differ could never be reached, and rule 1 says a built-in may not do anything an extension cannot. imara-diff would have meant a dependency in the one crate that has none.', e: 'Correctness is checked against git rather than argued: a minimal edit script has exactly one length, so myers must match git diff --minimal exactly. git/examples/diffcheck.rs runs it over real history, from ./check.sh.' },
+  { n: '0012', t: 'Config is data, behaviour is not', tags: ['seam'], d: 'gitten.toml for data, round-tripped with toml_edit; plugins in their own files, referenced by name. Behaviour never appears in the settings file.', x: 'Lua is the tempting answer and its computed themes are a real argument. It loses on three counts, and the decisive one is that a settings panel cannot round-trip code.', e: 'Rows::render runs ~50× a frame and runs() rebuilds per visible row per redraw — neither can cross a script boundary. Lua’s territory is commands, keybindings and workflow.' },
+  { n: '0013', t: 'The differs live in core, not in a dependency', tags: ['boundary', 'seam'], d: 'Histogram, patience and myers are written in core rather than pulled in, and acquisition hands over two lists of lines instead of a finished unified diff.', x: 'Letting git diff choose the algorithm makes gitten_core::differ decoration — a semantic or language-aware differ could never be reached, and rule 1 says a built-in may not do anything an extension cannot. imara-diff would have meant a dependency in the one crate that has none.', e: 'Correctness is checked against git rather than argued: a minimal edit script has exactly one length, so myers must match git diff --minimal exactly. git/examples/diffcheck.rs runs it over real history, from ./check.sh.' },
 ];
 let adrTag = 'all';
 function drawAdrs() {

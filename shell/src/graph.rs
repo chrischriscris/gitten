@@ -7,16 +7,16 @@
 //! virtualizes with the list for free. Twice the run of a half-row corner,
 //! half the steepness, no clipping at the boundary.
 //!
-//! Geometry comes entirely from `plait_core::GraphRow` — this file decides how
+//! Geometry comes entirely from `gitten_core::GraphRow` — this file decides how
 //! it looks, never what the topology is. It reads two things off the rows
 //! either side: which lanes are mid-curve, because half of a curve lives next
 //! door, and where a branch begins and ends, because that is what colour
-//! follows (see [`plait_core::graph::Hues`]) rather than the column it happens to occupy.
+//! follows (see [`gitten_core::graph::Hues`]) rather than the column it happens to occupy.
 
 use gpui::*;
-use plait_core::graph::MAX_LANES;
-use plait_core::host::Host;
-use plait_core::theme::Theme;
+use gitten_core::graph::MAX_LANES;
+use gitten_core::host::Host;
+use gitten_core::theme::Theme;
 use std::rc::Rc;
 
 pub const ROW_H: f32 = 22.0;
@@ -27,8 +27,8 @@ const LANE_W: f32 = 14.0;
 /// really are — comes from `core`, because every part of it is a pure function
 /// of the topology. A terminal gutter in box characters, a browser drawing SVG
 /// and this canvas therefore agree about all of it, and what is left in this
-/// file is geometry. See `plait_core::graph`.
-pub use plait_core::graph::{lane_count, plan as row_draws, Draw};
+/// file is geometry. See `gitten_core::graph`.
+pub use gitten_core::graph::{lane_count, plan as row_draws, Draw};
 
 /// A lane is 2px, not the 1.5px a dense list first suggests. Thinner reads as
 /// a hairline sketch rather than something you could grab, and 2px straddles
@@ -54,7 +54,7 @@ const RING: f32 = 0.45;
 const OVERSHOOT: f32 = 0.5;
 
 /// Colour belongs to the *branch*, not to the column it happens to sit in —
-/// see [`plait_core::graph::Hues`]. Overflow is the exception: past the cap every lane shares one
+/// see [`gitten_core::graph::Hues`]. Overflow is the exception: past the cap every lane shares one
 /// column, so they share one grey and stop pretending to be individuals.
 fn color(theme: &Theme, overflow: bool, hue: u16) -> Rgba {
     if overflow {
@@ -189,7 +189,7 @@ fn half_s(window: &mut Window, x: f32, partner_x: f32, y: f32, down: bool, color
 /// A ring with the background punched out of the middle — one quad, since a
 /// quad with corner radii at half its size *is* a circle, and the shader
 /// antialiases it better than tessellation would.
-fn dot(window: &mut Window, x: f32, y: f32, r: f32, color: Rgba, bg: plait_core::theme::Rgb) {
+fn dot(window: &mut Window, x: f32, y: f32, r: f32, color: Rgba, bg: gitten_core::theme::Rgb) {
     window.paint_quad(quad(
         Bounds::from_corners(point(px(x - r), px(y - r)), point(px(x + r), px(y + r))),
         Corners::all(px(r)),

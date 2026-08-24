@@ -1,9 +1,9 @@
-//! plait in a browser tab, served from the terminal you started it in.
+//! gitten in a browser tab, served from the terminal you started it in.
 //!
 //! Everything above drawing runs here, natively: acquisition spawns `git` the
 //! way it always has, and `core` runs the differ, the intraline pass, the
 //! highlighter and the wrap. What crosses to the browser is
-//! [`plait_core::prepared`] cut into windows of rows — which is what
+//! [`gitten_core::prepared`] cut into windows of rows — which is what
 //! `Prepared`'s own docs describe as "ready for whatever is going to draw them",
 //! and this is the third thing to take them up on after the GPUI view and
 //! `core/examples/paint.rs`.
@@ -19,7 +19,7 @@
 //! is arrives in `meta` and the script branches on it. A second page would be a
 //! second copy of the virtual list, the theme and the keys.
 //!
-//! The commit graph crosses the wire as `plait_core::graph`'s **plan** — which
+//! The commit graph crosses the wire as `gitten_core::graph`'s **plan** — which
 //! halves of which lanes exist, which curve pairs with which, which branch is
 //! which colour — and the browser turns each half into one SVG path. It is the
 //! same plan the window paints as Bézier curves and the terminal paints as box
@@ -34,8 +34,8 @@ pub mod rows;
 
 use http::{Request, Response};
 use log::Log;
-use plait_app::MIN_WRAP_COLS;
-use plait_core::host::Host;
+use gitten_app::MIN_WRAP_COLS;
+use gitten_core::host::Host;
 use rows::Doc;
 use std::sync::Mutex;
 
@@ -137,7 +137,7 @@ impl State {
             // wrong subcommand looking like a broken build.
             ("/api/rows", _) | ("/api/commits", _) => Response::status(
                 404,
-                "not this view — start plait-web with the other subcommand",
+                "not this view — start gitten-web with the other subcommand",
             ),
             _ => Response::status(404, "no such route"),
         }
@@ -147,8 +147,8 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use plait_core::prepared::prepare;
-    use plait_core::{parse_log, parse_unified_diff};
+    use gitten_core::prepared::prepare;
+    use gitten_core::{parse_log, parse_unified_diff};
 
     fn diff_state() -> State {
         let host = Host::new();
@@ -156,7 +156,7 @@ mod tests {
         let doc = Doc::build(prepare(
             &parse_unified_diff(raw),
             &host.syntax,
-            plait_app::MAX_LINE_CHARS,
+            gitten_app::MAX_LINE_CHARS,
         ));
         State {
             label: "test".into(),

@@ -151,7 +151,7 @@ it.
 
 ## Evidence
 
-`cargo test -p plait-core select` and `cargo test -p plait-shell`. The tests worth
+`cargo test -p gitten-core select` and `cargo test -p gitten-shell`. The tests worth
 knowing about, because each is a bug that was available:
 
 - a wrapped line copies **once**, without the break

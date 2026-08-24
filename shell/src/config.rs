@@ -1,20 +1,20 @@
 //! The live [`Host`], as a GPUI global.
 //!
 //! Everything about the *file* — parsing it, applying it, writing it out,
-//! watching it — is `plait_app::config`, shared with every other client. What is
+//! watching it — is `gitten_app::config`, shared with every other client. What is
 //! left here is the one thing that cannot be shared: how a reloaded host reaches
 //! the views, which in GPUI is a global and in a terminal is a flag in an event
 //! loop.
 //!
 //! The two functions this crate actually calls are re-exported, so the call
 //! sites did not have to move when the rest of the file did; everything else is
-//! `plait_app::config::` at the one place that wants it.
+//! `gitten_app::config::` at the one place that wants it.
 
-pub use plait_app::config::{load, watch};
+pub use gitten_app::config::{load, watch};
 
 use gpui::{px, App, Global, Hsla};
-use plait_core::host::Host;
-use plait_core::theme::Rgb;
+use gitten_core::host::Host;
+use gitten_core::theme::Rgb;
 use std::path::Path;
 use std::rc::Rc;
 
@@ -27,7 +27,7 @@ impl Global for Active {}
 /// The theme the title bar picked, if anything has.
 ///
 /// Client state, and it belongs here for the same reason the diff view keeps its
-/// own layout index: `plait.toml` says what the window *opens* on, and a control
+/// own layout index: `gitten.toml` says what the window *opens* on, and a control
 /// in the strip says what it is showing now. The file is rebuilt from defaults on
 /// every save — that is what makes deleting a line fall back — so without
 /// somewhere outside the host to keep this, saving a colour would silently throw
@@ -82,7 +82,7 @@ pub fn host(cx: &App) -> Rc<Host> {
     cx.global::<Active>().0.clone()
 }
 
-/// Hands plait's palette to the one thing in the window that is not drawn from
+/// Hands gitten's palette to the one thing in the window that is not drawn from
 /// it: `gpui_component`'s scrollbars.
 ///
 /// `gpui_component::init` sets its theme to **Light** and nothing here ever
@@ -98,7 +98,7 @@ pub fn host(cx: &App) -> Rc<Host> {
 /// fields alone does nothing.
 ///
 /// Called again on every config reload, so a scrollbar follows a saved
-/// `plait.toml` the way every other colour in the window does.
+/// `gitten.toml` the way every other colour in the window does.
 pub fn sync_widgets(host: &Host, cx: &mut App) {
     let c = host.theme.chrome;
     let hsla = |v: Rgb| Hsla::from(gpui::rgb(v));

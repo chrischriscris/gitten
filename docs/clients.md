@@ -1,12 +1,12 @@
 # Writing a client
 
-plait is a core and a set of clients. Three exist, and they are **not** equal:
+gitten is a core and a set of clients. Three exist, and they are **not** equal:
 
 | | |
 |---|---|
-| `plait-shell` | **the product.** GPUI. A feature asked for without a client named means this one. |
-| `plait-tui` | planned, and built; the one that comes after the window. |
-| `plait-web` | a *proof*, not a plan. It exists because a client written in JavaScript could not exist at all if `core` had leaked anything UI-shaped. |
+| `gitten-shell` | **the product.** GPUI. A feature asked for without a client named means this one. |
+| `gitten-tui` | planned, and built; the one that comes after the window. |
+| `gitten-web` | a *proof*, not a plan. It exists because a client written in JavaScript could not exist at all if `core` had leaked anything UI-shaped. |
 
 So read this page as two separate obligations. **The seam belongs in `core`, in
 the same pass as the feature** — that is what makes a fourth client possible and
@@ -24,9 +24,9 @@ reimplement.
 ## The line
 
 ```
-   plait-core   the pipeline. no dependencies, no I/O, no idea a UI exists
-   plait-git    acquisition. the only crate that talks to a repository
-   plait-app    plait.toml, the command line, loading
+   gitten-core   the pipeline. no dependencies, no I/O, no idea a UI exists
+   gitten-git    acquisition. the only crate that talks to a repository
+   gitten-app    gitten.toml, the command line, loading
    ──────────────────────────────────────────────────────────────────────
    a client     drawing, and input
 ```
@@ -41,22 +41,22 @@ twice — and it has been three times already:
 | tokens × spans → styled runs | three times | `core::runs` |
 | which branch is which colour, and the shape of a row | once, in the window | `core::graph` |
 | arguments, `--fixtures`, error strings | twice | `app::cli`, `app::acquire` |
-| `plait.toml` | once, behind GPUI | `app::config` |
+| `gitten.toml` | once, behind GPUI | `app::config` |
 | which command a key runs | nowhere shared | `core::command` |
 | what the mouse has selected, and what copying it yields | nowhere — the window had none | `core::select` |
 | where a scrollbar's thumb goes | nowhere — no client drew one | `core::view` |
 
-The last two are the ones that mattered most. Before `plait-app`, the parser for
-`plait.toml` lived in `shell/src/config.rs` — so the *window* was the only client
-that could be configured, and `plait-web` shipped with a comment apologising for
+The last two are the ones that mattered most. Before `gitten-app`, the parser for
+`gitten.toml` lived in `shell/src/config.rs` — so the *window* was the only client
+that could be configured, and `gitten-web` shipped with a comment apologising for
 it. Before `core::command`, a keybinding was three `match` statements that could
 not be made to agree.
 
 ## What a client's `main` looks like
 
 ```rust
-let started = match Startup::new("plait-tui", View::Commits)
-    .blurb("plait in the terminal you started it from")
+let started = match Startup::new("gitten-tui", View::Commits)
+    .blurb("gitten in the terminal you started it from")
     .extra(EXTRA)              // this client's own flags, for the usage text
     .go()
 {
@@ -65,8 +65,8 @@ let started = match Startup::new("plait-tui", View::Commits)
 };
 ```
 
-That call has already: parsed the arguments, read `plait.toml` and printed its
-warnings, answered `--help` and `plait config`, chosen the differ the file asked
+That call has already: parsed the arguments, read `gitten.toml` and printed its
+warnings, answered `--help` and `gitten config`, chosen the differ the file asked
 for, and acquired the data. What comes back is a `Host`, a `View`, a `Source` and
 a `Loaded`.
 
@@ -74,38 +74,38 @@ A client with its own flags takes them out first, so they may appear anywhere on
 the line rather than only where a positional parser looks:
 
 ```rust
-let mut start = Startup::new("plait-web", View::Diff);
+let mut start = Startup::new("gitten-web", View::Diff);
 let port = cli::take_value(start.take(), "--port")?;
 ```
 
 ## The arguments are a promise
 
 ```sh
-plait-shell diff . HEAD~2..HEAD
-plait-web   diff . HEAD~2..HEAD
-plait-tui   diff . HEAD~2..HEAD
+gitten-shell diff . HEAD~2..HEAD
+gitten-web   diff . HEAD~2..HEAD
+gitten-tui   diff . HEAD~2..HEAD
 
 ./dev desktop diff . HEAD~2..HEAD    # …and one script that reaches all three
 ./dev web     diff . HEAD~2..HEAD
 ./dev tui     diff . HEAD~2..HEAD
 ```
 
-Same words, same order, same errors, same `plait.toml`. A client is a way of
+Same words, same order, same errors, same `gitten.toml`. A client is a way of
 *looking* at a repository, not a different tool, so what you type to reach one
 reaches any of them. `app::cli::usage` emits the shared half and folds in the
 client's own lines, which is what stops the three drifting — they did drift, in
 their error messages, within a week of each other.
 
 One deliberate strictness: **a word that is not a view is `--help`**, not a
-repository. Letting the view word be optional so `plait .` means `plait diff .`
-costs more than it gives, because `plait dfif .` then shows the default view of a
+repository. Letting the view word be optional so `gitten .` means `gitten diff .`
+costs more than it gives, because `gitten dfif .` then shows the default view of a
 repository called `dfif` and looks like it worked.
 
 ## Input: a key is data, a command is a name
 
 `core::command` resolves a keypress to a command **name**. A client turns that
 name into a method call on a view it owns. Nothing in the chain is a function
-pointer, which is what lets `plait.toml` hold it:
+pointer, which is what lets `gitten.toml` hold it:
 
 ```text
   a platform event → Key → Keymap::resolve(&modes, pending) → "diff.next-file"
@@ -114,7 +114,7 @@ pointer, which is what lets `plait.toml` hold it:
 
 So a client writes exactly two input-shaped things:
 
-1. **A translation** from its platform's event to `command::Key`. In `plait-tui`
+1. **A translation** from its platform's event to `command::Key`. In `gitten-tui`
    that is `term.rs`, forty lines, and it is the only file in the crate that
    imports `crossterm`.
 2. **A `match` on command names.** `"view.down" => self.down()`. A name it does
@@ -131,7 +131,7 @@ same name in all three clients. Kept out of `Code`, it would have been a `match`
 in each client deciding that the wheel scrolls: three keymaps nobody could
 configure, which is the exact thing this module exists to prevent. A mouse
 *position* is not a key and is not here; it belongs to whatever was clicked, and
-`plait-tui/src/main.rs` is what a client routing one looks like.
+`gitten-tui/src/main.rs` is what a client routing one looks like.
 
 ### What `Keymap` will not do
 
@@ -145,7 +145,7 @@ two things a name-based system otherwise loses: a help screen that lists what is
 actually there, and a config file that can say *no such command* instead of
 silently binding a key to nothing.
 
-### `[keys]` in `plait.toml`
+### `[keys]` in `gitten.toml`
 
 ```toml
 [keys]
@@ -167,9 +167,9 @@ exists and a typo is named.
 
 | client | `render` produces |
 |---|---|
-| `plait-shell` | `AnyElement` |
-| `plait-tui` | cells, through a `Pen` |
-| `plait-web` | text pieces on the wire |
+| `gitten-shell` | `AnyElement` |
+| `gitten-tui` | cells, through a `Pen` |
+| `gitten-web` | text pieces on the wire |
 
 **The registry of presentations.** `Layouts` is client-side because a `Rows`
 implementation returns a UI element. What is on `Host` is `layout` — the *name*
@@ -193,10 +193,10 @@ Three, all cheap:
 
 1. **`core/Cargo.toml` has an empty `[dependencies]`.** If something needs
    adding, the thing wanting it belongs in another crate.
-2. **A client contains no pipeline code.** `plait-tui`'s two presentations are
+2. **A client contains no pipeline code.** `gitten-tui`'s two presentations are
    `TextRows` and `SplitRows`, and neither clips, diffs, highlights or wraps
    anything: they hold a `core::rows::Flat` and draw it.
-3. **The same `plait.toml` drives all three.** `./dev config > plait.toml` then
+3. **The same `gitten.toml` drives all three.** `./dev config > gitten.toml` then
    start any of them; a colour, a differ, a wrap, a keybinding and `[view]` all
    apply.
 
@@ -206,21 +206,21 @@ notice a panic in a presentation.
 
 ## Not there yet
 
-- **`plait-shell` does not read `[keys]`.** `core::command` is built and the
+- **`gitten-shell` does not read `[keys]`.** `core::command` is built and the
   terminal dispatches through it; the window still binds `s`, `w`, `cmd-c`,
   `cmd-a` and `escape` with `KeyBinding::new`. Porting it is a `match` on a
-  command name — the same one `plait-tui/src/main.rs` has. `copy.selection`,
+  command name — the same one `gitten-tui/src/main.rs` has. `copy.selection`,
   `select.all` and `select.none` are registered commands already, waiting for it.
-- **`plait-web` has no selection of its own**, and does not need one: a browser
+- **`gitten-web` has no selection of its own**, and does not need one: a browser
   selects text for free. The window and the terminal both drive `core::select`,
   and the terminal's half of it turned out to be exactly what this entry
   predicted — `hit` and `selectable` on its own `Rows`, and nothing else. See
   [decisions/0022](decisions/0022-the-mouse-in-a-terminal.md).
-- **`plait-web` has no input at all**, so the keymap reaches it only once the
+- **`gitten-web` has no input at all**, so the keymap reaches it only once the
   browser sends keypresses to an endpoint. It has `j`/`k`/`g`/`G` in its own
   script, which is exactly the duplication `core::command` exists to end.
 - **`shell` and `web` still hold their own row flattening.** `core::rows` is the
-  canonical one and `plait-tui` uses it; the other two predate it. `shell`'s is
+  canonical one and `gitten-tui` uses it; the other two predate it. `shell`'s is
   the harder migration, because `TextRows` stores `SharedString` so GPUI is
   handed a refcount bump rather than a copy per frame.
 - **Extension loading.** Every seam takes an implementation, and `Host` is

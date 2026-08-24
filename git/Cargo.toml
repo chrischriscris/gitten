@@ -1,8 +1,8 @@
 [package]
-name = "plait-git"
+name = "gitten-git"
 version = "0.0.0"
 edition = "2021"
 
 # Acquisition only. Depends on core for the types; no third-party deps.
 [dependencies]
-plait-core = { path = "../core" }
+gitten-core = { path = "../core" }

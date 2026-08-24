@@ -1,13 +1,13 @@
 //! The command line every client shares.
 //!
-//! `plait-shell diff . HEAD~2..HEAD` and `plait-web diff . HEAD~2..HEAD` and
-//! `plait-tui diff . HEAD~2..HEAD` are the same words in the same order, and
+//! `gitten-shell diff . HEAD~2..HEAD` and `gitten-web diff . HEAD~2..HEAD` and
+//! `gitten-tui diff . HEAD~2..HEAD` are the same words in the same order, and
 //! that is a promise rather than a coincidence: a client is a way of *looking*
 //! at a repository, not a different tool, so the thing you type to reach one
 //! should reach any of them.
 //!
-//! It was written twice before it was written once. `plait-shell` and
-//! `plait-web` each had their own `USAGE`, their own `Source`, their own
+//! It was written twice before it was written once. `gitten-shell` and
+//! `gitten-web` each had their own `USAGE`, their own `Source`, their own
 //! `--fixtures` arm; the two drifted in their error messages within a week of
 //! each other.
 //!
@@ -85,7 +85,7 @@ impl Source {
 pub enum Request {
     /// `-h`, `--help`, or nothing a client understood.
     Help,
-    /// `plait config` — print the current host as TOML. A complete, correct
+    /// `gitten config` — print the current host as TOML. A complete, correct
     /// starting file rather than a page of documentation to copy out of.
     Config,
     Open {
@@ -101,8 +101,8 @@ pub enum Request {
 /// on a diff.
 ///
 /// **A word that is not a view is [`Request::Help`]**, not a repository. The
-/// tempting alternative is to let the view word be optional so `plait .` means
-/// `plait diff .`, and it costs more than it gives: `plait dfif .` then shows
+/// tempting alternative is to let the view word be optional so `gitten .` means
+/// `gitten diff .`, and it costs more than it gives: `gitten dfif .` then shows
 /// the default view of a repository called `dfif` and looks like it worked. A
 /// typo and a request for help want the same answer.
 pub fn parse(args: &[String], default: View) -> Request {
@@ -174,11 +174,11 @@ pub fn usage(binary: &str, blurb: &str, extra: &str) -> String {
   REVSPEC is anything git takes:  HEAD~50..HEAD   main..feature   <sha>
   Pass --fixtures instead of REPO to read fixtures/ instead of a repository.
 
-  plait.toml next to the binary (or $PLAIT_CONFIG) picks the theme — dark, light
+  gitten.toml next to the binary (or $GITTEN_CONFIG) picks the theme — dark, light
   or slate, or one it defines itself — and sets the font and the [diff] table:
   the algorithm, how much whitespace has to match, how much context, and what
   the presentation and the wrap open on. Every client reads the same file.
-  Start one with:  {binary} config > plait.toml
+  Start one with:  {binary} config > gitten.toml
 "
     );
     match extra.is_empty() {
@@ -252,7 +252,7 @@ mod tests {
 
     #[test]
     fn a_word_that_is_not_a_view_is_help_and_not_a_repository() {
-        // The cost of letting the view word be optional: `plait dfif .` would
+        // The cost of letting the view word be optional: `gitten dfif .` would
         // show the default view of a repository called `dfif` and look right.
         assert_eq!(parse(&args(". HEAD~1..HEAD"), View::Diff), Request::Help);
         assert_eq!(parsed("dfif ."), Request::Help);
@@ -328,16 +328,16 @@ mod tests {
     #[test]
     fn the_usage_names_the_binary_it_was_asked_about() {
         let text = usage(
-            "plait-tui",
-            "plait in a terminal",
+            "gitten-tui",
+            "gitten in a terminal",
             "  --ascii   no box drawing",
         );
-        assert!(text.starts_with("plait-tui — plait in a terminal"));
-        assert!(text.contains("plait-tui config > plait.toml"));
+        assert!(text.starts_with("gitten-tui — gitten in a terminal"));
+        assert!(text.contains("gitten-tui config > gitten.toml"));
         assert!(text.contains("--ascii"));
         // Every client documents the same two views and the same file.
         assert!(text.contains("commits [REPO] [LIMIT]"));
         assert!(text.contains("diff    [REPO] [REVSPEC]"));
-        assert!(!usage("plait-web", "b", "").ends_with("\n\n"));
+        assert!(!usage("gitten-web", "b", "").ends_with("\n\n"));
     }
 }

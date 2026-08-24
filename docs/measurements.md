@@ -12,16 +12,16 @@ without `--release` is a different, much slower binary, and the title bar says s
 
 ```
 ./dev check                                             # all of the below, plus tests
-cargo test -p plait-core                                # correctness, sub-second
-cargo test -p plait-app                                 # the config file and the command line
-cargo run -q -p plait-core --example bench   --release   # load timings, per fixture
-cargo run -q -p plait-core --example shape   --release   # topology statistics
-cargo run -q -p plait-core --example verify  --release   # lane invariants
-cargo run -q -p plait-core --example paint   --release   # the diff view, in ANSI
-cargo run -q -p plait-git  --example diffcheck --release [REPO] [REVSPEC]
+cargo test -p gitten-core                                # correctness, sub-second
+cargo test -p gitten-app                                 # the config file and the command line
+cargo run -q -p gitten-core --example bench   --release   # load timings, per fixture
+cargo run -q -p gitten-core --example shape   --release   # topology statistics
+cargo run -q -p gitten-core --example verify  --release   # lane invariants
+cargo run -q -p gitten-core --example paint   --release   # the diff view, in ANSI
+cargo run -q -p gitten-git  --example diffcheck --release [REPO] [REVSPEC]
                                                         # differs, against git's own answer
 ./dev dump diff --fixtures                              # a terminal frame, and what it cost
-PLAIT_STATS=1 ./target/release/plait-shell diff         # frame/heap overlay
+GITTEN_STATS=1 ./target/release/gitten-shell diff         # frame/heap overlay
 ```
 
 `bench` and `shape` read `fixtures/big.diff` and `fixtures/log.txt`; `check.sh`
@@ -364,14 +364,14 @@ borrowed graph lane IDs, a flattened LCS table and token buffer,
 allocation-free syntax routing behind lexer category gates, and a byte-length
 fast path in `clip` (`core`); labels, untracked status and the tui's watcher run
 beside acquisition instead of behind it, the desktop window opens before
-acquisition finishes, and `PLAIT_START_LOG=1` prints per-stage startup timings
+acquisition finishes, and `GITTEN_START_LOG=1` prints per-stage startup timings
 (`app`, `git`, `shell`, `tui`). Outputs are byte-identical either side: 1,000,000
 commits / widest 21 lanes; 928,577 lines / 5,953 files / 142,858 replace-pairs /
 2,071,441 tokens / 0 wrap rejections.
 
 ```
-cargo run -q -p plait-core --example bench --release   # per-stage, fixtures/big.diff + log.txt
-PLAIT_START_LOG=1 ./target/release/plait-shell diff .   # startup stages, opt-in
+cargo run -q -p gitten-core --example bench --release   # per-stage, fixtures/big.diff + log.txt
+GITTEN_START_LOG=1 ./target/release/gitten-shell diff .   # startup stages, opt-in
 ```
 
 Before/after, `main` vs the pass, median of six rounds a side. The design
@@ -402,7 +402,7 @@ sentinel on a private pty; seven alternating runs a side, ranges non-overlapping
 |---|---|---|---|
 | spawn → first frame | 759 ms | 666 ms | −12.2 % |
 
-On the branch itself, `PLAIT_START_LOG` puts nearly all of that in two stages —
+On the branch itself, `GITTEN_START_LOG` puts nearly all of that in two stages —
 acquired 347 ms, views built 308 ms — everything else under a millisecond. The
 desktop client was **not** measured: it needs a window, and nothing headless
 exercises it; its win (window-before-acquisition) is structural rather than a
@@ -496,7 +496,7 @@ merged tree and matches the tolerance profile in the section above exactly.
 
 | | |
 |---|---|
-| `plait-shell`, release, before syntax highlighting | 12,916,304 bytes |
+| `gitten-shell`, release, before syntax highlighting | 12,916,304 bytes |
 | after: scanner, theme, host, prepared, seams | 13,056,496 bytes (+123 KB) |
 | new dependencies | none |
 | `core` dependencies | none, and `[dependencies]` is empty |
@@ -657,8 +657,8 @@ garbage — it did, at first, and made both languages look catastrophic.
 ### The ratios a theme is built to
 
 ```sh
-cargo run -q -p plait-core --example contrast --release          # all three
-cargo run -q -p plait-core --example contrast --release light
+cargo run -q -p gitten-core --example contrast --release          # all three
+cargo run -q -p gitten-core --example contrast --release light
 ```
 
 A floor keeps a palette legible; *hierarchy* is what a reader learns, and the
@@ -723,7 +723,7 @@ regress silently.
 
 Same function, one layer out: `contrast()` over the palette as it shipped, for the
 things that are *not* token text. Reproduce any row with
-`plait_core::theme::contrast(a, b)`.
+`gitten_core::theme::contrast(a, b)`.
 
 The furniture — one hex literal, drawn on five row backgrounds:
 

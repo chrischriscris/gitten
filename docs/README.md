@@ -1,4 +1,4 @@
-# plait docs
+# gitten docs
 
 `AGENTS.md` holds the philosophy — three rules, the boundary, the *don't*s. It is
 short on purpose and stays short. This directory holds everything that would

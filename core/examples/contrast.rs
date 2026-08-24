@@ -1,8 +1,8 @@
 //! Every ratio a theme is built to, as numbers.
 //!
 //! ```sh
-//! cargo run -q -p plait-core --example contrast          # every registered theme
-//! cargo run -q -p plait-core --example contrast light    # one of them
+//! cargo run -q -p gitten-core --example contrast          # every registered theme
+//! cargo run -q -p gitten-core --example contrast light    # one of them
 //! ```
 //!
 //! `paint` is for looking at a palette and this is for checking one, and the two
@@ -22,9 +22,9 @@
 //! failure — it is `readable` doing its job, and the lifted value is what is
 //! drawn. The `*` says which colours the theme is *not* really choosing.
 
-use plait_core::host::Host;
-use plait_core::syntax::Kind;
-use plait_core::theme::{contrast, Surface, Theme};
+use gitten_core::host::Host;
+use gitten_core::syntax::Kind;
+use gitten_core::theme::{contrast, Surface, Theme};
 
 fn row(label: &str, got: f32, floor: f32) {
     let mark = if got < floor { "*" } else { " " };

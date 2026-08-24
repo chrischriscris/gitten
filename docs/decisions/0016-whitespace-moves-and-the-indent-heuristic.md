@@ -102,7 +102,7 @@ Two more traps, both found the same way:
 Asked at the same time, and it has two separate blockers.
 
 *Where the code lives* is solved: tree-sitter cannot go in `core`, so it would be
-a crate implementing `plait_core::differ::Differ`, which is what the seam is for.
+a crate implementing `gitten_core::differ::Differ`, which is what the seam is for.
 [0003](0003-scanner-over-tree-sitter.md) measured tree-sitter and rejected it for
 highlighting — 7.1 MB/s against the scanner's 104–262, falling to 2.6 MB/s on
 hunk-shaped input while losing a fifth of its spans to error recovery, plus

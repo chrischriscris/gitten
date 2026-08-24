@@ -5,19 +5,19 @@ and anyone can write another.
 
 ```
    ┌──────────────────────────────────────────────────────────────────────┐
-   │  plait-core                                              zero deps   │
+   │  gitten-core                                              zero deps   │
    │  parse_log  assign_lanes  differ::{Histogram, Myers}  align  wrap    │
    │  prepared::prepare  rows::{Flat, Present, expand}  runs  markdown    │
    │  syntax  graph::Hues  command::{Key, Keymap, Modes}  select  theme   │
    │  font  host::Host — every swappable piece, in one struct             │
    └───────────────────────────────┬──────────────────────────────────────┘
    ┌───────────────────────────────┴──────────────────────────────────────┐
-   │  plait-git      the only crate that talks to a repository            │
-   │  plait-app      plait.toml, the command line, acquisition            │
+   │  gitten-git      the only crate that talks to a repository            │
+   │  gitten-app      gitten.toml, the command line, acquisition            │
    └──┬──────────────────┬──────────────────┬─────────────────────────────┘
       │                  │                  │
  ┌────▼───────┐ ┌────────▼─────┐ ┌──────────▼──┐   ┌──────────────────┐
- │plait-shell │ │  plait-tui   │ │  plait-web  │   │ yours            │
+ │gitten-shell │ │  gitten-tui   │ │  gitten-web  │   │ yours            │
  │GPUI window │ │cells, raw tty│ │loopback HTTP│   │ AnyElement, a    │
  │            │ │              │ │  + a page   │   │ cell, a payload  │
  └────────────┘ └──────────────┘ └─────────────┘   └──────────────────┘
@@ -25,12 +25,12 @@ and anyone can write another.
 
 A client is **drawing and input, and nothing else.** Everything above that line
 is one implementation: the same differ, the same rows, the same order table, the
-same `plait.toml`, the same keymap. What differs is the type a `Rows`
+same `gitten.toml`, the same keymap. What differs is the type a `Rows`
 implementation returns — an `AnyElement`, a row of cells, a JSON payload — and
 that is the only reason the `Rows` trait itself cannot live in `core`.
 
-**The three are not equal.** `plait-shell` is the product; `plait-tui` is
-planned and built and comes after it; `plait-web` is a proof that the boundary
+**The three are not equal.** `gitten-shell` is the product; `gitten-tui` is
+planned and built and comes after it; `gitten-web` is a proof that the boundary
 holds and not a thing anybody asked to ship. A feature asked for without a client
 named means the window. See [clients.md](clients.md), and `AGENTS.md` for the
 tie-break when a shared seam and a good window disagree.
@@ -38,7 +38,7 @@ tie-break when a shared seam and a good window disagree.
 `core/examples/paint.rs` is a fourth, tiny client: a real diff in ANSI, no
 crate of its own, and still the cheapest place to look at a colour.
 
-## plait-core
+## gitten-core
 
 Pure. No GPUI, no gitoxide, no I/O, and `[dependencies]` is empty — deliberately,
 because it compiles in a second and its tests need no window.
@@ -73,7 +73,7 @@ had none, and the keymap it replaced was three `match` statements
 that could not agree — see [terminal.md](terminal.md) and
 [clients.md](clients.md).
 
-## plait-git
+## gitten-git
 
 The only crate that talks to a repository. Everything currently shells out to the
 `git` binary; reads are meant to move to `gix` while writes stay on the binary
@@ -94,7 +94,7 @@ branch is most of what you are looking for.
 **It acquires content, not diffs.** `pairs` returns two lists of lines per changed
 file; `diff` is that plus the host's `Differs`. It used to run `git diff` and parse
 the unified output back, which meant git chose the algorithm and
-`plait_core::differ` could not have existed — see
+`gitten_core::differ` could not have existed — see
 [decisions/0013](decisions/0013-differs-in-core-not-a-dependency.md). Two
 processes for a whole diff whatever the file count: one `git diff --raw`, one `git
 cat-file --batch`.
@@ -102,14 +102,14 @@ cat-file --batch`.
 `examples/diffcheck.rs` is the headless check that the differs agree with git on
 real history, and is run by `./check.sh`.
 
-## plait-app
+## gitten-app
 
 The config file, the command line, and acquisition — everything a client needs
 before it can draw, and nothing that draws.
 
 | module | what lives there |
 |---|---|
-| `config.rs` | `plait.toml`: parse, apply, write out, watch |
+| `config.rs` | `gitten.toml`: parse, apply, write out, watch |
 | `cli.rs` | `View`, `Source`, `Request`, the usage text, a client's own flags |
 | `acquire.rs` | one view of one source into `Vec<FileDiff>` or `Vec<Commit>` |
 | `lib.rs` | `Startup` — the four lines a client's `main` starts with |
@@ -123,7 +123,7 @@ What is *not* here is how a reload reaches the views. `watch` is shared; what to
 do when it fires is a client's, because GPUI swaps a global and a terminal drops
 a flag into its event loop.
 
-## plait-tui
+## gitten-tui
 
 The terminal. A cell grid, the presentations that fill it, and escape codes.
 
@@ -142,17 +142,17 @@ The terminal. A cell grid, the presentations that fill it, and escape codes.
 looked at without a terminal — and, because `Screen` is a `Vec<Cell>`, it is the
 one frontend whose *drawing* is unit-tested. See [terminal.md](terminal.md).
 
-## plait-web
+## gitten-web
 
 **A proof, not a product.** It exists to answer one question — can a client
 written in a different language, with no access to any of this crate's types,
-draw a plait diff? — and the answer being yes is what says `core` has no UI in
+draw a gitten diff? — and the answer being yes is what says `core` has no UI in
 it. Nobody asked for a web app and the roadmap does not have one.
 
 Read it that way when deciding whether to invest in it. It still holds its own
 row flattening (`rows.rs`) and its own keymap (`ui/app.js`), and those are worth
 *knowing about* rather than worth fixing: closing them buys a client nobody
-ships. What matters is that it never constrains `core` — if `plait-web` ever
+ships. What matters is that it never constrains `core` — if `gitten-web` ever
 wants something in `core` that the window does not, the window wins.
 
 A loopback HTTP server and a page. No third-party dependencies of its own: the
@@ -173,7 +173,7 @@ The graph crosses the wire as `core::graph::plan` — the halves, not a drawing 
 them — so the browser's SVG paths and the window's Bézier curves are the same
 shape from the same numbers.
 
-## plait-shell
+## gitten-shell
 
 GPUI. Drawing and input, and as little else as possible.
 
@@ -187,9 +187,9 @@ GPUI. Drawing and input, and as little else as possible.
 | `views/commits.rs` | the commit list, author initials, row layout |
 | `graph.rs` | lane geometry and painting: quads, paths, one canvas per row |
 | `controls.rs` | the title-bar pickers: a label, a value, and the registered alternatives |
-| `config.rs` | `plait.toml`: parse, apply, watch, and the live `Host` global |
+| `config.rs` | `gitten.toml`: parse, apply, watch, and the live `Host` global |
 | `session.rs` | the row you were on, so `./dev desktop` can put you back after a restart |
-| `stats.rs` | the counting allocator and the `PLAIT_STATS` overlay |
+| `stats.rs` | the counting allocator and the `GITTEN_STATS` overlay |
 | `assets/icon.svg` | the mark: three lanes weaving. `./dev bundle` renders the iconset from it |
 
 ## Which way data moves
@@ -238,11 +238,11 @@ Two checks, both cheap to run against a diff:
 
 Listed so nobody reads an intention as a description:
 
-- **`cli/`.** Referenced throughout as the second door. `plait-tui` and
-  `plait-web` now stand in as the proof that the boundary holds; what `cli/`
+- **`cli/`.** Referenced throughout as the second door. `gitten-tui` and
+  `gitten-web` now stand in as the proof that the boundary holds; what `cli/`
   would still add is a non-interactive door — a diff to stdout, an exit status —
   and `tui/examples/dump.rs` is most of it already.
-- **Any keyboard beyond scrolling, in the terminal.** `plait-tui`'s views are
+- **Any keyboard beyond scrolling, in the terminal.** `gitten-tui`'s views are
   components: every action is a method and nothing in the crate knows what a
   keypress is. There is no `main`, no event loop and no keymap, because a keymap
   written there is one `cli/` would have to duplicate — see the next item.
@@ -252,7 +252,7 @@ Listed so nobody reads an intention as a description:
   rather than something to replace.
 - **Configurable keybindings, and a settings panel.** The title-bar pickers are
   the interim answer: a control per registry, driven by the same names
-  `plait.toml` uses. When the panel exists it should read the same registries and
+  `gitten.toml` uses. When the panel exists it should read the same registries and
   these should collapse into it.
 - **Code hot reload.** The config file reloads *data* live, and `./dev` removes
   everything either side of a code rebuild — but the rebuild itself remains, 3–5 s.
@@ -292,7 +292,7 @@ Listed so nobody reads an intention as a description:
   has the same limit by default and lifts it with `--color-moved`\'s
   cross-file modes.
 - **`gix`.** All reads still spawn `git`.
-- **A rendering test, *in the shell*.** `plait-tui` has one — its screen is a
+- **A rendering test, *in the shell*.** `gitten-tui` has one — its screen is a
   cell buffer, so a row's text and its per-cell colour are both assertions, and
   82 tests exercise the real presentations. Nothing equivalent exercises a GPUI
   element tree:

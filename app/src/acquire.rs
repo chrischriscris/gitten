@@ -3,7 +3,7 @@
 //! One function, and it is the whole of what sits between
 //! [`cli::parse`](crate::cli::parse) and a view. It uses the host's own
 //! `Differs`, which is the point: *which algorithm ran* is a configured choice
-//! and this is the one place it is made, so `[diff] algorithm` in `plait.toml`
+//! and this is the one place it is made, so `[diff] algorithm` in `gitten.toml`
 //! means the same thing in a window, a browser and a terminal.
 //!
 //! It returns **`Vec<FileDiff>`, not prepared rows.** Every client wants
@@ -14,9 +14,9 @@
 //! what a client needs.
 
 use crate::cli::{Source, View};
-use plait_core::differ::Overrides;
-use plait_core::host::Host;
-use plait_core::{Commit, FileDiff};
+use gitten_core::differ::Overrides;
+use gitten_core::host::Host;
+use gitten_core::{Commit, FileDiff};
 use std::path::Path;
 
 /// Where the fixtures live, for a client that wants to say so in an error.
@@ -78,7 +78,7 @@ pub fn acquire(view: View, source: &Source, host: &Host) -> Result<Loaded, Strin
             // as this call.
             std::thread::scope(|s| {
                 let title = s.spawn(|| describe(path, arg));
-                let files = plait_git::diff(path, arg, &host.differ, &Overrides::default())?;
+                let files = gitten_git::diff(path, arg, &host.differ, &Overrides::default())?;
                 if files.is_empty() {
                     let what = match arg.is_empty() {
                         true => "(working tree)",
@@ -95,7 +95,7 @@ pub fn acquire(view: View, source: &Source, host: &Host) -> Result<Loaded, Strin
             })
         }
         (View::Diff, Source::Fixtures) => {
-            let files = plait_core::parse_unified_diff(&read_fixture(DIFF_FIXTURE));
+            let files = gitten_core::parse_unified_diff(&read_fixture(DIFF_FIXTURE));
             if files.is_empty() {
                 return Err(format!(
                     "{DIFF_FIXTURE} is missing or empty — ./fixtures/gen.sh 1000 1000"
@@ -110,8 +110,8 @@ pub fn acquire(view: View, source: &Source, host: &Host) -> Result<Loaded, Strin
             // Beside, not behind: the same overlap the diff view has, because
             // the graph waits on `git log` either way.
             std::thread::scope(|s| {
-                let title = s.spawn(|| plait_git::describe(path));
-                let commits = plait_git::log(path, arg.parse().unwrap_or(5000))?;
+                let title = s.spawn(|| gitten_git::describe(path));
+                let commits = gitten_git::log(path, arg.parse().unwrap_or(5000))?;
                 if commits.is_empty() {
                     return Err(format!("no commits in {}", path.display()));
                 }
@@ -122,7 +122,7 @@ pub fn acquire(view: View, source: &Source, host: &Host) -> Result<Loaded, Strin
             })
         }
         (View::Commits, Source::Fixtures) => {
-            let commits = plait_core::parse_log(&read_fixture(LOG_FIXTURE));
+            let commits = gitten_core::parse_log(&read_fixture(LOG_FIXTURE));
             if commits.is_empty() {
                 return Err(format!(
                     "{LOG_FIXTURE} is missing or empty — ./fixtures/dump.sh ."
@@ -148,7 +148,7 @@ fn joined(title: std::thread::ScopedJoinHandle<'_, String>) -> String {
 }
 
 fn describe(repo: &Path, revspec: &str) -> String {
-    format!("{} {revspec}", plait_git::describe(repo))
+    format!("{} {revspec}", gitten_git::describe(repo))
         .trim()
         .into()
 }
@@ -177,7 +177,7 @@ mod tests {
     #[test]
     fn the_hosts_differ_is_the_one_that_runs() {
         // The whole reason acquisition takes a `Host`: `[diff] algorithm` in
-        // `plait.toml` has to reach the thing that actually diffs.
+        // `gitten.toml` has to reach the thing that actually diffs.
         let mut host = Host::new();
         assert!(host.differ.select("myers"));
         host.differ.context = 1;

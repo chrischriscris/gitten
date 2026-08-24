@@ -1,6 +1,6 @@
 //! Checks the differs against git's own answer on a real repository.
 //!
-//!     cargo run -q -p plait-git --example diffcheck --release [REPO] [REVSPEC]
+//!     cargo run -q -p gitten-git --example diffcheck --release [REPO] [REVSPEC]
 //!
 //! `core`'s tests prove an edit script applies and that Myers is minimal, on
 //! inputs small enough to check by hand. This is the other half: real files,
@@ -32,8 +32,8 @@
 //! the hunk and git's does not, which is a bounded difference in a string nobody
 //! diffs.
 
-use plait_core::differ::{Differs, Overrides, Whitespace};
-use plait_core::{parse_unified_diff, LineKind};
+use gitten_core::differ::{Differs, Overrides, Whitespace};
+use gitten_core::{parse_unified_diff, LineKind};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -44,7 +44,7 @@ fn main() {
     let revspec = args.next().unwrap_or_default();
 
     let t = Instant::now();
-    let pairs = match plait_git::pairs(&repo, &revspec) {
+    let pairs = match gitten_git::pairs(&repo, &revspec) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("{e}");
@@ -197,10 +197,10 @@ fn main() {
 /// `core`'s split, not a second copy of it: this had its own two-line version of
 /// the same scan, which is one place for the two to disagree about what a header
 /// is — and this comparison is the thing that decides whether a differ is right.
-fn ranges(f: &plait_core::FileDiff) -> Vec<String> {
+fn ranges(f: &gitten_core::FileDiff) -> Vec<String> {
     f.hunks
         .iter()
-        .map(|h| plait_core::hunk_parts(&h.header).0.to_string())
+        .map(|h| gitten_core::hunk_parts(&h.header).0.to_string())
         .collect()
 }
 
@@ -208,7 +208,7 @@ fn git_diff(
     repo: &Path,
     revspec: &str,
     flags: &[&str],
-) -> (usize, usize, usize, Duration, Vec<plait_core::FileDiff>) {
+) -> (usize, usize, usize, Duration, Vec<gitten_core::FileDiff>) {
     let dir = repo.to_str().unwrap_or(".");
     let mut args: Vec<&str> = if revspec.is_empty() {
         vec!["-C", dir, "diff", "--no-ext-diff", "-M", "HEAD"]
@@ -251,7 +251,7 @@ fn report_worst(
     revspec: &str,
     flags: &[&str],
     differs: &Differs,
-    pairs: &[plait_git::Pair],
+    pairs: &[gitten_git::Pair],
 ) {
     if std::env::var_os("WORST").is_none() {
         return;
@@ -275,7 +275,7 @@ fn report_worst(
     args.extend_from_slice(flags);
     let out = Command::new("git").args(&args).output().expect("git");
     let theirs = parse_unified_diff(&String::from_utf8_lossy(&out.stdout));
-    let count = |f: &plait_core::FileDiff| -> usize {
+    let count = |f: &gitten_core::FileDiff| -> usize {
         f.hunks
             .iter()
             .flat_map(|h| &h.lines)

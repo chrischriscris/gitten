@@ -4,7 +4,7 @@
 //! This is `shell/src/views/diff.rs`'s `Diff` with GPUI taken out, and it turns
 //! out to be much smaller — because `uniform_list` is replaced by a `for` over
 //! the visible rows, and because the pipeline it used to drive now lives in
-//! [`plait_core::rows`].
+//! [`gitten_core::rows`].
 //!
 //! # No events in here
 //!
@@ -20,11 +20,11 @@
 //! line, so it subtracts them, and what arrives here is already a place in this
 //! view. Below that, which text and which byte is the presentation's — see
 //! [`crate::rows::Rows::hit`] — and everything a selection *means* is
-//! [`plait_core::select`], shared with the window.
+//! [`gitten_core::select`], shared with the window.
 //!
 //! # Where it is scrolled to is not this file's
 //!
-//! [`plait_core::view::Viewport`] holds the cursor and the top row and the rule
+//! [`gitten_core::view::Viewport`] holds the cursor and the top row and the rule
 //! relating them, because the commit list needs exactly the same pair and had
 //! its own copy. What is left here is the part that is genuinely a *diff*: the
 //! order table the rows are counted from, and the anchor a reflow keeps — the
@@ -40,12 +40,12 @@
 use crate::rows::{assemble, Frame, Layouts, Rows};
 use crate::screen::{Ink, Screen};
 use crate::scrollbar::{self, Bar};
-use plait_core::host::Host;
-use plait_core::rows::{expand, RowRef};
-use plait_core::runs::Run;
-use plait_core::select::{self, Caret, RowId, Selection, Text as _};
-use plait_core::view::Viewport;
-use plait_core::FileDiff;
+use gitten_core::host::Host;
+use gitten_core::rows::{expand, RowRef};
+use gitten_core::runs::Run;
+use gitten_core::select::{self, Caret, RowId, Selection, Text as _};
+use gitten_core::view::Viewport;
+use gitten_core::FileDiff;
 use std::time::Duration;
 
 pub struct Diff {
@@ -92,7 +92,7 @@ pub struct Diff {
     file_count: usize,
     /// What the mouse has selected, or nothing.
     ///
-    /// The model is [`plait_core::select`] and this is the only state this view
+    /// The model is [`gitten_core::select`] and this is the only state this view
     /// keeps for it: which rows are covered, what a wrapped line copies and where
     /// a word ends are all answers about a *diff* and are `core`'s, shared with
     /// the window.
@@ -105,7 +105,7 @@ pub struct Diff {
     bar: Bar,
 }
 
-/// Where every row's selectable text comes from, for [`plait_core::select`].
+/// Where every row's selectable text comes from, for [`gitten_core::select`].
 ///
 /// A wrapper rather than an impl on the vector, because the trait and the vector
 /// both belong to somebody else. Three lines is what this seam costs — the same
@@ -135,7 +135,7 @@ impl Diff {
             Some(i) => i,
             None => {
                 eprintln!(
-                    "plait: unknown diff.layout {:?}; registered: {}",
+                    "gitten: unknown diff.layout {:?}; registered: {}",
                     host.layout,
                     layouts.names().join(", ")
                 );
@@ -254,7 +254,7 @@ impl Diff {
     /// One pass over the order table, marking the rows that are file headers.
     ///
     /// A binary search per row against that owner's own header list, which is
-    /// sorted because [`plait_core::rows::assemble`] builds it in file order.
+    /// sorted because [`gitten_core::rows::assemble`] builds it in file order.
     /// Only the first visual row of a logical one can be a header, so a wrapped
     /// diff costs no more than an unwrapped one.
     fn index_headers(&mut self) {
@@ -331,10 +331,10 @@ impl Diff {
 
     /// Moves the cursor to the header of the next or previous file.
     ///
-    /// The jump list is [`plait_core::rows::Present::files`], so a presentation
+    /// The jump list is [`gitten_core::rows::Present::files`], so a presentation
     /// that is not file-shaped offers no jumps rather than wrong ones — and this
     /// works for a presentation registered by an extension without it doing
-    /// anything but hold a [`plait_core::rows::Flat`].
+    /// anything but hold a [`gitten_core::rows::Flat`].
     pub fn jump_file(&mut self, by: isize) {
         // Binary search rather than a scan: a 5,953-file diff is a realistic
         // input and this is a keypress.
@@ -671,7 +671,7 @@ impl Diff {
                         shift: self.shift,
                         current: n == self.view.cursor(),
                         // Two integer comparisons per visible row, and no search
-                        // of the order table: see `plait_core::select::Caret::at`.
+                        // of the order table: see `gitten_core::select::Caret::at`.
                         sel: self.sel.as_ref().and_then(|s| s.at(n, r.logical())),
                     };
                     let mut pen = screen.row(row);
@@ -758,9 +758,9 @@ fn span(part: u16, at: &Caret, bytes: std::ops::Range<usize>) -> Selection {
 mod tests {
     use super::*;
     use crate::rows::TextRows;
-    use plait_core::parse_unified_diff;
-    use plait_core::prepared::File;
-    use plait_core::rows::Present;
+    use gitten_core::parse_unified_diff;
+    use gitten_core::prepared::File;
+    use gitten_core::rows::Present;
 
     fn diff(lines: usize) -> Vec<FileDiff> {
         let mut raw = String::from("diff --git a/a.rs b/a.rs\n@@ -1,1 +1,1 @@\n");

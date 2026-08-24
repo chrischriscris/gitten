@@ -1,7 +1,7 @@
 //! Keys, commands, and the mode stack.
 //!
 //! The last thing `docs/architecture.md` listed as missing from `core`, and the
-//! one that most had to be here: a keybinding is the promise that plait behaves
+//! one that most had to be here: a keybinding is the promise that gitten behaves
 //! the same in a window, a browser and a terminal, and a promise kept in three
 //! places is not kept.
 //!
@@ -9,14 +9,14 @@
 //!
 //! Nothing in here is a function pointer, and that is
 //! [decisions/0012](../docs/decisions/0012-config-is-data-behaviour-is-not.md)
-//! applied to input: a settings panel has to be able to rewrite `plait.toml` in
+//! applied to input: a settings panel has to be able to rewrite `gitten.toml` in
 //! place, and it cannot round-trip a closure. So a binding says
 //! `"ctrl-d" = "view.page-down"` and *what that does* lives in whatever is being
 //! driven.
 //!
 //! The consequence is the interesting part. `core` resolves a keypress to a
 //! command **name**; a client turns that name into a method call on a view it
-//! owns. So the same `plait.toml` drives a GPUI window and a terminal, and an
+//! owns. So the same `gitten.toml` drives a GPUI window and a terminal, and an
 //! extension binds a key without either of them knowing it exists.
 //!
 //! ```text
@@ -49,7 +49,7 @@ use std::fmt;
 /// does, and what it should *do* is exactly as much a matter of taste as what
 /// `j` should do. Kept out, it would be a `match` in each client deciding that
 /// the wheel scrolls — a keymap the client owned alone, with no line in
-/// `plait.toml` and no row on the help screen. A mouse *position* is another
+/// `gitten.toml` and no row on the help screen. A mouse *position* is another
 /// matter and is not a key: it belongs to whatever was clicked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Code {
@@ -569,7 +569,7 @@ mod tests {
     #[test]
     fn a_key_round_trips_through_its_own_spelling() {
         // The property a config file rests on: a settings panel writes what it
-        // read, and `plait config` emits a file that parses back.
+        // read, and `gitten config` emits a file that parses back.
         for s in [
             "j",
             "G",

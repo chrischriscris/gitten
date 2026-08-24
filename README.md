@@ -1,4 +1,4 @@
-# plait
+# gitten
 
 A desktop git client with lazygit's keyboard model. History and diffs, written
 in Rust on [GPUI](https://github.com/zed-industries/zed), driven almost
@@ -13,7 +13,7 @@ weaving past each other.
 
 ## How this was built
 
-**plait is fully AI-written — every line of Rust, every decision record, this
+**gitten is fully AI-written — every line of Rust, every decision record, this
 README.** A human sets direction, reviews, and deletes what does not survive;
 coding agents do the writing. That is stated up front rather than left to be
 discovered, because the project makes two claims about it:
@@ -55,12 +55,12 @@ Pre-release, and honest about it:
 | Intraline | word-level second pass over changed pairs; moved blocks flagged beside their kind, three-line minimum |
 | Syntax highlighting | a hand-written scanner over twenty-odd languages, chosen over tree-sitter on measurement |
 | Markdown diffs | rendered as blocks; tables wider than the window are squeezed per column rather than broken across rows |
-| Themes | three shipped palettes, contrast floors asserted by test, editable live in `plait.toml` |
-| Config | `plait.toml` hot-reloads on the next frame — colours, font, algorithm, layouts, keybindings |
+| Themes | three shipped palettes, contrast floors asserted by test, editable live in `gitten.toml` |
+| Config | `gitten.toml` hot-reloads on the next frame — colours, font, algorithm, layouts, keybindings |
 | Scale | git/git's 82k-commit history and a 714k-line pull request are fixtures, not stress tests |
 
 Three frontends share one pipeline: the GPUI window (the product), a terminal
-client (`plait-tui`), and a browser proof (`plait-web`) whose whole job is to
+client (`gitten-tui`), and a browser proof (`gitten-web`) whose whole job is to
 keep the boundary honest. Anything two of them need lives in `core`.
 
 ## Numbers
@@ -82,7 +82,7 @@ your `PATH`. The first build compiles GPUI out of Zed's tree — several
 minutes, once.
 
 ```sh
-git clone https://github.com/chrischriscris/plait && cd plait
+git clone https://github.com/chrischriscris/gitten && cd gitten
 ./dev desktop commits               # the window, on this repository's history
 ./dev desktop diff . HEAD~2..HEAD   # or a diff on any revspec
 ```
@@ -94,8 +94,8 @@ git clone https://github.com/chrischriscris/plait && cd plait
 ./dev web    diff --fixtures        # the browser proof; prints a URL
 ./dev dump   commits ~/src/somerepo # one frame on stdout, timing on stderr
 ./dev check                         # everything headless: tests + benchmarks
-./dev config > plait.toml           # a complete, correct starting config
-./dev bundle                        # target/plait.app — icon and all
+./dev config > gitten.toml           # a complete, correct starting config
+./dev bundle                        # target/gitten.app — icon and all
 ```
 
 Debug builds and the stats overlay are the defaults, because that is the loop
@@ -105,8 +105,8 @@ and cell counts are still worth watching.
 Headless checks, if you would rather not run the script:
 
 ```sh
-cargo test -p plait-core     # correctness, sub-second
-cargo run -q -p plait-git --example diffcheck --release . HEAD~50
+cargo test -p gitten-core     # correctness, sub-second
+cargo run -q -p gitten-git --example diffcheck --release . HEAD~50
                              # our differs against git's own answer
 ```
 
@@ -123,22 +123,22 @@ lazygit's model: one key, one verb. The defaults:
 | `q` / `?` | quit · key help — the terminal derives its help panel from the same `[keys]` table |
 
 A binding is data, not a `match`: every default lives in `core::command`,
-every client reads the same `[keys]` table in `plait.toml`, and the help
+every client reads the same `[keys]` table in `gitten.toml`, and the help
 panel is derived from it rather than written by hand.
 
 ## How it fits together
 
 One rule holds the shape: **`core/` never knows a UI exists.** No GPUI, no
 I/O, an empty `[dependencies]` — which is why it compiles in a second and its
-tests need no window. `plait-git` is the only crate that talks to a
+tests need no window. `gitten-git` is the only crate that talks to a
 repository (writes through the `git` binary today, reads meant for `gix`);
-`plait-app` holds `plait.toml` and the command line; each client is drawing
+`gitten-app` holds `gitten.toml` and the command line; each client is drawing
 and input, and nothing else.
 
 ```
-plait-core                                   zero deps — differs, graph, rows, keys, themes
-plait-git · plait-app                        the only git boundary · plait.toml and the cli
-plait-shell │ plait-tui │ plait-web │ yours  the window │ the tty │ a browser proof │ next
+gitten-core                                   zero deps — differs, graph, rows, keys, themes
+gitten-git · gitten-app                        the only git boundary · gitten.toml and the cli
+gitten-shell │ gitten-tui │ gitten-web │ yours  the window │ the tty │ a browser proof │ next
 ```
 
 Start reading at [docs/README.md](docs/README.md). `AGENTS.md` holds the
