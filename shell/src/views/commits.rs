@@ -71,6 +71,12 @@ pub struct Commits {
     /// First visible row, for the session — see the note in the diff view.
     pub top: Rc<Cell<usize>>,
     pub load: String,
+    /// The hard reset awaiting its second press: the sha of the commit that
+    /// asked. One slot — arming a different row moves the question. Any
+    /// cursor move, wheel or refresh drops it, because a stale yes waiting
+    /// on a sha the list may no longer hold is exactly the accident the
+    /// double press exists to prevent.
+    armed: Option<String>,
 }
 
 impl Commits {
@@ -174,6 +180,9 @@ impl Commits {
                 v.scroll_to((-y / graph::ROW_H).round().max(0.0) as usize);
                 self.view.set(v);
                 self.top.set(v.top());
+                // The wheel is also a move of attention — same rule the
+                // arrow keys keep.
+                self.armed = None;
                 return true;
             }
             // A request not paired with our marker belongs to another
@@ -198,6 +207,7 @@ impl Commits {
         v.scroll_to((-y / graph::ROW_H).round().max(0.0) as usize);
         self.view.set(v);
         self.synced.set(y);
+        self.armed = None;
         true
     }
 
@@ -241,10 +251,15 @@ impl Commits {
             "view.scroll-up" => v.scroll_by(-(host.view.rows as isize)),
             "view.top" => v.to_top(),
             "view.bottom" => v.to_bottom(),
-            // No sideways half: see `pan_pixels`.
+            // No sideways half: see `pan_pixels`. Answered without moving
+            // anything, so an armed reset stands.
             "view.left" | "view.right" => return true,
             _ => return false,
         }
+        // The keyboard moved — including the two scrolls above, which leave
+        // the cursor but not the question's row in view. Whatever was armed
+        // was armed to what the keyboard used to be on.
+        self.armed = None;
         self.view.set(v);
         self.show(v);
         true
@@ -299,6 +314,27 @@ impl Commits {
         false
     }
 
+    /// The hard reset's two-press dance, shared with every destructive verb:
+    /// first press on a row arms it and asks through the notice band; the
+    /// second press on the *same* commit executes. True means the press was
+    /// the second one and the arm is spent. Addressed by sha — the thing
+    /// `current` hands the shell and git will be aimed at.
+    pub(crate) fn confirm_or_arm_reset(&mut self, sha: &str) -> bool {
+        let already = self.armed.as_deref() == Some(sha);
+        self.armed = match already {
+            true => None,
+            false => Some(sha.to_string()),
+        };
+        already
+    }
+
+    /// Whether a reset is waiting for its second press — the render's tint of
+    /// the row the question is about.
+    #[cfg(test)]
+    pub(crate) fn armed_sha(&self) -> Option<String> {
+        self.armed.clone()
+    }
+
     // ----------------------------------------------------------------- search
 
     /// Sets the filter — once per keystroke, and never anywhere else. The
@@ -319,6 +355,9 @@ impl Commits {
         if self.query.as_deref() == next {
             return;
         }
+        // A changed filter can move the cursor by clamping, and a question
+        // aimed at yesterday's row is the thing the arm exists to prevent.
+        self.armed = None;
         // Anchor first: named by sha, like every other re-anchor in this file,
         // because row numbers are about to stop meaning anything.
         let anchored = self
@@ -374,6 +413,7 @@ impl Commits {
             rendered: Rc::new(Cell::new(0)),
             top: Rc::new(Cell::new(0)),
             load,
+            armed: None,
         }
     }
 
@@ -385,6 +425,9 @@ impl Commits {
     }
 
     pub(crate) fn replace_prepared(&mut self, prepared: Prepared, host: &Host) {
+        // A refresh is the repository saying things moved; an armed reset was
+        // a promise about how they were, so it dies here first.
+        self.armed = None;
         self.reconcile(host);
         let old = self.view.get();
         let cursor_sha = self
@@ -524,6 +567,12 @@ impl Render for Commits {
         // the indirection before it touches a commit: under a query, row
         // numbers are positions in `visible`, not in `data.commits`.
         let visible = self.visible.clone();
+        // The row an armed reset is waiting on, found once per frame — the
+        // same tint a discard and a drop wear.
+        let armed = self
+            .armed
+            .as_ref()
+            .and_then(|sha| visible.iter().position(|i| data.commits[*i].sha == *sha));
         let list = uniform_list("commits", visible.len(), move |range, _, cx| {
             rendered.set(range.len());
             top.set(range.start);
@@ -552,6 +601,7 @@ impl Render for Commits {
                         &data.draws[c],
                         &host,
                         i == cursor,
+                        Some(i) == armed,
                     )
                 })
                 .collect()
@@ -602,8 +652,17 @@ const WHO_CHARS: f32 = 3.0;
 ///
 /// `current` paints the keyboard's row in `chrome.selection_bg`, the one colour
 /// the terminal uses for exactly this, so the cursor is visible wherever the
-/// keymap moves it.
-fn row(c: &Commit, who: &Who, d: &graph::Draw, host: &Rc<Host>, current: bool) -> AnyElement {
+/// keymap moves it. `armed` tints the sha and subject toward `chrome.error`,
+/// so the commit a second press would reset to is named by its own colour
+/// and not only by the band above it.
+fn row(
+    c: &Commit,
+    who: &Who,
+    d: &graph::Draw,
+    host: &Rc<Host>,
+    current: bool,
+    armed: bool,
+) -> AnyElement {
     let ch = host.font.char_width();
     div()
         .flex()
@@ -617,7 +676,13 @@ fn row(c: &Commit, who: &Who, d: &graph::Draw, host: &Rc<Host>, current: bool) -
             div()
                 .flex_none()
                 .w(px(SHA_CHARS * ch))
-                .text_color(rgb(host.theme.chrome.dim))
+                // The error colour is already this palette's "this row ends
+                // work" foreground — conflicts and armed destructions draw
+                // with it — so the tint spends nothing new.
+                .text_color(rgb(match armed {
+                    true => host.theme.chrome.error,
+                    false => host.theme.chrome.dim,
+                }))
                 .child(c.short.clone()),
         )
         .child(
@@ -628,7 +693,14 @@ fn row(c: &Commit, who: &Who, d: &graph::Draw, host: &Rc<Host>, current: bool) -
                 .child(who.initials.clone()),
         )
         .child(graph::row_canvas(d.clone(), host.clone()))
-        .child(div().flex_none().child(c.subject.clone()))
+        .child(
+            div()
+                .flex_none()
+                // Unarmed keeps the inherited ink; only the question
+                // repaints the row.
+                .when(armed, |d| d.text_color(rgb(host.theme.chrome.error)))
+                .child(c.subject.clone()),
+        )
         .into_any_element()
 }
 
@@ -636,6 +708,7 @@ fn row(c: &Commit, who: &Who, d: &graph::Draw, host: &Rc<Host>, current: bool) -
 mod tests {
     // By name, not a glob: `use gpui::*` in the parent shadows `#[test]` with
     // GPUI's own attribute macro and every test in here fails to expand.
+    use super::graph;
     use super::Commits;
     use gitten_core::host::Host;
     use gitten_core::Commit;
@@ -1101,5 +1174,78 @@ mod tests {
             Some(anchored.as_str())
         );
         assert_eq!(c.filter_note().as_deref(), Some("16/31"));
+    }
+
+    // ------------------------------------------------------------ arming
+
+    #[test]
+    fn a_hard_reset_arms_its_row_and_spends_on_the_same_commit() {
+        let host = Rc::new(Host::new());
+        let mut c = Commits::new(commits(4), host.clone());
+        with_height(&mut c, 10);
+        c.run_view("view.top", &host);
+        let sha = c.current().expect("a commit").sha.clone();
+
+        // First press: asked, not acted. The arm names the commit by sha.
+        assert!(!c.confirm_or_arm_reset(&sha));
+        assert_eq!(c.armed_sha(), Some(sha.clone()));
+
+        // Second press on the same row: act, and the slot is spent.
+        assert!(c.confirm_or_arm_reset(&sha));
+        assert_eq!(c.armed_sha(), None);
+
+        // And a third press starts over: there is no latched yes.
+        assert!(!c.confirm_or_arm_reset(&sha));
+    }
+
+    #[test]
+    fn arming_a_different_commit_moves_the_question_rather_than_confirming_it() {
+        let host = Rc::new(Host::new());
+        let mut c = Commits::new(commits(4), Rc::clone(&host));
+        with_height(&mut c, 10);
+        let (first, second) = (c.data.commits[0].sha.clone(), c.data.commits[1].sha.clone());
+
+        assert!(!c.confirm_or_arm_reset(&first));
+        assert!(!c.confirm_or_arm_reset(&second));
+        assert_eq!(c.armed_sha(), Some(second), "one slot: the question moved");
+        assert!(
+            !c.confirm_or_arm_reset(&first),
+            "the old arm was already gone"
+        );
+    }
+
+    #[test]
+    fn a_cursor_move_a_wheel_and_a_refresh_all_disarm_a_reset() {
+        let host = Rc::new(Host::new());
+        let mut c = Commits::new(commits(20), host.clone());
+        with_height(&mut c, 5);
+        c.run_view("view.top", &host);
+        let sha0 = c.data.commits[0].sha.clone();
+        let armed = |c: &Commits| c.armed_sha().is_some();
+
+        // The keyboard moved.
+        assert!(!c.confirm_or_arm_reset(&sha0));
+        c.run_view("view.down", &host);
+        assert!(!armed(&c), "the cursor move disarmed");
+
+        // view.left/right move nothing, so the question stands — and a
+        // wheel over a list that cannot move changes nothing either, so
+        // neither gesture spends what is armed.
+        assert!(!c.confirm_or_arm_reset(&sha0));
+        c.run_view("view.right", &host);
+        c.scroll_pixels(-3.0 * graph::ROW_H, &host);
+        assert!(
+            armed(&c),
+            "gestures that moved nothing must not spend the question"
+        );
+
+        // The repository moved too.
+        c.replace(mixed_history(), &host);
+        assert!(!armed(&c), "a refresh disarmed");
+
+        // And a changed filter is a movement of attention as well.
+        assert!(!c.confirm_or_arm_reset(&sha0));
+        c.apply_query("engine");
+        assert!(!armed(&c), "a changed query disarmed");
     }
 }
