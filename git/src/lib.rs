@@ -202,6 +202,39 @@ pub trait Repo: Send + Sync {
         Err(unserved("the reflog"))
     }
 
+    // --------------------------------------------------------------- the verbs
+
+    /// Stages one path: `git add --`.
+    ///
+    /// One word for everything the working tree can be doing to a file —
+    /// untracked, modified, deleted — because that is git's own answer: `add`
+    /// records a path's current state in the index whatever state it is. The
+    /// path is bytes, exactly as [`status`](Self::status) named it.
+    fn stage(&self, _path: &[u8]) -> Result<()> {
+        Err(unserved("staging"))
+    }
+
+    /// Unstages one path: `git reset` against HEAD.
+    ///
+    /// The change returns to wherever it came from — a staged modification
+    /// back to unstaged, a newly added file back to untracked — and the
+    /// working tree is never touched. Nothing staged for the path is not an
+    /// error: git answers a no-op, and so does this.
+    fn unstage(&self, _path: &[u8]) -> Result<()> {
+        Err(unserved("unstaging"))
+    }
+
+    /// Commits what the index holds with `message`, returning the new
+    /// commit's OID.
+    ///
+    /// Hooks run, untouched — that is WHY this shells out rather than writing
+    /// an object through a library. An empty or whitespace-only message is
+    /// refused here, because git's own answer to one ("nothing to commit")
+    /// names the wrong failure.
+    fn commit(&self, _message: &str) -> Result<String> {
+        Err(unserved("committing"))
+    }
+
     /// A short label for the window title.
     ///
     /// Infallible: a repository whose branch cannot be read still has a name.
@@ -619,6 +652,60 @@ impl Repo for Binary {
             },
         };
         Ok(parse_reflog(&raw))
+    }
+
+    fn stage(&self, path: &[u8]) -> Result<()> {
+        // `add --`, not bare `add`: a path may begin with `-`. Bytes through
+        // [`run_bytes`] — the same discipline the reads keep, so the file
+        // staged is the one status named, whatever its bytes are.
+        run_bytes(&self.root, &[b"add", b"--", path]).map(|_| ())
+    }
+
+    fn unstage(&self, path: &[u8]) -> Result<()> {
+        // `-q` because a quiet no-op is the answer this verb owes "nothing was
+        // staged"; git exits zero there and for an unmatched path both. On an
+        // unborn branch — every fresh repository, where HEAD names a branch
+        // that does not exist yet — modern git resolves HEAD to the empty tree
+        // and still unstages; that is tested, not assumed, and an older git's
+        // failure surfaces as the error it is rather than being guessed around.
+        run_bytes(&self.root, &[b"reset", b"-q", b"HEAD", b"--", path]).map(|_| ())
+    }
+
+    fn commit(&self, message: &str) -> Result<String> {
+        if message.trim().is_empty() {
+            return Err("a commit needs a message".into());
+        }
+        // The message rides stdin (`--file=-`), never an argv word: quotes,
+        // newlines and non-ASCII arrive byte-for-byte instead of surviving an
+        // escaping exercise here. Hooks see exactly what they would from a
+        // terminal commit.
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .args(["commit", "--file=-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("could not run git commit: {e}"))?;
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        // A write failure (a hook that quit before reading) is git's story to
+        // tell through the exit status; ours would only be noise in front of it.
+        let _ = stdin.write_all(message.as_bytes());
+        drop(stdin); // EOF is the message's end
+        let out = child
+            .wait_with_output()
+            .map_err(|e| format!("git commit: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "git commit: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        // Ask, don't parse prose: hook output shares the stream with git's own
+        // summary, and the OID is one cheap rev-parse away.
+        let sha = run(&self.root, &["rev-parse", "HEAD"])?;
+        Ok(lossy(trimmed(&sha)))
     }
 }
 
@@ -3257,5 +3344,244 @@ mod tests {
         assert_eq!(got[0].commit, "aa11", "lightweight: object is commit");
         assert_eq!(got[1].name.as_bytes(), b"v2");
         assert_eq!(got[1].commit, "bb22", "annotated: the peel wins");
+    }
+
+    // ------------------------------------------------------------------ writes
+
+    /// A backend that serves only its reads. The verb defaults exist so a
+    /// partial implementation — a test fake, a gix port landed read by read —
+    /// never has to stub what it does not do.
+    struct ReadsOnly;
+
+    impl Repo for ReadsOnly {
+        fn log(&self, _: usize) -> Result<Vec<Commit>> {
+            Ok(Vec::new())
+        }
+        fn pairs(&self, _: &str) -> Result<Vec<Pair>> {
+            Ok(Vec::new())
+        }
+        fn status(&self) -> Result<Status> {
+            Ok(Status::default())
+        }
+        fn describe(&self) -> String {
+            "fake".into()
+        }
+    }
+
+    #[test]
+    fn a_backend_that_does_not_serve_writes_says_so_by_name() {
+        assert_eq!(
+            ReadsOnly.stage(b"x").unwrap_err(),
+            "this repository does not serve staging"
+        );
+        assert_eq!(
+            ReadsOnly.unstage(b"x").unwrap_err(),
+            "this repository does not serve unstaging"
+        );
+        assert_eq!(
+            ReadsOnly.commit("hi").unwrap_err(),
+            "this repository does not serve committing"
+        );
+    }
+
+    #[test]
+    fn staging_an_untracked_file_records_it_in_the_index() {
+        // The case `git diff` cannot see and the status pass exists for: a
+        // brand-new file stages like anything else, because `add` is git's one
+        // word for "the index should hold this".
+        let r = Scratch::new("stage-untracked");
+        r.write("seed.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        r.write("new.txt", b"brand new\n");
+
+        let g = r.open();
+        assert_eq!(g.status().unwrap().untracked.len(), 1);
+        g.stage(b"new.txt").expect("stages");
+        let s = g.status().unwrap();
+        assert!(s.untracked.is_empty(), "{s:?}");
+        assert_eq!(s.staged.len(), 1);
+        assert_eq!(s.staged[0].change, Change::Added);
+        assert_eq!(s.staged[0].path.as_bytes(), b"new.txt");
+    }
+
+    #[test]
+    fn staging_addresses_the_path_by_its_bytes() {
+        // Spaces plus a Latin-1 byte: the shapes an argv-joined or decoded
+        // path would mangle.
+        let r = Scratch::new("stage-raw");
+        r.write("seed.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        if !r.plant_raw(b"has space \xe9.txt", b"bytes\n") {
+            return; // this volume validates UTF-8; see the untracked read test
+        }
+
+        let g = r.open();
+        g.stage(b"has space \xe9.txt").expect("stages");
+        let s = g.status().unwrap();
+        assert_eq!(s.staged.len(), 1);
+        assert_eq!(
+            s.staged[0].path.as_bytes(),
+            b"has space \xe9.txt".as_slice(),
+            "the index holds the exact name"
+        );
+        assert!(s.untracked.is_empty());
+    }
+
+    #[test]
+    fn unstaging_puts_each_change_back_where_it_came_from() {
+        let r = Scratch::new("unstage-back");
+        r.write("f.txt", b"one\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+
+        let g = r.open();
+        // A modification returns to the working tree's list...
+        r.write("f.txt", b"two\n");
+        g.stage(b"f.txt").unwrap();
+        g.unstage(b"f.txt").expect("unstages");
+        let s = g.status().unwrap();
+        assert!(s.staged.is_empty());
+        assert_eq!(s.unstaged.len(), 1);
+        assert!(!s.unstaged[0].submodule.modified, "untouched by the verb");
+
+        // ...and a fresh file returns to untracked, not nowhere.
+        r.write("loose.md", b"notes\n");
+        g.stage(b"loose.md").unwrap();
+        g.unstage(b"loose.md").expect("unstages");
+        let s = g.status().unwrap();
+        assert!(s.staged.is_empty());
+        assert_eq!(
+            s.untracked
+                .iter()
+                .map(|e| e.path.to_string())
+                .collect::<Vec<_>>(),
+            vec!["loose.md"]
+        );
+    }
+
+    #[test]
+    fn unstaging_nothing_is_a_quiet_no_op() {
+        // git answers an unmatched pathspec with success, not an error — and
+        // idempotent is the honest answer to "make sure this is unstaged",
+        // which is what a toggle key ends up asking twice.
+        let r = Scratch::new("unstage-noop");
+        r.write("f.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        let g = r.open();
+        g.unstage(b"never-seen.txt")
+            .expect("no-op on nothing staged");
+        g.unstage(b"f.txt").expect("no-op on a clean tracked file");
+    }
+
+    #[test]
+    fn unstaging_works_on_an_unborn_branch() {
+        // Every fresh repository: HEAD names a branch with no commit under it,
+        // and the file just staged has to come back out anyway.
+        let r = Scratch::new("unstage-unborn");
+        r.write("first.txt", b"x\n");
+        let g = r.open();
+        match g.head().unwrap() {
+            HeadState::Branch { commit: None, .. } => {}
+            other => panic!("expected unborn, got {other:?}"),
+        }
+        g.stage(b"first.txt").unwrap();
+        g.unstage(b"first.txt").expect("unstages without a HEAD");
+        let s = g.status().unwrap();
+        assert!(s.staged.is_empty());
+        assert_eq!(
+            s.untracked
+                .iter()
+                .map(|e| e.path.to_string())
+                .collect::<Vec<_>>(),
+            vec!["first.txt"]
+        );
+    }
+
+    #[test]
+    fn the_first_commit_lands_on_an_unborn_branch_and_matches_git() {
+        let r = Scratch::new("commit-unborn");
+        r.write("f.txt", b"x\n");
+        let g = r.open();
+        g.stage(b"f.txt").expect("stages");
+        let sha = g.commit("first\n\nwith a body").expect("commits");
+
+        // The returned OID is git's own answer, not one we computed.
+        assert_eq!(sha, r.rev_parse("HEAD"));
+        match g.head().unwrap() {
+            HeadState::Branch { name, commit } => {
+                assert_eq!(name.as_bytes(), b"main", "the branch was born");
+                assert_eq!(commit.as_deref(), Some(sha.as_str()));
+            }
+            other => panic!("{other:?}"),
+        }
+        // And the subject is the message's first line, as log will show it.
+        assert_eq!(g.log(1).unwrap()[0].subject, "first");
+    }
+
+    #[test]
+    fn the_message_reaches_the_commit_whatever_it_holds() {
+        // Quotes, ampersands, newlines, non-ASCII, no trailing newline — every
+        // shape that breaks a message passed as an argv word.
+        let r = Scratch::new("commit-message");
+        r.write("f.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        r.write("f.txt", b"y\n");
+        r.git(&["add", "f.txt"]);
+
+        let message =
+            "he said \"stage it\" & left <>\n\nbody with é, 中文, 🎯\nand \"quotes\" again";
+        let sha = r.open().commit(message).expect("commits");
+        assert_eq!(sha, r.rev_parse("HEAD"));
+
+        // The stored bytes, read back through git itself. git appends the one
+        // final newline it promises every commit; everything else is verbatim.
+        let raw = String::from_utf8(r.git_os_out(&[
+            "show".into(),
+            "-s".into(),
+            "--format=%B".into(),
+            sha.into(),
+        ]))
+        .unwrap();
+        assert_eq!(raw.trim_end_matches('\n'), message);
+    }
+
+    #[test]
+    fn an_empty_message_is_refused_without_touching_history_or_index() {
+        let r = Scratch::new("commit-empty");
+        r.write("f.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        r.write("f.txt", b"y\n");
+
+        let g = r.open();
+        g.stage(b"f.txt").unwrap();
+        for empty in ["", "   ", "\n\t \n"] {
+            let e = g.commit(empty).unwrap_err();
+            assert!(e.contains("message"), "{empty:?}: {e}");
+        }
+        assert_eq!(g.log(5).unwrap().len(), 1, "nothing was committed");
+        assert_eq!(
+            g.status().unwrap().staged.len(),
+            1,
+            "the index kept its entry"
+        );
+    }
+
+    #[test]
+    fn a_failing_commit_reports_gits_own_words() {
+        // No user identity configured in this shell of a repository beyond the
+        // scratch defaults is NOT the failure here — instead, make git fail
+        // with nothing staged, where its own diagnosis is the useful answer.
+        let r = Scratch::new("commit-fails");
+        r.write("seed.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        let e = r.open().commit("nothing staged").unwrap_err();
+        assert!(e.starts_with("git commit:"), "{e}");
+        assert!(!e.trim().is_empty(), "git's stderr travelled");
     }
 }
