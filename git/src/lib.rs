@@ -779,7 +779,25 @@ impl Repo for Binary {
         // through [`join_raw`], or the read would stat a decoded near-miss
         // of somebody's real filename; the message decodes lossily because
         // it is human text and never aimed back at anything.
+        //
+        // The one verb that touches the filesystem directly is also the one
+        // that fences where it may touch it. `join` treats an absolute path
+        // as a replacement for the root, so the guard sits on the JOINED
+        // result — the thing about to be unlinked — and `..` is refused in
+        // the raw bytes, which a lexical prefix check cannot see through.
+        if path.starts_with(b"/") || path.split(|b| *b == b'/').any(|c| c == b"..") {
+            return Err(format!(
+                "not inside this repository: {}",
+                String::from_utf8_lossy(path)
+            ));
+        }
         let at = join_raw(&self.root, path);
+        if !at.starts_with(&self.root) {
+            return Err(format!(
+                "not inside this repository: {}",
+                String::from_utf8_lossy(path)
+            ));
+        }
         std::fs::remove_file(&at).map_err(|e| format!("could not delete {}: {e}", at.display()))
     }
 
@@ -3822,6 +3840,41 @@ mod tests {
         let s = g.status().unwrap();
         assert!(s.is_empty(), "{s:?}");
         assert!(!join_raw(&r.0, b"notes.md").exists());
+    }
+
+    #[test]
+    fn removing_an_untracked_path_may_not_leave_the_repository() {
+        // The fence around the only verb that unlinks directly: absolute
+        // names would have `join` replace the root outright, and `..` would
+        // walk out past a lexical prefix check. Both refuse in words, and
+        // what they name survives.
+        let r = Scratch::new("untracked-fence");
+        r.write("seed.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+
+        // A real file just outside the root, at exactly where `..` lands.
+        let outside = r.0.parent().unwrap().join("flee-escape-test.txt");
+        std::fs::write(&outside, b"still here\n").expect("a file beside the repo");
+        let outside_name = format!("../{}", outside.file_name().unwrap().to_string_lossy());
+
+        let g = r.open();
+        let absolute = g.remove_untracked(b"/etc/passwd").unwrap_err();
+        assert!(
+            absolute.contains("not inside this repository"),
+            "{absolute}"
+        );
+        let relative = g.remove_untracked(outside_name.as_bytes()).unwrap_err();
+        assert!(
+            relative.contains("not inside this repository"),
+            "{relative}"
+        );
+        assert!(outside.exists(), "the neighbour file was not touched");
+        let _ = std::fs::remove_file(&outside);
+
+        // And the fence is on the deletion only: git itself governs where a
+        // pathspec may point, so discard needs no second opinion.
+        g.discard(b"seed.txt").expect("inside the fence, as always");
     }
 
     #[test]
