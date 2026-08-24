@@ -108,8 +108,12 @@ jobs:
           sudo apt-get install -y \
             fontconfig libfontconfig1-dev \
             libxcb1-dev libxcb-util-dev \
-            libxkbcommon-dev libxkbcommon-x11-0 \
+            libxkbcommon-dev libxkbcommon-x11-0 libxkbcommon-x11-dev \
             libwayland-dev libudev-dev libvulkan-dev
+      # One package beyond lint's list, and only here: linking the test binary
+      # resolves `-lxkbcommon-x11`, which needs the unversioned .so symlink the
+      # -dev package carries — the -0 runtime library alone leaves rust-lld
+      # unable to find it.
       - run: cargo test -q --locked -p gitten-shell
 
   # RUSTSEC advisories against the locked tree. Advisory, not a gate: this repo
