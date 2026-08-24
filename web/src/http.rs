@@ -10,6 +10,24 @@
 //! What it is *not* is a server for the internet. It binds loopback, and the
 //! things it therefore does not do — TLS, auth, request limits beyond a header
 //! cap, any write method at all — are the reason that is not a knob.
+//!
+//! # Loopback is not the boundary it looks like
+//!
+//! Binding `127.0.0.1` keeps the *network* out. It does not keep a *browser*
+//! out, and a browser is the one client this has. Any page the person is
+//! visiting can point its own hostname at 127.0.0.1 and come back through the
+//! user's own browser, at which point the same-origin policy is on the
+//! attacker's side and every route here answers with the contents of a working
+//! tree. That is DNS rebinding, it needs no privileged position on the network,
+//! and the only thing that stops it is refusing a request whose `Host` is not
+//! one this server could legitimately have been reached by — see
+//! [`addressed_to_us`].
+//!
+//! Two headers do the rest, and they are on every response rather than on the
+//! HTML because the cost of forgetting one is the whole working tree:
+//! `Content-Security-Policy` keeps injected markup from reaching a third-party
+//! origin even if something downstream is escaped wrong, and `nosniff` stops a
+//! diff of an HTML file being re-interpreted as one.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -161,11 +179,64 @@ fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         431 => "Request Header Fields Too Large",
         _ => "Error",
     }
+}
+
+/// What the page is allowed to do, which is very little.
+///
+/// `default-src 'none'` and then back only what the document actually uses: its
+/// own script and stylesheet, `fetch` to its own origin, and inline `style=`
+/// attributes — which every row carries, because a token's colour is resolved
+/// per surface and arrives as data. No inline *script* is needed; the page has
+/// none.
+///
+/// `connect-src 'self'` is the one that matters most. Injected script that
+/// cannot reach another origin cannot post a working tree to it, so this is what
+/// keeps an escaping bug from being an exfiltration bug.
+const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
+                   connect-src 'self'; base-uri 'none'; form-action 'none'";
+
+/// Whether a request's `Host` is one this server could have been reached by.
+///
+/// The defence against DNS rebinding, and it is a whitelist rather than a
+/// blocklist because the attacker picks the name: `evil.example` resolving to
+/// 127.0.0.1 arrives here indistinguishable from a legitimate request in every
+/// respect *except* this header, which carries whatever the browser was asked
+/// for. So: the loopback literals and `localhost`, with our own port or no port
+/// at all, and nothing else.
+///
+/// A request with no `Host` at all is refused too. HTTP/1.1 requires one, every
+/// browser sends one, and something that does not is not the client this serves.
+fn addressed_to_us(head: &str, port: u16) -> bool {
+    let Some(host) = header(head, "host") else {
+        return false;
+    };
+    // An IPv6 literal is bracketed, so the last colon outside the brackets is
+    // the port separator — splitting on the first colon would cut `[::1]` up.
+    let (name, given) = match host.rfind(':') {
+        Some(i) if !host[i..].contains(']') => (&host[..i], Some(&host[i + 1..])),
+        _ => (host, None),
+    };
+    if let Some(given) = given {
+        if given.parse::<u16>() != Ok(port) {
+            return false;
+        }
+    }
+    matches!(name, "127.0.0.1" | "localhost" | "[::1]" | "::1")
+}
+
+/// One header's value, matched case-insensitively on the name because a header
+/// name is case-insensitive and a client may send `HOST:`.
+fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines().skip(1).find_map(|line| {
+        let (k, v) = line.split_once(':')?;
+        k.trim().eq_ignore_ascii_case(name).then(|| v.trim())
+    })
 }
 
 /// Binds and serves until the process ends.
@@ -205,7 +276,7 @@ where
             // problem: a malformed request should not take the server down
             // while someone is reading a diff in another tab.
             std::thread::spawn(move || {
-                let _ = connection(stream, &post);
+                let _ = connection(stream, &post, port);
             });
         }
     });
@@ -226,7 +297,7 @@ struct Job {
     reply: mpsc::Sender<Response>,
 }
 
-fn connection(stream: TcpStream, post: &mpsc::Sender<Job>) -> std::io::Result<()> {
+fn connection(stream: TcpStream, post: &mpsc::Sender<Job>, port: u16) -> std::io::Result<()> {
     stream.set_read_timeout(Some(IDLE))?;
     stream.set_nodelay(true)?;
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -234,8 +305,16 @@ fn connection(stream: TcpStream, post: &mpsc::Sender<Job>) -> std::io::Result<()
     let (reply, answers) = mpsc::channel::<Response>();
 
     loop {
-        let Some(head) = read_head(&mut reader)? else {
-            return Ok(());
+        let head = match read_head(&mut reader)? {
+            Head::Got(head) => head,
+            Head::Closed => return Ok(()),
+            // Answered and then *closed*: whatever else is in that oversized
+            // head is still in the pipe, and reading it as the next request
+            // would parse the tail of one message as the start of another.
+            Head::TooLarge => {
+                let _ = write(&mut out, &Response::status(431, "request head too large"));
+                return Ok(());
+            }
         };
         let mut lines = head.lines();
         let Some(start) = lines.next() else {
@@ -245,7 +324,11 @@ fn connection(stream: TcpStream, post: &mpsc::Sender<Job>) -> std::io::Result<()
         let method = parts.next().unwrap_or("");
         let target = parts.next().unwrap_or("/");
 
-        let response = if method != "GET" {
+        let response = if !addressed_to_us(&head, port) {
+            // Before the method check and before the route: a rebound request
+            // must not learn which routes exist either.
+            Response::status(403, "not addressed to this server")
+        } else if method != "GET" {
             Response::status(405, "GET only")
         } else {
             let (path, query) = target.split_once('?').unwrap_or((target, ""));
@@ -273,10 +356,25 @@ fn connection(stream: TcpStream, post: &mpsc::Sender<Job>) -> std::io::Result<()
     }
 }
 
-/// Reads up to the blank line that ends the request head. `None` on a clean
-/// close, which is what a browser does to an idle keep-alive connection and is
-/// not an error.
-fn read_head(reader: &mut BufReader<TcpStream>) -> std::io::Result<Option<String>> {
+/// How a read of a request head ended.
+///
+/// Three outcomes and not an `Option`, because the oversized one is neither a
+/// head nor a close: it used to be reported as a synthetic `GET /-too-large`,
+/// which got a 404 while the rest of the oversized head stayed in the pipe to be
+/// read as the *next* request. The cap has to end the connection, not the
+/// message.
+enum Head {
+    /// A complete request head, up to and including the blank line.
+    Got(String),
+    /// A clean close, which is what a browser does to an idle keep-alive
+    /// connection and is not an error.
+    Closed,
+    /// Past [`MAX_HEAD`]. Not a browser.
+    TooLarge,
+}
+
+/// Reads up to the blank line that ends the request head.
+fn read_head(reader: &mut BufReader<TcpStream>) -> std::io::Result<Head> {
     let mut head = String::new();
     loop {
         let mut line = String::new();
@@ -284,36 +382,45 @@ fn read_head(reader: &mut BufReader<TcpStream>) -> std::io::Result<Option<String
         // UTF-8 is not one we serve.
         let n = match reader.read_line(&mut line) {
             Ok(n) => n,
-            Err(_) => return Ok(None),
+            Err(_) => return Ok(Head::Closed),
         };
         if n == 0 {
-            return Ok(if head.is_empty() { None } else { Some(head) });
+            return Ok(match head.is_empty() {
+                true => Head::Closed,
+                false => Head::Got(head),
+            });
         }
         if head.len() + n > MAX_HEAD {
-            return Ok(Some("GET /-too-large HTTP/1.1".into()));
+            return Ok(Head::TooLarge);
         }
         let blank = line.trim_end_matches(['\r', '\n']).is_empty();
         head.push_str(&line);
         if blank {
-            return Ok(Some(head));
+            return Ok(Head::Got(head));
         }
     }
 }
 
-fn write(out: &mut TcpStream, r: &Response) -> std::io::Result<()> {
+/// The response head, as its own function so a test asserts on the bytes that
+/// actually go out rather than on a second copy of this format string.
+fn head_of(r: &Response) -> String {
     let cache = if r.cache {
         "Cache-Control: max-age=3600\r\n"
     } else {
         "Cache-Control: no-store\r\n"
     };
-    let head = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{cache}\r\n",
+    format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n\
+         Content-Security-Policy: {CSP}\r\nX-Content-Type-Options: nosniff\r\n{cache}\r\n",
         r.status,
         reason(r.status),
         r.content_type,
         r.body.len(),
-    );
-    out.write_all(head.as_bytes())?;
+    )
+}
+
+fn write(out: &mut TcpStream, r: &Response) -> std::io::Result<()> {
+    out.write_all(head_of(r).as_bytes())?;
     out.write_all(&r.body)?;
     out.flush()
 }
@@ -358,5 +465,77 @@ mod tests {
     fn a_parameter_is_matched_whole_and_not_by_prefix() {
         assert_eq!(req("count=40").param("cou"), None);
         assert_eq!(req("recount=1&count=40").param("count"), Some("40".into()));
+    }
+
+    fn head(host: &str) -> String {
+        format!("GET / HTTP/1.1\r\nHost: {host}\r\nAccept: */*\r\n\r\n")
+    }
+
+    #[test]
+    fn only_a_host_we_could_have_been_reached_by_is_served() {
+        for host in [
+            "127.0.0.1:7423",
+            "localhost:7423",
+            "[::1]:7423",
+            "127.0.0.1",
+        ] {
+            assert!(addressed_to_us(&head(host), 7423), "{host} was refused");
+        }
+        // The rebinding case: the attacker's own name, resolved to loopback. The
+        // request is identical to a real one in every way but this.
+        for host in [
+            "evil.example:7423",
+            "evil.example",
+            "gitten.attacker.test:7423",
+        ] {
+            assert!(!addressed_to_us(&head(host), 7423), "{host} was served");
+        }
+        // A port that is not ours is somebody else's server being proxied at us.
+        assert!(!addressed_to_us(&head("127.0.0.1:9999"), 7423));
+        // HTTP/1.1 requires a Host; something without one is not a browser.
+        assert!(!addressed_to_us("GET / HTTP/1.0\r\n\r\n", 7423));
+    }
+
+    #[test]
+    fn a_host_header_is_matched_case_insensitively() {
+        let raw = "GET / HTTP/1.1\r\nHOST: LocalHost:7423\r\n\r\n";
+        // The name is case-insensitive; the value's host part is too, per URL
+        // rules, but we only ever produce the lowercase form ourselves.
+        assert_eq!(header(raw, "host"), Some("LocalHost:7423"));
+    }
+
+    #[test]
+    fn the_request_line_is_not_mistaken_for_a_header() {
+        // `header` skips line one, or a target containing a colon would read as
+        // one — `GET /a:b HTTP/1.1` has a perfectly good `:` in it.
+        assert_eq!(header("GET /a:b HTTP/1.1\r\nHost: x\r\n\r\n", "a"), None);
+    }
+
+    #[test]
+    fn every_response_carries_the_policy_and_nosniff() {
+        // On all of them, not just the HTML: a JSON route that forgets is the
+        // one an injected script would use.
+        for r in [
+            Response::json("{}".into()),
+            Response::html("<p>"),
+            Response::css("a{}"),
+            Response::js("0"),
+            Response::status(404, "no"),
+        ] {
+            let head = head_of(&r);
+            assert!(
+                head.contains("X-Content-Type-Options: nosniff"),
+                "{}: no nosniff",
+                r.content_type
+            );
+            assert!(
+                head.contains("connect-src 'self'"),
+                "{}: exfiltration is not fenced",
+                r.content_type
+            );
+            assert!(head.contains("default-src 'none'"), "{}", r.content_type);
+        }
+        // No inline script anywhere in the page, so none is allowed.
+        assert!(!CSP.contains("script-src 'self' 'unsafe-inline'"));
     }
 }
