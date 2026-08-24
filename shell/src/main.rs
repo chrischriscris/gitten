@@ -164,18 +164,25 @@ enum Prompt {
 /// The write rails, handed to every pane command: the repository this window
 /// opened on, and the one queue every job rides.
 ///
-/// Passed by ref so a command can aim a write without owning either half —
-/// which is what makes rule 1 true for verbs rather than merely said: a
-/// compiled-in extension pane stages through exactly these two things that
+/// Owned clones rather than borrows — a refcount and a channel sender each —
+/// because a command speaks *between* acquiring the rails and aiming the
+/// write (the discard that clears its own question from the band), and an
+/// extension may want to keep a half past the call. Both copies are cheap by
+/// design; nothing here was meant to be held.
+///
+/// Passed by reference so a command can aim a write without owning either
+/// half — which is what makes rule 1 true for verbs rather than merely said:
+/// a compiled-in extension pane stages through exactly these two things that
 /// `files.stage` does, and a fixture window hands `None`, whose honest answer
 /// is the notice a built-in gives. `None` is also all a drawing-only command
 /// ever sees of them.
-struct Writes<'a> {
-    repo: &'a gitten_git::Handle,
-    submit: &'a Submitter,
+#[derive(Clone)]
+struct Writes {
+    repo: gitten_git::Handle,
+    submit: Submitter,
 }
 
-impl Writes<'_> {
+impl Writes {
     /// Queues one job. False is the queue rejecting work — the window is
     /// going away — and saying so is the caller's, who knows what was tried.
     fn send(&self, job: Box<dyn Job>) -> bool {
@@ -797,11 +804,11 @@ impl DevShell {
     /// repository and its queue, or `None` over a fixture. The shell's own
     /// verbs go through the same value — there is no second path for a
     /// built-in.
-    fn writes(&self) -> Option<Writes<'_>> {
+    fn writes(&self) -> Option<Writes> {
         let (_, repo) = self.repo.as_ref()?;
         Some(Writes {
-            repo,
-            submit: &self.submitter,
+            repo: gitten_git::Handle::clone(repo),
+            submit: self.submitter.clone(),
         })
     }
 
@@ -836,8 +843,8 @@ impl DevShell {
         };
         let bytes = path.as_bytes().to_vec();
         let job = match section {
-            views::files::Section::Staged => gitten_app::verbs::Write::unstage(writes.repo, bytes),
-            _ => gitten_app::verbs::Write::stage(writes.repo, bytes),
+            views::files::Section::Staged => gitten_app::verbs::Write::unstage(&writes.repo, bytes),
+            _ => gitten_app::verbs::Write::stage(&writes.repo, bytes),
         };
         if !writes.send(Box::new(job)) {
             self.set_notice("the job queue is shutting down");
@@ -877,7 +884,7 @@ impl DevShell {
             return;
         };
         if !writes.send(Box::new(gitten_app::verbs::Write::commit(
-            writes.repo,
+            &writes.repo,
             message,
         ))) {
             self.set_notice("the job queue is shutting down");
@@ -918,9 +925,9 @@ impl DevShell {
             }
             views::files::Section::Untracked | views::files::Section::Unstaged => {}
         }
-        // The repository, held rather than borrowed — the arm question below
-        // has to be able to speak through the band either way.
-        let Some((_, repo)) = self.repo.as_ref().cloned() else {
+        // The rails, taken once like every sibling takes them: a fixture has
+        // no working tree to discard from, and saying so outranks arming one.
+        let Some(writes) = self.writes() else {
             self.set_notice("a fixture has no working tree to discard from");
             return;
         };
@@ -933,11 +940,11 @@ impl DevShell {
         let bytes = path.as_bytes().to_vec();
         let job = match section {
             views::files::Section::Untracked => {
-                gitten_app::verbs::Write::remove_untracked(&repo, bytes)
+                gitten_app::verbs::Write::remove_untracked(&writes.repo, bytes)
             }
-            _ => gitten_app::verbs::Write::discard(&repo, bytes),
+            _ => gitten_app::verbs::Write::discard(&writes.repo, bytes),
         };
-        if self.submitter.submit(Box::new(job)).is_err() {
+        if !writes.send(Box::new(job)) {
             self.set_notice("the job queue is shutting down");
         }
     }
@@ -983,8 +990,8 @@ impl DevShell {
         };
         let bytes = targets.iter().map(|p| p.as_bytes().to_vec()).collect();
         let job = match staging {
-            true => gitten_app::verbs::Write::stage_many(writes.repo, bytes),
-            false => gitten_app::verbs::Write::unstage_many(writes.repo, bytes),
+            true => gitten_app::verbs::Write::stage_many(&writes.repo, bytes),
+            false => gitten_app::verbs::Write::unstage_many(&writes.repo, bytes),
         };
         if !writes.send(Box::new(job)) {
             self.set_notice("the job queue is shutting down");
@@ -1016,7 +1023,7 @@ impl DevShell {
             self.set_notice("a fixture has no repository to ignore in");
             return;
         };
-        let job = gitten_app::verbs::Write::ignore(writes.repo, path.as_bytes().to_vec());
+        let job = gitten_app::verbs::Write::ignore(&writes.repo, path.as_bytes().to_vec());
         if !writes.send(Box::new(job)) {
             self.set_notice("the job queue is shutting down");
         }
@@ -2576,7 +2583,7 @@ mod tests {
         /// built-in is special-cased — these are the same two rails
         /// `files.stage` rides.
         fn stage_like_a_builtin(&self, writes: &Writes) -> bool {
-            let job = gitten_app::verbs::Write::stage(writes.repo, b"notes.md".to_vec());
+            let job = gitten_app::verbs::Write::stage(&writes.repo, b"notes.md".to_vec());
             let queued = writes.send(Box::new(job));
             self.ran.set(queued);
             queued

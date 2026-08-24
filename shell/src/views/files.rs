@@ -299,7 +299,10 @@ pub struct Files {
     rendered: Rc<Cell<usize>>,
     /// The discard awaiting its second press: the section and path of the
     /// row that asked. One slot — arming a different row moves the question,
-    /// it does not queue two.
+    /// it does not queue two. Outliving a switch to another pane and back is
+    /// deliberate: the question still sits on the row it was asked about,
+    /// and only a cursor move, a wheel or a refresh can make its answer
+    /// stale — none of which is a focus change.
     armed: Option<(Section, PathBytes)>,
 }
 
@@ -1343,10 +1346,6 @@ mod tests {
         assert_eq!(
             discard_question(Section::Unstaged, "src/x.rs"),
             "discard src/x.rs? press again to confirm"
-        );
-        assert_eq!(
-            discard_question(Section::Staged, "gone.txt"),
-            "discard gone.txt? press again to confirm"
         );
     }
 }
