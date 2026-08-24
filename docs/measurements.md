@@ -363,9 +363,9 @@ Two commits, reviewed together because they share a measurement session:
 borrowed graph lane IDs, a flattened LCS table and token buffer,
 allocation-free syntax routing behind lexer category gates, and a byte-length
 fast path in `clip` (`core`); labels, untracked status and the tui's watcher run
-beside acquisition instead of behind it, the desktop window opens before
-acquisition finishes, and `GITTEN_START_LOG=1` prints per-stage startup timings
-(`app`, `git`, `shell`, `tui`). Outputs are byte-identical either side: 1,000,000
+beside acquisition instead of behind it, and `GITTEN_START_LOG=1` prints per-stage
+startup timings (`app`, `git`, `shell`, `tui`). Outputs are byte-identical either
+side: 1,000,000
 commits / widest 21 lanes; 928,577 lines / 5,953 files / 142,858 replace-pairs /
 2,071,441 tokens / 0 wrap rejections.
 
