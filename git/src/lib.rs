@@ -340,9 +340,14 @@ pub trait Repo: Send + Sync {
     /// Deliberately **not** spelled behind `--`. Everything after that
     /// separator is a *pathspec*, and `git checkout -q -- main` would quietly
     /// restore paths matching `main` instead of moving HEAD — the one way
-    /// this verb could run while doing nothing it said. A refname cannot begin
-    /// with `-` (git refuses such a name outright), so the bare form needs no
-    /// separator to be injection-safe.
+    /// this verb could run while doing nothing it said. What makes the bare
+    /// form safe instead is a check here, not a property of refnames: git's
+    /// *porcelain* refuses to create refs beginning with `-`, but its
+    /// plumbing does not (`git update-ref refs/heads/--detach HEAD`
+    /// succeeds on any repository), and a name like that handed to argv
+    /// arrives as a **flag** — `git checkout -q --detach` detaches HEAD
+    /// rather than checking out a branch somebody spelled. Names beginning
+    /// with `-` are refused before the process runs; see [`refuse_dashes`].
     fn checkout(&self, _name: &[u8]) -> Result<()> {
         Err(unserved("checkout"))
     }
@@ -901,13 +906,20 @@ impl Repo for Binary {
     fn checkout(&self, name: &[u8]) -> Result<()> {
         // `-q` keeps git's "Switched to branch" off our error band's road;
         // the name rides bare — see the trait method for why no `--` sits in
-        // front of it.
+        // front of it, and [`refuse_dashes`] for what does stand guard.
+        refuse_dashes(name)?;
         run_bytes(&self.root, &[b"checkout", b"-q", name]).map(|_| ())
     }
 
     fn create_branch(&self, name: &[u8], start: Option<&[u8]>) -> Result<()> {
         if !nameable(name) {
             return Err("a branch needs a name".into());
+        }
+        refuse_dashes(name)?;
+        // The start point is a revspec and rides argv too; a rev never
+        // begins with `-` any more than a refname does.
+        if let Some(start) = start {
+            refuse_dashes(start)?;
         }
         match start {
             Some(start) => run_bytes(&self.root, &[b"branch", name, start]),
@@ -921,6 +933,7 @@ impl Repo for Binary {
             true => b"-D",
             false => b"-d",
         };
+        refuse_dashes(name)?;
         run_bytes(&self.root, &[b"branch", flag, name]).map(|_| ())
     }
 
@@ -928,6 +941,8 @@ impl Repo for Binary {
         if !nameable(to) {
             return Err("a branch needs a name".into());
         }
+        refuse_dashes(from)?;
+        refuse_dashes(to)?;
         run_bytes(&self.root, &[b"branch", b"-m", from, to]).map(|_| ())
     }
 
@@ -1078,10 +1093,32 @@ fn ignore_line(path: &[u8]) -> Option<Vec<u8>> {
 /// not there at all. Git's own answer to `git branch ""` is "not a valid
 /// branch name" — true, and useless beside a field that just closed — so
 /// the refusal here says what the reader can act on instead. Every other
-/// rule of ref spelling (`..`, leading `-`, trailing `.lock`) stays git's,
-/// because its error quotes the offending name back.
+/// rule of ref spelling (`..`, trailing `.lock`) stays git's, because its
+/// error quotes the offending name back.
 fn nameable(name: &[u8]) -> bool {
     !name.is_empty() && name.iter().any(|b| !b.is_ascii_whitespace())
+}
+
+/// Refuses any name-shaped argument whose first byte is `-`.
+///
+/// Not paranoia about names git would never hold: plumbing holds them.
+/// `git update-ref refs/heads/--detach HEAD` succeeds where
+/// `git branch --detach` refuses, and the ref then sits in
+/// [`branches`](Repo::branches) spelled exactly like an option. Handed back
+/// through argv bare — which is how every verb here addresses a name — it
+/// *is* an option: `git checkout -q --detach` detaches HEAD instead of
+/// erroring, and worse spellings are one release of git away from meaning
+/// something else. So the refusal is ours and it is up front, in words
+/// that name the rule rather than git's usage dump; the panel still shows
+/// the branch, because showing is not aiming.
+fn refuse_dashes(name: &[u8]) -> Result<()> {
+    if name.first() == Some(&b'-') {
+        return Err(format!(
+            "names beginning with '-' are refused ({})",
+            String::from_utf8_lossy(name)
+        ));
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------------- the pair
@@ -4570,6 +4607,54 @@ mod tests {
             .collect();
         assert!(!names.contains(&b"f\xe9ature".to_vec()));
         assert!(names.contains(&b"ok".to_vec()), "{names:?}");
+    }
+
+    #[test]
+    fn a_plumbing_created_dash_ref_is_refused_instead_of_read_as_a_flag() {
+        // Porcelain refuses to create this name; plumbing does not. Once it
+        // exists, the bare-argv form of every verb would read it as an
+        // *option* — `git checkout -q --detach` detaches HEAD, verified — so
+        // the refusal has to be ours, before any process runs.
+        let r = two_branches("branch-dash");
+        r.git_os(&[
+            "update-ref".into(),
+            std::ffi::OsString::from("refs/heads/--weird"),
+            std::ffi::OsString::from(r.rev_parse("HEAD")),
+        ]);
+        let g = r.open();
+        let before = g.head().unwrap();
+
+        // The verb that would have detached: refused in words that name
+        // the rule, and HEAD exactly where it was.
+        let e = g.checkout(b"--detach").unwrap_err();
+        assert!(e.contains("'-'"), "{e}");
+        assert_eq!(
+            g.head().unwrap(),
+            before,
+            "a refused checkout moved nothing"
+        );
+
+        // Every verb that aims a name refuses the same way — including the
+        // from side of a rename, which rides argv just as bare.
+        for attempted in [
+            g.create_branch(b"--x", None).err().unwrap(),
+            g.delete_branch(b"--weird", false).err().unwrap(),
+            g.rename_branch(b"--weird", b"ok").err().unwrap(),
+            g.rename_branch(b"main", b"--x").err().unwrap(),
+            g.create_branch(b"x", Some(b"--detach")).err().unwrap(),
+        ] {
+            assert!(attempted.contains("'-'"), "{attempted}");
+        }
+
+        // And showing is not aiming: the ref still lists, spelled as git
+        // holds it, for the panel to render honestly.
+        let names: Vec<Vec<u8>> = g
+            .branches()
+            .unwrap()
+            .iter()
+            .map(|b| b.name.as_bytes().to_vec())
+            .collect();
+        assert!(names.contains(&b"--weird".to_vec()), "{names:?}");
     }
 
     #[test]
