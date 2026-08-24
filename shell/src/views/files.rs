@@ -810,6 +810,32 @@ mod tests {
     }
 
     #[test]
+    fn a_non_utf8_path_keeps_its_bytes_and_displays_lossily() {
+        // `café.txt` in Latin-1: git emits bytes no encoding claims, and the
+        // model keeps them raw while the display string takes U+FFFD for the
+        // one it cannot show.
+        let s = Status {
+            untracked: vec![UntrackedEntry {
+                path: PathBytes::from_bytes(b"caf\xe9.txt"),
+            }],
+            ..Default::default()
+        };
+        let rows = flatten(&s);
+        let Entry::File(f) = &rows[1] else {
+            panic!("row 1 is the file under the heading");
+        };
+        assert_eq!(
+            f.path.as_bytes(),
+            b"caf\xe9.txt",
+            "addressing keeps the bytes"
+        );
+        assert!(
+            f.path_text.contains('\u{FFFD}'),
+            "display decodes lossily instead of failing"
+        );
+    }
+
+    #[test]
     fn navigation_moves_across_sections_and_clamps_at_both_ends() {
         let host = Host::new();
         let mut f = files(sample_status());
