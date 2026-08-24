@@ -152,13 +152,19 @@ enum Open {
 type RefreshValue = Box<dyn std::any::Any + Send>;
 type ApplyRefresh = dyn FnOnce(RefreshValue, &Host, &mut App) -> Result<(), String>;
 
-/// What the open input's accept means, and the only thing the shell's prompt
-/// slot can hold tonight. A second consumer — `/` search is planned — becomes
-/// a second variant and nothing else changes: the field routes by what it was
-/// opened *for*, never by who is listening.
+/// What the open input's accept means, and the only things the shell's prompt
+/// slot can hold tonight. A third consumer becomes a third variant and nothing
+/// else changes: the field routes by what it was opened *for*, never by who is
+/// listening.
 enum Prompt {
     /// The message a `files.commit` accept turns into a commit job.
     CommitMessage,
+    /// A `/` query over one pane, named by its registration name — a name and
+    /// not a type, so the slot stays open to whatever pane learns to answer a
+    /// search next. Every edit filters that pane live (see
+    /// [`DevShell::search_edited`]); accepting keeps the last edit standing,
+    /// cancelling clears it.
+    Search { target: String },
 }
 
 /// The write rails, handed to every pane command: the repository this window
@@ -220,7 +226,11 @@ impl Refresh {
 trait Pane {
     fn any(&self) -> AnyView;
     fn mode(&self) -> &'static str;
-    fn label(&self) -> String;
+
+    /// What this pane says in the title strip. Takes the app so a pane whose
+    /// label depends on live view state — a filtered commit list counts its
+    /// rows — can read itself before answering.
+    fn label(&self, cx: &App) -> String;
 
     /// A tenant-owned repository refresh. The load half must contain every
     /// blocking operation; the apply half is the only half allowed to touch a
@@ -362,12 +372,21 @@ impl Screen {
         }
     }
 
-    fn label(&self) -> String {
+    fn label(&self, cx: &App) -> String {
         match self {
-            Screen::Commits { label, .. }
-            | Screen::Diff { label, .. }
-            | Screen::Files { label, .. } => label.borrow().clone(),
-            Screen::Custom(pane) => pane.label(),
+            Screen::Commits { view, label, .. } => {
+                let base = label.borrow().clone();
+                // The filter's count rides on the acquisition label rather
+                // than replacing it — the same shape the working tree uses for
+                // "0 changed" — and the pane cell keeps holding only what the
+                // repository named, so a refresh has nothing to recompose.
+                match view.read(cx).filter_note() {
+                    Some(note) => format!("{base} · {note}"),
+                    None => base,
+                }
+            }
+            Screen::Diff { label, .. } | Screen::Files { label, .. } => label.borrow().clone(),
+            Screen::Custom(pane) => pane.label(cx),
         }
     }
 
@@ -656,6 +675,10 @@ struct DevShell {
     /// by [`DevShell::close_input`]. One at a time, because there is one
     /// field; a second prompt replaces the first and says what it means.
     prompt: Option<Prompt>,
+    /// The live half of a [`Prompt::Search`]: the subscription that carries
+    /// each edit to the pane being filtered. Held so it dies with the prompt —
+    /// replaced when another opens, dropped the moment one closes.
+    search_live: Option<Subscription>,
     /// The live picks. Every field `None` means "whatever the config selected",
     /// which is what the controls show until somebody changes one — so the strip
     /// agrees with `gitten.toml` rather than with a copy of it taken at startup.
@@ -764,6 +787,9 @@ impl DevShell {
     }
 
     fn open_input(&mut self, input: Entity<input::Input>, cx: &mut Context<Self>) {
+        // Whatever the previous prompt was filtering live stops now; what its
+        // last edit did to its pane is that prompt's close to decide.
+        self.search_live = None;
         if let Some(previous) = self.input.replace(input) {
             previous.update(cx, |input, cx| input.cancel(cx));
         }
@@ -779,6 +805,9 @@ impl DevShell {
         let Some(input) = self.input.take() else {
             return;
         };
+        // The live feed dies with the prompt; the routing below settles what
+        // the last edit left on the pane.
+        self.search_live = None;
         // Read before the entity confirms its own event: the value is what the
         // consumer asked for; accept only closes.
         let text = input.read(cx).value().to_string();
@@ -787,8 +816,14 @@ impl DevShell {
             false => input.cancel(cx),
         });
         self.sync_modes();
-        if let (true, Some(Prompt::CommitMessage)) = (accept, self.prompt.take()) {
-            self.commit_message(text);
+        match (accept, self.prompt.take()) {
+            (true, Some(Prompt::CommitMessage)) => self.commit_message(text),
+            // A search keeps what was typed on accept and clears on cancel —
+            // `esc` means "forget it", not "keep half of it".
+            (_, Some(Prompt::Search { target })) => {
+                self.finish_search(&target, accept.then_some(text), cx)
+            }
+            _ => {}
         }
         cx.notify();
     }
@@ -881,6 +916,75 @@ impl DevShell {
             message,
         ))) {
             self.set_notice("the job queue is shutting down");
+        }
+    }
+
+    /// `commits.search`: gather a query over the focused commits pane.
+    ///
+    /// While the field is open every edit filters that pane's list live — the
+    /// subscription installed here forwards each [`input::Event::Edited`] to
+    /// [`DevShell::search_edited`] — so accept and cancel differ only in
+    /// whether the last edit stands. A second `/` finds the current query
+    /// already in the field, because the pane still holds it; an empty accept
+    /// is how a filter comes off.
+    ///
+    /// The target is the pane's registration name taken at open, not "the
+    /// focused screen" read again at close: a click can move focus while the
+    /// field holds the keyboard's *mode*, and the query belongs to the pane it
+    /// was typed over.
+    fn begin_search(&mut self, cx: &mut Context<Self>) {
+        let Some(Screen::Commits { view, .. }) = self.active() else {
+            self.set_notice("commits.search is not supported here");
+            return;
+        };
+        let target = self.panes.focused_name().to_string();
+        let initial = view.read(cx).query().unwrap_or_default().to_string();
+        let input = cx.new(|cx| input::Input::new("search", "search", initial, cx));
+        self.open_input(input.clone(), cx);
+        // After `open_input`, which may have cancelled a previous prompt.
+        self.prompt = Some(Prompt::Search { target });
+        self.search_live = Some(cx.subscribe(&input, Self::search_edited));
+    }
+
+    /// One edit in an open search: into the pane, before the next frame. Runs
+    /// per keystroke and only while a search prompt lives — never per render.
+    fn search_edited(
+        &mut self,
+        _: Entity<input::Input>,
+        event: &input::Event,
+        cx: &mut Context<Self>,
+    ) {
+        let input::Event::Edited(text) = event else {
+            return;
+        };
+        let Some(Prompt::Search { target }) = &self.prompt else {
+            return;
+        };
+        if let Some(view) = self.commits_pane(target).map(|(_, view)| view.clone()) {
+            view.update(cx, |v, _| v.apply_query(text));
+            cx.notify();
+        }
+    }
+
+    /// Accept or cancel of a search prompt: what the last edit left standing,
+    /// or its absence. Same routing as the live half, one last time.
+    fn finish_search(&mut self, target: &str, query: Option<String>, cx: &mut Context<Self>) {
+        let Some((_, view)) = self.commits_pane(target) else {
+            return;
+        };
+        let query = query.unwrap_or_default();
+        view.update(cx, |v, _| v.apply_query(&query));
+    }
+
+    /// The named pane's commits screen, when that is what the name registers:
+    /// the one place search routing learns which screens answer. A closed pane
+    /// or a kind with no search answers nothing, quietly — the prompt is
+    /// closing anyway.
+    fn commits_pane(&self, target: &str) -> Option<(usize, &Entity<views::commits::Commits>)> {
+        let at = self.panes.position(target)?;
+        match self.panes.iter().nth(at)? {
+            Screen::Commits { view, .. } => Some((at, view)),
+            _ => None,
         }
     }
 
@@ -1137,6 +1241,7 @@ impl DevShell {
             "pane.prev" => self.cycle_pane(-1, cx),
             "files.focus" => self.focus_named("files", cx),
             "commits.open-diff" => self.open_diff(cx),
+            "commits.search" => self.begin_search(cx),
             // The working tree's verbs. Context comes from the focused pane,
             // the write from the job queue — and where either is missing, the
             // same honest sentence an unknown command gets.
@@ -1877,7 +1982,7 @@ impl Render for DevShell {
                             // revspec, and `…/git HEAD~2..HEAD` is the half worth
                             // keeping.
                             .text_ellipsis_start()
-                            .child(self.active_label()),
+                            .child(self.active_label(cx)),
                     )
                     .children(cfg!(debug_assertions).then(|| {
                         // One word and not the sentence this used to be — "DEBUG
@@ -2265,6 +2370,7 @@ fn main() {
                     running: None,
                     input: None,
                     prompt: None,
+                    search_live: None,
                     over: Overrides::default(),
                     open: None,
                     error: None,
@@ -2351,10 +2457,10 @@ fn main() {
 impl DevShell {
     /// What the title's dimmest third says: the repository and revision, or the
     /// commit whose diff is on top.
-    fn active_label(&self) -> SharedString {
+    fn active_label(&self, cx: &App) -> SharedString {
         SharedString::from(
             self.active()
-                .map(Screen::label)
+                .map(|screen| screen.label(cx))
                 .unwrap_or_else(|| self.which.to_string()),
         )
     }
@@ -2451,7 +2557,7 @@ mod tests {
             "extension"
         }
 
-        fn label(&self) -> String {
+        fn label(&self, _: &gpui::App) -> String {
             "extension pane".into()
         }
 
@@ -2582,6 +2688,7 @@ mod tests {
                 running: None,
                 input: None,
                 prompt: None,
+                search_live: None,
                 over: Default::default(),
                 open: which,
                 error: None,
@@ -2657,14 +2764,14 @@ mod tests {
             );
             shell.sync_modes();
         });
-        shell.read_with(cx, |shell, _| {
-            assert_eq!(shell.active_label().as_ref(), "second");
+        shell.read_with(cx, |shell, app| {
+            assert_eq!(shell.active_label(app).as_ref(), "second");
             assert_eq!(shell.modes.top(), "commits");
         });
 
         shell.update(cx, |shell, cx| shell.run_command("pane.prev", cx));
-        shell.read_with(cx, |shell, _| {
-            assert_eq!(shell.active_label().as_ref(), "repo");
+        shell.read_with(cx, |shell, app| {
+            assert_eq!(shell.active_label(app).as_ref(), "repo");
             assert_eq!(shell.modes.as_slice(), &["global", panes::MODE, "commits"]);
             let mut keys = Keymap::builtin();
             keys.bind("commits", "ctrl-j", "view.down").unwrap();
@@ -2679,8 +2786,8 @@ mod tests {
         });
 
         shell.update(cx, |shell, cx| shell.run_command("pane.next", cx));
-        shell.read_with(cx, |shell, _| {
-            assert_eq!(shell.active_label().as_ref(), "second");
+        shell.read_with(cx, |shell, app| {
+            assert_eq!(shell.active_label(app).as_ref(), "second");
             assert_eq!(shell.panes.focused_index(), 1);
         });
     }
@@ -2714,8 +2821,8 @@ mod tests {
             shell.refresh_stale(cx);
         });
         cx.run_until_parked();
-        shell.read_with(cx, |shell, _| {
-            assert_eq!(shell.active_label().as_ref(), "extension pane");
+        shell.read_with(cx, |shell, app| {
+            assert_eq!(shell.active_label(app).as_ref(), "extension pane");
             assert_eq!(shell.active_view_name(), "extension");
             assert_eq!(shell.panes.len(), 2);
         });
@@ -2880,10 +2987,13 @@ mod tests {
 
         // Named dispatch — the same path the `2` key resolves through.
         shell.update(cx, |shell, cx| shell.run_command("files.focus", cx));
-        shell.read_with(cx, |shell, _| {
+        shell.read_with(cx, |shell, app| {
             assert_eq!(shell.panes.focused_index(), 1);
             assert_eq!(shell.modes.top(), "files");
-            assert_eq!(shell.active_label().as_ref(), "gitten (main) · 0 changed");
+            assert_eq!(
+                shell.active_label(app).as_ref(),
+                "gitten (main) · 0 changed"
+            );
         });
 
         // And with the pane gone again, the key is answered with a sentence,
