@@ -16,6 +16,7 @@ pub mod graph;
 pub mod host;
 pub mod markdown;
 pub mod prepared;
+pub mod refs;
 pub mod rows;
 pub mod runs;
 pub mod select;
