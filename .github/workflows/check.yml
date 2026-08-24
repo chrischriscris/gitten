@@ -86,15 +86,13 @@ jobs:
   # one the plain `test` job leaves out because it is the only crate that needs
   # the GPUI Linux headers. Clippy already proves these compile on ubuntu (see
   # `lint`); this runs them. Almost all are ordinary `#[test]` functions with no
-  # window; the two `#[gpui::test]` cases are the reason for the caution below.
-  #
-  # continue-on-error until observed green: a headless GPUI test run on ubuntu is
-  # unproven, and a first-time flake should not turn main red before the signal
-  # is established. Remove this line once a run is seen passing — same promotion
-  # path as the audit job below.
+  # window; the two `#[gpui::test]` cases are why the job opened under
+  # continue-on-error — a headless GPUI run on ubuntu was unproven, and a
+  # first-time flake should not have turned main red before the signal was
+  # established. Observed green on its second run (the first died linking for
+  # want of libxkbcommon-x11-dev), so it gates like the rest.
   test-shell:
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v5
         with:
