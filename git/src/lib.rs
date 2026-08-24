@@ -328,6 +328,58 @@ pub trait Repo: Send + Sync {
         Err(unserved("committing"))
     }
 
+    /// Moves HEAD onto the named local branch: `git checkout -q`.
+    ///
+    /// The name travels as bytes and lands in argv as bytes — the same
+    /// discipline as every verb above, so the branch checked out is the one
+    /// [`branches`](Self::branches) named. A working tree whose changes would
+    /// be lost is git's refusal, not ours: its own sentence comes back
+    /// verbatim, because "commit your changes or stash them" is advice only
+    /// the person reading it can act on.
+    ///
+    /// Deliberately **not** spelled behind `--`. Everything after that
+    /// separator is a *pathspec*, and `git checkout -q -- main` would quietly
+    /// restore paths matching `main` instead of moving HEAD — the one way
+    /// this verb could run while doing nothing it said. A refname cannot begin
+    /// with `-` (git refuses such a name outright), so the bare form needs no
+    /// separator to be injection-safe.
+    fn checkout(&self, _name: &[u8]) -> Result<()> {
+        Err(unserved("checkout"))
+    }
+
+    /// Creates a local branch at `start`, or at HEAD when `start` is `None`.
+    ///
+    /// Creating never checks anything out — HEAD stays where it was, which is
+    /// what makes this safe to offer beside [`checkout`](Self::checkout)
+    /// without a confirmation dance between them. Only emptiness is refused
+    /// here (`git branch ""` answers "not a valid branch name", which is
+    /// true but says nothing a panel can repeat); every other rule of
+    /// ref spelling is git's, and its error comes back quoted.
+    fn create_branch(&self, _name: &[u8], _start: Option<&[u8]>) -> Result<()> {
+        Err(unserved("branch creation"))
+    }
+
+    /// Deletes a local branch — merged work only, unless `force`.
+    ///
+    /// `-d` is git's own safety: a branch holding commits nowhere else is
+    /// refused in words ("not fully merged") that come back verbatim, and
+    /// `force` is the reader's explicit answer to exactly that sentence.
+    /// Deleting the checked-out branch is likewise git's refusal, taken as
+    /// the truth rather than re-implemented ahead of the call.
+    fn delete_branch(&self, _name: &[u8], _force: bool) -> Result<()> {
+        Err(unserved("branch deletion"))
+    }
+
+    /// Renames a local branch.
+    ///
+    /// Git's `-m` moves the ref, its configuration and its upstream link
+    /// together, which is several facts a hand-rolled delete-plus-create
+    /// would drop. The new name gets the same emptiness check as
+    /// [`create_branch`](Self::create_branch); everything else is git's.
+    fn rename_branch(&self, _from: &[u8], _to: &[u8]) -> Result<()> {
+        Err(unserved("branch rename"))
+    }
+
     /// A short label for the window title.
     ///
     /// Infallible: a repository whose branch cannot be read still has a name.
@@ -846,6 +898,39 @@ impl Repo for Binary {
         self.run_chunked(&[b"reset", b"-q", b"HEAD", b"--"], paths)
     }
 
+    fn checkout(&self, name: &[u8]) -> Result<()> {
+        // `-q` keeps git's "Switched to branch" off our error band's road;
+        // the name rides bare — see the trait method for why no `--` sits in
+        // front of it.
+        run_bytes(&self.root, &[b"checkout", b"-q", name]).map(|_| ())
+    }
+
+    fn create_branch(&self, name: &[u8], start: Option<&[u8]>) -> Result<()> {
+        if !nameable(name) {
+            return Err("a branch needs a name".into());
+        }
+        match start {
+            Some(start) => run_bytes(&self.root, &[b"branch", name, start]),
+            None => run_bytes(&self.root, &[b"branch", name]),
+        }
+        .map(|_| ())
+    }
+
+    fn delete_branch(&self, name: &[u8], force: bool) -> Result<()> {
+        let flag: &[u8] = match force {
+            true => b"-D",
+            false => b"-d",
+        };
+        run_bytes(&self.root, &[b"branch", flag, name]).map(|_| ())
+    }
+
+    fn rename_branch(&self, from: &[u8], to: &[u8]) -> Result<()> {
+        if !nameable(to) {
+            return Err("a branch needs a name".into());
+        }
+        run_bytes(&self.root, &[b"branch", b"-m", from, to]).map(|_| ())
+    }
+
     fn commit(&self, message: &str) -> Result<String> {
         if message.trim().is_empty() {
             return Err("a commit needs a message".into());
@@ -985,6 +1070,18 @@ fn ignore_line(path: &[u8]) -> Option<Vec<u8>> {
         }
     }
     Some(body)
+}
+
+/// Whether a name is worth handing to git at all.
+///
+/// The one rule checked before git sees it: emptiness, whitespace only or
+/// not there at all. Git's own answer to `git branch ""` is "not a valid
+/// branch name" — true, and useless beside a field that just closed — so
+/// the refusal here says what the reader can act on instead. Every other
+/// rule of ref spelling (`..`, leading `-`, trailing `.lock`) stays git's,
+/// because its error quotes the offending name back.
+fn nameable(name: &[u8]) -> bool {
+    !name.is_empty() && name.iter().any(|b| !b.is_ascii_whitespace())
 }
 
 // ------------------------------------------------------------------- the pair
@@ -4245,5 +4342,264 @@ mod tests {
         let e = r.open().commit("nothing staged").unwrap_err();
         assert!(e.starts_with("git commit:"), "{e}");
         assert!(!e.trim().is_empty(), "git's stderr travelled");
+    }
+
+    // ------------------------------------------------------- the branch verbs
+
+    /// Two commits on `main` and a `feature` branch pinned to the first, with
+    /// a file that differs between them — the least state checkout, dirty-tree
+    /// refusal and unmerged deletion mean anything in.
+    fn two_branches(name: &str) -> Scratch {
+        let r = Scratch::new(name);
+        r.write("shared.txt", b"on main\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "first"]);
+        r.git(&["branch", "feature"]);
+        r.write("shared.txt", b"on main, edited\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "second"]);
+        r
+    }
+
+    #[test]
+    fn checkout_moves_head_and_the_working_tree_together() {
+        let r = two_branches("checkout");
+        let g = r.open();
+
+        assert_eq!(g.checkout(b"feature").map(|_| ()), Ok(()));
+        match g.head().unwrap() {
+            HeadState::Branch { name, commit } => {
+                assert_eq!(name.as_bytes(), b"feature");
+                assert_eq!(commit.as_deref(), Some(r.rev_parse("HEAD~1").as_str()));
+            }
+            other => panic!("attached HEAD expected, got {other:?}"),
+        }
+        // The tree followed: what is on disk is what feature says.
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"shared.txt")).unwrap(),
+            b"on main\n"
+        );
+
+        // And back. The round trip is the part a one-way test can miss.
+        g.checkout(b"main").unwrap();
+        match g.head().unwrap() {
+            HeadState::Branch { name, .. } => assert_eq!(name.as_bytes(), b"main"),
+            other => panic!("attached HEAD expected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn checkout_reaches_a_branch_from_detached_head() {
+        // Detached is where half of all checkouts *start* — a bisect, an old
+        // release — so the state the verb has to be able to leave is the one
+        // this repo's own panel shows first.
+        let r = two_branches("checkout-detached");
+        let g = r.open();
+        r.git(&["checkout", "-q", "--detach", "HEAD~1"]);
+        assert!(matches!(g.head().unwrap(), HeadState::Detached { .. }));
+
+        g.checkout(b"main").unwrap();
+        match g.head().unwrap() {
+            HeadState::Branch { name, commit } => {
+                assert_eq!(name.as_bytes(), b"main");
+                assert_eq!(commit.as_deref(), Some(r.rev_parse("main").as_str()));
+            }
+            other => panic!("attached HEAD expected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_checkout_that_would_lose_work_refuses_in_gits_own_words() {
+        let r = two_branches("checkout-dirty");
+        let g = r.open();
+        g.checkout(b"feature").unwrap();
+        // A change on top of feature that main cannot carry: exactly the shape
+        // git stops to warn about.
+        r.write("shared.txt", b"uncommitted work\n");
+
+        let e = g.checkout(b"main").unwrap_err();
+        assert!(
+            e.contains("local changes") && e.contains("overwritten"),
+            "git's own refusal came through verbatim: {e}"
+        );
+        // And nothing moved — the refusal was a stop, not a detour.
+        match g.head().unwrap() {
+            HeadState::Branch { name, .. } => assert_eq!(name.as_bytes(), b"feature"),
+            other => panic!("HEAD stayed put, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"shared.txt")).unwrap(),
+            b"uncommitted work\n",
+            "the working tree kept the uncommitted work"
+        );
+    }
+
+    #[test]
+    fn a_branch_is_created_where_it_is_told_and_at_head_when_not() {
+        let r = two_branches("branch-create");
+        let g = r.open();
+
+        let start = r.rev_parse("HEAD~1");
+        g.create_branch(b"pinned", Some(start.as_bytes())).unwrap();
+        g.create_branch(b"here", None).unwrap();
+
+        let branches = g.branches().unwrap();
+        let at = |name: &str| branch(&branches, name).commit.clone();
+        assert_eq!(at("pinned"), start, "the start point was honoured");
+        assert_eq!(at("here"), r.rev_parse("HEAD"), "default is HEAD");
+        // Creating checked nothing out.
+        match g.head().unwrap() {
+            HeadState::Branch { name, .. } => assert_eq!(name.as_bytes(), b"main"),
+            other => panic!("HEAD unmoved, got {other:?}"),
+        }
+
+        // A second branch by the same name is git's error, quoted.
+        let e = g.create_branch(b"pinned", None).unwrap_err();
+        assert!(e.contains("already exists"), "{e}");
+    }
+
+    #[test]
+    fn an_unnamed_branch_is_refused_before_git_sees_it() {
+        let r = two_branches("branch-nameless");
+        let g = r.open();
+        for empty in [&b""[..], &b"  \t "[..]] {
+            let e = g.create_branch(empty, None).unwrap_err();
+            assert!(e.contains("name"), "{empty:?}: {e}");
+            let e = g.rename_branch(b"main", empty).unwrap_err();
+            assert!(e.contains("name"), "{empty:?}: {e}");
+        }
+        // Nothing landed in either direction.
+        assert_eq!(g.branches().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn deleting_an_unmerged_branch_needs_force_and_force_answers_it() {
+        let r = two_branches("branch-delete");
+        let g = r.open();
+        // feature holds the first commit only; give it a commit main lacks so
+        // `-d` has something real to refuse.
+        g.checkout(b"feature").unwrap();
+        r.write("shared.txt", b"on feature\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "feature work"]);
+        g.checkout(b"main").unwrap();
+
+        // First press: git's safety, verbatim.
+        let e = g.delete_branch(b"feature", false).unwrap_err();
+        assert!(
+            e.contains("not fully merged"),
+            "git's own refusal came through: {e}"
+        );
+        assert!(
+            g.branches()
+                .unwrap()
+                .iter()
+                .any(|b| b.name.as_bytes() == b"feature"),
+            "the branch survived"
+        );
+
+        // Force is the reader's answer to exactly that sentence.
+        g.delete_branch(b"feature", true).unwrap();
+        let names: Vec<Vec<u8>> = g
+            .branches()
+            .unwrap()
+            .iter()
+            .map(|b| b.name.as_bytes().to_vec())
+            .collect();
+        assert_eq!(names, vec![b"main".to_vec()]);
+    }
+
+    #[test]
+    fn renaming_a_branch_moves_everything_gits_m_would_move() {
+        let (r, _origin) = upstream_fixture("branch-rename");
+        // `main` tracks `origin/main`; the rename has to carry that link.
+        let g = r.open();
+        g.rename_branch(b"main", b"trunk").unwrap();
+
+        let names: Vec<Vec<u8>> = g
+            .branches()
+            .unwrap()
+            .iter()
+            .map(|b| b.name.as_bytes().to_vec())
+            .collect();
+        assert_eq!(names, vec![b"trunk".to_vec()]);
+        let branches = g.branches().unwrap();
+        let trunk = &branches[0];
+        let upstream = trunk
+            .upstream
+            .as_ref()
+            .expect("the tracking link moved too");
+        assert_eq!(upstream.branch.as_bytes(), b"main");
+        // And HEAD followed the rename rather than falling off.
+        match g.head().unwrap() {
+            HeadState::Branch { name, .. } => assert_eq!(name.as_bytes(), b"trunk"),
+            other => panic!("attached HEAD expected, got {other:?}"),
+        }
+
+        // Renaming onto an existing name is git's error, not a silent clobber.
+        g.create_branch(b"side", None).unwrap();
+        let e = g.rename_branch(b"side", b"trunk").unwrap_err();
+        assert!(e.contains("already exists"), "{e}");
+    }
+
+    #[test]
+    fn a_rename_keeps_a_non_utf8_name_byte_exact() {
+        // The verb passes bytes to argv and reads bytes back from
+        // for-each-ref; nothing between them may decode. Whether the volume
+        // allows such a ref at all decides how far this proof runs: loose
+        // refs are files named after their branch, and APFS refuses names
+        // that are not UTF-8 outright.
+        use std::os::unix::ffi::OsStrExt;
+        let r = two_branches("branch-bytes");
+        let latin1: std::ffi::OsString = std::ffi::OsStr::from_bytes(b"f\xe9ature").to_owned();
+        if !r.git_os_try(&["branch".into(), latin1]) {
+            return; // This volume refused; the plumbing stays proven by the
+                    // ASCII rename above and the byte pass-through by the
+                    // verb-level tests in `gitten-app` and the shell.
+        }
+        let g = r.open();
+        g.rename_branch(b"f\xe9ature", b"ok").unwrap();
+        let names: Vec<Vec<u8>> = g
+            .branches()
+            .unwrap()
+            .iter()
+            .map(|b| b.name.as_bytes().to_vec())
+            .collect();
+        assert!(!names.contains(&b"f\xe9ature".to_vec()));
+        assert!(names.contains(&b"ok".to_vec()), "{names:?}");
+    }
+
+    #[test]
+    fn an_unborn_repository_answers_honestly_instead_of_inventing_state() {
+        // Every fresh `git init`: HEAD names a branch no commit backs. The
+        // reads say so (see [`HeadState::Branch`]'s `None`), and the verbs
+        // pass git's own refusals through rather than pretending anything
+        // moved.
+        let r = Scratch::new("branch-unborn");
+        let g = r.open();
+
+        match g.head().unwrap() {
+            HeadState::Branch { name, commit } => {
+                assert_eq!(name.as_bytes(), b"main");
+                assert_eq!(commit, None, "no commit exists to point at");
+            }
+            other => panic!("an unborn branch expected, got {other:?}"),
+        }
+        assert!(g.branches().unwrap().is_empty());
+
+        // Checkout has nothing to move to, and says so in git's words.
+        let e = g.checkout(b"main").unwrap_err();
+        assert!(!e.trim().is_empty(), "{e}");
+        // Creating at an implicit HEAD has nothing to resolve, same answer.
+        let e = g.create_branch(b"fresh", None).unwrap_err();
+        assert!(!e.trim().is_empty(), "{e}");
+        // And still unborn — none of it half-happened.
+        assert_eq!(
+            g.head().unwrap(),
+            HeadState::Branch {
+                name: RefName::from("main"),
+                commit: None,
+            }
+        );
     }
 }
