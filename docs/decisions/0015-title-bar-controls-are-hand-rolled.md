@@ -6,7 +6,7 @@
 ## Context
 
 Layout and algorithm are both registries of named things, and both were only
-reachable by editing `plait.toml`. Layout also had `s`. Neither is discoverable:
+reachable by editing `gitten.toml`. Layout also had `s`. Neither is discoverable:
 nothing on screen said which algorithm produced the diff, or that there was a
 choice.
 
@@ -29,7 +29,7 @@ The floating list is `gpui::deferred` and dismisses through
 
 ## Why not `Popover` or `Select`
 
-- **Every colour in this app comes from `plait_core::theme`**, which the ANSI
+- **Every colour in this app comes from `gitten_core::theme`**, which the ANSI
   painter and a future terminal frontend read too — see
   [0005](0005-theme-in-core.md). `Popover` draws its surface from
   gpui-component's theme, so matching means keeping a second theme in sync with
@@ -72,7 +72,7 @@ leave the closure holding a stale registry.
 configured fallback for one call. The alternative — building a second `Differs`
 with a different selection — would lose whatever an extension registered into the
 host's, and rule 1 says an extension's algorithm must be pickable exactly as a
-built-in's is. A name is also what `plait.toml` already uses, per
+built-in's is. A name is also what `gitten.toml` already uses, per
 [0012](0012-config-is-data-behaviour-is-not.md).
 
 The override beats the *routes* too, deliberately: someone who asks for myers
@@ -101,7 +101,7 @@ hot-reload while every view inside them did — the exact trap
 [extending.md](../extending.md) warns about, in the one place nobody had looked.
 Fixed here because the strip needs the live host anyway.
 
-**The pick does not persist.** Relaunching returns to `plait.toml`. That is right
+**The pick does not persist.** Relaunching returns to `gitten.toml`. That is right
 while this is interim — the file is the source of truth and a control that quietly
 rewrote it would be a settings panel with no confirmation — and wrong the moment
 the panel exists.

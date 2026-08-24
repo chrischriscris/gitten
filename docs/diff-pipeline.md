@@ -4,7 +4,7 @@ From two blobs to pixels, in six stages. Five of them are in `core` and have no
 idea a window exists.
 
 ```
-  1  acquire     plait_git::pairs                    Vec<Pair>   two texts per file
+  1  acquire     gitten_git::pairs                    Vec<Pair>   two texts per file
   2  diff        Differs::file                       Vec<FileDiff>
        2a normalise  Whitespace::keys                how much whitespace must match
        2b script     Differ::diff, per file       ── the seam: histogram, myers, …

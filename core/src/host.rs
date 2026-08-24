@@ -59,7 +59,7 @@ pub struct Host {
     /// Which command each key runs, per mode.
     ///
     /// On `Host` and not in a client for the reason the whole struct exists: a
-    /// keybinding is the promise that plait behaves the same in a window, a
+    /// keybinding is the promise that gitten behaves the same in a window, a
     /// browser and a terminal. What `core` resolves is a command *name*; what a
     /// client does with that name is the only part it owns.
     pub keys: Keymap,
@@ -79,7 +79,7 @@ pub struct Host {
     /// [`Host::select_theme`] chooses from.
     ///
     /// Beside the active one rather than holding it, because `theme` is
-    /// *edited*: `plait.toml` sets colours on top of whatever it selected, and a
+    /// *edited*: `gitten.toml` sets colours on top of whatever it selected, and a
     /// registry that also owned the selection would have to decide whether the
     /// entry or the edit is the truth. This one is the catalogue and `theme` is
     /// the answer.

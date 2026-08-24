@@ -2,14 +2,14 @@
 //!
 //! What [`Doc`](crate::rows::Doc) is to a diff. The topology, the branch
 //! colours and the shape of every row all come from
-//! [`plait_core::graph`](plait_core::graph) — the same three calls the window
+//! [`gitten_core::graph`](gitten_core::graph) — the same three calls the window
 //! and the terminal make — and the only thing this adds is *holding* them, which
 //! is the point: a scroll is a request, and a request that re-walked 82,000
 //! commits to answer "rows 400 to 800" would be 13 ms of work per page for an
 //! answer that cannot change.
 
-use plait_core::graph::{lane_count, plan, Draw};
-use plait_core::{assign_lanes, Commit};
+use gitten_core::graph::{lane_count, plan, Draw};
+use gitten_core::{assign_lanes, Commit};
 
 pub struct Log {
     pub commits: Vec<Commit>,
@@ -56,8 +56,8 @@ impl Log {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use plait_core::graph::MAX_LANES;
-    use plait_core::parse_log;
+    use gitten_core::graph::MAX_LANES;
+    use gitten_core::parse_log;
 
     const LOG: &str = "\
 m\x1fmmmmmmm\x1fa b\x1fAda Lovelace\x1f1700000400\x1fMerge branch\x1e\

@@ -5,7 +5,7 @@
 //! what belongs here is exactly what a second client would have to write again:
 //! how *its* platform spells a key.
 //!
-//! The terminal's is `plait-tui`'s `term.rs`, over crossterm events. This one is
+//! The terminal's is `gitten-tui`'s `term.rs`, over crossterm events. This one is
 //! over GPUI's [`Keystroke`], whose spelling differs in four ways worth
 //! writing down:
 //!
@@ -46,8 +46,8 @@
 //!   fingers already know, and they stay native. A keystroke with `platform`
 //!   set does not translate.
 
+use gitten_core::command::{Code, Key};
 use gpui::Keystroke;
-use plait_core::command::{Code, Key};
 
 /// Every key one GPUI keystroke could mean, in the order GPUI's own matcher
 /// would try them — or empty for anything no client can bind: the platform
@@ -56,9 +56,9 @@ use plait_core::command::{Code, Key};
 ///
 /// Most presses carry exactly one spelling. A press whose insert differs from
 /// its physical key carries two; see the module note for why both survive and
-/// `plait_core::command::Keymap::resolve_any` for who decides between them.
+/// `gitten_core::command::Keymap::resolve_any` for who decides between them.
 pub fn translate(k: &Keystroke) -> Vec<Key> {
-    // Cmd-c means copy to the OS, whatever `plait.toml` says. See the module
+    // Cmd-c means copy to the OS, whatever `gitten.toml` says. See the module
     // note: the menu adapters own these, and translating them too would be a
     // command that fires twice.
     if k.modifiers.platform || k.modifiers.function {
@@ -159,7 +159,7 @@ fn characters(physical: Option<char>, inserted: Option<char>, mods: &gpui::Modif
 }
 
 /// The one character of `s`, or nothing: multi-character strings are IME
-/// mid-composition state or key names no [`Code`](plait_core::command::Code)
+/// mid-composition state or key names no [`Code`](gitten_core::command::Code)
 /// has, and neither is a key any client can bind.
 fn sole(s: &str) -> Option<char> {
     let mut chars = s.chars();
@@ -172,8 +172,8 @@ fn sole(s: &str) -> Option<char> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gitten_core::command::{Keymap, Modes, Resolve};
     use gpui::Modifiers;
-    use plait_core::command::{Keymap, Modes, Resolve};
 
     /// Every spelling of a keystroke.
     fn key(key: &str, m: Modifiers) -> Vec<Key> {
@@ -230,7 +230,7 @@ mod tests {
 
     #[test]
     fn the_keys_the_map_binds_all_translate_to_themselves() {
-        // The property `[keys]` rests on: a chord written in plait.toml is the
+        // The property `[keys]` rests on: a chord written in gitten.toml is the
         // chord a keystroke becomes. Every binding in the shipped map, spelled
         // as GPUI spells it. The wheel is the exception that proves it: it is in
         // the map, but a window delivers it as deltas rather than keystrokes —
@@ -456,8 +456,8 @@ mod tests {
 #[cfg(test)]
 mod resolution_tests {
     use super::translate;
+    use gitten_core::command::{Code, Key, Keymap, Modes, Resolve};
     use gpui::{Keystroke, Modifiers};
-    use plait_core::command::{Code, Key, Keymap, Modes, Resolve};
 
     /// Option-s as a German Mac delivers it.
     fn option_s() -> Keystroke {
@@ -509,7 +509,7 @@ mod resolution_tests {
         // hand every option-s to the global `ß` row. The innermost mode's
         // binding wins instead, whichever way it was written.
         let mut k = Keymap::empty();
-        k.bind(plait_core::command::GLOBAL, "ß", "global.ssharp")
+        k.bind(gitten_core::command::GLOBAL, "ß", "global.ssharp")
             .unwrap();
         k.bind("diff", "alt-s", "diff.save").unwrap();
         let mut modes = Modes::new();

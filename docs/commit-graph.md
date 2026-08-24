@@ -144,8 +144,8 @@ per-frame job.
 
 ```
 ./check.sh                                        # includes both examples below
-cargo run -p plait-core --example verify --release # lane invariants on real history
-cargo run -p plait-core --example shape --release  # topology statistics
+cargo run -p gitten-core --example verify --release # lane invariants on real history
+cargo run -p gitten-core --example shape --release  # topology statistics
 ```
 
 `shape` on the two real repositories, for a sense of what "wide" means:

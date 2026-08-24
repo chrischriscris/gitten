@@ -13,10 +13,10 @@ use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation as _;
 
 pub const MODE: &str = "input";
-const KEY_CONTEXT: &str = "PlaitInput";
+const KEY_CONTEXT: &str = "GittenInput";
 
 actions!(
-    plait_input,
+    gitten_input,
     [
         Backspace,
         Delete,

@@ -61,7 +61,7 @@ const state = {
 // --------------------------------------------------------------------- theme
 
 /** The theme, as custom properties. One place, so the stylesheet holds no
- *  colours and `plait.toml` stays the only thing that decides them. */
+ *  colours and `gitten.toml` stays the only thing that decides them. */
 function applyTheme(meta) {
   const s = document.documentElement.style;
   const t = meta.theme;
@@ -224,7 +224,7 @@ function laneColor(theme, hue, overflow) {
  *  A branch changing lanes spans a *whole* row, and each row draws its own half:
  *  the two meet on the row boundary, at the midpoint between the two lanes,
  *  sharing a tangent. That is why the server sends a `partner` and a direction
- *  rather than a start and an end — see `plait_core::graph`. The control points
+ *  rather than a start and an end — see `gitten_core::graph`. The control points
  *  are the window's, so the curve has the same shape in both clients.
  *
  *  The last segment runs half a pixel *past* the boundary along the tangent: two
@@ -363,7 +363,7 @@ function paint(force) {
 }
 
 function chrome(meta) {
-  dom.label.textContent = `plait · ${meta.label}`;
+  dom.label.textContent = `gitten · ${meta.label}`;
   if (meta.kind === "commits") {
     // The uncapped count against the drawn one: "280 lanes · 12 drawn" is worth
     // knowing, and silently drawing twelve is not.
@@ -522,7 +522,7 @@ async function main() {
     await reflow();
     dom.scroll.focus();
   } catch (e) {
-    dom.label.textContent = "plait";
+    dom.label.textContent = "gitten";
     dom.stats.textContent = String(e.message || e);
     dom.stats.className = "error";
   }

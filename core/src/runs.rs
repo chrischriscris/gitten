@@ -7,8 +7,8 @@
 //! list — the sweep that produces it is the same in every frontend, so it is
 //! here rather than in three of them.
 //!
-//! It was written three times before it was written once. `plait-shell` merged
-//! them into `HighlightStyle`s, `plait-web` merged them into text pieces for the
+//! It was written three times before it was written once. `gitten-shell` merged
+//! them into `HighlightStyle`s, `gitten-web` merged them into text pieces for the
 //! wire, and `core/examples/paint.rs` approximated the whole thing by
 //! underlining anything a span touched. Two of those had the same off-by-one
 //! available to them and one of them had it.

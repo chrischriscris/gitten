@@ -9,17 +9,17 @@ mod session;
 mod stats;
 mod views;
 
+use gitten_app::acquire::{Data, Loaded};
+use gitten_app::cli::{Source, View};
+use gitten_app::jobs::{Event as JobEvent, Generation, Job, Runner, Submitter};
+use gitten_app::{Started, Startup};
+use gitten_core::command::{chord_string, Code, Key, Modes, Resolve};
+use gitten_core::differ::{Overrides, Whitespace};
+use gitten_core::host::Host;
+use gitten_core::theme::Rgb;
+use gitten_core::FileDiff;
 use gpui::*;
 use gpui_component::*;
-use plait_app::acquire::{Data, Loaded};
-use plait_app::cli::{Source, View};
-use plait_app::jobs::{Event as JobEvent, Generation, Job, Runner, Submitter};
-use plait_app::{Started, Startup};
-use plait_core::command::{chord_string, Code, Key, Modes, Resolve};
-use plait_core::differ::{Overrides, Whitespace};
-use plait_core::host::Host;
-use plait_core::theme::Rgb;
-use plait_core::FileDiff;
 use stats::Stats;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Startup-stage timestamps on stderr, behind `PLAIT_START_LOG=1`.
+/// Startup-stage timestamps on stderr, behind `GITTEN_START_LOG=1`.
 ///
 /// Time-to-first-frame hides between stages nobody measures: acquisition and
 /// the config were timed, the GPUI window path never was, so a slow launch
@@ -49,7 +49,7 @@ mod start {
 
     pub fn on() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("PLAIT_START_LOG").is_some_and(|v| v != "0"))
+        *ON.get_or_init(|| std::env::var_os("GITTEN_START_LOG").is_some_and(|v| v != "0"))
     }
 
     /// Pins the epoch. Later than process start by exec and dyld, which no
@@ -83,7 +83,7 @@ static ALLOC: stats::Counting = stats::Counting;
 // items below carry them; their handlers call [`DevShell::run_command`] with
 // the *named* commands every other door uses — `quit`, `copy.selection`,
 // `select.all` — so a menu item is an adapter and not a second path.
-actions!(plait, [Quit, CopySelection, SelectAll]);
+actions!(gitten, [Quit, CopySelection, SelectAll]);
 
 /// The title strip, which is also the window's titlebar — see the note on
 /// [`window_options`]. Tall enough to hold the traffic lights with the same air
@@ -99,8 +99,8 @@ const LIGHTS_W: f32 = 72.0;
 /// one sentence, and it is only there when something has to be said.
 const BAND_H: f32 = 22.0;
 
-/// What only this client has. The two views, the arguments and `plait.toml` are
-/// documented once, in `plait_app::cli::usage`, because they are the same in
+/// What only this client has. The two views, the arguments and `gitten.toml` are
+/// documented once, in `gitten_app::cli::usage`, because they are the same in
 /// every client — see that function for why that is a promise and not a
 /// convenience.
 const EXTRA: &str =
@@ -108,9 +108,9 @@ const EXTRA: &str =
   where a line too wide for the window breaks (off, word, char), the diff
   algorithm (histogram, patience, myers), how much whitespace has to match
   (exact, trailing, change, all — git's default, --ignore-space-at-eol, -b and
-  -w) and the theme (dark, light, slate, and whatever plait.toml adds). `s`
+  -w) and the theme (dark, light, slate, and whatever gitten.toml adds). `s`
   cycles the presentation, `w` the wrap and `T` the theme — all three through
-  `[keys]` in plait.toml, where `?` lists everything.
+  `[keys]` in gitten.toml, where `?` lists everything.
 
   The file is re-read every time it is saved, and colours and font apply on the
   next frame — no rebuild, no relaunch.
@@ -119,7 +119,7 @@ const EXTRA: &str =
                    on the row you were reading. Debug build and the overlay by
                    default; pass --release before trusting a timing.
 
-  PLAIT_STATS=1   frame, row and heap overlay
+  GITTEN_STATS=1   frame, row and heap overlay
 ";
 
 /// How to acquire the diff again under different overrides.
@@ -195,7 +195,7 @@ trait Pane {
         _generation: Generation,
         _host: &Host,
         _overrides: &Overrides,
-        _repo: plait_git::Handle,
+        _repo: gitten_git::Handle,
     ) -> Option<Refresh> {
         None
     }
@@ -283,7 +283,7 @@ impl Screen {
         }
     }
 
-    /// Which mode's bindings are live. The name the keymap and `plait.toml` use.
+    /// Which mode's bindings are live. The name the keymap and `gitten.toml` use.
     fn mode(&self) -> &'static str {
         match self {
             Screen::Commits { .. } => "commits",
@@ -304,7 +304,7 @@ impl Screen {
         target: Generation,
         host: &Host,
         overrides: &Overrides,
-        repo: plait_git::Handle,
+        repo: gitten_git::Handle,
     ) -> Option<Refresh> {
         match self {
             Screen::Commits {
@@ -324,7 +324,7 @@ impl Screen {
                 Some(Refresh::new(
                     target,
                     move || {
-                        let loaded = plait_app::acquire::reacquire(
+                        let loaded = gitten_app::acquire::reacquire(
                             View::Commits,
                             &source,
                             &load_host,
@@ -368,7 +368,7 @@ impl Screen {
                 Some(Refresh::new(
                     target,
                     move || {
-                        let loaded = plait_app::acquire::reacquire(
+                        let loaded = gitten_app::acquire::reacquire(
                             View::Diff,
                             &source,
                             &load_host,
@@ -381,7 +381,7 @@ impl Screen {
                         let prepared = views::diff::prepare_files(files, &load_host);
                         Ok((loaded, prepared))
                     },
-                    move |(loaded, prepared): (Loaded, plait_core::prepared::Prepared),
+                    move |(loaded, prepared): (Loaded, gitten_core::prepared::Prepared),
                           host,
                           cx| {
                         if generation.get() >= target {
@@ -498,7 +498,7 @@ struct DevShell {
     /// The repository path used in labels and the persistent handle used for
     /// every acquisition. `None` for a fixture, which has no repository behind
     /// it — and the key then says so, which is what an unbound key does too.
-    repo: Option<(std::path::PathBuf, plait_git::Handle)>,
+    repo: Option<(std::path::PathBuf, gitten_git::Handle)>,
     jobs: Runner,
     submitter: Submitter,
     generation: Generation,
@@ -514,7 +514,7 @@ struct DevShell {
     input: Option<Entity<input::Input>>,
     /// The live picks. Every field `None` means "whatever the config selected",
     /// which is what the controls show until somebody changes one — so the strip
-    /// agrees with `plait.toml` rather than with a copy of it taken at startup.
+    /// agrees with `gitten.toml` rather than with a copy of it taken at startup.
     over: Overrides,
     open: Option<Open>,
     /// A failed re-diff. Shown, not swallowed: the usual cause is a repository
@@ -525,7 +525,7 @@ struct DevShell {
     /// that resolved to nothing this screen can do. Cleared by the next key,
     /// so it cannot go stale. Same band as [`DevShell::error`], which wins.
     notice: Option<String>,
-    /// Where `plait.toml` is. Held because picking a theme goes through the same
+    /// Where `gitten.toml` is. Held because picking a theme goes through the same
     /// reload a save does — see [`config::reload`] for why there is only one
     /// path.
     config: std::path::PathBuf,
@@ -552,7 +552,7 @@ struct DevShell {
     /// handle owned here means the views never have to know input exists.
     focus: FocusHandle,
     focused: Option<FocusHandle>,
-    /// The host the last key was resolved against. A saved `plait.toml` swaps
+    /// The host the last key was resolved against. A saved `gitten.toml` swaps
     /// the map mid-session; a chord half-typed against the old one means nothing
     /// under the new.
     seen_host: Option<Rc<Host>>,
@@ -851,12 +851,12 @@ impl DevShell {
     /// there is no host to edit: it is an `Rc` every view is holding, replaced
     /// wholesale precisely so nobody can see half a theme. So a pick is a
     /// rebuild from the file with the pick applied on top — which is also what
-    /// makes it survive the next save, and what makes a colour in `plait.toml`
+    /// makes it survive the next save, and what makes a colour in `gitten.toml`
     /// still count after one.
     fn set_theme(&mut self, name: String, cx: &mut Context<Self>) {
         cx.set_global(config::Chosen(Some(name)));
         for w in config::reload(&self.config, cx) {
-            eprintln!("plait: {w}");
+            eprintln!("gitten: {w}");
         }
         cx.notify();
     }
@@ -1005,7 +1005,7 @@ impl DevShell {
             path,
             arg: commit.sha.clone(),
         };
-        match plait_app::acquire::acquire(View::Diff, &source, &host, Some(repo.as_ref())) {
+        match gitten_app::acquire::acquire(View::Diff, &source, &host, Some(repo.as_ref())) {
             Ok(loaded) => {
                 let Data::Diff(files) = loaded.data else {
                     return;
@@ -1283,7 +1283,7 @@ impl DevShell {
         };
 
         // Straight off the registry in `core`, so a theme an extension registers
-        // — or one written in `plait.toml` — is in this menu without a line here
+        // — or one written in `gitten.toml` — is in this menu without a line here
         // changing. Outside the `diff` check below on purpose: a palette is the
         // whole window's, and the commit graph is drawn out of the same one.
         let theme_names = host.themes.names();
@@ -1579,7 +1579,7 @@ impl Render for DevShell {
                     .border_b_1()
                     .border_color(rgb(c.border))
                     .text_color(rgb(c.dim))
-                    .child(div().flex_none().text_color(rgb(c.fg)).child("plait"))
+                    .child(div().flex_none().text_color(rgb(c.fg)).child("gitten"))
                     .child(dot())
                     .child(div().flex_none().child(which))
                     .child(dot())
@@ -1671,7 +1671,7 @@ impl Render for DevShell {
 }
 
 /// One sentence on its own band under the title bar.
-fn band(c: &plait_core::theme::ChromePalette, text: SharedString, ink: Rgb) -> impl IntoElement {
+fn band(c: &gitten_core::theme::ChromePalette, text: SharedString, ink: Rgb) -> impl IntoElement {
     div()
         .flex_none()
         .flex()
@@ -1688,10 +1688,10 @@ fn band(c: &plait_core::theme::ChromePalette, text: SharedString, ink: Rgb) -> i
 fn main() {
     start::begin(std::time::Instant::now());
     start::mark("main enter");
-    // Arguments, `plait.toml`, `--help`, `plait config` and acquisition, all of
-    // it shared with every other client — see `plait_app`. What is left in this
+    // Arguments, `gitten.toml`, `--help`, `gitten config` and acquisition, all of
+    // it shared with every other client — see `gitten_app`. What is left in this
     // file is a window.
-    let started = match Startup::new("plait", View::Commits)
+    let started = match Startup::new("gitten", View::Commits)
         .blurb("a git client")
         .extra(EXTRA)
         .go()
@@ -1699,7 +1699,7 @@ fn main() {
         Ok(started) => started,
         Err(exit) => exit.finish(),
     };
-    start::mark("startup done (args + plait.toml + acquire)");
+    start::mark("startup done (args + gitten.toml + acquire)");
     let Started {
         view: which,
         source,
@@ -1724,7 +1724,7 @@ fn main() {
         (Source::Repo { path, .. }, Some(repo)) => {
             let for_diff = repo.clone();
             let rediff: Rediff = Rc::new(move |host: &Host, over: &Overrides, revision: &str| {
-                plait_git::diff(for_diff.as_ref(), revision, &host.differ, over)
+                gitten_git::diff(for_diff.as_ref(), revision, &host.differ, over)
             });
             (Some(rediff), Some((path.clone(), repo)))
         }
@@ -1768,7 +1768,7 @@ fn main() {
         };
         if watcher.is_none() {
             eprintln!(
-                "plait: could not watch {}; config reload is off",
+                "gitten: could not watch {}; config reload is off",
                 config_path.display()
             );
         }
@@ -1786,7 +1786,7 @@ fn main() {
                 // The same call a theme pick makes — see `config::reload`.
                 let warnings = cx.update(|cx| config::reload(&config_path, cx));
                 for w in warnings {
-                    eprintln!("plait: {w}");
+                    eprintln!("gitten: {w}");
                 }
             }
         })
@@ -2007,7 +2007,7 @@ fn main() {
         // the `actions!`.
         cx.set_menus(vec![
             Menu {
-                name: "plait".into(),
+                name: "gitten".into(),
                 items: vec![MenuItem::action("Quit", Quit)],
                 disabled: false,
             },
@@ -2041,7 +2041,7 @@ impl DevShell {
 
 /// The window's own title — what macOS shows in Mission Control, the Window menu
 /// and the tab bar. Not what is drawn in the strip: that is three separate
-/// colours in [`DevShell::render`], because "plait", the view and the repository
+/// colours in [`DevShell::render`], because "gitten", the view and the repository
 /// are three different kinds of thing and one grey run of text says so about
 /// none of them.
 ///
@@ -2049,7 +2049,7 @@ impl DevShell {
 /// after the `Started` has been taken apart, and reassembling it to ask would be
 /// sillier than the two lines.
 fn started_title(view: View, label: &str) -> String {
-    format!("plait · {} · {label}", view.name())
+    format!("gitten · {} · {label}", view.name())
 }
 
 /// The window, and the one decision in it worth writing down: **there is no
@@ -2086,14 +2086,14 @@ fn window_options(title: SharedString) -> WindowOptions {
 mod tests {
     use super::{config, input, panes, DevShell, Open, Pane, Refresh, Screen};
     use crate::views::commits::Commits;
+    use gitten_app::cli::Source;
+    use gitten_app::jobs::{Event as JobEvent, Generation, Job, Runner};
+    use gitten_core::command::{Code, Key, Keymap, Modes, Resolve};
+    use gitten_core::host::Host;
+    use gitten_core::status::Status;
+    use gitten_core::Commit;
+    use gitten_git::{Pair, Repo};
     use gpui::{AppContext as _, TestAppContext};
-    use plait_app::cli::Source;
-    use plait_app::jobs::{Event as JobEvent, Generation, Job, Runner};
-    use plait_core::command::{Code, Key, Keymap, Modes, Resolve};
-    use plait_core::host::Host;
-    use plait_core::status::Status;
-    use plait_core::Commit;
-    use plait_git::{Pair, Repo};
     use std::cell::Cell;
     use std::path::PathBuf;
     use std::rc::Rc;
@@ -2124,8 +2124,8 @@ mod tests {
             &self,
             target: Generation,
             _: &Host,
-            _: &plait_core::differ::Overrides,
-            repo: plait_git::Handle,
+            _: &gitten_core::differ::Overrides,
+            repo: gitten_git::Handle,
         ) -> Option<Refresh> {
             if self.generation.get() >= target {
                 return None;
@@ -2193,7 +2193,7 @@ mod tests {
     }
 
     impl Repo for RefreshRepo {
-        fn log(&self, _: usize) -> plait_git::Result<Vec<Commit>> {
+        fn log(&self, _: usize) -> gitten_git::Result<Vec<Commit>> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             Ok(vec![Commit {
                 sha: "1".into(),
@@ -2205,11 +2205,11 @@ mod tests {
             }])
         }
 
-        fn pairs(&self, _: &str) -> plait_git::Result<Vec<Pair>> {
+        fn pairs(&self, _: &str) -> gitten_git::Result<Vec<Pair>> {
             Ok(Vec::new())
         }
 
-        fn status(&self) -> plait_git::Result<Status> {
+        fn status(&self) -> gitten_git::Result<Status> {
             Ok(Status::default())
         }
 

@@ -1,15 +1,15 @@
-//! `plait-web` — acquire in the terminal, read in a browser.
+//! `gitten-web` — acquire in the terminal, read in a browser.
 //!
 //! The arguments are every other client's, because they come from the same
-//! place: see `plait_app::cli`. What this adds is `--port`.
+//! place: see `gitten_app::cli`. What this adds is `--port`.
 
-use plait_app::acquire::Data as Loaded;
-use plait_app::cli::{self, View};
-use plait_app::{Startup, MAX_LINE_CHARS};
-use plait_core::prepared::prepare;
-use plait_web::log::Log;
-use plait_web::rows::Doc;
-use plait_web::{http, Data, State};
+use gitten_app::acquire::Data as Loaded;
+use gitten_app::cli::{self, View};
+use gitten_app::{Startup, MAX_LINE_CHARS};
+use gitten_core::prepared::prepare;
+use gitten_web::log::Log;
+use gitten_web::rows::Doc;
+use gitten_web::{http, Data, State};
 use std::rc::Rc;
 use std::sync::Mutex;
 
@@ -24,8 +24,8 @@ const EXTRA: &str = "  --port N       listen on N instead of 7423
 const DEFAULT_PORT: u16 = 7423;
 
 fn main() {
-    let mut start = Startup::new("plait-web", View::Diff)
-        .blurb("plait in a browser tab, served from this terminal")
+    let mut start = Startup::new("gitten-web", View::Diff)
+        .blurb("gitten in a browser tab, served from this terminal")
         .extra(EXTRA);
 
     // Taken before the shared parse sees it, so `--port` may appear anywhere on
@@ -78,17 +78,17 @@ fn main() {
         true => "  ·  debug build, timings meaningless — use --release",
         false => "",
     };
-    println!("plait · {} · {label}{build}", which.name());
+    println!("gitten · {} · {label}{build}", which.name());
     println!("  http://127.0.0.1:{port}/");
 
     let serving = state.clone();
     if let Err(e) = http::serve(port, move |req| serving.route(req)) {
-        eprintln!("plait-web: could not listen on 127.0.0.1:{port}: {e}");
+        eprintln!("gitten-web: could not listen on 127.0.0.1:{port}: {e}");
         std::process::exit(1);
     }
 }
 
 fn fail(start: &Startup, message: &str) -> ! {
-    eprintln!("plait-web: {message}\n\n{}", start.usage());
+    eprintln!("gitten-web: {message}\n\n{}", start.usage());
     std::process::exit(1)
 }

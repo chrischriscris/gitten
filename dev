@@ -7,11 +7,11 @@
 #   ./dev web       diff --fixtures
 #   ./dev dump      commits ~/Projects/git 600     one frame, no takeover
 #   ./dev check                                    everything headless
-#   ./dev config                                   a starting plait.toml
-#   ./dev bundle                                   target/plait.app, icon and all
+#   ./dev config                                   a starting gitten.toml
+#   ./dev bundle                                   target/gitten.app, icon and all
 #
 #   ./dev --release tui diff .       when you need honest numbers
-#   PLAIT_STATS=0 ./dev tui          without the frame readout
+#   GITTEN_STATS=0 ./dev tui          without the frame readout
 #
 # **Debug and the stats readout by default**, because this is the loop you
 # iterate in: ~2.5 s to rebuild instead of ~4 s, and the frame and cell counts
@@ -29,7 +29,7 @@
 # is the same 2.5 s either way. `./dev dump` is the watchable one, because a
 # frame on stdout interrupts nobody.
 #
-# Colour, font, `[diff]` and `[keys]` changes need none of this: plait.toml
+# Colour, font, `[diff]` and `[keys]` changes need none of this: gitten.toml
 # reloads live in both clients, on the next frame. Use this for code.
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -45,13 +45,13 @@ while true; do
 done
 
 # On unless it was deliberately turned off — both clients treat "0" as off, so
-# `PLAIT_STATS=0 ./dev tui` works and anything else the caller set is kept.
-export PLAIT_STATS="${PLAIT_STATS:-1}"
+# `GITTEN_STATS=0 ./dev tui` works and anything else the caller set is kept.
+export GITTEN_STATS="${GITTEN_STATS:-1}"
 
 WHAT="${1:-}"
 [ $# -gt 0 ] && shift
 
-# Progress on stderr, always: `./dev config > plait.toml` has to produce a file
+# Progress on stderr, always: `./dev config > gitten.toml` has to produce a file
 # with a config in it and not a build log.
 dim() { printf '\033[2m%s\033[0m\n' "$1" >&2; }
 red() { printf '\033[31m%s\033[0m\n' "$1" >&2; }
@@ -136,19 +136,19 @@ watch_run() { # watch_run <crate> <binary> [args...]
 
 case "$WHAT" in
   desktop|shell|gui)
-    watch_run plait-shell "target/$PROFILE/plait-shell" "$@"
+    watch_run gitten-shell "target/$PROFILE/gitten-shell" "$@"
     ;;
 
   web|browser)
-    watch_run plait-web "target/$PROFILE/plait-web" "$@"
+    watch_run gitten-web "target/$PROFILE/gitten-web" "$@"
     ;;
 
   tui|terminal)
-    build plait-tui || exit 1
+    build gitten-tui || exit 1
     # In the foreground: it reads the terminal, so there is nothing to put in
     # front of it. Raw mode and the alternate screen are restored on exit and on
     # panic by `term.rs`; this is the belt for the case it is killed instead.
-    "target/$PROFILE/plait-tui" "$@"
+    "target/$PROFILE/gitten-tui" "$@"
     status=$?
     printf '\033[?25h\033[?1049l'
     stty sane 2>/dev/null
@@ -162,7 +162,7 @@ case "$WHAT" in
     : "${COLS:=$(tput cols 2>/dev/null || echo 120)}"
     : "${ROWS:=$(tput lines 2>/dev/null || echo 40)}"
     export COLS ROWS
-    exec cargo run -q -p plait-tui --example dump --release -- "$@"
+    exec cargo run -q -p gitten-tui --example dump --release -- "$@"
     ;;
 
   bundle)
@@ -174,10 +174,10 @@ case "$WHAT" in
     # Release always: nobody wants a debug build in /Applications, and the
     # timings inside one are meaningless anyway.
     FLAGS=(--release); PROFILE=release
-    build plait-shell || exit 1
-    APP="target/plait.app"
-    rm -rf "$APP" "target/plait.iconset"
-    mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" target/plait.iconset
+    build gitten-shell || exit 1
+    APP="target/gitten.app"
+    rm -rf "$APP" "target/gitten.iconset"
+    mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" target/gitten.iconset
 
     # Rendered from the vector at every size rather than downscaled from one
     # PNG: at 16 and 32 the difference between a re-rendered glyph and a
@@ -188,26 +188,26 @@ case "$WHAT" in
       set -- $pair
       rm -rf target/.ql && mkdir -p target/.ql
       qlmanage -t -s "$1" -o target/.ql shell/assets/icon.svg >/dev/null 2>&1
-      cp target/.ql/icon.svg.png "target/plait.iconset/icon_$2.png"
+      cp target/.ql/icon.svg.png "target/gitten.iconset/icon_$2.png"
     done
     rm -rf target/.ql
-    iconutil -c icns target/plait.iconset -o "$APP/Contents/Resources/plait.icns"
-    rm -rf target/plait.iconset
+    iconutil -c icns target/gitten.iconset -o "$APP/Contents/Resources/gitten.icns"
+    rm -rf target/gitten.iconset
 
-    # The executable is named `plait` inside the bundle: macOS titles the first
-    # menu with CFBundleName, and the binary being `plait-shell` is why the menu
+    # The executable is named `gitten` inside the bundle: macOS titles the first
+    # menu with CFBundleName, and the binary being `gitten-shell` is why the menu
     # bar says so today.
-    cp "target/$PROFILE/plait-shell" "$APP/Contents/MacOS/plait"
+    cp "target/$PROFILE/gitten-shell" "$APP/Contents/MacOS/gitten"
     cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key><string>plait</string>
-  <key>CFBundleDisplayName</key><string>plait</string>
-  <key>CFBundleExecutable</key><string>plait</string>
-  <key>CFBundleIdentifier</key><string>dev.plait.desktop</string>
-  <key>CFBundleIconFile</key><string>plait</string>
+  <key>CFBundleName</key><string>gitten</string>
+  <key>CFBundleDisplayName</key><string>gitten</string>
+  <key>CFBundleExecutable</key><string>gitten</string>
+  <key>CFBundleIdentifier</key><string>dev.gitten.desktop</string>
+  <key>CFBundleIconFile</key><string>gitten</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>0.0.0</string>
   <key>CFBundleVersion</key><string>0</string>
@@ -232,8 +232,8 @@ PLIST
     ;;
 
   config)
-    build plait-tui || exit 1
-    exec "target/$PROFILE/plait-tui" config
+    build gitten-tui || exit 1
+    exec "target/$PROFILE/gitten-tui" config
     ;;
 
   ""|-h|--help|help)

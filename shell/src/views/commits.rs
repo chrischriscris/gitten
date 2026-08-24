@@ -1,11 +1,11 @@
 use super::{accept_deferred_scroll, DeferredScrollbar, PendingScroll};
 use crate::graph;
+use gitten_core::host::Host;
+use gitten_core::view::Viewport;
+use gitten_core::{assign_lanes, initials, Commit};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::scroll::Scrollbar;
-use plait_core::host::Host;
-use plait_core::view::Viewport;
-use plait_core::{assign_lanes, initials, Commit};
 use std::cell::Cell;
 use std::rc::Rc;
 
@@ -41,7 +41,7 @@ pub(crate) struct Prepared {
 pub struct Commits {
     data: Rc<Data>,
     scroll: UniformListScrollHandle,
-    /// The cursor, the top row and the height — [`plait_core::view::Viewport`],
+    /// The cursor, the top row and the height — [`gitten_core::view::Viewport`],
     /// the same model the terminal's commit list holds. Behind a shared cell so
     /// the render closure can read which row is the cursor's without a second
     /// source of truth.
@@ -492,8 +492,8 @@ mod tests {
     // By name, not a glob: `use gpui::*` in the parent shadows `#[test]` with
     // GPUI's own attribute macro and every test in here fails to expand.
     use super::Commits;
-    use plait_core::host::Host;
-    use plait_core::Commit;
+    use gitten_core::host::Host;
+    use gitten_core::Commit;
     use std::rc::Rc;
 
     /// One commit with everything the view needs, and nothing it reads.

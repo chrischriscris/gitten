@@ -6,7 +6,7 @@
 ## Context
 
 Colour has been data in a dependency-free crate since
-[0005](0005-theme-in-core.md), and `plait.toml` has been able to set every field
+[0005](0005-theme-in-core.md), and `gitten.toml` has been able to set every field
 of it since [0012](0012-config-is-data-behaviour-is-not.md). What did not exist
 was a *second* palette: `Host::theme` was one `Theme`, built by
 `Theme::default_dark()`, and "switch to a light theme" meant retyping sixty hex
@@ -28,7 +28,7 @@ three entries.** `host.select_theme(name)` copies one into `host.theme`,
 
 **The registry holds no selection.** This is the one place it differs from
 `Differs` and `Wraps`, and the reason is that a theme is the only seam whose
-implementation is data the config file *edits*: `plait.toml` sets colours on top
+implementation is data the config file *edits*: `gitten.toml` sets colours on top
 of whatever it selected. A registry that also owned the selection would have to
 answer whether the entry or the edit is the truth. So `themes` is the catalogue,
 `theme` is what is drawn, and `theme.name` is which one it came from.
@@ -61,7 +61,7 @@ value you meant teaches you to ignore the ones that matter.
 
 ## Why the file's theme goes into the registry
 
-Because otherwise the picker lies. `plait config` dumps *every* colour of the
+Because otherwise the picker lies. `gitten config` dumps *every* colour of the
 theme you are on, so a file produced by it and then edited is a full palette; if
 that palette were not registered, picking "light" from the menu would apply the
 file's sixty overrides on top of light and change nothing on screen. Registering

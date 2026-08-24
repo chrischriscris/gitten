@@ -3,7 +3,7 @@
 //! One function, and it is the whole of what sits between
 //! [`cli::parse`](crate::cli::parse) and a view. It uses the host's own
 //! `Differs`, which is the point: *which algorithm ran* is a configured choice
-//! and this is the one place it is made, so `[diff] algorithm` in `plait.toml`
+//! and this is the one place it is made, so `[diff] algorithm` in `gitten.toml`
 //! means the same thing in a window, a browser and a terminal.
 //!
 //! It returns **`Vec<FileDiff>`, not prepared rows.** Every client wants
@@ -14,10 +14,10 @@
 //! what a client needs.
 
 use crate::cli::{Source, View};
-use plait_core::differ::Overrides;
-use plait_core::host::Host;
-use plait_core::{Commit, FileDiff};
-use plait_git::Repo;
+use gitten_core::differ::Overrides;
+use gitten_core::host::Host;
+use gitten_core::{Commit, FileDiff};
+use gitten_git::Repo;
 use std::path::Path;
 
 /// Where the fixtures live, for a client that wants to say so in an error.
@@ -117,7 +117,7 @@ fn acquire_with(
             // this call.
             std::thread::scope(|s| {
                 let title = s.spawn(|| describe(repo, arg));
-                let files = plait_git::diff(repo, arg, &host.differ, overrides)?;
+                let files = gitten_git::diff(repo, arg, &host.differ, overrides)?;
                 if files.is_empty() && !allow_empty {
                     let what = match arg.is_empty() {
                         true => "(working tree)",
@@ -134,7 +134,7 @@ fn acquire_with(
             })
         }
         (View::Diff, Source::Fixtures) => {
-            let files = plait_core::parse_unified_diff(&read_fixture(DIFF_FIXTURE));
+            let files = gitten_core::parse_unified_diff(&read_fixture(DIFF_FIXTURE));
             if files.is_empty() {
                 return Err(format!(
                     "{DIFF_FIXTURE} is missing or empty — ./fixtures/gen.sh 1000 1000"
@@ -162,7 +162,7 @@ fn acquire_with(
             })
         }
         (View::Commits, Source::Fixtures) => {
-            let commits = plait_core::parse_log(&read_fixture(LOG_FIXTURE));
+            let commits = gitten_core::parse_log(&read_fixture(LOG_FIXTURE));
             if commits.is_empty() {
                 return Err(format!(
                     "{LOG_FIXTURE} is missing or empty — ./fixtures/dump.sh ."
@@ -203,8 +203,8 @@ fn describe(repo: &dyn Repo, revspec: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use plait_core::status::Status;
-    use plait_git::{Handle, Pair};
+    use gitten_core::status::Status;
+    use gitten_git::{Handle, Pair};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -238,14 +238,14 @@ mod tests {
     }
 
     impl Repo for Fake {
-        fn log(&self, limit: usize) -> plait_git::Result<Vec<Commit>> {
+        fn log(&self, limit: usize) -> gitten_git::Result<Vec<Commit>> {
             // Honours the limit, so a caller's argument is observable.
             Ok((0..limit.min(2))
                 .map(|i| commit(&format!("f{i}")))
                 .collect())
         }
 
-        fn pairs(&self, _revspec: &str) -> plait_git::Result<Vec<Pair>> {
+        fn pairs(&self, _revspec: &str) -> gitten_git::Result<Vec<Pair>> {
             // Two changes separated by ten shared lines: narrow context keeps
             // them as two hunks, wide context merges them into one — which is
             // what makes the host's configured context observable through
@@ -269,7 +269,7 @@ mod tests {
             }])
         }
 
-        fn status(&self) -> plait_git::Result<Status> {
+        fn status(&self) -> gitten_git::Result<Status> {
             Ok(Status::default())
         }
 
@@ -279,15 +279,15 @@ mod tests {
     }
 
     impl Repo for Empty {
-        fn log(&self, _limit: usize) -> plait_git::Result<Vec<Commit>> {
+        fn log(&self, _limit: usize) -> gitten_git::Result<Vec<Commit>> {
             Ok(Vec::new())
         }
 
-        fn pairs(&self, _revspec: &str) -> plait_git::Result<Vec<Pair>> {
+        fn pairs(&self, _revspec: &str) -> gitten_git::Result<Vec<Pair>> {
             Ok(Vec::new())
         }
 
-        fn status(&self) -> plait_git::Result<Status> {
+        fn status(&self) -> gitten_git::Result<Status> {
             Ok(Status::default())
         }
 
@@ -298,7 +298,7 @@ mod tests {
 
     /// A real handle against a path, for the tests that want actual git.
     fn real(path: &str) -> Handle {
-        plait_git::open(Path::new(path))
+        gitten_git::open(Path::new(path))
     }
 
     fn here() -> Source {
@@ -359,7 +359,7 @@ mod tests {
     /// ownership of the implementation it is handed.
     struct Counting(Arc<AtomicUsize>);
 
-    impl plait_core::differ::Differ for Counting {
+    impl gitten_core::differ::Differ for Counting {
         fn name(&self) -> &'static str {
             "counting"
         }
@@ -369,9 +369,9 @@ mod tests {
             _path: &str,
             old: &[Arc<str>],
             new: &[Arc<str>],
-        ) -> Vec<plait_core::differ::Edit> {
+        ) -> Vec<gitten_core::differ::Edit> {
             self.0.fetch_add(1, Ordering::Relaxed);
-            vec![plait_core::differ::Edit {
+            vec![gitten_core::differ::Edit {
                 old_start: 0,
                 old_end: old.len() as u32,
                 new_start: 0,
@@ -469,7 +469,7 @@ mod tests {
     #[test]
     fn the_hosts_differ_is_the_one_that_runs() {
         // The whole reason acquisition takes a `Host`: `[diff] algorithm` in
-        // `plait.toml` has to reach the thing that actually diffs.
+        // `gitten.toml` has to reach the thing that actually diffs.
         let mut host = Host::new();
         assert!(host.differ.select("myers"));
         host.differ.context = 1;

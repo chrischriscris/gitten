@@ -13,7 +13,7 @@
 //! written here rather than pulled in. Two of the three are textbook and the
 //! third is a parameter change; the whole module is smaller than the wrapper
 //! around a third-party differ would have been, and it keeps `cargo test -p
-//! plait-core` at well under a second.
+//! gitten-core` at well under a second.
 //!
 //! # The split of responsibility
 //!
@@ -1962,7 +1962,7 @@ mod tests {
         // What a fully rewritten generated file hits. Driven through `Ctx`
         // directly with a small budget rather than by feeding it 60k lines,
         // because the cost of reaching `MAX_STEPS` honestly *is* MAX_STEPS and
-        // `cargo test -p plait-core` is meant to stay under a second.
+        // `cargo test -p gitten-core` is meant to stay under a second.
         let old: Vec<Arc<str>> = (0..400).map(|i| Arc::from(format!("old {i}"))).collect();
         let new: Vec<Arc<str>> = (0..400).map(|i| Arc::from(format!("new {i}"))).collect();
         let (a, b) = intern(&old, &new);

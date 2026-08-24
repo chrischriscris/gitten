@@ -45,7 +45,7 @@ jobs:
       # cache hit contains every locked source, so it need not update indexes.
       - run: >-
           cargo test -q --locked
-          -p plait-core -p plait-app -p plait-git -p plait-web -p plait-tui
+          -p gitten-core -p gitten-app -p gitten-git -p gitten-web -p gitten-tui
         env:
           CARGO_NET_OFFLINE: ${{ steps.cache.outputs.cache-hit }}
 

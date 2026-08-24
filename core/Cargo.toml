@@ -1,5 +1,5 @@
 [package]
-name = "plait-core"
+name = "gitten-core"
 version = "0.0.0"
 edition = "2021"
 

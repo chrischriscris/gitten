@@ -9,7 +9,7 @@ The terminal client asked for mode 1000 so the wheel would scroll, decoded the
 clicks it got as a side effect, and threw them away. That was defensible for
 exactly as long as nothing could use one — but it had already taken something
 away: **an emulator forwarding clicks is no longer drag-selecting text with
-them**, so plait was the one program in the terminal you could not copy a line
+them**, so gitten was the one program in the terminal you could not copy a line
 out of. `shift` (`option` on iTerm) is the escape hatch and it is not a feature.
 
 Meanwhile the wheel was the only way to move a long list with the pointer, and
@@ -21,7 +21,7 @@ nothing on screen said where in a 714k-row diff you were.
 
 A **wheel notch is a key**: `Code::WheelUp` / `Code::WheelDown` resolve through
 the keymap to `view.scroll-up` / `view.scroll-down`, appear on the `?` panel and
-are rebindable in `plait.toml`. Unchanged from 0012's rule — it is data, so it is
+are rebindable in `gitten.toml`. Unchanged from 0012's rule — it is data, so it is
 config.
 
 A **button is a position**, and a position cannot be a key, because a config file
@@ -75,7 +75,7 @@ thing.
 **`cmd-c` / `ctrl-shift-c`, the way you would in any other terminal program.**
 They never arrive: the emulator intercepts them before the pty, and `Key` has no
 super modifier because no terminal delivers one reliably. What they copy is the
-emulator's own selection, which plait cannot write to and which is empty anyway
+emulator's own selection, which gitten cannot write to and which is empty anyway
 while mode 1002 is on. Hence copy-on-select and `y`, which is also why
 copy-on-select is *on* by default: an app that takes the drag and gives back no
 copy is worse than one that never took it.

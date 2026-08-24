@@ -1,10 +1,10 @@
 //! One frame of the terminal views, printed to stdout.
 //!
 //! ```sh
-//! cargo run -q -p plait-tui --example dump -- diff    [REPO] [REVSPEC]
-//! cargo run -q -p plait-tui --example dump -- diff    --fixtures
-//! cargo run -q -p plait-tui --example dump -- commits [REPO] [LIMIT]
-//! cargo run -q -p plait-tui --example dump -- commits --fixtures
+//! cargo run -q -p gitten-tui --example dump -- diff    [REPO] [REVSPEC]
+//! cargo run -q -p gitten-tui --example dump -- diff    --fixtures
+//! cargo run -q -p gitten-tui --example dump -- commits [REPO] [LIMIT]
+//! cargo run -q -p gitten-tui --example dump -- commits --fixtures
 //! ```
 //!
 //! `COLS` and `ROWS` override the size; `LAYOUT`, `WRAP`, `THEME` and `AT` pick
@@ -14,17 +14,17 @@
 //! `--release` before believing it**, exactly as the window's overlay says.
 //!
 //! No raw mode, no alternate screen, no window: it builds the same
-//! [`Screen`](plait_tui::screen::Screen) the app would and
-//! [`print`](plait_tui::screen::Screen::print)s it, so it can be piped into
+//! [`Screen`](gitten_tui::screen::Screen) the app would and
+//! [`print`](gitten_tui::screen::Screen::print)s it, so it can be piped into
 //! `less -R` or diffed against yesterday's output. That is what `core`'s
 //! `paint` example is for the pipeline, and it exists for the same reason
 //! `AGENTS.md` says never to launch the app unannounced — a window appearing
 //! interrupts whoever is at the keyboard, and a frame on stdout does not.
 
-use plait_core::host::Host;
-use plait_tui::commits::Commits;
-use plait_tui::diff::Diff;
-use plait_tui::screen::{Ink, Screen};
+use gitten_core::host::Host;
+use gitten_tui::commits::Commits;
+use gitten_tui::diff::Diff;
+use gitten_tui::screen::{Ink, Screen};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -40,7 +40,7 @@ fn read(path: &str) -> String {
     match std::fs::read(path) {
         Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(e) => {
-            eprintln!("plait: {path}: {e}");
+            eprintln!("gitten: {path}: {e}");
             std::process::exit(1);
         }
     }
@@ -60,7 +60,7 @@ fn main() {
     if let Some(name) = env("WRAP") {
         if !host.wrap.select(&name) {
             eprintln!(
-                "plait: unknown wrap {name:?}; have {}",
+                "gitten: unknown wrap {name:?}; have {}",
                 host.wrap.names().join(", ")
             );
         }
@@ -68,7 +68,7 @@ fn main() {
     if let Some(name) = env("THEME") {
         if !host.select_theme(&name) {
             eprintln!(
-                "plait: unknown theme {name:?}; have {}",
+                "gitten: unknown theme {name:?}; have {}",
                 host.themes.names().join(", ")
             );
         }
@@ -80,18 +80,18 @@ fn main() {
     let status = match which.as_str() {
         "diff" => {
             let files = match where_.as_str() {
-                "--fixtures" => plait_core::parse_unified_diff(&read("fixtures/big.diff")),
+                "--fixtures" => gitten_core::parse_unified_diff(&read("fixtures/big.diff")),
                 repo => {
                     let spec = rest.unwrap_or_default();
-                    match plait_git::diff(
-                        plait_git::open(&PathBuf::from(repo)).as_ref(),
+                    match gitten_git::diff(
+                        gitten_git::open(&PathBuf::from(repo)).as_ref(),
                         &spec,
                         &host.differ,
                         &Default::default(),
                     ) {
                         Ok(f) => f,
                         Err(e) => {
-                            eprintln!("plait: {e}");
+                            eprintln!("gitten: {e}");
                             std::process::exit(1);
                         }
                     }
@@ -119,13 +119,13 @@ fn main() {
         }
         "commits" => {
             let commits = match where_.as_str() {
-                "--fixtures" => plait_core::parse_log(&read("fixtures/log.txt")),
+                "--fixtures" => gitten_core::parse_log(&read("fixtures/log.txt")),
                 repo => {
                     let limit = rest.and_then(|n| n.parse().ok()).unwrap_or(5000);
-                    match plait_git::open(&PathBuf::from(repo)).log(limit) {
+                    match gitten_git::open(&PathBuf::from(repo)).log(limit) {
                         Ok(c) => c,
                         Err(e) => {
-                            eprintln!("plait: {e}");
+                            eprintln!("gitten: {e}");
                             std::process::exit(1);
                         }
                     }
@@ -149,7 +149,7 @@ fn main() {
             view.status()
         }
         other => {
-            eprintln!("plait: no such view {other:?}; try `diff` or `commits`");
+            eprintln!("gitten: no such view {other:?}; try `diff` or `commits`");
             std::process::exit(1);
         }
     };
@@ -164,6 +164,6 @@ fn main() {
 
     let mut out = std::io::stdout().lock();
     if let Err(e) = screen.print(&mut out) {
-        eprintln!("plait: {e}");
+        eprintln!("gitten: {e}");
     }
 }

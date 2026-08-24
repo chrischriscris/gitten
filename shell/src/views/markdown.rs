@@ -4,7 +4,7 @@
 //! the same prepared lines the built-in takes, and draws them with the markers
 //! gone — `## ` off the front and the row a size larger, `**` off a word that is
 //! now simply bold, a link down to its text. The structural work is
-//! [`plait_core::markdown`]; what is here is pixels.
+//! [`gitten_core::markdown`]; what is here is pixels.
 //!
 //! # What fixed row height buys and costs
 //!
@@ -63,15 +63,15 @@ use super::diff::{
     row_frame, scrolled, selected, slice, slice_shared, Hit, Rows, Scratch, PAD, ROW_H, SIGN_W,
     TEXT_CHROME,
 };
+use gitten_core::host::Host;
+use gitten_core::markdown::{flow_table, lay_out_tables, Block, Grid, Layout, TableRow};
+use gitten_core::runs::surfaces;
+use gitten_core::select::Selected;
+use gitten_core::syntax::Token;
+use gitten_core::theme::Rgb;
+use gitten_core::wrap::{Break, Budget, Wrap, Wrapped};
+use gitten_core::{LineKind, Span};
 use gpui::*;
-use plait_core::host::Host;
-use plait_core::markdown::{flow_table, lay_out_tables, Block, Grid, Layout, TableRow};
-use plait_core::runs::surfaces;
-use plait_core::select::Selected;
-use plait_core::syntax::Token;
-use plait_core::theme::Rgb;
-use plait_core::wrap::{Break, Budget, Wrap, Wrapped};
-use plait_core::{LineKind, Span};
 
 /// How a rendered markdown row is proportioned. A struct rather than constants
 /// because these are the numbers someone will want to disagree with — and rule 1
@@ -121,7 +121,7 @@ impl Metrics {
     /// capped by [`ROW_H`] and not by the font, but it is *relative* to the body
     /// size, so a larger font has to give up the top of the scale rather than
     /// draw outside its row.
-    pub fn for_font(font: &plait_core::font::Font) -> Self {
+    pub fn for_font(font: &gitten_core::font::Font) -> Self {
         // A glyph needs roughly 1.2x its point size of line box, so this is the
         // largest a row can hold. At the default 14px body size it lands at 18px,
         // which is where the scale was pinned when it was a constant.
@@ -229,7 +229,7 @@ pub struct MarkdownRows {
 /// One table row re-laid-out to the window: the sub-rows of its grid laid end to
 /// end, and everything that indexes them.
 ///
-/// The shell's copy of [`plait_core::markdown::FlowRow`], and it exists for one
+/// The shell's copy of [`gitten_core::markdown::FlowRow`], and it exists for one
 /// reason: `SharedString`. A row is sliced per visible row per frame through the
 /// same `slice` every other row uses, and that is a refcount bump on a
 /// `SharedString` and a `to_string` on a `String`.
@@ -555,7 +555,7 @@ impl Rows for MarkdownRows {
         true
     }
 
-    fn build(&mut self, mut f: plait_core::prepared::File) {
+    fn build(&mut self, mut f: gitten_core::prepared::File) {
         self.rows.push(Row::File {
             path: std::mem::take(&mut f.path).into(),
             adds: f.adds,
@@ -970,7 +970,7 @@ impl MarkdownRows {
                 .font_weight(FontWeight::BOLD),
             // A fence's language label is punctuation the reader should be able
             // to skip. A table's pipes are too, but a table is drawn verbatim —
-            // see the note on `Block::Table` in `plait_core::markdown`.
+            // see the note on `Block::Table` in `gitten_core::markdown`.
             Block::Fence => body.text_color(rgb(md.marker)),
             _ => body,
         };
@@ -983,11 +983,11 @@ mod tests {
     // By name, not a glob: `use gpui::*` in the parent shadows `#[test]`.
     use super::{MarkdownRows, Metrics, Row};
     use crate::views::diff::{Diff, Rows, TextRows, PAD, TEXT_CHROME};
-    use plait_core::host::Host;
-    use plait_core::markdown::Block;
-    use plait_core::prepared::prepare;
-    use plait_core::syntax::Kind;
-    use plait_core::{parse_unified_diff, LineKind};
+    use gitten_core::host::Host;
+    use gitten_core::markdown::Block;
+    use gitten_core::prepared::prepare;
+    use gitten_core::syntax::Kind;
+    use gitten_core::{parse_unified_diff, LineKind};
     use std::rc::Rc;
 
     /// A real diff body. The lone `\x20` lines are blank *context* lines: a diff
@@ -996,7 +996,7 @@ mod tests {
     const DOC: &str = "\
 diff --git a/README.md b/README.md
 @@ -1,9 +1,9 @@
- # plait
+ # gitten
 \x20
 -A git client with **bold** claims and [a link](https://example.com/long/url).
 +A git client with **bolder** claims and [a link](https://example.com/other/url).
@@ -1121,7 +1121,7 @@ diff --git a/README.md b/README.md
     #[test]
     fn the_markers_are_gone_from_the_text_that_will_be_drawn() {
         let t = texts(&built(DOC));
-        assert!(t.contains(&"plait".to_string()), "hashes survived: {t:?}");
+        assert!(t.contains(&"gitten".to_string()), "hashes survived: {t:?}");
         assert!(
             t.iter().any(|l| l == "one"),
             "a bullet marker survived: {t:?}"
@@ -1170,7 +1170,7 @@ diff --git a/README.md b/README.md
             .iter()
             .find(|t| t.kind == Kind::Heading)
             .expect("a heading token");
-        assert_eq!(&text[t.range()], "plait");
+        assert_eq!(&text[t.range()], "gitten");
     }
 
     #[test]
@@ -1281,7 +1281,7 @@ diff --git a/README.md b/README.md
     #[test]
     fn metrics_derived_from_the_default_font_match_the_constants_they_replaced() {
         // The scale used to be pixel constants. Deriving it must not move it.
-        let m = Metrics::for_font(&plait_core::font::Font::default());
+        let m = Metrics::for_font(&gitten_core::font::Font::default());
         assert!((m.size(1) - 18.0).abs() < 0.35, "h1 moved to {}", m.size(1));
         assert!((m.size(2) - 16.5).abs() < 0.35, "h2 moved to {}", m.size(2));
         assert!((m.size(4) - 14.0).abs() < 0.01, "h4 is not the body size");
@@ -1292,9 +1292,9 @@ diff --git a/README.md b/README.md
     fn a_bigger_font_gives_up_the_top_of_the_scale_rather_than_the_row() {
         // The constraint is the row, not the font: at a 20px body size a 1.3x h1
         // would be 26px and clip into the row below, so it is capped instead.
-        let big = plait_core::font::Font {
+        let big = gitten_core::font::Font {
             size: 20.0,
-            ..plait_core::font::Font::default()
+            ..gitten_core::font::Font::default()
         };
         let m = Metrics::for_font(&big);
         for level in 1..=6u8 {
@@ -1313,9 +1313,9 @@ diff --git a/README.md b/README.md
     #[test]
     fn a_proportional_font_turns_table_padding_off() {
         // The whole reason `monospaced` is on the font rather than assumed here.
-        let prop = plait_core::font::Font {
+        let prop = gitten_core::font::Font {
             monospaced: false,
-            ..plait_core::font::Font::default()
+            ..gitten_core::font::Font::default()
         };
         assert!(!Metrics::for_font(&prop).layout.monospaced);
     }

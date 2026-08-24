@@ -1,9 +1,9 @@
 [package]
-name = "plait-tui"
+name = "gitten-tui"
 version = "0.0.0"
 edition = "2021"
 
-# The terminal door. Everything above drawing is `core` and `plait-git`, exactly
+# The terminal door. Everything above drawing is `core` and `gitten-git`, exactly
 # as it is for the window and the browser; what is here is a cell grid, the
 # presentations that fill it and the escape codes that put it on screen.
 #
@@ -18,8 +18,8 @@ edition = "2021"
 # answer to the same question. Already in the lock file as a gpui dependency, so
 # it costs no download and no fresh compile.
 [dependencies]
-plait-app = { path = "../app" }
-plait-core = { path = "../core" }
-plait-git = { path = "../git" }
+gitten-app = { path = "../app" }
+gitten-core = { path = "../core" }
+gitten-git = { path = "../git" }
 crossterm = "0.29"
 unicode-width = "0.2"

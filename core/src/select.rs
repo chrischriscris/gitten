@@ -46,7 +46,7 @@
 use crate::rows::RowRef;
 use std::ops::Range;
 
-/// What the mouse does besides select. `[mouse]` in `plait.toml`.
+/// What the mouse does besides select. `[mouse]` in `gitten.toml`.
 ///
 /// One field, and it is here rather than beside the renderer because it is a
 /// question about a *selection* — what finishing one means — and a client that

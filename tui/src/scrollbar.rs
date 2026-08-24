@@ -1,7 +1,7 @@
 //! A column of cells that says where you are in a list, and can be dragged.
 //!
 //! Two halves, and the split is the same one everything else in this app has:
-//! **where the thumb goes is [`plait_core::view::Viewport::thumb`]** — arithmetic
+//! **where the thumb goes is [`gitten_core::view::Viewport::thumb`]** — arithmetic
 //! about a list, shared with every other door — and what it is *made of* is here,
 //! because a glyph is a UI.
 //!
@@ -26,8 +26,8 @@
 //! `[view] scrollbar = false` turns it off entirely.
 
 use crate::screen::Screen;
-use plait_core::host::Host;
-use plait_core::view::Viewport;
+use gitten_core::host::Host;
+use gitten_core::view::Viewport;
 
 /// What a scrollbar is made of.
 ///

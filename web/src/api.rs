@@ -6,18 +6,18 @@
 //! fetched constantly and therefore carrying nothing derivable from `meta`.
 //!
 //! The colours are resolved here rather than named, because
-//! [`Theme::syntax_on`](plait_core::theme::Theme::syntax_on) is where the
+//! [`Theme::syntax_on`](gitten_core::theme::Theme::syntax_on) is where the
 //! contrast floor is applied and a client that picked its own colours would
 //! quietly not have one.
 
 use crate::json::*;
 use crate::log::Log;
 use crate::rows::{pieces, Doc, Piece, Row};
-use plait_core::graph::{Draw, MAX_LANES};
-use plait_core::host::Host;
-use plait_core::syntax::Kind;
-use plait_core::theme::{Surface, Theme};
-use plait_core::LineKind;
+use gitten_core::graph::{Draw, MAX_LANES};
+use gitten_core::host::Host;
+use gitten_core::syntax::Kind;
+use gitten_core::theme::{Surface, Theme};
+use gitten_core::LineKind;
 
 /// The name a client uses for a syntax class.
 ///
@@ -292,7 +292,7 @@ pub fn rows(out: &mut String, doc: &Doc, from: usize, count: usize) {
 }
 
 /// The commit graph. Lanes come from
-/// [`assign_lanes`](plait_core::assign_lanes) — the geometry is `core`'s, and
+/// [`assign_lanes`](gitten_core::assign_lanes) — the geometry is `core`'s, and
 /// what a frontend adds is a curve.
 /// Everything about the commit list that a scroll does not change: the theme,
 /// how wide the gutter is, and how many lanes there really are.
@@ -322,7 +322,7 @@ pub fn commits_meta(out: &mut String, log: &Log, host: &Host, label: &str) {
 /// A window of the commit list, with each row's graph already resolved.
 ///
 /// The **shape** of a row — which halves of which lanes exist, which curve pairs
-/// with which — is [`plait_core::graph::plan`], the same plan the window paints
+/// with which — is [`gitten_core::graph::plan`], the same plan the window paints
 /// as Bézier curves and the terminal paints as box characters. What crosses the
 /// wire is that plan, not a drawing of it: turning a half-curve into an SVG path
 /// is arithmetic, and it is the client's.
@@ -344,7 +344,7 @@ pub fn commits(out: &mut String, log: &Log, host: &Host, from: usize, count: usi
             object(o, |o, f| {
                 field_str(o, f, "sha", &c.short);
                 field_str(o, f, "author", &c.author);
-                field_str(o, f, "initials", &plait_core::initials(&c.author));
+                field_str(o, f, "initials", &gitten_core::initials(&c.author));
                 // Resolved here because the hash that picks it is `Theme`'s,
                 // and a client reimplementing it would drift the moment the
                 // palette changed length.
@@ -401,9 +401,9 @@ fn draw(out: &mut String, first: &mut bool, d: &Draw) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use plait_core::parse_unified_diff;
-    use plait_core::prepared::prepare;
-    use plait_core::wrap::Off;
+    use gitten_core::parse_unified_diff;
+    use gitten_core::prepared::prepare;
+    use gitten_core::wrap::Off;
 
     const DIFF: &str = "\
 diff --git a/a.rs b/a.rs
@@ -501,7 +501,7 @@ diff --git a/a.rs b/a.rs
     #[test]
     fn the_commit_payload_is_well_formed() {
         // sha, short, parents, author, timestamp, subject — see `parse_log`.
-        let log = plait_core::parse_log(
+        let log = gitten_core::parse_log(
             "aaaa1111\x1faaaa111\x1fbbbb2222\x1fAda Lovelace\x1f1700000000\x1ffirst\x1e\
              bbbb2222\x1fbbbb222\x1f\x1fAda Lovelace\x1f1699999999\x1froot\x1e",
         );

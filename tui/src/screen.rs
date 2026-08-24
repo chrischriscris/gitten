@@ -37,7 +37,7 @@
 //! instead of a broken screen. `docs/` has the note on what fixing it properly
 //! would take.
 
-use plait_core::theme::{Rgb, Style};
+use gitten_core::theme::{Rgb, Style};
 use std::io::{self, Write};
 use unicode_width::UnicodeWidthChar;
 
@@ -85,7 +85,7 @@ impl Ink {
 
     /// A [`Style`] from the theme, on a background the theme resolved it
     /// against. The two travel together everywhere in the diff view — see
-    /// [`Theme::syntax_on`](plait_core::theme::Theme::syntax_on).
+    /// [`Theme::syntax_on`](gitten_core::theme::Theme::syntax_on).
     pub const fn styled(style: Style, bg: Rgb) -> Self {
         Self {
             fg: style.fg,
@@ -403,7 +403,7 @@ fn sgr(out: &mut impl Write, ink: Ink) -> io::Result<()> {
 /// Clipping rather than wrapping, always: a row is a row, and a presentation
 /// that wanted two asks for two. That is the same constraint the GPUI shell has
 /// for the same reason — a wrapped line is *more rows*, decided before anything
-/// is drawn, by [`plait_core::wrap`].
+/// is drawn, by [`gitten_core::wrap`].
 pub struct Pen<'a> {
     cells: &'a mut [Cell],
     x: usize,
@@ -443,7 +443,7 @@ impl Pen<'_> {
     /// calls this, then draws the text, and the pen does the rest. Doing it by
     /// slicing the text instead is the obvious alternative and it is wrong: the
     /// syntax tokens and the intraline spans address the *line*, so a slice
-    /// taken before [`plait_core::runs::runs`] runs pairs styling with the wrong
+    /// taken before [`gitten_core::runs::runs`] runs pairs styling with the wrong
     /// bytes.
     pub fn scroll(&mut self, cols: usize) {
         self.skip = cols;

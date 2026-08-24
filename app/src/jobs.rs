@@ -1,6 +1,6 @@
 //! Serial background jobs and repository invalidation generations.
 //!
-//! A job is I/O, so this lives in `plait-app`, never `core`. The runner knows
+//! A job is I/O, so this lives in `gitten-app`, never `core`. The runner knows
 //! nothing about git or a UI: it executes extension and built-in jobs through
 //! the same object-safe seam and reports lifecycle events to whichever client
 //! owns it.
@@ -76,7 +76,7 @@ impl Runner {
         let (commands, work) = mpsc::channel();
         let (reports, events) = mpsc::channel();
         std::thread::Builder::new()
-            .name("plait-jobs".into())
+            .name("gitten-jobs".into())
             .spawn(move || worker(work, reports))
             .expect("failed to start job worker");
         Self {

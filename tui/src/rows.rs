@@ -1,6 +1,6 @@
 //! The seam: one file's diff, turned into rows and drawn into a terminal.
 //!
-//! [`Rows`] is [`plait_core::rows::Present`] plus a `render`, and that split is
+//! [`Rows`] is [`gitten_core::rows::Present`] plus a `render`, and that split is
 //! the whole design. Claiming files, holding rows, counting how many rows a
 //! wrapped line takes — none of that knows what a UI is, so none of it is here;
 //! what is here is the part whose type is a pen over a row of cells.
@@ -25,20 +25,20 @@
 //!
 //! `render` is handed a [`Pen`] over exactly the cells it may write and cannot
 //! leave them. No allocation is required to draw a row: the run list comes from
-//! [`plait_core::runs::runs`] into a buffer the caller owns and reuses, and the
+//! [`gitten_core::runs::runs`] into a buffer the caller owns and reuses, and the
 //! text is sliced out of the line rather than copied. That is the terminal's
 //! version of "nothing on the render path allocates per frame".
 
 use crate::screen::{self, Ink, Pen};
 use crate::{MAX_LINE_CHARS, MIN_WRAP_COLS};
-use plait_core::host::Host;
-use plait_core::prepared::File;
-use plait_core::rows::{Entry, Flat, Present, Row};
-use plait_core::runs::{runs, Run};
-use plait_core::select::{Hit, Selected};
-use plait_core::theme::{DiffPalette, Rgb, Style, Surface, Theme};
-use plait_core::wrap::Wrap;
-use plait_core::LineKind;
+use gitten_core::host::Host;
+use gitten_core::prepared::File;
+use gitten_core::rows::{Entry, Flat, Present, Row};
+use gitten_core::runs::{runs, Run};
+use gitten_core::select::{Hit, Selected};
+use gitten_core::theme::{DiffPalette, Rgb, Style, Surface, Theme};
+use gitten_core::wrap::Wrap;
+use gitten_core::LineKind;
 use std::ops::Range;
 
 /// Everything a row needs to know beyond which row it is.
@@ -63,7 +63,7 @@ pub struct Frame<'a> {
     ///
     /// A different thing from `current` and a different colour: that one is a
     /// bar under the row the keyboard is on, and this one is chosen text. The
-    /// model behind it is [`plait_core::select`], shared with the window, so a
+    /// model behind it is [`gitten_core::select`], shared with the window, so a
     /// wrapped line copies once in both.
     pub sel: Option<Selected>,
 }
@@ -127,7 +127,7 @@ pub trait Rows: Present {
     ///
     /// The offset is into the **logical** row's text, not the visual row's, so a
     /// caret on the third row of a wrapped line is the same kind of thing as one
-    /// on an unwrapped line — see [`plait_core::select`]. `None` means the row
+    /// on an unwrapped line — see [`gitten_core::select`]. `None` means the row
     /// takes no part in a selection, and defaults to it: an extension's
     /// presentation compiles unchanged and is simply not selectable until it says
     /// where its text is.
@@ -181,7 +181,7 @@ impl Layouts {
     pub fn builtin() -> Self {
         let mut l = Self(Vec::new());
         l.register("unified", |_| vec![Box::new(TextRows::default())]);
-        // The same name the desktop registers and `plait.toml` documents:
+        // The same name the desktop registers and `gitten.toml` documents:
         // `diff.layout` is data, and one value has to open this presentation
         // from every client that reads the file.
         l.register("split", |_| {
@@ -376,7 +376,7 @@ pub fn line_colors(kind: LineKind, moved: bool, p: &DiffPalette) -> (Rgb, Rgb, &
 /// the window still reads as a block of colour.
 #[allow(clippy::too_many_arguments)]
 pub fn text_run(
-    line: &plait_core::prepared::Line,
+    line: &gitten_core::prepared::Line,
     span: std::ops::Range<usize>,
     theme: &Theme,
     row_ink: Ink,
@@ -416,7 +416,7 @@ pub fn text_run(
 /// `core`'s contrast table doing what it is for, and the window resolves the same
 /// way.
 fn piece(
-    line: &plait_core::prepared::Line,
+    line: &gitten_core::prepared::Line,
     run: &Run,
     at: Range<usize>,
     on: bool,
@@ -624,22 +624,22 @@ impl Rows for TextRows {
 }
 
 /// Runs the shared pipeline for a set of presentations. A thin alias for
-/// [`plait_core::rows::assemble`] with this frontend's clip budget applied, so
+/// [`gitten_core::rows::assemble`] with this frontend's clip budget applied, so
 /// no caller in here repeats the number.
 pub fn assemble(
-    files: &[plait_core::FileDiff],
+    files: &[gitten_core::FileDiff],
     host: &Host,
     owners: &mut [Box<dyn Rows>],
-) -> plait_core::rows::Assembled {
-    plait_core::rows::assemble(files, &host.syntax, MAX_LINE_CHARS, owners)
+) -> gitten_core::rows::Assembled {
+    gitten_core::rows::assemble(files, &host.syntax, MAX_LINE_CHARS, owners)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::screen::Screen;
-    use plait_core::parse_unified_diff;
-    use plait_core::wrap::{Off, Word};
+    use gitten_core::parse_unified_diff;
+    use gitten_core::wrap::{Off, Word};
 
     const DIFF: &str = "\
 diff --git a/a.rs b/a.rs
@@ -657,7 +657,7 @@ diff --git a/a.rs b/a.rs
     struct Harness {
         host: Host,
         owners: Vec<Box<dyn Rows>>,
-        order: Vec<plait_core::rows::RowRef>,
+        order: Vec<gitten_core::rows::RowRef>,
         screen: Screen,
     }
 
@@ -683,7 +683,7 @@ diff --git a/a.rs b/a.rs
             for o in self.owners.iter_mut() {
                 o.reflow(cols, host, wrap);
             }
-            self.order = plait_core::rows::expand(&self.order, &self.owners, None).order;
+            self.order = gitten_core::rows::expand(&self.order, &self.owners, None).order;
         }
 
         fn paint(&mut self, shift: usize, current: Option<usize>) {
@@ -696,7 +696,7 @@ diff --git a/a.rs b/a.rs
             &mut self,
             shift: usize,
             current: Option<usize>,
-            sel: Option<&plait_core::select::Selection>,
+            sel: Option<&gitten_core::select::Selection>,
         ) {
             let ink = Ink::new(self.host.theme.chrome.fg, self.host.theme.chrome.bg);
             self.screen.clear(ink);
@@ -776,8 +776,8 @@ diff --git a/a.rs b/a.rs
         let theme = &h.host.theme;
         let expected = theme
             .syntax_on(
-                plait_core::syntax::Kind::Keyword,
-                plait_core::theme::Surface::Removed,
+                gitten_core::syntax::Kind::Keyword,
+                gitten_core::theme::Surface::Removed,
             )
             .fg;
         // `let` on the removed line.
@@ -848,7 +848,7 @@ diff --git a/a.rs b/a.rs
 
     #[test]
     fn a_selection_is_painted_on_the_bytes_it_covers_and_no_others() {
-        use plait_core::select::{Caret, Selection};
+        use gitten_core::select::{Caret, Selection};
         let mut h = Harness::new(DIFF, 40, "unified");
         // `let x = 1;` on row 3: select `x = 1`.
         let mut sel = Selection::new(0, Caret::new((0, 3), 4, 3));
@@ -880,7 +880,7 @@ diff --git a/a.rs b/a.rs
         // it is the thing that just moved — but the row's changed word is still
         // read against the *selected* surface, not left in a colour chosen for a
         // removal it is no longer drawn on.
-        use plait_core::select::{Caret, Selection};
+        use gitten_core::select::{Caret, Selection};
         let mut h = Harness::new(DIFF, 40, "unified");
         let mut sel = Selection::new(0, Caret::new((0, 3), 0, 3));
         sel.extend(Caret::new((0, 3), 10, 3));
@@ -898,7 +898,7 @@ diff --git a/a.rs b/a.rs
 
     #[test]
     fn a_header_lights_up_under_a_selection_too() {
-        use plait_core::select::{Caret, Selection};
+        use gitten_core::select::{Caret, Selection};
         let mut h = Harness::new(DIFF, 40, "unified");
         let mut sel = Selection::new(0, Caret::new((0, 0), 0, 0));
         sel.extend(Caret::new((0, 0), 4, 0));

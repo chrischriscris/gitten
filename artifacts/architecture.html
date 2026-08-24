@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>plait — Architecture &amp; Algorithms</title>
+<title>gitten — Architecture &amp; Algorithms</title>
 <style>
   :root {
     --bg: #0e0d0c;
@@ -187,7 +187,7 @@
 <body>
 
 <header>
-  <span class="logo">plait</span>
+  <span class="logo">gitten</span>
   <span class="tagline">a desktop git client — architecture &amp; algorithms</span>
   <nav id="nav">
     <button data-sec="overview" class="active">Overview</button>
@@ -204,7 +204,7 @@
 
 <!-- ================= OVERVIEW ================= -->
 <section id="overview" class="active">
-  <h1>plait</h1>
+  <h1>gitten</h1>
   <p class="lead">A desktop git client with lazygit's keyboard model, written in Rust on GPUI. It is a <em>reader</em>: it acquires, parses, prepares and draws git data — commits and diffs — as fast as it can, with every stage testable without a window.</p>
 
   <h2>Three rules, in priority order</h2>
@@ -233,19 +233,19 @@
   <h2>Data flow at a glance</h2>
   <div class="arch">
     <div class="arch-box arch-git">
-      <div class="arch-title">plait-git — the acquisition layer</div>
+      <div class="arch-title">gitten-git — the acquisition layer</div>
       <p class="muted" style="margin:0">The only crate that talks to a repository. Reads through <code>gix</code> (no process spawn on the hot path); writes through the <code>git</code> binary so hooks, credential helpers and <code>.gitconfig</code> behave exactly as they do in a terminal. Both behind one surface.</p>
       <div class="arch-tags"><span class="arch-tag">log</span><span class="arch-tag">diff</span><span class="arch-tag">describe</span></div>
     </div>
     <div class="flow"><span>bytes</span><span class="arrow">▼</span></div>
     <div class="arch-box arch-core">
-      <div class="arch-title">plait-core — pure, zero deps</div>
+      <div class="arch-title">gitten-core — pure, zero deps</div>
       <p class="muted" style="margin:0">Everything except drawing and input. Parsing, preparation, lane assignment, syntax, theming, fonts, the swappable <code>Host</code>.</p>
       <div class="arch-tags"><span class="arch-tag">parse_unified_diff</span><span class="arch-tag">assign_lanes</span><span class="arch-tag">prepared::prepare</span><span class="arch-tag">intraline</span><span class="arch-tag">syntax</span><span class="arch-tag">theme</span><span class="arch-tag">font</span><span class="arch-tag">host</span></div>
     </div>
     <div class="flow"><span>rows, colours</span><span class="arrow">▼</span></div>
     <div class="arch-box arch-shell">
-      <div class="arch-title">plait-shell — GPUI</div>
+      <div class="arch-title">gitten-shell — GPUI</div>
       <p class="muted" style="margin:0">Drawing and input, and as little else as possible. Views consume already-loaded data; they never mutate it.</p>
       <div class="arch-tags"><span class="arch-tag">views/diff</span><span class="arch-tag">views/markdown</span><span class="arch-tag">views/commits</span><span class="arch-tag">graph</span><span class="arch-tag">config</span><span class="arch-tag">session</span><span class="arch-tag">stats</span></div>
     </div>
@@ -267,7 +267,7 @@
   <h1>The three crates</h1>
   <p class="lead">The interesting line is between the first two crates and the third. Everything below that line is pure, dependency-free and testable without a window.</p>
 
-  <h2>plait-core</h2>
+  <h2>gitten-core</h2>
   <div class="grid grid-2">
     <div class="card"><h3><code>lib.rs</code></h3><p class="muted">Commit &amp; diff parsing, <code>assign_lanes</code>, <code>intraline</code>, <code>replace_pairs</code>, <code>initials</code>.</p></div>
     <div class="card"><h3><code>prepared.rs</code></h3><p class="muted">A diff assembled into drawable rows: clip → intraline → syntax.</p></div>
@@ -279,19 +279,19 @@
   </div>
   <p class="muted">Four examples double as the headless test bench: <code>bench</code> (timings), <code>shape</code> (topology), <code>verify</code> (lane invariants), <code>paint</code> (the diff view in ANSI).</p>
 
-  <h2>plait-git</h2>
+  <h2>gitten-git</h2>
   <p class="muted">The only crate that talks to a repository. Today it shells out to the <code>git</code> binary for <code>log</code>, <code>diff</code> and <code>describe</code>; reads are meant to move to <code>gix</code> while writes stay on the binary permanently — shelling out is what gets hooks, credential helpers and <code>.gitconfig</code> semantics exactly right. Both paths sit behind one surface, so a frontend never learns which ran.</p>
 
-  <h2>plait-shell</h2>
+  <h2>gitten-shell</h2>
   <div class="grid grid-2">
     <div class="card"><h3><code>main.rs</code></h3><p class="muted">Argument parsing, data loading, the window, the <code>Host</code>.</p></div>
     <div class="card"><h3><code>views/diff.rs</code></h3><p class="muted">The <code>Rows</code> seam, <code>TextRows</code>, run-list merging, row furniture.</p></div>
     <div class="card"><h3><code>views/markdown.rs</code></h3><p class="muted"><code>MarkdownRows</code>: the rendered-Markdown presentation and its metrics.</p></div>
     <div class="card"><h3><code>views/commits.rs</code></h3><p class="muted">The commit list, author initials, row layout.</p></div>
     <div class="card"><h3><code>graph.rs</code></h3><p class="muted">Lane geometry &amp; painting: quads, paths, one canvas per row.</p></div>
-    <div class="card"><h3><code>config.rs</code></h3><p class="muted"><code>plait.toml</code>: parse, apply, watch, and the live <code>Host</code> global.</p></div>
+    <div class="card"><h3><code>config.rs</code></h3><p class="muted"><code>gitten.toml</code>: parse, apply, watch, and the live <code>Host</code> global.</p></div>
     <div class="card"><h3><code>session.rs</code></h3><p class="muted">The row you were on, so <code>./dev.sh</code> puts you back after a restart.</p></div>
-    <div class="card"><h3><code>stats.rs</code></h3><p class="muted">The counting allocator and the <code>PLAIT_STATS</code> overlay.</p></div>
+    <div class="card"><h3><code>stats.rs</code></h3><p class="muted">The counting allocator and the <code>GITTEN_STATS</code> overlay.</p></div>
   </div>
 
   <h2>Which way data moves</h2>
@@ -320,8 +320,8 @@
     <div class="stage">
       <div class="rail"><div class="dot">1</div><div class="line"></div></div>
       <div class="body">
-        <div class="name">Acquire <span class="pill git">plait-git</span></div>
-        <div class="where">plait_git::diff → bytes</div>
+        <div class="name">Acquire <span class="pill git">gitten-git</span></div>
+        <div class="where">gitten_git::diff → bytes</div>
         <p>Reads bytes — never <code>read_to_string</code>, because commit metadata is not guaranteed UTF-8 and real history carries Latin-1 author names.</p>
       </div>
     </div>
@@ -604,7 +604,7 @@ pub fn readable(fg: Rgb, bg: Rgb, target: f32) -> Rgb</code></pre>
   <p class="muted"><code>readable</code> costs six <code>powf</code> per call and <code>render</code> asks for a style per run per visible row per frame. So resolution happens once, in <code>rebuild()</code>, into a <code>12 × 5</code> table of <code>Style</code>. Render is one index. After mutating <code>syntax</code>, <code>diff</code> or <code>min_contrast</code> directly, call <code>rebuild()</code>.</p>
 
   <h2>Changing it without a rebuild</h2>
-  <pre><code>plait config &gt; plait.toml     # a complete, correct starting file
+  <pre><code>gitten config &gt; gitten.toml     # a complete, correct starting file
 
 [font]
 family = "JetBrainsMono Nerd Font Mono"
@@ -615,7 +615,7 @@ added_bg = "#16241a"
 
 [theme.syntax]
 comment = "#615a52 italic"</code></pre>
-  <p class="muted"><code>plait.toml</code> is re-read every time it is saved, and colours, the font family and the font size land <strong>on the next frame</strong> — no rebuild, no relaunch, no lost scroll position. Two fields cannot reload live and say so: <code>font.monospaced</code> (Markdown table padding rewrites row text during <code>prepare</code>) and <code>font.advance</code> (the widest-row guess is made once at load).</p>
+  <p class="muted"><code>gitten.toml</code> is re-read every time it is saved, and colours, the font family and the font size land <strong>on the next frame</strong> — no rebuild, no relaunch, no lost scroll position. Two fields cannot reload live and say so: <code>font.monospaced</code> (Markdown table padding rewrites row text during <code>prepare</code>) and <code>font.advance</code> (the widest-row guess is made once at load).</p>
   <p class="muted">The file holds <strong>data only</strong> — no expressions, no computed colours — because a settings panel has to be able to rewrite the file in place and cannot round-trip a function.</p>
 </section>
 
@@ -707,7 +707,7 @@ Diff::with_renderers(files, host, vec![
 </main>
 
 <footer>
-  Built from the plait <code>docs/</code> — architecture, diff-pipeline, commit-graph, syntax-highlighting, theming, extending, and the decisions. Numbers and commands live in <code>docs/measurements.md</code>.
+  Built from the gitten <code>docs/</code> — architecture, diff-pipeline, commit-graph, syntax-highlighting, theming, extending, and the decisions. Numbers and commands live in <code>docs/measurements.md</code>.
 </footer>
 
 <script>

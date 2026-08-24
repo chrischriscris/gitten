@@ -3,7 +3,7 @@
 //! The rows are [`Keymap::help`]'s — `core`'s projection of the *active* modes
 //! against the keymap and the command registry, which is the part two clients
 //! must not say differently. What is here is only how wide to draw it and in
-//! which ink; a binding added by `plait.toml` or by an extension appears in both
+//! which ink; a binding added by `gitten.toml` or by an extension appears in both
 //! without either being told.
 //!
 //! Two GPUI facts shape the element. It is [`deferred`], because it is painted
@@ -12,10 +12,10 @@
 //! dodge). And it is [`occlude`], because hit-testing is paint order too: an
 //! overlay that lets clicks fall through is a menu you act on through a hole.
 
+use gitten_core::command::HelpRow;
+use gitten_core::host::Host;
 use gpui::*;
 use gpui_component::StyledExt as _;
-use plait_core::command::HelpRow;
-use plait_core::host::Host;
 
 /// One bound row of the panel. Taller than a diff row: a menu row is a target,
 /// even one nobody clicks.
@@ -34,7 +34,7 @@ const MIN_W: f32 = 280.0;
 /// A pure function of the host and the modes: nothing here has a list of keys in
 /// it, which is the whole test the title-bar pickers set for a control built on
 /// a registry.
-pub fn overlay(host: &Host, modes: &plait_core::command::Modes) -> AnyElement {
+pub fn overlay(host: &Host, modes: &gitten_core::command::Modes) -> AnyElement {
     let c = &host.theme.chrome;
     let rows = host.keys.help(&host.commands, modes);
 
@@ -148,8 +148,8 @@ mod tests {
     // By name, not a glob: `use gpui::*` in the parent shadows `#[test]` with
     // GPUI's own attribute macro and every test in here fails to expand.
     use super::panel_width;
-    use plait_core::command::{Commands, Keymap, Modes};
-    use plait_core::host::Host;
+    use gitten_core::command::{Commands, Keymap, Modes};
+    use gitten_core::host::Host;
 
     const MIN_W: f32 = super::MIN_W;
     const MAX_W: f32 = super::MAX_W;

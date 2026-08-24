@@ -1,4 +1,4 @@
-//! Stats for nerds. `PLAIT_STATS=1` turns the overlay on.
+//! Stats for nerds. `GITTEN_STATS=1` turns the overlay on.
 //!
 //! Frame timing here measures *how fast we can redraw*, not how often we do.
 //! GPUI is reactive and idles at zero frames; the overlay requests an animation
@@ -48,7 +48,7 @@ unsafe impl GlobalAlloc for Counting {
 }
 
 pub fn enabled() -> bool {
-    std::env::var("PLAIT_STATS").is_ok_and(|v| v != "0")
+    std::env::var("GITTEN_STATS").is_ok_and(|v| v != "0")
 }
 
 const RING: usize = 120;

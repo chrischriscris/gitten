@@ -163,7 +163,7 @@ given — one side of one hunk. The next hunk starts clean.
 ## Looking at it
 
 ```
-cargo run -q -p plait-core --example paint --release 40 .md
+cargo run -q -p gitten-core --example paint --release 40 .md
 ```
 
 Paints `fixtures/big.diff` in 24-bit ANSI using the same highlighters, the same

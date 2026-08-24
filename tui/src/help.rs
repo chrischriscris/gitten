@@ -2,7 +2,7 @@
 //!
 //! A pure function of [`Keymap`] and [`Commands`], which is the only interesting
 //! thing about it: nothing here has a list of keys in it, so a binding added by
-//! `plait.toml` or by an extension appears without being told to. That is the
+//! `gitten.toml` or by an extension appears without being told to. That is the
 //! same test the title-bar pickers pass in the GPUI client — a control that is a
 //! pure function of a registry is a control nobody has to remember to update.
 //!
@@ -11,8 +11,8 @@
 //! place that exists to stop you guessing.
 
 use crate::screen::{Ink, Screen};
-use plait_core::command::{Commands, HelpRow, Keymap, Modes};
-use plait_core::theme::Theme;
+use gitten_core::command::{Commands, HelpRow, Keymap, Modes};
+use gitten_core::theme::Theme;
 
 /// Widest the panel gets, in columns. Past this the descriptions are further
 /// from their keys than the eye will carry them.
@@ -50,7 +50,7 @@ pub fn paint(
     screen: &mut Screen,
     top: usize,
     height: usize,
-    host: &plait_core::host::Host,
+    host: &gitten_core::host::Host,
     modes: &Modes,
 ) {
     let theme: &Theme = &host.theme;
@@ -126,7 +126,7 @@ pub fn paint(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use plait_core::host::Host;
+    use gitten_core::host::Host;
 
     fn shown(host: &Host, modes: &Modes) -> Vec<String> {
         let mut screen = Screen::new(90, 40);

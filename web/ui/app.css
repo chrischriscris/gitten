@@ -3,7 +3,7 @@
  * Every value comes from `--` properties the script sets from the theme the
  * server sent, which is the same `Theme` the window draws from and has already
  * had the contrast floor applied. A hex code in this file would be a second
- * theme that no `plait.toml` can retune. */
+ * theme that no `gitten.toml` can retune. */
 
 * {
   box-sizing: border-box;

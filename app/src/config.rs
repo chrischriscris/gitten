@@ -6,8 +6,8 @@
 //! relaunch, no lost scroll position.
 //!
 //! It lives here rather than in `core` for one reason: reading a file is I/O,
-//! and `core` does none — the same rule that makes `plait-git` its own crate.
-//! It lived in `plait-shell` until there were three clients, at which point the
+//! and `core` does none — the same rule that makes `gitten-git` its own crate.
+//! It lived in `gitten-shell` until there were three clients, at which point the
 //! window was the only one that could read the file, which is not a property a
 //! config format should have.
 //!
@@ -39,7 +39,7 @@
 //! # One list, both directions
 //!
 //! Every colour is named once, in the `rgb_fields!` invocation below, which
-//! generates the setter *and* the writer from that one list. So `plait config`
+//! generates the setter *and* the writer from that one list. So `gitten config`
 //! emits a file that reads back identically, and a field cannot be added to the
 //! theme in a way that is settable but not dumpable — there is a round-trip test
 //! over the whole thing.
@@ -63,17 +63,17 @@
 //! All of them are applied to the `Host` regardless, so a relaunch picks them
 //! up, and [`apply`] says so in its warnings rather than leaving you guessing.
 
-use plait_core::differ::Whitespace;
-use plait_core::font::Font;
-use plait_core::host::Host;
-use plait_core::syntax::Kind;
-use plait_core::theme::{Rgb, Style, Theme};
+use gitten_core::differ::Whitespace;
+use gitten_core::font::Font;
+use gitten_core::host::Host;
+use gitten_core::syntax::Kind;
+use gitten_core::theme::{Rgb, Style, Theme};
 use std::path::{Path, PathBuf};
 
 /// Names every `Rgb` field of a [`Theme`] once, and generates both directions.
 ///
 /// A macro rather than two hand-written matches because two lists drift: the day
-/// a colour is added to the theme and only to the setter, `plait config` starts
+/// a colour is added to the theme and only to the setter, `gitten config` starts
 /// emitting a file that is quietly missing it.
 macro_rules! rgb_fields {
     ($( $table:literal : $( $name:literal = $($field:ident).+ ),+ $(,)? ; )+) => {
@@ -136,15 +136,15 @@ const KINDS: [(&str, Kind); Kind::COUNT] = [
     ("link", Kind::Link),
 ];
 
-/// Where the config lives: `$PLAIT_CONFIG`, else `./plait.toml`.
+/// Where the config lives: `$GITTEN_CONFIG`, else `./gitten.toml`.
 ///
 /// The working directory rather than a home directory, deliberately for now — a
 /// dev loop wants the file next to the code it is describing, and a per-user
 /// location is a product decision this does not need to make yet.
 pub fn path() -> PathBuf {
-    std::env::var_os("PLAIT_CONFIG")
+    std::env::var_os("GITTEN_CONFIG")
         .map(PathBuf::from)
-        .unwrap_or_else(|| "plait.toml".into())
+        .unwrap_or_else(|| "gitten.toml".into())
 }
 
 /// Reads and applies the config, if there is one.
@@ -262,7 +262,7 @@ fn apply_mouse(host: &mut Host, value: &toml::Value, warn: &mut Vec<String>) {
 ///
 /// A bare key at the top of the table is global; a sub-table is a mode, so
 /// `[keys.diff]` binds only where a diff is on screen. Both are the same call
-/// into [`plait_core::command::Keymap`], which is the only place that knows what
+/// into [`gitten_core::command::Keymap`], which is the only place that knows what
 /// a mode is.
 ///
 /// Three things it will not do, each because the alternative is a key that
@@ -289,7 +289,7 @@ fn apply_keys(host: &mut Host, value: &toml::Value, warn: &mut Vec<String>) {
                     bind_one(host, key, chord, command, warn);
                 }
             }
-            _ => bind_one(host, plait_core::command::GLOBAL, key, v, warn),
+            _ => bind_one(host, gitten_core::command::GLOBAL, key, v, warn),
         }
     }
 }
@@ -654,12 +654,12 @@ fn number(v: &toml::Value) -> Option<f32> {
 
 /// The whole of a host's appearance as a config file.
 ///
-/// What `plait config` prints, so there is a complete and correct starting point
+/// What `gitten config` prints, so there is a complete and correct starting point
 /// rather than a page of documentation to copy from. Generated from the same
 /// field list that reads it back, and a test round-trips it.
 pub fn dump(host: &Host) -> String {
     let mut out = String::with_capacity(4096);
-    out.push_str("# plait — saved while the window is open and applied on the next frame.\n");
+    out.push_str("# gitten — saved while the window is open and applied on the next frame.\n");
     out.push_str("# Colours are #rrggbb. Delete anything to fall back to the default.\n\n");
 
     let f = &host.font;
@@ -717,7 +717,7 @@ pub fn dump(host: &Host) -> String {
     out.push_str(&format!("scrollbar = {}\n\n", host.view.scrollbar));
 
     out.push_str("# In the terminal, finishing a drag puts it on the clipboard, the way that\n");
-    out.push_str("# terminal's own selection would — plait took the drag, so it owes you the\n");
+    out.push_str("# terminal's own selection would — gitten took the drag, so it owes you the\n");
     out.push_str("# copy. A click is a cursor move and never copies; `y` copies either way. The\n");
     out.push_str("# window has the platform's own cmd-c and ignores this.\n");
     out.push_str("[mouse]\n");
@@ -768,7 +768,7 @@ pub fn dump(host: &Host) -> String {
 
     // Every binding, grouped by mode, global first. Written out in full rather
     // than as a diff against the built-ins: a file that only lists what you
-    // changed cannot be read to find out what a key does, and `plait config`
+    // changed cannot be read to find out what a key does, and `gitten config`
     // exists to be read.
     out.push_str(
         "\n# Which command each key runs. A key at the top level is global; a key under\n",
@@ -778,14 +778,14 @@ pub fn dump(host: &Host) -> String {
     for c in host.commands.all() {
         out.push_str(&format!("#   {:<20} {}\n", c.name, c.doc));
     }
-    let mut modes: Vec<&str> = vec![plait_core::command::GLOBAL];
+    let mut modes: Vec<&str> = vec![gitten_core::command::GLOBAL];
     for b in host.keys.bindings() {
         if !modes.contains(&b.mode.as_str()) {
             modes.push(&b.mode);
         }
     }
     for mode in modes {
-        let header = match mode == plait_core::command::GLOBAL {
+        let header = match mode == gitten_core::command::GLOBAL {
             true => "[keys]".to_string(),
             false => format!("[keys.{mode}]"),
         };
@@ -793,7 +793,7 @@ pub fn dump(host: &Host) -> String {
         for b in host.keys.bindings().iter().filter(|b| b.mode == mode) {
             out.push_str(&format!(
                 "{:?} = {:?}\n",
-                plait_core::command::chord_string(&b.chord),
+                gitten_core::command::chord_string(&b.chord),
                 b.command
             ));
         }
@@ -858,7 +858,7 @@ pub fn watch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use plait_core::theme::Surface;
+    use gitten_core::theme::Surface;
 
     fn host() -> Host {
         Host::new()
@@ -871,19 +871,19 @@ mod tests {
         assert!(apply(&mut h, "").is_empty());
         assert_eq!((h.theme.clone(), h.font.clone()), before);
         // And a file that does not exist is not an error.
-        assert!(load(&mut h, Path::new("/nonexistent/plait.toml")).is_empty());
+        assert!(load(&mut h, Path::new("/nonexistent/gitten.toml")).is_empty());
     }
 
     #[test]
     fn a_key_reaches_the_keymap_in_the_mode_it_was_written_in() {
-        use plait_core::command::{Modes, Resolve};
+        use gitten_core::command::{Modes, Resolve};
         let mut h = host();
         let warn = apply(
             &mut h,
             "[keys]\n\"x\" = \"quit\"\n\n[keys.diff]\n\"x\" = \"diff.cycle-wrap\"\n",
         );
         assert!(warn.is_empty(), "{warn:?}");
-        let chord = [plait_core::command::Key::char('x')];
+        let chord = [gitten_core::command::Key::char('x')];
         assert_eq!(h.keys.resolve(&Modes::new(), &chord), Resolve::Run("quit"));
         let mut diff = Modes::new();
         diff.push("diff");
@@ -895,7 +895,7 @@ mod tests {
 
     #[test]
     fn a_key_can_be_unbound_and_not_only_moved() {
-        use plait_core::command::{Key, Modes, Resolve};
+        use gitten_core::command::{Key, Modes, Resolve};
         let mut h = host();
         assert!(apply(&mut h, "[keys]\n\"j\" = \"\"\n").is_empty());
         assert_eq!(
@@ -910,7 +910,7 @@ mod tests {
 
     #[test]
     fn a_binding_the_keymap_cannot_hold_warns_and_changes_nothing() {
-        use plait_core::command::{Key, Modes, Resolve};
+        use gitten_core::command::{Key, Modes, Resolve};
         let mut h = host();
         // As a string, because a `Resolve` borrows the map it came from.
         let before = match h.keys.resolve(&Modes::new(), &[Key::char('j')]) {
@@ -938,7 +938,7 @@ mod tests {
     fn a_command_an_extension_registered_is_bindable_from_the_file() {
         // The reason commands are validated against the host rather than a list
         // in here: the registry is the thing that knows what exists.
-        use plait_core::command::{Key, Modes, Resolve};
+        use gitten_core::command::{Key, Modes, Resolve};
         let mut h = host();
         h.commands
             .register("blame.toggle", "show blame beside the diff");
@@ -985,7 +985,7 @@ mod tests {
         assert!(warn.is_empty(), "{warn:?}");
         assert_eq!(
             h.theme.chrome.bg,
-            plait_core::theme::Theme::light().chrome.bg
+            gitten_core::theme::Theme::light().chrome.bg
         );
         assert_eq!(h.theme.name, "light");
     }
@@ -1006,7 +1006,7 @@ mod tests {
         );
         assert_eq!(
             h.theme.diff.removed_bg,
-            plait_core::theme::Theme::light().diff.removed_bg
+            gitten_core::theme::Theme::light().diff.removed_bg
         );
     }
 
@@ -1050,7 +1050,7 @@ mod tests {
             Some(0xff0000)
         );
         // The other two are untouched, which is the whole reason a pick can be
-        // trusted: `plait config` dumps every colour of the theme you are on,
+        // trusted: `gitten config` dumps every colour of the theme you are on,
         // and that must not repaint the ones you are not.
         assert_eq!(h.themes.get("light").map(|t| t.chrome.bg), Some(0xfaf7f1));
     }
@@ -1148,7 +1148,7 @@ mod tests {
     fn a_registered_algorithm_is_selectable_from_the_file() {
         // Rule 1, as a test: an extension's differ has to be reachable from the
         // config the same way a built-in's is.
-        use plait_core::differ::{Differ, Edit};
+        use gitten_core::differ::{Differ, Edit};
         struct Semantic;
         impl Differ for Semantic {
             fn name(&self) -> &'static str {
@@ -1175,7 +1175,7 @@ mod tests {
         // The same test as the differ's, for the same reason: an extension's wrap
         // has to be reachable from the file the day it is registered, and the
         // error message has to name it.
-        use plait_core::wrap::{Break, Wrap};
+        use gitten_core::wrap::{Break, Wrap};
         struct Sentence;
         impl Wrap for Sentence {
             fn name(&self) -> &'static str {

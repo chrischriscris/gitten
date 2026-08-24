@@ -1,22 +1,22 @@
 [package]
-name = "plait-app"
+name = "gitten-app"
 version = "0.0.0"
 edition = "2021"
 
 # What every client needs before it can draw, and nothing that draws.
 #
-# `core` is the pipeline and has no dependencies; `plait-git` is acquisition and
+# `core` is the pipeline and has no dependencies; `gitten-git` is acquisition and
 # is the only crate that talks to a repository. This is the third shared layer:
 # the config file, the command line, and turning what they say into loaded data.
 # It exists because all of that was written twice and about to be written a
-# third time, and because `plait.toml` was reachable only from behind GPUI —
+# third time, and because `gitten.toml` was reachable only from behind GPUI —
 # which made the window the only client that could be configured.
 #
 # `toml` and `notify` are here rather than in `core` for the reason `core` has
 # no dependencies at all: reading a file is I/O. Both are already in the lock
 # file, so neither adds a download or a fresh compile.
 [dependencies]
-plait-core = { path = "../core" }
-plait-git = { path = "../git" }
+gitten-core = { path = "../core" }
+gitten-git = { path = "../git" }
 toml = "0.8"
 notify = "7.0"

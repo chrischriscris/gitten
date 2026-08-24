@@ -1,4 +1,4 @@
-use plait_core::*;
+use gitten_core::*;
 use std::collections::BTreeMap;
 
 fn main() {

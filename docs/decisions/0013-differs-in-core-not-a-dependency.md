@@ -11,7 +11,7 @@ stands unchanged.
 
 [0001](0001-histogram-not-myers.md) said "`imara-diff`, Histogram. Diffing is a
 `trait Differ`." Neither half was true. There was no trait, `imara-diff` was
-never in the lock file, and nothing in the codebase diffed anything: `plait-git`
+never in the lock file, and nothing in the codebase diffed anything: `gitten-git`
 ran `git diff` and `parse_unified_diff` read the unified output back.
 
 That is a working diff viewer and a dead end. *Git* was choosing the algorithm,
@@ -30,7 +30,7 @@ finished unified diff has already been diffed by somebody else?
 edit script; line numbering, context and hunk headers are `differ::hunks`, shared
 by all of them.
 
-**`plait-git` acquires blob pairs, not diffs.** One `git diff --raw -z -M
+**`gitten-git` acquires blob pairs, not diffs.** One `git diff --raw -z -M
 --abbrev=64` names every changed path and both object ids; one `git cat-file
 --batch` streams every blob. Two processes, whatever the file count. `core`
 decides which lines correspond, afterwards.
@@ -48,7 +48,7 @@ that the shipped configuration reaches around the seam rather than through it â€
 the failure [0004](0004-markdown-second-highlighter.md) exists to avoid.
 
 Written out, the whole module including tests is smaller than the wrapper would
-have been, and `cargo test -p plait-core` still runs in 0.6 s.
+have been, and `cargo test -p gitten-core` still runs in 0.6 s.
 
 ## Why not keep git as the differ and expose its flags
 

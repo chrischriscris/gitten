@@ -1,7 +1,7 @@
 //! The commit list, and the graph gutter drawn in box-drawing characters.
 //!
-//! Topology is [`plait_core::assign_lanes`] and colour is
-//! [`plait_core::graph::Hues`], both untouched — this file decides only what a
+//! Topology is [`gitten_core::assign_lanes`] and colour is
+//! [`gitten_core::graph::Hues`], both untouched — this file decides only what a
 //! lane *looks like* in a cell grid, which is the same division
 //! `shell/src/graph.rs` has with its Bézier curves. Both frontends therefore
 //! agree about which branch is amber and where the overflow begins.
@@ -36,11 +36,11 @@
 
 use crate::screen::{Ink, Pen, Screen};
 use crate::scrollbar::{self, Bar};
-use plait_core::graph::{lane_count, Hues, MAX_LANES};
-use plait_core::host::Host;
-use plait_core::theme::{Rgb, Theme};
-use plait_core::view::Viewport;
-use plait_core::{assign_lanes, initials, Commit, GraphRow};
+use gitten_core::graph::{lane_count, Hues, MAX_LANES};
+use gitten_core::host::Host;
+use gitten_core::theme::{Rgb, Theme};
+use gitten_core::view::Viewport;
+use gitten_core::{assign_lanes, initials, Commit, GraphRow};
 
 /// Columns per lane: the glyph, then the gap a connector runs through.
 const LANE_W: usize = 2;
@@ -168,7 +168,7 @@ pub struct Commits {
     /// gutter is one width and it is this one.
     gutter: usize,
     cols: usize,
-    /// The cursor, the top row and the height. [`plait_core::view::Viewport`]
+    /// The cursor, the top row and the height. [`gitten_core::view::Viewport`]
     /// and not a pair of fields, because the diff view needs the same ones and
     /// two copies of a scroll rule drift — this one had already lost the name of
     /// its own margin.
@@ -197,7 +197,7 @@ impl Commits {
     /// No `Host`, deliberately: nothing here is resolved at load that a theme
     /// could change. A lane's colour is `theme.lane(hue)` and an author's is a
     /// hash and an index, both read on the frame that draws them — so editing
-    /// `plait.toml` recolours the list without rebuilding it. The shell resolves
+    /// `gitten.toml` recolours the list without rebuilding it. The shell resolves
     /// its author colours once at construction and does not.
     pub fn new(commits: Vec<Commit>) -> Self {
         Self::with_glyphs(commits, Glyphs::default())
@@ -600,7 +600,7 @@ impl Commits {
 /// Walks the history once, resolving every row's lanes to hues.
 ///
 /// The order of the claims and releases is not incidental — see
-/// [`plait_core::graph::Hues`], which documents it, because getting it wrong
+/// [`gitten_core::graph::Hues`], which documents it, because getting it wrong
 /// wastes a colour per merge and a busy repository then runs out.
 fn draws(commits: &[Commit], rows: &[GraphRow]) -> Vec<Draw> {
     let mut hues = Hues::new();
@@ -656,7 +656,7 @@ fn draws(commits: &[Commit], rows: &[GraphRow]) -> Vec<Draw> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use plait_core::parse_log;
+    use gitten_core::parse_log;
 
     /// A merge of two branches off one root, newest first:
     ///

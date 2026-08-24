@@ -597,7 +597,7 @@ impl Theme {
 /// [`Wraps`](crate::wrap::Wraps) it holds no selection, because a theme is the
 /// one seam whose implementation is *data the config file edits*. What is on
 /// screen is [`Host::theme`](crate::host::Host::theme) — a copy taken from here
-/// and then given whatever `plait.toml` said on top of it — and two answers to
+/// and then given whatever `gitten.toml` said on top of it — and two answers to
 /// "which theme" would be one too many.
 ///
 /// So a file that names a theme nobody registered is not an error: it is a theme

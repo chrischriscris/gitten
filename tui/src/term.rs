@@ -19,9 +19,9 @@
 //!
 //! There is no tracking mode that reports the wheel and nothing else, so asking
 //! for a notch means asking for clicks — and an emulator that is forwarding
-//! clicks is no longer drag-selecting text with them. plait therefore has to
+//! clicks is no longer drag-selecting text with them. gitten therefore has to
 //! *have* a selection of its own, which it does: [`Input::Mouse`] routes to a
-//! view, the model is `plait_core::select` and `y` copies. The emulator's own
+//! view, the model is `gitten_core::select` and `y` copies. The emulator's own
 //! override is still there for the times you want the whole screen rather than a
 //! diff — `shift` (`option` on iTerm) — and `--no-mouse` is the other half, for a
 //! terminal that has neither.
@@ -46,22 +46,22 @@ use crossterm::event::{
     MouseEventKind,
 };
 use crossterm::terminal;
-use plait_core::command::{Code, Key};
+use gitten_core::command::{Code, Key};
 use std::io::{self, BufWriter, Stdout, Write};
 use std::time::Duration;
 
 /// Something that happened.
 ///
-/// The key is [`plait_core::command::Key`] and not a type of this crate's, which
+/// The key is [`gitten_core::command::Key`] and not a type of this crate's, which
 /// is the whole reason `term.rs` exists as a boundary: a keypress becomes
 /// `core`'s idea of a keypress at the edge, and everything inland — the keymap,
-/// the modes, `plait.toml` — is shared with every other client. A second client
+/// the modes, `gitten.toml` — is shared with every other client. A second client
 /// on a second platform writes this function and nothing else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Input {
     /// A keypress — and a wheel notch, which [`Code`] holds a variant for and
     /// which therefore needs nothing here. That is the point of it arriving as a
-    /// key: what a notch does is a line in `plait.toml` like everything else,
+    /// key: what a notch does is a line in `gitten.toml` like everything else,
     /// and this enum stays a list of things that happened rather than a list of
     /// things to do.
     Key(Key),
@@ -304,9 +304,9 @@ fn translate_event(event: Event) -> Option<Input> {
 /// **A wheel notch is a key.** It has no coordinate anything needs — there is one
 /// scrollable thing under the pointer and the view already knows which — so it
 /// resolves through the keymap like `j`, appears on the `?` panel and is
-/// rebindable in `plait.toml`. See [`Code::WheelUp`].
+/// rebindable in `gitten.toml`. See [`Code::WheelUp`].
 ///
-/// **A button is a position**, and a position cannot be a key: `plait.toml`
+/// **A button is a position**, and a position cannot be a key: `gitten.toml`
 /// cannot hold a hit test. So it leaves here as an [`Input::Mouse`] and whoever
 /// assembled the screen decides which view it landed in.
 ///
@@ -388,7 +388,7 @@ fn translate(k: KeyEvent) -> Option<Input> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use plait_core::command::{Keymap, Modes, Resolve};
+    use gitten_core::command::{Keymap, Modes, Resolve};
 
     fn key(code: KeyCode, mods: KeyModifiers) -> Option<Key> {
         match translate(KeyEvent::new(code, mods)) {
@@ -429,7 +429,7 @@ mod tests {
     #[test]
     fn a_button_becomes_a_position_and_the_other_buttons_do_not() {
         // The line this module draws: a notch is a key and a click is a place,
-        // because `plait.toml` cannot hold a hit test.
+        // because `gitten.toml` cannot hold a hit test.
         let left = event::MouseButton::Left;
         let down = at(MouseEventKind::Down(left), KeyModifiers::SHIFT);
         assert_eq!(
@@ -479,7 +479,7 @@ mod tests {
     #[test]
     fn a_keypress_becomes_cores_own_key() {
         // The boundary this module exists to be: what leaves here is the type
-        // `plait.toml` and the keymap already speak.
+        // `gitten.toml` and the keymap already speak.
         assert_eq!(
             key(KeyCode::Char('j'), KeyModifiers::NONE),
             Some(Key::char('j'))

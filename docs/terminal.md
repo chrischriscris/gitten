@@ -1,6 +1,6 @@
 # The terminal frontend
 
-`plait-tui`. The third door, after the GPUI window and the browser.
+`gitten-tui`. The third door, after the GPUI window and the browser.
 
 It exists to be the cheap check on the boundary. `docs/architecture.md` names the
 test — *a second frontend needs no logic of its own* — and a terminal is the
@@ -9,7 +9,7 @@ that scrolls itself, and no element tree. If something a view needs is not in
 `core`, it is immediately obvious, because there is nothing else there.
 
 Writing it moved six things out of the clients, and one of them —
-`plait.toml` — could not be reached from anywhere but the window before. That is
+`gitten.toml` — could not be reached from anywhere but the window before. That is
 the interesting part of this page; [clients.md](clients.md) is the general
 version.
 
@@ -31,7 +31,7 @@ version.
   select::*      carets, rows, words, the copy,     → where a click landed, and
                  what finishing a drag means         a background on a run
   view::Viewport top, cursor, and the thumb         → glyphs for the scrollbar
-  app::config    plait.toml, watched                how a reload reaches a view
+  app::config    gitten.toml, watched                how a reload reaches a view
   app::cli       the arguments, the usage           its own flags
   app::acquire   a view of a source → data
   theme, font, wrap, differ, syntax
@@ -41,7 +41,7 @@ Everything on the left had at least two implementations before, or — for
 `command` — none that was shared at all. `web/src/rows.rs` and
 `shell/src/views/diff.rs` have not been migrated onto `core::rows` yet, so the row
 flattening has one canonical implementation and two copies that predate it;
-`runs` and `graph` are canonical everywhere except `plait-web`; `command` is used
+`runs` and `graph` are canonical everywhere except `gitten-web`; `command` is used
 by this client and not yet by the window. See [Still to do](#still-to-do).
 
 ## The one thing a `Rows` implementation owns
@@ -50,9 +50,9 @@ by this client and not yet by the window. See [Still to do](#still-to-do).
 
 | frontend | `render` produces |
 |---|---|
-| `plait-shell` | `AnyElement` |
-| `plait-web` | text pieces on the wire |
-| `plait-tui` | cells, through a `Pen` |
+| `gitten-shell` | `AnyElement` |
+| `gitten-web` | text pieces on the wire |
+| `gitten-tui` | cells, through a `Pen` |
 
 Everything above it is `core::rows::Present`, which the frontend trait extends.
 So a presentation that exists in one door is a `render` away from existing in
@@ -172,7 +172,7 @@ scan.
 ```
 
 Nothing in that file decides what a key *does*. The keymap is on `Host`, so
-`plait.toml` and an extension reach it the same way, and `?` lists whatever is
+`gitten.toml` and an extension reach it the same way, and `?` lists whatever is
 actually bound because the help panel is a pure function of the registry. See
 [clients.md](clients.md) for the seam.
 
@@ -180,7 +180,7 @@ Four things about it are decisions:
 
 **A wheel notch is a key.** `Code::WheelUp` and `Code::WheelDown` are variants of
 the same enum `j` is, so the wheel resolves through the keymap, appears on the
-`?` panel, and is rebindable in `plait.toml` — where the alternative was a
+`?` panel, and is rebindable in `gitten.toml` — where the alternative was a
 `match` in this client deciding that the wheel scrolls, which is the keymap
 `core::command` exists to stop three clients each owning. What it runs is
 `view.scroll-down` / `view.scroll-up`, also on `ctrl-e` / `ctrl-y`, because
@@ -190,7 +190,7 @@ there is one scrollable thing on screen, and a coordinate nothing can route is
 one that gets routed wrong the day there are panes.
 
 **A button is not a key**, for the same reason and pointing the other way: a
-position cannot be a line in `plait.toml`, because a config file cannot hold a
+position cannot be a line in `gitten.toml`, because a config file cannot hold a
 hit test. So it arrives as an `Input::Mouse` and this file routes it — see
 [the mouse](#the-mouse) above, and
 [decisions/0022](decisions/0022-the-mouse-in-a-terminal.md).
@@ -199,13 +199,13 @@ hit test. So it arrives as an `Input::Mouse` and this file routes it — see
 per *line* of the platform's scroll delta, not once per notch — Ghostty on macOS
 sends three for one detent of a mouse — so a client that multiplies is
 multiplying a number the user already tuned in System Settings. Three rows an
-event measured as nine rows a notch here, which reads as a page. At one, plait
+event measured as nine rows a notch here, which reads as a page. At one, gitten
 scrolls at exactly the speed the terminal's own scrollback does. `[view] scroll`
 is the multiplier for anyone whose emulator sends one event per notch, where 3 is
 the usual answer.
 
 **It is idle at rest.** The loop blocks on input with a 150 ms timeout, and the
-timeout exists only so a saved `plait.toml` is noticed. Nothing redraws unless
+timeout exists only so a saved `gitten.toml` is noticed. Nothing redraws unless
 something happened — the property GPUI gives the window for free, arrived at here
 on purpose.
 
@@ -268,7 +268,7 @@ lines`, which is the only feedback there is.
 frequently not on the machine the clipboard is on, and OSC 52 is the one
 mechanism that follows the session rather than the process. `cmd-c` and
 `ctrl-shift-c` cannot be used for this — the emulator eats them before the pty,
-and what they copy is the *emulator's* selection, which is empty while plait
+and what they copy is the *emulator's* selection, which is empty while gitten
 holds the mouse. The cost is that an emulator without OSC 52 copies nothing and
 cannot say so — there is no reply. tmux needs `set-clipboard on`, which is its
 3.x default.
@@ -293,7 +293,7 @@ as `|` and `#`.
 than a pane. The acquisition is in `main`, not in the view: a view takes
 already-loaded data and never learns what a repository is, which is the same rule
 the GPUI client follows. A bare revision is "what did this commit change" to
-`plait_git::pairs`, merges included.
+`gitten_git::pairs`, merges included.
 
 ## Cost
 

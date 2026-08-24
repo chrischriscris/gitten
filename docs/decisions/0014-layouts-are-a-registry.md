@@ -29,7 +29,7 @@ intraline pass uses — is a filter over the same function.
 **The startup layout is `host.layout`, a `String`.** The registry cannot be on
 `Host`, because a `Rows` implementation returns an `AnyElement` and `core` never
 knows a UI exists. The *choice* out of it is data, so it can be, and `[diff]
-layout` in `plait.toml` sets it.
+layout` in `gitten.toml` sets it.
 
 ## Why the pairing has to be shared
 

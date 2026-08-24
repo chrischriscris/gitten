@@ -4,7 +4,7 @@
 //! headers and lines all the same height — so the whole thing virtualizes
 //! through one `uniform_list` regardless of how large the diff is.
 //!
-//! Word-level spans come from `plait_core::intraline` and syntax tokens from
+//! Word-level spans come from `gitten_core::intraline` and syntax tokens from
 //! whichever `Highlighter` the host routed the file to, both computed once at
 //! load. Nothing here re-diffs, re-lexes or re-merges during render or scroll.
 //!
@@ -41,7 +41,7 @@
 //! changes on a resize, and [`Diff::reflow`] is what re-expands the rows when it
 //! crosses a character boundary. That runs stages 4c and 5 of the pipeline and
 //! nothing above them: no clip, no intraline, no syntax. Where a line breaks is
-//! `plait_core::wrap`, which is a registry on `Host` and has `w` and a title-bar
+//! `gitten_core::wrap`, which is a registry on `Host` and has `w` and a title-bar
 //! control like everything else that is one.
 //!
 //! # Scrolling sideways
@@ -59,19 +59,19 @@
 //! vertical axis, which is the one that has to virtualize.
 
 use super::{accept_deferred_scroll, DeferredScrollbar, PendingScroll};
+use gitten_core::host::Host;
+use gitten_core::prepared::{prepare, Prepared};
+use gitten_core::rows::{Ordered, RowRef};
+use gitten_core::runs::{self, surfaces, Run};
+use gitten_core::select::{self, Caret, RowId, Selected, Selection, Text as _};
+use gitten_core::syntax::Token;
+use gitten_core::theme::{DiffPalette, Rgb, Surface, Theme};
+use gitten_core::view::Viewport;
+use gitten_core::wrap::{Wrap, Wrapped};
+use gitten_core::{FileDiff, LineKind, Span};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::scroll::{Scrollbar, ScrollbarHandle};
-use plait_core::host::Host;
-use plait_core::prepared::{prepare, Prepared};
-use plait_core::rows::{Ordered, RowRef};
-use plait_core::runs::{self, surfaces, Run};
-use plait_core::select::{self, Caret, RowId, Selected, Selection, Text as _};
-use plait_core::syntax::Token;
-use plait_core::theme::{DiffPalette, Rgb, Surface, Theme};
-use plait_core::view::Viewport;
-use plait_core::wrap::{Wrap, Wrapped};
-use plait_core::{FileDiff, LineKind, Span};
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::rc::Rc;
@@ -134,7 +134,7 @@ pub(crate) fn prepare_files(files: &[FileDiff], host: &Host) -> Prepared {
 ///
 /// `core`'s, since the terminal asks its presentations the same question in
 /// cells and got the same answer back.
-pub use plait_core::select::Hit;
+pub use gitten_core::select::Hit;
 
 /// Which byte of `text` a click `x` pixels into it landed on.
 ///
@@ -181,7 +181,7 @@ pub(crate) fn column_at(text: &str, x: f32, size: f32, host: &Host) -> usize {
 /// [`Rows::rows`] and [`Rows::reflow`] both default, so a presentation that does
 /// not wrap is exactly as long as it was and an extension's compiles unchanged.
 /// A presentation that does wrap gets the hard part —
-/// [`plait_core::wrap::Wrapped`] — from `core`; see `TextRows::reflow` for what
+/// [`gitten_core::wrap::Wrapped`] — from `core`; see `TextRows::reflow` for what
 /// is left, which is six lines and a column budget.
 pub trait Rows {
     /// Whether this implementation wants the file. The built-in claims
@@ -194,9 +194,9 @@ pub trait Rows {
     fn len(&self) -> usize;
 
     /// Appends the rows for `file`, which arrives clipped, intraline-diffed and
-    /// highlighted — see `plait_core::prepared`. An implementation draws; it does
+    /// highlighted — see `gitten_core::prepared`. An implementation draws; it does
     /// not redo any of that.
-    fn build(&mut self, file: plait_core::prepared::File);
+    fn build(&mut self, file: gitten_core::prepared::File);
 
     /// How many visual rows logical row `index` occupies at the current wrap.
     /// More than one only when its text wraps.
@@ -219,7 +219,7 @@ pub trait Rows {
     /// the row's own byte coordinates — `None` for the overwhelming majority of
     /// rows on the overwhelming majority of frames. `current` is whether this is
     /// the row the keyboard is on, drawn as a background bar so navigation has a
-    /// visible cursor — see [`plait_core::view::Viewport`].
+    /// visible cursor — see [`gitten_core::view::Viewport`].
     ///
     /// `shift` is how many pixels of text a horizontal scroll has pulled off the
     /// left edge. A row is as wide as the viewport whatever it holds, so an
@@ -278,7 +278,7 @@ pub trait Rows {
     ///
     /// The offset is into the **logical** row's text, not the visual row's, so a
     /// caret on the third row of a wrapped line is the same kind of thing as one
-    /// on an unwrapped line — see [`plait_core::select`]. `None` means the row
+    /// on an unwrapped line — see [`gitten_core::select`]. `None` means the row
     /// takes no part in a selection, and defaults to it: an extension's
     /// presentation compiles unchanged and is simply not selectable until it says
     /// where its text is.
@@ -390,7 +390,7 @@ impl Layouts {
 }
 
 // The order table's row reference and the table itself are
-// `plait_core::rows`': 8 bytes a row, `logical()` for what survives a reflow,
+// `gitten_core::rows`': 8 bytes a row, `logical()` for what survives a reflow,
 // and the same `widest`/`anchor` a walk of it computes. Only `expand` below is
 // this client's, and only because a `Rows` returns an `AnyElement` — see the
 // note there.
@@ -404,7 +404,7 @@ impl Layouts {
 /// however many times the window is dragged.
 ///
 /// Returns the table plus where the file headers landed in it — what `]` and
-/// `[` jump between. Core's [`plait_core::rows::Ordered`] stays as it is because
+/// `[` jump between. Core's [`gitten_core::rows::Ordered`] stays as it is because
 /// the terminal indexes headers off its own presentations; this client collects
 /// them during the same walk rather than search the table per keypress.
 fn expand(
@@ -606,7 +606,7 @@ pub struct Diff {
     order: Rc<Vec<RowRef>>,
     /// What the mouse has selected, or nothing.
     ///
-    /// The model is `plait_core::select` and this is the only state the window
+    /// The model is `gitten_core::select` and this is the only state the window
     /// keeps: a caret is a logical row and a byte, so it survives a reflow, and
     /// the render path turns it into a byte range per visible row in two
     /// comparisons. Cleared by a layout change and by a new diff, because the
@@ -627,7 +627,7 @@ pub struct Diff {
     /// module note. Bounded from `widest` on every reflow.
     pan: Pan,
     /// The cursor, the top row and the height, and nothing else about them. The
-    /// keyboard's position in this diff, from [`plait_core::view::Viewport`] —
+    /// keyboard's position in this diff, from [`gitten_core::view::Viewport`] —
     /// the same model the terminal holds, so a key means the same thing in both.
     ///
     /// Behind a shared cell because the render closure reads it per batch, which
@@ -1249,7 +1249,7 @@ impl Diff {
             Some(i) => i,
             None => {
                 eprintln!(
-                    "plait: unknown diff.layout {:?}; registered: {}",
+                    "gitten: unknown diff.layout {:?}; registered: {}",
                     host.layout,
                     layouts.names().join(", ")
                 );
@@ -1459,7 +1459,7 @@ impl Diff {
 
 // -------------------------------------------------------------- the selection
 
-/// Where every row's selectable text comes from, for `plait_core::select`.
+/// Where every row's selectable text comes from, for `gitten_core::select`.
 ///
 /// A wrapper rather than an impl on the vector, because the trait and the vector
 /// both belong to somebody else. Three lines is what this seam costs.
@@ -1982,7 +1982,7 @@ impl Rows for TextRows {
         true
     }
 
-    fn build(&mut self, f: plait_core::prepared::File) {
+    fn build(&mut self, f: gitten_core::prepared::File) {
         self.rows.push(Row::File {
             path: f.path.into(),
             adds: f.adds,
@@ -2354,7 +2354,7 @@ pub(crate) fn file_header(
                                 // own background rather than a row's — a header is not
                                 // a `Surface`, and `gutter_fg` raw is 1.7:1 on it.
                                 // Twice a frame at most: one header per file.
-                                let fg = plait_core::theme::readable(
+                                let fg = gitten_core::theme::readable(
                                     p.gutter_fg,
                                     p.file_bg,
                                     theme.min_furniture,
@@ -2424,7 +2424,7 @@ fn split_path(path: &str) -> (Option<&str>, &str) {
 /// A hunk's header row: `@@ -41,9 +41,11 @@ fn dispatch() {`.
 ///
 /// Drawn as two things, because it is two things — the split is
-/// [`plait_core::hunk_parts`], so every client agrees where it is. The
+/// [`gitten_core::hunk_parts`], so every client agrees where it is. The
 /// coordinates are furniture and take the gutter's colour, which is what they
 /// are: a line number with a range around it. The declaration git appends is the
 /// half a reader wants, and keeps `hunk_fg`.
@@ -2440,7 +2440,7 @@ pub(crate) fn hunk_header(
     shift: f32,
 ) -> AnyElement {
     let p = &theme.diff;
-    let (marker, _) = plait_core::hunk_parts(header);
+    let (marker, _) = gitten_core::hunk_parts(header);
     row_frame()
         .items_center()
         .px_4()
@@ -2659,16 +2659,16 @@ mod tests {
         line_colors, locked, row_background, Diff, Layouts, Pan, Row, Rows, TextRows, PAD, ROW_H,
         TEXT_CHROME,
     };
+    use gitten_core::host::Host;
+    use gitten_core::prepared::{prepare, File as PreparedFile};
+    use gitten_core::select::{Caret, Selected, Selection};
+    use gitten_core::syntax::{Kind, Token};
+    use gitten_core::theme::{Style, Surface, Theme};
+    use gitten_core::{parse_unified_diff, LineKind, Span};
     use gpui::{
         div, rgb, AnyElement, FontStyle, FontWeight, HighlightStyle, IntoElement, ParentElement,
         ScrollStrategy,
     };
-    use plait_core::host::Host;
-    use plait_core::prepared::{prepare, File as PreparedFile};
-    use plait_core::select::{Caret, Selected, Selection};
-    use plait_core::syntax::{Kind, Token};
-    use plait_core::theme::{Style, Surface, Theme};
-    use plait_core::{parse_unified_diff, LineKind, Span};
     use std::rc::Rc;
 
     fn tok(start: u32, end: u32, kind: Kind) -> Token {
@@ -3255,7 +3255,7 @@ diff --git a/a.rs b/a.rs
         // no run at all: it is already the row's own `hunk_fg`.
         let theme = Theme::dark();
         let header = "@@ -41,9 +41,11 @@ fn dispatch() {";
-        let (marker, code) = plait_core::hunk_parts(header);
+        let (marker, code) = gitten_core::hunk_parts(header);
         let out = super::hunk_runs(marker.len(), 0..0, &theme);
         well_formed(header, &out);
         assert_eq!(out.len(), 1, "one run: the coordinates");
@@ -3274,7 +3274,7 @@ diff --git a/a.rs b/a.rs
         // ends live in different halves of the header.
         let theme = Theme::dark();
         let header = "@@ -41,9 +41,11 @@ fn dispatch() {";
-        let marker = plait_core::hunk_parts(header).0.len();
+        let marker = gitten_core::hunk_parts(header).0.len();
         let out = super::hunk_runs(marker, 5..25, &theme);
         well_formed(header, &out);
         let bg = rgb(theme.chrome.selected_bg);
@@ -3307,7 +3307,7 @@ diff --git a/a.rs b/a.rs
         // not half-painted at an offset nothing chose.
         let theme = Theme::dark();
         let header = "not a hunk header";
-        let marker = plait_core::hunk_parts(header).0.len();
+        let marker = gitten_core::hunk_parts(header).0.len();
         assert_eq!(marker, header.len(), "the whole string is the marker");
         let out = super::hunk_runs(marker, 0..0, &theme);
         well_formed(header, &out);
@@ -3661,13 +3661,13 @@ diff --git a/a.rs b/a.rs
         // The swap test. A policy that breaks every line into single characters
         // is absurd and unmistakable, which is the point.
         struct EveryChar;
-        impl plait_core::wrap::Wrap for EveryChar {
+        impl gitten_core::wrap::Wrap for EveryChar {
             fn name(&self) -> &'static str {
                 "every-char"
             }
-            fn breaks(&self, text: &str, _cols: usize, out: &mut Vec<plait_core::wrap::Break>) {
+            fn breaks(&self, text: &str, _cols: usize, out: &mut Vec<gitten_core::wrap::Break>) {
                 for (i, _) in text.char_indices().skip(1) {
-                    out.push(plait_core::wrap::Break::hard(i));
+                    out.push(gitten_core::wrap::Break::hard(i));
                 }
             }
         }
@@ -4049,7 +4049,7 @@ diff --git a/b.md b/b.md
     }
 
     /// Enough rows that a proportional scroll position means something.
-    fn long_diff() -> Vec<plait_core::FileDiff> {
+    fn long_diff() -> Vec<gitten_core::FileDiff> {
         let mut raw = String::from("diff --git a/big.rs b/big.rs\n@@ -1,200 +1,200 @@\n");
         for i in 0..200 {
             if i % 5 == 0 {
@@ -4331,7 +4331,7 @@ diff --git a/b.md b/b.md
             .iter()
             .position(|r| r.seg > 0)
             .expect("a wrapped continuation to click on");
-        d.view.set(plait_core::view::Viewport::new());
+        d.view.set(gitten_core::view::Viewport::new());
         d.click_row(continuation, &host);
         assert_eq!(d.cursor(), continuation);
         // And the list was written back to meet the model, so they agree.

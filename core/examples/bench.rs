@@ -1,4 +1,4 @@
-use plait_core::*;
+use gitten_core::*;
 use std::time::Instant;
 
 fn main() {

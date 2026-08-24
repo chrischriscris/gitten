@@ -11,7 +11,7 @@
 //! has both a `Popover` and a `Select`. This is a deliberate exception, and the
 //! reasoning is short enough to check:
 //!
-//! - **Every colour in this app comes from `plait_core::theme`**, which the ANSI
+//! - **Every colour in this app comes from `gitten_core::theme`**, which the ANSI
 //!   painter and a terminal frontend read too. `Popover` draws its surface from
 //!   gpui-component's own theme, so matching would mean keeping a second theme
 //!   in sync with ours, and *not* matching is what rule 2 forbids —
@@ -43,9 +43,9 @@
 //! `cx.listener` closures from that same entity. So this file has no lifecycle
 //! to get wrong, and it is a pure function of a `Picker` plus a bool.
 
+use gitten_core::font::Font;
+use gitten_core::theme::Theme;
 use gpui::*;
-use plait_core::font::Font;
-use plait_core::theme::Theme;
 use std::rc::Rc;
 
 /// Height of the control, and of the strip it sits in.

@@ -182,7 +182,7 @@ fn reason(status: u16) -> &'static str {
 /// idle timeout. But `handler` stays on the thread that called `serve` and every
 /// request is posted to it over a channel.
 ///
-/// That is not caution, it is a fact about [`plait_core::host::Host`]: its three
+/// That is not caution, it is a fact about [`gitten_core::host::Host`]: its three
 /// registries are `Box<dyn Differ>`, `Box<dyn Wrap>` and `Box<dyn Highlighter>`
 /// with no `Send` bound, because the shell holds an `Rc<Host>` and has never
 /// needed one. Sharing it across threads means putting `Send + Sync` on three

@@ -5,7 +5,7 @@
 
 ## Context
 
-`plait.toml` exists and reloads live, which raised the question of whether it was
+`gitten.toml` exists and reloads live, which raised the question of whether it was
 the right format. The answer turns on two things that were not decided yet:
 
 1. **There will be a settings panel** — preferences you click, not only a file you
@@ -23,7 +23,7 @@ Two layers, and the line between them is not the format, it is **data versus
 behaviour**.
 
 ```
-plait.toml        data.  Hand-edited OR written by the settings panel.
+gitten.toml        data.  Hand-edited OR written by the settings panel.
                   Round-tripped with toml_edit, so comments and order survive.
 plugins/*.lua     behaviour.  Separate files. Referenced from the config by
                   name, never inlined into it.
@@ -33,7 +33,7 @@ Zed's split, and it is well-trodden: JSON settings plus a settings UI plus
 separate extensions. Helix does the same with TOML and Scheme.
 
 **Behaviour never appears in the settings file.** That is the load-bearing rule.
-The moment a function lives in `plait.toml`, the panel cannot round-trip the file,
+The moment a function lives in `gitten.toml`, the panel cannot round-trip the file,
 and the panel is a stated requirement.
 
 ```toml

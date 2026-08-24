@@ -10,5 +10,5 @@
 
 # The live config. Reproducible, and personal — colours you are in the middle of
 # tuning are not the repository's business:
-#   plait config > plait.toml
-/plait.toml
+#   gitten config > gitten.toml
+/gitten.toml

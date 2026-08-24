@@ -1,4 +1,4 @@
-# plait
+# gitten
 
 A desktop git client with lazygit's keyboard model. Rust, GPUI.
 
@@ -32,7 +32,7 @@ the cheap check on this. Anything two of them need is a bug until it is in
 graph's branch colours were each written twice before they were written once.
 
 **A client is drawing and input, and nothing else.** Everything before it is
-shared: `plait-git` acquires, `plait-app` holds `plait.toml` and the command line,
+shared: `gitten-git` acquires, `gitten-app` holds `gitten.toml` and the command line,
 `core` holds the rest. A client that has to write its own argument parsing is a
 client nobody else will write — which is why the config parser living behind GPUI
 was a bug and not a layout choice.
@@ -89,7 +89,7 @@ Windows is not a target and not a promise.
 
 ## Git
 
-`plait-git` is the acquisition layer — the only crate that talks to a repository.
+`gitten-git` is the acquisition layer — the only crate that talks to a repository.
 `core` stays pure and does no I/O; `shell` does no I/O either. Both views take
 already-loaded data, which is also why they are trivial to test and to drop into
 a pane.
@@ -264,11 +264,11 @@ table — so a `Wrap` decides where a line breaks and nothing else.
 ./dev dump    commits ~/src 600     one frame on stdout, timing on stderr.
                                     COLS, ROWS, LAYOUT, WRAP, THEME, AT, FRAMES
 ./dev check                         everything headless
-./dev config > plait.toml           a complete, correct starting file
-./dev bundle                        target/plait.app — icon, name, a real app
+./dev config > gitten.toml           a complete, correct starting file
+./dev bundle                        target/gitten.app — icon, name, a real app
 
 ./dev --release tui diff .          when you need honest numbers
-PLAIT_STATS=0 ./dev tui             without the readout
+GITTEN_STATS=0 ./dev tui             without the readout
 ```
 
 Debug and the stats readout are the defaults, because that is the loop you
@@ -283,9 +283,9 @@ press up-enter. `./dev dump` is the watchable one.
 Under it, and worth knowing when something is wrong:
 
 ```sh
-cargo test -p plait-core            # just correctness, sub-second
-cargo test -p plait-app             # the config file and the command line
-cargo run -q -p plait-git --example diffcheck --release [REPO] [REVSPEC]
+cargo test -p gitten-core            # just correctness, sub-second
+cargo test -p gitten-app             # the config file and the command line
+cargo run -q -p gitten-git --example diffcheck --release [REPO] [REVSPEC]
                                     # the differs against git's own answer;
                                     # WORST=1 for the files it did worst on
 ```
@@ -295,14 +295,14 @@ GPUI is reactive and draws nothing at rest, so an honest idle reading would be
 zero. It measures how fast we *can* redraw, not what the app costs sitting still.
 Never read those numbers off a debug build.
 
-Colour and font live in `plait.toml` and reload on the next frame — no rebuild.
+Colour and font live in `gitten.toml` and reload on the next frame — no rebuild.
 `[diff] algorithm`, `context`, `layout` and `wrap` live there too. `context`
 applies on the next launch; the others have controls in the title bar and change
 live, and the file sets what they *open* on. A control there is the temporary
 answer until a settings panel exists — the picker is a pure function of a list
 and an index, so any seam with a registry gets one for free, and the terminal's
 `?` panel is the same trick over the keymap.
-`./dev config > plait.toml` writes a complete one, and `[keys]` is in it — every
+`./dev config > gitten.toml` writes a complete one, and `[keys]` is in it — every
 client reads the same file. Code still costs a rebuild; `./dev` is what removes
 the quitting and retyping around it.
 

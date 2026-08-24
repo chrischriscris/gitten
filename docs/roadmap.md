@@ -18,7 +18,7 @@ a serial background runner and invalidation generations, native text input can
 join the mode stack, and the window has registered stacked panes with logical
 focus. The commit and diff panes are the first two tenants.
 
-The actor itself does not exist: **zero write verbs** in `plait-git`, no
+The actor itself does not exist: **zero write verbs** in `gitten-git`, no
 branch/stash/remote/tag/reflog reads and no files panel consuming the status
 model. Lazygit is mostly actor — staging, committing, rebasing is its centre of
 gravity, not reading logs. What follows closes that gap on seams that now exist.
@@ -37,9 +37,9 @@ the remaining read models add tenants to it.
 
 | # | Block | Lands | Notes | Size |
 |---|---|---|---|---|
-| 7 | **Branch + ref reads** | `plait-git` | Local and remote branches, upstream, ahead/behind, HEAD. Refs are gix's home turf, so this is also the honest start of the gix port — no hot path exists yet to break | M |
-| 8 | **Stash, remotes, tags, reflog reads** | `plait-git` | Each small through the trait; each feeds a panel later | S each |
-| 9 | **Diff cache keyed by blob OID** | `plait-git`/acquisition edge | Prescribed in AGENTS.md, never built; acquisition already yields both OIDs. Pays twice: repeat views free, post-commit reloads re-diff only what changed | S |
+| 7 | **Branch + ref reads** | `gitten-git` | Local and remote branches, upstream, ahead/behind, HEAD. Refs are gix's home turf, so this is also the honest start of the gix port — no hot path exists yet to break | M |
+| 8 | **Stash, remotes, tags, reflog reads** | `gitten-git` | Each small through the trait; each feeds a panel later | S each |
+| 9 | **Diff cache keyed by blob OID** | `gitten-git`/acquisition edge | Prescribed in AGENTS.md, never built; acquisition already yields both OIDs. Pays twice: repeat views free, post-commit reloads re-diff only what changed | S |
 
 ## Phase C — tracer bullet
 

@@ -9,7 +9,7 @@
 //! index ([`Status::unstaged`]), and gives untracked ([`Status::untracked`])
 //! and merge-conflicted ([`Status::conflicts`]) lists of their own.
 //!
-//! Pure data, like everything in this crate. Parsing lives in `plait-git`,
+//! Pure data, like everything in this crate. Parsing lives in `gitten-git`,
 //! drawing lives in a client, and neither gets to teach these types about the
 //! other.
 
@@ -257,7 +257,7 @@ pub struct Status {
     /// Left unresolved by a merge.
     pub conflicts: Vec<ConflictEntry>,
     /// Matched `.gitignore` — collected when git is asked for them, which
-    /// plait deliberately does not by default: `target/` alone would be forty
+    /// gitten deliberately does not by default: `target/` alone would be forty
     /// thousand entries nobody reads.
     pub ignored: Vec<PathBytes>,
 }

@@ -1,13 +1,13 @@
-//! plait in the terminal it was started from.
+//! gitten in the terminal it was started from.
 //!
 //! The third door, and the one that has to earn its keep by needing no logic of
-//! its own. Acquisition is `plait-git`, the differ and every pass over a diff is
-//! `plait-core`, and what is here is a grid of cells, the presentations that
+//! its own. Acquisition is `gitten-git`, the differ and every pass over a diff is
+//! `gitten-core`, and what is here is a grid of cells, the presentations that
 //! fill it and the escape codes that put it on screen — the same division
-//! `plait-shell` has with GPUI and `plait-web` has with a browser.
+//! `gitten-shell` has with GPUI and `gitten-web` has with a browser.
 //!
 //! ```text
-//!   plait-git ──► core::rows::assemble ──► Ordered ──► Rows::render ──► Screen
+//!   gitten-git ──► core::rows::assemble ──► Ordered ──► Rows::render ──► Screen
 //!   two texts     prepare, claim,          8 bytes    one row of        cells,
 //!   per file      order                    a row      cells             then ANSI
 //! ```
@@ -55,6 +55,6 @@ pub mod scrollbar;
 pub mod split;
 pub mod term;
 
-/// The two rendering budgets, from `plait_app` — where they are shared rather
+/// The two rendering budgets, from `gitten_app` — where they are shared rather
 /// than picked independently by three clients that all picked the same numbers.
-pub use plait_app::{MAX_LINE_CHARS, MIN_WRAP_COLS};
+pub use gitten_app::{MAX_LINE_CHARS, MIN_WRAP_COLS};

@@ -20,7 +20,7 @@ done
 # docs/measurements.md for both shapes and the one-liner that makes the other.
 if [ ! -s "$OUT/md.diff" ]; then
   echo "  building md.diff from rust-lang/book ..."
-  BOOK="${TMPDIR:-/tmp}/plait-book"
+  BOOK="${TMPDIR:-/tmp}/gitten-book"
   [ -d "$BOOK/.git" ] || git clone --quiet --no-checkout https://github.com/rust-lang/book.git "$BOOK"
   git -C "$BOOK" diff 'HEAD~300..HEAD' -- '*.md' > "$OUT/md.diff"
   printf '  md.diff %s lines\n' "$(wc -l < "$OUT/md.diff" | tr -d ' ')"

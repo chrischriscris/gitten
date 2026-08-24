@@ -6,21 +6,21 @@
 //! view uses — 24-bit ANSI instead of `Hsla`, and that is the only difference.
 //! If a colour looks wrong here it is wrong there.
 //!
-//!   cargo run -q -p plait-core --example paint --release [ROWS] [PATH-FILTER]
+//!   cargo run -q -p gitten-core --example paint --release [ROWS] [PATH-FILTER]
 //!
 //! `THEME=name` paints it in another registered palette — `dark`, `light`,
-//! `slate`, or one `plait.toml` defined. `WRAP_COLS=n` sets where a long line
+//! `slate`, or one `gitten.toml` defined. `WRAP_COLS=n` sets where a long line
 //! breaks, and `WRAP_COLS=0` turns wrapping off. That is the same [`Wrap`] the
 //! window uses, reached the same way: a break point is a property of text, and
 //! this is the check that nothing about the seam is shaped like GPUI. What a
 //! terminal supplies is the column count — the one thing `core` cannot know.
-use plait_core::host::Host;
-use plait_core::markdown::{lay_out, Block, Layout};
-use plait_core::prepared::prepare;
-use plait_core::syntax::Kind;
-use plait_core::theme::{MarkdownPalette, Rgb, Style, Surface};
-use plait_core::wrap::Wrapped;
-use plait_core::{parse_unified_diff, LineKind};
+use gitten_core::host::Host;
+use gitten_core::markdown::{lay_out, Block, Layout};
+use gitten_core::prepared::prepare;
+use gitten_core::syntax::Kind;
+use gitten_core::theme::{MarkdownPalette, Rgb, Style, Surface};
+use gitten_core::wrap::Wrapped;
+use gitten_core::{parse_unified_diff, LineKind};
 
 fn fg(c: Rgb) -> String {
     format!(
@@ -42,7 +42,7 @@ fn bg(c: Rgb) -> String {
 
 /// Underline a piece if any intraline span covers it. Cheap and approximate —
 /// the point is to see that the spans and the tokens agree.
-fn underlined(l: &plait_core::prepared::Line, start: usize, end: usize, piece: &str) -> String {
+fn underlined(l: &gitten_core::prepared::Line, start: usize, end: usize, piece: &str) -> String {
     let hit = l
         .spans
         .iter()
