@@ -367,6 +367,14 @@ impl Keymap {
         // convention, so one keyboard works in both programs.
         bind(GLOBAL, "4", "stashes.focus");
 
+        // lazygit's three sync keys, global because they aim past every pane
+        // at the branch HEAD sits on: P sends it, p pulls onto its upstream,
+        // f updates what the remotes hold. The capital is lazygit's own
+        // asymmetry between sending work and asking for it.
+        bind(GLOBAL, "P", "repo.push");
+        bind(GLOBAL, "p", "repo.pull");
+        bind(GLOBAL, "f", "repo.fetch");
+
         // lazygit's files panel: space acts on the row the keyboard is on, by
         // the side of the index it sits on, and c commits what the index
         // holds. Both are particular to this pane, so they are not globals.
@@ -791,6 +799,15 @@ impl Commands {
                 "apply this stash and drop it when the apply is clean",
             ),
             ("stashes.drop", "drop this stash, asked twice"),
+            (
+                "repo.push",
+                "send the current branch to its remote, setting the upstream if needed",
+            ),
+            (
+                "repo.pull",
+                "fast-forward the current branch onto its upstream",
+            ),
+            ("repo.fetch", "update the remote-tracking branches"),
             ("input.accept", "accept the text"),
             ("input.cancel", "discard the text"),
             ("pane.next", "focus the next pane"),
@@ -1161,6 +1178,37 @@ mod tests {
         ] {
             assert!(commands.known(name), "{name} is not registered");
             assert!(!k.keys_for(name).is_empty(), "{name} is bound to nothing");
+        }
+    }
+
+    #[test]
+    fn the_sync_verbs_are_globals_on_lazygits_keys() {
+        let k = Keymap::builtin();
+        for (chord, name) in [("P", "repo.push"), ("p", "repo.pull"), ("f", "repo.fetch")] {
+            // Repo-level actions: no pane pushed, nothing focused — they aim
+            // at the branch HEAD sits on wherever the keyboard happens to be,
+            // which is why these are globals and not a mode's bindings.
+            assert_eq!(
+                k.resolve(&Modes::new(), &keys(chord)),
+                Resolve::Run(name),
+                "{chord} did not reach {name} globally"
+            );
+            // Inherited inside a pane too, never re-bound there.
+            let mut modes = Modes::new();
+            modes.push("branches");
+            assert_eq!(k.resolve(&modes, &keys(chord)), Resolve::Run(name));
+        }
+        // A capital is not its lowercase twin's binding: sending and asking
+        // stay two commands on lazygit's pair.
+        assert_ne!(
+            k.resolve(&Modes::new(), &keys("p")),
+            k.resolve(&Modes::new(), &keys("P"))
+        );
+
+        let commands = Commands::builtin();
+        for name in ["repo.push", "repo.pull", "repo.fetch"] {
+            assert!(commands.known(name), "{name} is not registered");
+            assert_eq!(k.keys_for(name).len(), 1, "{name}: one key");
         }
     }
 

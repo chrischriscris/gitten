@@ -10,6 +10,7 @@
 //! the same queue — without a line changing here.
 
 use crate::jobs::Job;
+use gitten_core::refs::{HeadState, Remote};
 use gitten_git::{Handle, Repo};
 
 /// The write itself: a closure over the trait, so an extension's verb and a
@@ -25,6 +26,10 @@ pub struct Write {
     name: String,
     repo: Handle,
     op: Op,
+    /// The sentence a clean finish announces, when this verb's effect lands
+    /// somewhere the eye is not. `None` for everything whose result shows
+    /// itself in the pane it changed — a staged file needs no announcer.
+    done: Option<String>,
 }
 
 /// The band's count of paths, said the way a person says it.
@@ -45,7 +50,16 @@ impl Write {
             name,
             repo: Handle::clone(repo),
             op: Box::new(op),
+            done: None,
         }
+    }
+
+    /// Names the sentence a clean finish announces. The sync verbs' extra
+    /// word: their effect is counts on branches the reader may not be
+    /// looking at, and quiet about those reads as nothing happened.
+    fn announcing(mut self, done: impl Into<String>) -> Self {
+        self.done = Some(done.into());
+        self
     }
 
     /// Stages one path — `git add --`, which picks up untracked files,
@@ -193,11 +207,103 @@ impl Write {
             r.stash_drop(index)
         })
     }
+
+    // ------------------------------------------------------------ the sync
+
+    /// Sends `branch` to `remote` — `git push -q`, adding `--set-upstream`
+    /// exactly when the branch tracks nothing yet. Whether it does is the
+    /// trait's decision, read fresh from the repository, never remembered
+    /// here; this wrapper's whole job is to carry the two names as bytes and
+    /// say the band's words.
+    pub fn push(repo: &Handle, remote: Vec<u8>, branch: Vec<u8>) -> Self {
+        let shown = shown_pair(&remote, &branch);
+        Self::named(format!("push {shown}"), repo, move |r| {
+            r.push(&remote, &branch)
+        })
+        .announcing(format!("pushed {shown}"))
+    }
+
+    /// Fast-forwards the current branch onto its upstream — `git pull
+    /// --ff-only`. Which branch pulls from where is the repository's own
+    /// configuration, so there are no arguments to pass and no refusals to
+    /// pre-empt: a divergence comes back in git's words, never auto-rebased.
+    pub fn pull(repo: &Handle) -> Self {
+        Self::named("pull".into(), repo, |r| r.pull()).announcing("pulled")
+    }
+
+    /// Updates remote-tracking refs — `remote` when named, every remote this
+    /// repository knows when not. Fetching moves nothing but those refs,
+    /// which is what makes it safe behind a single unconfirmed key.
+    pub fn fetch(repo: &Handle, remote: Option<Vec<u8>>) -> Self {
+        let shown = match &remote {
+            Some(remote) => format!(" {}", String::from_utf8_lossy(remote)),
+            None => String::new(),
+        };
+        Self::named(format!("fetch{shown}"), repo, move |r| {
+            r.fetch(remote.as_deref())
+        })
+        .announcing(format!("fetched{shown}"))
+    }
+
+    /// `repo.push`'s verb, aimed: HEAD's branch, sent to the remote its
+    /// upstream names. When the branch tracks nothing yet, `origin` stands
+    /// in if the repository has one, else its sole remote — a guess among
+    /// several servers is how work lands on somebody else's machine, so
+    /// none is made. The reads ride the same [`Repo`] every client drives;
+    /// they run here, before the queue, where a refusal costs one sentence
+    /// instead of a job.
+    pub fn push_current(repo: &Handle) -> Result<Self, String> {
+        let branch = match repo.head()? {
+            HeadState::Branch { name, .. } => name,
+            HeadState::Detached { .. } => return Err("detached HEAD has no branch to push".into()),
+        };
+        let tracked = repo
+            .branches()?
+            .iter()
+            .find(|b| b.name.as_bytes() == branch.as_bytes())
+            .and_then(|b| b.upstream.as_ref())
+            .map(|u| u.remote.as_bytes().to_vec());
+        let remote = match tracked {
+            Some(remote) => remote,
+            None => default_remote(&repo.remotes()?)?,
+        };
+        Ok(Self::push(repo, remote, branch.as_bytes().to_vec()))
+    }
+}
+
+/// Two byte-names as a person reads them, once: the band's words and the
+/// finish line's both.
+fn shown_pair(remote: &[u8], branch: &[u8]) -> String {
+    format!(
+        "{} {}",
+        String::from_utf8_lossy(remote),
+        String::from_utf8_lossy(branch)
+    )
+}
+
+/// The remote a first push means when no configuration says: `origin` if the
+/// repository has one, its only remote when exactly one, a refusal otherwise.
+fn default_remote(remotes: &[Remote]) -> Result<Vec<u8>, String> {
+    if let Some(origin) = remotes.iter().find(|r| r.name.as_bytes() == b"origin") {
+        return Ok(origin.name.as_bytes().to_vec());
+    }
+    if let [only] = remotes {
+        return Ok(only.name.as_bytes().to_vec());
+    }
+    Err(
+        "this branch has no upstream and no single remote stands out; \
+         push it from the branches panel to set one"
+            .into(),
+    )
 }
 
 impl Job for Write {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn confirmation(&self) -> Option<String> {
+        self.done.clone()
     }
 
     fn run(self: Box<Self>) -> Result<(), String> {
@@ -210,6 +316,7 @@ impl Job for Write {
 mod tests {
     use super::*;
     use crate::jobs::{Event, Runner};
+    use gitten_core::refs::{Branch, HeadState, RefName, Remote, Upstream};
     use gitten_core::status::Status;
     use gitten_core::Commit;
     use std::sync::{Arc, Mutex};
@@ -695,5 +802,215 @@ mod tests {
                 "rename a → b\u{FFFD}",
             ]
         );
+    }
+
+    // ------------------------------------------------------------ the sync
+
+    /// Serves the sync verbs and the reads [`Write::push_current`] aims
+    /// them with. Recorded as raw byte lines, for the same reason its
+    /// sibling above records bytes: a lossy log could never tell a
+    /// pass-through from a mangling.
+    struct SyncFake {
+        calls: Arc<Mutex<Vec<Vec<u8>>>>,
+        head: HeadState,
+        branches: Vec<Branch>,
+        remotes: Vec<Remote>,
+    }
+
+    impl SyncFake {
+        /// One branch under HEAD, tracking `upstream` when named.
+        fn tracked(upstream: Option<&str>, remotes: &[&str]) -> Self {
+            let main = Branch {
+                name: RefName::from("main"),
+                commit: "0123".into(),
+                upstream: upstream.map(|remote| Upstream {
+                    remote: RefName::from(remote),
+                    branch: RefName::from("main"),
+                    ahead: Some(0),
+                    behind: Some(0),
+                }),
+                head: true,
+            };
+            Self {
+                calls: Arc::default(),
+                head: HeadState::Branch {
+                    name: RefName::from("main"),
+                    commit: Some("0123".into()),
+                },
+                branches: vec![main],
+                remotes: remotes
+                    .iter()
+                    .map(|r| Remote {
+                        name: RefName::from(*r),
+                        urls: vec!["https://example.invalid/x".into()],
+                    })
+                    .collect(),
+            }
+        }
+
+        fn detached() -> Self {
+            let mut me = Self::tracked(None, &[]);
+            me.head = HeadState::Detached {
+                commit: "0123".into(),
+            };
+            me
+        }
+
+        fn said(&self) -> Vec<String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|c| String::from_utf8_lossy(c).into_owned())
+                .collect()
+        }
+    }
+
+    impl Repo for SyncFake {
+        fn log(&self, _: usize) -> gitten_git::Result<Vec<Commit>> {
+            Ok(Vec::new())
+        }
+        fn pairs(&self, _: &str) -> gitten_git::Result<Vec<gitten_git::Pair>> {
+            Ok(Vec::new())
+        }
+        fn status(&self) -> gitten_git::Result<Status> {
+            Ok(Status::default())
+        }
+        fn describe(&self) -> String {
+            "sync".into()
+        }
+        fn head(&self) -> gitten_git::Result<HeadState> {
+            Ok(self.head.clone())
+        }
+        fn branches(&self) -> gitten_git::Result<Vec<Branch>> {
+            Ok(self.branches.clone())
+        }
+        fn remotes(&self) -> gitten_git::Result<Vec<Remote>> {
+            Ok(self.remotes.clone())
+        }
+        fn push(&self, remote: &[u8], branch: &[u8]) -> gitten_git::Result<()> {
+            let mut line = b"push ".to_vec();
+            line.extend_from_slice(remote);
+            line.push(b' ');
+            line.extend_from_slice(branch);
+            self.calls.lock().unwrap().push(line);
+            Ok(())
+        }
+        fn pull(&self) -> gitten_git::Result<()> {
+            self.calls.lock().unwrap().push(b"pull".to_vec());
+            Ok(())
+        }
+        fn fetch(&self, remote: Option<&[u8]>) -> gitten_git::Result<()> {
+            let mut line = b"fetch ".to_vec();
+            line.extend_from_slice(remote.unwrap_or(b"--all"));
+            self.calls.lock().unwrap().push(line);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_sync_verbs_reach_the_trait_bytes_intact_and_announce_their_finish() {
+        let fake = Arc::new(SyncFake::tracked(Some("up"), &["up"]));
+        let repo: Handle = fake.clone();
+        let runner = Runner::new();
+        let submit = runner.submitter();
+
+        let mut jobs: Vec<Box<dyn Job>> = vec![
+            Box::new(Write::push(&repo, b"o\xe9".to_vec(), b"m\xe9".to_vec())),
+            Box::new(Write::pull(&repo)),
+            Box::new(Write::fetch(&repo, None)),
+            Box::new(Write::fetch(&repo, Some(b"or\xedgin".to_vec()))),
+        ];
+        for job in jobs.drain(..) {
+            assert!(submit.submit(job).is_ok());
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while fake.said().len() < 4 {
+            assert!(
+                Instant::now() < deadline,
+                "jobs did not run: {:?}",
+                fake.said()
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            fake.said(),
+            vec![
+                "push o\u{FFFD} m\u{FFFD}",
+                "pull",
+                "fetch --all",
+                "fetch or\u{FFFD}gin",
+            ],
+            "every byte arrived undecoded"
+        );
+
+        // The band's words going out, and the finish line's coming back:
+        // present tense while running, past tense once it landed.
+        let (mut started, mut finished) = (Vec::new(), Vec::new());
+        while let Some(event) = runner.try_next() {
+            match event {
+                Event::Started { name } => started.push(name),
+                Event::Finished { done, .. } => finished.push(done),
+            }
+        }
+        assert_eq!(
+            started,
+            vec![
+                "push o\u{FFFD} m\u{FFFD}",
+                "pull",
+                "fetch",
+                "fetch or\u{FFFD}gin"
+            ]
+        );
+        assert_eq!(
+            finished,
+            vec![
+                Some("pushed o\u{FFFD} m\u{FFFD}".into()),
+                Some("pulled".into()),
+                Some("fetched".into()),
+                Some("fetched or\u{FFFD}gin".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn push_current_aims_where_the_repository_says() {
+        // An upstream wins over any stand-in: what the configuration names
+        // is where the branch goes.
+        let fake = Arc::new(SyncFake::tracked(Some("up"), &["up", "other"]));
+        let repo: Handle = fake.clone();
+        let job = Write::push_current(&repo).expect("an aim");
+        assert_eq!(job.name(), "push up main");
+        assert_eq!(fake.said(), Vec::<String>::new(), "nothing ran yet");
+
+        // No upstream: origin stands in when the repository has one.
+        let fake = Arc::new(SyncFake::tracked(None, &["web", "origin"]));
+        let repo: Handle = fake.clone();
+        assert_eq!(
+            Write::push_current(&repo).expect("an aim").name(),
+            "push origin main"
+        );
+
+        // No origin either: the sole remote is unambiguous.
+        let fake = Arc::new(SyncFake::tracked(None, &["solo"]));
+        let repo: Handle = fake.clone();
+        assert_eq!(
+            Write::push_current(&repo).expect("an aim").name(),
+            "push solo main"
+        );
+
+        // Several servers and no configuration: refusing beats guessing.
+        let fake = Arc::new(SyncFake::tracked(None, &["one", "two"]));
+        let repo: Handle = fake.clone();
+        let err = Write::push_current(&repo).err().expect("refused");
+        assert!(err.contains("no upstream"), "{err}");
+        assert_eq!(fake.said(), Vec::<String>::new(), "refused before running");
+
+        // Detached HEAD is not a branch; nothing to send.
+        let fake = Arc::new(SyncFake::detached());
+        let repo: Handle = fake.clone();
+        let err = Write::push_current(&repo).err().expect("refused");
+        assert!(err.contains("detached"), "{err}");
     }
 }

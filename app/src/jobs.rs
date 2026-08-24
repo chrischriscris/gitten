@@ -13,6 +13,17 @@ use std::sync::{Arc, Mutex};
 /// Work that may block and therefore must not run on a client's render thread.
 pub trait Job: Send + 'static {
     fn name(&self) -> &str;
+
+    /// What a clean finish announces, when announcing earns its sentence.
+    /// `None` — every write's default — says nothing: most writes show
+    /// themselves in the pane they changed. A job whose effect lands where
+    /// the eye is not (a push moves counts on an upstream) overrides this,
+    /// and a client says the sentence instead of leaving the reader to guess
+    /// whether anything happened.
+    fn confirmation(&self) -> Option<String> {
+        None
+    }
+
     fn run(self: Box<Self>) -> Result<(), String>;
 }
 
@@ -62,6 +73,10 @@ pub enum Event {
     Finished {
         name: String,
         outcome: Result<Generation, String>,
+        /// The job's own [`confirmation`](Job::confirmation), read off it
+        /// before it ran and forwarded verbatim. A client decides what to do
+        /// with one — shown only beside a success is the usual answer.
+        done: Option<String>,
     },
 }
 
@@ -117,6 +132,7 @@ fn worker(commands: Receiver<Message>, events: Sender<Event>) {
     while let Ok(message) = commands.recv() {
         let Message::Run(job) = message else { break };
         let name = job.name().to_string();
+        let done = job.confirmation();
         let _ = events.send(Event::Started { name: name.clone() });
         let outcome = match catch_unwind(AssertUnwindSafe(|| job.run())) {
             Ok(Ok(())) => {
@@ -126,7 +142,11 @@ fn worker(commands: Receiver<Message>, events: Sender<Event>) {
             Ok(Err(error)) => Err(error),
             Err(payload) => Err(format!("job panicked: {}", panic_text(&payload))),
         };
-        let _ = events.send(Event::Finished { name, outcome });
+        let _ = events.send(Event::Finished {
+            name,
+            outcome,
+            done,
+        });
     }
 }
 
@@ -212,6 +232,35 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn a_confirmation_is_read_off_the_job_and_forwarded_verbatim() {
+        // The sentence is the job's own words, carried even through a
+        // failure — what a client does with one beside an error is the
+        // client's call, not the worker's.
+        struct Announcing;
+        impl Job for Announcing {
+            fn name(&self) -> &str {
+                "announce"
+            }
+            fn confirmation(&self) -> Option<String> {
+                Some("sent".into())
+            }
+            fn run(self: Box<Self>) -> Result<(), String> {
+                Err("declined".into())
+            }
+        }
+        let runner = Runner::new();
+        assert!(runner.submitter().submit(Box::new(Announcing)).is_ok());
+        assert_eq!(
+            receive(&runner, 2).pop(),
+            Some(Event::Finished {
+                name: "announce".into(),
+                outcome: Err("declined".into()),
+                done: Some("sent".into()),
+            })
+        );
     }
 
     struct Gated {
