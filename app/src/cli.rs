@@ -215,11 +215,12 @@ pub fn usage(binary: &str, blurb: &str, extra: &str) -> String {
   Pass --fixtures instead of REPO to read fixtures/ instead of a repository.
   A patch needs no checkout at all:  git diff | {binary} diff -
 
-  gitten.toml next to the binary (or $GITTEN_CONFIG) picks the theme — dark, light
-  or slate, or one it defines itself — and sets the font and the [diff] table:
-  the algorithm, how much whitespace has to match, how much context, and what
-  the presentation and the wrap open on. Every client reads the same file.
-  Start one with:  {binary} config > gitten.toml
+  gitten.toml picks the theme — dark, light or slate, or one it defines itself —
+  and sets the font and the [diff] table: the algorithm, how much whitespace has
+  to match, how much context, and what the presentation and the wrap open on.
+  Read from ~/.config/gitten/gitten.toml, or ./gitten.toml when the current
+  directory has one, or $GITTEN_CONFIG. Every client reads the same file.
+  Start one with:  {binary} config > ~/.config/gitten/gitten.toml
 "
     );
     match extra.is_empty() {
@@ -438,7 +439,7 @@ mod tests {
             "  --ascii   no box drawing",
         );
         assert!(text.starts_with("gitten-tui — gitten in a terminal"));
-        assert!(text.contains("gitten-tui config > gitten.toml"));
+        assert!(text.contains("gitten-tui config > ~/.config/gitten/gitten.toml"));
         assert!(text.contains("--ascii"));
         // Every client documents the same two views and the same file.
         assert!(text.contains("commits [REPO] [LIMIT]"));
