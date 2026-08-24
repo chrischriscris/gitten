@@ -129,6 +129,33 @@ fn join_raw(root: &Path, path: &[u8]) -> PathBuf {
     root.join(std::ffi::OsStr::from_bytes(path))
 }
 
+/// The byte budget of paths one bulk-write process is handed, counted after
+/// the fixed head of its argv.
+///
+/// Bulk exists for the huge case — stage-all on a fresh tree — which is
+/// exactly where a single argv overflows `E2BIG`. Past the budget the
+/// remainder simply becomes the next process: rare, sequential, and invisible
+/// next to the fork cost it saves.
+const ARGV_BUDGET: usize = 100 * 1024;
+
+/// The exclusive end of one process's worth of `paths`, starting at `at`.
+///
+/// Always at least one path — a single name larger than the budget still
+/// travels, because progress beats deadlock — then every neighbour that fits
+/// under [`ARGV_BUDGET`] beside it.
+fn chunk_end(paths: &[&[u8]], at: usize) -> usize {
+    let mut bytes = 0;
+    let mut end = at;
+    while end < paths.len() {
+        bytes += paths[end].len();
+        if end > at && bytes > ARGV_BUDGET {
+            break;
+        }
+        end += 1;
+    }
+    end
+}
+
 // ------------------------------------------------------------------- the seam
 
 /// One repository, as everything behind a client sees it.
@@ -269,8 +296,8 @@ pub trait Repo: Send + Sync {
     /// Stages every path in one call.
     ///
     /// Bulk spelling of [`stage`](Self::stage), for the stage-everything
-    /// command: the binary-backed implementation answers it with one `add`
-    /// process over the whole list instead of one process per path, and a
+    /// command: the binary-backed implementation answers it with `add`
+    /// processes over the whole list instead of one process per path, and a
     /// backend that does not need the distinction gets the loop free through
     /// this default. Empty is a quiet no-op.
     fn stage_many(&self, paths: &[&[u8]]) -> Result<()> {
@@ -791,21 +818,14 @@ impl Repo for Binary {
         if paths.is_empty() {
             return Ok(());
         }
-        // One process over every path — the spelling git itself uses, and
-        // the difference between a stage-all keypress on a fresh repository
-        // costing one fork and costing one per untracked file.
-        let mut args: Vec<&[u8]> = vec![b"add", b"--"];
-        args.extend(paths.iter().copied());
-        run_bytes(&self.root, &args).map(|_| ())
+        self.run_chunked(&[b"add", b"--"], paths)
     }
 
     fn unstage_many(&self, paths: &[&[u8]]) -> Result<()> {
         if paths.is_empty() {
             return Ok(());
         }
-        let mut args: Vec<&[u8]> = vec![b"reset", b"-q", b"HEAD", b"--"];
-        args.extend(paths.iter().copied());
-        run_bytes(&self.root, &args).map(|_| ())
+        self.run_chunked(&[b"reset", b"-q", b"HEAD", b"--"], paths)
     }
 
     fn commit(&self, message: &str) -> Result<String> {
@@ -847,6 +867,21 @@ impl Repo for Binary {
 }
 
 impl Binary {
+    /// Runs `head ++ paths` through [`run_bytes`], in as many processes as
+    /// [`ARGV_BUDGET`] demands — one for every list a person actually
+    /// stages, several only for the fresh-repository trees bulk exists for.
+    fn run_chunked(&self, head: &[&[u8]], paths: &[&[u8]]) -> Result<()> {
+        let mut at = 0;
+        while at < paths.len() {
+            let end = chunk_end(paths, at);
+            let mut args: Vec<&[u8]> = head.to_vec();
+            args.extend(paths[at..end].iter().copied());
+            run_bytes(&self.root, &args).map(|_| ())?;
+            at = end;
+        }
+        Ok(())
+    }
+
     /// Ahead and behind between a branch and its upstream: one process, both
     /// numbers.
     ///
@@ -3809,6 +3844,71 @@ mod tests {
             .expect("unstages all");
         let s = g.status().unwrap();
         assert!(s.staged.is_empty() && s.untracked.len() == 3, "{s:?}");
+    }
+
+    #[test]
+    fn argv_chunks_take_at_least_one_path_and_never_cross_the_budget() {
+        let small: &[&[u8]] = &[b"a", b"b", b"c"];
+        assert_eq!(
+            chunk_end(small, 0),
+            3,
+            "a list under the budget is one chunk"
+        );
+
+        // A single name larger than the budget still travels: progress
+        // beats deadlock, because a chunk of zero would loop forever.
+        let big = vec![b'x'; ARGV_BUDGET + 1];
+        let one: [&[u8]; 1] = [&big];
+        assert_eq!(chunk_end(&one, 0), 1);
+
+        // And the boundary itself: fill up to the budget, stop before the
+        // path that would cross it.
+        let half = vec![b'y'; ARGV_BUDGET / 2 + 1];
+        let pair: [&[u8]; 2] = [&half, &half];
+        assert_eq!(
+            chunk_end(&pair, 0),
+            1,
+            "the second half would cross the budget"
+        );
+        assert_eq!(chunk_end(&pair, 1), 2);
+    }
+
+    #[test]
+    fn staging_a_tree_too_big_for_one_argv_still_stages_everything() {
+        // ~900 paths at ~124 bytes each is ~110 KB of argv — past
+        // [`ARGV_BUDGET`], so the verb runs more than one `add`. The whole
+        // point: stage-all's own use case must not be the thing that breaks
+        // it with E2BIG. The assertion nobody notices is the point.
+        let r = Scratch::new("bulk-chunks");
+        r.write(".gitignore", b"");
+        r.write("seed.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+
+        let paths: Vec<String> = (0..900)
+            .map(|i| format!("bulk/{i:04}/{}.txt", "p".repeat(110)))
+            .collect();
+        for name in &paths {
+            r.write(name, b"\n");
+        }
+        let refs: Vec<&[u8]> = paths.iter().map(|p| p.as_bytes()).collect();
+
+        let g = r.open();
+        g.stage_many(&refs).expect("stages across every chunk");
+        let s = g.status().unwrap();
+        assert_eq!(
+            s.staged.len(),
+            paths.len(),
+            "{:?} summaries lie",
+            s.staged.len()
+        );
+        assert!(s.untracked.is_empty(), "{s:?}");
+
+        // And back out again, through however many resets it takes.
+        g.unstage_many(&refs).expect("unstages across every chunk");
+        let s = g.status().unwrap();
+        assert!(s.staged.is_empty());
+        assert_eq!(s.untracked.len(), paths.len());
     }
 
     #[test]
