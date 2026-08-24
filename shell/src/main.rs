@@ -2408,7 +2408,7 @@ mod tests {
     use super::{config, input, panes, DevShell, Open, Pane, Refresh, Screen, Writes};
     use crate::views::commits::Commits;
     use gitten_app::cli::Source;
-    use gitten_app::jobs::{Event as JobEvent, Generation, Job, Runner};
+    use gitten_app::jobs::{Event as JobEvent, Generation, Job, Runner, Submitter};
     use gitten_core::command::{Code, Key, Keymap, Modes, Resolve};
     use gitten_core::host::Host;
     use gitten_core::status::Status;
@@ -3139,41 +3139,60 @@ mod tests {
         (shell, repo, handle)
     }
 
-    /// Waits for one successful finish off the job thread, then drains the
-    /// events the way the live window's pump does — so a generation bump and
-    /// the re-acquire it schedules happen through the real rails.
-    #[track_caller]
-    fn wait_finished(shell: &gpui::Entity<DevShell>, cx: &mut TestAppContext) -> Generation {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut done = None;
-        while done.is_none() {
-            assert!(Instant::now() < deadline, "no job finished in time");
-            shell.update(cx, |shell, _| {
-                while let Some(event) = shell.jobs.try_next() {
-                    match event {
-                        JobEvent::Started { .. } => {}
-                        JobEvent::Finished {
-                            outcome: Ok(generation),
-                            ..
-                        } => done = Some(generation),
-                        JobEvent::Finished {
-                            outcome: Err(error),
-                            ..
-                        } => panic!("job failed: {error}"),
-                    }
-                }
-            });
-            if done.is_none() {
-                std::thread::yield_now();
-            }
-        }
-        let generation = done.unwrap();
-        shell.update(cx, |shell, cx| {
-            shell.generation = generation;
-            shell.refresh_stale(cx);
+    /// Puts a caller-visible runner pair into the shell, so a test submits
+    /// into the very queue [`DevShell::drain_jobs`] drains.
+    fn wire_runner(shell: &gpui::Entity<DevShell>, cx: &mut TestAppContext) -> Submitter {
+        let jobs = Runner::new();
+        let submitter = jobs.submitter();
+        shell.update(cx, |shell, _| {
+            shell.jobs = jobs;
+            shell.submitter = submitter.clone();
         });
+        submitter
+    }
+
+    /// Drives the production pump — [`DevShell::drain_jobs`], the same call
+    /// the live window makes from its timer — until `done` says an event has
+    /// landed. No test-local event reading; what a window does, this does.
+    #[track_caller]
+    fn pump_until(
+        shell: &gpui::Entity<DevShell>,
+        cx: &mut TestAppContext,
+        done: impl Fn(&DevShell) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            shell.update(cx, |shell, cx| shell.drain_jobs(cx));
+            if shell.read_with(cx, |shell, _| done(shell)) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the pump never saw the event land"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    /// Waits through the pump for one successful write, then lets the refresh
+    /// it scheduled apply — the whole production path from queue to screen.
+    #[track_caller]
+    fn pump_write(shell: &gpui::Entity<DevShell>, cx: &mut TestAppContext) {
+        let before = shell.read_with(cx, |shell, _| shell.generation);
+        pump_until(shell, cx, |shell| shell.generation > before);
         cx.run_until_parked();
-        generation
+    }
+
+    struct Fails;
+
+    impl Job for Fails {
+        fn name(&self) -> &str {
+            "fails"
+        }
+
+        fn run(self: Box<Self>) -> Result<(), String> {
+            Err("git commit: hook declined".into())
+        }
     }
 
     #[gpui::test]
@@ -3181,7 +3200,7 @@ mod tests {
         let (shell, repo, _handle) = files_shell(cx);
         // The cursor starts on the last row: notes.md, under *unstaged*.
         shell.update(cx, |shell, cx| shell.run_command("files.stage", cx));
-        wait_finished(&shell, cx);
+        pump_write(&shell, cx);
         assert_eq!(repo.wrote(), vec!["stage notes.md"]);
         // The refresh rails ran: the pane re-acquired against the (empty)
         // post-write tree, which is what makes the file visibly move.
@@ -3202,7 +3221,7 @@ mod tests {
             });
         });
         shell.update(cx, |shell, cx| shell.run_command("files.stage", cx));
-        wait_finished(&shell, cx);
+        pump_write(&shell, cx);
         assert_eq!(repo.wrote(), vec!["stage notes.md", "unstage gone.txt"]);
     }
 
@@ -3230,7 +3249,7 @@ mod tests {
         });
         shell.update(cx, |shell, cx| shell.run_command("input.accept", cx));
 
-        wait_finished(&shell, cx);
+        pump_write(&shell, cx);
         shell.read_with(cx, |shell, _| {
             assert!(shell.input.is_none(), "the field stayed open");
         });
@@ -3271,6 +3290,75 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_failed_job_lands_on_the_error_band_and_advances_nothing(cx: &mut TestAppContext) {
+        let shell = shell(None, cx);
+        let submit = wire_runner(&shell, cx);
+        assert!(submit.submit(Box::new(Fails)).is_ok());
+
+        // The production pump, not a test-local read of the queue.
+        pump_until(&shell, cx, |shell| shell.error.is_some());
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(
+                shell.error.as_deref(),
+                Some("git commit: hook declined"),
+                "the repository's own words reached the band"
+            );
+            assert!(shell.running.is_none(), "the job still reads as running");
+            assert_eq!(
+                shell.generation,
+                Generation::default(),
+                "a failure advanced the generation"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn a_successful_job_bumps_the_generation_and_reacquires_through_the_pump(
+        cx: &mut TestAppContext,
+    ) {
+        let (shell, repo, handle) = files_shell(cx);
+        let submit = wire_runner(&shell, cx);
+        assert!(submit
+            .submit(Box::new(gitten_app::verbs::Write::stage(
+                &handle,
+                b"notes.md".to_vec()
+            )))
+            .is_ok());
+
+        let before = shell.read_with(cx, |shell, _| shell.generation);
+        pump_write(&shell, cx);
+        assert_eq!(
+            repo.wrote(),
+            vec!["stage notes.md"],
+            "the write ran off-thread against the real handle"
+        );
+        shell.read_with(cx, |shell, _cx| {
+            assert!(shell.generation > before, "the bump never happened");
+            assert!(shell.error.is_none());
+            // Re-acquisition applied: every pane's generation caught up with
+            // the shell's, through refresh_stale and no test help.
+            for screen in shell.panes.iter() {
+                match screen {
+                    Screen::Files { generation, .. } => {
+                        assert_eq!(generation.get(), shell.generation);
+                    }
+                    Screen::Commits { source, .. } => {
+                        assert!(matches!(source, Source::Fixtures), "a fixture stays put")
+                    }
+                    other => panic!(
+                        "unexpected pane kind: {}",
+                        match other {
+                            Screen::Custom(_) => "custom",
+                            Screen::Diff { .. } => "diff",
+                            Screen::Commits { .. } | Screen::Files { .. } => unreachable!(),
+                        }
+                    ),
+                }
+            }
+        });
+    }
+
+    #[gpui::test]
     fn an_extension_pane_stages_through_the_same_writes_a_builtin_gets(cx: &mut TestAppContext) {
         // Rule 1, exercised rather than asserted: a pane that shipped with no
         // verb of its own runs a stage-equivalent from inside its `run`, off
@@ -3294,7 +3382,7 @@ mod tests {
 
         shell.update(cx, |shell, cx| shell.run_command("extension.stage", cx));
         assert!(ran.get(), "the extension could not reach the rails");
-        wait_finished(&shell, cx);
+        pump_write(&shell, cx);
         assert_eq!(repo.wrote(), vec!["stage notes.md"]);
         shell.read_with(cx, |shell, _| {
             assert!(shell.generation.get() > 0);
