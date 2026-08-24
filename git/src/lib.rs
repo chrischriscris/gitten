@@ -202,12 +202,20 @@ where
     let raw = if revspec.is_empty() {
         run(repo, &[&["diff"], &RAW[..], &["HEAD"]].concat())?
     } else if revspec.contains("..") {
-        run(repo, &[&["diff"], &RAW[..], &[revspec]].concat())?
+        run(
+            repo,
+            &[&["diff"], &RAW[..], &["--end-of-options", revspec]].concat(),
+        )?
     } else {
         // A bare revision means "what did this commit change".
         run(
             repo,
-            &[&["show"], &RAW[..], &["--format=", revspec]].concat(),
+            &[
+                &["show"],
+                &RAW[..],
+                &["--format=", "--end-of-options", revspec],
+            ]
+            .concat(),
         )?
     };
 
@@ -920,6 +928,35 @@ mod tests {
         let got = pairs(&r.0, "").unwrap();
         assert_eq!(paths(&got), vec!["has space.txt"]);
         assert_eq!(strs(&got[0].new), ["spaced"]);
+    }
+
+    #[test]
+    fn a_revspec_cannot_smuggle_an_option_to_git() {
+        // A revspec beginning with `-` would be parsed by git as an option
+        // without `--end-of-options`, and `--output=<path>` would make
+        // `git diff` write to an arbitrary file. The separator must turn it
+        // back into a (nonexistent) revision, so the file is never written.
+        let r = Scratch::new("smuggle");
+        r.write("seed.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+
+        let target = r.0.join("PWNED");
+        let hostile = format!("--output={}", target.display());
+
+        // The `..` (diff) arm.
+        let _ = pairs(&r.0, &format!("{hostile}..HEAD"));
+        assert!(
+            !target.exists(),
+            "a revspec must not be able to make git write a file"
+        );
+
+        // The bare-revision (show) arm.
+        let _ = pairs(&r.0, &hostile);
+        assert!(
+            !target.exists(),
+            "the bare-revision arm must guard the separator too"
+        );
     }
 
     #[test]
