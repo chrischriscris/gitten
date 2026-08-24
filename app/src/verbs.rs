@@ -18,13 +18,21 @@ type Op = Box<dyn FnOnce(&dyn Repo) -> Result<(), String> + Send>;
 
 /// One repository write, ready for a [`Submitter`](crate::jobs::Submitter).
 ///
-/// Built through [`Write::stage`], [`Write::unstage`] or [`Write::commit`];
+/// Built through [`Write::stage`], [`Write::discard`] and their siblings;
 /// anything else is the constructor with a closure of your own, which is what
 /// keeps this from being a list of built-ins wearing a struct.
 pub struct Write {
     name: String,
     repo: Handle,
     op: Op,
+}
+
+/// The band's count of paths, said the way a person says it.
+fn many(n: usize) -> String {
+    match n {
+        1 => "1 path".into(),
+        n => format!("{n} paths"),
+    }
 }
 
 impl Write {
@@ -52,6 +60,51 @@ impl Write {
     pub fn unstage(repo: &Handle, path: Vec<u8>) -> Self {
         let shown = String::from_utf8_lossy(&path).into_owned();
         Self::named(format!("unstage {shown}"), repo, move |r| r.unstage(&path))
+    }
+
+    /// Stages every path as one job — the stage-all command's shape. One job,
+    /// not one per path, because each finish is a generation bump and a
+    /// re-acquire wave, and forty of those for one keypress is forty lies
+    /// about what happened.
+    pub fn stage_many(repo: &Handle, paths: Vec<Vec<u8>>) -> Self {
+        Self::named(format!("stage {}", many(paths.len())), repo, move |r| {
+            let refs: Vec<&[u8]> = paths.iter().map(|p| p.as_slice()).collect();
+            r.stage_many(&refs)
+        })
+    }
+
+    /// Unstages every path as one job — [`Write::stage_many`]'s mirror.
+    pub fn unstage_many(repo: &Handle, paths: Vec<Vec<u8>>) -> Self {
+        Self::named(format!("unstage {}", many(paths.len())), repo, move |r| {
+            let refs: Vec<&[u8]> = paths.iter().map(|p| p.as_slice()).collect();
+            r.unstage_many(&refs)
+        })
+    }
+
+    /// Checks out one path's working-tree state away. DESTRUCTIVE: unstaged
+    /// work ends here, which is why the caller confirms before this job is
+    /// ever built.
+    pub fn discard(repo: &Handle, path: Vec<u8>) -> Self {
+        let shown = String::from_utf8_lossy(&path).into_owned();
+        Self::named(format!("discard {shown}"), repo, move |r| r.discard(&path))
+    }
+
+    /// Deletes one untracked file — discard's mechanics for a file git has
+    /// no earlier version of. Destructive in the plain sense: nothing is
+    /// recoverable from the object database, because nothing was ever in it.
+    pub fn remove_untracked(repo: &Handle, path: Vec<u8>) -> Self {
+        let shown = String::from_utf8_lossy(&path).into_owned();
+        Self::named(format!("delete {shown}"), repo, move |r| {
+            r.remove_untracked(&path)
+        })
+    }
+
+    /// Appends one path to `.gitignore`. Not destructive — the file stays on
+    /// disk — but it edits a user-authored file, so it rides the same queue
+    /// and answers through the same bands as everything else that writes.
+    pub fn ignore(repo: &Handle, path: Vec<u8>) -> Self {
+        let shown = String::from_utf8_lossy(&path).into_owned();
+        Self::named(format!("ignore {shown}"), repo, move |r| r.ignore(&path))
     }
 
     /// Commits the index with `message`. The returned OID has no consumer on
@@ -117,6 +170,45 @@ mod tests {
                 .push(format!("unstage {}", String::from_utf8_lossy(path)));
             Ok(())
         }
+        fn discard(&self, path: &[u8]) -> gitten_git::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("discard {}", String::from_utf8_lossy(path)));
+            Ok(())
+        }
+        fn remove_untracked(&self, path: &[u8]) -> gitten_git::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("delete {}", String::from_utf8_lossy(path)));
+            Ok(())
+        }
+        fn ignore(&self, path: &[u8]) -> gitten_git::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("ignore {}", String::from_utf8_lossy(path)));
+            Ok(())
+        }
+        fn stage_many(&self, paths: &[&[u8]]) -> gitten_git::Result<()> {
+            let shown = paths
+                .iter()
+                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.0.lock().unwrap().push(format!("stage-many {shown}"));
+            Ok(())
+        }
+        fn unstage_many(&self, paths: &[&[u8]]) -> gitten_git::Result<()> {
+            let shown = paths
+                .iter()
+                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.0.lock().unwrap().push(format!("unstage-many {shown}"));
+            Ok(())
+        }
         fn commit(&self, message: &str) -> gitten_git::Result<String> {
             self.0.lock().unwrap().push(format!("commit {message}"));
             Ok("f00d".into())
@@ -167,6 +259,79 @@ mod tests {
             }
         }
         assert_eq!(names, vec!["stage a.txt", "unstage b c.txt", "commit"]);
+    }
+
+    #[test]
+    fn the_file_verbs_reach_the_trait_and_name_themselves_for_the_band() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let repo: Handle = Arc::new(Recording(Arc::clone(&calls)));
+        let runner = Runner::new();
+        let submit = runner.submitter();
+
+        assert!(submit
+            .submit(Box::new(Write::discard(&repo, b"src/x.rs".to_vec())))
+            .is_ok());
+        assert!(submit
+            .submit(Box::new(Write::remove_untracked(
+                &repo,
+                b"notes.md".to_vec()
+            )))
+            .is_ok());
+        assert!(submit
+            .submit(Box::new(Write::ignore(&repo, b"notes.md".to_vec())))
+            .is_ok());
+        // Bulk: one job over many paths, named for its count — a stage-all
+        // keypress reads as one thing happening, not forty.
+        assert!(submit
+            .submit(Box::new(Write::stage_many(
+                &repo,
+                vec![b"a.txt".to_vec(), b"b c.txt".to_vec()]
+            )))
+            .is_ok());
+        assert!(submit
+            .submit(Box::new(Write::unstage_many(
+                &repo,
+                vec![b"a.txt".to_vec()]
+            )))
+            .is_ok());
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while recorded(&calls).len() < 5 {
+            assert!(
+                Instant::now() < deadline,
+                "jobs did not run: {:?}",
+                recorded(&calls)
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            recorded(&calls),
+            vec![
+                "discard src/x.rs",
+                "delete notes.md",
+                "ignore notes.md",
+                "stage-many a.txt, b c.txt",
+                "unstage-many a.txt",
+            ]
+        );
+
+        let mut names = Vec::new();
+        while let Some(event) = runner.try_next() {
+            if let Event::Started { name } = event {
+                names.push(name);
+            }
+        }
+        assert_eq!(
+            names,
+            vec![
+                "discard src/x.rs",
+                "delete notes.md",
+                "ignore notes.md",
+                "stage 2 paths",
+                "unstage 1 path",
+            ],
+            "the band names are the verbs' own words"
+        );
     }
 
     #[test]
