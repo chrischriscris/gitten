@@ -42,9 +42,7 @@ pub(crate) enum Entry {
 /// One file of the working tree.
 pub(crate) struct FileEntry {
     /// Which group it sits under — what stage/unstage will need to know where
-    /// a verb goes. Read by the tests tonight and by the stage wave next; a
-    /// binary crate does not count a test as a use.
-    #[allow(dead_code)]
+    /// a verb goes, and half of the refresh anchor.
     pub section: Section,
     /// The addressing form, byte for byte. Never decoded in place.
     pub path: PathBytes,
@@ -309,20 +307,23 @@ impl Files {
     pub(crate) fn replace_prepared(&mut self, prepared: Prepared, host: &Host) {
         self.reconcile(host);
         let old = self.view.get();
-        // Only a file anchors; a heading is a fact about the last refresh's
-        // grouping, not a thing the eye was reading.
+        // Only a file anchors, and on its **section and path together**: the
+        // same path can sit in staged *and* unstaged, and anchoring on the
+        // bare path would walk the cursor to whichever twin flattens first.
+        // A heading is a fact about the last refresh's grouping, not a thing
+        // the eye was reading.
         let anchored = match self.data.get(old.cursor()) {
-            Some(Entry::File(f)) => Some(f.path.clone()),
+            Some(Entry::File(f)) => Some((f.section, f.path.clone())),
             _ => None,
         };
         let Prepared { rows, .. } = prepared;
         self.data = Rc::new(rows);
 
         let cursor = anchored
-            .and_then(|path| {
-                self.data
-                    .iter()
-                    .position(|e| matches!(e, Entry::File(f) if f.path == path))
+            .and_then(|(section, path)| {
+                self.data.iter().position(
+                    |e| matches!(e, Entry::File(f) if f.section == section && f.path == path),
+                )
             })
             .unwrap_or(old.cursor());
         let mut view = old;
@@ -849,7 +850,7 @@ mod tests {
     }
 
     #[test]
-    fn replacement_keeps_the_cursor_on_its_file_across_a_refresh() {
+    fn replacement_keeps_the_cursor_on_its_file_within_its_section() {
         let host = Host::new();
         let mut f = files(sample_status());
         with_height(&mut f, 9);
@@ -861,14 +862,45 @@ mod tests {
         }
         assert_eq!(f.cursor_text(), "? notes.md");
 
-        // A write stages everything: notes.md moves to the staged section and
-        // gone.txt leaves the list, but the keyboard follows its path.
-        let next = Status {
-            staged: vec![staged("notes.md", Change::Added)],
-            ..Default::default()
-        };
+        // A refresh that adds a file above it in the same section shifts
+        // notes.md down a row; the keyboard goes with the file.
+        let mut next = sample_status();
+        next.untracked.insert(0, untracked("aaa.md"));
         f.replace(next, &host);
-        assert_eq!(f.cursor_text(), "A notes.md");
+        assert_eq!(f.cursor_text(), "? notes.md");
+    }
+
+    #[test]
+    fn an_anchor_does_not_cross_sections_to_a_path_twin() {
+        // `src/main.rs` sits in staged *and* unstaged. The cursor is on the
+        // unstaged one; a refresh must not walk it up to the staged twin just
+        // because that twin flattens first.
+        let host = Host::new();
+        let mut f = files(sample_status());
+        with_height(&mut f, 9);
+        f.run_view("view.top", &host);
+        for _ in 0..4 {
+            f.run_view("view.down", &host);
+        }
+        let before = f.current_file().expect("a file under the cursor");
+        assert_eq!(
+            (before.section, before.path.to_string_lossy().as_ref()),
+            (Section::Unstaged, "src/main.rs")
+        );
+
+        // A staged addition above shifts every staged row; the anchor holds
+        // the unstaged copy anyway.
+        let mut next = sample_status();
+        next.staged.insert(0, staged("aaa.rs", Change::Added));
+        f.replace(next, &host);
+
+        let after = f.current_file().expect("still a file");
+        assert_eq!(
+            after.section,
+            Section::Unstaged,
+            "the cursor walked across sections"
+        );
+        assert_eq!(after.path.as_bytes(), b"src/main.rs");
     }
 
     #[test]
