@@ -111,6 +111,16 @@ impl Commits {
         self.data.commits.len()
     }
 
+    /// Rows the list draws right now: [`Commits::total`] until a query
+    /// narrows it, and what every viewport number addresses.
+    ///
+    /// Read by tests and, one day, by a second client's status line; nothing
+    /// in this window needs it yet.
+    #[allow(dead_code)]
+    pub fn rows(&self) -> usize {
+        self.visible.len()
+    }
+
     /// The commit under the keyboard, for whatever opens a diff from it.
     ///
     /// Through the indirection and not `data.commits[cursor]`: the cursor is
@@ -651,15 +661,18 @@ mod tests {
     /// A history whose subjects alternate between two words, so half of it
     /// survives any query the tests type and the rest does not.
     fn mixed_history() -> Vec<Commit> {
-        (0..30)
-            .map(|n| Commit {
-                author: Arc::from(if n % 2 == 0 { "ada" } else { "grace" }),
-                subject: if n % 2 == 0 {
-                    format!("engine note {n}")
-                } else {
-                    format!("compiler pass {n}")
-                },
-                ..commit(n)
+        (0..30usize)
+            .map(|n| {
+                let even = n.is_multiple_of(2);
+                Commit {
+                    author: Arc::from(if even { "ada" } else { "grace" }),
+                    subject: if even {
+                        format!("engine note {n}")
+                    } else {
+                        format!("compiler pass {n}")
+                    },
+                    ..commit(n)
+                }
             })
             .collect()
     }

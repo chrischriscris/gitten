@@ -156,6 +156,7 @@ type ApplyRefresh = dyn FnOnce(RefreshValue, &Host, &mut App) -> Result<(), Stri
 /// slot can hold tonight. A third consumer becomes a third variant and nothing
 /// else changes: the field routes by what it was opened *for*, never by who is
 /// listening.
+#[derive(Debug)]
 enum Prompt {
     /// The message a `files.commit` accept turns into a commit job.
     CommitMessage,
@@ -3028,6 +3029,198 @@ mod tests {
         shell.read_with(cx, |shell, _| {
             assert!(shell.input.is_none());
             assert_eq!(shell.modes.top(), "commits");
+        });
+    }
+
+    // ---------------------------------------------------------- the search
+
+    /// A history to filter: alternating authors and subjects, so any query
+    /// keeps a known half and discards the rest.
+    fn search_commit(n: usize) -> Commit {
+        let even = n.is_multiple_of(2);
+        Commit {
+            sha: format!("{n:040x}"),
+            short: format!("abc00{n}"),
+            parents: Box::from(&[][..]),
+            author: Arc::from(if even { "ada" } else { "grace" }),
+            timestamp: 1_700_000_000 + n as i64,
+            subject: if even {
+                format!("engine note {n}")
+            } else {
+                format!("compiler pass {n}")
+            },
+        }
+    }
+
+    fn search_history() -> Vec<Commit> {
+        (0..30).map(search_commit).collect()
+    }
+
+    /// [`shell`] is built with an empty pane; this one carries rows, which is
+    /// what every search test needs to see move. Replacing by name keeps the
+    /// root slot — and focus — exactly where they were.
+    fn commits_shell(cx: &mut TestAppContext) -> gpui::Entity<DevShell> {
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, cx| {
+            let view = cx.new(|_| Commits::new(search_history(), Rc::new(Host::new())));
+            shell.panes.register(
+                "commits",
+                Screen::commits(view, Source::Fixtures, Generation::default(), "~/src"),
+            );
+            shell.sync_modes();
+        });
+        shell
+    }
+
+    /// The focused commits pane, for reading what a search did to it.
+    fn commits_view(shell: &gpui::Entity<DevShell>, cx: &TestAppContext) -> gpui::Entity<Commits> {
+        match shell.read_with(cx, |shell, _| shell.active().cloned()) {
+            Some(Screen::Commits { view, .. }) => view.clone(),
+            _ => panic!("no commits pane under the keyboard"),
+        }
+    }
+
+    /// Opens the prompt and types `query` into it the way the platform would:
+    /// through the field's own edit path, whose event the live filter rides.
+    #[track_caller]
+    fn type_query(shell: &gpui::Entity<DevShell>, cx: &mut TestAppContext, query: &str) {
+        shell.update(cx, |shell, cx| shell.run_command("commits.search", cx));
+        let typed = shell.read_with(cx, |shell, _| shell.input.clone());
+        let Some(field) = typed else {
+            panic!("no field opened");
+        };
+        field.update(cx, |field, cx| field.replace(None, query, cx));
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn slash_opens_a_live_search_and_enter_leaves_what_it_found(cx: &mut TestAppContext) {
+        let shell = commits_shell(cx);
+        type_query(&shell, cx, "engine");
+
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.modes.top(), input::MODE, "the field owns the keys");
+            assert!(
+                matches!(shell.prompt, Some(super::Prompt::Search { .. })),
+                "{:?}",
+                shell.prompt
+            );
+        });
+        let view = commits_view(&shell, cx);
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.rows(), 15, "the list filtered while typing");
+            assert_eq!(v.filter_note().as_deref(), Some("15/30"));
+        });
+
+        // Enter closes with the query standing; the count stays in the title.
+        shell.update(cx, |shell, cx| shell.run_command("input.accept", cx));
+        shell.read_with(cx, |shell, app| {
+            assert!(shell.input.is_none());
+            assert_eq!(shell.modes.top(), "commits");
+            assert_eq!(shell.active_label(app).as_ref(), "~/src · 15/30");
+        });
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.rows(), 15, "accept kept the filter")
+        });
+    }
+
+    #[gpui::test]
+    fn esc_clears_the_filter_along_with_the_prompt(cx: &mut TestAppContext) {
+        let shell = commits_shell(cx);
+        type_query(&shell, cx, "engine");
+        let view = commits_view(&shell, cx);
+        view.read_with(cx, |v, _| assert_eq!(v.rows(), 15));
+
+        // The real exit key: `back` finds the input and cancels it.
+        shell.update(cx, |shell, cx| shell.back(cx));
+        shell.read_with(cx, |shell, app| {
+            assert!(shell.input.is_none());
+            assert_eq!(shell.active_label(app).as_ref(), "~/src", "restored");
+        });
+        view.read_with(cx, |v, _| assert_eq!(v.rows(), 30, "nothing left standing"));
+    }
+
+    #[gpui::test]
+    fn a_second_slash_edits_the_standing_query(cx: &mut TestAppContext) {
+        let shell = commits_shell(cx);
+        type_query(&shell, cx, "engine");
+        shell.update(cx, |shell, cx| shell.run_command("input.accept", cx));
+
+        // Reopen: the pane still holds the query, so the field starts from
+        // it rather than from nothing.
+        type_query(&shell, cx, "");
+        let value = shell.read_with(cx, |shell, app| {
+            shell
+                .input
+                .as_ref()
+                .map(|field| field.read(app).value().to_string())
+        });
+        assert_eq!(value.as_deref(), Some("engine"));
+
+        // Narrowing from there filters live from the longer query.
+        let typed = shell.read_with(cx, |shell, _| shell.input.clone().unwrap());
+        typed.update(cx, |field, cx| field.replace(None, " note 3", cx));
+        cx.run_until_parked();
+        let view = commits_view(&shell, cx);
+        view.read_with(cx, |v, _| {
+            assert!(matches!(v.query(), Some(q) if q.contains("note 3")));
+            assert!(v.rows() < 15, "the edited query applied live");
+        });
+    }
+
+    #[gpui::test]
+    fn an_empty_accept_takes_the_filter_back_off(cx: &mut TestAppContext) {
+        let shell = commits_shell(cx);
+
+        // Accepting an untouched prompt clears nothing because there is
+        // nothing to clear — and says so by leaving the label alone.
+        type_query(&shell, cx, "");
+        shell.update(cx, |shell, cx| shell.run_command("input.accept", cx));
+        shell.read_with(cx, |shell, app| {
+            assert_eq!(shell.active_label(app).as_ref(), "~/src");
+        });
+
+        // A standing filter comes off live the moment the field is emptied:
+        // cmd-a and delete are enough, before enter even lands.
+        type_query(&shell, cx, "engine");
+        let typed = shell.read_with(cx, |shell, _| shell.input.clone().unwrap());
+        typed.update(cx, |field, cx| {
+            field.select_all_text(true, cx);
+            field.replace(None, "", cx);
+        });
+        cx.run_until_parked();
+        let view = commits_view(&shell, cx);
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.rows(), 30, "cleared while still open")
+        });
+        shell.update(cx, |shell, cx| shell.run_command("input.accept", cx));
+        shell.read_with(cx, |shell, app| {
+            assert_eq!(shell.active_label(app).as_ref(), "~/src");
+        });
+    }
+
+    #[gpui::test]
+    fn search_says_so_where_nothing_answers_it(cx: &mut TestAppContext) {
+        // No repository data at all is still a commits screen — it answers.
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, cx| shell.run_command("commits.search", cx));
+        shell.read_with(cx, |shell, _| assert!(shell.input.is_some()));
+
+        // But the command belongs to the commits mode: over the working tree
+        // it resolves to nothing that can act, and is said rather than done.
+        let (shell, _repo, _handle) = files_shell(cx);
+        shell.update(cx, |shell, cx| shell.run_command("commits.search", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.input.is_none(), "a prompt opened over the files pane");
+            assert!(
+                shell
+                    .notice
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("not supported here"),
+                "{:?}",
+                shell.notice
+            );
         });
     }
 

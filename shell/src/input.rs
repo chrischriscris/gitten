@@ -198,7 +198,15 @@ impl Input {
     /// paste, cut and the platform's own `replace_text_in_range` all arrive
     /// here — which is why the [`Event::Edited`] emission lives at this one
     /// place and nowhere else.
-    fn replace(&mut self, range_utf16: Option<Range<usize>>, text: &str, cx: &mut Context<Self>) {
+    ///
+    /// Crate-visible so a test can drive an edit the way the platform would,
+    /// without a window to deliver one through.
+    pub(crate) fn replace(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) {
         let range = range_utf16
             .as_ref()
             .map(|range| range_from_utf16(&self.content, range))
