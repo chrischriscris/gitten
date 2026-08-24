@@ -962,7 +962,15 @@ impl DevShell {
             return;
         };
         if let Some(view) = self.commits_pane(target).map(|(_, view)| view.clone()) {
-            view.update(cx, |v, _| v.apply_query(text));
+            // Meet the list where its last drag left it — the order
+            // `open_diff` and `copy` read in — before anchoring. Otherwise
+            // typing right after a scrollbar drag anchors to the cursor as it
+            // froze, not to the commit now being looked at.
+            let host = config::host(cx);
+            view.update(cx, |v, _| {
+                v.reconcile(&host);
+                v.apply_query(text);
+            });
             cx.notify();
         }
     }
@@ -3063,6 +3071,9 @@ mod tests {
         let shell = shell(None, cx);
         shell.update(cx, |shell, cx| {
             let view = cx.new(|_| Commits::new(search_history(), Rc::new(Host::new())));
+            // A live edit reconciles against the file's settings, like every
+            // other reader of the host.
+            cx.set_global(config::Active(Rc::new(Host::new())));
             shell.panes.register(
                 "commits",
                 Screen::commits(view, Source::Fixtures, Generation::default(), "~/src"),
