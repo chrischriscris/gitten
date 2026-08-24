@@ -19,6 +19,7 @@ pub mod prepared;
 pub mod refs;
 pub mod rows;
 pub mod runs;
+pub mod search;
 pub mod select;
 pub mod status;
 pub mod syntax;

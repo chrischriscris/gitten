@@ -40,6 +40,13 @@ impl<T> Panes<T> {
         &self.entries[self.focused].value
     }
 
+    /// The focused tenant's stable registration name — what a prompt holds so
+    /// its result can be routed back to the pane it was opened over, however
+    /// focus moves while it is open.
+    pub fn focused_name(&self) -> &str {
+        &self.entries[self.focused].name
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &T> {
         self.entries.iter().map(|entry| &entry.value)
     }

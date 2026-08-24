@@ -68,6 +68,11 @@ pub fn bind_keys(cx: &mut App) {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
+    /// The text changed — typed, pasted, cut, deleted or replaced by the
+    /// platform. Emitted from the two places content can mutate, so a live
+    /// consumer (a search prompt filtering as you type) sees every edit
+    /// without polling a field it does not own.
+    Edited(String),
     Accepted(String),
     Cancelled,
 }
@@ -188,7 +193,20 @@ impl Input {
             .unwrap_or(self.content.len())
     }
 
-    fn replace(&mut self, range_utf16: Option<Range<usize>>, text: &str) {
+    /// Replaces the selected (or marked, or given) range. The one choke point
+    /// for every edit that is not composition state — backspace, delete,
+    /// paste, cut and the platform's own `replace_text_in_range` all arrive
+    /// here — which is why the [`Event::Edited`] emission lives at this one
+    /// place and nowhere else.
+    ///
+    /// Crate-visible so a test can drive an edit the way the platform would,
+    /// without a window to deliver one through.
+    pub(crate) fn replace(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) {
         let range = range_utf16
             .as_ref()
             .map(|range| range_from_utf16(&self.content, range))
@@ -199,13 +217,18 @@ impl Input {
         self.selected = cursor..cursor;
         self.reversed = false;
         self.marked = None;
+        cx.emit(Event::Edited(self.content.clone()));
     }
 
+    /// The composition half of the same story: IME text lands through here,
+    /// and it edits content just as much as a keystroke does, so it says so
+    /// with the same event.
     fn replace_marked(
         &mut self,
         range_utf16: Option<Range<usize>>,
         text: &str,
         selected_utf16: Option<Range<usize>>,
+        cx: &mut Context<Self>,
     ) {
         let range = range_utf16
             .as_ref()
@@ -221,6 +244,7 @@ impl Input {
             .map(|range| start + range.start..start + range.end)
             .unwrap_or_else(|| start + text.len()..start + text.len());
         self.reversed = false;
+        cx.emit(Event::Edited(self.content.clone()));
     }
 
     fn index_for_point(&self, point: Point<Pixels>) -> usize {
@@ -303,7 +327,7 @@ impl Input {
             }
             self.select_to(at);
         }
-        self.replace(None, "");
+        self.replace(None, "", cx);
         cx.notify();
     }
 
@@ -316,13 +340,13 @@ impl Input {
             }
             self.select_to(at);
         }
-        self.replace(None, "");
+        self.replace(None, "", cx);
         cx.notify();
     }
 
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.replace(None, &text.replace(['\r', '\n'], " "));
+            self.replace(None, &text.replace(['\r', '\n'], " "), cx);
             cx.notify();
         }
     }
@@ -340,7 +364,7 @@ impl Input {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.selected.clone()].to_string(),
             ));
-            self.replace(None, "");
+            self.replace(None, "", cx);
             cx.notify();
         }
     }
@@ -429,7 +453,7 @@ impl EntityInputHandler for Input {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.replace(range_utf16, text);
+        self.replace(range_utf16, text, cx);
         cx.notify();
     }
 
@@ -441,7 +465,7 @@ impl EntityInputHandler for Input {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.replace_marked(range_utf16, text, selected_utf16);
+        self.replace_marked(range_utf16, text, selected_utf16, cx);
         cx.notify();
     }
 
@@ -765,6 +789,8 @@ fn range_to_utf16(text: &str, range: &Range<usize>) -> Range<usize> {
 mod tests {
     use super::{offset_from_utf16, range_from_utf16, range_to_utf16, Input};
     use gpui::{AppContext as _, Entity, TestAppContext};
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     fn input(text: &str, cx: &mut TestAppContext) -> Entity<Input> {
         cx.new(|cx| Input::new("message", "type", text, cx))
@@ -791,14 +817,14 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         let input = input("ab", cx);
-        input.update(cx, |input, _| {
+        input.update(cx, |input, cx| {
             input.move_to(1);
-            input.replace_marked(None, "😀x", Some(2..3));
+            input.replace_marked(None, "😀x", Some(2..3), cx);
             assert_eq!(input.value(), "a😀xb");
             assert_eq!(input.marked, Some(1..6));
             assert_eq!(input.selected, 5..6);
 
-            input.replace(None, "é");
+            input.replace(None, "é", cx);
             assert_eq!(input.value(), "aéb");
             assert_eq!(input.marked, None);
             assert_eq!(input.selected, 3..3);
@@ -806,9 +832,33 @@ mod tests {
     }
 
     #[gpui::test]
+    fn every_edit_from_either_choke_point_is_announced(cx: &mut TestAppContext) {
+        // A live consumer — the search prompt filtering as you type — sees
+        // each edit through [`Event::Edited`], from both places content can
+        // change, without polling a field it does not own.
+        let input = input("ab", cx);
+        let seen: Rc<RefCell<Vec<String>>> = Rc::default();
+        let sink = seen.clone();
+        input.update(cx, |_, cx| {
+            cx.subscribe(&input, move |_, _, event: &super::Event, _| {
+                if let super::Event::Edited(text) = event {
+                    sink.borrow_mut().push(text.clone());
+                }
+            })
+            .detach();
+        });
+        input.update(cx, |input, cx| {
+            input.move_to(input.content.len());
+            input.replace(None, "c", cx); // the keystroke path
+            input.replace_marked(None, "de", None, cx); // the composition path
+        });
+        assert_eq!(*seen.borrow(), vec!["abc".to_string(), "abcde".to_string()]);
+    }
+
+    #[gpui::test]
     fn cursor_motion_and_deletion_follow_graphemes(cx: &mut TestAppContext) {
         let input = input("éx", cx);
-        input.update(cx, |input, _| {
+        input.update(cx, |input, cx| {
             input.move_to(input.content.len());
             let before_x = input.previous_boundary(input.cursor());
             input.move_to(before_x);
@@ -816,7 +866,7 @@ mod tests {
             let before_combined = input.previous_boundary(input.cursor());
             assert_eq!(before_combined, 0, "the accent stayed with its base");
             input.selected = before_combined..input.cursor();
-            input.replace(None, "");
+            input.replace(None, "", cx);
             assert_eq!(input.value(), "x");
         });
     }

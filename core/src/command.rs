@@ -383,6 +383,7 @@ impl Keymap {
         bind("diff", "backtab", "diff.prev-file");
 
         bind("commits", "enter", "commits.open-diff");
+        bind("commits", "/", "commits.search");
 
         // Text itself belongs to the platform input service. These are the two
         // transitions around it, kept as named commands so a config file can
@@ -731,6 +732,7 @@ impl Commands {
             ("diff.cycle-wrap", "the next wrap"),
             ("theme.cycle", "the next theme"),
             ("commits.open-diff", "the diff for this commit"),
+            ("commits.search", "search the commits"),
             ("files.focus", "focus the working-tree pane"),
             ("files.stage", "stage or unstage the selected file"),
             ("files.commit", "commit the staged changes"),
