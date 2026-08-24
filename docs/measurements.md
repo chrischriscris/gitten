@@ -483,6 +483,52 @@ unlike `align`'s usual 13–27 % CV these two rows are real effects.
 Diffing answers did not move: `./check.sh`'s `differs vs git` section ran on the
 merged tree and matches the tolerance profile in the section above exactly.
 
+### One hasher, everywhere
+
+`FxHasher` was written for `parse_log`'s author map and stayed there. Every other
+intern map in `core` was still on `HashMap`'s default SipHash — including the
+**line** map, which is the hottest map in the application, and which additionally
+started at zero capacity and rehashed its way up once per file.
+
+```sh
+cargo run -q -p gitten-git --example diffcheck --release . 6401fcd~4..6401fcd
+```
+
+94 files, 50,103 old lines, 50,434 new. Same binary configuration, same revspec,
+`main` against the change, back to back:
+
+| mode | before | after | Δ |
+|---|---|---|---|
+| `histogram` | 14.4 ms | 6.4 ms | **−56 %** |
+| `patience` | 14.2 ms | 5.9 ms | **−58 %** |
+| `myers` | 6.9 ms | 3.8 ms | −45 % |
+| `ws-eol` | 32.1 ms | 13.3 ms | **−59 %** |
+| `ws-change` | 44.5 ms | 20.7 ms | −53 % |
+| `ws-all` | 34.0 ms | 18.9 ms | −44 % |
+
+Per fixture, whole-file histogram diffs over both reconstructed sides:
+
+| fixture | lines | before | after |
+|---|---|---|---|
+| `pr33933.diff` | 20,877 | 1.5 ms | 0.7 ms |
+| `pr30698.diff` | 82,258 | 34.1 ms | 17.3 ms |
+| `md.diff` | 94,614 | 52.1 ms | 24.3 ms |
+| `pr30683.diff` | 715,406 | 45.7 ms | 20.9 ms |
+
+**Answers are unchanged**, which is the only reason the number counts: `diffcheck`
+reports the same changed-line counts *and the same hunk positions* against all six
+git invocations, matching the tolerance profile in
+[the differs section](#the-differs-against-git) exactly.
+
+Half the differ, for a type alias. Two things are worth taking from it rather
+than the number. The whitespace rows moved most because `KeyArena` was hashing
+**twice** — SipHash over the key to get a `u64`, then SipHash over that `u64` to
+place it — so the mode that normalises every line paid for it twice per line. And
+those rows are still 2–3× `Exact`, because a whitespace key is interned twice over:
+once by `KeyArena` into an `Arc<str>` and again by the line map. Having
+`Whitespace::keys` yield ids directly removes a whole pass and is the next thing
+here.
+
 ### Topology
 
 `shape`, on the two real repositories:

@@ -41,21 +41,30 @@ pub struct Commit {
     pub subject: String,
 }
 
-/// Parses the output of `fixtures/dump.sh` (see that script for the format).
-/// Fields are \x1f-separated, records \x1e-separated — control characters git
-/// will never emit inside a subject, so there is nothing to escape.
-/// The hash behind the author intern map: rustc's own Fx construction, a
-/// rotate-xor-multiply over eight-byte chunks. `HashMap`'s default SipHash
-/// cost more per lookup than the rest of the interning put together on short
-/// names — measured at about a third of `parse_log`'s regression before this
-/// replaced it. Not cryptographic, and it does not need to be: a collision
-/// only costs a probe, because the map compares the real bytes either way.
+/// The hash behind every intern map in this crate: rustc's own Fx construction,
+/// a rotate-xor-multiply over eight-byte chunks.
+///
+/// `HashMap`'s default SipHash cost more per lookup than the rest of the
+/// interning put together on short keys — measured at about a third of
+/// `parse_log`'s regression before this replaced it, and at **half of the
+/// differ's whole runtime** when it reached the line-intern map too (see
+/// `docs/measurements.md`). Not cryptographic, and it does not need to be: a
+/// collision only costs a probe, because the map compares the real bytes either
+/// way. Nothing here hashes anything an attacker chooses *and* keeps, which is
+/// the only reason SipHash's flooding resistance would be worth paying for.
+///
 /// The 0xff terminator keeps `"ab" + "c"` and `"abc"` apart in one stream, as
 /// `str`'s default hash does.
 #[derive(Default)]
-struct FxHasher {
+pub(crate) struct FxHasher {
     hash: u64,
 }
+
+/// A `HashMap` on [`FxHasher`]. A named alias rather than the bound spelled out
+/// at each use, because the point is that every intern map in the crate is the
+/// *same* map — the line map having quietly stayed on SipHash while the author
+/// map moved is exactly what this prevents.
+pub(crate) type FxHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
 const FX_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
 
@@ -77,6 +86,10 @@ impl Hasher for FxHasher {
     }
 }
 
+/// Parses the output of `fixtures/dump.sh` (see that script for the format).
+///
+/// Fields are \x1f-separated, records \x1e-separated — control characters git
+/// will never emit inside a subject, so there is nothing to escape.
 pub fn parse_log(raw: &str) -> Vec<Commit> {
     // Counting separators first costs one byte scan and buys a right-sized
     // vector: at 100k commits the growth path was re-copying the whole list
@@ -88,8 +101,8 @@ pub fn parse_log(raw: &str) -> Vec<Commit> {
     // and sized for a real history up front: growing this table mid-parse
     // rehashed everything parsed so far, twice, on the way to a few thousand
     // authors.
-    let mut authors: HashMap<&str, Arc<str>, BuildHasherDefault<FxHasher>> =
-        HashMap::with_capacity_and_hasher(4096, BuildHasherDefault::default());
+    let mut authors: FxHashMap<&str, Arc<str>> =
+        FxHashMap::with_capacity_and_hasher(4096, BuildHasherDefault::default());
     for rec in raw.split('\u{1e}') {
         let rec = rec.trim();
         if rec.is_empty() {
