@@ -45,7 +45,7 @@
 
 use gitten_core::differ::{Differs, Overrides};
 use gitten_core::refs::{
-    Branch, HeadState, ReflogEntry, Remote, RemoteBranch, Stash, Tag, Upstream,
+    Branch, HeadState, ReflogEntry, Remote, RemoteBranch, ResetMode, Stash, Tag, Upstream,
 };
 use gitten_core::status::{
     Change, ConflictEntry, ConflictKind, Kind, PathBytes, StagedEntry, Status, Submodule,
@@ -420,6 +420,57 @@ pub trait Repo: Send + Sync {
     /// positions across any of these verbs.
     fn stash_drop(&self, _index: usize) -> Result<()> {
         Err(unserved("dropping a stash"))
+    }
+
+    /// Moves the branch HEAD names onto `target` — `git reset -q --<mode>`.
+    ///
+    /// The mode says how much follows the pointer: [`ResetMode::Soft`] moves
+    /// the branch alone, [`ResetMode::Mixed`] takes the index with it, and
+    /// [`ResetMode::Hard`] sweeps the working tree too, which is why that one
+    /// strength is the caller's to confirm before this is ever reached — the
+    /// trait runs what it was asked for and asks nothing itself. Soft and
+    /// mixed destroy nothing: every abandoned commit stays reachable through
+    /// the reflog.
+    ///
+    /// `target` is a revspec in git's own language — a sha from
+    /// [`log`](Self::log), `HEAD~1`, a branch name — and rides argv guarded
+    /// by [`refuse_dashes`] like every name-shaped word here, because a rev
+    /// never begins with `-` any more than a refname does.
+    fn reset(&self, _mode: ResetMode, _target: &[u8]) -> Result<()> {
+        Err(unserved("resetting"))
+    }
+
+    /// Undoes one commit by applying its inverse — `git revert --no-edit`.
+    ///
+    /// History grows; nothing moves. A new commit lands on HEAD carrying the
+    /// opposite of `commit`'s change, so this needs no confirmation anywhere:
+    /// dropping the result undoes the undo. A commit whose inverse does not
+    /// apply cleanly (it touches lines later commits rewrote) refuses, leaves
+    /// the conflict in the working tree where a human resolves it, and its
+    /// refusal comes back verbatim — "your local changes would be
+    /// overwritten" or git's conflict summary, never a paraphrase, because
+    /// which paths conflicted is the useful half of the sentence.
+    fn revert(&self, _commit: &[u8]) -> Result<()> {
+        Err(unserved("reverting"))
+    }
+
+    /// Rewrites HEAD to hold the same tree plus whatever the index has now,
+    /// under `message`, returning the replacement commit's OID.
+    ///
+    /// `git commit --amend` over the same stdin transport
+    /// [`commit`](Self::commit) uses, so hooks run exactly as they would for
+    /// a fresh commit and the message arrives byte-for-byte. An empty
+    /// message is refused on the same terms as [`commit`](Self::commit); an
+    /// unborn branch is refused *before any process runs*, because there is
+    /// nothing yet to amend and git's own answer to it ("bad default
+    /// revision") names nothing a person can act on.
+    ///
+    /// Amending a commit some remote already holds rewrites shared history —
+    /// the next push will refuse it until forced. Nothing here tracks push
+    /// state, so that decision stays entirely the caller's tonight; the
+    /// guard arrives when the ahead/behind read can be asked honestly.
+    fn amend(&self, _message: &str) -> Result<String> {
+        Err(unserved("amending"))
     }
 
     /// Sends `branch` to `remote`: `git push -q`, plus `--set-upstream`
@@ -1029,40 +1080,7 @@ impl Repo for Binary {
     }
 
     fn commit(&self, message: &str) -> Result<String> {
-        if message.trim().is_empty() {
-            return Err("a commit needs a message".into());
-        }
-        // The message rides stdin (`--file=-`), never an argv word: quotes,
-        // newlines and non-ASCII arrive byte-for-byte instead of surviving an
-        // escaping exercise here. Hooks see exactly what they would from a
-        // terminal commit.
-        let mut child = Command::new("git")
-            .arg("-C")
-            .arg(&self.root)
-            .args(["commit", "--file=-"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("could not run git commit: {e}"))?;
-        let mut stdin = child.stdin.take().expect("piped stdin");
-        // A write failure (a hook that quit before reading) is git's story to
-        // tell through the exit status; ours would only be noise in front of it.
-        let _ = stdin.write_all(message.as_bytes());
-        drop(stdin); // EOF is the message's end
-        let out = child
-            .wait_with_output()
-            .map_err(|e| format!("git commit: {e}"))?;
-        if !out.status.success() {
-            return Err(format!(
-                "git commit: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-        // Ask, don't parse prose: hook output shares the stream with git's own
-        // summary, and the OID is one cheap rev-parse away.
-        let sha = run(&self.root, &["rev-parse", "HEAD"])?;
-        Ok(lossy(trimmed(&sha)))
+        self.commit_via(&[b"commit", b"--file=-"], message)
     }
 
     fn stash_push(&self, message: Option<&str>) -> Result<usize> {
@@ -1101,6 +1119,45 @@ impl Repo for Binary {
             &[b"stash", b"drop", stash_ref(index).as_slice()],
         )
         .map(|_| ())
+    }
+
+    fn reset(&self, mode: ResetMode, target: &[u8]) -> Result<()> {
+        // Mixed is git's default when the flag is left off; spelled anyway,
+        // for the same reason an argument-less fetch is `--all` — what the
+        // verb means is said, never inherited from a default that could
+        // drift. `-q` keeps git's position summary off the error band's road.
+        refuse_dashes(target)?;
+        let flag: &[u8] = match mode {
+            ResetMode::Soft => b"--soft",
+            ResetMode::Mixed => b"--mixed",
+            ResetMode::Hard => b"--hard",
+        };
+        run_bytes(&self.root, &[b"reset", b"-q", flag, target]).map(|_| ())
+    }
+
+    fn revert(&self, commit: &[u8]) -> Result<()> {
+        // `--no-edit` because the inverse commit gets git's own summary of
+        // what it undoes — composing a message is a prompt this verb has no
+        // field for, and "Revert \"<original subject>\"" says more than an
+        // empty one would. A conflict refuses below with git's own words and
+        // leaves its question in the working tree.
+        refuse_dashes(commit)?;
+        run_bytes(&self.root, &[b"revert", b"--no-edit", commit]).map(|_| ())
+    }
+
+    fn amend(&self, message: &str) -> Result<String> {
+        // The same two refusals commit makes, said before anything runs: an
+        // empty message names the wrong failure only after a process, and an
+        // unborn branch has nothing to rewrite — git's answer there ("fatal:
+        // bad default revision" or worse) describes no state the reader
+        // recognises.
+        if message.trim().is_empty() {
+            return Err("a commit needs a message".into());
+        }
+        if let HeadState::Branch { commit: None, .. } = self.head()? {
+            return Err("nothing to amend: this branch has no commits yet".into());
+        }
+        self.commit_via(&[b"commit", b"--amend", b"-q", b"--file=-"], message)
     }
 
     fn push(&self, remote: &[u8], branch: &[u8]) -> Result<()> {
@@ -1167,6 +1224,44 @@ impl Binary {
             at = end;
         }
         Ok(())
+    }
+
+    /// One commit-shaped write — a fresh one or an amend — with `message`
+    /// riding stdin under whatever argv `head` spells.
+    ///
+    /// The message rides stdin (`--file=-`), never an argv word: quotes,
+    /// newlines and non-ASCII arrive byte-for-byte instead of surviving an
+    /// escaping exercise here. Hooks see exactly what they would from a
+    /// terminal commit. The returned OID is asked for afterwards rather than
+    /// parsed out of git's prose: hook output shares the stream with git's
+    /// own summary, and the answer is one cheap rev-parse away.
+    fn commit_via(&self, head: &[&[u8]], message: &str) -> Result<String> {
+        use std::os::unix::ffi::OsStrExt;
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .args(head.iter().map(|a| std::ffi::OsStr::from_bytes(a)))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("could not run git commit: {e}"))?;
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        // A write failure (a hook that quit before reading) is git's story to
+        // tell through the exit status; ours would only be noise in front of it.
+        let _ = stdin.write_all(message.as_bytes());
+        drop(stdin); // EOF is the message's end
+        let out = child
+            .wait_with_output()
+            .map_err(|e| format!("git commit: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "git commit: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let sha = run(&self.root, &["rev-parse", "HEAD"])?;
+        Ok(lossy(trimmed(&sha)))
     }
 
     /// What `stash@{0}` resolves to right now, when a stack exists at all.
@@ -5081,6 +5176,218 @@ mod tests {
         assert!(g.stashes().unwrap().is_empty());
         let e = g.stash_drop(0).unwrap_err();
         assert!(e.contains("git stash drop"), "{e}");
+    }
+
+    // ----------------------------------------------------- the history verbs
+
+    /// Two commits where the second rewrote `f.txt`, so HEAD~1 has content
+    /// of its own to go back to.
+    fn two_commits(name: &str) -> Scratch {
+        let r = Scratch::new(name);
+        r.write("f.txt", b"first\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "first"]);
+        r.write("f.txt", b"second\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "second"]);
+        r
+    }
+
+    #[test]
+    fn the_three_reset_strengths_leave_different_parts_behind() {
+        // Soft: the branch alone moves, and the abandoned commit's change is
+        // sitting in the index as if just staged.
+        let r = two_commits("reset-soft");
+        r.write("f.txt", b"second, edited\n");
+        r.git(&["add", "-A"]);
+        let g = r.open();
+        let first = r.rev_parse("HEAD~1");
+        g.reset(ResetMode::Soft, b"HEAD~1").expect("resets");
+        assert_eq!(r.rev_parse("HEAD"), first, "branch moved");
+        let tree = g.status().unwrap();
+        assert_eq!(tree.staged.len(), 1, "the step back is staged");
+        assert_eq!(tree.unstaged.len(), 0);
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"second, edited\n",
+            "the working tree never moved"
+        );
+
+        // Mixed: the index goes too, so the same change comes back unstaged.
+        let r = two_commits("reset-mixed");
+        let g = r.open();
+        let second = r.rev_parse("HEAD");
+        g.reset(ResetMode::Mixed, b"HEAD~1").expect("resets");
+        assert_ne!(r.rev_parse("HEAD"), second);
+        let tree = g.status().unwrap();
+        assert_eq!(tree.staged.len(), 0, "nothing stayed staged");
+        assert_eq!(tree.unstaged.len(), 1, "and nothing was lost either");
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"second\n",
+            "the working tree keeps its files"
+        );
+        // Every abandoned commit stays reachable through the reflog, which is
+        // what makes soft and mixed recoverable and hard the odd one out.
+        // The reflog abbreviates, so the abandoned sha is matched by prefix.
+        assert!(
+            g.reflog(5)
+                .unwrap()
+                .iter()
+                .any(|e| second.starts_with(e.commit.as_str())),
+            "the abandoned commit survived in the reflog"
+        );
+
+        // Hard: all three move, and the changes are gone from everywhere the
+        // status reads.
+        let r = two_commits("reset-hard");
+        r.write("f.txt", b"unsaved work\n");
+        let g = r.open();
+        assert_eq!(g.log(5).unwrap().len(), 2);
+        g.reset(ResetMode::Hard, b"HEAD~1").expect("resets");
+        assert_eq!(g.log(5).unwrap().len(), 1, "history shortened");
+        let tree = g.status().unwrap();
+        assert_eq!(tree.staged.len() + tree.unstaged.len(), 0, "all quiet");
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"first\n",
+            "the file went back to what the target says"
+        );
+    }
+
+    #[test]
+    fn a_reset_aimed_at_a_bare_oid_moves_whatever_head_points_at() {
+        // Named by its own object id, not a HEAD-relative spelling — the
+        // shape a commits row carries. Detached, so the verb must move HEAD
+        // itself rather than a branch under it.
+        let r = two_commits("reset-detached");
+        r.git(&["checkout", "-q", "--detach", "HEAD"]);
+        let g = r.open();
+        let target = r.rev_parse("HEAD~1");
+
+        g.reset(ResetMode::Hard, target.as_bytes()).expect("resets");
+        assert_eq!(r.rev_parse("HEAD"), target);
+        match g.head().unwrap() {
+            HeadState::Detached { commit } => assert_eq!(commit, target),
+            other => panic!("detached expected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reset_and_revert_targets_beginning_with_a_dash_are_refused_before_git() {
+        let r = two_commits("history-dash");
+        let before = r.rev_parse("HEAD");
+        let g = r.open();
+        // A revspec spelled like an option would arrive in argv AS an option;
+        // the guard answers in words instead of letting git guess.
+        for mode in [ResetMode::Soft, ResetMode::Mixed, ResetMode::Hard] {
+            let e = g.reset(mode, b"--hard").unwrap_err();
+            assert!(e.contains("refused"), "{mode:?}: {e}");
+        }
+        let e = g.revert(b"-m 1").unwrap_err();
+        assert!(e.contains("refused"), "{e}");
+        assert_eq!(r.rev_parse("HEAD"), before, "nothing ran");
+    }
+
+    #[test]
+    fn a_revert_lands_an_inverse_commit_and_leaves_the_tree_matching_the_parent() {
+        let r = two_commits("revert-clean");
+        let g = r.open();
+
+        g.revert(b"HEAD").expect("reverts");
+        assert_eq!(g.log(5).unwrap().len(), 3, "a third commit appeared");
+        // The undo's tree is what history held two steps back — the state
+        // before the undone commit existed.
+        assert_eq!(r.rev_parse("HEAD^{tree}"), r.rev_parse("HEAD~2^{tree}"));
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"first\n",
+            "what the reverted commit did, the undo undid"
+        );
+        let tree = g.status().unwrap();
+        assert_eq!(
+            tree.staged.len() + tree.unstaged.len(),
+            0,
+            "the revert committed itself"
+        );
+    }
+
+    #[test]
+    fn a_reverting_conflict_refuses_in_gits_own_words_and_changes_no_history() {
+        let r = Scratch::new("revert-conflict");
+        r.write("f.txt", b"one\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "one"]);
+        r.write("f.txt", b"one\ntwo\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "two"]);
+        r.write("f.txt", b"ONE\nTWO\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "three"]);
+        let g = r.open();
+
+        // Undoing the middle commit means removing "two", which later work
+        // rewrote into "TWO"; git stops and asks, and that question is the
+        // answer this verb gives — verbatim, its own diagnosis included.
+        let e = g.revert(r.rev_parse("HEAD~1").as_bytes()).unwrap_err();
+        assert!(e.contains("could not revert"), "{e}");
+        assert!(!g.status().unwrap().conflicts.is_empty(), "left conflicted");
+        assert_eq!(g.log(5).unwrap().len(), 3, "nothing landed");
+    }
+
+    #[test]
+    fn an_amend_replaces_head_with_new_message_and_staged_content() {
+        let r = two_commits("amend-roundtrip");
+        let old = r.rev_parse("HEAD");
+        let parent = r.rev_parse("HEAD~1");
+        r.write("f.txt", b"second, amended\n");
+        r.git(&["add", "-A"]);
+
+        let message = "second, rewritten\n\nwith a body & \"quotes\"\n";
+        let sha = r.open().amend(message).expect("amends");
+        assert_eq!(sha, r.rev_parse("HEAD"));
+        assert_ne!(sha, old, "the commit was replaced, not kept");
+        assert_eq!(r.rev_parse("HEAD~1"), parent, "the parent stood still");
+
+        // The stored bytes, read back through git itself — %B is the whole
+        // message, body included. git appends the one final newline it
+        // promises every commit; everything else is verbatim.
+        let raw = String::from_utf8(r.git_os_out(&[
+            "show".into(),
+            "-s".into(),
+            "--format=%B".into(),
+            sha.into(),
+        ]))
+        .unwrap();
+        assert_eq!(raw.trim_end_matches('\n'), message.trim_end_matches('\n'));
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"second, amended\n",
+            "the index rode along"
+        );
+    }
+
+    #[test]
+    fn an_unborn_or_empty_amend_is_refused_before_any_process_runs() {
+        let r = Scratch::new("amend-unborn");
+        r.write("f.txt", b"x\n");
+        let g = r.open();
+        match g.head().unwrap() {
+            HeadState::Branch { commit: None, .. } => {}
+            other => panic!("unborn expected, got {other:?}"),
+        }
+        let e = g.amend("too soon").unwrap_err();
+        assert!(e.contains("no commits yet"), "{e}");
+        assert!(g.log(1).is_err() || g.log(1).unwrap().is_empty());
+
+        // Same refusal an empty commit gets: said here, not discovered in a
+        // hook's output afterwards.
+        let r = two_commits("amend-empty");
+        for empty in ["", "  \n\t"] {
+            let e = r.open().amend(empty).unwrap_err();
+            assert!(e.contains("message"), "{empty:?}: {e}");
+        }
+        assert_eq!(r.rev_parse("HEAD"), r.rev_parse("HEAD"), "unmoved");
     }
 
     // ------------------------------------------------------ the sync verbs
