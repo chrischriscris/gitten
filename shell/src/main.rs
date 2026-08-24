@@ -161,6 +161,28 @@ enum Prompt {
     CommitMessage,
 }
 
+/// The write rails, handed to every pane command: the repository this window
+/// opened on, and the one queue every job rides.
+///
+/// Passed by ref so a command can aim a write without owning either half —
+/// which is what makes rule 1 true for verbs rather than merely said: a
+/// compiled-in extension pane stages through exactly these two things that
+/// `files.stage` does, and a fixture window hands `None`, whose honest answer
+/// is the notice a built-in gives. `None` is also all a drawing-only command
+/// ever sees of them.
+struct Writes<'a> {
+    repo: &'a gitten_git::Handle,
+    submit: &'a Submitter,
+}
+
+impl Writes<'_> {
+    /// Queues one job. False is the queue rejecting work — the window is
+    /// going away — and saying so is the caller's, who knows what was tried.
+    fn send(&self, job: Box<dyn Job>) -> bool {
+        self.submit.submit(job).is_ok()
+    }
+}
+
 /// A pane-owned refresh split at the thread boundary: pure blocking load, then
 /// GPUI apply. The shell schedules both halves without knowing the tenant's data
 /// type, which is what lets a files or extension pane refresh without joining a
@@ -230,7 +252,11 @@ trait Pane {
         false
     }
 
-    fn run(&self, _command: &str, _host: &Host, _cx: &mut App) -> bool {
+    /// Runs one of this pane's commands. `writes` is [`Writes`] when the
+    /// window sits on a repository — the same handle and queue a built-in
+    /// verb uses — and the pane answers for itself whether it can act on
+    /// them. False is "not one of mine", and the caller says so.
+    fn run(&self, _command: &str, _host: &Host, _writes: Option<&Writes>, _cx: &mut App) -> bool {
         false
     }
 
@@ -529,7 +555,7 @@ impl Screen {
     /// and each screen's own additions. False is "not one of mine", and the
     /// caller says so — an unknown command that resolved is worth naming rather
     /// than swallowing.
-    fn run(&self, command: &str, host: &Host, cx: &mut App) -> bool {
+    fn run(&self, command: &str, host: &Host, writes: Option<&Writes>, cx: &mut App) -> bool {
         match self {
             Screen::Commits { view, .. } => view.update(cx, |v, c| {
                 let known = v.run_view(command, host);
@@ -552,7 +578,7 @@ impl Screen {
                 }
                 known
             }),
-            Screen::Custom(pane) => pane.run(command, host, cx),
+            Screen::Custom(pane) => pane.run(command, host, writes, cx),
         }
     }
 
@@ -767,13 +793,16 @@ impl DevShell {
         cx.notify();
     }
 
-    /// Queues one job through the shared [`Submitter`], saying so if the queue
-    /// is gone — the only rejection a live shell sees, and the same rails an
-    /// extension's job rides.
-    fn enqueue(&mut self, job: Box<dyn Job>) {
-        if self.submit(job).is_err() {
-            self.set_notice("the job queue is shutting down");
-        }
+    /// The write rails as every pane command receives them: this window's
+    /// repository and its queue, or `None` over a fixture. The shell's own
+    /// verbs go through the same value — there is no second path for a
+    /// built-in.
+    fn writes(&self) -> Option<Writes<'_>> {
+        let (_, repo) = self.repo.as_ref()?;
+        Some(Writes {
+            repo,
+            submit: &self.submitter,
+        })
     }
 
     /// `files.stage`: act on the row the keyboard is on, by the side of the
@@ -799,16 +828,20 @@ impl DevShell {
             self.set_notice("nothing selected to stage");
             return;
         };
-        let Some((_, repo)) = self.repo.clone() else {
+        // No rails means no repository behind this window — the same answer
+        // the pane would get if it asked for them itself.
+        let Some(writes) = self.writes() else {
             self.set_notice("a fixture has no working tree to stage in");
             return;
         };
         let bytes = path.as_bytes().to_vec();
         let job = match section {
-            views::files::Section::Staged => gitten_app::verbs::Write::unstage(&repo, bytes),
-            _ => gitten_app::verbs::Write::stage(&repo, bytes),
+            views::files::Section::Staged => gitten_app::verbs::Write::unstage(writes.repo, bytes),
+            _ => gitten_app::verbs::Write::stage(writes.repo, bytes),
         };
-        self.enqueue(Box::new(job));
+        if !writes.send(Box::new(job)) {
+            self.set_notice("the job queue is shutting down");
+        }
     }
 
     /// `files.commit`: gather a message over the pane, then commit on accept.
@@ -839,11 +872,16 @@ impl DevShell {
             self.set_notice("a commit needs a message");
             return;
         }
-        let Some((_, repo)) = self.repo.clone() else {
+        let Some(writes) = self.writes() else {
             self.set_notice("a fixture has no repository to commit in");
             return;
         };
-        self.enqueue(Box::new(gitten_app::verbs::Write::commit(&repo, message)));
+        if !writes.send(Box::new(gitten_app::verbs::Write::commit(
+            writes.repo,
+            message,
+        ))) {
+            self.set_notice("the job queue is shutting down");
+        }
     }
 
     /// The one registration path built-ins and compiled-in extensions share.
@@ -1121,7 +1159,8 @@ impl DevShell {
                 let known = match self.active() {
                     Some(screen) => {
                         let host = config::host(cx);
-                        screen.run(command, &host, cx)
+                        let writes = self.writes();
+                        screen.run(command, &host, writes.as_ref(), cx)
                     }
                     None => false,
                 };
@@ -1298,7 +1337,8 @@ impl DevShell {
                 }
             }
             Some(Screen::Custom(pane)) => {
-                pane.run("copy.selection", &host, cx);
+                let writes = self.writes();
+                pane.run("copy.selection", &host, writes.as_ref(), cx);
             }
             None => {}
         }
@@ -2365,7 +2405,7 @@ fn window_options(title: SharedString) -> WindowOptions {
 
 #[cfg(test)]
 mod tests {
-    use super::{config, input, panes, DevShell, Open, Pane, Refresh, Screen};
+    use super::{config, input, panes, DevShell, Open, Pane, Refresh, Screen, Writes};
     use crate::views::commits::Commits;
     use gitten_app::cli::Source;
     use gitten_app::jobs::{Event as JobEvent, Generation, Job, Runner};
@@ -2386,6 +2426,20 @@ mod tests {
         view: gpui::Entity<Commits>,
         ran: Rc<Cell<bool>>,
         generation: Rc<Cell<Generation>>,
+    }
+
+    impl ExtensionPane {
+        /// What a verb looks like from a pane that did not ship with the app:
+        /// aim a [`gitten_app::verbs::Write`] at the handed repository and
+        /// hand it to the handed queue. No field of the shell is reached, no
+        /// built-in is special-cased — these are the same two rails
+        /// `files.stage` rides.
+        fn stage_like_a_builtin(&self, writes: &Writes) -> bool {
+            let job = gitten_app::verbs::Write::stage(writes.repo, b"notes.md".to_vec());
+            let queued = writes.send(Box::new(job));
+            self.ran.set(queued);
+            queued
+        }
     }
 
     impl Pane for ExtensionPane {
@@ -2426,12 +2480,17 @@ mod tests {
             ))
         }
 
-        fn run(&self, command: &str, _: &Host, _: &mut gpui::App) -> bool {
-            if command != "extension.toggle" {
-                return false;
+        fn run(&self, command: &str, _: &Host, writes: Option<&Writes>, _: &mut gpui::App) -> bool {
+            match (command, writes) {
+                ("extension.toggle", _) => {
+                    self.ran.set(true);
+                    true
+                }
+                // A fixture has no repository to write through; `None` here is
+                // the same honest nothing a built-in verb answers.
+                ("extension.stage", Some(writes)) => self.stage_like_a_builtin(writes),
+                _ => false,
             }
-            self.ran.set(true);
-            true
         }
     }
 
@@ -3031,12 +3090,21 @@ mod tests {
 
     /// A shell with the two startup panes and a repository behind the files
     /// pane, whose tree carries one staged change and one unstaged one.
-    /// Registration leaves the keyboard on the working tree.
-    fn files_shell(cx: &mut TestAppContext) -> (gpui::Entity<DevShell>, Arc<RecordingRepo>) {
+    /// Registration leaves the keyboard on the working tree. Returns the
+    /// recording repository and its handle, so a test can both assert what
+    /// was asked of it and aim writes of its own.
+    fn files_shell(
+        cx: &mut TestAppContext,
+    ) -> (
+        gpui::Entity<DevShell>,
+        Arc<RecordingRepo>,
+        gitten_git::Handle,
+    ) {
         let calls = Arc::default();
         let repo = Arc::new(RecordingRepo {
             calls: Arc::clone(&calls),
         });
+        let handle: gitten_git::Handle = repo.clone();
         let shell = shell(None, cx);
         shell.update(cx, |shell, cx| {
             let host = Rc::new(Host::new());
@@ -3065,13 +3133,10 @@ mod tests {
                 Screen::files(files, Generation::default(), "files"),
             );
             shell.sync_modes();
-            shell.repo = Some((
-                PathBuf::from("/recorded"),
-                repo.clone() as gitten_git::Handle,
-            ));
+            shell.repo = Some((PathBuf::from("/recorded"), handle.clone()));
             cx.set_global(config::Active(Rc::new(Host::new())));
         });
-        (shell, repo)
+        (shell, repo, handle)
     }
 
     /// Waits for one successful finish off the job thread, then drains the
@@ -3113,7 +3178,7 @@ mod tests {
 
     #[gpui::test]
     fn space_acts_on_the_row_by_the_side_it_sits_on(cx: &mut TestAppContext) {
-        let (shell, repo) = files_shell(cx);
+        let (shell, repo, _handle) = files_shell(cx);
         // The cursor starts on the last row: notes.md, under *unstaged*.
         shell.update(cx, |shell, cx| shell.run_command("files.stage", cx));
         wait_finished(&shell, cx);
@@ -3143,7 +3208,7 @@ mod tests {
 
     #[gpui::test]
     fn commit_opens_the_field_and_the_accepted_text_becomes_the_job(cx: &mut TestAppContext) {
-        let (shell, repo) = files_shell(cx);
+        let (shell, repo, _handle) = files_shell(cx);
 
         shell.update(cx, |shell, cx| shell.run_command("files.commit", cx));
         shell.read_with(cx, |shell, _| {
@@ -3178,7 +3243,7 @@ mod tests {
 
     #[gpui::test]
     fn an_empty_commit_refuses_at_accept_without_submitting_anything(cx: &mut TestAppContext) {
-        let (shell, repo) = files_shell(cx);
+        let (shell, repo, _handle) = files_shell(cx);
         shell.update(cx, |shell, cx| shell.run_command("files.commit", cx));
         // The field opens empty and is accepted empty — the shape of hitting
         // enter on an untouched prompt.
@@ -3203,6 +3268,41 @@ mod tests {
             }
         });
         assert!(repo.wrote().is_empty());
+    }
+
+    #[gpui::test]
+    fn an_extension_pane_stages_through_the_same_writes_a_builtin_gets(cx: &mut TestAppContext) {
+        // Rule 1, exercised rather than asserted: a pane that shipped with no
+        // verb of its own runs a stage-equivalent from inside its `run`, off
+        // the rails dispatch hands it, and the result is indistinguishable —
+        // queued, run, generation bumped, pane re-acquired.
+        let (shell, repo, _handle) = files_shell(cx);
+        let ran = Rc::new(Cell::new(false));
+        let refreshed = Rc::new(Cell::new(Generation::default()));
+        shell.update(cx, |shell, cx| {
+            let commits = cx.new(|_| Commits::new(Vec::new(), Rc::new(Host::new())));
+            shell.register_pane(
+                "extension",
+                ExtensionPane {
+                    view: commits,
+                    ran: ran.clone(),
+                    generation: refreshed.clone(),
+                },
+                cx,
+            );
+        });
+
+        shell.update(cx, |shell, cx| shell.run_command("extension.stage", cx));
+        assert!(ran.get(), "the extension could not reach the rails");
+        wait_finished(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["stage notes.md"]);
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.generation.get() > 0);
+        });
+        // And the write's generation reached the extension pane's own refresh,
+        // exactly as it reached every built-in pane's.
+        let target = shell.read_with(cx, |shell, _| shell.generation);
+        assert_eq!(refreshed.get(), target);
     }
 
     #[gpui::test]
@@ -3265,7 +3365,7 @@ mod tests {
         });
 
         // And a clean tree: nothing under the keyboard to act on.
-        let (shell, repo) = files_shell(cx);
+        let (shell, repo, _handle) = files_shell(cx);
         shell.update(cx, |shell, cx| {
             let Some(Screen::Files { view, .. }) = shell.active() else {
                 panic!("files pane lost");
