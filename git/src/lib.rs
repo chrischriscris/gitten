@@ -422,6 +422,51 @@ pub trait Repo: Send + Sync {
         Err(unserved("dropping a stash"))
     }
 
+    /// Sends `branch` to `remote`: `git push -q`, plus `--set-upstream`
+    /// exactly when the branch tracks nothing yet.
+    ///
+    /// The upstream decision is *read*, not remembered:
+    /// [`branches`](Self::branches) answers whether this branch is configured
+    /// against a remote-tracking ref today, and only absence adds the flag —
+    /// a branch that already tracks one pushes bare, because rewriting
+    /// somebody's tracking configuration is not what "push" said.
+    ///
+    /// Deliberately **no force tonight**, as no flag anywhere in the call: a
+    /// refused non-fast-forward comes back verbatim in git's own words,
+    /// because the history it would discard is the reader's to decide about,
+    /// and a key that says only *push* must not decide it for them. Force
+    /// arrives when something asks for it by name, like stash's `-u` did.
+    ///
+    /// Both names are bytes and both are guarded by [`refuse_dashes`] before
+    /// any process runs — a remote spelled `--upload-pack=…` is exactly the
+    /// accident that guard exists for.
+    fn push(&self, _remote: &[u8], _branch: &[u8]) -> Result<()> {
+        Err(unserved("pushing"))
+    }
+
+    /// Fast-forwards the current branch onto its upstream:
+    /// `git pull --ff-only`.
+    ///
+    /// No arguments on purpose — which branch pulls from where is the
+    /// repository's own configuration, so every way that can be missing is
+    /// git's to refuse and its sentence comes back verbatim: no branch under
+    /// HEAD ("not currently on a branch"), no tracking pair ("no tracking
+    /// information"), a divergence (`--ff-only`'s whole point). The tree is
+    /// untouched behind every one of those refusals, which a test holds this
+    /// to. No auto-rebase hides here either: untangling history is a
+    /// deliberate act, never a side effect of a sync key.
+    fn pull(&self) -> Result<()> {
+        Err(unserved("pulling"))
+    }
+
+    /// Updates remote-tracking refs — the one remote named, or every remote
+    /// this repository knows when `None`. Nothing else moves: a fetch never
+    /// touches local branches, HEAD or the working tree, which is what makes
+    /// it safe behind a single unconfirmed key.
+    fn fetch(&self, _remote: Option<&[u8]>) -> Result<()> {
+        Err(unserved("fetching"))
+    }
+
     /// A short label for the window title.
     ///
     /// Infallible: a repository whose branch cannot be read still has a name.
@@ -1056,6 +1101,55 @@ impl Repo for Binary {
             &[b"stash", b"drop", stash_ref(index).as_slice()],
         )
         .map(|_| ())
+    }
+
+    fn push(&self, remote: &[u8], branch: &[u8]) -> Result<()> {
+        refuse_dashes(remote)?;
+        refuse_dashes(branch)?;
+        // The flag rides only when the branches read proves absence — the
+        // same read the branches panel draws its tracking pairs from, so a
+        // verb and a pane cannot disagree about what tracks what. A read
+        // that failed proves nothing either way, and pushing bare rewrites
+        // nothing, so absence of proof means absence of the flag.
+        let tracked = self
+            .branches()
+            .ok()
+            .and_then(|all| {
+                all.iter()
+                    .find(|b| b.name.as_bytes() == branch)
+                    .map(|b| b.upstream.is_some())
+            })
+            .unwrap_or(false);
+        let argv: &[&[u8]] = match tracked {
+            true => &[b"push", b"-q", remote, branch],
+            false => &[b"push", b"-q", b"--set-upstream", remote, branch],
+        };
+        run_bytes(&self.root, argv).map(|_| ())
+    }
+
+    fn pull(&self) -> Result<()> {
+        // Everything specific — which branch, which upstream, what a
+        // divergence means — is git's to resolve from the repository's own
+        // configuration, which is also why there is no name here to guard:
+        // nothing we chose rides argv. `--ff-only` is the one word added,
+        // because moving a branch sideways without being asked is exactly
+        // what a client must never do quietly; git's refusal to move at all
+        // is surfaced verbatim by [`run_bytes`], tree intact.
+        run_bytes(&self.root, &[b"pull", b"--ff-only"]).map(|_| ())
+    }
+
+    fn fetch(&self, remote: Option<&[u8]>) -> Result<()> {
+        match remote {
+            Some(remote) => {
+                refuse_dashes(remote)?;
+                run_bytes(&self.root, &[b"fetch", b"-q", remote]).map(|_| ())
+            }
+            // Spelled `--all` rather than left off: what an argument-less
+            // fetch covers has drifted across git versions and depends on
+            // config besides, and "every remote this repository knows"
+            // should be said, not inherited.
+            None => run_bytes(&self.root, &[b"fetch", b"-q", b"--all"]).map(|_| ()),
+        }
     }
 }
 
@@ -4987,5 +5081,248 @@ mod tests {
         assert!(g.stashes().unwrap().is_empty());
         let e = g.stash_drop(0).unwrap_err();
         assert!(e.contains("git stash drop"), "{e}");
+    }
+
+    // ------------------------------------------------------ the sync verbs
+
+    /// The tracking pair the branches read reports for `main`, as counts.
+    fn main_counts(r: &Scratch) -> (Option<u32>, Option<u32>) {
+        branch(&r.open().branches().unwrap(), "main")
+            .upstream
+            .as_ref()
+            .map(|u| (u.ahead, u.behind))
+            .expect("main tracks origin")
+    }
+
+    #[test]
+    fn a_first_push_sets_the_upstream_and_a_second_leaves_it_alone() {
+        let origin = Scratch::bare("sync-upstream-origin");
+        let r = Scratch::new("sync-upstream");
+        r.write("seed.txt", b"seed\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "seed"]);
+        r.git(&[
+            "remote",
+            "add",
+            "origin",
+            &format!("{}", origin.0.display()),
+        ]);
+
+        let g = r.open();
+        g.push(b"origin", b"main").expect("the first push");
+
+        // The remote holds what was sent, and the branch now tracks it —
+        // measured through the same branches read that made the decision.
+        assert_eq!(origin.rev_parse("refs/heads/main"), r.rev_parse("main"));
+        let branches = g.branches().unwrap();
+        let up = branch(&branches, "main")
+            .upstream
+            .as_ref()
+            .expect("the first push set it");
+        assert_eq!(up.remote.as_bytes(), b"origin");
+        assert_eq!(up.branch.as_bytes(), b"main");
+        assert_eq!((up.ahead, up.behind), (Some(0), Some(0)));
+
+        // And a second push does not touch the configuration it found: the
+        // tracking pair is still exactly the pair the first push wrote.
+        let config = ["config".into(), "--get-regexp".into(), "^branch\\.".into()];
+        let before = r.git_os_out(&config);
+        assert!(!before.is_empty(), "the config exists to be left alone");
+        g.push(b"origin", b"main").expect("the second push");
+        assert_eq!(
+            r.git_os_out(&config),
+            before,
+            "an existing upstream is none of a push's business"
+        );
+    }
+
+    #[test]
+    fn a_fast_forward_pull_moves_the_branch_and_the_tree() {
+        let (r, origin) = upstream_fixture("sync-ff");
+        // The other machine moves; this side has not.
+        let twin = Scratch::cloned(&origin.0, "sync-ff-twin");
+        twin.write("t.txt", b"theirs\n");
+        twin.git(&["add", "-A"]);
+        twin.git(&["commit", "-qm", "theirs"]);
+        twin.git(&["push", "-q", "origin", "main"]);
+
+        r.open().pull().expect("a clean fast-forward");
+
+        assert_eq!(r.rev_parse("HEAD"), twin.rev_parse("HEAD"));
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"t.txt")).unwrap(),
+            b"theirs\n",
+            "the working tree came along, as a pull owes"
+        );
+    }
+
+    #[test]
+    fn a_diverged_pull_refuses_verbatim_and_touches_nothing() {
+        let (r, origin) = upstream_fixture("sync-diverged");
+        // Ours: a commit only this side has.
+        r.write("ours.txt", b"ours\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "ours"]);
+        // Theirs: a commit only the remote has, already fetched.
+        let twin = Scratch::cloned(&origin.0, "sync-diverged-twin");
+        twin.write("theirs.txt", b"theirs\n");
+        twin.git(&["add", "-A"]);
+        twin.git(&["commit", "-qm", "theirs"]);
+        twin.git(&["push", "-q", "origin", "main"]);
+        r.git(&["fetch", "-q", "origin"]);
+
+        let ours = r.rev_parse("HEAD");
+        let err = r.open().pull().unwrap_err();
+        assert!(
+            err.to_lowercase().contains("fast-forward"),
+            "git's own refusal, verbatim: {err}"
+        );
+
+        // Refused means refused: HEAD stays on our commit, their commit is
+        // nowhere in our history, and both working-tree files are exactly
+        // as the tree held them. No auto-rebase tidies this up behind the
+        // reader's back.
+        assert_eq!(r.rev_parse("HEAD"), ours);
+        assert!(!join_raw(&r.0, b"theirs.txt").exists());
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"ours.txt")).unwrap(),
+            b"ours\n"
+        );
+    }
+
+    #[test]
+    fn pulling_without_an_upstream_refuses_in_gits_own_words() {
+        let origin = Scratch::bare("sync-noupstream-origin");
+        let r = Scratch::new("sync-noupstream");
+        r.write("seed.txt", b"seed\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "seed"]);
+        // A remote, but no `-u`: nothing says where main pulls from.
+        r.git(&[
+            "remote",
+            "add",
+            "origin",
+            &format!("{}", origin.0.display()),
+        ]);
+
+        let seed = r.rev_parse("HEAD");
+        let err = r.open().pull().unwrap_err();
+        assert!(
+            err.to_lowercase().contains("tracking information"),
+            "git's own sentence names the missing configuration: {err}"
+        );
+        assert_eq!(r.rev_parse("HEAD"), seed, "refused, so unmoved");
+    }
+
+    #[test]
+    fn a_fetch_updates_exactly_the_remote_tracking_refs() {
+        let (r, origin) = upstream_fixture("sync-fetch");
+        let twin = Scratch::cloned(&origin.0, "sync-fetch-twin");
+        twin.write("t.txt", b"t\n");
+        twin.git(&["add", "-A"]);
+        twin.git(&["commit", "-qm", "theirs"]);
+        twin.git(&["push", "-q", "origin", "main"]);
+
+        // Before the fetch the local view cannot know: in sync at 0/0,
+        // because the tracking ref still names yesterday's commit.
+        assert_eq!(main_counts(&r), (Some(0), Some(0)));
+        r.open().fetch(Some(b"origin")).expect("the fetch");
+
+        // After: the ref moved and the count arrived with it — behind is
+        // the fetch's whole story, told without touching anything else.
+        assert_eq!(
+            r.rev_parse("refs/remotes/origin/main"),
+            twin.rev_parse("HEAD")
+        );
+        assert_eq!(main_counts(&r), (Some(0), Some(1)));
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"seed.txt")).unwrap(),
+            b"seed\n",
+            "a fetch never touches the working tree"
+        );
+    }
+
+    #[test]
+    fn a_nameless_fetch_takes_every_remote_at_once() {
+        let a = Scratch::bare("sync-all-a");
+        let b = Scratch::bare("sync-all-b");
+        let r = Scratch::new("sync-all");
+        r.write("seed.txt", b"seed\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "seed"]);
+        for (name, remote) in [("a", &a), ("b", &b)] {
+            r.git(&["remote", "add", name, &format!("{}", remote.0.display())]);
+            r.git(&["push", "-q", name, "main"]);
+        }
+        // Each remote gains a branch of its own, pushed by its own twin, and
+        // the twin's commit is what the local tracking ref must come to name.
+        let mut theirs = Vec::new();
+        for (name, remote) in [("a", &a), ("b", &b)] {
+            let twin = Scratch::cloned(&remote.0, &format!("sync-all-{name}-twin"));
+            twin.write("x.txt", b"x\n");
+            twin.git(&["add", "-A"]);
+            twin.git(&["commit", "-qm", "ahead"]);
+            twin.git(&["push", "-q", "origin", &format!("main:side-{name}")]);
+            theirs.push((
+                format!("refs/remotes/{name}/side-{name}"),
+                twin.rev_parse("HEAD"),
+            ));
+        }
+
+        r.open().fetch(None).expect("fetches everything");
+
+        // Named on neither command line: both tracking refs moved anyway,
+        // which is what `--all` was spelled for.
+        for (refname, oid) in &theirs {
+            assert_eq!(&r.rev_parse(refname), oid, "{refname} arrived");
+        }
+    }
+
+    #[test]
+    fn ahead_and_behind_move_through_fetch_pull_commit_and_push_end_to_end() {
+        let (r, origin) = upstream_fixture("sync-counts");
+        let twin = Scratch::cloned(&origin.0, "sync-counts-twin");
+        twin.write("t.txt", b"t\n");
+        twin.git(&["add", "-A"]);
+        twin.git(&["commit", "-qm", "theirs"]);
+        twin.git(&["push", "-q", "origin", "main"]);
+        let g = r.open();
+
+        // Fetch: the remote's move becomes visible as behind.
+        g.fetch(Some(b"origin")).expect("fetch");
+        assert_eq!(main_counts(&r), (Some(0), Some(1)), "behind, seen");
+
+        // Pull: the distance closes to nothing, on both sides of the pair.
+        g.pull().expect("fast-forward");
+        assert_eq!(main_counts(&r), (Some(0), Some(0)));
+
+        // A local commit opens the other direction: what a push would send.
+        r.write("mine.txt", b"mine\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "mine"]);
+        assert_eq!(main_counts(&r), (Some(1), Some(0)), "ahead, earned");
+
+        // Push closes it — and does not reopen behind, because sending is
+        // all a push does.
+        g.push(b"origin", b"main").expect("push");
+        assert_eq!(main_counts(&r), (Some(0), Some(0)));
+        assert_eq!(origin.rev_parse("refs/heads/main"), r.rev_parse("main"));
+    }
+
+    #[test]
+    fn sync_names_beginning_with_a_dash_are_refused_before_git_sees_them() {
+        let (r, _) = upstream_fixture("sync-dash");
+        let g = r.open();
+        // `--upload-pack` runs a program of its choosing; a remote spelled
+        // to look like one is precisely why the guard stands ahead of argv.
+        let e = g.fetch(Some(b"--upload-pack=touch /tmp/x")).unwrap_err();
+        assert!(e.contains("refused"), "{e}");
+        let e = g.push(b"-oProxyCommand=x", b"main").unwrap_err();
+        assert!(e.contains("refused"), "{e}");
+        let e = g.push(b"origin", b"-b").unwrap_err();
+        assert!(e.contains("refused"), "{e}");
+
+        // And nothing ran: HEAD never moved, no process answered any of it.
+        assert_eq!(r.rev_parse("HEAD"), r.rev_parse("main"));
     }
 }

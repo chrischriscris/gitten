@@ -4813,7 +4813,9 @@ mod tests {
                             Screen::Custom(_) => "custom",
                             Screen::Diff { .. } => "diff",
                             Screen::Stashes { .. } => "stashes",
-                            Screen::Commits { .. } | Screen::Files { .. } | Screen::Branches { .. } => {
+                            Screen::Commits { .. }
+                            | Screen::Files { .. }
+                            | Screen::Branches { .. } => {
                                 unreachable!()
                             }
                         }
