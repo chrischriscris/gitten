@@ -49,9 +49,15 @@ jobs:
       # the index on a hit for seconds; offline turned an imperfect save into
       # a red main. A cache hit still skips all the compile work, which is
       # the part worth having.
+      #
+      # `gitten-git` is in this list and was missing from it for a long time.
+      # It is the only crate that talks to a repository — `parse_raw`, the
+      # `cat-file` batch protocol, untracked status, CRLF — and its tests build
+      # their own scratch repositories, so they are as headless as the rest.
+      # They passed the whole time; nothing ran them.
       - run: >-
           cargo test -q --locked
-          -p gitten-core -p gitten-app -p gitten-web -p gitten-tui
+          -p gitten-core -p gitten-app -p gitten-git -p gitten-web -p gitten-tui
 
   lint:
     runs-on: ubuntu-latest
