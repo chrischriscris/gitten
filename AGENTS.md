@@ -94,15 +94,24 @@ Windows is not a target and not a promise.
 already-loaded data, which is also why they are trivial to test and to drop into
 a pane.
 
-**Reads through `gix`** — status, log, diff, graph traversal. These run on every
-keystroke; no process spawn on the hot path.
+**Reads spawn the `git` binary today** — status, log, diff, graph traversal all
+go through `Command::new("git")` (`git/src/lib.rs`). `gix` is the intended
+destination, not the current state: the goal is no process spawn on the hot path,
+and moving reads onto `gix` is roadmap work (`docs/roadmap.md`). Until then, do
+not write a doc, a comment or a plan that assumes a `gix` handle exists — there is
+no `gix` dependency in the tree. The blob-OID diff cache is the cheaper half of
+the same goal and is also not built yet.
 
-**Writes through the `git` binary** — push, pull, merge, rebase, commit. Rare and
-latency-insensitive, and shelling out means hooks, credential helpers, SSH agents
-and `.gitconfig` behave exactly as they do in the user's terminal. Don't
-reimplement any of that; you will get it subtly wrong.
+**Writes do not exist yet** — there are zero write verbs in `gitten-git`; it is a
+read-only acquisition layer. When writes land (push, pull, merge, rebase, commit)
+they go through the `git` binary, because shelling out means hooks, credential
+helpers, SSH agents and `.gitconfig` behave exactly as they do in the user's
+terminal — don't reimplement any of that; you will get it subtly wrong.
 
-Both behind one trait. Frontends never learn which path ran.
+One trait behind both read paths (and the eventual writes) is the roadmap shape,
+so a frontend never learns which path ran — but it is roadmap item #1, not a fact
+about the code today: `git/src/lib.rs` exports free functions (`log`, `pairs`,
+`diff`, `describe`), not a trait.
 
 **Untracked files are `git status`, never `git diff`.** `git diff` compares the
 index and the working tree against a commit and an untracked file is in none of
@@ -315,6 +324,20 @@ a glyph there rather than asking someone to open something.
 
 `rust-toolchain.toml` tracks the channel Zed pins. When GPUI fails with an
 unstable-feature error, that pin has drifted — go read Zed's `rust-toolchain.toml`.
+
+**GPUI is pinned only by `Cargo.lock`, so never run a bare `cargo update`.** The
+four GPUI git dependencies in `shell/Cargo.toml` (`gpui`, `gpui_platform`,
+`gpui-component`, `gpui-component-assets`) are declared without a `rev`; the exact
+commits live in `Cargo.lock` and nothing else holds them. A bare `cargo update`
+floats them to Zed's default-branch tip — a wall of compile errors and probably a
+`rust-toolchain.toml` bump, at a moment nobody chose. A *scoped* update
+(`cargo update -p <crate>` for some unrelated dependency) does **not** touch the
+git deps and is safe. Bumping GPUI is deliberate: `cargo update -p gpui -p
+gpui-component`, then match `rust-toolchain.toml` to whatever channel the new Zed
+commit pins — one reviewed commit. (Pinning the deps with `rev = "…"` in the
+manifest was tried and rejected: `gpui-component` depends on `gpui` *bare*, so a
+`rev` on our side splits the whole Zed tree into two source variants and compiles
+GPUI twice. The lockfile is the pin; this note is the guard.)
 
 Never judge performance on a debug build — `cargo run` without `--release` is a
 different, much slower binary, and the title bar says so. `[profile.dev.package."*"]
