@@ -444,6 +444,14 @@ mod tests {
         let mut host = Host::new();
         let warn = config::apply(&mut host, &text);
         assert!(warn.is_empty(), "{warn:?}");
+        // And the shipped verbs ride it without a special line each: a new
+        // binding appears in the dump because the dump walks the keymap.
+        for command in ["files.discard", "files.stage-all", "files.ignore"] {
+            assert!(
+                !host.keys.keys_for(command).is_empty(),
+                "{command} is bound nowhere in the dumped file"
+            );
+        }
     }
 
     #[test]
