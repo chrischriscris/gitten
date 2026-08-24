@@ -361,6 +361,8 @@ impl Keymap {
         // lazygit's panel number for files. A direct jump is global so it works
         // whatever is focused; cycling between panes stays in [panes].
         bind(GLOBAL, "2", "files.focus");
+        // ...and for branches, lazygit's next panel down.
+        bind(GLOBAL, "3", "branches.focus");
 
         // lazygit's files panel: space acts on the row the keyboard is on, by
         // the side of the index it sits on, and c commits what the index
@@ -374,6 +376,15 @@ impl Keymap {
         bind("files", "D", "files.discard");
         bind("files", "a", "files.stage-all");
         bind("files", "i", "files.ignore");
+
+        // The branches panel: space checks out the branch under the keyboard,
+        // n names a new one, r renames the one under the keyboard (lazygit
+        // uses shift-r; unshifted is one less finger and nothing else claims
+        // it here), d deletes — twice-pressed like every destruction.
+        bind("branches", "space", "branches.checkout");
+        bind("branches", "n", "branches.new");
+        bind("branches", "r", "branches.rename");
+        bind("branches", "d", "branches.delete");
 
         bind("diff", "s", "diff.cycle-layout");
         bind("diff", "w", "diff.cycle-wrap");
@@ -748,6 +759,11 @@ impl Commands {
                 "files.ignore",
                 "add the selected untracked file to .gitignore",
             ),
+            ("branches.focus", "focus the branches pane"),
+            ("branches.checkout", "check out the selected branch"),
+            ("branches.new", "create a branch"),
+            ("branches.rename", "rename the selected branch"),
+            ("branches.delete", "delete the selected branch, asked twice"),
             ("input.accept", "accept the text"),
             ("input.cancel", "discard the text"),
             ("pane.next", "focus the next pane"),
@@ -1007,6 +1023,60 @@ mod tests {
                 assert!(command.doc.contains(needle), "{}: {}", name, command.doc);
             }
         }
+    }
+
+    #[test]
+    fn the_branch_verbs_resolve_in_branches_mode_and_project_into_the_help() {
+        let k = Keymap::builtin();
+        let mut modes = Modes::new();
+        modes.push("branches");
+        for (chord, name) in [
+            ("space", "branches.checkout"),
+            ("n", "branches.new"),
+            ("r", "branches.rename"),
+            ("d", "branches.delete"),
+        ] {
+            assert_eq!(
+                k.resolve(&modes, &keys(chord)),
+                Resolve::Run(name),
+                "{chord} did not reach {name} in [branches]"
+            );
+            // Particular to this pane: another context keeps its own
+            // meanings — space belongs to no list, and `d` is nobody's
+            // outside [files]' capital D.
+            assert_ne!(
+                k.resolve(&Modes::new(), &keys(chord)),
+                Resolve::Run(name),
+                "{name} leaked out of [branches]"
+            );
+        }
+        // The panel jump sits beside files' own: lazygit's numbers.
+        assert_eq!(
+            k.resolve(&Modes::new(), &keys("3")),
+            Resolve::Run("branches.focus")
+        );
+
+        let commands = Commands::builtin();
+        for name in [
+            "branches.focus",
+            "branches.checkout",
+            "branches.new",
+            "branches.rename",
+            "branches.delete",
+        ] {
+            assert!(commands.known(name), "{name} is not registered");
+            assert_eq!(k.keys_for(name).len(), 1, "{name}: one key");
+        }
+        let rows = shown(&k, &commands, &modes);
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("space · check out the selected branch")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("asked twice")),
+            "the delete row says it confirms"
+        );
     }
 
     #[test]
