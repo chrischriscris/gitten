@@ -44,6 +44,9 @@
 //! never changes, so a diff keyed on the pair of them is cacheable forever.
 
 use gitten_core::differ::{Differs, Overrides};
+use gitten_core::refs::{
+    Branch, HeadState, ReflogEntry, Remote, RemoteBranch, Stash, Tag, Upstream,
+};
 use gitten_core::status::{
     Change, ConflictEntry, ConflictKind, Kind, PathBytes, StagedEntry, Status, Submodule,
     UnstagedEntry, UntrackedEntry,
@@ -81,6 +84,33 @@ fn run(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         return Err(format!("git {}: {}", args.join(" "), err.trim()));
+    }
+    Ok(out.stdout)
+}
+
+/// [`run`] for arguments that are names rather than text.
+///
+/// A branch name may carry bytes no UTF-8 string can hold, and handing git
+/// their decoded near-misses would read somebody else's ref — the same
+/// reason [`join_raw`] exists for paths. Same process shape, byte arguments.
+fn run_bytes(repo: &Path, args: &[&[u8]]) -> Result<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args.iter().map(|a| std::ffi::OsStr::from_bytes(a)))
+        .output()
+        .map_err(|e| format!("could not run git: {e}"))?;
+    if !out.status.success() {
+        let err = args
+            .iter()
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        return Err(format!(
+            "git {err}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
     }
     Ok(out.stdout)
 }
@@ -132,10 +162,64 @@ pub trait Repo: Send + Sync {
     /// [`gitten_core::status`] for the model and why the four are separate.
     fn status(&self) -> Result<Status>;
 
+    /// The local branches, with HEAD's position and each branch's upstream
+    /// counts. See [`gitten_core::refs`] for the model.
+    fn branches(&self) -> Result<Vec<Branch>> {
+        Err(unserved("branches"))
+    }
+
+    /// The branches as the remotes hold them, as of the last fetch. See
+    /// [`gitten_core::refs`].
+    fn remote_branches(&self) -> Result<Vec<RemoteBranch>> {
+        Err(unserved("remote branches"))
+    }
+
+    /// Where `HEAD` points — a branch, or a commit it detached onto, or
+    /// nothing at all in a repository with no commits yet. Detached is a
+    /// state here and never an error; see [`HeadState`].
+    fn head(&self) -> Result<HeadState> {
+        Err(unserved("HEAD"))
+    }
+
+    /// The stash stack, newest first.
+    fn stashes(&self) -> Result<Vec<Stash>> {
+        Err(unserved("stashes"))
+    }
+
+    /// The remotes this repository knows by name, with their URLs.
+    fn remotes(&self) -> Result<Vec<Remote>> {
+        Err(unserved("remotes"))
+    }
+
+    /// The tags, each resolved to the commit it names.
+    fn tags(&self) -> Result<Vec<Tag>> {
+        Err(unserved("tags"))
+    }
+
+    /// Where HEAD has been: up to `limit` entries, newest first. Zero asks
+    /// for none.
+    fn reflog(&self, _limit: usize) -> Result<Vec<ReflogEntry>> {
+        Err(unserved("the reflog"))
+    }
+
     /// A short label for the window title.
     ///
     /// Infallible: a repository whose branch cannot be read still has a name.
     fn describe(&self) -> String;
+}
+
+/// The error a read answers when an implementation does not serve it.
+///
+/// The new reads default rather than being required, so an implementation
+/// serves *what it serves* without stubbing out the rest — the same shape
+/// as `core::rows::Present`'s defaulted methods, and for the same reason:
+/// a partial backend is a real thing (a gix port lands read by read; a test
+/// fake stands in for one view). An empty list would be a lie — a repository
+/// with no stashes and one whose backend cannot read stashes would look
+/// identical — so the default is an error that names what was not served,
+/// visible wherever errors are shown.
+fn unserved(what: &str) -> String {
+    format!("this repository does not serve {what}")
 }
 
 /// A shared handle to one opened repository.
@@ -382,6 +466,198 @@ impl Repo for Binary {
             name
         } else {
             format!("{name} ({branch})")
+        }
+    }
+
+    fn branches(&self) -> Result<Vec<Branch>> {
+        // One process names every local branch, points at its commit and
+        // reports its tracking pair. `%(upstream:remotename)` and
+        // `%(upstream:remoteref)` are the two halves *as the configuration
+        // holds them* — joining a refname by hand to get them would misread a
+        // remote whose name contains a slash, and there is no other place the
+        // pair is said unambiguously.
+        //
+        // `%(upstream:track)` rides along for two words only: "" (in sync)
+        // and "[gone]". Both retire a process — an in-sync branch needs no
+        // counts measured, and a gone one has none to measure — so the
+        // rev-list below runs once per actually-diverged branch and never on
+        // a plain open.
+        //
+        // Records are newline-separated with NUL-separated fields: no field
+        // can hold either (ref names forbid both; the track values are git's
+        // own documented spellings), and a line that does not split into
+        // exactly [`BRANCH_ARITY`] fields is skipped whole rather than
+        // guessed through, which is what keeps a warning line from poisoning
+        // its neighbours.
+        let raw = run(
+            &self.root,
+            &[
+                "for-each-ref",
+                &format!("--format={BRANCH_FORMAT}"),
+                "refs/heads",
+            ],
+        )?;
+        let mut out = Vec::new();
+        for b in parse_branches(&raw) {
+            let upstream = b.upstream.map(|u| {
+                let (ahead, behind) = match u.track {
+                    Track::Synced => (Some(0), Some(0)),
+                    Track::Gone => (None, None),
+                    Track::Diverged => self.counts(u.tracking_ref.as_bytes(), b.refname.as_bytes()),
+                };
+                Upstream {
+                    remote: u.remote,
+                    branch: PathBytes::from_bytes(short(u.upstream_ref.as_bytes(), HEADS_PREFIX)),
+                    ahead,
+                    behind,
+                }
+            });
+            out.push(Branch {
+                name: PathBytes::from_bytes(short(b.refname.as_bytes(), HEADS_PREFIX)),
+                commit: b.commit,
+                upstream,
+                head: b.head,
+            });
+        }
+        Ok(out)
+    }
+
+    fn remote_branches(&self) -> Result<Vec<RemoteBranch>> {
+        // Same framing as `branches`, one process over the other half of the
+        // ref namespace. The symbolic `refs/remotes/<remote>/HEAD` alias a
+        // clone writes is not a branch and reads as one nowhere.
+        let raw = run(
+            &self.root,
+            &[
+                "for-each-ref",
+                "--format=%(refname)%00%(objectname)",
+                "refs/remotes",
+            ],
+        )?;
+        Ok(parse_remote_branches(&raw))
+    }
+
+    fn head(&self) -> Result<HeadState> {
+        // `symbolic-ref -q` succeeds exactly when HEAD names a branch — an
+        // *unborn* one included, which every fresh repository has — and fails
+        // exactly when HEAD is detached. Its exit status is the state; the
+        // commit under it is a second question.
+        match run(&self.root, &["symbolic-ref", "-q", "HEAD"]) {
+            Ok(name) => {
+                // A fresh repository resolves HEAD to nothing: the branch is
+                // a name and nothing else yet, and that is what `None` says.
+                let commit = run(&self.root, &["rev-parse", "HEAD"])
+                    .ok()
+                    .map(|c| lossy(trimmed(&c)));
+                Ok(HeadState::Branch {
+                    name: PathBytes::from_bytes(short(trimmed(&name), HEADS_PREFIX)),
+                    commit,
+                })
+            }
+            // Detached HEAD must still resolve to a commit. Failing here is a
+            // broken repository worth reporting, not a state worth inventing.
+            Err(_) => {
+                let commit = run(&self.root, &["rev-parse", "HEAD"])?;
+                Ok(HeadState::Detached {
+                    commit: lossy(trimmed(&commit)),
+                })
+            }
+        }
+    }
+
+    fn stashes(&self) -> Result<Vec<Stash>> {
+        // `-z` ends each entry with NUL instead of a newline, because a stash
+        // message may contain anything a commit message may — everything but
+        // NUL. Two fields per entry: the message runs to the entry's NUL,
+        // newlines and all.
+        let raw = run(&self.root, &["stash", "list", "-z", "--format=%H%x00%gs"])?;
+        Ok(parse_stashes(&raw))
+    }
+
+    fn remotes(&self) -> Result<Vec<Remote>> {
+        // Lines, not NUL records: neither a remote name nor a URL can carry a
+        // raw newline (a config value cannot hold one), so nothing here needs
+        // the stronger frame.
+        let raw = run(&self.root, &["remote", "-v"])?;
+        Ok(parse_remotes(&raw))
+    }
+
+    fn tags(&self) -> Result<Vec<Tag>> {
+        // One process, and `%(*objectname)` is why: an annotated tag points
+        // at a tag object which points at the commit, and peeling it here
+        // costs nothing extra. A lightweight tag's own object already *is*
+        // the commit, which the parser picks apart positionally.
+        let raw = run(
+            &self.root,
+            &[
+                "for-each-ref",
+                "--format=%(refname)%00%(*objectname)%00%(objectname)",
+                "refs/tags",
+            ],
+        )?;
+        Ok(parse_tags(&raw))
+    }
+
+    fn reflog(&self, limit: usize) -> Result<Vec<ReflogEntry>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let n = limit.to_string();
+        let raw = match run(
+            &self.root,
+            &["reflog", "show", "-n", &n, "--format=%h%x00%gd%x00%gs"],
+        ) {
+            Ok(raw) => raw,
+            // An unborn branch has no reflog — every fresh repository — and
+            // that is emptiness, not breakage. Which case this is comes from
+            // the head model rather than from parsing stderr for a phrase
+            // another locale spells differently: unborn says empty, anything
+            // else passes the original error on.
+            Err(e) => match self.head() {
+                Ok(HeadState::Branch { commit: None, .. }) => return Ok(Vec::new()),
+                _ => return Err(e),
+            },
+        };
+        Ok(parse_reflog(&raw))
+    }
+}
+
+impl Binary {
+    /// Ahead and behind between a branch and its upstream: one process, both
+    /// numbers.
+    ///
+    /// The symmetric difference is written upstream-first — `upstream...local`,
+    /// the direction the question is asked from ("what would a pull bring?")
+    /// — so `--left-right` counts the *left* side as behind and the right as
+    /// ahead. The swap happens here, at the only place the argument order is
+    /// knowable, and never downstream.
+    ///
+    /// Bytes end to end: these names address git, and handing over their
+    /// lossy spelling would count a different branch's commits.
+    fn counts(&self, upstream: &[u8], local: &[u8]) -> (Option<u32>, Option<u32>) {
+        let mut range = Vec::with_capacity(upstream.len() + 3 + local.len());
+        range.extend_from_slice(upstream);
+        range.extend_from_slice(b"...");
+        range.extend_from_slice(local);
+        let raw = match run_bytes(
+            &self.root,
+            &[b"rev-list", b"--left-right", b"--count", &range],
+        ) {
+            Ok(raw) => raw,
+            // One unreadable branch must not take the whole answer down:
+            // a rebase moving the upstream mid-read, or a shallow clone
+            // missing one side, fails this one call — and the model already
+            // has a word, `None`, for "cannot be compared".
+            Err(_) => return (None, None),
+        };
+        let text = String::from_utf8_lossy(&raw);
+        let mut sides = text.split_whitespace();
+        match (
+            sides.next().and_then(|s| s.parse().ok()),
+            sides.next().and_then(|s| s.parse().ok()),
+        ) {
+            (Some(behind), Some(ahead)) => (Some(ahead), Some(behind)),
+            _ => (None, None),
         }
     }
 }
@@ -762,6 +1038,315 @@ fn loose_pair(entry: &UntrackedEntry, root: &Path) -> Option<Pair> {
     })
 }
 
+// ----------------------------------------------------------------------- refs
+
+/// The `for-each-ref` format for local branches: full name, commit, the
+/// remote-tracking ref the upstream resolves to, the two configured halves
+/// of the upstream, its track state, and HEAD's marker.
+///
+/// Three atoms describe one upstream because they answer different
+/// questions: `%(upstream)` names the local ref a fetch updates — the only
+/// safe thing to *count* against, since `%(upstream:remoteref)` resolves in
+/// the remote's own namespace and means nothing here — while the remotename
+/// and remoteref pair is what the configuration literally says, which is
+/// what the model carries.
+const BRANCH_FORMAT: &str = concat!(
+    "%(refname)%00%(objectname)%00%(upstream)",
+    "%00%(upstream:remotename)%00%(upstream:remoteref)",
+    "%00%(upstream:track)%00%(HEAD)"
+);
+
+/// Fields per [`BRANCH_FORMAT`] record.
+const BRANCH_ARITY: usize = 7;
+
+/// A full local ref starts here; whatever follows is the branch's own name.
+const HEADS_PREFIX: &[u8] = b"refs/heads/";
+
+/// A full tag ref starts here, for the same reason.
+const TAGS_PREFIX: &[u8] = b"refs/tags/";
+
+/// The name under a namespace: everything after `refs/heads/`, or all of it
+/// when the prefix is not there — an honest echo of what git said beats a
+/// guess at what it meant.
+fn short<'a>(refname: &'a [u8], namespace: &[u8]) -> &'a [u8] {
+    refname.strip_prefix(namespace).unwrap_or(refname)
+}
+
+/// Output up to its one trailing newline.
+fn trimmed(bytes: &[u8]) -> &[u8] {
+    bytes.strip_suffix(b"\n").unwrap_or(bytes)
+}
+
+/// The display form of bytes git emitted.
+///
+/// Where this lands in a *model field*, the field is human text — a stash
+/// message, a reflog subject — and the comment there says why decoding
+/// becomes right at that point. Names never come through here; they stay
+/// [`PathBytes`] end to end because verbs aim them back at git.
+fn lossy(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// One `for-each-ref` record over local branches, before counts run.
+#[derive(Debug)]
+struct RawBranch {
+    /// The full ref, `refs/heads/main` — kept whole because this is what
+    /// addresses git; the short name is cut only when the model is built.
+    refname: PathBytes,
+    commit: String,
+    head: bool,
+    upstream: Option<RawUpstream>,
+}
+
+/// The tracking pair as configuration holds it, plus whether comparing
+/// against it is even possible.
+#[derive(Debug)]
+struct RawUpstream {
+    remote: PathBytes,
+    /// The merge ref on the remote side, e.g. `refs/heads/main`.
+    upstream_ref: PathBytes,
+    /// The local ref a fetch updates for this pair, e.g.
+    /// `refs/remotes/origin/main` — what counts are measured against, and
+    /// not derivable from the two halves above without guessing where the
+    /// remote's name ends.
+    tracking_ref: PathBytes,
+    track: Track,
+}
+
+/// Whether a branch can be compared against its upstream at all.
+///
+/// `%(upstream:track)` answers two cases outright — "" (equal) and "[gone]"
+/// (the upstream's ref no longer exists locally) — and both retire the
+/// rev-list that measures everything else. Its remaining values carry the
+/// counts in prose, which are never parsed: they are re-measured exactly by
+/// `rev-list --left-right --count`, where the numbers are numbers.
+enum Track {
+    Synced,
+    Gone,
+    Diverged,
+}
+
+impl std::fmt::Debug for Track {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Track::Synced => "synced",
+            Track::Gone => "gone",
+            Track::Diverged => "diverged",
+        })
+    }
+}
+
+fn track(field: &[u8]) -> Track {
+    match field {
+        b"" => Track::Synced,
+        b"[gone]" => Track::Gone,
+        _ => Track::Diverged,
+    }
+}
+
+/// `for-each-ref` over `refs/heads`, in the framing described on
+/// [`BRANCH_FORMAT`]: newline-terminated records of NUL-separated fields.
+///
+/// Empty fields are preserved, not filtered — "no upstream configured"
+/// arrives as two empty pieces between NULs, and filtering empties would
+/// slide every later field into their slots. A line that does not split into
+/// exactly [`BRANCH_ARITY`] pieces is skipped whole: git prefixes warning
+/// lines to this output, and one malformed record must not shift another's
+/// fields.
+fn parse_branches(raw: &[u8]) -> Vec<RawBranch> {
+    let mut out = Vec::new();
+    for line in raw.split(|b| *b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let f: Vec<&[u8]> = line.split(|b| *b == 0).collect();
+        if f.len() != BRANCH_ARITY {
+            continue;
+        }
+        let upstream = match (f[2].is_empty(), f[3].is_empty(), f[4].is_empty()) {
+            // All three atoms or nothing: half a pair names no upstream, so
+            // none is claimed rather than one guessed from partial words.
+            (false, false, false) => Some(RawUpstream {
+                tracking_ref: PathBytes::from_bytes(f[2]),
+                remote: PathBytes::from_bytes(f[3]),
+                upstream_ref: PathBytes::from_bytes(f[4]),
+                track: track(f[5]),
+            }),
+            _ => None,
+        };
+        out.push(RawBranch {
+            refname: PathBytes::from_bytes(f[0]),
+            commit: lossy(f[1]),
+            head: f[6].first() == Some(&b'*'),
+            upstream,
+        });
+    }
+    out
+}
+
+/// `for-each-ref` over `refs/remotes`: `refs/remotes/<remote>/<branch>` and
+/// the commit, one per line.
+///
+/// The first slash after the namespace divides remote from branch — the same
+/// convention every git reader applies, because a slash *inside* a remote
+/// name is unreadable through any flat ref listing, this one included. The
+/// symbolic `<remote>/HEAD` alias a clone writes beside the real branches is
+/// not a branch and is dropped.
+fn parse_remote_branches(raw: &[u8]) -> Vec<RemoteBranch> {
+    let mut out = Vec::new();
+    for line in raw.split(|b| *b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let f: Vec<&[u8]> = line.split(|b| *b == 0).collect();
+        let [refname, oid] = f[..] else { continue };
+        let rest = match refname.strip_prefix(b"refs/remotes/") {
+            Some(rest) => rest,
+            None => continue,
+        };
+        let mut halves = rest.splitn(2, |b| *b == b'/');
+        let (remote, branch) = match (halves.next(), halves.next()) {
+            (Some(r), Some(b)) if !b.is_empty() => (r, b),
+            _ => continue,
+        };
+        if branch == b"HEAD" {
+            continue;
+        }
+        out.push(RemoteBranch {
+            remote: PathBytes::from_bytes(remote),
+            branch: PathBytes::from_bytes(branch),
+            commit: lossy(oid),
+        });
+    }
+    out
+}
+
+/// `git stash list -z --format=%H%x00%gs`, parsed.
+///
+/// `-z` ends every entry with NUL instead of a newline — the message inside
+/// may hold any character a commit message may, newlines included — so the
+/// stream splits into fixed pairs of fields with no line anywhere in it.
+///
+/// The index is the position: the list **is** the stash reflog read
+/// newest-first, so entry `i` *is* `stash@{i}`, which is why `%gd` is not
+/// asked for and re-derived from nothing.
+///
+/// The message decodes lossily, deliberately, exactly here: it is human text
+/// shown to a person, and no verb ever aims at it — stashes are addressed by
+/// [`Stash::index`] — so the raw bytes have nowhere further to travel and a
+/// bad byte becomes U+FFFD instead of failing the whole stack.
+fn parse_stashes(raw: &[u8]) -> Vec<Stash> {
+    let fields: Vec<&[u8]> = raw.split(|b| *b == 0).collect();
+    fields
+        .chunks(2)
+        .enumerate()
+        .filter_map(|(index, rec)| match rec {
+            [commit, message] => Some(Stash {
+                index,
+                commit: lossy(commit),
+                message: String::from_utf8_lossy(message).into_owned(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `git remote -v`: one line per URL as `<name>\t<url> (fetch)` or
+/// `(push)`.
+///
+/// Neither half of a line can contain a newline — remote names are ref
+/// components and config values cannot hold a raw one — so lines frame
+/// records without a stronger separator. The same URL serving both
+/// directions is listed once; an explicit distinct push URL is kept beside
+/// the fetch URL, in the order git reported them.
+fn parse_remotes(raw: &[u8]) -> Vec<Remote> {
+    let mut out: Vec<Remote> = Vec::new();
+    for line in raw.split(|b| *b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let Some(tab) = line.iter().position(|b| *b == b'\t') else {
+            continue;
+        };
+        let body = &line[tab + 1..];
+        let url = match body
+            .strip_suffix(b" (fetch)")
+            .or_else(|| body.strip_suffix(b" (push)"))
+        {
+            Some(url) => url,
+            None => continue,
+        };
+        let name = PathBytes::from_bytes(&line[..tab]);
+        // URLs display and are never aimed at anything — verbs address the
+        // remote by name — so this decode loses nothing that gets used.
+        let url = String::from_utf8_lossy(url).into_owned();
+        match out.iter_mut().find(|r| r.name == name) {
+            Some(remote) => {
+                if !remote.urls.contains(&url) {
+                    remote.urls.push(url);
+                }
+            }
+            None => out.push(Remote {
+                name,
+                urls: vec![url],
+            }),
+        }
+    }
+    out
+}
+
+/// `for-each-ref` over `refs/tags`: refname, peeled commit, object itself.
+///
+/// `%(*objectname)` peels an annotated tag to the commit it names and comes
+/// back empty for a lightweight tag, whose own object already *is* the
+/// commit — so the model carries the commit either way, positionally.
+fn parse_tags(raw: &[u8]) -> Vec<Tag> {
+    let mut out = Vec::new();
+    for line in raw.split(|b| *b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let f: Vec<&[u8]> = line.split(|b| *b == 0).collect();
+        let [refname, peeled, object] = f[..] else {
+            continue;
+        };
+        out.push(Tag {
+            name: PathBytes::from_bytes(short(refname, TAGS_PREFIX)),
+            commit: lossy(if peeled.is_empty() { object } else { peeled }),
+        });
+    }
+    out
+}
+
+/// `git reflog show --format=%h%x00%gd%x00%gs`, newest first.
+///
+/// Lines frame records because a reflog subject is single-line by
+/// construction — git folds newlines away when it writes an entry — and NULs
+/// split the three fields inside one.
+///
+/// Both text fields decode lossily, deliberately, at this boundary: the
+/// subject is history shown to a person and the selector (`HEAD@{3}`) is
+/// ASCII git itself generated. Neither addresses an object the way a branch
+/// name does, so there is no verb these bytes have to survive.
+fn parse_reflog(raw: &[u8]) -> Vec<ReflogEntry> {
+    let mut out = Vec::new();
+    for line in raw.split(|b| *b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let f: Vec<&[u8]> = line.split(|b| *b == 0).collect();
+        let [commit, selector, message] = f[..] else {
+            continue;
+        };
+        out.push(ReflogEntry {
+            commit: lossy(commit),
+            selector: String::from_utf8_lossy(selector).into_owned(),
+            message: String::from_utf8_lossy(message).into_owned(),
+        });
+    }
+    out
+}
+
 // ------------------------------------------------------------------- internals
 
 /// A gitlink: `--raw`'s mode for a submodule.
@@ -1075,6 +1660,7 @@ fn lines(content: &[u8]) -> Vec<Arc<str>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gitten_core::refs::RefName;
 
     /// A throwaway repository, because untracked files and conflicts are the
     /// things that cannot be tested against a canned string: they exist only
@@ -1110,6 +1696,40 @@ mod tests {
             let me = Scratch(dir);
             me.git(&["init", "-q", "-b", "main", "."]);
             me
+        }
+
+        /// A scratch repository acting as a remote: bare, because nothing ever
+        /// checks it out.
+        fn bare(name: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("gitten-git-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("a temp dir");
+            let me = Scratch(dir);
+            me.git(&["init", "-q", "--bare", "."]);
+            me
+        }
+
+        /// A clone of an existing repository at its own path, standing in for
+        /// the second machine a real divergence between two branches needs.
+        fn cloned(from: &std::path::Path, name: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("gitten-git-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(std::env::temp_dir())
+                .args(["clone", "-q"])
+                .arg(from)
+                .arg(&dir)
+                .output()
+                .expect("git clone runs");
+            assert!(
+                out.status.success(),
+                "clone: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            Scratch(dir)
         }
 
         fn git(&self, args: &[&str]) {
@@ -1154,6 +1774,15 @@ mod tests {
                 .args(args)
                 .output()
                 .expect("git runs");
+        }
+
+        /// The full object id of whatever `rev` resolves to, so assertions
+        /// compare against git's own answer rather than a canned constant.
+        fn rev_parse(&self, rev: &str) -> String {
+            String::from_utf8(self.git_os_out(&["rev-parse".into(), rev.into()]))
+                .unwrap()
+                .trim()
+                .to_string()
         }
 
         fn write(&self, path: &str, content: &[u8]) {
@@ -1237,6 +1866,33 @@ mod tests {
     /// The lines as plain slices, for assertions.
     fn strs(lines: &[Arc<str>]) -> Vec<&str> {
         lines.iter().map(|l| l.as_ref()).collect()
+    }
+
+    /// A repository with a real remote — a bare scratch repository reached
+    /// over its local path, no network — with one commit pushed under `-u`,
+    /// so `main` tracks `origin/main` and the remote-tracking ref exists.
+    /// That is the least state ahead/behind and gone-ness mean anything in.
+    fn upstream_fixture(name: &str) -> (Scratch, Scratch) {
+        let origin = Scratch::bare(&format!("{name}-origin"));
+        let r = Scratch::new(name);
+        r.write("seed.txt", b"seed\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "seed"]);
+        r.git(&[
+            "remote",
+            "add",
+            "origin",
+            &format!("{}", origin.0.display()),
+        ]);
+        r.git(&["push", "-q", "-u", "origin", "main"]);
+        (r, origin)
+    }
+
+    fn branch<'a>(branches: &'a [Branch], name: &str) -> &'a Branch {
+        branches
+            .iter()
+            .find(|b| b.name.as_bytes() == name.as_bytes())
+            .unwrap_or_else(|| panic!("no branch {name} among {branches:?}"))
     }
 
     #[test]
@@ -2259,5 +2915,347 @@ mod tests {
             .label(),
             "new.rs"
         );
+    }
+
+    // -------------------------------------------------------------------- refs
+
+    #[test]
+    fn an_empty_repository_reads_as_unborn_and_every_list_reads_as_empty() {
+        // Fresh `git init`: HEAD names a branch that has no commits yet, and
+        // no branch ref, stash, tag, remote or reflog exists. Every read
+        // answers — none of this is an error state, or opening a repository
+        // the moment after creating it would fail.
+        let r = Scratch::new("refs-empty");
+        let g = r.open();
+
+        assert_eq!(
+            g.head().unwrap(),
+            HeadState::Branch {
+                name: RefName::from("main"),
+                commit: None,
+            },
+            "an unborn branch is a name and nothing else yet"
+        );
+        assert_eq!(g.branches().unwrap(), vec![]);
+        assert_eq!(g.remote_branches().unwrap(), vec![]);
+        assert_eq!(g.stashes().unwrap(), vec![]);
+        assert_eq!(g.remotes().unwrap(), vec![]);
+        assert_eq!(g.tags().unwrap(), vec![]);
+        assert_eq!(
+            g.reflog(10).unwrap(),
+            vec![],
+            "the unborn branch has no reflog; that is emptiness, not breakage"
+        );
+    }
+
+    #[test]
+    fn local_branches_carry_their_commit_head_flag_and_upstream() {
+        let (r, _) = upstream_fixture("ref-fields");
+        r.git(&["branch", "feature"]);
+
+        let got = r.open().branches().unwrap();
+        let main = branch(&got, "main");
+        let feature = branch(&got, "feature");
+
+        assert!(main.head, "HEAD is attached here and nowhere else");
+        assert!(!feature.head);
+        assert_eq!(main.commit, r.rev_parse("main"));
+        assert_eq!(feature.commit, r.rev_parse("feature"));
+
+        // In sync with its upstream, and measured without a process: "" from
+        // `%(upstream:track)` *is* the answer when a comparison is possible.
+        assert_eq!(
+            main.upstream,
+            Some(Upstream {
+                remote: RefName::from("origin"),
+                branch: RefName::from("main"),
+                ahead: Some(0),
+                behind: Some(0),
+            })
+        );
+        assert!(feature.upstream.is_none(), "no configuration, no claim");
+    }
+
+    #[test]
+    fn ahead_and_behind_count_commits_each_side_has() {
+        let (r, origin) = upstream_fixture("ref-diverged");
+
+        // Two commits only this side has: what a push would send.
+        r.write("a.txt", b"a\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "one"]);
+        r.write("a.txt", b"b\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "two"]);
+
+        // One commit only the remote has, arrived by fetch: what a pull
+        // would bring. A second clone plays the other machine.
+        let twin = Scratch::cloned(&origin.0, "ref-diverged-twin");
+        twin.write("t.txt", b"t\n");
+        twin.git(&["add", "-A"]);
+        twin.git(&["commit", "-qm", "theirs"]);
+        twin.git(&["push", "-q", "origin", "main"]);
+        r.git(&["fetch", "-q", "origin"]);
+
+        let branches = r.open().branches().unwrap();
+        let up = branch(&branches, "main")
+            .upstream
+            .as_ref()
+            .expect("still tracking");
+        assert_eq!(
+            (up.remote.as_bytes(), up.branch.as_bytes()),
+            (b"origin".as_slice(), b"main".as_slice())
+        );
+        assert_eq!(up.ahead, Some(2));
+        assert_eq!(up.behind, Some(1), "left and right are not to be confused");
+    }
+
+    #[test]
+    fn a_gone_upstream_keeps_its_name_but_its_counts_become_unknown() {
+        let (r, _) = upstream_fixture("ref-gone");
+        // The server deleted the branch and the tracking ref went with it.
+        // The branch still remembers what it was tracking — which is worth
+        // showing — but nothing can be counted against a ref that is not
+        // here.
+        r.git(&["update-ref", "-d", "refs/remotes/origin/main"]);
+
+        let branches = r.open().branches().unwrap();
+        let up = branch(&branches, "main")
+            .upstream
+            .as_ref()
+            .expect("the configured pair survives the deletion");
+        assert_eq!(
+            (up.remote.as_bytes(), up.branch.as_bytes()),
+            (b"origin".as_slice(), b"main".as_slice())
+        );
+        assert_eq!(up.ahead, None, "gone is not zero");
+        assert_eq!(up.behind, None);
+    }
+
+    #[test]
+    fn detached_head_is_a_state_and_no_branch_claims_it() {
+        let (r, _) = upstream_fixture("ref-detached");
+        r.git(&["checkout", "-q", "--detach", "main"]);
+
+        let g = r.open();
+        match g.head().unwrap() {
+            HeadState::Detached { commit } => assert_eq!(commit, r.rev_parse("HEAD")),
+            other => panic!("expected detached, got {other:?}"),
+        }
+        assert!(
+            g.branches().unwrap().iter().all(|b| !b.head),
+            "detached means attached to none of them"
+        );
+    }
+
+    #[test]
+    fn a_unicode_branch_name_round_trips_byte_for_byte() {
+        // Cyrillic: stable under Unicode normalisation, which matters because
+        // loose refs live in filenames and macOS's volume plays games with
+        // combining marks. The assertion is on bytes, not text, because the
+        // name is addressed back to git byte for byte.
+        let r = Scratch::new("ref-unicode");
+        r.write("seed.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "seed"]);
+        r.git(&["branch", "ветка"]);
+
+        let got = r.open().branches().unwrap();
+        let b = branch(&got, "ветка");
+        assert_eq!(b.display().as_ref(), "ветка");
+        assert_eq!(b.commit, r.rev_parse("ветка"));
+    }
+
+    #[test]
+    fn remote_branches_name_both_halves_and_skip_the_head_alias() {
+        let (r, _origin) = upstream_fixture("ref-remotes");
+        // The symbolic alias a clone writes beside the real branches. It
+        // points at a branch; it is not one.
+        r.git(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ]);
+
+        let got = r.open().remote_branches().unwrap();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].remote.as_bytes(), b"origin");
+        assert_eq!(got[0].branch.as_bytes(), b"main");
+        assert_eq!(got[0].commit, r.rev_parse("refs/remotes/origin/main"));
+    }
+
+    #[test]
+    fn stashes_index_messages_and_commits_newest_first() {
+        let r = Scratch::new("ref-stash");
+        r.write("seed.txt", b"seed\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "seed"]);
+
+        r.write("seed.txt", b"first\n");
+        r.git(&["stash", "push", "-q", "-m", "wip: parser | %gs; \"quoted\""]);
+        r.write("seed.txt", b"second\n");
+        r.git(&["stash", "push", "-q"]);
+
+        let got = r.open().stashes().unwrap();
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[0].index, 0, "newest first, as stash@{{n}} counts");
+        assert!(
+            !got[0].message.is_empty(),
+            "git wrote its own message; it arrives whatever it says"
+        );
+        assert_eq!(got[1].index, 1);
+        // git prefixes its own `On <branch>:` to whatever was given; the
+        // model carries the reflog subject as git wrote it.
+        assert!(
+            got[1].message.ends_with("wip: parser | %gs; \"quoted\""),
+            "separators inside a message are content, not structure: {}",
+            got[1].message
+        );
+        assert_eq!(got[0].commit, r.rev_parse("stash@{0}"));
+        assert_eq!(got[1].commit, r.rev_parse("stash@{1}"));
+    }
+
+    #[test]
+    fn remotes_list_each_distinct_url_once() {
+        let r = Scratch::new("ref-remotes-model");
+        let a = Scratch::bare("ref-remotes-a");
+        let b = Scratch::bare("ref-remotes-b");
+        let url_a = format!("{}", a.0.display());
+        let url_b = format!("{}", b.0.display());
+        r.git(&["remote", "add", "origin", &url_a]);
+        r.git(&["remote", "add", "upstream", &url_a]);
+        // An explicit push address distinct from the fetch address rides
+        // beside it; the default one, where fetch and push agree, shows once.
+        r.git(&["remote", "set-url", "--add", "--push", "upstream", &url_b]);
+
+        let got = r.open().remotes().unwrap();
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[0].name.as_bytes(), b"origin");
+        assert_eq!(
+            got[0].urls,
+            vec![url_a.clone()],
+            "same URL both directions, listed once"
+        );
+        assert_eq!(got[1].name.as_bytes(), b"upstream");
+        assert_eq!(got[1].urls, vec![url_a, url_b]);
+    }
+
+    #[test]
+    fn tags_resolve_to_the_commit_they_name_whichever_kind_they_are() {
+        let r = Scratch::new("ref-tags");
+        r.write("f.txt", b"one\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "one"]);
+        r.git(&["tag", "v1"]);
+        r.git(&["tag", "-a", "v2", "-m", "release two"]);
+
+        let got = r.open().tags().unwrap();
+        let head = r.rev_parse("HEAD");
+        assert_eq!(
+            branch_names_of_tags(&got),
+            vec![b"v1".as_slice(), b"v2".as_slice()],
+            "git's own order, by refname"
+        );
+        let v1 = got.iter().find(|t| t.name.as_bytes() == b"v1").unwrap();
+        let v2 = got.iter().find(|t| t.name.as_bytes() == b"v2").unwrap();
+        assert_eq!(
+            v1.commit, head,
+            "lightweight: the object already is the commit"
+        );
+        assert_eq!(
+            v2.commit, head,
+            "annotated: peeled past the tag object git created for it"
+        );
+    }
+
+    fn branch_names_of_tags(tags: &[Tag]) -> Vec<&[u8]> {
+        tags.iter().map(|t| t.name.as_bytes()).collect()
+    }
+
+    #[test]
+    fn reflog_entries_carry_selector_and_message_newest_first_up_to_the_limit() {
+        let r = Scratch::new("ref-reflog");
+        for i in 0..3 {
+            r.write(&format!("f{i}.txt"), format!("{i}\n").as_bytes());
+            r.git(&["add", "-A"]);
+            r.git(&["commit", "-qm", &format!("number {i}")]);
+        }
+
+        let g = r.open();
+        let all = g.reflog(5).unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].selector, "HEAD@{0}");
+        assert_eq!(all[2].selector, "HEAD@{2}");
+        assert!(all[0].message.starts_with("commit:"), "{}", all[0].message);
+
+        let log = g.log(1).unwrap();
+        assert!(
+            log[0].sha.starts_with(&all[0].commit),
+            "the abbreviated sha abbreviates the full one"
+        );
+
+        assert_eq!(g.reflog(2).unwrap().len(), 2, "the limit bounds the answer");
+        assert_eq!(g.reflog(0).unwrap(), vec![], "zero asks for none");
+    }
+
+    #[test]
+    fn branch_records_parse_positionally_through_empty_fields() {
+        // main has no upstream at all — two empty halves between NULs, kept
+        // positional. gone has one whose ref left, so track answers by
+        // itself. A warning line and a truncated tail are skipped whole,
+        // never allowed to shift another record's fields.
+        let raw = b"\
+            refs/heads/main\0abc\0\0\0\0\0*\n\
+            refs/heads/gone\0def\0refs/remotes/origin/main\0origin\0refs/heads/main\0[gone]\0 \n\
+            warning: something git wanted to say\n\
+            refs/heads/truncated\x00123";
+
+        let got = parse_branches(raw);
+        assert_eq!(got.len(), 2, "{got:?}");
+
+        let main = &got[0];
+        assert_eq!(main.refname.as_bytes(), b"refs/heads/main");
+        assert_eq!(main.commit, "abc");
+        assert!(main.head);
+        assert!(main.upstream.is_none());
+
+        let gone = &got[1];
+        assert!(!gone.head, "a space marks not-HEAD, not a parse failure");
+        let up = gone.upstream.as_ref().expect("all three atoms present");
+        assert_eq!(up.tracking_ref.as_bytes(), b"refs/remotes/origin/main");
+        assert_eq!(up.remote.as_bytes(), b"origin");
+        assert_eq!(up.upstream_ref.as_bytes(), b"refs/heads/main");
+        assert!(
+            matches!(up.track, Track::Gone),
+            "the one prose value parsed: it retires the counting process"
+        );
+    }
+
+    #[test]
+    fn stash_records_keep_messages_whatever_they_hold() {
+        // Newlines survive inside a message because entries are NUL-framed,
+        // not line-split; the trailing NUL leaves a ragged piece that is
+        // skipped rather than read as an entry of its own.
+        let raw = b"h1\0WIP multi\nline\0h2\0plain\0";
+        let got = parse_stashes(raw);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].index, 0);
+        assert_eq!(got[0].commit, "h1");
+        assert_eq!(got[0].message, "WIP multi\nline");
+        assert_eq!(got[1].index, 1);
+        assert_eq!(got[1].message, "plain");
+    }
+
+    #[test]
+    fn tag_records_peel_only_when_a_peel_arrived() {
+        let raw = b"\
+            refs/tags/v1\0\0aa11\n\
+            refs/tags/v2\0bb22\0cc33\n";
+        let got = parse_tags(raw);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].name.as_bytes(), b"v1");
+        assert_eq!(got[0].commit, "aa11", "lightweight: object is commit");
+        assert_eq!(got[1].name.as_bytes(), b"v2");
+        assert_eq!(got[1].commit, "bb22", "annotated: the peel wins");
     }
 }
