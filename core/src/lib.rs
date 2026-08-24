@@ -278,13 +278,50 @@ pub struct FileDiff {
     pub hunks: Vec<Hunk>,
 }
 
+/// Whether a patch's own line terminators are CRLF, decided once for the whole
+/// file rather than per line — because per line it is not decidable.
+///
+/// A content line of a CRLF *file* ends with `\r` inside the patch; so does every
+/// line of a patch that was itself saved with CRLF terminators. The two are
+/// indistinguishable in isolation, and guessing per line means a patch of a
+/// Windows file loses the very bytes it is about. The whole file settles it: if
+/// *every* line carries a `\r` then the `\r` is punctuation, and if any line does
+/// not then the ones that do are content. This is the rule `git apply` uses, and
+/// it is why the decision is taken before a single line is parsed.
+fn crlf_terminated(raw: &str) -> bool {
+    let mut any = false;
+    for line in raw.split('\n') {
+        // The empty tail after a trailing newline is not a line.
+        if line.is_empty() {
+            continue;
+        }
+        if !line.ends_with('\r') {
+            return false;
+        }
+        any = true;
+    }
+    any
+}
+
 /// Parses `git diff` unified output. Enough for the spike; binary files,
 /// renames and mode changes are skipped rather than modelled.
+///
+/// **A `\r` that is content stays in the line.** `str::lines()` was what this
+/// used, and it strips a trailing `\r` unconditionally — so every line of a patch
+/// of a CRLF file silently lost the byte the patch existed to show, and the
+/// repository door (which keeps it, see `gitten_git`) and this one disagreed
+/// about the text of the same commit. See [`crlf_terminated`] for how the
+/// ambiguity is settled.
 pub fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
     let mut files: Vec<FileDiff> = Vec::new();
     let (mut old_no, mut new_no) = (0u32, 0u32);
+    let strip_cr = crlf_terminated(raw);
 
-    for line in raw.lines() {
+    for line in raw.split('\n') {
+        let line = match strip_cr {
+            true => line.strip_suffix('\r').unwrap_or(line),
+            false => line,
+        };
         if let Some(rest) = line.strip_prefix("diff --git ") {
             let path = rest
                 .split_whitespace()
@@ -601,6 +638,60 @@ mod tests {
             timestamp: 0,
             subject: "s".into(),
         }
+    }
+
+    /// The text of every line of a parsed patch, in order.
+    fn texts(files: &[FileDiff]) -> Vec<String> {
+        files
+            .iter()
+            .flat_map(|f| &f.hunks)
+            .flat_map(|h| &h.lines)
+            .map(|l| l.text.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_carriage_return_that_is_content_survives_the_patch_parser() {
+        // A patch of a file whose endings changed: the `-` lines are LF and the
+        // `+` lines carry a CR *inside* the patch. `str::lines()` ate it, which
+        // made this door disagree with the repository door about the text of the
+        // same commit — and a patch of a CRLF file lose the byte it is about.
+        let raw = "diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n\
+                   @@ -1,2 +1,2 @@\n-alpha\n-beta\n+alpha\r\n+beta\r\n";
+        assert_eq!(
+            texts(&parse_unified_diff(raw)),
+            ["alpha", "beta", "alpha\r", "beta\r"]
+        );
+    }
+
+    #[test]
+    fn a_patch_saved_with_crlf_terminators_keeps_none_of_them() {
+        // Every line ends with `\r`, so every `\r` is punctuation — including the
+        // one on the path, which would otherwise put a control character in a
+        // file name.
+        let raw = "diff --git a/f.txt b/f.txt\r\n--- a/f.txt\r\n+++ b/f.txt\r\n\
+                   @@ -1,1 +1,1 @@\r\n-alpha\r\n+beta\r\n";
+        let files = parse_unified_diff(raw);
+        assert_eq!(files[0].path, "f.txt", "a CR reached the path");
+        assert_eq!(texts(&files), ["alpha", "beta"]);
+    }
+
+    #[test]
+    fn a_crlf_patch_of_a_crlf_file_keeps_the_inner_carriage_return() {
+        // Both at once: the terminator is stripped and the content's own `\r`
+        // stays, because there were two.
+        let raw = "diff --git a/f.txt b/f.txt\r\n@@ -1,1 +1,1 @@\r\n-alpha\r\r\n+beta\r\r\n";
+        assert_eq!(texts(&parse_unified_diff(raw)), ["alpha\r", "beta\r"]);
+    }
+
+    #[test]
+    fn deciding_the_terminator_needs_the_whole_patch() {
+        assert!(crlf_terminated("a\r\nb\r\n"));
+        assert!(crlf_terminated("a\r\nb\r"), "no final newline");
+        assert!(!crlf_terminated("a\r\nb\n"), "one bare LF settles it");
+        assert!(!crlf_terminated("a\nb\n"));
+        assert!(!crlf_terminated(""), "nothing to decide about");
+        assert!(!crlf_terminated("\n\n"));
     }
 
     #[test]
