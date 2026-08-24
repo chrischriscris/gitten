@@ -62,6 +62,14 @@ pub enum Source {
         /// view's business.
         arg: String,
     },
+    /// A patch, not a repository: `-` reads standard input, `--patch FILE`
+    /// names a file. The patch *is* the whole changeset — no revspec, no
+    /// second positional, which is why a word left over beside it is
+    /// [`Request::Help`] rather than an argument nobody noticed.
+    Patch {
+        /// `None` for `-`.
+        file: Option<PathBuf>,
+    },
     Fixtures,
 }
 
@@ -75,6 +83,10 @@ impl Source {
             Source::Repo { path, arg } => {
                 format!("{}:{}:{arg}", view.name(), path.to_string_lossy())
             }
+            Source::Patch { file: Some(path) } => {
+                format!("{}:{}:", view.name(), path.to_string_lossy())
+            }
+            Source::Patch { file: None } => format!("{}:-:", view.name()),
             Source::Fixtures => format!("{}:--fixtures:", view.name()),
         }
     }
@@ -109,23 +121,50 @@ pub fn parse(args: &[String], default: View) -> Request {
     if args.iter().any(|a| a == "-h" || a == "--help") {
         return Request::Help;
     }
-    let (view, rest) = match args.first().map(String::as_str) {
-        None => (default, &args[..0]),
+    // `--patch` names a source rather than adjusting one, so it belongs to
+    // this parse and not to any client: the same words name a patch in a
+    // window, a browser tab and a terminal. Taken out first, so it sits where
+    // the line wants it — beside every other flag.
+    let mut rest = args.to_vec();
+    let patch = match take_value(&mut rest, "--patch") {
+        Ok(Some(v)) => Some(v),
+        Ok(None) => None,
+        Err(_) => return Request::Help,
+    };
+    let (view, tail): (View, &[String]) = match rest.first().map(String::as_str) {
+        None => (default, &[]),
         Some("config") => return Request::Config,
         Some(word) => match View::parse(word) {
-            Some(v) => (v, &args[1..]),
+            Some(v) => (v, &rest[1..]),
             None => return Request::Help,
         },
     };
-    let source = match rest.first().map(String::as_str) {
-        Some("--fixtures") => Source::Fixtures,
-        Some(path) => Source::Repo {
-            path: PathBuf::from(path),
-            arg: rest.get(1).cloned().unwrap_or_default(),
+    let positional: Option<&str> = tail.first().map(String::as_str);
+    let source = match (patch.as_deref(), positional) {
+        // A patch takes no revspec — anything left over beside it is a word
+        // nobody could have meant. `--patch -` and a bare `-` are both stdin.
+        (Some("-"), None | Some("-")) => Source::Patch { file: None },
+        (Some(file), None | Some("-")) => Source::Patch {
+            file: Some(PathBuf::from(file)),
         },
-        None => Source::Repo {
+        (Some(_), Some(_)) => return Request::Help,
+        (None, Some("-")) => Source::Patch { file: None },
+        (None, Some("--fixtures")) => Source::Fixtures,
+        (None, Some(path)) => {
+            // `-` past the repository slot cannot be meant: stdin has no
+            // revspec to pair with, so `diff main -` is help and not a
+            // revision called `-` that fails somewhere inside git.
+            if tail.get(1).map(String::as_str) == Some("-") {
+                return Request::Help;
+            }
+            Source::Repo {
+                path: PathBuf::from(path),
+                arg: tail.get(1).cloned().unwrap_or_default(),
+            }
+        }
+        (None, None) => Source::Repo {
             path: PathBuf::from("."),
-            arg: rest.get(1).cloned().unwrap_or_default(),
+            arg: tail.get(1).cloned().unwrap_or_default(),
         },
     };
     Request::Open { view, source }
@@ -169,10 +208,12 @@ pub fn usage(binary: &str, blurb: &str, extra: &str) -> String {
 
   {binary} commits [REPO] [LIMIT]     history graph      (default: . , 5000)
   {binary} diff    [REPO] [REVSPEC]   a diff             (default: . , working tree)
+  {binary} diff    --patch FILE       review a patch     (--patch - or diff - = stdin)
   {binary} config                     print the current theme and font as TOML
 
   REVSPEC is anything git takes:  HEAD~50..HEAD   main..feature   <sha>
   Pass --fixtures instead of REPO to read fixtures/ instead of a repository.
+  A patch needs no checkout at all:  git diff | {binary} diff -
 
   gitten.toml next to the binary (or $GITTEN_CONFIG) picks the theme — dark, light
   or slate, or one it defines itself — and sets the font and the [diff] table:
@@ -267,6 +308,70 @@ mod tests {
                 source: Source::Fixtures
             }
         );
+    }
+
+    #[test]
+    fn a_patch_is_named_explicitly_and_never_guessed() {
+        // A `.diff` suffix is not a rule: the word after `diff` means a
+        // repository until `--patch` or `-` says otherwise, because a typo
+        // must not look like success.
+        assert_eq!(
+            parsed("diff --patch pr30683.diff"),
+            Request::Open {
+                view: View::Diff,
+                source: Source::Patch {
+                    file: Some(PathBuf::from("pr30683.diff"))
+                }
+            }
+        );
+        assert_eq!(
+            parsed("diff -"),
+            Request::Open {
+                view: View::Diff,
+                source: Source::Patch { file: None }
+            }
+        );
+        assert_eq!(
+            parsed("diff --patch -"),
+            Request::Open {
+                view: View::Diff,
+                source: Source::Patch { file: None }
+            }
+        );
+    }
+
+    #[test]
+    fn a_patch_takes_no_revspec() {
+        // Whatever is left over beside a patch is a word nobody could have
+        // meant, and help is what a word nobody meant gets.
+        assert_eq!(parsed("diff . --patch pr.diff"), Request::Help);
+        assert_eq!(parsed("diff HEAD~1..HEAD -"), Request::Help);
+        // And `--patch` with no value is its own mistake.
+        assert_eq!(parsed("diff --patch"), Request::Help);
+        // A patch is not history either; the parse stays syntactic and
+        // acquisition says so — see acquire.
+        assert_eq!(
+            parsed("commits -"),
+            Request::Open {
+                view: View::Commits,
+                source: Source::Patch { file: None }
+            }
+        );
+    }
+
+    #[test]
+    fn a_patch_key_names_one_patch() {
+        let file = Source::Patch {
+            file: Some(PathBuf::from("a.diff")),
+        };
+        let stdin = Source::Patch { file: None };
+        assert_eq!(file.key(View::Diff), file.key(View::Diff));
+        assert_ne!(file.key(View::Diff), stdin.key(View::Diff));
+        assert_ne!(
+            file.key(View::Diff),
+            repo(".", "HEAD~1..HEAD").key(View::Diff)
+        );
+        assert_ne!(stdin.key(View::Diff), Source::Fixtures.key(View::Diff));
     }
 
     #[test]

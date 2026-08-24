@@ -595,8 +595,8 @@ fn main() {
 
     // How to fetch the diff again with a different algorithm. Built here, where
     // the source is known, so nothing downstream has to learn what a repository
-    // is. `None` for a `.diff` fixture and for the commit graph — neither has an
-    // algorithm to choose, and the control says so by being inert.
+    // is. `None` for a `.diff` fixture, a patch and the commit graph — none has
+    // an algorithm to choose, and the control says so by being inert.
     let rediff: Option<Rediff> = match (which, &source) {
         (View::Diff, Source::Repo { path, arg }) => {
             let (repo, revspec) = (path.clone(), arg.clone());

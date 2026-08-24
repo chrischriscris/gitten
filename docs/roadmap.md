@@ -30,9 +30,9 @@ before everything else.
 
 | # | Block | Lands | Why now | Unblocks | Size |
 |---|---|---|---|---|---|
-| 1 | **Repo access trait** | `gitten-git` | Five free functions today (`log`, `pairs`, …). One surface so reads (someday gix) and writes (binary) hide behind it; frontends never learn which ran | every later item plugs in here | S |
+| 1 | **Repo access trait** | `gitten-git` | Five free functions today (`log`, `pairs`, …). One surface so reads (someday gix) and writes (binary) hide behind it; frontends never learn which ran. Shape it against a non-git backend staying possible — a method name or return type that says "git" means the seam is wrong, and #1 is the last cheap moment to find out | every later item plugs in here | S |
 | 2 | **GPUI adopts `core::command` dispatch** | `shell` | Still GPUI's action system; every verb added before the migration costs three re-bindings after. Do it once, then each new command gets `[keys]`, help panel and extension reach for free | all of D | M |
-| 3 | **Job runner + invalidation generation** | `app`/`shell` (never `core` — no I/O there) | Writes are processes taking seconds; they cannot block render. Queue → run → completion event → bump a generation → affected views re-acquire → `session.rs` restores selection | every write verb | M |
+| 3 | **Job runner + invalidation generation** | `app`/`shell` (never `core` — no I/O there) | Writes are processes taking seconds; they cannot block render. Queue → run → completion event → bump a generation → affected views re-acquire → `session.rs` restores selection. Design the channel so a filesystem event and a job completion are indistinguishable to the consumer — watch mode ([competition.md](competition.md)) is then one small producer later, not a parallel refresh path | every write verb | M |
 | 4 | **Text input block** | `shell`, mode on the existing mode stack | No text field exists anywhere in the shell. Consumer #1 is the commit message; #2 the search prompt (#17) | #10, #17 | M |
 | 5 | **Pane layout + focus model** | `shell` | One view fills the window; lazygit *is* a focus-switching pane grid. Two stacked panes and a focus ring is enough to start. Already listed under "Panes" in [architecture.md](architecture.md); the diff view measures its own box, so tenants exist ([decisions/0017](decisions/0017-wrapping-is-more-rows-not-taller-ones.md)) | Files/branches/stash panels | L |
 
@@ -90,9 +90,14 @@ code hot reload, the gix port beyond its start in #7, semantic diffs,
 Linux builds — see [architecture.md](architecture.md) § "Not built yet", which
 is the canonical record of gaps; update both together.
 
-Two standing notes. First, the `cli/` door stays optional for a desktop v1 —
+Three standing notes. First, the `cli/` door stays optional for a desktop v1 —
 build it whenever a command name first feels ambiguous, which is exactly when
 it earns its keep. Second, rule 1 applies to every verb above: if a write op
 exists, an extension reaches it through the same command name, or the seam is
 wrong. The tracer bullet (#10) should prove that too — wire one command from
 the registry, not around it.
+
+Third, [competition.md](competition.md) holds the field notes on hunk: patch
+input has landed, watch mode lands as consumer two of #3, agent annotations
+wait for the extension host, and everything else there is sorted — smaller
+gaps, and what not to take. Read it when planning a phase, not before.

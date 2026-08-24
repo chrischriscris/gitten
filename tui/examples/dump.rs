@@ -3,6 +3,7 @@
 //! ```sh
 //! cargo run -q -p gitten-tui --example dump -- diff    [REPO] [REVSPEC]
 //! cargo run -q -p gitten-tui --example dump -- diff    --fixtures
+//! cargo run -q -p gitten-tui --example dump -- diff    --patch FILE   (- = stdin)
 //! cargo run -q -p gitten-tui --example dump -- commits [REPO] [LIMIT]
 //! cargo run -q -p gitten-tui --example dump -- commits --fixtures
 //! ```
@@ -46,6 +47,17 @@ fn read(path: &str) -> String {
     }
 }
 
+/// A patch from `-`: lossy, like everything that came out of git.
+fn read_stdin() -> String {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .lock()
+        .read_to_end(&mut bytes)
+        .expect("standard input");
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let which = args.next().unwrap_or_else(|| "diff".into());
@@ -81,6 +93,15 @@ fn main() {
         "diff" => {
             let files = match where_.as_str() {
                 "--fixtures" => gitten_core::parse_unified_diff(&read("fixtures/big.diff")),
+                "--patch" => match rest.as_deref() {
+                    Some("-") => gitten_core::parse_unified_diff(&read_stdin()),
+                    Some(path) => gitten_core::parse_unified_diff(&read(path)),
+                    None => {
+                        eprintln!("gitten: --patch wants a file, or - for standard input");
+                        std::process::exit(1);
+                    }
+                },
+                "-" => gitten_core::parse_unified_diff(&read_stdin()),
                 repo => {
                     let spec = rest.unwrap_or_default();
                     match gitten_git::diff(
@@ -120,6 +141,12 @@ fn main() {
         "commits" => {
             let commits = match where_.as_str() {
                 "--fixtures" => gitten_core::parse_log(&read("fixtures/log.txt")),
+                // Same answer acquisition gives, because the example mirrors
+                // the CLI rather than re-deciding it.
+                "--patch" | "-" => {
+                    eprintln!("gitten: a patch is one diff and has no history — open it with diff");
+                    std::process::exit(1);
+                }
                 repo => {
                     let limit = rest.and_then(|n| n.parse().ok()).unwrap_or(5000);
                     match gitten_git::log(&PathBuf::from(repo), limit) {

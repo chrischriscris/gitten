@@ -18,6 +18,7 @@ which numbers those decisions rest on, and the diagrams.
 | [terminal.md](terminal.md) | the terminal frontend, and what writing it moved into `core` |
 | [extending.md](extending.md) | every seam, with a worked example each |
 | [roadmap.md](roadmap.md) | build order from viewer to product, one block at a time |
+| [competition.md](competition.md) | what else is out there, what to steal and when |
 
 ## Decisions
 

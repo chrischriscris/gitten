@@ -339,7 +339,7 @@ impl App {
     fn new(started: gitten_app::Started, glyphs: Glyphs) -> Self {
         let repo = match &started.source {
             Source::Repo { path, .. } => Some(path.clone()),
-            Source::Fixtures => None,
+            Source::Fixtures | Source::Patch { .. } => None,
         };
         let label = started.loaded.label.clone();
         let host = started.host;

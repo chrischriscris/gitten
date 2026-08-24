@@ -61,12 +61,38 @@ pub fn read_fixture(path: &str) -> String {
     String::from_utf8_lossy(&std::fs::read(path).unwrap_or_default()).into_owned()
 }
 
+/// Reads a patch from a named file, or from standard input for `None`.
+///
+/// Lossy like [`read_fixture`], and for the same reason: a patch came out of
+/// git or someone's mailer and guarantees no encoding. The label is what the
+/// title bar calls it — the path as it was typed, or `-`.
+fn read_patch(file: Option<&Path>) -> Result<(String, String), String> {
+    match file {
+        Some(path) => {
+            let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+            Ok((
+                String::from_utf8_lossy(&bytes).into_owned(),
+                path.display().to_string(),
+            ))
+        }
+        None => {
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            std::io::stdin()
+                .lock()
+                .read_to_end(&mut bytes)
+                .map_err(|e| format!("standard input: {e}"))?;
+            Ok((String::from_utf8_lossy(&bytes).into_owned(), "-".into()))
+        }
+    }
+}
+
 /// Acquires the data for one view of one source.
 ///
 /// Errors are strings a client prints beside its usage, because every one of
 /// them is something the person typing can fix: a path that is not a
 /// repository, a revspec with nothing in it, a fixture that has not been
-/// generated.
+/// generated, a patch that holds no diff.
 pub fn acquire(view: View, source: &Source, host: &Host) -> Result<Loaded, String> {
     match (view, source) {
         (View::Diff, Source::Repo { path, arg }) => {
@@ -106,6 +132,22 @@ pub fn acquire(view: View, source: &Source, host: &Host) -> Result<Loaded, Strin
                 data: Data::Diff(files),
             })
         }
+        (View::Diff, Source::Patch { file }) => {
+            let (raw, label) = read_patch(file.as_deref())?;
+            let files = gitten_core::parse_unified_diff(&raw);
+            if files.is_empty() {
+                return Err(match file {
+                    Some(path) => format!("{} holds no unified diff", path.display()),
+                    None => "standard input held no unified diff \
+                             — pipe one in:  git diff | gitten diff -"
+                        .into(),
+                });
+            }
+            Ok(Loaded {
+                label,
+                data: Data::Diff(files),
+            })
+        }
         (View::Commits, Source::Repo { path, arg }) => {
             // Beside, not behind: the same overlap the diff view has, because
             // the graph waits on `git log` either way.
@@ -132,6 +174,12 @@ pub fn acquire(view: View, source: &Source, host: &Host) -> Result<Loaded, Strin
                 label: "fixtures".into(),
                 data: Data::Commits(commits),
             })
+        }
+        // A patch is one diff and has no history, so this is a message rather
+        // than an arm: the person typing asked for something that does not
+        // exist, and the usage after it shows what does.
+        (View::Commits, Source::Patch { .. }) => {
+            Err("a patch is one diff and has no history — open it with `diff`".into())
         }
     }
 }
@@ -242,5 +290,57 @@ mod tests {
         };
         let loaded = acquire(View::Commits, &source, &host).unwrap();
         assert_eq!(loaded.data.len(), 3);
+    }
+
+    /// A small real diff, so a patch arm has something honest to parse.
+    const PATCH: &str = "\
+diff --git a/src/main.rs b/src/main.rs
+index 3e7a1b2..9c4d0f1 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,3 +1,4 @@
+ fn main() {
++    let answer = 42;
+     println!(\"hello\");
+ }
+";
+
+    fn patch_file(name: &str, contents: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("gitten-patch-test-{name}"));
+        std::fs::write(&path, contents).expect("wrote the test patch");
+        path
+    }
+
+    #[test]
+    fn a_patch_file_arrives_parsed_without_a_repository() {
+        let host = Host::new();
+        let source = Source::Patch {
+            file: Some(patch_file("ok.diff", PATCH)),
+        };
+        let loaded = acquire(View::Diff, &source, &host).expect("the patch parses");
+        assert!(matches!(loaded.data, Data::Diff(_)));
+        assert!(!loaded.data.is_empty());
+        assert!(loaded.label.ends_with("ok.diff"), "{}", loaded.label);
+    }
+
+    #[test]
+    fn an_empty_patch_says_so_rather_than_opening_on_nothing() {
+        let host = Host::new();
+        let source = Source::Patch {
+            file: Some(patch_file("empty.diff", "")),
+        };
+        let err = acquire(View::Diff, &source, &host).unwrap_err();
+        assert!(err.contains("no unified diff"), "{err}");
+        assert!(err.contains("empty.diff"), "{err}");
+    }
+
+    #[test]
+    fn a_patch_is_not_history_and_says_what_to_do_instead() {
+        let host = Host::new();
+        let source = Source::Patch {
+            file: Some(patch_file("hist.diff", PATCH)),
+        };
+        let err = acquire(View::Commits, &source, &host).unwrap_err();
+        assert!(err.contains("diff"), "{err}");
     }
 }
