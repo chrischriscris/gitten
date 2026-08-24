@@ -361,6 +361,9 @@ impl Keymap {
         // lazygit's panel number for files. A direct jump is global so it works
         // whatever is focused; cycling between panes stays in [panes].
         bind(GLOBAL, "2", "files.focus");
+        // lazygit numbers the stash stack 4 (branches take 3); the same
+        // convention, so one keyboard works in both programs.
+        bind(GLOBAL, "4", "stashes.focus");
 
         // lazygit's files panel: space acts on the row the keyboard is on, by
         // the side of the index it sits on, and c commits what the index
@@ -374,6 +377,19 @@ impl Keymap {
         bind("files", "D", "files.discard");
         bind("files", "a", "files.stage-all");
         bind("files", "i", "files.ignore");
+        // lazygit's shift-stash: park what the working tree holds and start
+        // again from HEAD.
+        bind("files", "s", "files.stash");
+
+        // The stash stack, on lazygit's own three: space applies and keeps,
+        // g pops — apply, then drop only when the apply was clean — and d
+        // drops (twice-pressed, like files.discard). `g` and `d` are bound
+        // globally to view movements; here they mean the row, which is the
+        // mode-overrides-global rule doing its job, with home/end/G still
+        // reaching the same places.
+        bind("stashes", "space", "stashes.apply");
+        bind("stashes", "g", "stashes.pop");
+        bind("stashes", "d", "stashes.drop");
 
         bind("diff", "s", "diff.cycle-layout");
         bind("diff", "w", "diff.cycle-wrap");
@@ -748,6 +764,17 @@ impl Commands {
                 "files.ignore",
                 "add the selected untracked file to .gitignore",
             ),
+            ("stashes.focus", "focus the stash pane"),
+            (
+                "files.stash",
+                "park the working tree's changes on the stash stack",
+            ),
+            ("stashes.apply", "apply this stash, keeping it"),
+            (
+                "stashes.pop",
+                "apply this stash and drop it when the apply is clean",
+            ),
+            ("stashes.drop", "drop this stash, asked twice"),
             ("input.accept", "accept the text"),
             ("input.cancel", "discard the text"),
             ("pane.next", "focus the next pane"),
@@ -1006,6 +1033,64 @@ mod tests {
             if let Some(needle) = doc {
                 assert!(command.doc.contains(needle), "{}: {}", name, command.doc);
             }
+        }
+    }
+
+    #[test]
+    fn the_stash_verbs_resolve_in_stashes_mode_and_focus_is_global() {
+        let k = Keymap::builtin();
+        // The direct jump works whatever is focused, like files.focus.
+        assert_eq!(
+            k.resolve(&Modes::new(), &keys("4")),
+            Resolve::Run("stashes.focus")
+        );
+
+        // The panel's three verbs, on lazygit's keys, and nowhere else.
+        let mut modes = Modes::new();
+        modes.push("stashes");
+        for (chord, name) in [
+            ("space", "stashes.apply"),
+            ("g", "stashes.pop"),
+            ("d", "stashes.drop"),
+        ] {
+            assert_eq!(
+                k.resolve(&modes, &keys(chord)),
+                Resolve::Run(name),
+                "{chord} did not reach {name} in [stashes]"
+            );
+            assert_ne!(
+                k.resolve(&Modes::new(), &keys(chord)),
+                Resolve::Run(name),
+                "{name} leaked out of [stashes]"
+            );
+        }
+        // The mode-overrides-global rule at work: `g` means the row here and
+        // view.top everywhere else, where `home` still reaches.
+        assert_eq!(
+            k.resolve(&Modes::new(), &keys("g")),
+            Resolve::Run("view.top")
+        );
+        assert_eq!(
+            k.resolve(&modes, &keys("home")),
+            Resolve::Run("view.top"),
+            "the movement vocabulary survives inside the mode"
+        );
+
+        // And parking the working tree belongs to the files pane's keyboard.
+        let mut files = Modes::new();
+        files.push("files");
+        assert_eq!(k.resolve(&files, &keys("s")), Resolve::Run("files.stash"));
+
+        let commands = Commands::builtin();
+        for name in [
+            "stashes.focus",
+            "files.stash",
+            "stashes.apply",
+            "stashes.pop",
+            "stashes.drop",
+        ] {
+            assert!(commands.known(name), "{name} is not registered");
+            assert!(!k.keys_for(name).is_empty(), "{name} is bound to nothing");
         }
     }
 
