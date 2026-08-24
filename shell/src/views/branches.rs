@@ -889,6 +889,59 @@ mod tests {
     }
 
     #[test]
+    fn a_refresh_disarms_an_armed_delete_even_when_the_branch_survives() {
+        // The mirror of the working tree's rule: a refresh is the repository
+        // saying things moved, and an armed delete was a promise about how
+        // they were.
+        let host = Host::new();
+        let mut b = Branches::from_prepared(prepare(
+            vec![local("feature", false), local("main", true)],
+            Vec::new(),
+            None,
+            "",
+        ));
+        b.rendered.set(3);
+        let mut v = b.view.get();
+        v.set_len(b.data.len());
+        v.set_height(3);
+        b.view.set(v);
+        assert!(b.run_view("view.down", &host)); // onto feature
+        let target = b.current().expect("a branch under the keyboard");
+        assert!(!b.confirm_or_arm_delete(&target));
+        assert_eq!(b.armed_row(), Some(target.clone()));
+
+        // A refresh that changes nothing at all still says "things moved".
+        b.replace_prepared(
+            prepare(
+                vec![local("feature", false), local("main", true)],
+                Vec::new(),
+                None,
+                "",
+            ),
+            &host,
+        );
+        assert_eq!(b.armed_row(), None, "the question did not survive");
+        // And the press after it re-arms rather than executes — there was
+        // never a latched yes to lose.
+        assert!(!b.confirm_or_arm_delete(&target));
+
+        // The same when the branch itself is gone under the arm.
+        assert!(b.confirm_or_arm_delete(&target));
+        b.replace_prepared(
+            prepare(vec![local("main", true)], Vec::new(), None, ""),
+            &host,
+        );
+        assert_eq!(b.armed_row(), None);
+        // The cursor clamped onto the branch that remains — a real row,
+        // never the ghost of the one the question was about.
+        assert_eq!(
+            b.current(),
+            Some(Target::Local(RefName::from("main"))),
+            "the vanished anchor fell back to clamping"
+        );
+    }
+
+    #[test]
     fn the_label_counts_both_groups_and_an_empty_repository_flattens_to_nothing() {
         let p = prepare(
             vec![local("main", true)],

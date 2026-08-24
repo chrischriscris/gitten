@@ -1264,13 +1264,19 @@ impl DevShell {
             self.set_notice("only a local branch can be renamed");
             return;
         };
-        let shown = String::from_utf8_lossy(name.as_bytes()).into_owned();
+        // Pre-fill only when the bytes *are* text. A legal Latin-1 name
+        // decodes lossily into something with U+FFFD in it — a different
+        // name than the branch has — and accepting the field unchanged
+        // would then rename the branch to its own mojibake. The bytes are
+        // carried in the prompt regardless; an empty field is the honest
+        // shape for a name this field cannot show.
+        let initial = std::str::from_utf8(name.as_bytes()).unwrap_or("");
         self.begin_branch_prompt(
             BranchPrompt::Rename {
                 from: name.as_bytes().to_vec(),
             },
             "rename branch",
-            &shown,
+            initial,
             cx,
         );
     }
@@ -4910,15 +4916,68 @@ mod tests {
         });
         assert!(repo.wrote().is_empty());
 
-        // An empty accept is refused without submitting anything.
+        // An empty accept is refused without submitting anything — proven by
+        // the production pump running dry, not by hoping the worker waited.
         let (shell, repo, _handle) = branches_shell(cx);
         shell.update(cx, |shell, cx| shell.run_command("branches.new", cx));
         shell.update(cx, |shell, cx| shell.run_command("input.accept", cx));
-        std::thread::sleep(Duration::from_millis(50));
+        pump_until(&shell, cx, |_| true);
         assert!(repo.wrote().is_empty(), "an unnamed branch was submitted");
         shell.read_with(cx, |shell, _| {
             assert!(shell.notice.as_deref().unwrap_or_default().contains("name"));
         });
+    }
+
+    #[gpui::test]
+    fn a_non_utf8_rename_opens_empty_rather_than_pre_filling_mojibake(cx: &mut TestAppContext) {
+        // The one way the lossy pre-fill could corrupt something: accept on
+        // an untouched field would rename a legal Latin-1 branch to its own
+        // U+FFFD spelling — a different refname. Empty is what honesty
+        // looks like here; the bytes still ride the prompt for whoever
+        // actually types a replacement.
+        let calls = Arc::default();
+        let repo = Arc::new(RecordingRepo::new(Arc::clone(&calls)));
+        let handle: gitten_git::Handle = repo.clone();
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, cx| {
+            let prepared = crate::views::branches::prepare(
+                vec![gitten_core::refs::Branch {
+                    name: gitten_core::refs::RefName::from_bytes(b"f\xe9ature"),
+                    ..branch_ref("unused", false)
+                }],
+                Vec::new(),
+                None,
+                "r",
+            );
+            let view = cx.new(|_| crate::views::branches::Branches::from_prepared(prepared));
+            view.update(cx, |b, _| {
+                b.run_view("view.down", &Rc::new(Host::new())); // onto f<latin1-e>ature
+            });
+            shell.panes.register(
+                "branches",
+                Screen::branches(view, Generation::default(), "branches"),
+            );
+            shell.sync_modes();
+            shell.repo = Some((PathBuf::from("/recorded"), handle.clone()));
+            cx.set_global(config::Active(Rc::new(Host::new())));
+        });
+
+        shell.update(cx, |shell, cx| shell.run_command("branches.rename", cx));
+        let typed = shell.read_with(cx, |shell, _app| shell.input.clone().unwrap());
+        assert_eq!(
+            typed.read_with(cx, |field, _| field.value().to_string()),
+            "",
+            "the mojibake was never offered as if it were the name"
+        );
+
+        // Typing a replacement still aims at the real bytes.
+        typed.update(cx, |field, cx| field.replace(None, "ok", cx));
+        shell.update(cx, |shell, cx| shell.run_command("input.accept", cx));
+        pump_write(&shell, cx);
+        // RecordingRepo logs through from_utf8_lossy; the *bytes* are proven
+        // at the verb layer — here the old side is what matters: it is the
+        // branch that was under the keyboard.
+        assert_eq!(repo.wrote(), vec!["rename f\u{FFFD}ature ok"]);
     }
 
     #[gpui::test]
@@ -4935,14 +4994,15 @@ mod tests {
                 shell.notice
             );
         });
-        std::thread::sleep(Duration::from_millis(50));
+        // The production pump runs dry: nothing was ever submitted, and the
+        // drain through the real path is what proves it.
+        pump_until(&shell, cx, |_| true);
         assert!(repo.wrote().is_empty());
 
         // Second press on the same row spends the arm.
         shell.update(cx, |shell, cx| shell.run_command("branches.delete", cx));
         pump_write(&shell, cx);
         assert_eq!(repo.wrote(), vec!["delete feature"]);
-
         // A remote row refuses before arming — deliberate scope tonight:
         // a tracking ref is its remote's shadow, pruned by fetch.
         let (shell, repo, _handle) = branches_shell(cx);
