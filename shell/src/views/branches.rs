@@ -272,6 +272,13 @@ impl Branches {
         self.data.is_empty()
     }
 
+    /// The flattened rows of the last refresh, read-only: what the tests
+    /// read to see what a refresh actually landed.
+    #[cfg(test)]
+    pub(crate) fn rows(&self) -> &[Row] {
+        &self.data
+    }
+
     pub(crate) fn replace_prepared(&mut self, prepared: Prepared, host: &Host) {
         // A refresh is the repository saying things moved; an armed delete
         // was a promise about how they were, so it dies here first.

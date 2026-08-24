@@ -895,9 +895,11 @@ struct DevShell {
     /// that moved under the window, and silently keeping the old rows would be a
     /// diff labelled with an algorithm that did not produce it.
     error: Option<SharedString>,
-    /// One sentence about what a key just did — an unbound chord, or a command
-    /// that resolved to nothing this screen can do. Cleared by the next key,
-    /// so it cannot go stale. Same band as [`DevShell::error`], which wins.
+    /// One sentence about what a key just did — an unbound chord, a command
+    /// that resolved to nothing this screen can do, or a write that named
+    /// its own finish (the sync verbs: pushed, pulled, fetched). Cleared by
+    /// the next key, so it cannot go stale. Same band as
+    /// [`DevShell::error`], which wins.
     notice: Option<String>,
     /// Where `gitten.toml` is. Held because picking a theme goes through the same
     /// reload a save does — see [`config::reload`] for why there is only one
@@ -1343,6 +1345,32 @@ impl DevShell {
         }
     }
 
+    /// `repo.push` / `repo.pull` / `repo.fetch`: the repository's sync verbs.
+    /// No row is read and none is needed — pull lets git resolve the current
+    /// branch's own upstream, fetch takes every remote, and push's aiming is
+    /// [`Write::push_current`](gitten_app::verbs::Write::push_current)'s,
+    /// whose refusals arrive here as sentences instead of jobs.
+    fn sync_remote(&mut self, command: &str, _cx: &mut Context<Self>) {
+        let Some(writes) = self.writes() else {
+            self.set_notice("a fixture has no repository to sync");
+            return;
+        };
+        let job = match command {
+            "repo.pull" => gitten_app::verbs::Write::pull(&writes.repo),
+            "repo.fetch" => gitten_app::verbs::Write::fetch(&writes.repo, None),
+            _ => match gitten_app::verbs::Write::push_current(&writes.repo) {
+                Ok(job) => job,
+                Err(reason) => {
+                    self.set_notice(reason);
+                    return;
+                }
+            },
+        };
+        if !writes.send(Box::new(job)) {
+            self.set_notice("the job queue is shutting down");
+        }
+    }
+
     /// `stashes.apply` / `stashes.pop` / `stashes.drop`: act on the row the
     /// keyboard is on, addressed by its index — which is also why only the
     /// drop asks twice. Apply and pop are recoverable in every direction that
@@ -1659,12 +1687,20 @@ impl DevShell {
                 }
                 JobEvent::Finished {
                     outcome: Ok(generation),
+                    done,
                     ..
                 } => {
                     self.running = None;
                     if generation > self.generation {
                         self.generation = generation;
                         self.refresh_stale(cx);
+                    }
+                    // A job that named its finish gets its sentence in this
+                    // band — the sync verbs' pushed/pulled/fetched. Said
+                    // once, beside the facts the refresh above puts back on
+                    // screen; the next key clears it like any other notice.
+                    if let Some(done) = done {
+                        self.notice = Some(done);
                     }
                 }
             }
@@ -1893,6 +1929,10 @@ impl DevShell {
             "branches.new" => self.begin_branch_new(cx),
             "branches.rename" => self.begin_branch_rename(cx),
             "branches.delete" => self.delete_branch_selected(cx),
+            // The repository-level sync verbs: whatever pane the keyboard
+            // sits over, they act on the branch HEAD is on — which is why
+            // their keys are globals.
+            "repo.push" | "repo.pull" | "repo.fetch" => self.sync_remote(command, cx),
             "copy.selection" => self.copy_selection(cx),
             // Both are answered by whichever screen is up; a commit graph has no
             // selection yet, and a command nothing handles there is inert — the
@@ -4067,26 +4107,40 @@ mod tests {
 
     struct RecordingRepo {
         calls: Arc<std::sync::Mutex<Vec<String>>>,
-        /// The ref picture verbs' reads see: two local branches (one under
-        /// HEAD) and one remote-tracking ref.
-        branches: Vec<gitten_core::refs::Branch>,
-        head: gitten_core::refs::HeadState,
+        head: std::sync::Mutex<gitten_core::refs::HeadState>,
+        /// Where main sits against origin/main, moved by the sync verbs the
+        /// way a real remote moves it — fetch reveals behind, pull closes
+        /// the distance, push spends ahead. Interior-mutable so a test can
+        /// set the starting gap.
+        distance: std::sync::Mutex<(u32, u32)>,
     }
 
     impl RecordingRepo {
         fn new(calls: Arc<std::sync::Mutex<Vec<String>>>) -> Self {
             Self {
                 calls,
-                branches: vec![branch_ref("feature", false), branch_ref("main", true)],
-                head: gitten_core::refs::HeadState::Branch {
+                head: std::sync::Mutex::new(gitten_core::refs::HeadState::Branch {
                     name: gitten_core::refs::RefName::from("main"),
                     commit: None,
-                },
+                }),
+                distance: std::sync::Mutex::new((0, 0)),
             }
         }
 
         fn wrote(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
+        }
+
+        /// Detaches HEAD, for the refusal half of the sync tests.
+        fn detach(&self) {
+            *self.head.lock().unwrap() = gitten_core::refs::HeadState::Detached {
+                commit: "0123456789abcdef".into(),
+            };
+        }
+
+        /// The tracking pair the branches read reports for main.
+        fn counts(&self) -> (u32, u32) {
+            *self.distance.lock().unwrap()
         }
     }
 
@@ -4274,7 +4328,15 @@ mod tests {
         }
 
         fn branches(&self) -> gitten_git::Result<Vec<gitten_core::refs::Branch>> {
-            Ok(self.branches.clone())
+            let (ahead, behind) = *self.distance.lock().unwrap();
+            let mut main = branch_ref("main", true);
+            main.upstream = Some(gitten_core::refs::Upstream {
+                remote: gitten_core::refs::RefName::from("origin"),
+                branch: gitten_core::refs::RefName::from("main"),
+                ahead: Some(ahead),
+                behind: Some(behind),
+            });
+            Ok(vec![branch_ref("feature", false), main])
         }
 
         fn remote_branches(&self) -> gitten_git::Result<Vec<gitten_core::refs::RemoteBranch>> {
@@ -4286,7 +4348,41 @@ mod tests {
         }
 
         fn head(&self) -> gitten_git::Result<gitten_core::refs::HeadState> {
-            Ok(self.head.clone())
+            Ok(self.head.lock().unwrap().clone())
+        }
+
+        fn remotes(&self) -> gitten_git::Result<Vec<gitten_core::refs::Remote>> {
+            Ok(vec![gitten_core::refs::Remote {
+                name: gitten_core::refs::RefName::from("origin"),
+                urls: vec!["https://example.invalid/x".into()],
+            }])
+        }
+
+        fn push(&self, remote: &[u8], branch: &[u8]) -> gitten_git::Result<()> {
+            self.calls.lock().unwrap().push(format!(
+                "push {} {}",
+                String::from_utf8_lossy(remote),
+                String::from_utf8_lossy(branch)
+            ));
+            *self.distance.lock().unwrap() = (0, 0);
+            Ok(())
+        }
+
+        fn pull(&self) -> gitten_git::Result<()> {
+            self.calls.lock().unwrap().push("pull".into());
+            *self.distance.lock().unwrap() = (0, 0);
+            Ok(())
+        }
+
+        fn fetch(&self, remote: Option<&[u8]>) -> gitten_git::Result<()> {
+            let named = match remote {
+                Some(remote) => String::from_utf8_lossy(remote).into_owned(),
+                None => "--all".into(),
+            };
+            self.calls.lock().unwrap().push(format!("fetch {named}"));
+            // A fetched stranger commit: the only honest first reading.
+            *self.distance.lock().unwrap() = (0, 1);
+            Ok(())
         }
     }
 
@@ -4371,11 +4467,11 @@ mod tests {
         let calls = Arc::default();
         let repo = Arc::new(RecordingRepo {
             calls: Arc::clone(&calls),
-            branches: Vec::new(),
-            head: gitten_core::refs::HeadState::Branch {
+            head: std::sync::Mutex::new(gitten_core::refs::HeadState::Branch {
                 name: "main".into(),
                 commit: Some("abc1234".into()),
-            },
+            }),
+            distance: std::sync::Mutex::new((0, 0)),
         });
         let handle: gitten_git::Handle = repo.clone();
         let shell = shell(None, cx);
@@ -5243,6 +5339,105 @@ mod tests {
                     Screen::Commits { .. } | Screen::Diff { .. } | Screen::Custom(_) => {}
                 }
             }
+        });
+    }
+
+    // ------------------------------------------------------- the sync verbs
+
+    /// The tracking line the branches pane draws for main right now.
+    #[track_caller]
+    fn main_upstream_line(shell: &gpui::Entity<DevShell>, cx: &TestAppContext) -> String {
+        shell.read_with(cx, |shell, cx| {
+            let Some(Screen::Branches { view, .. }) = shell.active() else {
+                panic!("branches pane lost");
+            };
+            view.read(cx)
+                .rows()
+                .iter()
+                .find_map(|r| match r {
+                    crate::views::branches::Row::Local(l) if l.name.as_bytes() == b"main" => {
+                        l.upstream.clone()
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default()
+                .to_string()
+        })
+    }
+
+    #[gpui::test]
+    fn the_sync_keys_run_through_the_pump_and_the_counts_follow(cx: &mut TestAppContext) {
+        let (shell, repo, _handle) = branches_shell(cx);
+
+        // f first: the remote has moved on its own, and fetch is how this
+        // side learns. The verb runs off-thread through the real queue...
+        shell.update(cx, |shell, cx| shell.run_command("repo.fetch", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["fetch --all"]);
+        assert_eq!(repo.counts(), (0, 1));
+        // ...the finish names itself in the band...
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.notice.as_deref(), Some("fetched"));
+        });
+        // ...and the branches panel re-acquired through the production
+        // drain_jobs rails: one behind, drawn where the counts live.
+        let line = main_upstream_line(&shell, cx);
+        assert!(line.contains("↓1"), "{line}");
+
+        // p closes that distance git's way — fast-forward or nothing.
+        shell.update(cx, |shell, cx| shell.run_command("repo.pull", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["fetch --all", "pull"]);
+        assert_eq!(repo.counts(), (0, 0));
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.notice.as_deref(), Some("pulled"));
+        });
+        let line = main_upstream_line(&shell, cx);
+        assert!(!line.contains('↓'), "in sync reads as a bare name: {line}");
+
+        // A local commit opens the other direction; P spends it. Origin
+        // stands in only because the fake tracks nothing — here it tracks.
+        *repo.distance.lock().unwrap() = (1, 0);
+        shell.update(cx, |shell, cx| shell.run_command("repo.push", cx));
+        pump_write(&shell, cx);
+        assert_eq!(
+            repo.wrote(),
+            vec!["fetch --all", "pull", "push origin main"]
+        );
+        assert_eq!(repo.counts(), (0, 0));
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.notice.as_deref(), Some("pushed origin main"));
+        });
+        let line = main_upstream_line(&shell, cx);
+        assert!(!line.contains('↑'), "{line}");
+    }
+
+    #[gpui::test]
+    fn the_sync_keys_say_so_where_they_cannot_act(cx: &mut TestAppContext) {
+        // A fixture has no repository behind any pane; every sync key says
+        // so instead of pretending.
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, cx| shell.run_command("repo.push", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(shell
+                .notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("fixture"));
+        });
+
+        // Detached HEAD is a place, not a branch: nothing under HEAD to aim
+        // a push at, refused before any job exists.
+        let (shell, repo, _handle) = branches_shell(cx);
+        repo.detach();
+        shell.update(cx, |shell, cx| shell.run_command("repo.push", cx));
+        assert_eq!(repo.wrote(), Vec::<String>::new());
+        shell.read_with(cx, |shell, _| {
+            assert!(shell
+                .notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("detached"));
         });
     }
 
