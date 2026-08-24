@@ -48,6 +48,9 @@ rather than nine.
 | [0021](0021-themes-are-a-registry.md) | A theme is a registered palette, and the config file writes one |
 | [0022](0022-the-mouse-in-a-terminal.md) | A notch is a key, a button is a place |
 | [0023](0023-the-gutter-does-not-scroll.md) | The gutter does not scroll, so the offset is not the list's |
+| [0024](0024-ci-is-two-jobs.md) | CI is two jobs, and most of check.sh stays home |
+| [0025](0025-formatting-and-lints-are-gated.md) | Formatting and lints are gated |
+| [0026](0026-line-text-is-not-the-memory-to-save.md) | Line text is not the memory to save |
 
 **0011 is deliberately absent.** It was a rendered-Markdown reader that was built,
 looked at, judged broken and parked in a `git stash` rather than deleted. The
