@@ -630,6 +630,7 @@ mod tests {
     use gitten_core::host::Host;
     use gitten_core::Commit;
     use std::rc::Rc;
+    use std::sync::Arc;
 
     /// One commit with everything the view needs, and nothing it reads.
     fn commit(n: usize) -> Commit {
@@ -647,10 +648,26 @@ mod tests {
         (0..n).map(commit).collect()
     }
 
+    /// A history whose subjects alternate between two words, so half of it
+    /// survives any query the tests type and the rest does not.
+    fn mixed_history() -> Vec<Commit> {
+        (0..30)
+            .map(|n| Commit {
+                author: Arc::from(if n % 2 == 0 { "ada" } else { "grace" }),
+                subject: if n % 2 == 0 {
+                    format!("engine note {n}")
+                } else {
+                    format!("compiler pass {n}")
+                },
+                ..commit(n)
+            })
+            .collect()
+    }
+
     fn with_height(c: &mut Commits, n: usize) {
         c.rendered.set(n);
         let mut v = c.view.get();
-        v.set_len(c.data.commits.len());
+        v.set_len(c.visible.len());
         v.set_height(n);
         c.view.set(v);
     }
@@ -927,5 +944,149 @@ mod tests {
         // Meeting the list twice is not moving it twice.
         c.reconcile(&host);
         assert_eq!((c.view.get().top(), c.view.get().cursor()), (10, 13));
+    }
+
+    // ----------------------------------------------------------------- search
+
+    #[test]
+    fn a_query_filters_live_and_the_keyboard_stays_on_its_commit() {
+        let host = Rc::new(Host::new());
+        let mut c = Commits::new(mixed_history(), host.clone());
+        with_height(&mut c, 10);
+        // The keyboard sits on an *even* commit — one that survives "ENGINE".
+        for _ in 0..4 {
+            c.run_view("view.down", &host);
+        }
+        let anchored_sha = c.current().expect("a commit under the cursor").sha.clone();
+
+        c.apply_query("  ENGINE  ");
+        let v = c.view.get();
+        assert_eq!(v.len(), 15, "half the history matches, folded");
+        assert_eq!(c.filter_note().as_deref(), Some("15/30"));
+        // Through the indirection: `current` is the anchored commit, not
+        // whatever now happens to sit at row 4 of a shorter list.
+        assert_eq!(
+            c.current().map(|cm| cm.sha.as_str()),
+            Some(anchored_sha.as_str())
+        );
+        // And what copy falls back to is still that same commit.
+        assert!(
+            c.cursor_text().contains("engine note"),
+            "{:?}",
+            c.cursor_text()
+        );
+    }
+
+    #[test]
+    fn narrowing_past_the_anchor_clamps_instead_of_pointing_nowhere() {
+        let host = Rc::new(Host::new());
+        let mut c = Commits::new(mixed_history(), host.clone());
+        with_height(&mut c, 10);
+        // Bottom row under "compiler": odd commits only, so the anchor below…
+        c.run_view("view.bottom", &host);
+        // …then a query no compiler row survives.
+        c.apply_query("engine");
+        let v = c.view.get();
+        assert!(v.cursor() < v.len(), "the cursor outlived its own list");
+        assert!(c.current().is_some());
+        assert_eq!(c.filter_note().as_deref(), Some("15/30"));
+    }
+
+    #[test]
+    fn a_query_matching_nothing_empties_the_list_and_holds_together() {
+        let host = Rc::new(Host::new());
+        let mut c = Commits::new(commits(20), host.clone());
+        with_height(&mut c, 10);
+        c.apply_query("nothing matches this");
+        assert_eq!(
+            c.total(),
+            20,
+            "the filter narrows what is shown, never what is loaded"
+        );
+        assert_eq!(c.view.get().len(), 0);
+        assert!(c.current().is_none());
+        assert_eq!(c.filter_note().as_deref(), Some("0/20"));
+
+        // Clearing puts every row back where it started.
+        c.apply_query("");
+        assert_eq!(c.view.get().len(), 20);
+        assert!(c.query().is_none());
+        assert_eq!(c.filter_note(), None);
+    }
+
+    #[test]
+    fn clearing_restores_the_full_list_under_the_same_commit() {
+        let host = Rc::new(Host::new());
+        let mut c = Commits::new(mixed_history(), host.clone());
+        with_height(&mut c, 10);
+        for _ in 0..6 {
+            c.run_view("view.down", &host);
+        }
+        let before = c.current().map(|cm| cm.sha.clone()).unwrap();
+
+        c.apply_query("ada");
+        assert_eq!(c.view.get().len(), 15);
+        c.apply_query("");
+        assert_eq!(c.view.get().len(), 30);
+        assert_eq!(
+            c.current().map(|cm| cm.sha.as_str()),
+            Some(before.as_str()),
+            "empty restores instantly, cursor included"
+        );
+    }
+
+    #[test]
+    fn a_second_search_finds_the_query_standing() {
+        let host = Rc::new(Host::new());
+        let mut c = Commits::new(mixed_history(), host.clone());
+        with_height(&mut c, 10);
+        assert!(c.query().is_none());
+
+        c.apply_query("compiler");
+        assert_eq!(
+            c.query(),
+            Some("compiler"),
+            "the prompt pre-fills from here"
+        );
+
+        // The same query again is no change at all — and rebuilds nothing.
+        let before = Rc::as_ptr(&c.visible);
+        let rows = c.view.get().len();
+        c.apply_query("compiler ");
+        assert_eq!(c.query(), Some("compiler"), "trimmed before comparing");
+        assert_eq!(c.view.get().len(), rows);
+        assert_eq!(
+            Rc::as_ptr(&c.visible),
+            before,
+            "a no-op query did not rebuild the index"
+        );
+    }
+
+    #[test]
+    fn a_refresh_keeps_the_filter_and_reanchors_within_it() {
+        let host = Rc::new(Host::new());
+        let mut c = Commits::new(mixed_history(), host.clone());
+        with_height(&mut c, 10);
+        c.apply_query("engine");
+        let anchored = c.current().map(|cm| cm.sha.clone()).unwrap();
+
+        // A refresh prepends one new engine commit; the query re-runs against
+        // the *new* data rather than dropping what the user looks through.
+        let mut refreshed = mixed_history();
+        refreshed.insert(
+            0,
+            Commit {
+                subject: "engine note fresh".into(),
+                ..commit(99)
+            },
+        );
+        c.replace(refreshed, &host);
+
+        assert_eq!(c.view.get().len(), 16, "still filtered, over the new data");
+        assert_eq!(
+            c.current().map(|cm| cm.sha.as_str()),
+            Some(anchored.as_str())
+        );
+        assert_eq!(c.filter_note().as_deref(), Some("16/31"));
     }
 }
