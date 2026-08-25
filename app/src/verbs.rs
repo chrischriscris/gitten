@@ -10,6 +10,7 @@
 //! the same queue — without a line changing here.
 
 use crate::jobs::Job;
+use gitten_core::rebase::TodoScript;
 use gitten_core::refs::{HeadState, Remote, ResetMode};
 use gitten_git::{Handle, Repo};
 
@@ -179,6 +180,42 @@ impl Write {
             // The rewritten history shows up in a pane that may not be focused —
             // the key lives over the working tree — so this one says what it did.
             .announcing("amended HEAD")
+    }
+
+    /// Rewrites this branch by installing `script` as git's own
+    /// interactive-rebase plan over `upstream` — reorder, squash, fixup,
+    /// drop and exec between picks, exactly as the plan says. The plan was
+    /// composed in [`gitten_core::rebase::compose`], which refuses every
+    /// shape it cannot complete; the trait refuses again before any process
+    /// runs. A conflict mid-rewrite comes back refused in git's words with
+    /// rebase state left standing; [`Write::rebase_abort`] undoes that.
+    /// DESTRUCTIVE: the caller confirms before this job is ever built.
+    pub fn rebase_todo(repo: &Handle, upstream: Vec<u8>, script: TodoScript) -> Self {
+        let shown = String::from_utf8_lossy(&upstream).into_owned();
+        Self::named(format!("rebase onto {shown}"), repo, move |r| {
+            r.rebase_todo(&upstream, &script)
+        })
+        .announcing(format!("rebased onto {shown}"))
+    }
+
+    /// Moves the current branch onto `upstream`, replaying its own commits:
+    /// the non-interactive sibling of [`Write::rebase_todo`], on the same
+    /// honesty terms — a dirty tree is git's refusal verbatim, a conflict
+    /// leaves its question standing, no force anywhere. DESTRUCTIVE: the
+    /// caller confirms before this job is ever built.
+    pub fn rebase_onto(repo: &Handle, upstream: Vec<u8>) -> Self {
+        let shown = String::from_utf8_lossy(&upstream).into_owned();
+        Self::named(format!("rebase onto {shown}"), repo, move |r| {
+            r.rebase_onto(&upstream)
+        })
+        .announcing(format!("rebased onto {shown}"))
+    }
+
+    /// Abandons an in-progress rebase and puts branch, index and working
+    /// tree back where they started — git's own guarantee. Nothing here to
+    /// confirm: it only ever runs after a refusal named the state it cleans.
+    pub fn rebase_abort(repo: &Handle) -> Self {
+        Self::named("rebase abort".into(), repo, |r| r.rebase_abort()).announcing("rebase aborted")
     }
 
     /// Moves the current branch onto `target`, taking as much of the index

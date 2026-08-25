@@ -320,6 +320,17 @@ impl Commits {
     /// the second one and the arm is spent. Addressed by sha — the thing
     /// `current` hands the shell and git will be aimed at.
     pub(crate) fn confirm_or_arm_reset(&mut self, sha: &str) -> bool {
+        self.arm(sha)
+    }
+
+    /// The same dance for the history rewrites — squash-up, fixup-up,
+    /// drop-commit — over the one arm slot a pane holds. Arming anything
+    /// else moves the question rather than queueing a second one.
+    pub(crate) fn confirm_or_arm_rewrite(&mut self, sha: &str) -> bool {
+        self.arm(sha)
+    }
+
+    fn arm(&mut self, sha: &str) -> bool {
         let already = self.armed.as_deref() == Some(sha);
         self.armed = match already {
             true => None,

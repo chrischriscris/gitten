@@ -1533,6 +1533,154 @@ impl DevShell {
         }
     }
 
+    /// `commits.squash-up` / `commits.fixup-up` / `commits.drop-commit`:
+    /// rewrite the branch with the commit under the keyboard folded into
+    /// its parent or gone entirely.
+    ///
+    /// The plan is composed over the same window of history the pane drew —
+    /// [`gitten_core::rebase::compose`] refuses anything it cannot cover
+    /// whole: merges (a rebase would flatten them), side commits
+    /// interleaved into the window (a wholesale plan would drop their
+    /// changes), a root under the keyboard. Those refusals arrive here as
+    /// sentences instead of jobs.
+    ///
+    /// All three rewrite history — commits leave the branch, recoverable
+    /// only through the reflog — so each asks twice, exactly as reset-hard
+    /// does: first press arms the row and says so, any cursor move, wheel
+    /// or refresh disarms, second press on the same commit builds the job.
+    fn rewrite_selected(&mut self, command: &str, cx: &mut Context<Self>) {
+        use gitten_core::rebase::{compose, Rewrite};
+        let kind = match command {
+            "commits.squash-up" => Rewrite::SquashUp,
+            "commits.fixup-up" => Rewrite::FixupUp,
+            _ => Rewrite::Drop,
+        };
+        let Some(Screen::Commits { view, .. }) = self.active() else {
+            self.set_notice(format!("{command} is not supported here"));
+            return;
+        };
+        let view = view.clone();
+        let host = config::host(cx);
+        // Meet the list where it actually is, like every verb above: a
+        // scrollbar drag moved the offset without moving the cursor.
+        view.update(cx, |v, _| v.reconcile(&host));
+        let Some(commit) = view.read(cx).current().cloned() else {
+            self.set_notice("nothing selected to rewrite");
+            return;
+        };
+        let Some(writes) = self.writes() else {
+            self.set_notice("a fixture has no repository to rewrite");
+            return;
+        };
+        if !view.update(cx, |v, _| v.confirm_or_arm_rewrite(&commit.sha)) {
+            let asked = match kind {
+                Rewrite::SquashUp => format!(
+                    "squash {} into its parent? press again to confirm",
+                    commit.short
+                ),
+                Rewrite::FixupUp => format!(
+                    "fixup {} into its parent? press again to confirm",
+                    commit.short
+                ),
+                Rewrite::Drop => format!("drop {}? press again to confirm", commit.short),
+            };
+            self.set_notice(asked);
+            return;
+        }
+        self.notice = None; // the question is spent; the running band speaks next
+
+        // The same window acquisition loaded the pane from; composing over
+        // less would be composing over a lie.
+        const LOG_WINDOW: usize = 5000;
+        let history = match writes.repo.log(LOG_WINDOW) {
+            Ok(history) => history,
+            Err(e) => {
+                self.set_notice(e);
+                return;
+            }
+        };
+        let index = history.iter().position(|c| c.sha == commit.sha);
+        let (upstream, script) = match index.map(|i| compose(kind, &history, i)) {
+            Some(Ok(composed)) => composed,
+            Some(Err(reason)) => {
+                self.set_notice(reason);
+                return;
+            }
+            None => {
+                self.set_notice(format!(
+                    "{} is older than the {} commits loaded, so a plan built \
+                     from this window could not be complete",
+                    commit.short, LOG_WINDOW
+                ));
+                return;
+            }
+        };
+        let job = gitten_app::verbs::Write::rebase_todo(&writes.repo, upstream, script);
+        if !writes.send(Box::new(job)) {
+            self.set_notice("the job queue is shutting down");
+        }
+    }
+
+    /// `commits.rebase-onto`: move the branch HEAD is on onto the row the
+    /// keyboard is on — plain rebase, no plan, on the same terms as every
+    /// other write: a dirty tree is git's refusal verbatim, a conflict
+    /// leaves its state standing for [`Write::rebase_abort`] to undo.
+    ///
+    /// The key lives in [branches], because that is where the thing aimed at
+    /// lives — lazygit keeps its rebase key there too. Rewrites this
+    /// branch's own commits, so it asks twice like the fold verbs do.
+    fn rebase_branch_selected(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.active(), Some(Screen::Branches { .. })) {
+            self.set_notice("commits.rebase-onto is not supported here");
+            return;
+        }
+        let Some(target) = self.branches_target(cx) else {
+            self.set_notice("nothing selected to rebase onto");
+            return;
+        };
+        let shown = match &target {
+            views::branches::Target::Local(name) => name.to_string_lossy().into_owned(),
+            views::branches::Target::Remote { remote, branch } => {
+                format!("{}/{}", remote.to_string_lossy(), branch.to_string_lossy())
+            }
+            views::branches::Target::Detached => String::from("(detached)"),
+        };
+        let Some(Screen::Branches { view, .. }) = self.active() else {
+            unreachable!("checked above");
+        };
+        if matches!(target, views::branches::Target::Detached) {
+            self.set_notice("HEAD is detached here; check out a branch first");
+            return;
+        }
+        let Some(writes) = self.writes() else {
+            self.set_notice("a fixture has no repository to rebase in");
+            return;
+        };
+        if !view.update(cx, |b, _| b.confirm_or_arm_rebase(&target)) {
+            self.set_notice(format!(
+                "rebase this branch onto {shown}? press again to confirm"
+            ));
+            return;
+        }
+        self.notice = None; // the question is spent; the running band speaks next
+        let upstream = match target {
+            views::branches::Target::Local(name) => name.as_bytes().to_vec(),
+            views::branches::Target::Remote { remote, branch } => {
+                // The full refname git resolves, joined from the halves the
+                // model keeps apart because either may hold a slash.
+                let mut full = remote.as_bytes().to_vec();
+                full.push(b'/');
+                full.extend_from_slice(branch.as_bytes());
+                full
+            }
+            views::branches::Target::Detached => unreachable!("refused above"),
+        };
+        let job = gitten_app::verbs::Write::rebase_onto(&writes.repo, upstream);
+        if !writes.send(Box::new(job)) {
+            self.set_notice("the job queue is shutting down");
+        }
+    }
+
     // ---------------------------------------------------- the branch verbs
 
     /// The focused branches pane's target — what the keyboard is on, as
@@ -2174,6 +2322,11 @@ impl DevShell {
                 self.reset_selected(command, cx)
             }
             "commits.revert" => self.revert_selected(cx),
+            // History's rewrites, composed over the pane's own window of
+            // log and run through the queue. All three ask twice.
+            "commits.squash-up" | "commits.fixup-up" | "commits.drop-commit" => {
+                self.rewrite_selected(command, cx)
+            }
             // The working tree's verbs. Context comes from the focused pane,
             // the write from the job queue — and where either is missing, the
             // same honest sentence an unknown command gets.
@@ -2195,6 +2348,11 @@ impl DevShell {
             "branches.new" => self.begin_branch_new(cx),
             "branches.rename" => self.begin_branch_rename(cx),
             "branches.delete" => self.delete_branch_selected(cx),
+            // Aimed at the branch row the keyboard is on, so it lives with
+            // the branches verbs even though the command name sits in the
+            // commits family — the name says what happens to history; the
+            // pane says where the aim comes from.
+            "commits.rebase-onto" => self.rebase_branch_selected(cx),
             // The repository-level sync verbs: whatever pane the keyboard
             // sits over, they act on the branch HEAD is on — which is why
             // their keys are globals.
@@ -4410,6 +4568,9 @@ mod tests {
         /// so a test arms exactly the files its diff fixture talks about —
         /// the fact hunk verbs classify creations by.
         untracked: std::sync::Mutex<Vec<String>>,
+        /// What `log` answers — the window of history a rewrite composes
+        /// over. Empty until a test serves it.
+        log_answer: std::sync::Mutex<Vec<Commit>>,
     }
 
     impl RecordingRepo {
@@ -4423,11 +4584,18 @@ mod tests {
                 distance: std::sync::Mutex::new((0, 0)),
                 conflict: AtomicBool::new(false),
                 untracked: std::sync::Mutex::new(Vec::new()),
+                log_answer: std::sync::Mutex::new(Vec::new()),
             }
         }
 
         fn wrote(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
+        }
+
+        /// Serves `log`'s answer — the same commits the pane shows, which is
+        /// what makes a composed plan checkable against what was asked for.
+        fn serve_log(&self, commits: Vec<Commit>) {
+            *self.log_answer.lock().unwrap() = commits;
         }
 
         /// Makes the next `revert` refuse the way git does on a conflict:
@@ -4471,7 +4639,7 @@ mod tests {
     /// a live window.
     impl Repo for RecordingRepo {
         fn log(&self, _: usize) -> gitten_git::Result<Vec<Commit>> {
-            Ok(Vec::new())
+            Ok(self.log_answer.lock().unwrap().clone())
         }
 
         fn pairs(&self, _: &str) -> gitten_git::Result<Vec<Pair>> {
@@ -4562,6 +4730,35 @@ mod tests {
                 // recognised: refused, and the question left in the tree.
                 return Err("error: could not revert 0000000...".into());
             }
+            Ok(())
+        }
+
+        fn rebase_todo(
+            &self,
+            upstream: &[u8],
+            script: &gitten_git::TodoScript,
+        ) -> gitten_git::Result<()> {
+            // The plan travels in the record lossily — these shas are hex
+            // and the assertions read them; the real bytes are covered by
+            // the git crate's own tests.
+            self.calls.lock().unwrap().push(format!(
+                "rebase onto {} with plan {}",
+                String::from_utf8_lossy(upstream),
+                String::from_utf8_lossy(&script.emit())
+            ));
+            Ok(())
+        }
+
+        fn rebase_onto(&self, upstream: &[u8]) -> gitten_git::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("rebase onto {}", String::from_utf8_lossy(upstream)));
+            Ok(())
+        }
+
+        fn rebase_abort(&self) -> gitten_git::Result<()> {
+            self.calls.lock().unwrap().push("rebase abort".into());
             Ok(())
         }
 
@@ -4859,6 +5056,7 @@ mod tests {
             distance: std::sync::Mutex::new((0, 0)),
             conflict: AtomicBool::new(false),
             untracked: std::sync::Mutex::new(Vec::new()),
+            log_answer: std::sync::Mutex::new(Vec::new()),
         });
         let handle: gitten_git::Handle = repo.clone();
         let shell = shell(None, cx);
@@ -5997,6 +6195,246 @@ diff --git a/added.txt b/added.txt
                 shell.notice
             );
         });
+    }
+
+    // ---------------------------------------------- the rebase rewrites
+
+    /// Five straight-line commits, newest first, with shas readable in
+    /// assertions: `"00…"·40` at HEAD down to `"44…"·40` at the root, each
+    /// commit's parent exactly the next one's sha — the straight line
+    /// [`gitten_core::rebase::compose`] demands.
+    fn linear_chain() -> Vec<Commit> {
+        let sha = |k: u8| format!("{:02x}", k).repeat(20);
+        (0..5u8)
+            .map(|k| Commit {
+                sha: sha(k),
+                short: format!("abc0{k}"),
+                parents: match k {
+                    4 => Vec::new(),
+                    _ => vec![sha(k + 1)],
+                }
+                .into_boxed_slice(),
+                author: "".into(),
+                timestamp: 0,
+                subject: format!("s{k}"),
+            })
+            .collect()
+    }
+
+    /// A commits pane over a repository whose `log` answers with that same
+    /// straight line — the pair the rewrite verbs compose from.
+    fn rebase_shell(cx: &mut TestAppContext) -> (gpui::Entity<DevShell>, Arc<RecordingRepo>) {
+        let calls = Arc::default();
+        let repo = Arc::new(RecordingRepo::new(Arc::clone(&calls)));
+        repo.serve_log(linear_chain());
+        let handle: gitten_git::Handle = repo.clone();
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, cx| {
+            let view = cx.new(|_| Commits::new(linear_chain(), Rc::new(Host::new())));
+            cx.set_global(config::Active(Rc::new(Host::new())));
+            shell.panes.register(
+                "commits",
+                Screen::commits(view, Source::Fixtures, Generation::default(), "~/src"),
+            );
+            shell.sync_modes();
+            shell.repo = Some((PathBuf::from("/recorded"), handle));
+        });
+        (shell, repo)
+    }
+
+    #[gpui::test]
+    fn squash_up_asks_twice_then_rides_the_pump_with_a_whole_plan(cx: &mut TestAppContext) {
+        let (shell, repo) = rebase_shell(cx);
+
+        // First press on HEAD: asked, not acted.
+        shell.update(cx, |shell, cx| shell.run_command("commits.squash-up", cx));
+        std::thread::sleep(Duration::from_millis(50));
+        shell.read_with(cx, |shell, _| {
+            assert!(repo.wrote().is_empty());
+            assert!(
+                shell
+                    .notice
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("squash abc00 into its parent?"),
+                "{:?}",
+                shell.notice
+            );
+        });
+
+        // Second press composes the plan and queues the job through the
+        // production dispatch: folding HEAD into its parent replays nothing
+        // else, so the plan is one squash sitting on the parent's sha.
+        shell.update(cx, |shell, cx| shell.run_command("commits.squash-up", cx));
+        pump_write(&shell, cx);
+        assert_eq!(
+            repo.wrote(),
+            vec![format!(
+                "rebase onto {} with plan squash {}\n",
+                "01".repeat(20),
+                "00".repeat(20)
+            )]
+        );
+        shell.read_with(cx, |shell, _| assert!(shell.generation.get() > 0));
+    }
+
+    #[gpui::test]
+    fn drop_composes_a_plan_that_omits_only_the_selected_commit(cx: &mut TestAppContext) {
+        let (shell, repo) = rebase_shell(cx);
+
+        // The keyboard moves to the second-newest commit…
+        shell.update(cx, |shell, cx| {
+            let Some(Screen::Commits { view, .. }) = shell.active() else {
+                panic!("no commits pane");
+            };
+            let host = Rc::new(Host::new());
+            view.update(cx, |v, _| v.run_view("view.down", &host));
+        });
+
+        // …and two presses drop exactly it: the plan sits on its parent,
+        // replays everything newer, and carries no line for the dropped
+        // commit itself.
+        for _ in 0..2 {
+            shell.update(cx, |shell, cx| shell.run_command("commits.drop-commit", cx));
+        }
+        pump_write(&shell, cx);
+        assert_eq!(
+            repo.wrote(),
+            vec![format!(
+                "rebase onto {} with plan pick {}\n",
+                "02".repeat(20),
+                "00".repeat(20)
+            )]
+        );
+    }
+
+    #[gpui::test]
+    fn a_merge_under_the_keyboard_refuses_in_words_and_queues_nothing(cx: &mut TestAppContext) {
+        let calls = Arc::default();
+        let repo = Arc::new(RecordingRepo::new(Arc::clone(&calls)));
+        let mut merged = linear_chain();
+        merged[1] = Commit {
+            parents: vec!["03".repeat(20), "ee".repeat(20)].into_boxed_slice(),
+            ..merged[1].clone()
+        };
+        repo.serve_log(merged.clone());
+        let handle: gitten_git::Handle = repo.clone();
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, cx| {
+            let view = cx.new(|_| Commits::new(merged, Rc::new(Host::new())));
+            cx.set_global(config::Active(Rc::new(Host::new())));
+            shell.panes.register(
+                "commits",
+                Screen::commits(view, Source::Fixtures, Generation::default(), "~/src"),
+            );
+            shell.sync_modes();
+            shell.repo = Some((PathBuf::from("/recorded"), handle));
+        });
+
+        // The keyboard moves onto the merge itself, then arm, spend, refuse:
+        // the merge would be flattened, said in words, with no job queued
+        // behind the sentence.
+        shell.update(cx, |shell, cx| {
+            let Some(Screen::Commits { view, .. }) = shell.active() else {
+                panic!("no commits pane");
+            };
+            let host = Rc::new(Host::new());
+            view.update(cx, |v, _| v.run_view("view.down", &host));
+        });
+        for _ in 0..2 {
+            shell.update(cx, |shell, cx| shell.run_command("commits.drop-commit", cx));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        shell.read_with(cx, |shell, _| {
+            assert!(repo.wrote().is_empty(), "{:?}", repo.wrote());
+            assert!(
+                shell
+                    .notice
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("flatten"),
+                "{:?}",
+                shell.notice
+            );
+        });
+    }
+
+    /// A branches pane with `main` under HEAD and `other` beside it — the
+    /// aim `commits.rebase-onto` takes from the pane the keyboard is over.
+    fn rebase_branches_shell(
+        cx: &mut TestAppContext,
+    ) -> (gpui::Entity<DevShell>, Arc<RecordingRepo>) {
+        let calls = Arc::default();
+        let repo = Arc::new(RecordingRepo::new(Arc::clone(&calls)));
+        let handle: gitten_git::Handle = repo.clone();
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, cx| {
+            let prepared = crate::views::branches::prepare(
+                vec![branch_ref("main", true), branch_ref("other", false)],
+                Vec::new(),
+                None,
+                "test",
+            );
+            let label = prepared.label.clone();
+            let view = cx.new(|_| crate::views::branches::Branches::from_prepared(prepared));
+            cx.set_global(config::Active(Rc::new(Host::new())));
+            shell.panes.register(
+                "branches",
+                Screen::branches(view, Generation::default(), label),
+            );
+            shell.sync_modes();
+            shell.repo = Some((PathBuf::from("/recorded"), handle));
+        });
+        (shell, repo)
+    }
+
+    #[gpui::test]
+    fn rebase_onto_asks_twice_then_moves_this_branch_onto_the_selection(cx: &mut TestAppContext) {
+        let (shell, repo) = rebase_branches_shell(cx);
+
+        // The keyboard walks past the heading and past main (HEAD's own
+        // row) onto `other`.
+        shell.update(cx, |shell, cx| {
+            let host = Rc::new(Host::new());
+            for _ in 0..5 {
+                let under = match shell.active() {
+                    Some(Screen::Branches { view, .. }) => view.read(cx).cursor_text(),
+                    _ => panic!("no branches pane"),
+                };
+                if under == "other" {
+                    break;
+                }
+                shell.active().unwrap().run("view.down", &host, None, cx);
+            }
+            assert_eq!(
+                match shell.active() {
+                    Some(Screen::Branches { view, .. }) => view.read(cx).cursor_text(),
+                    _ => unreachable!(),
+                },
+                "other",
+                "the keyboard never reached the branch"
+            );
+        });
+
+        shell.update(cx, |shell, cx| shell.run_command("commits.rebase-onto", cx));
+        std::thread::sleep(Duration::from_millis(50));
+        shell.read_with(cx, |shell, _| {
+            assert!(repo.wrote().is_empty());
+            assert!(
+                shell
+                    .notice
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("rebase this branch onto other?"),
+                "{:?}",
+                shell.notice
+            );
+        });
+
+        shell.update(cx, |shell, cx| shell.run_command("commits.rebase-onto", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["rebase onto other"]);
+        shell.read_with(cx, |shell, _| assert!(shell.generation.get() > 0));
     }
 
     #[gpui::test]
