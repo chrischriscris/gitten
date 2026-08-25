@@ -99,8 +99,9 @@ go through `Command::new("git")` (`git/src/lib.rs`). `gix` is the intended
 destination, not the current state: the goal is no process spawn on the hot path,
 and moving reads onto `gix` is roadmap work (`docs/roadmap.md`). Until then, do
 not write a doc, a comment or a plan that assumes a `gix` handle exists — there is
-no `gix` dependency in the tree. The blob-OID diff cache is the cheaper half of
-the same goal and is also not built yet.
+no `gix` dependency in the tree. The blob-OID diff cache was the cheaper half of
+the same goal and has landed — `core::differ`, keyed on the pair's OIDs plus the
+settings that reach the answer.
 
 **Writes go through the `git` binary** — stage, commit, branch, stash, reset,
 push and pull are verbs on the same trait as the reads. Shelling out means
@@ -214,7 +215,7 @@ without being told to; if a new seam needs a control written for it by hand, the
 seam is shaped wrong.
 
 Cache diffs by blob OID. They never change. Acquisition yields both OIDs for
-exactly this reason; the cache itself is not built.
+exactly this reason; the cache lives in `core::differ`.
 
 ## Wrapping
 

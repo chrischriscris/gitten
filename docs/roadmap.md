@@ -33,7 +33,8 @@ they no longer compete with product work.
 Branch + ref reads (#7) and stash/remotes/tags/reflog (#8) landed together with
 the panes that consume them: the models are `core::refs` — names as bytes,
 absence as data — the reads are trait methods, and Files, Branches and Stashes
-are tenants of the pane registry. One block escaped and stays open below: #9.
+are tenants of the pane registry. Its one escapee, #9, landed afterwards on its
+own; see below.
 
 ## Phase C — tracer bullet (#10 landed)
 
@@ -54,6 +55,15 @@ asked for) and search over commits (#17: `/` over a folded index,
 `core::search`). Each hung off C independently, so any subset could have been
 the last.
 
+## #9 — the diff cache (landed)
+
+Assembled hunks are remembered in `core::differ` against the pair's blob OIDs
+plus everything else that reaches the answer — resolved algorithm, whitespace
+relation, context, move floor, indent heuristic — bounded at 4096 entries,
+oldest evicted first, shared by every pane through one `Arc`. A side with no OID
+(untracked, added or deleted, a gitlink) never caches: partial identity invents
+keys for answers nobody proved.
+
 ## Still open
 
 The long tail. Each is its own vertical slice; none blocks another, and none
@@ -61,7 +71,6 @@ is a verb over existing rails.
 
 | # | Block | Why it is hard |
 |---|---|---|
-| 9 | **Diff cache keyed by blob OID** | Prescribed in AGENTS.md, never built; acquisition already yields both OIDs, and a blob never changes. Pays twice: repeat views free, post-write reloads re-diff only what changed |
 | 18 | **Interactive-rebase todo editor** | An editable ordered list (pick/reword/squash/fixup/drop), driven by pointing `GIT_SEQUENCE_EDITOR` back into the app. New UI paradigm, not a new verb |
 | 19 | **Conflict merge editor** | Inline three-way resolution. Lazygit's actual differentiator and the hardest thing on this page |
 | 20 | **Cherry-pick register · bisect · worktrees · submodules · tag UI** | Long tail; each a slice |
