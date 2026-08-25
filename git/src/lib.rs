@@ -4789,6 +4789,62 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_final_newline_refuses_every_direction_and_moves_nothing() {
+        // The documented limit, pinned: the line model cannot say "this file
+        // has no final newline", so a hunk touching its last line goes out
+        // claiming one. git must REFUSE that — refusing is honest; applying
+        // it would add or eat the terminator byte-for-byte. All three verbs
+        // are proven to refuse AND to leave both sides untouched, because
+        // the directions differ in what they read: `--cached` reads the
+        // index blob, and the worktree reverse writes the file itself.
+        let r = Scratch::new("hunk-no-newline");
+        let base = b"alpha\nbeta\ngamma";
+        r.write("f.txt", base);
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        let edited = b"alpha\nbeta\nGAMMA";
+        r.write("f.txt", edited);
+
+        let g = r.open();
+        let files = diff_files(&g);
+        let patch = gitten_core::patch::emit(&files[0].path, &[&files[0].hunks[0]]);
+
+        let index_is_head = || {
+            String::from_utf8_lossy(
+                &r.cmd(&["rev-parse".into(), ":f.txt".into()])
+                    .output()
+                    .expect("rev-parse :f.txt")
+                    .stdout,
+            ) == String::from_utf8_lossy(
+                &r.cmd(&["rev-parse".into(), "HEAD:f.txt".into()])
+                    .output()
+                    .expect("rev-parse HEAD:f.txt")
+                    .stdout,
+            )
+        };
+        let worktree = || std::fs::read(join_raw(&r.0, b"f.txt")).unwrap();
+
+        for (verb, err) in [
+            ("stage", g.stage_patch(&patch)),
+            ("discard", g.discard_patch(&patch)),
+            ("unstage", g.unstage_patch(&patch)),
+        ] {
+            let err = err.expect_err("git refuses a patch that lies about EOF");
+            // Verbatim, both lines: where git tripped and its verdict. A
+            // paraphrase here would also match a misapplication that merely
+            // warned; this sentence exists only on a refusal.
+            assert!(
+                err.contains("error: patch failed: f.txt:1")
+                    && err.contains("error: f.txt: patch does not apply"),
+                "{verb}: {err}"
+            );
+            assert!(index_is_head(), "{verb}: the index moved on a refusal");
+            assert_eq!(worktree(), edited.to_vec(), "{verb}: the worktree moved");
+        }
+        assert_ne!(*base, *edited, "the fixture really changed the last line");
+    }
+
+    #[test]
     fn the_patch_verbs_reach_the_trait_through_the_same_stdin_transport() {
         // A recording backend answers success; the point is the plumbing —
         // bytes in, no path arguments anywhere.
