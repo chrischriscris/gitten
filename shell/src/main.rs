@@ -1705,6 +1705,38 @@ impl DevShell {
         }
     }
 
+    /// `commits.cherry-pick-abort` / `commits.cherry-pick-continue`: drive
+    /// the cherry-pick git is holding mid-flight — the same door as
+    /// rebase.abort / rebase.continue, on its own names. Rebase's capitals
+    /// answer a *rebase* state; run over `CHERRY_PICK_HEAD` they come back
+    /// "no rebase in progress", true and useless. Abort puts branch, index
+    /// and working tree back where the pick started; continue carries it
+    /// onward once conflicts are resolved, a further conflict refused in
+    /// git's words with the state standing.
+    fn cherry_pick_abort_command(&mut self, _cx: &mut Context<Self>) {
+        let Some(writes) = self.writes() else {
+            self.set_notice("a fixture has no repository to abort in");
+            return;
+        };
+        if !writes.send(Box::new(gitten_app::verbs::Write::cherry_pick_abort(
+            &writes.repo,
+        ))) {
+            self.set_notice("the job queue is shutting down");
+        }
+    }
+
+    fn cherry_pick_continue_command(&mut self, _cx: &mut Context<Self>) {
+        let Some(writes) = self.writes() else {
+            self.set_notice("a fixture has no repository to continue in");
+            return;
+        };
+        if !writes.send(Box::new(gitten_app::verbs::Write::cherry_pick_continue(
+            &writes.repo,
+        ))) {
+            self.set_notice("the job queue is shutting down");
+        }
+    }
+
     /// `commits.rebase-onto`: move the branch HEAD is on onto the row the
     /// keyboard is on — plain rebase, no plan, on the same terms as every
     /// other write: a dirty tree is git's refusal verbatim, a conflict
@@ -2011,7 +2043,7 @@ impl DevShell {
             self.set_notice("nothing selected to tag");
             return;
         };
-        if self.repo.is_none() {
+        if self.writes().is_none() {
             self.set_notice("a fixture has no repository to tag in");
             return;
         }
@@ -2026,11 +2058,13 @@ impl DevShell {
 
     /// The accepted tag name, as a job. Empty refused again here — the trait
     /// refuses it too, but saying so beside the field that just closed beats
-    /// making the reader find out twice. A duplicate rides on to git and
-    /// comes back in its words ("tag 'v1' already exists"), which says more
-    /// than a client-side veto would.
+    /// making the reader find out twice — and what is queued is the trimmed
+    /// text, because git would hold the padding as part of the name. A
+    /// duplicate rides on to git and comes back in its words ("tag 'v1'
+    /// already exists"), which says more than a client-side veto would.
     fn tag_named(&mut self, target: &str, sha: String, text: String) {
-        if text.trim().is_empty() {
+        let name = text.trim();
+        if name.is_empty() {
             self.set_notice("a tag needs a name");
             return;
         }
@@ -2044,7 +2078,7 @@ impl DevShell {
         };
         let job = gitten_app::verbs::Write::create_tag(
             &writes.repo,
-            text.into_bytes(),
+            name.as_bytes().to_vec(),
             sha.into_bytes(),
             None,
         );
@@ -2506,6 +2540,11 @@ impl DevShell {
             // on the rebase state git is holding, never on a row.
             "rebase.abort" => self.rebase_abort_command(cx),
             "rebase.continue" => self.rebase_continue_command(cx),
+            // The way out of a stranded cherry-pick — the same repository-
+            // level shape, on its own names: rebase's answer to a pick state
+            // is git's "no rebase in progress".
+            "commits.cherry-pick-abort" => self.cherry_pick_abort_command(cx),
+            "commits.cherry-pick-continue" => self.cherry_pick_continue_command(cx),
             // The repository-level sync verbs: whatever pane the keyboard
             // sits over, they act on the branch HEAD is on — which is why
             // their keys are globals.
@@ -4758,6 +4797,12 @@ mod tests {
             self.conflict.store(true, Ordering::SeqCst);
         }
 
+        /// Resolves it — the state `git add` leaves behind on a real
+        /// machine, which is what a continue needs to find.
+        fn clear_conflict(&self) {
+            self.conflict.store(false, Ordering::SeqCst);
+        }
+
         /// Detaches HEAD, for the refusal half of the sync tests.
         fn detach(&self) {
             *self.head.lock().unwrap() = gitten_core::refs::HeadState::Detached {
@@ -5077,6 +5122,19 @@ mod tests {
                 // change: refused, and the question left in the tree.
                 return Err("error: could not apply 0000000...".into());
             }
+            Ok(())
+        }
+
+        fn cherry_pick_abort(&self) -> gitten_git::Result<()> {
+            self.calls.lock().unwrap().push("cherry-pick abort".into());
+            Ok(())
+        }
+
+        fn cherry_pick_continue(&self) -> gitten_git::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push("cherry-pick continue".into());
             Ok(())
         }
 
@@ -6733,6 +6791,25 @@ diff --git a/added.txt b/added.txt
         });
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(repo.wrote().len(), 1, "the empty accept queued nothing");
+
+        // Padding around the name is field noise, not part of it: what is
+        // queued is the trimmed name.
+        shell.update(cx, |shell, cx| {
+            let field = cx.new(|cx| input::Input::new("new tag", "tag name", " v2 ", cx));
+            shell.open_input(field, cx);
+            shell.prompt = Some(super::Prompt::TagName {
+                target: "commits".into(),
+                sha: "0".repeat(40),
+            });
+        });
+        shell.update(cx, |shell, cx| shell.run_command("input.accept", cx));
+        pump_write(&shell, cx);
+        let expected = format!("tag v2 at {}", "0".repeat(40));
+        assert_eq!(
+            repo.wrote().last().map(String::as_str),
+            Some(expected.as_str()),
+            "the padding never reached git"
+        );
     }
 
     #[gpui::test]
@@ -6845,6 +6922,63 @@ diff --git a/added.txt b/added.txt
                 f.paths_in(crate::views::files::Section::Conflicts),
                 vec![gitten_core::status::PathBytes::from("poem.txt")],
                 "the unmerged path the pick left is on screen"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn a_stranded_pick_is_walked_out_by_its_own_commands_not_rebases(cx: &mut TestAppContext) {
+        // A conflicted pick leaves git holding the question under
+        // CHERRY_PICK_HEAD. Rebase's abort/continue answer that state with
+        // git's "no rebase in progress" — true and useless — so the way out
+        // is the pair beside the pick key, dispatching to the pick's own
+        // verbs.
+        let (shell, repo) = history_shell(cx);
+
+        // Abort: the refused pick's question, put back where it started.
+        repo.arm_conflict();
+        shell.update(cx, |shell, cx| shell.run_command("commits.cherry-pick", cx));
+        pump_until(&shell, cx, |shell| shell.error.is_some());
+        assert_eq!(
+            repo.wrote(),
+            vec![format!("cherry-pick {}", "0".repeat(40))]
+        );
+        let generation = shell.read_with(cx, |shell, _| shell.generation.get());
+        shell.update(cx, |shell, cx| {
+            shell.run_command("commits.cherry-pick-abort", cx)
+        });
+        pump_write(&shell, cx);
+        assert_eq!(
+            repo.wrote().last().map(String::as_str),
+            Some("cherry-pick abort"),
+            "the pick's own abort ran"
+        );
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.generation.get() > generation);
+        });
+
+        // Continue: the conflict resolved by hand, the pick lands as its
+        // own commit — the verb runs, the band re-acquires.
+        repo.clear_conflict();
+        let generation = shell.read_with(cx, |shell, _| shell.generation.get());
+        shell.update(cx, |shell, cx| {
+            shell.run_command("commits.cherry-pick-continue", cx)
+        });
+        pump_write(&shell, cx);
+        assert_eq!(
+            repo.wrote().last().map(String::as_str),
+            Some("cherry-pick continue")
+        );
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.generation.get() > generation);
+            assert!(
+                shell
+                    .notice
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("continued"),
+                "the finish said so: {:?}",
+                shell.notice
             );
         });
     }

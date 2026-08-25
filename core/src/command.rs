@@ -481,6 +481,15 @@ impl Keymap {
         // take; shadowing a global in one pane costs more than the letter
         // buys.
         bind("commits", "n", "commits.new-tag");
+        // The way out of a stranded cherry-pick, beside rebase.abort /
+        // rebase.continue's capitals: those answer a *rebase* state, and
+        // git's own reply to them over CHERRY_PICK_HEAD is "no rebase in
+        // progress" — true, and useless. Capitals because neither press is
+        // everyday and both act on a rewrite in progress; Z backs out (the
+        // ctrl-z reflex) and X carries onward, its neighbour on the bottom
+        // row there being no free letter left that begins either word.
+        bind("commits", "Z", "commits.cherry-pick-abort");
+        bind("commits", "X", "commits.cherry-pick-continue");
 
         // Text itself belongs to the platform input service. These are the two
         // transitions around it, kept as named commands so a config file can
@@ -887,6 +896,14 @@ impl Commands {
                 "apply this commit onto the current branch as a new commit",
             ),
             ("commits.new-tag", "name this commit with a new tag"),
+            (
+                "commits.cherry-pick-abort",
+                "give up the cherry-pick in progress and put everything back where it was",
+            ),
+            (
+                "commits.cherry-pick-continue",
+                "carry on the cherry-pick in progress once conflicts are resolved",
+            ),
             ("files.focus", "focus the working-tree pane"),
             ("files.stage", "stage or unstage the selected file"),
             ("files.commit", "commit the staged changes"),
@@ -1336,6 +1353,8 @@ mod tests {
             ("t", "commits.revert"),
             ("Y", "commits.cherry-pick"),
             ("n", "commits.new-tag"),
+            ("Z", "commits.cherry-pick-abort"),
+            ("X", "commits.cherry-pick-continue"),
         ] {
             assert_eq!(
                 k.resolve(&commits, &keys(chord)),

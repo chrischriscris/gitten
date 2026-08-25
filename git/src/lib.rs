@@ -7373,6 +7373,17 @@ mod tests {
         assert!(kinds.iter().any(|l| l == "v1 commit"), "{kinds:?}");
         assert!(kinds.iter().any(|l| l == "v2 tag"), "{kinds:?}");
 
+        // The annotated message arrived verbatim: `--file=-` stores stdin
+        // byte-for-byte, where `-m` would append a newline of its own — a
+        // mangled payload here would otherwise pass every check green. The
+        // brackets fence off for-each-ref's own record separator.
+        let note = r.git_os_out(&[
+            "for-each-ref".into(),
+            "--format=[%(contents)]".into(),
+            "refs/tags/v2".into(),
+        ]);
+        assert_eq!(String::from_utf8_lossy(&note), "[release two\n]\n");
+
         // Deleting at trait level takes the name off and leaves every
         // commit it pointed at alone.
         g.delete_tag(b"v1").expect("delete");
