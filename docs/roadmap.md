@@ -64,16 +64,23 @@ oldest evicted first, shared by every pane through one `Arc`. A side with no OID
 (untracked, added or deleted, a gitlink) never caches: partial identity invents
 keys for answers nobody proved.
 
-## Still open
+## #18 — the rebase todo editor (the mechanism landed)
 
-The long tail. Each is its own vertical slice; none blocks another, and none
-is a verb over existing rails.
+`core::rebase` models the todo file; `rebase_todo()` runs `git rebase -i` with
+`GIT_SEQUENCE_EDITOR` pointed at a `cp` of our own plan, which makes the
+"interactive" rebase fully scriptable — squash-up, fixup-up and drop compose
+from the commits pane (`S`/`F`/`d`), `R` in branches rebases onto a branch,
+`A`/`C` abort and continue a stranded one. Refused for now, each for a named
+reason: reword and edit (they open an editor mid-rebase), root folds
+(`--root`), merges in the window (flattening). What a future wave adds is
+surface, not mechanism: drag-reorder, multi-select, a todo pane.
+
+## Still open
 
 | # | Block | Why it is hard |
 |---|---|---|
-| 18 | **Interactive-rebase todo editor** | An editable ordered list (pick/reword/squash/fixup/drop), driven by pointing `GIT_SEQUENCE_EDITOR` back into the app. New UI paradigm, not a new verb |
-| 19 | **Conflict merge editor** | Inline three-way resolution. Lazygit's actual differentiator and the hardest thing on this page |
-| 20 | **Cherry-pick register · bisect · worktrees · submodules · tag UI** | Long tail; each a slice |
+| 19 | **Conflict merge editor** | Inline three-way resolution. Lazygit's actual differentiator and the hardest thing on this page — and it deserves a supervised design session, not an overnight |
+| 20 | **Cherry-pick register ✓ · bisect · worktrees · submodules · tag UI (create ✓, delete waits for a tags pane)** | The long tail; what is left is each its own slice |
 
 ## Deliberately not on this list
 
