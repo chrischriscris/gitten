@@ -6263,14 +6263,16 @@ diff --git a/added.txt b/added.txt
         });
 
         // Second press composes the plan and queues the job through the
-        // production dispatch: folding HEAD into its parent replays nothing
-        // else, so the plan is one squash sitting on the parent's sha.
+        // production dispatch: folding HEAD into its parent replays the
+        // parent first (a plan may not open with a squash) and sits on the
+        // grandparent's sha.
         shell.update(cx, |shell, cx| shell.run_command("commits.squash-up", cx));
         pump_write(&shell, cx);
         assert_eq!(
             repo.wrote(),
             vec![format!(
-                "rebase onto {} with plan squash {}\n",
+                "rebase onto {} with plan pick {}\nsquash {}\n",
+                "02".repeat(20),
                 "01".repeat(20),
                 "00".repeat(20)
             )]

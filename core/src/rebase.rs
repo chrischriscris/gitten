@@ -340,6 +340,30 @@ pub enum Rewrite {
 /// without it would silently drop that branch's changes from the result. A
 /// tangled stretch of history refuses in words rather than rewriting itself
 /// into something else; a straight one — most solo work — composes.
+/// Builds the plan for one of [`Rewrite`]'s rewrites, over history as a
+/// client's log presents it: newest first, `index` the row under the keyboard.
+///
+/// Returns the revspec the rebase must sit on — beneath the deepest commit
+/// the plan touches — together with a script covering every commit from
+/// there to HEAD.
+///
+/// Wholesale is the point and the danger. Our sequencer editor *replaces*
+/// what git generated, so the plan is only complete when the window it was
+/// built from *is* the range. The refusals below guarantee that: HEAD down
+/// to the keyboard must be a straight single-parent line — no merge anywhere
+/// in it, because `git rebase -i` without `--rebase-merges` flattens one;
+/// no side-branch commit interleaved into the window, because a plan built
+/// without it would silently drop that branch's changes from the result. A
+/// tangled stretch of history refuses in words rather than rewriting itself
+/// into something else; a straight one — most solo work — composes.
+///
+/// A fold has one more constraint than a drop: git refuses any plan whose
+/// *first* line is a squash or a fixup ("cannot 'squash' without a previous
+/// commit"), because there is nothing above it to meld into yet. So the fold
+/// opens with a pick of the parent itself, and sits one generation deeper —
+/// on the parent's parent. That reach is also the refusal: a parent at the
+/// edge of the loaded window hides its own parent from us; a root parent
+/// would need `git rebase --root`, which this client does not drive.
 pub fn compose(
     kind: Rewrite,
     commits: &[Commit],
@@ -377,30 +401,72 @@ pub fn compose(
         }
     }
 
-    // Oldest first, the way the file itself is ordered: from the deepest
-    // commit in the rewritten range up to HEAD, with the selected commit
-    // folded or omitted where it stands.
     let mut script = TodoScript::default();
-    for j in (0..=index).rev() {
-        let action = match (kind, j == index) {
-            (Rewrite::Drop, true) => continue,
-            (Rewrite::SquashUp, true) => Action::Squash,
-            (Rewrite::FixupUp, true) => Action::Fixup,
-            _ => Action::Pick,
-        };
-        script.push_step(action, commits[j].sha.as_bytes());
-    }
-    if script.lines().is_empty() {
-        // Dropping the one commit the range holds leaves git an empty todo,
-        // which it refuses — and the move the keypress meant already has a
-        // name in this app: reset --hard to this commit's parent.
-        return Err(
-            "this commit is the only one the plan would touch; dropping it \
-             would leave an empty plan — reset to its parent instead"
-                .into(),
-        );
-    }
-    Ok((selected.parents[0].clone().into_bytes(), script))
+    let upstream = match kind {
+        Rewrite::Drop => {
+            // Oldest first, the way the file itself is ordered, with the
+            // selected commit simply absent.
+            for j in (0..=index).rev() {
+                if j == index {
+                    continue;
+                }
+                script.push_step(Action::Pick, commits[j].sha.as_bytes());
+            }
+            if script.lines().is_empty() {
+                // Dropping the one commit the range holds leaves git an empty
+                // todo, which it refuses — and the move the keypress meant
+                // already has a name in this app: reset --hard to this
+                // commit's parent.
+                return Err(
+                    "this commit is the only one the plan would touch; dropping \
+                     it would leave an empty plan — reset to its parent instead"
+                        .into(),
+                );
+            }
+            selected.parents[0].clone().into_bytes()
+        }
+        Rewrite::SquashUp | Rewrite::FixupUp => {
+            // The fold lands on the parent, so the parent is replayed by the
+            // plan — which makes the plan open with its pick (git refuses a
+            // squash/fixup first line) and sit on the parent's own parent.
+            let Some(parent) = commits.get(index + 1) else {
+                return Err("the commit to fold into sits at the edge of the loaded \
+                     history, so the plan cannot say what lies beneath it"
+                    .into());
+            };
+            if selected.parents[0] != parent.sha {
+                return Err("the loaded history is not a straight line down to \
+                     this commit, so a plan built from it would not cover \
+                     everything the rebase would touch"
+                    .into());
+            }
+            match parent.parents.len() {
+                0 => {
+                    return Err("the commit under the keyboard folds into a root \
+                         commit; folding into a root needs git's --root, \
+                         which this client does not drive"
+                        .into())
+                }
+                n if n > 1 => {
+                    return Err("the commit under the keyboard folds into a merge; \
+                         rebasing would flatten it"
+                        .into())
+                }
+                _ => {}
+            }
+            let action = match kind {
+                Rewrite::SquashUp => Action::Squash,
+                _ => Action::Fixup,
+            };
+            script.push_step(Action::Pick, parent.sha.as_bytes());
+            script.push_step(action, selected.sha.as_bytes());
+            for j in (0..index).rev() {
+                script.push_step(Action::Pick, commits[j].sha.as_bytes());
+            }
+            parent.parents[0].clone().into_bytes()
+        }
+    };
+    Ok((upstream, script))
 }
 
 #[cfg(test)]
@@ -596,13 +662,16 @@ squash
         let commits = linear();
 
         // The plan covers upstream..HEAD — the keyboard and everything above
-        // it. `deep` and `root` are the history being sat on, never replayed.
+        // it. A fold replays its own parent first (git refuses a squash or
+        // fixup opening the plan), so it sits one generation deeper than a
+        // drop: on `root`, beneath the parent it melds into.
         let (upstream, script) = compose(Rewrite::SquashUp, &commits, 2).expect("composes");
-        assert_eq!(upstream, b"deep-sha", "the rebase sits on the parent");
+        assert_eq!(upstream, b"root-sha", "the rebase sits under the parent");
         assert_eq!(
             shown(&script),
             vec![
-                "squash under-sha", // the selected commit, melded upward
+                "pick deep-sha",    // the parent, replayed first
+                "squash under-sha", // the selected commit, melded into it
                 "pick mid-sha",
                 "pick head-sha",
             ],
@@ -610,9 +679,14 @@ squash
         );
 
         let (upstream, fix) = compose(Rewrite::FixupUp, &commits, 1).expect("composes");
-        assert_eq!(upstream, b"under-sha");
-        assert_eq!(shown(&fix), vec!["fixup mid-sha", "pick head-sha"]);
+        assert_eq!(upstream, b"deep-sha");
+        assert_eq!(
+            shown(&fix),
+            vec!["pick under-sha", "fixup mid-sha", "pick head-sha"]
+        );
 
+        // A drop needs no pick of its own parent — omission cannot strand —
+        // so it sits exactly where it always did.
         let (upstream, dropped) = compose(Rewrite::Drop, &commits, 1).expect("composes");
         assert_eq!(upstream, b"under-sha");
         assert_eq!(
@@ -620,6 +694,59 @@ squash
             vec!["pick head-sha"],
             "mid is gone, head replays"
         );
+    }
+
+    #[test]
+    fn a_fold_refuses_when_the_parent_hides_its_own_parent() {
+        // The parent beyond the window's edge: its pick would open the plan,
+        // but nothing here can say where that pick must sit.
+        let clipped = vec![commit_of("child", &["beneath-not-loaded"])];
+        let err = compose(Rewrite::SquashUp, &clipped, 0)
+            .expect_err("the parent is past the loaded window");
+        assert!(err.contains("edge of the loaded history"), "{err}");
+
+        // The parent in view but a root: folding into a root is git's --root
+        // territory, not ours.
+        let rooted = vec![commit_of("child", &["root"]), commit_of("root", &[])];
+        let err = compose(Rewrite::FixupUp, &rooted, 0).expect_err("the parent is a root");
+        assert!(err.contains("--root"), "{err}");
+
+        // The row beneath the keyboard is a side branch's tip, not the
+        // parent the fold claims to land on: same straight-line refusal as
+        // everywhere else.
+        let forked = vec![
+            commit_of("head", &["c1"]),
+            commit_of("side", &["elsewhere"]),
+            commit_of("c1", &["c0"]),
+        ];
+        let err = compose(Rewrite::SquashUp, &forked, 0).expect_err("side tip is not the parent");
+        assert!(err.contains("straight line"), "{err}");
+
+        // And a merge in the parent seat flattens like any other merge.
+        let merged = vec![
+            commit_of("head", &["m"]),
+            commit_of("m", &["a", "b"]),
+            commit_of("a", &["old"]),
+        ];
+        let err = compose(Rewrite::FixupUp, &merged, 0).expect_err("folding into a merge");
+        assert!(err.contains("flatten"), "{err}");
+    }
+
+    /// One named commit with the given parents — the fixture brick the
+    /// refusal tests build from.
+    fn commit_of(sha: &str, parents: &[&str]) -> Commit {
+        Commit {
+            sha: sha.into(),
+            short: String::new(),
+            parents: parents
+                .iter()
+                .map(|p| (*p).to_string())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            author: "".into(),
+            timestamp: 0,
+            subject: sha.into(),
+        }
     }
 
     #[test]
@@ -633,41 +760,23 @@ squash
 
     #[test]
     fn compose_refuses_every_shape_it_cannot_complete() {
-        let commit = |sha: &str, parents: &[&str]| Commit {
-            sha: sha.into(),
-            short: String::new(),
-            parents: parents
-                .iter()
-                .map(|p| (*p).to_string())
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-            author: "".into(),
-            timestamp: 0,
-            subject: sha.into(),
-        };
-
         let err = compose(Rewrite::Drop, &linear(), 7).expect_err("past the end");
         assert!(err.contains("nothing under the keyboard"), "{err}");
 
-        let rooted = vec![commit("root", &[])];
-        let err =
-            compose(Rewrite::SquashUp, &rooted, 0).expect_err("a root has no parent to fold into");
-        assert!(err.contains("root"), "{err}");
-
-        let merged = vec![commit("m", &["p1", "p2"]), commit("p1", &["old"])];
+        let merged = vec![commit_of("m", &["p1", "p2"]), commit_of("p1", &["old"])];
         let err = compose(Rewrite::Drop, &merged, 0)
             .expect_err("a merge under the keyboard would be flattened");
         assert!(err.contains("flatten"), "{err}");
 
-        let merged_deep = vec![commit("c2", &["c1"]), commit("merge", &["a", "b"])];
+        let merged_deep = vec![commit_of("c2", &["c1"]), commit_of("merge", &["a", "b"])];
         let err = compose(Rewrite::Drop, &merged_deep, 1)
             .expect_err("a merge anywhere in the range flattens");
         assert!(err.contains("flatten"), "{err}");
 
         let forked = vec![
-            commit("side", &["elsewhere"]),
-            commit("c2", &["c1"]),
-            commit("c1", &["c0"]),
+            commit_of("side", &["elsewhere"]),
+            commit_of("c2", &["c1"]),
+            commit_of("c1", &["c0"]),
         ];
         let err = compose(Rewrite::Drop, &forked, 2)
             .expect_err("a side commit interleaved in the window breaks completeness");

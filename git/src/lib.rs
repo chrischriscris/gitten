@@ -6476,7 +6476,7 @@ mod tests {
 
     // ------------------------------------------------------------- the rebase
 
-    use gitten_core::rebase::{Action, Line, TodoScript};
+    use gitten_core::rebase::{Action, Line, Rewrite, TodoScript};
 
     /// A straight line of work over separate files: `base`, then three
     /// commits each adding its own file, so a rewrite that loses content
@@ -6624,6 +6624,43 @@ mod tests {
             std::path::Path::new(&r2.0).join("one.txt").exists(),
             "but its change stayed"
         );
+    }
+
+    #[test]
+    fn a_composed_squash_of_the_second_visible_commit_runs_to_completion() {
+        // The shell-level path end to end: log the repository the way a
+        // pane does, hand that window to `core::rebase::compose`, aim the
+        // plan at git through the trait verb. This is exactly the shape
+        // that once opened its plan with a bare squash — which git refuses,
+        // stranding `.git/rebase-merge` behind exit 1 — so it is proven
+        // here against real git and not only against the model.
+        let r = linear_repo("rebase-compose-squash");
+        let g = r.open();
+        let history = g.log(500).expect("log");
+        let index = history
+            .iter()
+            .position(|c| c.subject == "two")
+            .expect("two sits in the window");
+        let before = history.len();
+
+        let (upstream, script) =
+            gitten_core::rebase::compose(Rewrite::SquashUp, &history, index).expect("composes");
+        g.rebase_todo(&upstream, &script)
+            .expect("the composed squash ran");
+
+        assert!(!g.rebase_in_progress(), "git completed the whole plan");
+        assert_eq!(
+            g.log(500).expect("log").len(),
+            before - 1,
+            "two commits became one"
+        );
+        assert_eq!(
+            body_of(&r, "HEAD~1").trim_end(),
+            "one\n\ntwo",
+            "melded by git's own concat rule, blank line between"
+        );
+        let tree = g.status().expect("status");
+        assert!(tree.staged.is_empty() && tree.unstaged.is_empty());
     }
 
     #[test]
