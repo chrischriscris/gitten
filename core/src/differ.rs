@@ -51,7 +51,9 @@
 //! so equal OIDs mean an equal answer, which is why the key can be that small:
 //! the cache changes what a diff costs and never what it says. A side with no
 //! OID — untracked, added or deleted, a gitlink — has no identity to remember
-//! it by and always computes.
+//! it by and always computes. Nothing here makes a cold diff cheaper: the first
+//! acquisition of anything, every file that actually changed, and every `git`
+//! spawn stay full-price — the cache only stops unchanged files paying twice.
 
 use crate::{DiffLine, FileDiff, Hunk, LineKind};
 use std::collections::VecDeque;
@@ -1547,6 +1549,13 @@ const CACHE_CAP: usize = 4096;
 /// *not* in the key: two paths resolving to the same algorithm and relation
 /// with the same blobs genuinely have the same hunks, and `.txt` renamed to
 /// `.rs` changes the routed algorithm, which changes the key on its own.
+///
+/// Forward note: the key is field-by-field today, so its maintenance rule is
+/// memory — a knob added to [`Overrides`] or to this registry that can change
+/// hunk output must join it, or stale answers survive a turn of that knob in
+/// silence. If that list grows, the structural fix is hoisting the settings
+/// into one `Hash` struct embedded wholesale, so a new field lands in the key
+/// by construction instead of by recall.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct Key {
     old: String,
@@ -1662,7 +1671,13 @@ impl Differs {
     /// as a language table can.
     pub fn register(&mut self, differ: impl Differ + 'static) {
         match self.impls.iter().position(|d| d.name() == differ.name()) {
-            Some(i) => self.impls[i] = Arc::new(differ),
+            Some(i) => {
+                self.impls[i] = Arc::new(differ);
+                // A replacement keeps its name but not its answers, and the
+                // key cannot tell them apart — drop everything rather than
+                // serve hunks under a name that did not produce them.
+                *self.locked() = Cache::default();
+            }
             None => self.impls.push(Arc::new(differ)),
         }
     }
