@@ -192,23 +192,64 @@ fn run_env(repo: &Path, args: &[&[u8]], env: &[(&str, &str)]) -> Result<Vec<u8>>
     Ok(out.stdout)
 }
 
-/// Writes a plan to one temp file and names it.
+/// Writes a plan to one freshly created temp file and names it.
 ///
-/// The sequencer editor copies this file over git's todo, so it exists only
-/// for the length of the rebase process; the name is unique per call rather
-/// than per process, because two rebases queued behind each other on the job
-/// thread must not share a plan.
+/// Three properties, because this file carries commit subjects and lives in
+/// a directory other users may be able to write:
+///
+/// **`create_new`** — the create fails if anything already sits at the
+/// path, so a pre-planted file or symlink cannot be clobbered with a plan
+/// it did not hold (CWE-377's classic shape); we simply pick another name.
+///
+/// **An unguessable name** — process id, clock nanoseconds and a sequence
+/// counter together, so nobody can win the race by predicting where the
+/// next plan will land.
+///
+/// **`0600`** — the owner reads it, and nobody else, whatever the umask or
+/// the platform default for new files would have said.
+///
+/// The file exists only for the length of the rebase process; uniqueness
+/// is per call rather than per process, because two rebases queued behind
+/// each other on the job thread must not share a plan.
 fn write_todo_tmpfile(script: Vec<u8>) -> Result<PathBuf> {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
-    let mut at = std::env::temp_dir();
-    at.push(format!(
-        "gitten-todo-{}-{}",
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::write(&at, script).map_err(|e| format!("could not write {}: {e}", at.display()))?;
-    Ok(at)
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.subsec_nanos())
+        .unwrap_or(0);
+    for attempt in 0..4 {
+        let mut at = std::env::temp_dir();
+        at.push(format!(
+            "gitten-todo-{}-{:x}-{:x}-{:x}",
+            std::process::id(),
+            nanos,
+            attempt,
+            SEQ.fetch_add(1, Ordering::Relaxed),
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&at)
+        {
+            Ok(file) => {
+                // Private before the first byte lands, not after.
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                    .map_err(|e| format!("could not lock down {}: {e}", at.display()))?;
+                (&file)
+                    .write_all(&script)
+                    .map_err(|e| format!("could not write {}: {e}", at.display()))?;
+                return Ok(at);
+            }
+            // Somebody (or something) got there first: another name, not a
+            // fight over theirs.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("could not create {}: {e}", at.display())),
+        }
+    }
+    Err("could not create a private todo tempfile after four attempts".into())
 }
 
 /// A path as one shell word. Temp directories do not usually need the
@@ -6926,6 +6967,24 @@ mod tests {
         assert!(g.rebase_in_progress(), "found by the progress read");
         g.rebase_abort().expect("abort");
         assert_eq!(r.rev_parse("clash"), before, "aborted clean");
+    }
+
+    #[test]
+    fn todo_tempfiles_are_private_unique_and_cleaned_up() {
+        // The plan carries commit subjects and lands in a shared directory,
+        // so the file answers to a stricter contract than convenience:
+        // owner-only however the umask feels, never the same name twice,
+        // bytes intact, gone when the caller removes it.
+        let first = write_todo_tmpfile(b"pick 1111111\n".to_vec()).expect("first");
+        let second = write_todo_tmpfile(b"pick 2222222\n".to_vec()).expect("second");
+        assert_ne!(first, second, "two plans never share a file");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&first).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "{:?} is not owner-only", first);
+        assert_eq!(std::fs::read(&first).unwrap(), b"pick 1111111\n");
+        std::fs::remove_file(&first).unwrap();
+        assert!(!first.exists());
+        std::fs::remove_file(&second).unwrap();
     }
 
     #[test]
