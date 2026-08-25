@@ -5072,6 +5072,11 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("cherry-pick {}", String::from_utf8_lossy(sha)));
+            if self.conflict.load(Ordering::SeqCst) {
+                // git's own sentence for a pick that cannot apply its
+                // change: refused, and the question left in the tree.
+                return Err("error: could not apply 0000000...".into());
+            }
             Ok(())
         }
 
@@ -6782,6 +6787,64 @@ diff --git a/added.txt b/added.txt
                 f.paths_in(crate::views::files::Section::Conflicts),
                 vec![gitten_core::status::PathBytes::from("poem.txt")],
                 "the unmerged path the revert left is on screen"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn a_conflicted_cherry_pick_says_what_git_said_and_shows_what_it_left(cx: &mut TestAppContext) {
+        // The same shape as the conflicted revert: the pick refuses with
+        // git's own words in the band, and the status pane re-acquires
+        // through the drain_jobs failure arm — a refusal is not proof the
+        // repository stood still, and an unmerged path nobody can see is a
+        // question nobody can answer.
+        let calls = Arc::default();
+        let repo = Arc::new(RecordingRepo::new(Arc::clone(&calls)));
+        repo.arm_conflict();
+        let handle: gitten_git::Handle = repo.clone();
+        let shell = shell(None, cx);
+        let files = shell.update(cx, |shell, cx| {
+            cx.set_global(config::Active(Rc::new(Host::new())));
+            let files = cx.new(|_| {
+                crate::views::files::Files::from_prepared(crate::views::files::prepare(
+                    Status::default(),
+                    "r",
+                ))
+            });
+            shell.panes.register(
+                "files",
+                Screen::files(files.clone(), Generation::default(), "files"),
+            );
+            let commits = cx.new(|_| Commits::new(search_history(), Rc::new(Host::new())));
+            shell.panes.register(
+                "commits",
+                Screen::commits(commits, Source::Fixtures, Generation::default(), "~/src"),
+            );
+            shell.sync_modes();
+            shell.repo = Some((PathBuf::from("/recorded"), handle));
+            files
+        });
+
+        shell.update(cx, |shell, cx| shell.run_command("commits.cherry-pick", cx));
+        pump_until(&shell, cx, |shell| shell.error.is_some());
+        cx.run_until_parked();
+
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                shell
+                    .error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("could not apply"),
+                "git's own words reached the band: {:?}",
+                shell.error
+            );
+        });
+        files.read_with(cx, |f, _| {
+            assert_eq!(
+                f.paths_in(crate::views::files::Section::Conflicts),
+                vec![gitten_core::status::PathBytes::from("poem.txt")],
+                "the unmerged path the pick left is on screen"
             );
         });
     }
