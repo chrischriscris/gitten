@@ -58,6 +58,39 @@ pub enum HeadState {
     Detached { commit: String },
 }
 
+// --------------------------------------------------------------------- history
+
+/// How far a reset takes the index and the working tree along.
+///
+/// The three strengths git itself names, and nothing about git beyond them:
+/// which parts of the repository follow the branch pointer backwards is the
+/// whole of what the word means here, so it lives in `core` where every
+/// client and an extension can aim it without learning this crate exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetMode {
+    /// The branch moves alone. Everything staged stays staged, everything in
+    /// the working tree stays put — the changes simply become changes *against
+    /// the new place*.
+    Soft,
+    /// The branch and the index move together; the working tree keeps its
+    /// files as they are, so the reset's own step comes back as unstaged work.
+    Mixed,
+    /// Branch, index and working tree all move. Anything unstaged is gone,
+    /// which is why this one strength is confirmed twice in every client.
+    Hard,
+}
+
+impl ResetMode {
+    /// git's own flag spelling, for the band that names a running job.
+    pub fn flag(self) -> &'static str {
+        match self {
+            ResetMode::Soft => "--soft",
+            ResetMode::Mixed => "--mixed",
+            ResetMode::Hard => "--hard",
+        }
+    }
+}
+
 // -------------------------------------------------------------------- branches
 
 /// A local branch, as `refs/heads` holds it.

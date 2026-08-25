@@ -380,6 +380,10 @@ impl Keymap {
         // holds. Both are particular to this pane, so they are not globals.
         bind("files", "space", "files.stage");
         bind("files", "c", "files.commit");
+        // Amending rides the commit path — same field, same staged content —
+        // and takes lazygit's amend capital A, one key off its lowercase
+        // sibling stage-all because rewriting HEAD is not staging.
+        bind("files", "A", "files.amend");
         // The rest of the panel's verbs, on lazygit's keys where lazygit has
         // one: D discards (twice-pressed — see files.discard's doc), a acts
         // on every row by the side of the index the keyboard sits in, i
@@ -419,6 +423,20 @@ impl Keymap {
 
         bind("commits", "enter", "commits.open-diff");
         bind("commits", "/", "commits.search");
+        // Resetting to the commit under the keyboard, on lazygit's own three
+        // strengths — its reset menu lists mixed, soft, hard under exactly
+        // these letters. The menu does not exist here (one keypress, one
+        // command name), so each strength is a binding of its own; `h`
+        // shadows one global (`view.left`) in this mode, the same
+        // mode-overrides-global trade [stashes] already makes for `g` and
+        // `d`. Hard is the destructive one and confirms twice; soft and
+        // mixed keep every change recoverable through reflog or working tree.
+        bind("commits", "s", "commits.reset-soft");
+        bind("commits", "m", "commits.reset-mixed");
+        bind("commits", "h", "commits.reset-hard");
+        // lazygit's revert key. Nothing is destroyed — the undo arrives as a
+        // new commit — so it takes no confirmation dance.
+        bind("commits", "t", "commits.revert");
 
         // Text itself belongs to the platform input service. These are the two
         // transitions around it, kept as named commands so a config file can
@@ -768,9 +786,29 @@ impl Commands {
             ("theme.cycle", "the next theme"),
             ("commits.open-diff", "the diff for this commit"),
             ("commits.search", "search the commits"),
+            (
+                "commits.reset-soft",
+                "move this branch here, keeping every change staged",
+            ),
+            (
+                "commits.reset-mixed",
+                "move this branch here, unstaging what it holds",
+            ),
+            (
+                "commits.reset-hard",
+                "move this branch here and discard the changes, asked twice",
+            ),
+            (
+                "commits.revert",
+                "undo this commit with a new inverse commit",
+            ),
             ("files.focus", "focus the working-tree pane"),
             ("files.stage", "stage or unstage the selected file"),
             ("files.commit", "commit the staged changes"),
+            (
+                "files.amend",
+                "rewrite HEAD to hold the staged changes under a new message",
+            ),
             (
                 "files.discard",
                 "discard the selected file's changes, asked twice",
@@ -1179,6 +1217,57 @@ mod tests {
             assert!(commands.known(name), "{name} is not registered");
             assert!(!k.keys_for(name).is_empty(), "{name} is bound to nothing");
         }
+    }
+
+    #[test]
+    fn the_history_verbs_resolve_in_their_panes_on_lazygits_letters() {
+        let k = Keymap::builtin();
+        let commands = Commands::builtin();
+
+        // Amend rides commit's pane and takes lazygit's amend capital, one
+        // key off stage-all because rewriting HEAD is not staging.
+        let mut files = Modes::new();
+        files.push("files");
+        assert_eq!(k.resolve(&files, &keys("A")), Resolve::Run("files.amend"));
+        assert_ne!(
+            k.resolve(&files, &keys("a")),
+            Resolve::Run("files.amend"),
+            "the capital is its own binding"
+        );
+        assert!(commands.known("files.amend"));
+
+        // The reset strengths are lazygit's reset-menu letters — mixed, soft,
+        // hard under m, s, h — flattened into three direct bindings. `h`
+        // shadows one global here (`view.left`), exactly as [stashes]
+        // shadows `g`/`d`; revert takes lazygit's own `t`.
+        let mut commits = Modes::new();
+        commits.push("commits");
+        for (chord, name) in [
+            ("s", "commits.reset-soft"),
+            ("m", "commits.reset-mixed"),
+            ("h", "commits.reset-hard"),
+            ("t", "commits.revert"),
+        ] {
+            assert_eq!(
+                k.resolve(&commits, &keys(chord)),
+                Resolve::Run(name),
+                "{chord} did not reach {name} in [commits]"
+            );
+            // Particular to this pane: a commit list has no stash, no
+            // view.left worth keeping, and no other mode's meanings.
+            assert_ne!(
+                k.resolve(&Modes::new(), &keys(chord)),
+                Resolve::Run(name),
+                "{name} leaked out of [commits]"
+            );
+            let command = commands.get(name).unwrap_or_else(|| panic!("{name}"));
+            if name == "commits.reset-hard" {
+                assert!(command.doc.contains("asked twice"), "{}", command.doc);
+            }
+        }
+        // The movement vocabulary survives inside the mode, minus what the
+        // panel's own letters took over.
+        assert_eq!(k.resolve(&commits, &keys("j")), Resolve::Run("view.down"));
     }
 
     #[test]

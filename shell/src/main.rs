@@ -16,6 +16,7 @@ use gitten_app::{Started, Startup};
 use gitten_core::command::{chord_string, Code, Key, Modes, Resolve};
 use gitten_core::differ::{Overrides, Whitespace};
 use gitten_core::host::Host;
+use gitten_core::refs::ResetMode;
 use gitten_core::theme::Rgb;
 use gitten_core::FileDiff;
 use gpui::*;
@@ -163,6 +164,9 @@ type ApplyRefresh = dyn FnOnce(RefreshValue, &Host, &mut App) -> Result<(), Stri
 enum Prompt {
     /// The message a `files.commit` accept turns into a commit job.
     CommitMessage,
+    /// The same field over the same staged content, aimed one step back:
+    /// what a `files.amend` accept turns into an amend job.
+    AmendMessage,
     /// A `/` query over one pane, named by its registration name — a name and
     /// not a type, so the slot stays open to whatever pane learns to answer a
     /// search next. Every edit filters that pane live (see
@@ -1027,6 +1031,7 @@ impl DevShell {
         self.sync_modes();
         match (accept, self.prompt.take()) {
             (true, Some(Prompt::CommitMessage)) => self.commit_message(text),
+            (true, Some(Prompt::AmendMessage)) => self.amend_message(text),
             // A search keeps what was typed on accept and clears on cancel —
             // `esc` means "forget it", not "keep half of it".
             (_, Some(Prompt::Search { target })) => {
@@ -1127,6 +1132,48 @@ impl DevShell {
             return;
         };
         if !writes.send(Box::new(gitten_app::verbs::Write::commit(
+            &writes.repo,
+            message,
+        ))) {
+            self.set_notice("the job queue is shutting down");
+        }
+    }
+
+    /// `files.amend`: the same field commit's key opens, aimed one step back
+    /// — accepting rewrites HEAD to hold the staged changes under this text.
+    /// The refusals are shared on purpose: no repository, an empty message.
+    /// Whether HEAD has anything to amend is the trait's to answer, where
+    /// the honest "no commits yet" lives next to git's own errors.
+    fn begin_amend_message(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.active(), Some(Screen::Files { .. })) {
+            self.set_notice("files.amend is not supported here");
+            return;
+        }
+        if self.repo.is_none() {
+            self.set_notice("a fixture has no repository to amend in");
+            return;
+        }
+        let input = cx.new(|cx| input::Input::new("amend", "amend message", "", cx));
+        self.open_input(input, cx);
+        // After `open_input`, which may have cancelled a previous prompt.
+        self.prompt = Some(Prompt::AmendMessage);
+    }
+
+    /// The accepted amend text, as a job. Empty refused again here — the
+    /// trait refuses it too, but saying so beside the field that just closed
+    /// beats making the reader find out twice. Amending a commit some remote
+    /// already holds is tonight the reader's own decision: nothing tracks
+    /// push state yet, and saying so beats a guard that guesses.
+    fn amend_message(&mut self, message: String) {
+        if message.trim().is_empty() {
+            self.set_notice("a commit needs a message");
+            return;
+        }
+        let Some(writes) = self.writes() else {
+            self.set_notice("a fixture has no repository to amend in");
+            return;
+        };
+        if !writes.send(Box::new(gitten_app::verbs::Write::amend(
             &writes.repo,
             message,
         ))) {
@@ -1286,6 +1333,88 @@ impl DevShell {
             &writes.repo,
             None,
         ))) {
+            self.set_notice("the job queue is shutting down");
+        }
+    }
+
+    // ---------------------------------------------------- the branch verbs
+
+    /// `commits.reset-soft` / `commits.reset-mixed` / `commits.reset-hard`:
+    /// move the branch onto the commit the keyboard is on. The target goes
+    /// through [`Commits::current`] — the sha under the keyboard, wherever
+    /// filtering left it — never a row index.
+    ///
+    /// Only hard asks twice, and it asks exactly as `files.discard` does:
+    /// first press arms the row and says so in the band, any cursor move,
+    /// wheel or refresh disarms, second press on the same commit builds the
+    /// job. Soft and mixed destroy nothing recoverable-with-effort — every
+    /// abandoned commit stays in the reflog, and mixed leaves its own step
+    /// sitting in the working tree — so they go straight through.
+    fn reset_selected(&mut self, command: &str, cx: &mut Context<Self>) {
+        let Some(Screen::Commits { view, .. }) = self.active() else {
+            self.set_notice(format!("{command} is not supported here"));
+            return;
+        };
+        let view = view.clone();
+        let host = config::host(cx);
+        // Meet the list where it actually is, like open-diff: a scrollbar
+        // drag moved the offset without moving the cursor.
+        view.update(cx, |v, _| v.reconcile(&host));
+        let Some(commit) = view.read(cx).current().cloned() else {
+            self.set_notice("nothing selected to reset to");
+            return;
+        };
+        let Some(writes) = self.writes() else {
+            self.set_notice("a fixture has no repository to reset in");
+            return;
+        };
+        if command == "commits.reset-hard"
+            && !view.update(cx, |v, _| v.confirm_or_arm_reset(&commit.sha))
+        {
+            self.set_notice(format!(
+                "reset --hard to {}? press again to confirm",
+                commit.short
+            ));
+            return;
+        }
+        if command == "commits.reset-hard" {
+            self.notice = None; // the question is spent; the running band speaks next
+        }
+        let mode = match command {
+            "commits.reset-soft" => ResetMode::Soft,
+            "commits.reset-mixed" => ResetMode::Mixed,
+            _ => ResetMode::Hard,
+        };
+        let job =
+            gitten_app::verbs::Write::reset(&writes.repo, mode, commit.sha.clone().into_bytes());
+        if !writes.send(Box::new(job)) {
+            self.set_notice("the job queue is shutting down");
+        }
+    }
+
+    /// `commits.revert`: land the inverse of the commit the keyboard is on
+    /// as a new commit. Nothing existing moves or is destroyed — dropping
+    /// the result undoes the undo — so there is no confirmation dance; a
+    /// conflicted revert refuses with git's own words and leaves its
+    /// question in the working tree.
+    fn revert_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(Screen::Commits { view, .. }) = self.active() else {
+            self.set_notice("commits.revert is not supported here");
+            return;
+        };
+        let view = view.clone();
+        let host = config::host(cx);
+        view.update(cx, |v, _| v.reconcile(&host));
+        let Some(commit) = view.read(cx).current().cloned() else {
+            self.set_notice("nothing selected to revert");
+            return;
+        };
+        let Some(writes) = self.writes() else {
+            self.set_notice("a fixture has no repository to revert in");
+            return;
+        };
+        let job = gitten_app::verbs::Write::revert(&writes.repo, commit.sha.into_bytes());
+        if !writes.send(Box::new(job)) {
             self.set_notice("the job queue is shutting down");
         }
     }
@@ -1679,14 +1808,26 @@ impl DevShell {
                 }
                 JobEvent::Finished {
                     outcome: Err(error),
+                    generation,
                     ..
                 } => {
-                    self.invalidate_refresh();
                     self.running = None;
                     self.error = Some(error.into());
+                    // A refusal is not proof the repository stood still: git
+                    // can answer nonzero with work already left behind, and
+                    // the conflicted revert is the case that proves it — its
+                    // unmerged paths sit in the index waiting for a human,
+                    // who cannot resolve what no pane shows. Nothing on this
+                    // queue reads, so every finish schedules the same
+                    // re-acquire wave a success does.
+                    if generation > self.generation {
+                        self.generation = generation;
+                        self.refresh_stale(cx);
+                    }
                 }
                 JobEvent::Finished {
-                    outcome: Ok(generation),
+                    outcome: Ok(()),
+                    generation,
                     done,
                     ..
                 } => {
@@ -1913,11 +2054,18 @@ impl DevShell {
             "branches.focus" => self.focus_named("branches", cx),
             "commits.open-diff" => self.open_diff(cx),
             "commits.search" => self.begin_search(cx),
+            // History's verbs, aimed at the commit the keyboard is on. Reset
+            // and revert read the pane; the write goes through the queue.
+            "commits.reset-soft" | "commits.reset-mixed" | "commits.reset-hard" => {
+                self.reset_selected(command, cx)
+            }
+            "commits.revert" => self.revert_selected(cx),
             // The working tree's verbs. Context comes from the focused pane,
             // the write from the job queue — and where either is missing, the
             // same honest sentence an unknown command gets.
             "files.stage" => self.stage_or_unstage(cx),
             "files.commit" => self.begin_commit_message(cx),
+            "files.amend" => self.begin_amend_message(cx),
             "files.discard" => self.discard_selected(cx),
             "files.stage-all" => self.stage_all(cx),
             "files.ignore" => self.ignore_selected(cx),
@@ -3305,7 +3453,7 @@ mod tests {
     use std::cell::Cell;
     use std::path::PathBuf;
     use std::rc::Rc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -3403,7 +3551,8 @@ mod tests {
         loop {
             while let Some(event) = runner.try_next() {
                 if let JobEvent::Finished {
-                    outcome: Ok(generation),
+                    generation,
+                    outcome: Ok(()),
                     ..
                 } = event
                 {
@@ -3836,6 +3985,28 @@ mod tests {
         (0..30).map(search_commit).collect()
     }
 
+    /// A commits pane with rows *and* a repository behind it — what the
+    /// history verbs need that the fixture-backed [commits] shell lacks.
+    /// The keyboard starts on row 0, whose sha is forty zeros and whose
+    /// short form is `abc000`.
+    fn history_shell(cx: &mut TestAppContext) -> (gpui::Entity<DevShell>, Arc<RecordingRepo>) {
+        let calls = Arc::default();
+        let repo = Arc::new(RecordingRepo::new(Arc::clone(&calls)));
+        let handle: gitten_git::Handle = repo.clone();
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, cx| {
+            let view = cx.new(|_| Commits::new(search_history(), Rc::new(Host::new())));
+            cx.set_global(config::Active(Rc::new(Host::new())));
+            shell.panes.register(
+                "commits",
+                Screen::commits(view, Source::Fixtures, Generation::default(), "~/src"),
+            );
+            shell.sync_modes();
+            shell.repo = Some((PathBuf::from("/recorded"), handle));
+        });
+        (shell, repo)
+    }
+
     /// [`shell`] is built with an empty pane; this one carries rows, which is
     /// what every search test needs to see move. Replacing by name keeps the
     /// root slot — and focus — exactly where they were.
@@ -4113,6 +4284,10 @@ mod tests {
         /// the distance, push spends ahead. Interior-mutable so a test can
         /// set the starting gap.
         distance: std::sync::Mutex<(u32, u32)>,
+        /// Set when a verb has left the index conflicted — the state a
+        /// refused revert leaves behind, which only the next status read
+        /// reveals. Interior-mutable so a test arms it before the verb runs.
+        conflict: AtomicBool,
     }
 
     impl RecordingRepo {
@@ -4124,11 +4299,19 @@ mod tests {
                     commit: None,
                 }),
                 distance: std::sync::Mutex::new((0, 0)),
+                conflict: AtomicBool::new(false),
             }
         }
 
         fn wrote(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
+        }
+
+        /// Makes the next `revert` refuse the way git does on a conflict:
+        /// nonzero, its own words, and unmerged paths left for the status
+        /// read that follows to find.
+        fn arm_conflict(&self) {
+            self.conflict.store(true, Ordering::SeqCst);
         }
 
         /// Detaches HEAD, for the refusal half of the sync tests.
@@ -4171,6 +4354,16 @@ mod tests {
             // still has changes after a write, and the re-acquire a successful
             // job schedules must find rows to put the keyboard back on.
             let mut tree = Status::default();
+            // The refused revert's leftover: unmerged paths in the index,
+            // found by the re-read the failure schedules.
+            if self.conflict.load(Ordering::SeqCst) {
+                tree.conflicts.push(gitten_core::status::ConflictEntry {
+                    path: "poem.txt".into(),
+                    state: gitten_core::status::ConflictKind::BothModified,
+                    kind: gitten_core::status::Kind::File,
+                    submodule: Default::default(),
+                });
+            }
             tree.staged.push(gitten_core::status::StagedEntry {
                 path: "gone.txt".into(),
                 change: gitten_core::status::Change::Deleted,
@@ -4209,6 +4402,37 @@ mod tests {
 
         fn commit(&self, message: &str) -> gitten_git::Result<String> {
             self.calls.lock().unwrap().push(format!("commit {message}"));
+            Ok("f00d".into())
+        }
+
+        fn reset(
+            &self,
+            mode: gitten_core::refs::ResetMode,
+            target: &[u8],
+        ) -> gitten_git::Result<()> {
+            self.calls.lock().unwrap().push(format!(
+                "reset {} {}",
+                mode.flag(),
+                String::from_utf8_lossy(target)
+            ));
+            Ok(())
+        }
+
+        fn revert(&self, commit: &[u8]) -> gitten_git::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("revert {}", String::from_utf8_lossy(commit)));
+            if self.conflict.load(Ordering::SeqCst) {
+                // git's own sentence for the case, close enough to be
+                // recognised: refused, and the question left in the tree.
+                return Err("error: could not revert 0000000...".into());
+            }
+            Ok(())
+        }
+
+        fn amend(&self, message: &str) -> gitten_git::Result<String> {
+            self.calls.lock().unwrap().push(format!("amend {message}"));
             Ok("f00d".into())
         }
 
@@ -4472,6 +4696,7 @@ mod tests {
                 commit: Some("abc1234".into()),
             }),
             distance: std::sync::Mutex::new((0, 0)),
+            conflict: AtomicBool::new(false),
         });
         let handle: gitten_git::Handle = repo.clone();
         let shell = shell(None, cx);
@@ -4843,13 +5068,16 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_failed_job_lands_on_the_error_band_and_advances_nothing(cx: &mut TestAppContext) {
-        let shell = shell(None, cx);
+    fn a_failed_write_lands_on_the_error_band_and_still_reacquires(cx: &mut TestAppContext) {
+        let (shell, _repo, _handle) = files_shell(cx);
         let submit = wire_runner(&shell, cx);
         assert!(submit.submit(Box::new(Fails)).is_ok());
 
-        // The production pump, not a test-local read of the queue.
+        // The production pump, not a test-local read of the queue — through
+        // the failure *and* the re-acquire wave it schedules, which is the
+        // point: a refused write may have left work behind.
         pump_until(&shell, cx, |shell| shell.error.is_some());
+        cx.run_until_parked();
         shell.read_with(cx, |shell, _| {
             assert_eq!(
                 shell.error.as_deref(),
@@ -4857,11 +5085,11 @@ mod tests {
                 "the repository's own words reached the band"
             );
             assert!(shell.running.is_none(), "the job still reads as running");
-            assert_eq!(
-                shell.generation,
-                Generation::default(),
-                "a failure advanced the generation"
+            assert!(
+                shell.generation > Generation::default(),
+                "a refusal left the panes believing they are current"
             );
+            assert_eq!(shell.refresh_pending, 0, "the wave never came home");
         });
     }
 
@@ -5236,6 +5464,227 @@ mod tests {
         shell.update(cx, |shell, cx| shell.run_command("files.ignore", cx));
         pump_write(&shell, cx);
         assert_eq!(repo.wrote(), vec!["ignore loose.txt"]);
+    }
+
+    // ------------------------------------------------- the history verbs
+
+    #[gpui::test]
+    fn soft_and_mixed_resets_go_straight_through_the_pump(cx: &mut TestAppContext) {
+        let (shell, repo) = history_shell(cx);
+        let target = "0".repeat(40);
+
+        shell.update(cx, |shell, cx| shell.run_command("commits.reset-soft", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec![format!("reset --soft {target}")]);
+        shell.read_with(cx, |shell, _| assert!(shell.generation.get() > 0));
+
+        shell.update(cx, |shell, cx| shell.run_command("commits.reset-mixed", cx));
+        pump_write(&shell, cx);
+        assert_eq!(
+            repo.wrote(),
+            vec![
+                format!("reset --soft {target}"),
+                format!("reset --mixed {target}")
+            ],
+            "neither strength asked twice"
+        );
+    }
+
+    #[gpui::test]
+    fn a_hard_reset_asks_twice_then_rides_the_pump(cx: &mut TestAppContext) {
+        let (shell, repo) = history_shell(cx);
+        let view = match shell.read_with(cx, |shell, _| shell.active().cloned()) {
+            Some(Screen::Commits { view, .. }) => view,
+            _ => panic!("no commits pane"),
+        };
+
+        // First press arms the row the keyboard is on and asks in the band.
+        shell.update(cx, |shell, cx| shell.run_command("commits.reset-hard", cx));
+        std::thread::sleep(Duration::from_millis(50));
+        shell.read_with(cx, |shell, _| {
+            assert!(repo.wrote().is_empty(), "nothing was reset yet");
+            assert!(
+                shell
+                    .notice
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("reset --hard to abc000?"),
+                "the question went unsaid: {:?}",
+                shell.notice
+            );
+        });
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.armed_sha(), Some("0".repeat(40)));
+        });
+
+        // Second press on the same commit spends the arm — and the whole
+        // production path runs: job queued by dispatch, drained by the same
+        // pump the window runs, generation bumped, panes re-acquired.
+        shell.update(cx, |shell, cx| shell.run_command("commits.reset-hard", cx));
+        pump_write(&shell, cx);
+        assert_eq!(
+            repo.wrote(),
+            vec![format!("reset --hard {}", "0".repeat(40))]
+        );
+        shell.read_with(cx, |shell, _| assert!(shell.generation.get() > 0));
+    }
+
+    #[gpui::test]
+    fn a_cursor_move_disarms_a_hard_reset_before_any_yes_can_land(cx: &mut TestAppContext) {
+        let (shell, repo) = history_shell(cx);
+        shell.update(cx, |shell, cx| shell.run_command("commits.reset-hard", cx));
+        std::thread::sleep(Duration::from_millis(50));
+
+        // The keyboard moves off the armed row.
+        shell.update(cx, |shell, cx| {
+            let Some(Screen::Commits { view, .. }) = shell.active() else {
+                panic!("no commits pane");
+            };
+            let host = Rc::new(Host::new());
+            view.update(cx, |v, _| v.run_view("view.down", &host));
+        });
+        shell.update(cx, |shell, cx| shell.run_command("commits.reset-hard", cx));
+        std::thread::sleep(Duration::from_millis(50));
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                repo.wrote().is_empty(),
+                "a stale yes reached a different commit: {:?}",
+                repo.wrote()
+            );
+            // And the question re-armed on the row now under the keyboard.
+            assert!(
+                shell
+                    .notice
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("abc001?"),
+                "{:?}",
+                shell.notice
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn revert_lands_the_inverse_through_the_pump_without_asking(cx: &mut TestAppContext) {
+        let (shell, repo) = history_shell(cx);
+        shell.update(cx, |shell, cx| shell.run_command("commits.revert", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec![format!("revert {}", "0".repeat(40))]);
+        shell.read_with(cx, |shell, _| assert!(shell.generation.get() > 0));
+    }
+
+    #[gpui::test]
+    fn a_conflicted_revert_says_what_git_said_and_shows_what_it_left(cx: &mut TestAppContext) {
+        // Both panes over one repository: the commits pane to aim revert
+        // from — registered last, so it holds the keyboard — and the status
+        // pane that has to show what the refusal left behind.
+        let calls = Arc::default();
+        let repo = Arc::new(RecordingRepo::new(Arc::clone(&calls)));
+        repo.arm_conflict();
+        let handle: gitten_git::Handle = repo.clone();
+        let shell = shell(None, cx);
+        let files = shell.update(cx, |shell, cx| {
+            cx.set_global(config::Active(Rc::new(Host::new())));
+            let files = cx.new(|_| {
+                crate::views::files::Files::from_prepared(crate::views::files::prepare(
+                    Status::default(),
+                    "r",
+                ))
+            });
+            shell.panes.register(
+                "files",
+                Screen::files(files.clone(), Generation::default(), "files"),
+            );
+            let commits = cx.new(|_| Commits::new(search_history(), Rc::new(Host::new())));
+            shell.panes.register(
+                "commits",
+                Screen::commits(commits, Source::Fixtures, Generation::default(), "~/src"),
+            );
+            shell.sync_modes();
+            shell.repo = Some((PathBuf::from("/recorded"), handle));
+            files
+        });
+
+        shell.update(cx, |shell, cx| shell.run_command("commits.revert", cx));
+        pump_until(&shell, cx, |shell| shell.error.is_some());
+        cx.run_until_parked();
+
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                shell
+                    .error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("could not revert"),
+                "git's own words reached the band: {:?}",
+                shell.error
+            );
+        });
+        files.read_with(cx, |f, _| {
+            assert_eq!(
+                f.paths_in(crate::views::files::Section::Conflicts),
+                vec![gitten_core::status::PathBytes::from("poem.txt")],
+                "the unmerged path the revert left is on screen"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn the_history_verbs_say_so_outside_the_commits_pane(cx: &mut TestAppContext) {
+        let (shell, _repo, _handle) = files_shell(cx);
+        for command in ["commits.reset-soft", "commits.reset-hard", "commits.revert"] {
+            shell.update(cx, |shell, cx| shell.run_command(command, cx));
+        }
+        shell.read_with(cx, |shell, _| {
+            assert!(shell
+                .notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not supported here"));
+        });
+    }
+
+    #[gpui::test]
+    fn amend_opens_the_field_and_the_accepted_text_becomes_the_job(cx: &mut TestAppContext) {
+        let (shell, repo, _handle) = files_shell(cx);
+
+        shell.update(cx, |shell, cx| shell.run_command("files.amend", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.input.is_some(), "no field opened");
+            assert_eq!(shell.modes.top(), input::MODE, "the field owns the keys");
+        });
+
+        // Typed text, as the platform would have left it; the real accept
+        // path carries it into the job.
+        shell.update(cx, |shell, cx| {
+            let field = cx.new(|cx| input::Input::new("amend", "amend message", "rewritten", cx));
+            shell.open_input(field, cx);
+            shell.prompt = Some(super::Prompt::AmendMessage);
+        });
+        shell.update(cx, |shell, cx| shell.run_command("input.accept", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["amend rewritten"]);
+    }
+
+    #[gpui::test]
+    fn an_empty_amend_refuses_at_accept_without_submitting_anything(cx: &mut TestAppContext) {
+        let (shell, repo, _handle) = files_shell(cx);
+        shell.update(cx, |shell, cx| shell.run_command("files.amend", cx));
+        shell.update(cx, |shell, cx| shell.run_command("input.accept", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.input.is_none());
+            assert!(
+                shell
+                    .notice
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("message"),
+                "the refusal went unsaid: {:?}",
+                shell.notice
+            );
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(repo.wrote().is_empty());
     }
 
     // ------------------------------------------------------- the branch verbs

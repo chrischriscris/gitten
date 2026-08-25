@@ -10,7 +10,7 @@
 //! the same queue — without a line changing here.
 
 use crate::jobs::Job;
-use gitten_core::refs::{HeadState, Remote};
+use gitten_core::refs::{HeadState, Remote, ResetMode};
 use gitten_git::{Handle, Repo};
 
 /// The write itself: a closure over the trait, so an extension's verb and a
@@ -130,6 +130,40 @@ impl Write {
         Self::named("commit".into(), repo, move |r| {
             r.commit(&message).map(|_| ())
         })
+    }
+
+    /// Rewrites HEAD to hold the staged changes under `message` — commit's
+    /// mechanics aimed one step back. The replacement OID ends here for the
+    /// same reason [`Write::commit`]'s does: the finish line is a generation
+    /// bump, and the new sha arrives with the refreshed pane.
+    pub fn amend(repo: &Handle, message: String) -> Self {
+        Self::named("amend".into(), repo, move |r| r.amend(&message).map(|_| ()))
+            // The rewritten history shows up in a pane that may not be focused —
+            // the key lives over the working tree — so this one says what it did.
+            .announcing("amended HEAD")
+    }
+
+    /// Moves the current branch onto `target`, taking as much of the index
+    /// and working tree along as `mode` says. Soft and mixed keep every
+    /// change on disk or in the reflog; hard destroys unstaged work, which
+    /// is why the caller confirms before this job is ever built.
+    pub fn reset(repo: &Handle, mode: ResetMode, target: Vec<u8>) -> Self {
+        let shown = String::from_utf8_lossy(&target).into_owned();
+        Self::named(format!("reset {} {shown}", mode.flag()), repo, move |r| {
+            r.reset(mode, &target)
+        })
+        // The branch moved somewhere the files pane cannot show; the band
+        // carries the destination, in git's own flag spelling.
+        .announcing(format!("reset {} to {shown}", mode.flag()))
+    }
+
+    /// Undoes one commit by landing its inverse as a new commit. Nothing is
+    /// destroyed — dropping the result undoes the undo — so no confirmation
+    /// precedes it, and a conflict comes back refused in git's own words.
+    pub fn revert(repo: &Handle, commit: Vec<u8>) -> Self {
+        let shown = String::from_utf8_lossy(&commit).into_owned();
+        Self::named(format!("revert {shown}"), repo, move |r| r.revert(&commit))
+            .announcing(format!("reverted {shown}"))
     }
 
     /// Moves HEAD onto the named branch. The name is bytes end to end — what
@@ -396,6 +430,25 @@ mod tests {
             self.0.lock().unwrap().push(format!("commit {message}"));
             Ok("f00d".into())
         }
+        fn reset(&self, mode: ResetMode, target: &[u8]) -> gitten_git::Result<()> {
+            self.0.lock().unwrap().push(format!(
+                "reset {} {}",
+                mode.flag(),
+                String::from_utf8_lossy(target)
+            ));
+            Ok(())
+        }
+        fn revert(&self, commit: &[u8]) -> gitten_git::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("revert {}", String::from_utf8_lossy(commit)));
+            Ok(())
+        }
+        fn amend(&self, message: &str) -> gitten_git::Result<String> {
+            self.0.lock().unwrap().push(format!("amend {message}"));
+            Ok("f00d".into())
+        }
         fn checkout(&self, name: &[u8]) -> gitten_git::Result<()> {
             self.0
                 .lock()
@@ -640,6 +693,73 @@ mod tests {
                 "stash drop stash@3",
             ],
             "the band names are the verbs' own words"
+        );
+    }
+
+    #[test]
+    fn the_history_verbs_reach_the_trait_and_announce_where_history_went() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let repo: Handle = Arc::new(Recording(Arc::clone(&calls)));
+        let runner = Runner::new();
+        let submit = runner.submitter();
+
+        let mut jobs: Vec<Box<dyn Job>> = vec![
+            Box::new(Write::reset(&repo, ResetMode::Soft, b"abc1234".to_vec())),
+            Box::new(Write::reset(&repo, ResetMode::Hard, b"HEAD~1".to_vec())),
+            Box::new(Write::revert(&repo, b"abc1234".to_vec())),
+            Box::new(Write::amend(&repo, "rewritten\n\nbody".into())),
+        ];
+        for job in jobs.drain(..) {
+            assert!(submit.submit(job).is_ok());
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while recorded(&calls).len() < 4 {
+            assert!(
+                Instant::now() < deadline,
+                "jobs did not run: {:?}",
+                recorded(&calls)
+            );
+            std::thread::yield_now();
+        }
+        // The mode travels as the concept, and git's flag spelling is chosen
+        // where git is called — the band borrows it only to speak.
+        assert_eq!(
+            recorded(&calls),
+            vec![
+                "reset --soft abc1234",
+                "reset --hard HEAD~1",
+                "revert abc1234",
+                "amend rewritten\n\nbody",
+            ]
+        );
+
+        let (mut started, mut finished) = (Vec::new(), Vec::new());
+        while let Some(event) = runner.try_next() {
+            match event {
+                Event::Started { name } => started.push(name),
+                Event::Finished { done, .. } => finished.push(done),
+            }
+        }
+        assert_eq!(
+            started,
+            vec![
+                "reset --soft abc1234",
+                "reset --hard HEAD~1",
+                "revert abc1234",
+                "amend"
+            ]
+        );
+        // Their effects land in panes the keyboard was elsewhere over, so
+        // each says what it did and where history went.
+        assert_eq!(
+            finished,
+            vec![
+                Some("reset --soft to abc1234".into()),
+                Some("reset --hard to HEAD~1".into()),
+                Some("reverted abc1234".into()),
+                Some("amended HEAD".into()),
+            ]
         );
     }
 
