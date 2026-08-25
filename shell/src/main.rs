@@ -3498,7 +3498,16 @@ impl Render for DevShell {
                             .then(|| div().flex_none().text_color(rgb(c.accent)).child("loading")),
                     )
             }))
-            .child(main_view.clone());
+            // A flexed box for the view itself: every view roots at
+            // `size_full`, which under this column would read the *container*
+            // height and slide the last rows behind the header without it.
+            .child(
+                div()
+                    .min_h_0()
+                    .flex_grow(1.0)
+                    .overflow_hidden()
+                    .child(main_view.clone()),
+            );
 
         let which = self.active_view_name();
         let strip = self.strip(&host, cx);
