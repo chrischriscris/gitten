@@ -38,11 +38,11 @@ version.
 ```
 
 Everything on the left had at least two implementations before, or — for
-`command` — none that was shared at all. `web/src/rows.rs` and
-`shell/src/views/diff.rs` have not been migrated onto `core::rows` yet, so the row
-flattening has one canonical implementation and two copies that predate it;
-`runs` and `graph` are canonical everywhere except `gitten-web`; `command` is used
-by this client and not yet by the window. See [Still to do](#still-to-do).
+`command` — none that was shared at all. The window now dispatches through
+`command` and builds its rows from `core::rows`, so both are canonical in every
+client but `gitten-web`, which still flattens its own rows and runs — a browser
+tab is the one place the copies survive, and they are worth *knowing about*
+rather than worth fixing. See [Still to do](#still-to-do).
 
 ## The one thing a `Rows` implementation owns
 
@@ -339,12 +339,11 @@ to. A terminal does the same.
 
 ## Still to do
 
-- **Migrating `shell` and `web` onto `core::rows`.** Both still hold their own
-  row flattening and order table. `shell`'s is the harder one: `TextRows` stores
-  `SharedString` so GPUI is handed a refcount bump rather than a copy per frame,
-  so it wants `Flat` plus a parallel table rather than `Flat` alone.
-- **`web` onto `core::runs`.** `web/src/rows.rs::pieces` is `runs` with the gap
-  handling that `runs` now has. This is a deletion.
+- **Migrating `web` onto `core::rows` and `core::runs`.** The window is on both
+  (its order table is `core::rows::Ordered`, its keymap `core::command`);
+  `web/src/rows.rs` is the one flattening left outside `core`, and its `pieces`
+  is `runs` with the gap handling that `runs` now has. Both are deletions once
+  somebody wants them.
 - **`MarkdownRows`.** `core/examples/paint.rs` already draws the furniture in
   ANSI, so the terminal version is that function and a `Rows` impl — and the
   furniture itself is then a fourth thing to lift into `core`.
