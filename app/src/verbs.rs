@@ -218,6 +218,16 @@ impl Write {
         Self::named("rebase abort".into(), repo, |r| r.rebase_abort()).announcing("rebase aborted")
     }
 
+    /// Carries an in-progress rebase onward once a human has resolved
+    /// whatever stopped it — both editors answered `true` by the trait, so
+    /// continuing from here means "carry on with what is here", never
+    /// "open another window". A further conflict comes back refused in
+    /// git's words with the state still standing, ready to be driven again.
+    pub fn rebase_continue(repo: &Handle) -> Self {
+        Self::named("rebase continue".into(), repo, |r| r.rebase_continue())
+            .announcing("rebase continued")
+    }
+
     /// Moves the current branch onto `target`, taking as much of the index
     /// and working tree along as `mode` says. Soft and mixed keep every
     /// change on disk or in the reflog; hard destroys unstaged work, which

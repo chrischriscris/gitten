@@ -6988,6 +6988,35 @@ mod tests {
     }
 
     #[test]
+    fn a_stranded_rebase_is_reached_by_abort_and_put_back() {
+        // A plan whose first line is a squash — the shape compose() once
+        // emitted, and exactly what git refuses with "cannot 'squash'
+        // without a previous commit" — strands the rebase deliberately:
+        // exit nonzero, state left standing. This is the state the
+        // rebase.abort command exists to walk out of.
+        let r = linear_repo("rebase-stranded");
+        let g = r.open();
+        let original = r.rev_parse("main");
+
+        let mut stranded = TodoScript::default();
+        stranded.push_step(Action::Squash, r.rev_parse("HEAD~1").as_bytes());
+        assert!(g
+            .rebase_todo(r.rev_parse("HEAD~3").as_bytes(), &stranded)
+            .is_err());
+        assert!(
+            g.rebase_in_progress(),
+            "git's refusal left its state to be found"
+        );
+
+        // The command's verb, driven directly: everything comes home.
+        g.rebase_abort().expect("abort");
+        assert!(!g.rebase_in_progress());
+        assert_eq!(r.rev_parse("HEAD"), original, "back where it began");
+        let tree = g.status().expect("status");
+        assert!(tree.staged.is_empty() && tree.unstaged.is_empty());
+    }
+
+    #[test]
     fn an_upstream_spelled_like_a_flag_is_refused_before_any_process_runs() {
         let r = linear_repo("rebase-dashes");
         let g = r.open();

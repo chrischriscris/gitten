@@ -461,6 +461,14 @@ impl Keymap {
         bind("commits", "S", "commits.squash-up");
         bind("commits", "F", "commits.fixup-up");
         bind("commits", "d", "commits.drop-commit");
+        // The way out of a stranded rebase — one that stopped mid-flight on
+        // a conflict or a refusal and left its state standing. lazygit
+        // offers these through a menu that appears during a rebase; here
+        // they are two named commands on the history pane's own keys,
+        // capitals because neither is an everyday press and both act on a
+        // rewrite in progress.
+        bind("commits", "A", "rebase.abort");
+        bind("commits", "C", "rebase.continue");
 
         // Text itself belongs to the platform input service. These are the two
         // transitions around it, kept as named commands so a config file can
@@ -853,6 +861,14 @@ impl Commands {
             (
                 "commits.rebase-onto",
                 "move the current branch onto the selected branch, asked twice",
+            ),
+            (
+                "rebase.abort",
+                "give up the rebase in progress and put everything back where it was",
+            ),
+            (
+                "rebase.continue",
+                "carry on the rebase in progress once conflicts are resolved",
             ),
             ("files.focus", "focus the working-tree pane"),
             ("files.stage", "stage or unstage the selected file"),

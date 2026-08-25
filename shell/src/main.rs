@@ -1621,6 +1621,38 @@ impl DevShell {
         }
     }
 
+    /// `rebase.abort` / `rebase.continue`: drive the rebase git is holding
+    /// mid-flight. Abort puts branch, index and working tree back where the
+    /// rewrite started; continue carries it onward once a human has
+    /// resolved whatever stopped it — and a further conflict comes back
+    /// refused in git's words with the state standing, ready to drive again.
+    /// Neither reads a pane and neither asks twice: both only ever mean
+    /// something while a stranded state exists, and git answers "no rebase
+    /// in progress" verbatim when there is none.
+    fn rebase_abort_command(&mut self, _cx: &mut Context<Self>) {
+        let Some(writes) = self.writes() else {
+            self.set_notice("a fixture has no repository to abort in");
+            return;
+        };
+        if !writes.send(Box::new(gitten_app::verbs::Write::rebase_abort(
+            &writes.repo,
+        ))) {
+            self.set_notice("the job queue is shutting down");
+        }
+    }
+
+    fn rebase_continue_command(&mut self, _cx: &mut Context<Self>) {
+        let Some(writes) = self.writes() else {
+            self.set_notice("a fixture has no repository to continue in");
+            return;
+        };
+        if !writes.send(Box::new(gitten_app::verbs::Write::rebase_continue(
+            &writes.repo,
+        ))) {
+            self.set_notice("the job queue is shutting down");
+        }
+    }
+
     /// `commits.rebase-onto`: move the branch HEAD is on onto the row the
     /// keyboard is on — plain rebase, no plan, on the same terms as every
     /// other write: a dirty tree is git's refusal verbatim, a conflict
@@ -2353,6 +2385,11 @@ impl DevShell {
             // commits family — the name says what happens to history; the
             // pane says where the aim comes from.
             "commits.rebase-onto" => self.rebase_branch_selected(cx),
+            // The way out of a stranded rebase. Repository-level like the
+            // sync verbs: whichever pane the keyboard sits over, they act
+            // on the rebase state git is holding, never on a row.
+            "rebase.abort" => self.rebase_abort_command(cx),
+            "rebase.continue" => self.rebase_continue_command(cx),
             // The repository-level sync verbs: whatever pane the keyboard
             // sits over, they act on the branch HEAD is on — which is why
             // their keys are globals.
@@ -4762,6 +4799,11 @@ mod tests {
             Ok(())
         }
 
+        fn rebase_continue(&self) -> gitten_git::Result<()> {
+            self.calls.lock().unwrap().push("rebase continue".into());
+            Ok(())
+        }
+
         fn amend(&self, message: &str) -> gitten_git::Result<String> {
             self.calls.lock().unwrap().push(format!("amend {message}"));
             Ok("f00d".into())
@@ -6437,6 +6479,26 @@ diff --git a/added.txt b/added.txt
         pump_write(&shell, cx);
         assert_eq!(repo.wrote(), vec!["rebase onto other"]);
         shell.read_with(cx, |shell, _| assert!(shell.generation.get() > 0));
+    }
+
+    #[gpui::test]
+    fn abort_and_continue_reach_the_queue_by_their_own_names(cx: &mut TestAppContext) {
+        // The way out of a stranded rebase is two named commands, reachable
+        // whatever pane holds the keyboard — repository-level verbs, like
+        // push and pull. No selection read, no confirmation dance: both
+        // only mean something while git holds a state, and git's own answer
+        // says so when there is none.
+        let (shell, repo) = history_shell(cx);
+
+        shell.update(cx, |shell, cx| shell.run_command("rebase.abort", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["rebase abort"]);
+        shell.read_with(cx, |shell, _| assert!(shell.generation.get() > 0));
+
+        shell.update(cx, |shell, cx| shell.run_command("rebase.continue", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["rebase abort", "rebase continue"]);
+        shell.read_with(cx, |shell, _| assert!(shell.generation.get() > 1));
     }
 
     #[gpui::test]
