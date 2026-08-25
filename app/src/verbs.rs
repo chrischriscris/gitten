@@ -95,6 +95,44 @@ impl Write {
         })
     }
 
+    /// Stages exactly what a synthesized patch describes onto the index —
+    /// `git apply --cached`. The bytes are [`gitten_core::patch::emit`]'s
+    /// output and travel untouched; an empty patch is refused here rather
+    /// than queued, because "nothing selected" is a sentence for now and
+    /// git's answer to zero bytes says nothing at all.
+    pub fn stage_patch(repo: &Handle, patch: Vec<u8>) -> Result<Self, String> {
+        if patch.is_empty() {
+            return Err("an empty patch stages nothing".into());
+        }
+        Ok(Self::named("stage patch".into(), repo, move |r| {
+            r.stage_patch(&patch)
+        }))
+    }
+
+    /// Removes exactly what the patch describes from the index — the
+    /// `--cached --reverse` spelling of [`Write::stage_patch`], on the same
+    /// terms: bytes end to end, emptiness refused before the queue.
+    pub fn unstage_patch(repo: &Handle, patch: Vec<u8>) -> Result<Self, String> {
+        if patch.is_empty() {
+            return Err("an empty patch unstages nothing".into());
+        }
+        Ok(Self::named("unstage patch".into(), repo, move |r| {
+            r.unstage_patch(&patch)
+        }))
+    }
+
+    /// Removes exactly what the patch describes from the working tree —
+    /// `git apply --reverse` without `--cached`, so nothing staged moves.
+    /// DESTRUCTIVE: the caller confirms before this job is ever built.
+    pub fn discard_patch(repo: &Handle, patch: Vec<u8>) -> Result<Self, String> {
+        if patch.is_empty() {
+            return Err("an empty patch discards nothing".into());
+        }
+        Ok(Self::named("discard patch".into(), repo, move |r| {
+            r.discard_patch(&patch)
+        }))
+    }
+
     /// Checks out one path's working-tree state away. DESTRUCTIVE: unstaged
     /// work ends here, which is why the caller confirms before this job is
     /// ever built.
@@ -764,8 +802,110 @@ mod tests {
     }
 
     #[test]
+    fn the_patch_verbs_refuse_empty_and_reach_the_trait_bytes_intact() {
+        // Empty in, refused out — before anything is queued, so no band ever
+        // flashes "running" for work that cannot happen. Non-empty, the
+        // patch travels whole: recorded as raw bytes, because a lossy log
+        // could never tell a pass-through from a mangling.
+        struct Patches(Arc<Mutex<Vec<Vec<u8>>>>);
+
+        impl Repo for Patches {
+            fn log(&self, _: usize) -> gitten_git::Result<Vec<Commit>> {
+                Ok(Vec::new())
+            }
+            fn pairs(&self, _: &str) -> gitten_git::Result<Vec<gitten_git::Pair>> {
+                Ok(Vec::new())
+            }
+            fn status(&self) -> gitten_git::Result<Status> {
+                Ok(Status::default())
+            }
+            fn describe(&self) -> String {
+                "patches".into()
+            }
+            fn stage_patch(&self, p: &[u8]) -> gitten_git::Result<()> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push([b"s".to_vec(), p.to_vec()].concat());
+                Ok(())
+            }
+            fn unstage_patch(&self, p: &[u8]) -> gitten_git::Result<()> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push([b"u".to_vec(), p.to_vec()].concat());
+                Ok(())
+            }
+            fn discard_patch(&self, p: &[u8]) -> gitten_git::Result<()> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push([b"d".to_vec(), p.to_vec()].concat());
+                Ok(())
+            }
+        }
+
+        let calls = Arc::default();
+        let repo: Handle = Arc::new(Patches(Arc::clone(&calls)));
+
+        for verb in ["stage", "unstage", "discard"] {
+            let err = (match verb {
+                "stage" => Write::stage_patch(&repo, Vec::new()),
+                "unstage" => Write::unstage_patch(&repo, Vec::new()),
+                _ => Write::discard_patch(&repo, Vec::new()),
+            })
+            .err()
+            .expect("empty refuses");
+            assert!(err.contains("empty patch"), "{verb}: {err}");
+        }
+        assert!(calls.lock().unwrap().is_empty(), "refusals queued nothing");
+
+        let patch = b"diff --git a/f b/f\n".to_vec();
+        let mut jobs: Vec<Box<dyn Job>> = vec![
+            Box::new(Write::stage_patch(&repo, patch.clone()).expect("non-empty")),
+            Box::new(Write::unstage_patch(&repo, patch.clone()).expect("non-empty")),
+            Box::new(Write::discard_patch(&repo, patch).expect("non-empty")),
+        ];
+        let runner = Runner::new();
+        let submit = runner.submitter();
+        for job in jobs.drain(..) {
+            assert!(submit.submit(job).is_ok());
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while calls.lock().unwrap().len() < 3 {
+            assert!(
+                Instant::now() < deadline,
+                "jobs did not run: {:?}",
+                calls.lock().unwrap()
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                [b"s".to_vec(), b"diff --git a/f b/f\n".to_vec()].concat(),
+                [b"u".to_vec(), b"diff --git a/f b/f\n".to_vec()].concat(),
+                [b"d".to_vec(), b"diff --git a/f b/f\n".to_vec()].concat(),
+            ],
+            "every byte arrived undecoded"
+        );
+
+        // And the running bands say the verbs' own words — there is no path
+        // to name, so the patch is not named either.
+        let mut names = Vec::new();
+        while let Some(event) = runner.try_next() {
+            if let Event::Started { name } = event {
+                names.push(name);
+            }
+        }
+        assert_eq!(names, vec!["stage patch", "unstage patch", "discard patch"]);
+    }
+
+    #[test]
     fn a_failed_write_fails_the_job_without_inventing_words() {
         struct Broken;
+
         impl Repo for Broken {
             fn log(&self, _: usize) -> gitten_git::Result<Vec<Commit>> {
                 Ok(Vec::new())
