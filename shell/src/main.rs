@@ -179,6 +179,11 @@ enum Prompt {
     /// name, the same promise [`Prompt::Search`] keeps: the answer belongs
     /// to the pane it was typed over.
     BranchName { target: String, what: BranchPrompt },
+    /// A tag name gathered over the commits pane: accepting names the commit
+    /// under the keyboard, whose sha is carried from open time so a cursor
+    /// move inside the field cannot re-aim it. The target is the pane
+    /// registration name, same as [`Prompt::BranchName`].
+    TagName { target: String, sha: String },
 }
 
 /// What an accepted [`Prompt::BranchName`] does with its text.
@@ -1043,6 +1048,7 @@ impl DevShell {
             (true, Some(Prompt::BranchName { target, what })) => {
                 self.branch_named(&target, what, text)
             }
+            (true, Some(Prompt::TagName { target, sha })) => self.tag_named(&target, sha, text),
             _ => {}
         }
         cx.notify();
@@ -1533,6 +1539,52 @@ impl DevShell {
         }
     }
 
+    /// `commits.cherry-pick`: apply the commit under the keyboard onto the
+    /// current branch as a new commit. Nothing existing moves and the
+    /// original stays where it is — dropping the copy undoes the pick — so
+    /// there is no confirmation dance; a conflicted pick refuses with git's
+    /// own words and leaves its question in the working tree, found by the
+    /// re-acquire every finish schedules.
+    ///
+    /// Detached HEAD refuses here rather than in git's sentence: a pick
+    /// lands on *the current branch*, and the reader aimed at a row of
+    /// history, so the honest answer names where the result would have gone.
+    fn cherry_pick_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(Screen::Commits { view, .. }) = self.active() else {
+            self.set_notice("commits.cherry-pick is not supported here");
+            return;
+        };
+        let view = view.clone();
+        let host = config::host(cx);
+        // Meet the list where it actually is, like every verb above: a
+        // scrollbar drag moved the offset without moving the cursor.
+        view.update(cx, |v, _| v.reconcile(&host));
+        let Some(commit) = view.read(cx).current().cloned() else {
+            self.set_notice("nothing selected to cherry-pick");
+            return;
+        };
+        let Some(writes) = self.writes() else {
+            self.set_notice("a fixture has no repository to cherry-pick in");
+            return;
+        };
+        use gitten_core::refs::HeadState;
+        match writes.repo.head() {
+            Ok(HeadState::Branch { .. }) => {}
+            Ok(HeadState::Detached { .. }) => {
+                self.set_notice("HEAD is detached here; a cherry-pick needs a branch to land on");
+                return;
+            }
+            Err(e) => {
+                self.set_notice(e);
+                return;
+            }
+        }
+        let job = gitten_app::verbs::Write::cherry_pick(&writes.repo, commit.sha.into_bytes());
+        if !writes.send(Box::new(job)) {
+            self.set_notice("the job queue is shutting down");
+        }
+    }
+
     /// `commits.squash-up` / `commits.fixup-up` / `commits.drop-commit`:
     /// rewrite the branch with the commit under the keyboard folded into
     /// its parent or gone entirely.
@@ -1934,6 +1986,68 @@ impl DevShell {
                 gitten_app::verbs::Write::rename_branch(&writes.repo, from, text.into_bytes())
             }
         };
+        if !writes.send(Box::new(job)) {
+            self.set_notice("the job queue is shutting down");
+        }
+    }
+
+    /// `commits.new-tag`: gather a name over the pane; accept names the
+    /// commit under the keyboard. The sha is captured when the field opens,
+    /// so nothing a cursor does while the field holds the keyboard can
+    /// re-aim the tag.
+    ///
+    /// Tonight's tag is lightweight: the shared field gathers a name and
+    /// nothing else, and an annotated tag wants a message field — a second
+    /// prompt away, not invented here ahead of a pane that asks for it.
+    fn begin_tag_prompt(&mut self, cx: &mut Context<Self>) {
+        let Some(Screen::Commits { view, .. }) = self.active() else {
+            self.set_notice("commits.new-tag is not supported here");
+            return;
+        };
+        let host = config::host(cx);
+        // Meet the list where its last drag left it, like every verb above.
+        view.update(cx, |v, _| v.reconcile(&host));
+        let Some(commit) = view.read(cx).current().cloned() else {
+            self.set_notice("nothing selected to tag");
+            return;
+        };
+        if self.repo.is_none() {
+            self.set_notice("a fixture has no repository to tag in");
+            return;
+        }
+        let input = cx.new(|cx| input::Input::new("new tag", "tag name", "", cx));
+        self.open_input(input, cx);
+        // After `open_input`, which may have cancelled a previous prompt.
+        self.prompt = Some(Prompt::TagName {
+            target: self.panes.focused_name().to_string(),
+            sha: commit.sha,
+        });
+    }
+
+    /// The accepted tag name, as a job. Empty refused again here — the trait
+    /// refuses it too, but saying so beside the field that just closed beats
+    /// making the reader find out twice. A duplicate rides on to git and
+    /// comes back in its words ("tag 'v1' already exists"), which says more
+    /// than a client-side veto would.
+    fn tag_named(&mut self, target: &str, sha: String, text: String) {
+        if text.trim().is_empty() {
+            self.set_notice("a tag needs a name");
+            return;
+        }
+        if self.panes.position(target).is_none() {
+            self.set_notice("the commits pane is gone");
+            return;
+        }
+        let Some(writes) = self.writes() else {
+            self.set_notice("a fixture has no repository to tag in");
+            return;
+        };
+        let job = gitten_app::verbs::Write::create_tag(
+            &writes.repo,
+            text.into_bytes(),
+            sha.into_bytes(),
+            None,
+        );
         if !writes.send(Box::new(job)) {
             self.set_notice("the job queue is shutting down");
         }
@@ -2354,6 +2468,8 @@ impl DevShell {
                 self.reset_selected(command, cx)
             }
             "commits.revert" => self.revert_selected(cx),
+            "commits.cherry-pick" => self.cherry_pick_selected(cx),
+            "commits.new-tag" => self.begin_tag_prompt(cx),
             // History's rewrites, composed over the pane's own window of
             // log and run through the queue. All three ask twice.
             "commits.squash-up" | "commits.fixup-up" | "commits.drop-commit" => {
@@ -4951,6 +5067,31 @@ mod tests {
             Ok(())
         }
 
+        fn cherry_pick(&self, sha: &[u8]) -> gitten_git::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("cherry-pick {}", String::from_utf8_lossy(sha)));
+            Ok(())
+        }
+
+        fn create_tag(
+            &self,
+            name: &[u8],
+            target: &[u8],
+            _message: Option<&str>,
+        ) -> gitten_git::Result<()> {
+            // Lossy on purpose, like every record here: these names are hex
+            // and text and the assertions read them; the byte discipline is
+            // the git crate's own tests to hold.
+            self.calls.lock().unwrap().push(format!(
+                "tag {} at {}",
+                String::from_utf8_lossy(name),
+                String::from_utf8_lossy(target)
+            ));
+            Ok(())
+        }
+
         fn branches(&self) -> gitten_git::Result<Vec<gitten_core::refs::Branch>> {
             let (ahead, behind) = *self.distance.lock().unwrap();
             let mut main = branch_ref("main", true);
@@ -6511,6 +6652,85 @@ diff --git a/added.txt b/added.txt
     }
 
     #[gpui::test]
+    fn cherry_pick_rides_the_pump_and_refuses_a_detached_head(cx: &mut TestAppContext) {
+        // Same terms as revert: nothing existing moves, so no confirmation
+        // dance — the keypress is the job, through production dispatch.
+        let (shell, repo) = history_shell(cx);
+        shell.update(cx, |shell, cx| shell.run_command("commits.cherry-pick", cx));
+        pump_write(&shell, cx);
+        assert_eq!(
+            repo.wrote(),
+            vec![format!("cherry-pick {}", "0".repeat(40))]
+        );
+        shell.read_with(cx, |shell, _| {
+            assert!(shell
+                .notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("picked"));
+        });
+
+        // Detached HEAD refuses before anything is queued: a pick lands on
+        // *the current branch*, and detached means there is none.
+        repo.detach();
+        shell.update(cx, |shell, cx| shell.run_command("commits.cherry-pick", cx));
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(repo.wrote().len(), 1, "nothing was queued");
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                shell
+                    .notice
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("detached"),
+                "the refusal went unsaid: {:?}",
+                shell.notice
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn a_new_tag_opens_the_field_and_the_accepted_text_becomes_the_job(cx: &mut TestAppContext) {
+        let (shell, repo) = history_shell(cx);
+
+        shell.update(cx, |shell, cx| shell.run_command("commits.new-tag", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.input.is_some(), "no field opened");
+            assert_eq!(shell.modes.top(), input::MODE, "the field owns the keys");
+            assert!(matches!(shell.prompt, Some(super::Prompt::TagName { .. })));
+        });
+
+        // Typed text, as the platform would have left it; the real accept
+        // path carries it into the job aimed at the row captured at open.
+        shell.update(cx, |shell, cx| {
+            let field = cx.new(|cx| input::Input::new("new tag", "tag name", "v1", cx));
+            shell.open_input(field, cx);
+            shell.prompt = Some(super::Prompt::TagName {
+                target: "commits".into(),
+                sha: "0".repeat(40),
+            });
+        });
+        shell.update(cx, |shell, cx| shell.run_command("input.accept", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec![format!("tag v1 at {}", "0".repeat(40))]);
+        shell.read_with(cx, |shell, _| assert!(shell.generation.get() > 0));
+
+        // An empty accept refuses beside the field and queues nothing.
+        shell.update(cx, |shell, cx| shell.run_command("commits.new-tag", cx));
+        shell.update(cx, |shell, cx| shell.run_command("input.accept", cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.input.is_none());
+            assert!(
+                shell.notice.as_deref().unwrap_or_default().contains("name"),
+                "the refusal went unsaid: {:?}",
+                shell.notice
+            );
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(repo.wrote().len(), 1, "the empty accept queued nothing");
+    }
+
+    #[gpui::test]
     fn a_conflicted_revert_says_what_git_said_and_shows_what_it_left(cx: &mut TestAppContext) {
         // Both panes over one repository: the commits pane to aim revert
         // from — registered last, so it holds the keyboard — and the status
@@ -6569,7 +6789,13 @@ diff --git a/added.txt b/added.txt
     #[gpui::test]
     fn the_history_verbs_say_so_outside_the_commits_pane(cx: &mut TestAppContext) {
         let (shell, _repo, _handle) = files_shell(cx);
-        for command in ["commits.reset-soft", "commits.reset-hard", "commits.revert"] {
+        for command in [
+            "commits.reset-soft",
+            "commits.reset-hard",
+            "commits.revert",
+            "commits.cherry-pick",
+            "commits.new-tag",
+        ] {
             shell.update(cx, |shell, cx| shell.run_command(command, cx));
         }
         shell.read_with(cx, |shell, _| {

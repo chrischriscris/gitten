@@ -764,6 +764,80 @@ pub trait Repo: Send + Sync {
         false
     }
 
+    /// Applies one commit onto the current branch as a new commit —
+    /// `git cherry-pick <sha>`.
+    ///
+    /// History grows and nothing existing moves, which is why this takes no
+    /// confirmation anywhere: dropping the copy undoes the pick, and the
+    /// original stays exactly where it was. A conflict refuses with git's own
+    /// summary verbatim and leaves its question standing in the working tree
+    /// — unmerged paths in the index, `CHERRY_PICK_HEAD` on disk — which
+    /// [`cherry_pick_in_progress`](Self::cherry_pick_in_progress) finds and
+    /// [`cherry_pick_abort`](Self::cherry_pick_abort) undoes or
+    /// [`cherry_pick_continue`](Self::cherry_pick_continue) drives onward.
+    /// A pick already mid-flight refuses before any process runs: one index,
+    /// one sequencer, and git's own answer to a second start names a state
+    /// rather than the reason.
+    fn cherry_pick(&self, _sha: &[u8]) -> Result<()> {
+        Err(unserved("cherry-picking"))
+    }
+
+    /// Abandons an in-progress cherry-pick and puts everything back:
+    /// `git cherry-pick --abort`. The branch, index and working tree return
+    /// to where they were when the pick started — git's own guarantee, not
+    /// ours.
+    fn cherry_pick_abort(&self) -> Result<()> {
+        Err(unserved("aborting a cherry-pick"))
+    }
+
+    /// Continues an in-progress cherry-pick after a human has resolved
+    /// whatever stopped it: `git cherry-pick --continue`, with the commit
+    /// message editor answered by `true` — continuing from a client means
+    /// "carry on with what is here", never "open another window". A further
+    /// conflict comes back refused verbatim with the state still standing.
+    fn cherry_pick_continue(&self) -> Result<()> {
+        Err(unserved("continuing a cherry-pick"))
+    }
+
+    /// Whether a cherry-pick is mid-flight right now, read from the
+    /// repository's own sequencing state — `CHERRY_PICK_HEAD` for a single
+    /// stopped pick, the `sequencer` directory for a ranged one — resolved
+    /// through `--git-path` so linked worktrees answer for themselves.
+    ///
+    /// The same posture as [`rebase_in_progress`](Self::rebase_in_progress):
+    /// an implementation that cannot see it answers `false`, and every verb
+    /// here asks before it starts rather than trusting a stale answer.
+    fn cherry_pick_in_progress(&self) -> bool {
+        false
+    }
+
+    /// Names `target` with a tag: annotated (`-a`) carrying `message` when
+    /// one is given, lightweight otherwise.
+    ///
+    /// An annotated tag's message rides **stdin** (`--file=-`), never argv —
+    /// prose travels byte-for-byte over the same transport
+    /// [`commit`](Self::commit) uses. Emptiness of the name is refused here,
+    /// because git's answer to it ("not a valid tag name") says nothing a
+    /// field that just closed can act on; dashes are refused before any
+    /// process runs like every name-shaped word; everything else — a
+    /// duplicate above all — is git's sentence, quoted verbatim, because
+    /// "tag 'v1' already exists" is advice the reader acts on.
+    fn create_tag(&self, _name: &[u8], _target: &[u8], _message: Option<&str>) -> Result<()> {
+        Err(unserved("tag creation"))
+    }
+
+    /// Deletes one tag off `name`.
+    ///
+    /// Lighter than it looks: a tag is a name and not a home, so every
+    /// commit it pointed at survives untouched. Nothing built-in aims this
+    /// tonight — no tags pane exists yet to aim it from — so the method sits
+    /// here defaulted for the pane that asks for it by name (a future wave)
+    /// and for any extension that reaches the same trait first.
+    #[allow(dead_code)]
+    fn delete_tag(&self, _name: &[u8]) -> Result<()> {
+        Err(unserved("tag deletion"))
+    }
+
     /// Sends `branch` to `remote`: `git push -q`, plus `--set-upstream`
     /// exactly when the branch tracks nothing yet.
     ///
@@ -1572,6 +1646,66 @@ impl Repo for Binary {
         ["rebase-merge", "rebase-apply"]
             .iter()
             .any(|state| self.git_state_exists(state))
+    }
+
+    fn cherry_pick(&self, sha: &[u8]) -> Result<()> {
+        // One index and one sequencer: a second start cannot share them with
+        // the first, and refusing before any process runs says so in words
+        // that name the way out — finish or abort — where git's own answer
+        // to a second start arrives only after disturbing the first.
+        if self.cherry_pick_in_progress() {
+            return Err("a cherry-pick is already in progress; finish or abort it \
+                 before starting another"
+                .into());
+        }
+        // The sha is a revspec and rides argv like every name-shaped word;
+        // see [`refuse_dashes`] for what stands guard.
+        refuse_dashes(sha)?;
+        run_bytes(&self.root, &[b"cherry-pick", sha]).map(|_| ())
+    }
+
+    fn cherry_pick_abort(&self) -> Result<()> {
+        run_bytes(&self.root, &[b"cherry-pick", b"--abort"]).map(|_| ())
+    }
+
+    fn cherry_pick_continue(&self) -> Result<()> {
+        run_env(
+            &self.root,
+            &[b"cherry-pick", b"--continue"],
+            &[("GIT_EDITOR", "true")],
+        )
+        .map(|_| ())
+    }
+
+    fn cherry_pick_in_progress(&self) -> bool {
+        ["CHERRY_PICK_HEAD", "sequencer"]
+            .iter()
+            .any(|state| self.git_state_exists(state))
+    }
+
+    fn create_tag(&self, name: &[u8], target: &[u8], message: Option<&str>) -> Result<()> {
+        if !nameable(name) {
+            return Err("a tag needs a name".into());
+        }
+        refuse_dashes(name)?;
+        // The target is a revspec and rides argv too; a rev never begins
+        // with `-` any more than a refname does.
+        refuse_dashes(target)?;
+        match message {
+            // `-a --file=-` is `-m`'s stdin spelling: same annotated tag,
+            // prose byte-for-byte instead of an argv-escaping exercise.
+            Some(message) => run_stdin(
+                &self.root,
+                &[b"tag", b"-a", b"--file=-", name, target],
+                message.as_bytes(),
+            ),
+            None => run_bytes(&self.root, &[b"tag", name, target]).map(|_| ()),
+        }
+    }
+
+    fn delete_tag(&self, name: &[u8]) -> Result<()> {
+        refuse_dashes(name)?;
+        run_bytes(&self.root, &[b"tag", b"-d", name]).map(|_| ())
     }
 
     fn push(&self, remote: &[u8], branch: &[u8]) -> Result<()> {
@@ -7048,5 +7182,235 @@ mod tests {
         let err = g.rebase_onto(b"--exec=touch /tmp/x").unwrap_err();
         assert!(err.contains("refused"), "{err}");
         assert_eq!(r.rev_parse("HEAD"), head, "nothing ran");
+    }
+
+    // ------------------------------------------------------- cherry-picking
+
+    #[test]
+    fn a_clean_cherry_pick_grows_the_branch_and_leaves_the_tree_clean() {
+        // side carries one commit of its own; picking it onto main replays
+        // that change as a new commit on main's tip. Nothing moves: side
+        // still points where it did, and main has simply grown.
+        let r = linear_repo("pick-clean");
+        r.git(&["checkout", "-qb", "side", "main"]);
+        r.write("side.txt", b"from side\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "side-one"]);
+        r.git(&["checkout", "-q", "main"]);
+        r.write("main.txt", b"from main\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "main-move"]);
+        let main_tip = r.rev_parse("HEAD");
+        let picked = r.rev_parse("side");
+        let g = r.open();
+        assert!(!g.cherry_pick_in_progress());
+
+        g.cherry_pick(picked.as_bytes()).expect("the pick ran");
+        assert_eq!(
+            subjects(&r),
+            vec!["side-one", "main-move", "three", "two", "one", "base"],
+            "the copy landed on main's tip"
+        );
+        assert_eq!(
+            r.rev_parse("HEAD~1"),
+            main_tip,
+            "the new commit sits exactly one above where main was"
+        );
+        // The change itself arrived, and the tree is clean afterwards.
+        assert!(std::path::Path::new(&r.0).join("side.txt").exists());
+        let tree = g.status().expect("status");
+        assert!(tree.staged.is_empty() && tree.unstaged.is_empty());
+        assert!(!g.cherry_pick_in_progress(), "nothing left standing");
+
+        // And the source branch never moved.
+        assert_eq!(r.rev_parse("side"), picked);
+    }
+
+    #[test]
+    fn a_conflicted_pick_is_found_by_progress_refuses_a_second_and_abort_puts_it_back() {
+        let r = two_branches_editing_one_file("pick-clash");
+        let g = r.open();
+        let before = r.rev_parse("main");
+
+        assert!(g.cherry_pick(r.rev_parse("topic").as_bytes()).is_err());
+        assert!(
+            g.cherry_pick_in_progress(),
+            "git's refusal left its state to be found"
+        );
+        // One sequencer: a second start cannot share the index with the
+        // first, and the refusal says so rather than disturbing it.
+        let err = g.cherry_pick(r.rev_parse("topic").as_bytes()).unwrap_err();
+        assert!(err.contains("already in progress"), "{err}");
+
+        // The conflict itself is in the index, where a status read finds it.
+        let tree = g.status().expect("status");
+        assert_eq!(tree.conflicts.len(), 1, "{tree:?}");
+        assert_eq!(
+            tree.conflicts[0].path.as_bytes(),
+            b"shared.txt",
+            "the unmerged path git stopped on"
+        );
+
+        g.cherry_pick_abort().expect("abort");
+        assert!(!g.cherry_pick_in_progress());
+        assert_eq!(r.rev_parse("HEAD"), before, "back where it began");
+        let tree = g.status().expect("status");
+        assert!(tree.staged.is_empty() && tree.unstaged.is_empty() && tree.conflicts.is_empty());
+    }
+
+    #[test]
+    fn a_resolved_pick_continues_to_a_commit_of_its_own() {
+        let r = two_branches_editing_one_file("pick-continue");
+        let g = r.open();
+
+        assert!(g.cherry_pick(r.rev_parse("topic").as_bytes()).is_err());
+        assert!(g.cherry_pick_in_progress());
+
+        // A human resolves: both lines kept, staged by hand — the exact
+        // state `git cherry-pick --continue` asks for.
+        std::fs::write(
+            std::path::Path::new(&r.0).join("shared.txt"),
+            b"from topic\nfrom main\n",
+        )
+        .expect("the resolution");
+        r.git(&["add", "-A"]);
+
+        g.cherry_pick_continue().expect("continue");
+        assert!(!g.cherry_pick_in_progress(), "nothing left standing");
+        assert_eq!(
+            subjects(&r)[0],
+            "topic-one",
+            "the copy keeps its original subject"
+        );
+        let tree = g.status().expect("status");
+        assert!(tree.staged.is_empty() && tree.unstaged.is_empty());
+    }
+
+    #[test]
+    fn a_sha_spelled_like_a_flag_is_refused_before_any_process_runs() {
+        let r = linear_repo("pick-dashes");
+        let g = r.open();
+        let head = r.rev_parse("HEAD");
+        let err = g.cherry_pick(b"--exec=touch /tmp/x").unwrap_err();
+        assert!(err.contains("refused"), "{err}");
+        assert_eq!(r.rev_parse("HEAD"), head, "nothing ran");
+        assert!(!g.cherry_pick_in_progress());
+    }
+
+    /// Two branches that each rewrote `shared.txt` their own way, ending on
+    /// `main` — the least state a cherry-pick conflict means anything in:
+    /// picking topic's commit onto main collides with main's own rewrite.
+    fn two_branches_editing_one_file(name: &str) -> Scratch {
+        let r = Scratch::new(name);
+        r.write("shared.txt", b"base\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        r.git(&["checkout", "-qb", "topic"]);
+        r.write("shared.txt", b"from topic\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "topic-one"]);
+        r.git(&["checkout", "-q", "main"]);
+        r.write("shared.txt", b"from main\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "main-move"]);
+        r
+    }
+
+    // ---------------------------------------------------------------- tags
+
+    #[test]
+    fn created_tags_read_back_whichever_kind_they_are() {
+        let r = linear_repo("tag-create");
+        let g = r.open();
+        let tip = r.rev_parse("HEAD");
+        let older = r.rev_parse("HEAD~2");
+
+        // Lightweight at HEAD; annotated with a message riding stdin; and
+        // one aimed at an explicit sha from history rather than HEAD.
+        g.create_tag(b"v1", b"HEAD", None).expect("lightweight");
+        g.create_tag(b"v2", b"HEAD", Some("release two\n"))
+            .expect("annotated");
+        g.create_tag(b"at-old", older.as_bytes(), None)
+            .expect("at a sha");
+
+        let got = g.tags().expect("tags");
+        assert_eq!(
+            branch_names_of_tags(&got),
+            vec![b"at-old".as_slice(), b"v1".as_slice(), b"v2".as_slice()],
+            "git's own order, by refname"
+        );
+        for name in [b"v1".as_slice(), b"v2".as_slice()] {
+            let tag = got.iter().find(|t| t.name.as_bytes() == name).unwrap();
+            assert_eq!(
+                tag.commit,
+                tip,
+                "{} names the tip either way",
+                String::from_utf8_lossy(name)
+            );
+        }
+        assert_eq!(
+            got.iter()
+                .find(|t| t.name.as_bytes() == b"at-old")
+                .unwrap()
+                .commit,
+            older,
+            "an explicit sha is aimed at, never silently HEAD"
+        );
+
+        // Cross-checked against git's own picture of the refs, which is how
+        // annotated and lightweight stay two different things and not just
+        // two spellings of our parser: a lightweight tag's object *is* the
+        // commit; an annotated one points at a tag object instead.
+        let out = r.git_os_out(&[
+            "for-each-ref".into(),
+            "--format=%(refname:short) %(objecttype)".into(),
+            "refs/tags".into(),
+        ]);
+        let kinds: Vec<String> = String::from_utf8_lossy(&out)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert!(kinds.iter().any(|l| l == "v1 commit"), "{kinds:?}");
+        assert!(kinds.iter().any(|l| l == "v2 tag"), "{kinds:?}");
+
+        // Deleting at trait level takes the name off and leaves every
+        // commit it pointed at alone.
+        g.delete_tag(b"v1").expect("delete");
+        let got = g.tags().expect("tags after delete");
+        assert_eq!(
+            branch_names_of_tags(&got),
+            vec![b"at-old".as_slice(), b"v2".as_slice()]
+        );
+        assert_eq!(subjects(&r).len(), 4, "deleting a name removes no commits");
+
+        // A missing tag is git's refusal to give, verbatim enough to read.
+        let err = g.delete_tag(b"nope").unwrap_err();
+        assert!(err.contains("not found"), "{err}");
+    }
+
+    #[test]
+    fn a_duplicate_or_unnameable_tag_is_refused_with_the_words_that_act() {
+        let r = linear_repo("tag-refuse");
+        let g = r.open();
+        g.create_tag(b"v1", b"HEAD", None).expect("first");
+
+        // A duplicate is git's sentence, quoted whole — the reader decides
+        // whether to pick another name or delete the old tag first.
+        let err = g.create_tag(b"v1", b"HEAD", Some("again")).unwrap_err();
+        assert!(err.contains("already exists"), "{err}");
+        let err = g.create_tag(b"v1", b"HEAD", None).unwrap_err();
+        assert!(err.contains("already exists"), "{err}");
+
+        // Emptiness is ours, said beside the field that closed; dashes are
+        // ours before any process runs. Both leave nothing behind.
+        let err = g.create_tag(b"", b"HEAD", None).unwrap_err();
+        assert!(err.contains("needs a name"), "{err}");
+        let err = g.create_tag(b"-umalicious", b"HEAD", None).unwrap_err();
+        assert!(err.contains("refused"), "{err}");
+        let err = g.delete_tag(b"--whatever").unwrap_err();
+        assert!(err.contains("refused"), "{err}");
+
+        let got = g.tags().expect("tags");
+        assert_eq!(branch_names_of_tags(&got), vec![b"v1".as_slice()]);
     }
 }

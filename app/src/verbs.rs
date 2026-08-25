@@ -228,6 +228,38 @@ impl Write {
             .announcing("rebase continued")
     }
 
+    /// Applies one commit onto the current branch as a new commit. Nothing
+    /// existing moves — dropping the copy undoes the pick — so no
+    /// confirmation precedes it, and a conflict comes back refused in git's
+    /// own words with its question left standing for
+    /// [`Write::cherry_pick_abort`] or [`Write::cherry_pick_continue`].
+    pub fn cherry_pick(repo: &Handle, sha: Vec<u8>) -> Self {
+        let shown = String::from_utf8_lossy(&sha).into_owned();
+        Self::named(format!("cherry-pick {shown}"), repo, move |r| {
+            r.cherry_pick(&sha)
+        })
+        .announcing(format!("picked {shown}"))
+    }
+
+    /// Abandons an in-progress cherry-pick and puts branch, index and
+    /// working tree back where the pick started — git's own guarantee.
+    /// Nothing here to confirm: it only ever runs after a refusal named the
+    /// state it cleans.
+    pub fn cherry_pick_abort(repo: &Handle) -> Self {
+        Self::named("cherry-pick abort".into(), repo, |r| r.cherry_pick_abort())
+            .announcing("cherry-pick aborted")
+    }
+
+    /// Carries an in-progress cherry-pick onward once a human has resolved
+    /// whatever stopped it; a further conflict comes back refused in git's
+    /// words with the state still standing, ready to drive again.
+    pub fn cherry_pick_continue(repo: &Handle) -> Self {
+        Self::named("cherry-pick continue".into(), repo, |r| {
+            r.cherry_pick_continue()
+        })
+        .announcing("cherry-pick continued")
+    }
+
     /// Moves the current branch onto `target`, taking as much of the index
     /// and working tree along as `mode` says. Soft and mixed keep every
     /// change on disk or in the reflog; hard destroys unstaged work, which
@@ -292,6 +324,32 @@ impl Write {
             repo,
             move |r| r.rename_branch(&from, &to),
         )
+    }
+
+    /// Names `target` with a tag — annotated carrying `message` when one is
+    /// given, lightweight otherwise. The name travels as bytes end to end; a
+    /// duplicate comes back refused in git's own words.
+    pub fn create_tag(
+        repo: &Handle,
+        name: Vec<u8>,
+        target: Vec<u8>,
+        message: Option<String>,
+    ) -> Self {
+        let shown = String::from_utf8_lossy(&name).into_owned();
+        Self::named(format!("tag {shown}"), repo, move |r| {
+            r.create_tag(&name, &target, message.as_deref())
+        })
+    }
+
+    /// Deletes one tag — a name and not a home, so every commit it pointed
+    /// at survives. No tags pane exists yet for anything built-in to aim
+    /// this from; it sits here on the same rails as its siblings so the
+    /// tags pane (a future wave) and any extension reach it through the one
+    /// door, never a private path.
+    #[allow(dead_code)]
+    pub fn delete_tag(repo: &Handle, name: Vec<u8>) -> Self {
+        let shown = String::from_utf8_lossy(&name).into_owned();
+        Self::named(format!("untag {shown}"), repo, move |r| r.delete_tag(&name))
     }
 
     /// Parks the tracked working tree on the stash stack — `git stash push`.

@@ -469,6 +469,18 @@ impl Keymap {
         // rewrite in progress.
         bind("commits", "A", "rebase.abort");
         bind("commits", "C", "rebase.continue");
+        // Cherry-picking the commit under the keyboard onto the current
+        // branch. A free capital beside revert's `t`, for the verb that
+        // shares its shape — history grows, nothing existing moves — and so
+        // takes no confirmation dance either: dropping the copy undoes the
+        // pick.
+        bind("commits", "Y", "commits.cherry-pick");
+        // Naming the commit under the keyboard with a tag, on the same
+        // letter that names branches in their pane. `t` is revert's here and
+        // capital-T is theme.cycle everywhere, so neither was available to
+        // take; shadowing a global in one pane costs more than the letter
+        // buys.
+        bind("commits", "n", "commits.new-tag");
 
         // Text itself belongs to the platform input service. These are the two
         // transitions around it, kept as named commands so a config file can
@@ -870,6 +882,11 @@ impl Commands {
                 "rebase.continue",
                 "carry on the rebase in progress once conflicts are resolved",
             ),
+            (
+                "commits.cherry-pick",
+                "apply this commit onto the current branch as a new commit",
+            ),
+            ("commits.new-tag", "name this commit with a new tag"),
             ("files.focus", "focus the working-tree pane"),
             ("files.stage", "stage or unstage the selected file"),
             ("files.commit", "commit the staged changes"),
@@ -1307,7 +1324,9 @@ mod tests {
         // The reset strengths are lazygit's reset-menu letters — mixed, soft,
         // hard under m, s, h — flattened into three direct bindings. `h`
         // shadows one global here (`view.left`), exactly as [stashes]
-        // shadows `g`/`d`; revert takes lazygit's own `t`.
+        // shadows `g`/`d`; revert takes lazygit's own `t`; cherry-pick takes
+        // the free capital beside it; a tag takes the letter that names
+        // branches in their pane.
         let mut commits = Modes::new();
         commits.push("commits");
         for (chord, name) in [
@@ -1315,6 +1334,8 @@ mod tests {
             ("m", "commits.reset-mixed"),
             ("h", "commits.reset-hard"),
             ("t", "commits.revert"),
+            ("Y", "commits.cherry-pick"),
+            ("n", "commits.new-tag"),
         ] {
             assert_eq!(
                 k.resolve(&commits, &keys(chord)),

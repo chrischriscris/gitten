@@ -446,7 +446,13 @@ mod tests {
         assert!(warn.is_empty(), "{warn:?}");
         // And the shipped verbs ride it without a special line each: a new
         // binding appears in the dump because the dump walks the keymap.
-        for command in ["files.discard", "files.stage-all", "files.ignore"] {
+        for command in [
+            "files.discard",
+            "files.stage-all",
+            "files.ignore",
+            "commits.cherry-pick",
+            "commits.new-tag",
+        ] {
             assert!(
                 !host.keys.keys_for(command).is_empty(),
                 "{command} is bound nowhere in the dumped file"
