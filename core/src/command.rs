@@ -358,8 +358,10 @@ impl Keymap {
         bind(GLOBAL, "l", "view.right");
         bind(GLOBAL, "right", "view.right");
 
-        // lazygit's panel number for files. A direct jump is global so it works
-        // whatever is focused; cycling between panes stays in [panes].
+        // lazygit's panel numbers. A direct jump is global so it works
+        // whatever is focused; each names the list that fills the window's
+        // one list column — nothing opens a second pane any more.
+        bind(GLOBAL, "1", "commits.focus");
         bind(GLOBAL, "2", "files.focus");
         // ...and for branches, lazygit's next panel down.
         bind(GLOBAL, "3", "branches.focus");
@@ -849,7 +851,10 @@ impl Commands {
                 "discard the hunk under the keyboard from the working tree, asked twice",
             ),
             ("theme.cycle", "the next theme"),
-            ("commits.open-diff", "the diff for this commit"),
+            (
+                "commits.open-diff",
+                "show the diff pane, loaded with this commit",
+            ),
             ("commits.search", "search the commits"),
             (
                 "commits.reset-soft",
@@ -904,7 +909,7 @@ impl Commands {
                 "commits.cherry-pick-continue",
                 "carry on the cherry-pick in progress once conflicts are resolved",
             ),
-            ("files.focus", "focus the working-tree pane"),
+            ("files.focus", "swap the working-tree list into the column"),
             ("files.stage", "stage or unstage the selected file"),
             ("files.commit", "commit the staged changes"),
             (
@@ -923,12 +928,13 @@ impl Commands {
                 "files.ignore",
                 "add the selected untracked file to .gitignore",
             ),
-            ("branches.focus", "focus the branches pane"),
+            ("branches.focus", "swap the branches list into the column"),
             ("branches.checkout", "check out the selected branch"),
             ("branches.new", "create a branch"),
             ("branches.rename", "rename the selected branch"),
             ("branches.delete", "delete the selected branch, asked twice"),
-            ("stashes.focus", "focus the stash pane"),
+            ("stashes.focus", "swap the stash list into the column"),
+            ("commits.focus", "swap the commit list into the column"),
             (
                 "files.stash",
                 "park the working tree's changes on the stash stack",
@@ -950,8 +956,8 @@ impl Commands {
             ("repo.fetch", "update the remote-tracking branches"),
             ("input.accept", "accept the text"),
             ("input.cancel", "discard the text"),
-            ("pane.next", "focus the next pane"),
-            ("pane.prev", "focus the previous pane"),
+            ("pane.next", "the next list in the column"),
+            ("pane.prev", "the previous list in the column"),
             ("select.all", "select the whole view"),
             ("select.none", "drop the selection"),
             (
