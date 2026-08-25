@@ -395,6 +395,8 @@ mod tests {
                 status: 'A',
                 old: Vec::new(),
                 new: vec!["fake contents".into()],
+                old_oid: None,
+                new_oid: Some("3333333333333333333333333333333333333333".into()),
                 binary: false,
             }])
         }

@@ -313,6 +313,12 @@ mod tests {
                 status: 'M',
                 old,
                 new,
+                // Constant by construction: this repository does not exist,
+                // so nothing in it can change, which is exactly what makes
+                // the pair's blob identity stable across acquisitions —
+                // and what lets the diff-cache tests observe a hit.
+                old_oid: Some("1111111111111111111111111111111111111111".into()),
+                new_oid: Some("2222222222222222222222222222222222222222".into()),
                 binary: false,
             }])
         }

@@ -1073,6 +1073,10 @@ impl Repo for Binary {
             // the record, the batch alignment, the working-tree read — went
             // through the raw bytes, so what reaches a frontend is the display
             // form of the path git actually named.
+            //
+            // The OIDs ride along under exactly [`fetchable`]'s rule, which is
+            // also how they were chosen for the request list: a side with no
+            // blob behind it has no identity worth keying anything on.
             out.push(Pair {
                 path: c.path.to_string_lossy().into_owned(),
                 old_path: c
@@ -1090,6 +1094,8 @@ impl Repo for Binary {
                 } else {
                     lines(new.as_deref().unwrap_or_default())
                 },
+                old_oid: fetchable(&c.old_mode, &c.old_oid).then(|| c.old_oid.clone()),
+                new_oid: fetchable(&c.new_mode, &c.new_oid).then(|| c.new_oid.clone()),
                 binary,
             });
         }
@@ -1976,6 +1982,10 @@ fn refuse_dashes(name: &[u8]) -> Result<()> {
 /// problem — on this side of the boundary. Handles and not owned strings because
 /// every changed line flows into a `DiffLine` verbatim: one allocation per line,
 /// shared from here to the screen, never copied.
+///
+/// The two OIDs are why acquisition runs `--abbrev=64` at all: they are what
+/// makes a re-diff of an unchanged file skippable, so [`Pair`] carries them
+/// beside the content rather than letting them die in [`RawChange`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pair {
     /// The path as it is now, which is what the diff is labelled with.
@@ -1986,6 +1996,19 @@ pub struct Pair {
     pub status: char,
     pub old: Vec<Arc<str>>,
     pub new: Vec<Arc<str>>,
+    /// The blob the old side came from, or `None` when there is none: a null
+    /// OID (`added`, `deleted`) and a gitlink have no blob in *this*
+    /// repository's object database, and neither does anything read off the
+    /// working tree. Exactly [`fetchable`]'s predicate — one definition of
+    /// "this side is a real blob", not two.
+    ///
+    /// A blob's content never changes, so `(old_oid, new_oid)` names the pair
+    /// of texts above completely; that is what the diff cache keys on.
+    pub old_oid: Option<String>,
+    /// The new side's blob, under the same rule as [`Pair::old_oid`]. An
+    /// untracked file's contents live nowhere but disk, so its new side is
+    /// `None` even though its text is right there in `new`.
+    pub new_oid: Option<String>,
     /// Either side contains a NUL byte. Nothing here can usefully diff it, and
     /// the frontend needs to say so rather than draw mojibake.
     pub binary: bool,
@@ -1998,6 +2021,15 @@ impl Pair {
             Some(old) => format!("{old} → {}", self.path),
             None => self.path.clone(),
         }
+    }
+
+    /// Both OIDs, when both sides are real blobs. Anything else — an added or
+    /// deleted file, a gitlink, an untracked file — is `None`, and a caller
+    /// keying a cache must treat it as *always compute* rather than inventing
+    /// a key from partial identity: one known OID says nothing about the text
+    /// on the other side.
+    pub fn blobs(&self) -> Option<(&str, &str)> {
+        Some((self.old_oid.as_deref()?, self.new_oid.as_deref()?))
     }
 }
 
@@ -2328,6 +2360,11 @@ fn loose_pair(entry: &UntrackedEntry, root: &Path) -> Option<Pair> {
         status: 'A',
         old: Vec::new(),
         new: if binary { Vec::new() } else { lines(&content) },
+        // Nothing on either side is in the object database: an untracked file
+        // is on disk and nowhere else, so there is no OID pair to remember it
+        // by — every diff of it is computed, never cached.
+        old_oid: None,
+        new_oid: None,
         binary,
     })
 }
@@ -4339,6 +4376,8 @@ mod tests {
             status: 'R',
             old: Vec::new(),
             new: Vec::new(),
+            old_oid: None,
+            new_oid: None,
             binary: false,
         };
         assert_eq!(p.label(), "old.rs → new.rs");
