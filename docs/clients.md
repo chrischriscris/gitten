@@ -116,7 +116,8 @@ So a client writes exactly two input-shaped things:
 
 1. **A translation** from its platform's event to `command::Key`. In `gitten-tui`
    that is `term.rs`, forty lines, and it is the only file in the crate that
-   imports `crossterm`.
+   imports `crossterm`; in the window it is `dispatch.rs`, whose whole job is
+   GPUI's keystroke spelling.
 2. **A `match` on command names.** `"view.down" => self.down()`. A name it does
    not handle is a key that does nothing, which is what an unbound key does too —
    so a browser tab ignoring `quit` is not a hole.
@@ -214,10 +215,10 @@ notice a panic in a presentation.
 - **`gitten-web` has no input at all**, so the keymap reaches it only once the
   browser sends keypresses to an endpoint. It has `j`/`k`/`g`/`G` in its own
   script, which is exactly the duplication `core::command` exists to end.
-- **`shell` and `web` still hold their own row flattening.** `core::rows` is the
-  canonical one and `gitten-tui` uses it; the other two predate it. `shell`'s is
-  the harder migration, because `TextRows` stores `SharedString` so GPUI is
-  handed a refcount bump rather than a copy per frame.
+- **`gitten-web` still holds its own row flattening**, and its own copy of
+  `runs`. `core::rows` is canonical everywhere else — the terminal uses it,
+  and the window migrated onto it (`Ordered` plus `RowRef`, so GPUI keeps its
+  refcount-bumped strings and the order table is shared).
 - **Extension loading.** Every seam takes an implementation, and `Host` is
   reachable from a client's `main`, but nothing loads one from outside the
   binary. Today "an extension" means code compiled in — see
