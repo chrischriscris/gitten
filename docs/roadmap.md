@@ -6,9 +6,6 @@ Written 2026-08, when the read side was done and the write side was empty. A
 plan that outlives its first few items is fiction — prune it as they land, and
 distrust anything here that has drifted from the code.
 
-Sizes are gut estimates of session scale (S ≈ an afternoon, M ≈ days,
-L ≈ a week or more), not measurements.
-
 ## Where this stands
 
 The viewer *and* the actor are one program now. Every read goes through the
