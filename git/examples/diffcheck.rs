@@ -116,7 +116,10 @@ fn main() {
         let (mut adds, mut dels, mut hunks) = (0usize, 0usize, 0usize);
         let mut ours_ranges: Vec<(String, Vec<String>)> = Vec::new();
         for p in pairs.iter().filter(|p| !p.binary) {
-            let f = differs.file_using(&Overrides::default(), &p.path, &p.old, &p.new);
+            // `None` for the OIDs: this checker measures the differ, and each
+            // mode runs on a registry built fresh above — a cache could only
+            // make its own timings meaningless.
+            let f = differs.file_using(&Overrides::default(), &p.path, &p.old, &p.new, None);
             ours_ranges.push((p.path.clone(), ranges(&f)));
             hunks += f.hunks.len();
             for l in f.hunks.iter().flat_map(|h| &h.lines) {
@@ -284,7 +287,7 @@ fn report_worst(
     };
     let mut rows: Vec<(isize, String, usize, usize)> = Vec::new();
     for p in pairs.iter().filter(|p| !p.binary) {
-        let ours = count(&differs.file_using(&Overrides::default(), &p.path, &p.old, &p.new));
+        let ours = count(&differs.file_using(&Overrides::default(), &p.path, &p.old, &p.new, None));
         let theirs = theirs
             .iter()
             .find(|f| f.path == p.path || Some(f.path.as_str()) == p.old_path.as_deref())

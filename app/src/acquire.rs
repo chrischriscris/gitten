@@ -525,11 +525,11 @@ mod tests {
     /// A differ that counts how often it was asked, and answers with one
     /// whole-file replace. Shared counter, because the registry takes
     /// ownership of the implementation it is handed.
-    struct Counting(Arc<AtomicUsize>);
+    struct Counting(Arc<AtomicUsize>, &'static str);
 
     impl gitten_core::differ::Differ for Counting {
         fn name(&self) -> &'static str {
-            "counting"
+            self.1
         }
 
         fn diff(
@@ -558,7 +558,8 @@ mod tests {
         // one hunk at any context), which nothing in `pairs` chose.
         let calls = Arc::new(AtomicUsize::new(0));
         let mut host = Host::new();
-        host.differ.register(Counting(Arc::clone(&calls)));
+        host.differ
+            .register(Counting(Arc::clone(&calls), "counting"));
         assert!(
             host.differ.select("counting"),
             "a registered extension algorithm is selectable"
@@ -591,6 +592,67 @@ mod tests {
             3,
             "every file went through the configured differ, once per acquire"
         );
+    }
+
+    /// A refresh after an unrelated write re-acquires everything and re-diffs
+    /// only what changed. Through a real repository that is hard to count;
+    /// through this fake it is exact: the pair's blob OIDs never change, so
+    /// the second acquisition must find its answer waiting.
+    #[test]
+    fn an_unchanged_pair_is_not_diffed_twice_by_repeated_acquisition() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut host = Host::new();
+        host.differ
+            .register(Counting(Arc::clone(&calls), "counting"));
+        assert!(host.differ.select("counting"));
+        let source = Source::Repo {
+            path: PathBuf::from("/nonexistent"),
+            arg: String::new(),
+        };
+        let hunks = |loaded: &Loaded| match &loaded.data {
+            Data::Diff(f) => f[0].hunks.clone(),
+            _ => panic!("a diff view loads files"),
+        };
+
+        let first = reacquire(
+            View::Diff,
+            &source,
+            &host,
+            Some(&Fake::default()),
+            &Overrides::default(),
+        )
+        .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        // The refresh: same repository state, same settings — the shape of
+        // every shell redraw after somebody staged a file elsewhere.
+        let second = reacquire(
+            View::Diff,
+            &source,
+            &host,
+            Some(&Fake::default()),
+            &Overrides::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "the second acquisition hit the cache"
+        );
+        assert_eq!(hunks(&first), hunks(&second), "a hit is what a miss said");
+
+        // A context change re-diffs: the key covers every setting that could
+        // alter the answer, so a stale hunk can never survive one.
+        host.differ.context = 12;
+        reacquire(
+            View::Diff,
+            &source,
+            &host,
+            Some(&Fake::default()),
+            &Overrides::default(),
+        )
+        .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 2, "context moved, so a miss");
     }
 
     #[test]

@@ -2059,9 +2059,13 @@ pub fn diff(
                 path: p.label(),
                 hunks: Vec::new(),
             },
+            // The OIDs go with the text, so a re-diff of an unchanged file —
+            // every refresh after every unrelated write — is remembered work.
+            // A pair without both OIDs computes as always; see
+            // [`Differs::file_using`] for what that covers.
             false => FileDiff {
                 path: p.label(),
-                ..differs.file_using(over, &p.path, &p.old, &p.new)
+                ..differs.file_using(over, &p.path, &p.old, &p.new, p.blobs())
             },
         })
         .collect())
@@ -3524,6 +3528,77 @@ mod tests {
         );
     }
 
+    /// The cache's end-to-end contract, over real git output: an unchanged
+    /// blob pair is diffed once and remembered; a side with no OID — the
+    /// untracked file here — computes every time, because it has no identity
+    /// to be remembered under.
+    #[test]
+    fn a_second_diff_of_the_same_tree_is_remembered_not_recomputed() {
+        use gitten_core::differ::{Differ, Edit};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Counting(Arc<AtomicUsize>);
+        impl Differ for Counting {
+            fn name(&self) -> &'static str {
+                "counting"
+            }
+            fn diff(&self, _p: &str, old: &[Arc<str>], new: &[Arc<str>]) -> Vec<Edit> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                vec![Edit {
+                    old_start: 0,
+                    old_end: old.len() as u32,
+                    new_start: 0,
+                    new_end: new.len() as u32,
+                }]
+            }
+        }
+
+        let r = Scratch::new("cache-e2e");
+        r.write("f.txt", b"one\ntwo\nthree\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "one"]);
+        r.write("f.txt", b"one\nTWO\nthree\nfour\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "two"]);
+        // One more edit, staged but not committed. A clean worktree would leave
+        // the `""` pass holding only the untracked file; a staged one puts in it
+        // a pair whose *both* sides are blobs — old from commit two, new from
+        // the index — which is what gives the worktree pass something to hit.
+        r.write("f.txt", b"one\nTWO\nthree\nfour\nfive\n");
+        r.git(&["add", "-A"]);
+        // Untracked: in no commit and no index, so no OID on either side.
+        r.write("loose.txt", b"untracked\n");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut differs = Differs::builtin();
+        differs.register(Counting(Arc::clone(&calls)));
+        assert!(differs.select("counting"));
+
+        let g = r.open();
+        let first = diff(g.as_ref(), "", &differs, &Overrides::default()).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 2, "cold pass: both files");
+
+        let second = diff(g.as_ref(), "", &differs, &Overrides::default()).unwrap();
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            3,
+            "the committed pair hit (no new call); untracked computed again"
+        );
+        assert_eq!(first, second, "a hit is byte-identical to what a miss said");
+
+        // And a range with nothing loose in it settles completely: the second
+        // pass adds no computation at all.
+        let a = diff(g.as_ref(), "HEAD~1..HEAD", &differs, &Overrides::default()).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 4);
+        let b = diff(g.as_ref(), "HEAD~1..HEAD", &differs, &Overrides::default()).unwrap();
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            4,
+            "same tree twice is one computation"
+        );
+        assert_eq!(a, b);
+    }
+
     #[test]
     fn a_rename_to_a_non_utf8_name_keeps_identity_through_the_read() {
         // Renamed in the index, then edited outside it: the raw record is an
@@ -4339,6 +4414,7 @@ mod tests {
                     "f.txt",
                     &lf,
                     &crlf,
+                    None,
                 )
                 .hunks
                 .len()

@@ -42,10 +42,21 @@
 //! every anchor peels off one line is a 50k-deep recursion, which is a stack
 //! overflow rather than a slow load, and it is not a hypothetical shape — a
 //! generated file with a repeating structure produces exactly it.
+//!
+//! # The cache
+//!
+//! Assembled hunks are remembered against both sides' blob OIDs plus every
+//! setting that reaches the answer — resolved algorithm, whitespace relation,
+//! context, move floor, indent heuristic ([`Cache`]). A blob never changes,
+//! so equal OIDs mean an equal answer, which is why the key can be that small:
+//! the cache changes what a diff costs and never what it says. A side with no
+//! OID — untracked, added or deleted, a gitlink — has no identity to remember
+//! it by and always computes.
 
 use crate::{DiffLine, FileDiff, Hunk, LineKind};
+use std::collections::VecDeque;
 use std::hash::Hasher;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 // ------------------------------------------------------------- the edit script
 
@@ -886,7 +897,7 @@ fn enclosing(old: &[Arc<str>], from: usize) -> Option<&str> {
 /// normalised text still addresses the original lines and the hunks show the real
 /// text. That is also what `git -w` does: a line whose only change was whitespace
 /// comes out as context, showing the version from the old file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Whitespace {
     /// Byte for byte. git's default.
     #[default]
@@ -1508,6 +1519,83 @@ fn score_cmp(a: &Score, b: &Score) -> i64 {
     INDENT_WEIGHT * indents + (a.penalty - b.penalty)
 }
 
+// ----------------------------------------------------------------- the cache
+
+/// How many answers the cache may hold before its oldest entry is forgotten.
+///
+/// An entry count and not a byte count, on purpose: bytes would need a pass
+/// over every hunk to know. 4096 files is far past any one diff — cmux at
+/// `HEAD~120..HEAD` is 482 — and far below anything that could crowd memory,
+/// while a walk of a 500k-commit history commit by commit simply forgets its
+/// beginning instead of growing without bound.
+const CACHE_CAP: usize = 4096;
+
+/// What one cached answer is keyed on: **identity plus every setting that
+/// reaches the answer.**
+///
+/// The OIDs are identity — a blob's content never changes, so the pair names
+/// both sides' text completely, renames included (the hunks of a rename are
+/// computed from content alone; only the *label* carries paths). The rest is
+/// the resolved answer of [`Differs::file_using`] itself: which algorithm ran
+/// *after* routing and overrides, which whitespace relation, and the three
+/// configuration knobs that shape hunks from an edit script.
+///
+/// The key is built in the same function that resolves those values — never
+/// re-derived by a caller — because a second derivation is where drift lives:
+/// a knob added to [`Differs`] tomorrow has to appear here once or every
+/// cached answer after a change of it is a lie. That is also why the path is
+/// *not* in the key: two paths resolving to the same algorithm and relation
+/// with the same blobs genuinely have the same hunks, and `.txt` renamed to
+/// `.rs` changes the routed algorithm, which changes the key on its own.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct Key {
+    old: String,
+    new: String,
+    algorithm: &'static str,
+    whitespace: Whitespace,
+    context: u32,
+    min_moved: u32,
+    indent_heuristic: bool,
+}
+
+/// Bounded, insertion-order-evicting store of assembled answers.
+///
+/// A plain map plus the order keys arrived in. No LRU touching, no per-entry
+/// locks, no reference counting scheme: a hit clones the answer, a miss
+/// computes outside the lock and inserts, and when the cap is crossed the
+/// front of the queue goes. Keys enter the queue exactly once each — only on
+/// the vacant side of an entry — so the queue and the map cannot disagree.
+#[derive(Default)]
+struct Cache {
+    answers: crate::FxHashMap<Key, Vec<Hunk>>,
+    order: VecDeque<Key>,
+}
+
+impl Cache {
+    fn get(&self, key: &Key) -> Option<Vec<Hunk>> {
+        self.answers.get(key).cloned()
+    }
+
+    /// Records an answer, unless another thread recorded it first — two cold
+    /// misses racing compute the same file twice and keep the first result;
+    /// determinism makes them identical, so dropping either is safe and this
+    /// keeps one canonical copy alive for every later clone to come from.
+    fn put(&mut self, key: Key, hunks: Vec<Hunk>) {
+        // One lock guards lookup through insertion, so this check and the
+        // insert below cannot interleave with another thread's.
+        if self.answers.contains_key(&key) {
+            return;
+        }
+        self.order.push_back(key.clone());
+        if self.order.len() > CACHE_CAP {
+            if let Some(oldest) = self.order.pop_front() {
+                self.answers.remove(&oldest);
+            }
+        }
+        self.answers.insert(key, hunks);
+    }
+}
+
 // ---------------------------------------------------------------- the registry
 
 /// Which algorithm each path gets, and how much context its hunks carry.
@@ -1531,6 +1619,16 @@ pub struct Differs {
     /// Slide each change to the most readable of its equivalent positions. On,
     /// as it is in git.
     pub indent_heuristic: bool,
+    /// Assembled answers, keyed on blob pair and settings — see [`Cache`].
+    ///
+    /// Behind an `Arc` so that a clone of the registry — which panes make to
+    /// diff on their own thread — shares this one cache rather than forking
+    /// it, and behind a lock because two panes may refresh at once. The cache
+    /// dies with the registry, i.e. with the host: a config reload rebuilds
+    /// both, and a reload is exactly when context or algorithm may have moved
+    /// anyway. The key covers those settings regardless; the lifetime is
+    /// hygiene, not correctness.
+    cache: Arc<Mutex<Cache>>,
 }
 
 impl Default for Differs {
@@ -1550,6 +1648,7 @@ impl Differs {
             whitespace: Whitespace::Exact,
             min_moved: MIN_MOVED_LINES,
             indent_heuristic: true,
+            cache: Arc::default(),
         };
         d.register(Histogram::default());
         d.register(Patience::default());
@@ -1638,7 +1737,7 @@ impl Differs {
     /// This is what an acquisition layer calls. It never learns which algorithm
     /// ran, which is the point.
     pub fn file(&self, path: &str, old: &[Arc<str>], new: &[Arc<str>]) -> FileDiff {
-        self.file_using(&Overrides::default(), path, old, new)
+        self.file_using(&Overrides::default(), path, old, new, None)
     }
 
     /// The same, with a frontend's live overrides applied.
@@ -1648,20 +1747,93 @@ impl Differs {
     /// `.json` on whatever it was routed to would make the control lie about what
     /// is on screen. A name that is not registered falls back to the configured
     /// behaviour rather than failing, because the caller is a click.
+    ///
+    /// `blobs` is the two sides' blob OIDs when both sides are real blobs in
+    /// the object database — what [`gitten_git::Pair`] carries — and `None`
+    /// when either side has none: a working-tree or null side, a gitlink, or
+    /// any caller without identity to offer. `None` is *always compute*, and
+    /// that is the whole safety story of the cache: partial identity invents
+    /// keys for answers nobody proved.
+    ///
+    /// # The cache, and why the key is built here
+    ///
+    /// A repeated acquisition re-diffs every unchanged file from scratch,
+    /// which is most of the cost of a shell refresh after an unrelated write.
+    /// When `blobs` is present the assembled hunks are remembered under
+    /// `(old_oid, new_oid)` **plus everything this function would otherwise
+    /// compute fresh**: the algorithm actually selected (override, else route,
+    /// else fallback), the whitespace relation in force, context, move floor
+    /// and the indent heuristic. A change to any of them misses, so the cache
+    /// can change what an answer costs but never what it says. See [`Cache`]
+    /// for the store; see [`Key`] for why the path is not in it.
+    ///
+    /// On a hit the hunks are cloned, not shared: one deep-ish copy per file —
+    /// refcount bumps on line text plus a small struct per line — against the
+    /// interning, search, slide and move detection being skipped, microseconds
+    /// against milliseconds. Sharing an `Arc<Vec<Hunk>>` would ripple that
+    /// wrapper through every consumer in three clients to save half of a win
+    /// the clone already banks.
     pub fn file_using(
         &self,
         over: &Overrides,
         path: &str,
         old: &[Arc<str>],
         new: &[Arc<str>],
+        blobs: Option<(&str, &str)>,
     ) -> FileDiff {
+        // The two resolutions below are the answer's actual inputs beyond the
+        // text, which makes them the non-identity part of the cache key. They
+        // happen here, once, and the same values drive both the lookup and the
+        // computation — a caller never re-derives them, because a second
+        // derivation could drift from this one.
         let differ = over
             .algorithm
             .as_deref()
             .and_then(|name| self.by_name(name))
             .unwrap_or_else(|| self.for_path(path));
-
         let ws = over.whitespace.unwrap_or(self.whitespace);
+
+        // No identity, no entry: compute, exactly as before the cache existed.
+        let Some((old_oid, new_oid)) = blobs else {
+            return self.compute(path, differ, old, new, ws);
+        };
+
+        let key = Key {
+            old: old_oid.to_owned(),
+            new: new_oid.to_owned(),
+            algorithm: differ.name(),
+            whitespace: ws,
+            context: self.context as u32,
+            min_moved: self.min_moved as u32,
+            indent_heuristic: self.indent_heuristic,
+        };
+        if let Some(hunks) = self.locked().get(&key) {
+            return FileDiff {
+                path: path.to_owned(),
+                hunks,
+            };
+        }
+
+        let fresh = self.compute(path, differ, old, new, ws);
+        self.locked().put(key, fresh.hunks.clone());
+        fresh
+    }
+
+    fn locked(&self) -> MutexGuard<'_, Cache> {
+        self.cache.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Everything between routing and a `FileDiff`: the equivalence relation's
+    /// keys, then the four stages of [`Self::assemble`]. The only caller of
+    /// both cache paths, so a hit and a miss are provably the same work.
+    fn compute(
+        &self,
+        path: &str,
+        differ: &dyn Differ,
+        old: &[Arc<str>],
+        new: &[Arc<str>],
+        ws: Whitespace,
+    ) -> FileDiff {
         match ws {
             // Byte-for-byte: the lines themselves are the keys, and their
             // handles are already shared.
@@ -2370,7 +2542,7 @@ mod tests {
 
         assert_eq!(d.for_path("x.rs").name(), "reverse");
         let routed = d.file("x.rs", &old, &new);
-        let overridden = d.file_using(&Overrides::algorithm("myers"), "x.rs", &old, &new);
+        let overridden = d.file_using(&Overrides::algorithm("myers"), "x.rs", &old, &new, None);
         assert_ne!(
             routed.hunks[0].lines.len(),
             overridden.hunks[0].lines.len(),
@@ -2380,11 +2552,11 @@ mod tests {
         // An unregistered name is a click that cannot be honoured, so it falls
         // back rather than producing nothing.
         assert_eq!(
-            d.file_using(&Overrides::algorithm("nope"), "x.rs", &old, &new),
+            d.file_using(&Overrides::algorithm("nope"), "x.rs", &old, &new, None),
             routed
         );
         assert_eq!(
-            d.file_using(&Overrides::default(), "x.rs", &old, &new),
+            d.file_using(&Overrides::default(), "x.rs", &old, &new, None),
             routed
         );
     }
@@ -2786,5 +2958,263 @@ mod tests {
             let f = d.file("x", &old, &new);
             assert_eq!(f.hunks[0].lines.len(), 2 + 2 * context, "context {context}");
         }
+    }
+
+    // ---------------------------------------------------------------- cache
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Counts invocations and answers one whole-file replace — the same
+    /// instrument the acquisition tests use, because the property under test
+    /// is "how many times did the differ run", not what it says. Named, so a
+    /// registry can hold two of them and an algorithm override can be
+    /// observed moving work from one to the other.
+    struct Counting(Arc<AtomicUsize>, &'static str);
+
+    impl Differ for Counting {
+        fn name(&self) -> &'static str {
+            self.1
+        }
+        fn diff(&self, _path: &str, old: &[Arc<str>], new: &[Arc<str>]) -> Vec<Edit> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            vec![Edit {
+                old_start: 0,
+                old_end: old.len() as u32,
+                new_start: 0,
+                new_end: new.len() as u32,
+            }]
+        }
+    }
+
+    fn counted() -> (Differs, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut d = Differs::builtin();
+        d.register(Counting(Arc::clone(&calls), "counting"));
+        assert!(d.select("counting"));
+        (d, calls)
+    }
+
+    fn calls(c: &Arc<AtomicUsize>) -> usize {
+        c.load(Ordering::Relaxed)
+    }
+
+    fn sample() -> (Vec<Arc<str>>, Vec<Arc<str>>) {
+        let old: Vec<Arc<str>> = (0..12).map(|i| Arc::from(format!("line {i}"))).collect();
+        let mut new = old.clone();
+        new[4] = "four!".into();
+        (old, new)
+    }
+
+    const OIDS: (&str, &str) = ("aaaa", "bbbb");
+
+    #[test]
+    fn a_second_identical_call_is_a_hit_and_the_differ_never_runs() {
+        let (d, count) = counted();
+        let (old, new) = sample();
+
+        let first = d.file_using(&Overrides::default(), "x.rs", &old, &new, Some(OIDS));
+        assert_eq!(calls(&count), 1);
+
+        // Different line handles, same identity: the whole point is that a
+        // re-acquisition builds fresh `Pair`s whose text happens to be equal.
+        let (old2, new2) = sample();
+        let second = d.file_using(&Overrides::default(), "x.rs", &old2, &new2, Some(OIDS));
+        assert_eq!(calls(&count), 1, "a hit must not reach the differ");
+        assert_eq!(first, second, "a hit must be byte-identical to a miss");
+    }
+
+    #[test]
+    fn every_setting_that_reaches_the_answer_is_in_the_key() {
+        let (mut d, count) = counted();
+        let (old, new) = sample();
+        d.file_using(&Overrides::default(), "x.rs", &old, &new, Some(OIDS));
+        assert_eq!(calls(&count), 1);
+
+        // Context shapes the hunks out of the same script.
+        d.context = 7;
+        d.file_using(&Overrides::default(), "x.rs", &old, &new, Some(OIDS));
+        assert_eq!(calls(&count), 2, "a context change must miss");
+
+        // So does the move floor, even when the script has no moves.
+        d.min_moved = 0;
+        d.file_using(&Overrides::default(), "x.rs", &old, &new, Some(OIDS));
+        assert_eq!(calls(&count), 3, "a min_moved change must miss");
+
+        // And the indent heuristic, which slides the script.
+        d.indent_heuristic = false;
+        d.file_using(&Overrides::default(), "x.rs", &old, &new, Some(OIDS));
+        assert_eq!(calls(&count), 4, "an indent-heuristic change must miss");
+
+        // The algorithm override resolves before the key is built: a second
+        // named counter takes the work, and the fallback's counter does not
+        // move — the miss is visible where the computation landed.
+        let other = Arc::new(AtomicUsize::new(0));
+        d.register(Counting(Arc::clone(&other), "counting2"));
+        d.file_using(
+            &Overrides::algorithm("counting2"),
+            "x.rs",
+            &old,
+            &new,
+            Some(OIDS),
+        );
+        assert_eq!(calls(&other), 1, "the overridden algorithm ran");
+        assert_eq!(calls(&count), 4, "the fallback did not");
+
+        // The whitespace relation changes what the differ compares.
+        d.file_using(
+            &Overrides {
+                whitespace: Some(Whitespace::All),
+                ..Default::default()
+            },
+            "x.rs",
+            &old,
+            &new,
+            Some(OIDS),
+        );
+        // Four fallback misses so far; the override above computed elsewhere.
+        assert_eq!(calls(&count), 5, "a whitespace change must miss");
+    }
+
+    #[test]
+    fn an_oid_change_misses_even_when_no_setting_did() {
+        let (d, count) = counted();
+        let (old, new) = sample();
+        d.file_using(&Overrides::default(), "x.rs", &old, &new, Some(OIDS));
+        d.file_using(
+            &Overrides::default(),
+            "x.rs",
+            &old,
+            &new,
+            Some(("cccc", "dddd")),
+        );
+        assert_eq!(calls(&count), 2, "different blobs are different answers");
+    }
+
+    #[test]
+    fn no_identity_means_always_compute() {
+        let (d, count) = counted();
+        let (old, new) = sample();
+        for _ in 0..3 {
+            d.file_using(&Overrides::default(), "x.rs", &old, &new, None);
+        }
+        assert_eq!(
+            calls(&count),
+            3,
+            "None is bypass: an untracked or half-known pair is never cached"
+        );
+    }
+
+    #[test]
+    fn the_path_is_not_in_the_key_but_the_resolved_algorithm_is() {
+        // Same blobs, same routed algorithm, two names: genuinely the same
+        // hunks — headers and moves come from content alone — so one entry
+        // serves both. A rename that crossed into a differently-routed
+        // extension would change the resolved algorithm and miss instead.
+        let (d, count) = counted();
+        let (old, new) = sample();
+        let a = d.file_using(&Overrides::default(), "a.txt", &old, &new, Some(OIDS));
+        let b = d.file_using(&Overrides::default(), "b.txt", &old, &new, Some(OIDS));
+        assert_eq!(calls(&count), 1);
+        assert_eq!(a.hunks, b.hunks);
+        assert_eq!(d.cache.lock().unwrap().answers.len(), 1);
+
+        // Routing `.rs` elsewhere makes the same blobs a different answer.
+        let mut routed = Differs::builtin();
+        routed.register(Counting(Arc::clone(&count), "counting"));
+        assert!(routed.route(&["rs"], "counting"));
+        routed.select("myers");
+        routed.file_using(&Overrides::default(), "x.rs", &old, &new, Some(OIDS));
+        assert_eq!(calls(&count), 2, "the route changed the resolved algorithm");
+    }
+
+    #[test]
+    fn a_hit_matches_a_fresh_registry_byte_for_byte() {
+        let (d, _) = counted();
+        let (old, new) = sample();
+        let cached = d.file_using(&Overrides::default(), "x.rs", &old, &new, Some(OIDS));
+
+        let (fresh, fresh_count) = counted();
+        let direct = fresh.file_using(&Overrides::default(), "x.rs", &old, &new, None);
+        assert_eq!(calls(&fresh_count), 1, "the comparison registry computed");
+        assert_eq!(cached, direct);
+    }
+
+    #[test]
+    fn the_cap_evicts_oldest_first_and_only_when_crossed() {
+        let (d, count) = counted();
+        let (old, new) = sample();
+        let oids = |n: usize| (format!("old-{n:06}"), format!("new-{n:06}"));
+        let ask = |d: &Differs, n: usize| {
+            let (o, w) = oids(n);
+            d.file_using(
+                &Overrides::default(),
+                "x.rs",
+                &old,
+                &new,
+                Some((o.as_str(), w.as_str())),
+            )
+        };
+
+        // One past the cap: exactly the cap survives, and the first key in is
+        // the first key out.
+        for n in 0..=CACHE_CAP {
+            ask(&d, n);
+        }
+        {
+            let cache = d.cache.lock().unwrap();
+            assert_eq!(cache.answers.len(), CACHE_CAP);
+            assert_eq!(cache.order.len(), CACHE_CAP);
+        }
+        ask(&d, 0);
+        assert_eq!(
+            calls(&count),
+            CACHE_CAP + 2,
+            "the oldest entry was evicted, so it computes again"
+        );
+        // The newest survivor still hits.
+        ask(&d, CACHE_CAP);
+        assert_eq!(calls(&count), CACHE_CAP + 2);
+    }
+
+    #[test]
+    fn two_threads_racing_one_key_agree_and_later_calls_hit() {
+        use std::thread;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut registry = Differs::builtin();
+        registry.register(Counting(Arc::clone(&counter), "counting"));
+        assert!(registry.select("counting"));
+        let d = Arc::new(registry);
+        let (old, new) = sample();
+
+        // Two cold misses at once. The computation runs outside the lock, so
+        // both may compute; determinism makes the answers identical and `put`
+        // keeps whichever landed first. Serialising the computation behind the
+        // lock instead would trade this rare duplicated diff for always
+        // making every pane's refresh wait on every other's — not a trade.
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let d = Arc::clone(&d);
+                let (old, new) = (old.clone(), new.clone());
+                thread::spawn(move || {
+                    d.file_using(&Overrides::default(), "x.rs", &old, &new, Some(OIDS))
+                })
+            })
+            .collect();
+        let results: Vec<FileDiff> = handles
+            .into_iter()
+            .map(|h| h.join().expect("no panic"))
+            .collect();
+
+        assert_eq!(results[0], results[1], "racers must agree byte for byte");
+        let after_race = calls(&counter);
+        assert!(
+            (1..=2).contains(&after_race),
+            "each racer computed at most once: {after_race}"
+        );
+
+        // Whatever the race did, a winner is now the answer of record.
+        d.file_using(&Overrides::default(), "x.rs", &old, &new, Some(OIDS));
+        assert_eq!(calls(&counter), after_race, "settled to a hit");
     }
 }
