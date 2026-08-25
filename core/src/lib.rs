@@ -17,6 +17,7 @@ pub mod host;
 pub mod markdown;
 pub mod patch;
 pub mod prepared;
+pub mod rebase;
 pub mod refs;
 pub mod rows;
 pub mod runs;
