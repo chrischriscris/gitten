@@ -58,8 +58,6 @@ jobs:
       # They passed the whole time; nothing ran them.
       - run: >-
           cargo test -q --locked
-      - run: >-
-          cargo test -q --locked
           -p gitten-core -p gitten-app -p gitten-git -p gitten-web -p gitten-tui
 
   lint:
