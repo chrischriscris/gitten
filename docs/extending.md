@@ -54,12 +54,14 @@ selected, and the commits a drag covered — and it is a whole `Surface`, so a t
 retunes the syntax colours that land on it rather than accepting whatever they
 were.
 
-`s` and `w` are the first real key bindings and are deliberately shaped like the
-last one will be — the view owns a focus handle, the binding is global, the handler is a
-method — so that when dispatch arrives they have something to attach to rather
-than something to replace. Until then the title-bar pickers are how a registry is
-reachable without editing a file; they read the same names `gitten.toml` does, and
-should collapse into a settings panel when there is one.
+`s` and `w` were the first real key bindings and were deliberately shaped like
+every one since — the view owns a focus handle, the binding lives in the shared
+map, the handler is a method — which is why dispatch cost them nothing when it
+arrived. It has arrived: the window translates its keystrokes in
+`dispatch.rs`, resolves through this same map, and hands each pane its commands
+by name. The title-bar pickers remain for registries nothing is bound to yet;
+they read the same names `gitten.toml` does, and should collapse into a
+settings panel when there is one.
 
 ## 1. A language
 
@@ -607,8 +609,17 @@ not have:
   twice. `Key::new` enforces it, so no client can get it wrong.
 
 What a client writes is a translation from its own platform's event to
-`command::Key` — `gitten-tui`'s is `term.rs`, and it is the only file in that
-crate that imports `crossterm`. See [clients.md](clients.md).
+`command::Key` — `gitten-tui`'s is `term.rs`, the only file in that crate
+that imports `crossterm`; the window's is `shell/src/dispatch.rs`, over GPUI
+keystrokes. See [clients.md](clients.md).
+
+**A name is also how a command reaches the repository.** The window's dispatch
+hands each command to its panes together with `Writes` — the retained `Handle`
+and the same job submitter a built-in verb uses. An extension registers a
+name, binds a key, and stages through exactly what `files.stage` does: an
+`app::verbs::Write` job, a generation bump, the re-acquire wave. A test drives
+an extension command through that slot; if a built-in verb cannot be reached
+that way, the seam is broken.
 
 ## 11. A selection your presentation takes part in
 
