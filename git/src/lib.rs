@@ -2531,9 +2531,16 @@ impl Drop for BlobStream {
 /// exist, and reading the working tree for it would diff an added file against
 /// itself and report that nothing changed.
 fn new_side(oid: &str, repo: &Path, path: &[u8]) -> Option<Vec<u8>> {
-    if !is_null_oid(oid) {
-        return None;
-    }
+    // Reached only when the fetch had nothing for the new side. The ordinary
+    // case is a null OID: the content is the working tree's and nowhere else.
+    // The extraordinary case is newer git hashing worktree content for a
+    // rename record (an R068 carrying a real OID for a blob that was never
+    // written to the object database) — the fetch answers "missing", and the
+    // worktree is still the remaining truth. The old side has no equivalent
+    // of either: a null OID there means the file did not exist, and reading
+    // the working tree for it would diff an added file against itself and
+    // report that nothing changed.
+    let _ = oid;
     std::fs::read(join_raw(repo, path)).ok()
 }
 
@@ -2598,7 +2605,7 @@ mod tests {
     /// set up itself: identity (no ambient user), signing off (a machine with
     /// `commit.gpgsign` must not fail these), and the local-file protocol
     /// (submodules over a path, which modern git disables by default).
-    const SCRATCH_CONFIG: [&str; 8] = [
+    const SCRATCH_CONFIG: [&str; 10] = [
         "-c",
         "user.email=t@t",
         "-c",
@@ -2607,6 +2614,12 @@ mod tests {
         "commit.gpgsign=false",
         "-c",
         "status.renames=true",
+        // A machine without a global default names unborn branches `master`,
+        // and a bare repository's HEAD then dangles on it: clones are born on
+        // a branch no push ever named, and `push origin main` cannot resolve.
+        // The tests' branch names are spelled; so is the default.
+        "-c",
+        "init.defaultBranch=main",
     ];
 
     impl Scratch {
@@ -2644,14 +2657,11 @@ mod tests {
             let dir =
                 std::env::temp_dir().join(format!("gitten-git-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
-            let out = Command::new("git")
-                .arg("-C")
-                .arg(std::env::temp_dir())
-                .args(["clone", "-q"])
-                .arg(from)
-                .arg(&dir)
-                .output()
-                .expect("git clone runs");
+            let mut cmd = Command::new("git");
+            cmd.arg("-C").arg(std::env::temp_dir());
+            cmd.args(SCRATCH_CONFIG);
+            cmd.args(["clone", "-q"]).arg(from).arg(&dir);
+            let out = cmd.output().expect("git clone runs");
             assert!(
                 out.status.success(),
                 "clone: {}",
@@ -4531,6 +4541,11 @@ mod tests {
         if !r.plant_raw(b"has space \xe9.txt", b"before\n") {
             return; // this volume validates UTF-8; see the staging read test
         }
+        // Tracked on purpose: `discard` is `checkout --`, and checkout restores
+        // what the index holds. An untracked name is `remove_untracked`'s
+        // caller's decision — a different destruction with no undo.
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "latin-1"]);
 
         let g = r.open();
         r.plant_raw(b"has space \xe9.txt", b"after\n");
