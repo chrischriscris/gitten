@@ -426,8 +426,8 @@ impl Keymap {
         // Resetting to the commit under the keyboard, on lazygit's own three
         // strengths — its reset menu lists mixed, soft, hard under exactly
         // these letters. The menu does not exist here (one keypress, one
-        // command name), so each strength is a binding of its own; `h` and
-        // `s` shadow two globals in this mode, which is the same
+        // command name), so each strength is a binding of its own; `h`
+        // shadows one global (`view.left`) in this mode, the same
         // mode-overrides-global trade [stashes] already makes for `g` and
         // `d`. Hard is the destructive one and confirms twice; soft and
         // mixed keep every change recoverable through reflog or working tree.
@@ -1237,9 +1237,9 @@ mod tests {
         assert!(commands.known("files.amend"));
 
         // The reset strengths are lazygit's reset-menu letters — mixed, soft,
-        // hard under m, s, h — flattened into three direct bindings. `s` and
-        // `h` shadow two globals here, exactly as [stashes] shadows `g`/`d`;
-        // revert takes lazygit's own `t`.
+        // hard under m, s, h — flattened into three direct bindings. `h`
+        // shadows one global here (`view.left`), exactly as [stashes]
+        // shadows `g`/`d`; revert takes lazygit's own `t`.
         let mut commits = Modes::new();
         commits.push("commits");
         for (chord, name) in [

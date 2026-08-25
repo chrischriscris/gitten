@@ -1127,12 +1127,14 @@ impl Repo for Binary {
         // verb means is said, never inherited from a default that could
         // drift. `-q` keeps git's position summary off the error band's road.
         refuse_dashes(target)?;
-        let flag: &[u8] = match mode {
-            ResetMode::Soft => b"--soft",
-            ResetMode::Mixed => b"--mixed",
-            ResetMode::Hard => b"--hard",
-        };
-        run_bytes(&self.root, &[b"reset", b"-q", flag, target]).map(|_| ())
+        // The flag comes from [`ResetMode::flag`] itself — the spelling
+        // lives in `core` beside the type, and this is not a second table
+        // to keep in step with it.
+        run_bytes(
+            &self.root,
+            &[b"reset", b"-q", mode.flag().as_bytes(), target],
+        )
+        .map(|_| ())
     }
 
     fn revert(&self, commit: &[u8]) -> Result<()> {
@@ -5383,11 +5385,12 @@ mod tests {
         // Same refusal an empty commit gets: said here, not discovered in a
         // hook's output afterwards.
         let r = two_commits("amend-empty");
+        let sha = r.rev_parse("HEAD");
         for empty in ["", "  \n\t"] {
             let e = r.open().amend(empty).unwrap_err();
             assert!(e.contains("message"), "{empty:?}: {e}");
         }
-        assert_eq!(r.rev_parse("HEAD"), r.rev_parse("HEAD"), "unmoved");
+        assert_eq!(r.rev_parse("HEAD"), sha, "the refusals left HEAD alone");
     }
 
     // ------------------------------------------------------ the sync verbs

@@ -1808,14 +1808,26 @@ impl DevShell {
                 }
                 JobEvent::Finished {
                     outcome: Err(error),
+                    generation,
                     ..
                 } => {
-                    self.invalidate_refresh();
                     self.running = None;
                     self.error = Some(error.into());
+                    // A refusal is not proof the repository stood still: git
+                    // can answer nonzero with work already left behind, and
+                    // the conflicted revert is the case that proves it — its
+                    // unmerged paths sit in the index waiting for a human,
+                    // who cannot resolve what no pane shows. Nothing on this
+                    // queue reads, so every finish schedules the same
+                    // re-acquire wave a success does.
+                    if generation > self.generation {
+                        self.generation = generation;
+                        self.refresh_stale(cx);
+                    }
                 }
                 JobEvent::Finished {
-                    outcome: Ok(generation),
+                    outcome: Ok(()),
+                    generation,
                     done,
                     ..
                 } => {
@@ -3441,7 +3453,7 @@ mod tests {
     use std::cell::Cell;
     use std::path::PathBuf;
     use std::rc::Rc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -3539,7 +3551,8 @@ mod tests {
         loop {
             while let Some(event) = runner.try_next() {
                 if let JobEvent::Finished {
-                    outcome: Ok(generation),
+                    generation,
+                    outcome: Ok(()),
                     ..
                 } = event
                 {
@@ -4271,6 +4284,10 @@ mod tests {
         /// the distance, push spends ahead. Interior-mutable so a test can
         /// set the starting gap.
         distance: std::sync::Mutex<(u32, u32)>,
+        /// Set when a verb has left the index conflicted — the state a
+        /// refused revert leaves behind, which only the next status read
+        /// reveals. Interior-mutable so a test arms it before the verb runs.
+        conflict: AtomicBool,
     }
 
     impl RecordingRepo {
@@ -4282,11 +4299,19 @@ mod tests {
                     commit: None,
                 }),
                 distance: std::sync::Mutex::new((0, 0)),
+                conflict: AtomicBool::new(false),
             }
         }
 
         fn wrote(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
+        }
+
+        /// Makes the next `revert` refuse the way git does on a conflict:
+        /// nonzero, its own words, and unmerged paths left for the status
+        /// read that follows to find.
+        fn arm_conflict(&self) {
+            self.conflict.store(true, Ordering::SeqCst);
         }
 
         /// Detaches HEAD, for the refusal half of the sync tests.
@@ -4329,6 +4354,16 @@ mod tests {
             // still has changes after a write, and the re-acquire a successful
             // job schedules must find rows to put the keyboard back on.
             let mut tree = Status::default();
+            // The refused revert's leftover: unmerged paths in the index,
+            // found by the re-read the failure schedules.
+            if self.conflict.load(Ordering::SeqCst) {
+                tree.conflicts.push(gitten_core::status::ConflictEntry {
+                    path: "poem.txt".into(),
+                    state: gitten_core::status::ConflictKind::BothModified,
+                    kind: gitten_core::status::Kind::File,
+                    submodule: Default::default(),
+                });
+            }
             tree.staged.push(gitten_core::status::StagedEntry {
                 path: "gone.txt".into(),
                 change: gitten_core::status::Change::Deleted,
@@ -4388,6 +4423,11 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("revert {}", String::from_utf8_lossy(commit)));
+            if self.conflict.load(Ordering::SeqCst) {
+                // git's own sentence for the case, close enough to be
+                // recognised: refused, and the question left in the tree.
+                return Err("error: could not revert 0000000...".into());
+            }
             Ok(())
         }
 
@@ -4656,6 +4696,7 @@ mod tests {
                 commit: Some("abc1234".into()),
             }),
             distance: std::sync::Mutex::new((0, 0)),
+            conflict: AtomicBool::new(false),
         });
         let handle: gitten_git::Handle = repo.clone();
         let shell = shell(None, cx);
@@ -5027,13 +5068,16 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_failed_job_lands_on_the_error_band_and_advances_nothing(cx: &mut TestAppContext) {
-        let shell = shell(None, cx);
+    fn a_failed_write_lands_on_the_error_band_and_still_reacquires(cx: &mut TestAppContext) {
+        let (shell, _repo, _handle) = files_shell(cx);
         let submit = wire_runner(&shell, cx);
         assert!(submit.submit(Box::new(Fails)).is_ok());
 
-        // The production pump, not a test-local read of the queue.
+        // The production pump, not a test-local read of the queue — through
+        // the failure *and* the re-acquire wave it schedules, which is the
+        // point: a refused write may have left work behind.
         pump_until(&shell, cx, |shell| shell.error.is_some());
+        cx.run_until_parked();
         shell.read_with(cx, |shell, _| {
             assert_eq!(
                 shell.error.as_deref(),
@@ -5041,11 +5085,11 @@ mod tests {
                 "the repository's own words reached the band"
             );
             assert!(shell.running.is_none(), "the job still reads as running");
-            assert_eq!(
-                shell.generation,
-                Generation::default(),
-                "a failure advanced the generation"
+            assert!(
+                shell.generation > Generation::default(),
+                "a refusal left the panes believing they are current"
             );
+            assert_eq!(shell.refresh_pending, 0, "the wave never came home");
         });
     }
 
@@ -5527,6 +5571,62 @@ mod tests {
         pump_write(&shell, cx);
         assert_eq!(repo.wrote(), vec![format!("revert {}", "0".repeat(40))]);
         shell.read_with(cx, |shell, _| assert!(shell.generation.get() > 0));
+    }
+
+    #[gpui::test]
+    fn a_conflicted_revert_says_what_git_said_and_shows_what_it_left(cx: &mut TestAppContext) {
+        // Both panes over one repository: the commits pane to aim revert
+        // from — registered last, so it holds the keyboard — and the status
+        // pane that has to show what the refusal left behind.
+        let calls = Arc::default();
+        let repo = Arc::new(RecordingRepo::new(Arc::clone(&calls)));
+        repo.arm_conflict();
+        let handle: gitten_git::Handle = repo.clone();
+        let shell = shell(None, cx);
+        let files = shell.update(cx, |shell, cx| {
+            cx.set_global(config::Active(Rc::new(Host::new())));
+            let files = cx.new(|_| {
+                crate::views::files::Files::from_prepared(crate::views::files::prepare(
+                    Status::default(),
+                    "r",
+                ))
+            });
+            shell.panes.register(
+                "files",
+                Screen::files(files.clone(), Generation::default(), "files"),
+            );
+            let commits = cx.new(|_| Commits::new(search_history(), Rc::new(Host::new())));
+            shell.panes.register(
+                "commits",
+                Screen::commits(commits, Source::Fixtures, Generation::default(), "~/src"),
+            );
+            shell.sync_modes();
+            shell.repo = Some((PathBuf::from("/recorded"), handle));
+            files
+        });
+
+        shell.update(cx, |shell, cx| shell.run_command("commits.revert", cx));
+        pump_until(&shell, cx, |shell| shell.error.is_some());
+        cx.run_until_parked();
+
+        shell.read_with(cx, |shell, _| {
+            assert!(
+                shell
+                    .error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("could not revert"),
+                "git's own words reached the band: {:?}",
+                shell.error
+            );
+        });
+        files.read_with(cx, |f, _| {
+            assert_eq!(
+                f.paths_in(crate::views::files::Section::Conflicts),
+                vec![gitten_core::status::PathBytes::from("poem.txt")],
+                "the unmerged path the revert left is on screen"
+            );
+        });
     }
 
     #[gpui::test]

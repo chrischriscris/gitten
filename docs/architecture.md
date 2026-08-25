@@ -118,7 +118,7 @@ before it can draw, and nothing that draws.
 | `config.rs` | `gitten.toml`: parse, apply, write out, watch |
 | `cli.rs` | `View`, `Source`, `Request`, the usage text, a client's own flags |
 | `acquire.rs` | one view of one source into `Vec<FileDiff>` or `Vec<Commit>`, and re-acquisition after writes |
-| `jobs.rs` | serial blocking jobs, lifecycle events and successful-write generations |
+| `jobs.rs` | serial blocking jobs, lifecycle events and write-finish generations |
 | `lib.rs` | `Startup` — the four lines a client's `main` starts with |
 
 It exists because all of that was written twice and about to be written a third
@@ -224,12 +224,15 @@ Nothing flows backwards, but the tail is re-run: cycling the layout replays
 everything from `prepare` against the same `Vec<FileDiff>`, which is why the view
 keeps it.
 
-A successful background job advances `app::jobs::Generation`. Every visible
+A finished background job advances `app::jobs::Generation` — a refusal as much
+as a success, because git can answer nonzero with work already left behind (a
+conflicted revert leaves its unmerged paths in the index). Every visible
 repository pane re-acquires through the retained `Repo` handle and replaces its
 data in place while preserving its semantic cursor anchors. Each pane supplies a
 type-erased `Refresh`: blocking acquisition and pure row/graph preparation run on
-the background executor, then a generation-guarded apply touches its GPUI entity. A
-failed or panicked write emits an error and does not advance the generation.
+the background executor, then a generation-guarded apply touches its GPUI entity.
+A failed or panicked write emits an error and schedules the same re-acquire wave,
+so the panes show the state the refusal left rather than the state they remember.
 
 A view never mutates what it was handed, which is why every stage above is
 testable without a window and why `paint.rs` can join the pipeline one stage from

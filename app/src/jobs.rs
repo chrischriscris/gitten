@@ -50,7 +50,12 @@ impl Submitter {
     }
 }
 
-/// The repository state produced by successful jobs.
+/// How many writes have come back from the queue.
+///
+/// A success moved the repository for certain; a refusal only *may* have —
+/// git can answer nonzero with work already left behind, a conflicted
+/// revert being the case that proves it. Both advance the count, because
+/// both are reasons for every pane holding repository state to read again.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Generation(u64);
 
@@ -64,7 +69,8 @@ impl Generation {
     }
 }
 
-/// A worker lifecycle event. Only a successful finish carries a new generation.
+/// A worker lifecycle event. Every finish carries the finish count — a
+/// refusal as much as a success, for the reason [`Generation`] gives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     Started {
@@ -72,7 +78,8 @@ pub enum Event {
     },
     Finished {
         name: String,
-        outcome: Result<Generation, String>,
+        generation: Generation,
+        outcome: Result<(), String>,
         /// The job's own [`confirmation`](Job::confirmation), read off it
         /// before it ran and forwarded verbatim. A client decides what to do
         /// with one — shown only beside a success is the usual answer.
@@ -135,15 +142,17 @@ fn worker(commands: Receiver<Message>, events: Sender<Event>) {
         let done = job.confirmation();
         let _ = events.send(Event::Started { name: name.clone() });
         let outcome = match catch_unwind(AssertUnwindSafe(|| job.run())) {
-            Ok(Ok(())) => {
-                generation = generation.next();
-                Ok(generation)
-            }
+            Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => Err(error),
             Err(payload) => Err(format!("job panicked: {}", panic_text(&payload))),
         };
+        // Counted either way: the client cannot tell a clean refusal from
+        // one that moved the repository on its way out, so both are a new
+        // state for the panes to catch up with.
+        generation = generation.next();
         let _ = events.send(Event::Finished {
             name,
+            generation,
             outcome,
             done,
         });
@@ -196,7 +205,7 @@ mod tests {
     }
 
     #[test]
-    fn jobs_are_fifo_and_only_success_advances_the_generation() {
+    fn jobs_are_fifo_and_every_finish_advances_the_generation() {
         let runner = Runner::new();
         let submit = runner.submitter();
         let ran = Arc::new(Mutex::new(Vec::new()));
@@ -214,13 +223,17 @@ mod tests {
         assert!(matches!(
             events[1],
             Event::Finished {
-                outcome: Ok(Generation(1)),
+                generation: Generation(1),
+                outcome: Ok(()),
                 ..
             }
         ));
+        // The refusal counts too: a conflicted revert answers nonzero with
+        // unmerged paths left behind, and the panes must re-read to see them.
         assert!(matches!(
             events[3],
             Event::Finished {
+                generation: Generation(2),
                 outcome: Err(_),
                 ..
             }
@@ -228,7 +241,8 @@ mod tests {
         assert!(matches!(
             events[5],
             Event::Finished {
-                outcome: Ok(Generation(2)),
+                generation: Generation(3),
+                outcome: Ok(()),
                 ..
             }
         ));
@@ -257,6 +271,7 @@ mod tests {
             receive(&runner, 2).pop(),
             Some(Event::Finished {
                 name: "announce".into(),
+                generation: Generation(1),
                 outcome: Err("declined".into()),
                 done: Some("sent".into()),
             })
@@ -326,9 +341,12 @@ mod tests {
             }))
             .is_ok());
         let events = receive(&runner, 4);
+        // The panic counts as a finish too — the worker's count is of
+        // answers, and the job after it comes back as the second one.
         assert!(matches!(
             events[1],
             Event::Finished {
+                generation: Generation(1),
                 outcome: Err(_),
                 ..
             }
@@ -336,7 +354,8 @@ mod tests {
         assert!(matches!(
             events[3],
             Event::Finished {
-                outcome: Ok(Generation(1)),
+                generation: Generation(2),
+                outcome: Ok(()),
                 ..
             }
         ));
