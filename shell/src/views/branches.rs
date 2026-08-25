@@ -444,6 +444,16 @@ impl Branches {
     /// (returns false); second call on the same target spends the arm and
     /// acts (returns true); anything else re-arms and asks again.
     pub(crate) fn confirm_or_arm_delete(&mut self, target: &Target) -> bool {
+        self.arm(target)
+    }
+
+    /// The same dance for `commits.rebase-onto`, over the one arm slot the
+    /// pane holds: arming anything else moves the question.
+    pub(crate) fn confirm_or_arm_rebase(&mut self, target: &Target) -> bool {
+        self.arm(target)
+    }
+
+    fn arm(&mut self, target: &Target) -> bool {
         let already = self.armed.as_ref() == Some(target);
         self.armed = match already {
             true => None,

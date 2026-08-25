@@ -52,6 +52,11 @@ use gitten_core::status::{
     UnstagedEntry, UntrackedEntry,
 };
 use gitten_core::{parse_log, Commit, FileDiff};
+
+/// The interactive-rebase plan, re-exported because it appears on the
+/// [`Repo`] trait: an implementor should not need to know which crate
+/// spelled it.
+pub use gitten_core::rebase::TodoScript;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
@@ -158,6 +163,104 @@ fn display_args(args: &[&[u8]]) -> String {
         .map(|a| String::from_utf8_lossy(a).into_owned())
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// [`run_bytes`] with environment set for the one process.
+///
+/// The rebase verbs are its only callers tonight, and for a reason worth
+/// keeping rare: environment is process-wide state by another name, and the
+/// one legitimate use here is pointing git's *editor* at something that
+/// answers without a human — never at changing what git itself reads.
+fn run_env(repo: &Path, args: &[&[u8]], env: &[(&str, &str)]) -> Result<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut command = Command::new("git");
+    command.arg("-C").arg(repo);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let out = command
+        .args(args.iter().map(|a| std::ffi::OsStr::from_bytes(a)))
+        .output()
+        .map_err(|e| format!("could not run git: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git {}: {}",
+            display_args(args),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(out.stdout)
+}
+
+/// Writes a plan to one freshly created temp file and names it.
+///
+/// Three properties, because this file carries commit subjects and lives in
+/// a directory other users may be able to write:
+///
+/// **`create_new`** — the create fails if anything already sits at the
+/// path, so a pre-planted file or symlink cannot be clobbered with a plan
+/// it did not hold (CWE-377's classic shape); we simply pick another name.
+///
+/// **An unguessable name** — process id, clock nanoseconds and a sequence
+/// counter together, so nobody can win the race by predicting where the
+/// next plan will land.
+///
+/// **`0600`** — the owner reads it, and nobody else, whatever the umask or
+/// the platform default for new files would have said.
+///
+/// The file exists only for the length of the rebase process; uniqueness
+/// is per call rather than per process, because two rebases queued behind
+/// each other on the job thread must not share a plan.
+fn write_todo_tmpfile(script: Vec<u8>) -> Result<PathBuf> {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.subsec_nanos())
+        .unwrap_or(0);
+    for attempt in 0..4 {
+        let mut at = std::env::temp_dir();
+        at.push(format!(
+            "gitten-todo-{}-{:x}-{:x}-{:x}",
+            std::process::id(),
+            nanos,
+            attempt,
+            SEQ.fetch_add(1, Ordering::Relaxed),
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&at)
+        {
+            Ok(file) => {
+                // Private before the first byte lands, not after.
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                    .map_err(|e| format!("could not lock down {}: {e}", at.display()))?;
+                (&file)
+                    .write_all(&script)
+                    .map_err(|e| format!("could not write {}: {e}", at.display()))?;
+                return Ok(at);
+            }
+            // Somebody (or something) got there first: another name, not a
+            // fight over theirs.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("could not create {}: {e}", at.display())),
+        }
+    }
+    Err("could not create a private todo tempfile after four attempts".into())
+}
+
+/// A path as one shell word. Temp directories do not usually need the
+/// quotes; a machine whose `$TMPDIR` has a space in it does, and quoting a
+/// path that did not need it costs nothing.
+///
+/// The single-quote form cannot represent an embedded quote itself, so those
+/// are spelled the standard way: close, an escaped literal quote, reopen.
+fn shell_quote(raw: &[u8]) -> String {
+    let text = String::from_utf8_lossy(raw);
+    format!("'{}'", text.replace('\'', r"'\''"))
 }
 
 /// The repository's top level. `--raw` and `--porcelain` paths are relative to
@@ -585,6 +688,80 @@ pub trait Repo: Send + Sync {
     /// guard arrives when the ahead/behind read can be asked honestly.
     fn amend(&self, _message: &str) -> Result<String> {
         Err(unserved("amending"))
+    }
+
+    /// Rewrites history by handing git a plan: `git rebase -i <upstream>`
+    /// with the sequencer editor replaced by a command that installs
+    /// [`script`](gitten_core::rebase::TodoScript).
+    ///
+    /// Interactive rebase is git's own machinery for rewriting a stretch of
+    /// history — reorder, squash, fixup, drop, run shell commands between
+    /// picks — and the *only* honest way to drive it is to let git keep that
+    /// machinery and script the one human moment in it. Git generates its
+    /// plan into `.git/rebase-merge/git-rebase-todo` and opens it with
+    /// `$GIT_SEQUENCE_EDITOR <todo>`; this verb points that variable at
+    /// `cp <our file>`, which overwrites git's plan with ours and exits 0.
+    /// No editor runs, no reentry happens, hooks and `.gitconfig` behave as
+    /// they would at a terminal — because it is one. (`GIT_EDITOR` is set to
+    /// `true`: a `squash` opens it on a message git has already assembled,
+    /// and accepting that text is what keeps git's own concatenation rule
+    /// while nothing waits on a prompt.)
+    ///
+    /// The script travels through [`gitten_core::rebase`], which refuses
+    /// anything that would need a *human* editor mid-rebase (`reword`,
+    /// `edit`) before any process runs; a hung background job waiting on an
+    /// invisible prompt is the failure this ordering exists to prevent.
+    ///
+    /// No autostash, deliberately: a dirty tree is git's refusal ("you have
+    /// unstaged changes"), surfaced verbatim, because stashing work behind a
+    /// keypress that said *rebase* hides exactly the state the reader should
+    /// decide about. A conflict mid-rewrite exits nonzero with
+    /// `.git/rebase-merge/` left standing — also verbatim — and the tree in
+    /// whatever state git stopped it at; [`rebase_in_progress`](Self::rebase_in_progress)
+    /// detects that state and [`rebase_abort`](Self::rebase_abort) undoes it,
+    /// which keeps the human in charge of the one part of a rebase no client
+    /// should automate.
+    fn rebase_todo(&self, _upstream: &[u8], _script: &TodoScript) -> Result<()> {
+        Err(unserved("interactive rebase"))
+    }
+
+    /// Moves the current branch onto `upstream`, replaying its own commits:
+    /// plain `git rebase -q <upstream>`, no plan involved.
+    ///
+    /// The non-interactive sibling of [`rebase_todo`](Self::rebase_todo) on
+    /// purpose — same refusals (a dirty tree is git's sentence), same
+    /// conflict story (nonzero exit, state left standing, the human drives),
+    /// no force anywhere: commits already pushed come back refused when the
+    /// upstream has them, which is git deciding rather than us.
+    fn rebase_onto(&self, _upstream: &[u8]) -> Result<()> {
+        Err(unserved("rebasing"))
+    }
+
+    /// Abandons an in-progress rebase and puts everything back:
+    /// `git rebase --abort`. The branch, index and working tree return to
+    /// where they were when it started — git's own guarantee, not ours.
+    fn rebase_abort(&self) -> Result<()> {
+        Err(unserved("aborting a rebase"))
+    }
+
+    /// Continues an in-progress rebase after a human has resolved whatever
+    /// stopped it: `git rebase --continue`. Both editors are answered with
+    /// `true` — the sequencer todo stands as git wrote it and commit messages
+    /// keep their generated text — because continuing from a client means
+    /// "carry on with what is here", never "open another window".
+    fn rebase_continue(&self) -> Result<()> {
+        Err(unserved("continuing a rebase"))
+    }
+
+    /// Whether a rebase is mid-flight right now, read from the repository's
+    /// own state directories (`rebase-merge` / `rebase-apply`, resolved
+    /// through `--git-path` so linked worktrees answer for themselves).
+    ///
+    /// An implementation that cannot see it answers `false` — the same
+    /// posture as a read answering an empty list — and every verb here asks
+    /// before it starts rather than trusting a stale answer.
+    fn rebase_in_progress(&self) -> bool {
+        false
     }
 
     /// Sends `branch` to `remote`: `git push -q`, plus `--set-upstream`
@@ -1332,6 +1509,71 @@ impl Repo for Binary {
         self.commit_via(&[b"commit", b"--amend", b"-q", b"--file=-"], message)
     }
 
+    fn rebase_todo(&self, upstream: &[u8], script: &TodoScript) -> Result<()> {
+        // The plan is checked before anything runs: a refusal that names the
+        // action beats a background job hung on an editor nobody can see.
+        script.validate()?;
+        if self.rebase_in_progress() {
+            return Err(
+                "a rebase is already in progress; finish or abort it before \
+                 starting another"
+                    .into(),
+            );
+        }
+        refuse_dashes(upstream)?;
+        let todo = write_todo_tmpfile(script.emit())?;
+        // git runs the sequencer editor as `$EDITOR <todo>`, through the
+        // shell. `cp <ours>` takes the todo path as its second argument,
+        // overwrites it with our plan and exits 0 — an editor that always
+        // agrees with us. The temp path rides as bytes: a `$TMPDIR` with an
+        // odd byte in it is unusual, not impossible.
+        //
+        // `GIT_EDITOR=true` answers the *second* editor: a `squash` opens it
+        // on a message template git already filled in, and `true` accepts
+        // that text untouched — which is precisely what keeps git's own
+        // message-concatenation rule while nothing blocks on a prompt.
+        let editor = {
+            use std::os::unix::ffi::OsStrExt;
+            format!("cp {}", shell_quote(todo.as_os_str().as_bytes()))
+        };
+        let result = run_env(
+            &self.root,
+            &[b"rebase", b"-i", upstream],
+            &[("GIT_SEQUENCE_EDITOR", &editor[..]), ("GIT_EDITOR", "true")],
+        );
+        let _ = std::fs::remove_file(&todo);
+        result.map(|_| ())
+    }
+
+    fn rebase_onto(&self, upstream: &[u8]) -> Result<()> {
+        refuse_dashes(upstream)?;
+        run_bytes(&self.root, &[b"rebase", b"-q", upstream]).map(|_| ())
+    }
+
+    fn rebase_abort(&self) -> Result<()> {
+        run_env(
+            &self.root,
+            &[b"rebase", b"--abort"],
+            &[("GIT_SEQUENCE_EDITOR", "true")],
+        )
+        .map(|_| ())
+    }
+
+    fn rebase_continue(&self) -> Result<()> {
+        run_env(
+            &self.root,
+            &[b"rebase", b"--continue"],
+            &[("GIT_SEQUENCE_EDITOR", "true"), ("GIT_EDITOR", "true")],
+        )
+        .map(|_| ())
+    }
+
+    fn rebase_in_progress(&self) -> bool {
+        ["rebase-merge", "rebase-apply"]
+            .iter()
+            .any(|state| self.git_state_exists(state))
+    }
+
     fn push(&self, remote: &[u8], branch: &[u8]) -> Result<()> {
         refuse_dashes(remote)?;
         refuse_dashes(branch)?;
@@ -1445,6 +1687,28 @@ impl Binary {
         run(&self.root, &["rev-parse", "-q", "--verify", "stash@{0}"])
             .ok()
             .map(|oid| lossy(trimmed(&oid)))
+    }
+
+    /// Whether one of git's sequencing state directories exists —
+    /// `rebase-merge` for the modern interactive rebase, `rebase-apply` for
+    /// `am`-shaped ones and older git's fallback. Resolved through
+    /// `--git-path`, which is what makes a linked worktree answer about its
+    /// own state directory instead of the main `.git`.
+    fn git_state_exists(&self, name: &str) -> bool {
+        let Ok(raw) = run(&self.root, &["rev-parse", "--git-path", name]) else {
+            return false;
+        };
+        let shown = trimmed(&raw);
+        if shown.is_empty() {
+            return false;
+        }
+        use std::os::unix::ffi::OsStrExt;
+        let at = Path::new(std::ffi::OsStr::from_bytes(shown));
+        match at.is_absolute() {
+            true => at.exists(),
+            // Relative answers are relative to where git was pointed.
+            false => self.root.join(at).exists(),
+        }
     }
 
     /// Ahead and behind between a branch and its upstream: one process, both
@@ -6270,5 +6534,519 @@ mod tests {
 
         // And nothing ran: HEAD never moved, no process answered any of it.
         assert_eq!(r.rev_parse("HEAD"), r.rev_parse("main"));
+    }
+
+    // ------------------------------------------------------------- the rebase
+
+    use gitten_core::rebase::{Action, Line, Rewrite, TodoScript};
+
+    /// A straight line of work over separate files: `base`, then three
+    /// commits each adding its own file, so a rewrite that loses content
+    /// shows in the tree and not only in the log.
+    fn linear_repo(name: &str) -> Scratch {
+        let s = Scratch::new(name);
+        s.write("base.txt", b"base\n");
+        s.git(&["add", "-A"]);
+        s.git(&["commit", "-qm", "base"]);
+        for (file, body, msg) in [
+            ("one.txt", &b"one\n"[..], "one"),
+            ("two.txt", &b"two\n"[..], "two"),
+            ("three.txt", &b"three\n"[..], "three"),
+        ] {
+            s.write(file, body);
+            s.git(&["add", "-A"]);
+            s.git(&["commit", "-qm", msg]);
+        }
+        s
+    }
+
+    fn subjects(r: &Scratch) -> Vec<String> {
+        let out = r.git_os_out(&["log".into(), "--format=%s".into(), "--topo-order".into()]);
+        String::from_utf8_lossy(&out)
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The full message of the commit a rev names — squash's concat rules
+    /// live here and nowhere else.
+    fn body_of(r: &Scratch, rev: &str) -> String {
+        let out = r.git_os_out(&["log".into(), "-1".into(), "--format=%B".into(), rev.into()]);
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// A plan of bare picks over full shas, oldest first — what most of
+    /// these tests need and nothing more.
+    fn picks(revs: &[&str]) -> TodoScript {
+        let mut script = TodoScript::default();
+        for rev in revs {
+            script.push_step(Action::Pick, rev.as_bytes());
+        }
+        script
+    }
+
+    #[test]
+    fn a_reordered_plan_moves_the_commits_and_keeps_the_tree() {
+        let r = linear_repo("rebase-reorder");
+        let base = r.rev_parse("HEAD~3");
+        let (one, two, three) = (
+            r.rev_parse("HEAD~2"),
+            r.rev_parse("HEAD~1"),
+            r.rev_parse("HEAD"),
+        );
+        let g = r.open();
+        assert!(!g.rebase_in_progress());
+
+        // Two and one swap places: the plan reads oldest first, so [two, one,
+        // three] builds base←two←one←three and the log reads back three, one,
+        // two over base.
+        g.rebase_todo(base.as_bytes(), &picks(&[&two, &one, &three]))
+            .expect("the reorder ran");
+        assert_eq!(
+            subjects(&r),
+            vec!["three", "one", "two", "base"],
+            "history reads in the plan's order"
+        );
+        // Every file survived: a reorder moves commits, never their changes,
+        // and a clean finish leaves no state behind it.
+        let tree = g.status().expect("status");
+        assert!(tree.staged.is_empty() && tree.unstaged.is_empty());
+        for name in ["base.txt", "one.txt", "two.txt", "three.txt"] {
+            assert!(std::path::Path::new(&r.0).join(name).exists(), "{name}");
+        }
+        assert!(!g.rebase_in_progress());
+    }
+
+    #[test]
+    fn a_dropped_pick_leaves_its_change_out_of_the_tree() {
+        let r = linear_repo("rebase-drop");
+        let base = r.rev_parse("HEAD~3");
+        let (one, three) = (r.rev_parse("HEAD~2"), r.rev_parse("HEAD"));
+        let g = r.open();
+
+        g.rebase_todo(base.as_bytes(), &picks(&[&one, &three]))
+            .expect("the drop ran");
+        assert_eq!(subjects(&r), vec!["three", "one", "base"], "two is gone");
+        assert!(
+            !std::path::Path::new(&r.0).join("two.txt").exists(),
+            "and its change left the branch with it"
+        );
+    }
+
+    #[test]
+    fn squash_melds_messages_by_gits_own_rule_and_fixup_discards_them() {
+        // Squash opens GIT_EDITOR on a template that already holds both
+        // messages, separated by comment lines git strips afterwards — so
+        // with the editor answered `true`, the melded message is exactly
+        // first + blank line + second, git's own rule and not ours. Fixup
+        // never opens an editor at all.
+        let r = linear_repo("rebase-squash");
+        let base = r.rev_parse("HEAD~3");
+        let (one, two, three) = (
+            r.rev_parse("HEAD~2"),
+            r.rev_parse("HEAD~1"),
+            r.rev_parse("HEAD"),
+        );
+        let mut squashed = picks(&[&one]);
+        squashed.push_step(Action::Squash, two.as_bytes());
+        squashed.push_step(Action::Pick, three.as_bytes());
+        r.open()
+            .rebase_todo(base.as_bytes(), &squashed)
+            .expect("squash ran");
+        assert_eq!(
+            subjects(&r),
+            vec!["three", "one", "base"],
+            "three commits became two"
+        );
+        assert_eq!(
+            body_of(&r, "HEAD~1").trim_end(),
+            "one\n\ntwo",
+            "both messages survive, blank line between"
+        );
+
+        // The fixup shape, on a fresh straight line.
+        let r2 = linear_repo("rebase-fixup");
+        let base2 = r2.rev_parse("HEAD~3");
+        let (one2, two2, three2) = (
+            r2.rev_parse("HEAD~2"),
+            r2.rev_parse("HEAD~1"),
+            r2.rev_parse("HEAD"),
+        );
+        let mut fixed = picks(&[&one2]);
+        fixed.push_step(Action::Fixup, two2.as_bytes());
+        fixed.push_step(Action::Pick, three2.as_bytes());
+        let g2 = r2.open();
+        g2.rebase_todo(base2.as_bytes(), &fixed).expect("fixup ran");
+        assert_eq!(
+            body_of(&r2, "HEAD~1").trim_end(),
+            "one",
+            "the melded commit keeps the first message alone"
+        );
+        assert!(
+            std::path::Path::new(&r2.0).join("one.txt").exists(),
+            "but its change stayed"
+        );
+    }
+
+    #[test]
+    fn a_composed_squash_of_the_second_visible_commit_runs_to_completion() {
+        // The shell-level path end to end: log the repository the way a
+        // pane does, hand that window to `core::rebase::compose`, aim the
+        // plan at git through the trait verb. This is exactly the shape
+        // that once opened its plan with a bare squash — which git refuses,
+        // stranding `.git/rebase-merge` behind exit 1 — so it is proven
+        // here against real git and not only against the model.
+        let r = linear_repo("rebase-compose-squash");
+        let g = r.open();
+        let history = g.log(500).expect("log");
+        let index = history
+            .iter()
+            .position(|c| c.subject == "two")
+            .expect("two sits in the window");
+        let before = history.len();
+
+        let (upstream, script) =
+            gitten_core::rebase::compose(Rewrite::SquashUp, &history, index).expect("composes");
+        g.rebase_todo(&upstream, &script)
+            .expect("the composed squash ran");
+
+        assert!(!g.rebase_in_progress(), "git completed the whole plan");
+        assert_eq!(
+            g.log(500).expect("log").len(),
+            before - 1,
+            "two commits became one"
+        );
+        assert_eq!(
+            body_of(&r, "HEAD~1").trim_end(),
+            "one\n\ntwo",
+            "melded by git's own concat rule, blank line between"
+        );
+        let tree = g.status().expect("status");
+        assert!(tree.staged.is_empty() && tree.unstaged.is_empty());
+    }
+
+    #[test]
+    fn an_exec_line_runs_between_the_picks_without_becoming_a_commit() {
+        let r = linear_repo("rebase-exec");
+        let base = r.rev_parse("HEAD~3");
+        let (one, three) = (r.rev_parse("HEAD~2"), r.rev_parse("HEAD"));
+        let mut script = picks(&[&three]);
+        script.push_step(Action::Exec, b"echo executed > executed.txt");
+        script.push_step(Action::Pick, one.as_bytes());
+
+        r.open()
+            .rebase_todo(base.as_bytes(), &script)
+            .expect("exec ran");
+        assert_eq!(
+            subjects(&r),
+            vec!["one", "three", "base"],
+            "three commits went in, three came out"
+        );
+    }
+
+    #[test]
+    fn reword_and_edit_are_refused_before_any_process_runs() {
+        let r = linear_repo("rebase-reword");
+        let before = r.rev_parse("HEAD");
+        let g = r.open();
+
+        let mut bad = TodoScript::default();
+        bad.push_step(Action::Pick, b"aabbccd");
+        bad.push_step(Action::Reword, b"ddeeff0");
+        let err = g.rebase_todo(b"HEAD~3", &bad).unwrap_err();
+        assert!(err.contains("reword"), "{err}");
+
+        // Nothing started: no state directory, HEAD where it was.
+        assert!(!g.rebase_in_progress(), "the refusal predated any process");
+        assert_eq!(r.rev_parse("HEAD"), before);
+    }
+
+    #[test]
+    fn a_conflicted_rebase_is_found_by_progress_and_undone_by_abort() {
+        // Two commits editing the same line; replaying them swapped makes
+        // the second pick conflict — exactly the mid-flight state the abort
+        // story exists for.
+        let r = Scratch::new("rebase-conflict");
+        r.write("line.txt", b"start\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        r.write("line.txt", b"first\n");
+        r.git(&["commit", "-qam", "first"]);
+        r.write("line.txt", b"second\n");
+        r.git(&["commit", "-qam", "second"]);
+
+        let g = r.open();
+        let original_head = r.rev_parse("HEAD");
+        let base = r.rev_parse("HEAD~2");
+
+        let err = g
+            .rebase_todo(
+                base.as_bytes(),
+                &picks(&[&original_head, &r.rev_parse("HEAD~1")]),
+            )
+            .unwrap_err();
+        assert!(!err.is_empty(), "git's own words come back");
+        assert!(
+            g.rebase_in_progress(),
+            "the failed rebase left its state to be found"
+        );
+
+        g.rebase_abort().expect("abort");
+        assert!(!g.rebase_in_progress(), "abort cleaned up after itself");
+        assert_eq!(r.rev_parse("HEAD"), original_head, "back where it began");
+        let tree = g.status().expect("status");
+        assert!(
+            tree.staged.is_empty() && tree.unstaged.is_empty(),
+            "and the working tree came home too"
+        );
+    }
+
+    #[test]
+    fn continue_finishes_what_a_human_resolved() {
+        // Two commits editing the same line, replayed swapped: every pick
+        // conflicts, and each is resolved by hand through the scratch
+        // harness (`--theirs`, the side being replayed), then driven onward
+        // through the verb — both editors answered with `true`, so nothing
+        // blocks on a prompt nobody can see.
+        let r = Scratch::new("rebase-continue");
+        r.write("line.txt", b"start\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        r.write("line.txt", b"first\n");
+        r.git(&["commit", "-qam", "first"]);
+        r.write("line.txt", b"second\n");
+        r.git(&["commit", "-qam", "second"]);
+
+        let g = r.open();
+        let base = r.rev_parse("HEAD~2");
+        let _ = g.rebase_todo(
+            base.as_bytes(),
+            &picks(&[&r.rev_parse("HEAD"), &r.rev_parse("HEAD~1")]),
+        );
+        assert!(g.rebase_in_progress());
+
+        for round in 1..=4 {
+            if !g.rebase_in_progress() {
+                break;
+            }
+            let conflicted = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&r.0)
+                .args(SCRATCH_CONFIG)
+                .args(["diff", "--name-only", "--diff-filter=U"])
+                .output()
+                .expect("conflicted paths listed");
+            assert!(
+                !conflicted.stdout.is_empty(),
+                "round {round}: nothing stood unresolved"
+            );
+            r.git(&["checkout", "--theirs", "line.txt"]);
+            r.git(&["add", "line.txt"]);
+            // Continuing past one pick can walk straight into the next
+            // pick's conflict: git answers nonzero with its own words and
+            // the state left standing — which is exactly what the verb
+            // promises to surface, so the loop reads it rather than dies.
+            let _ = g.rebase_continue();
+        }
+        assert!(!g.rebase_in_progress());
+        assert_eq!(subjects(&r), vec!["first", "second", "base"]);
+    }
+
+    #[test]
+    fn a_dirty_tree_is_gits_own_refusal_surfaced_verbatim() {
+        let r = linear_repo("rebase-dirty");
+        let base = r.rev_parse("HEAD~3");
+        let head = r.rev_parse("HEAD");
+        r.write("one.txt", b"changed, unstaged\n");
+        let g = r.open();
+
+        let err = g
+            .rebase_todo(base.as_bytes(), &picks(&[&head]))
+            .unwrap_err();
+        assert!(err.contains("unstaged"), "{err}");
+        assert!(!g.rebase_in_progress());
+
+        let err = g.rebase_onto(b"HEAD~1").unwrap_err();
+        assert!(err.contains("unstaged"), "{err}");
+        assert_eq!(r.rev_parse("HEAD"), head, "nothing moved");
+    }
+
+    /// git's own todo file, saved by pointing `GIT_SEQUENCE_EDITOR` at a cp
+    /// that saves instead of installs — the same mechanism
+    /// [`Repo::rebase_todo`] drives, aimed the other way. Parsing what git
+    /// actually wrote and emitting it back byte-exact is the golden test;
+    /// feeding our emitted bytes through another rebase proves git accepts
+    /// them as its plan.
+    #[test]
+    fn gits_own_todo_round_trips_through_the_model_and_git_accepts_it_back() {
+        let r = linear_repo("rebase-golden");
+        let g = r.open();
+        let base = r.rev_parse("HEAD~3");
+
+        let saved = std::env::temp_dir().join(format!("gitten-golden-{}", std::process::id()));
+        let _ = std::fs::remove_file(&saved);
+        // git appends the todo path to the editor command, so a plain cp
+        // would copy the wrong way round for *saving*. A redirect does it:
+        // `cat > <saved> "<todo>"` — git's shell wrapping supplies the todo
+        // as one more argument and cat writes its content into the file.
+        let saved_shown = saved.display();
+        let editor = format!("cat > '{saved_shown}'");
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&r.0)
+            .args(SCRATCH_CONFIG)
+            .args(["rebase", "-i"])
+            .arg(&base)
+            .env("GIT_SEQUENCE_EDITOR", &editor)
+            .output()
+            .expect("rebase -i runs");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let raw = std::fs::read(&saved).expect("the editor saw the todo");
+        let _ = std::fs::remove_file(&saved);
+
+        // What git generated parses into three understood picks plus its
+        // comment header — and emits byte-exact.
+        let script = TodoScript::parse(&raw);
+        assert_eq!(raw, script.emit(), "our emitter reproduces git's file");
+        let steps: Vec<_> = script
+            .lines()
+            .iter()
+            .filter_map(|l| match l {
+                Line::Step(s) => Some(s.clone()),
+                Line::Verbatim(_) => None,
+            })
+            .collect();
+        assert_eq!(steps.len(), 3);
+        assert!(steps.iter().all(|s| s.action == Action::Pick));
+        assert!(
+            script
+                .lines()
+                .iter()
+                .any(|l| matches!(l, Line::Verbatim(raw) if raw.starts_with(b"#"))),
+            "the header rides along"
+        );
+
+        // Swap the two oldest picks in the model and hand the result to git:
+        // the identity replay above put three on top already, so the newest
+        // three subjects should now read two, one, three.
+        let mut reordered = TodoScript::default();
+        let mut order = steps.clone();
+        order.swap(0, 1);
+        for step in order {
+            reordered.push_step(step.action, &step.arg);
+        }
+        g.rebase_todo(base.as_bytes(), &reordered)
+            .expect("git accepted our plan");
+        assert_eq!(
+            subjects(&r),
+            vec!["three", "one", "two", "base"],
+            "the swap in the plan is the swap in history"
+        );
+    }
+
+    #[test]
+    fn plain_rebase_onto_moves_a_branch_and_conflicts_surface_the_same_way() {
+        // topic has one commit; main moves sideways; rebasing topic onto
+        // main replays topic's commit on top of main's tip.
+        let r = Scratch::new("rebase-onto");
+        r.write("f.txt", b"base\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        r.git(&["checkout", "-qb", "topic"]);
+        r.write("topic.txt", b"topic\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "topic-one"]);
+        r.git(&["checkout", "-q", "main"]);
+        r.write("main.txt", b"main\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "main-move"]);
+        r.git(&["checkout", "-q", "topic"]);
+        let main_tip = r.rev_parse("main");
+
+        let g = r.open();
+        g.rebase_onto(b"main").expect("rebase onto");
+        assert_eq!(r.rev_parse("HEAD~1"), main_tip, "topic now sits on main");
+        assert_eq!(subjects(&r), vec!["topic-one", "main-move", "base"]);
+        assert!(!g.rebase_in_progress());
+
+        // Conflicts leave the same findable state the interactive path does.
+        r.git(&["checkout", "-qb", "clash", "main"]);
+        r.write("shared.txt", b"from clash\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "clash-one"]);
+        r.git(&["checkout", "-q", "main"]);
+        r.write("shared.txt", b"from main\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "main-clash"]);
+        r.git(&["checkout", "-q", "clash"]);
+        let before = r.rev_parse("clash");
+        assert!(g.rebase_onto(b"main").is_err());
+        assert!(g.rebase_in_progress(), "found by the progress read");
+        g.rebase_abort().expect("abort");
+        assert_eq!(r.rev_parse("clash"), before, "aborted clean");
+    }
+
+    #[test]
+    fn todo_tempfiles_are_private_unique_and_cleaned_up() {
+        // The plan carries commit subjects and lands in a shared directory,
+        // so the file answers to a stricter contract than convenience:
+        // owner-only however the umask feels, never the same name twice,
+        // bytes intact, gone when the caller removes it.
+        let first = write_todo_tmpfile(b"pick 1111111\n".to_vec()).expect("first");
+        let second = write_todo_tmpfile(b"pick 2222222\n".to_vec()).expect("second");
+        assert_ne!(first, second, "two plans never share a file");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&first).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "{:?} is not owner-only", first);
+        assert_eq!(std::fs::read(&first).unwrap(), b"pick 1111111\n");
+        std::fs::remove_file(&first).unwrap();
+        assert!(!first.exists());
+        std::fs::remove_file(&second).unwrap();
+    }
+
+    #[test]
+    fn a_stranded_rebase_is_reached_by_abort_and_put_back() {
+        // A plan whose first line is a squash — the shape compose() once
+        // emitted, and exactly what git refuses with "cannot 'squash'
+        // without a previous commit" — strands the rebase deliberately:
+        // exit nonzero, state left standing. This is the state the
+        // rebase.abort command exists to walk out of.
+        let r = linear_repo("rebase-stranded");
+        let g = r.open();
+        let original = r.rev_parse("main");
+
+        let mut stranded = TodoScript::default();
+        stranded.push_step(Action::Squash, r.rev_parse("HEAD~1").as_bytes());
+        assert!(g
+            .rebase_todo(r.rev_parse("HEAD~3").as_bytes(), &stranded)
+            .is_err());
+        assert!(
+            g.rebase_in_progress(),
+            "git's refusal left its state to be found"
+        );
+
+        // The command's verb, driven directly: everything comes home.
+        g.rebase_abort().expect("abort");
+        assert!(!g.rebase_in_progress());
+        assert_eq!(r.rev_parse("HEAD"), original, "back where it began");
+        let tree = g.status().expect("status");
+        assert!(tree.staged.is_empty() && tree.unstaged.is_empty());
+    }
+
+    #[test]
+    fn an_upstream_spelled_like_a_flag_is_refused_before_any_process_runs() {
+        let r = linear_repo("rebase-dashes");
+        let g = r.open();
+        let head = r.rev_parse("HEAD");
+        let empty = TodoScript::default();
+        let err = g.rebase_todo(b"--exec=touch /tmp/x", &empty).unwrap_err();
+        assert!(err.contains("refused"), "{err}");
+        let err = g.rebase_onto(b"--exec=touch /tmp/x").unwrap_err();
+        assert!(err.contains("refused"), "{err}");
+        assert_eq!(r.rev_parse("HEAD"), head, "nothing ran");
     }
 }

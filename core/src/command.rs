@@ -413,6 +413,11 @@ impl Keymap {
         bind("branches", "n", "branches.new");
         bind("branches", "r", "branches.rename");
         bind("branches", "d", "branches.delete");
+        // Rebasing the branch HEAD is on onto the row the keyboard is on.
+        // lazygit keeps this key in the branches panel too; its natural
+        // letter is rename here, so capital-R sits beside it. Rewrites this
+        // branch's own commits, so it asks twice.
+        bind("branches", "R", "commits.rebase-onto");
 
         bind("diff", "s", "diff.cycle-layout");
         bind("diff", "w", "diff.cycle-wrap");
@@ -447,6 +452,23 @@ impl Keymap {
         // lazygit's revert key. Nothing is destroyed — the undo arrives as a
         // new commit — so it takes no confirmation dance.
         bind("commits", "t", "commits.revert");
+        // Folding the commit under the keyboard into its parent, on lazygit's
+        // squash and fixup letters pushed up a keyboard row: `s` already
+        // means reset-soft here, and lowercase `f` would shadow repo.fetch,
+        // a sync key meant to work over every pane — the same trade
+        // theme.cycle made for `T`. Drop is lazygit's own letter, free in
+        // this mode. All three rewrite history, so each asks twice.
+        bind("commits", "S", "commits.squash-up");
+        bind("commits", "F", "commits.fixup-up");
+        bind("commits", "d", "commits.drop-commit");
+        // The way out of a stranded rebase — one that stopped mid-flight on
+        // a conflict or a refusal and left its state standing. lazygit
+        // offers these through a menu that appears during a rebase; here
+        // they are two named commands on the history pane's own keys,
+        // capitals because neither is an everyday press and both act on a
+        // rewrite in progress.
+        bind("commits", "A", "rebase.abort");
+        bind("commits", "C", "rebase.continue");
 
         // Text itself belongs to the platform input service. These are the two
         // transitions around it, kept as named commands so a config file can
@@ -823,6 +845,30 @@ impl Commands {
             (
                 "commits.revert",
                 "undo this commit with a new inverse commit",
+            ),
+            (
+                "commits.squash-up",
+                "fold this commit into the one beneath it, keeping both messages, asked twice",
+            ),
+            (
+                "commits.fixup-up",
+                "fold this commit into the one beneath it, discarding this message, asked twice",
+            ),
+            (
+                "commits.drop-commit",
+                "remove this commit from the branch, asked twice",
+            ),
+            (
+                "commits.rebase-onto",
+                "move the current branch onto the selected branch, asked twice",
+            ),
+            (
+                "rebase.abort",
+                "give up the rebase in progress and put everything back where it was",
+            ),
+            (
+                "rebase.continue",
+                "carry on the rebase in progress once conflicts are resolved",
             ),
             ("files.focus", "focus the working-tree pane"),
             ("files.stage", "stage or unstage the selected file"),
