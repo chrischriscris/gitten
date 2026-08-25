@@ -1149,7 +1149,7 @@ mod tests {
             .unwrap();
         assert!(rows[global..]
             .iter()
-            .any(|r| matches!(r, HelpRow::Command { keys, doc } if keys == "2" && doc == "focus the working-tree pane")));
+            .any(|r| matches!(r, HelpRow::Command { keys, doc } if keys == "2" && doc == "swap the working-tree list into the column")));
     }
 
     // ------------------------------------------------------- the discard arm

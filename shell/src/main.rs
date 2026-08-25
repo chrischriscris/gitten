@@ -18,7 +18,7 @@ use gitten_core::differ::{Overrides, Whitespace};
 use gitten_core::host::Host;
 use gitten_core::refs::ResetMode;
 use gitten_core::theme::Rgb;
-use gitten_core::FileDiff;
+use gitten_core::{Commit, FileDiff};
 use gpui::*;
 use gpui_component::*;
 use stats::Stats;
@@ -99,13 +99,15 @@ const LIGHTS_W: f32 = 72.0;
 /// The error band under the title bar. Shorter than a title bar because it is
 /// one sentence, and it is only there when something has to be said.
 const BAND_H: f32 = 22.0;
-/// The slice of the pane column the working tree claims before the rest of the
-/// panes divide what is left — see [`Pane::height_share`]. A code constant on
-/// purpose tonight; a drag handle between panes would own this properly.
-const FILES_SHARE: f32 = 0.3;
-/// The stash stack's slice — smaller than the working tree's because parked
-/// work is context you glance at, not content you work in. Same caveat.
-const STASHES_SHARE: f32 = 0.15;
+/// The list column's slice of the window's width; the diff takes the rest.
+/// A code constant on purpose tonight — a drag handle between the two regions
+/// would own this properly, and that is polish-pass work.
+const COLUMN_SHARE: f32 = 0.32;
+/// How long the commits cursor may keep moving before the main view loads the
+/// commit it settled on. A fast run through the list schedules one timer per
+/// row but only the newest request ever survives its guard to load — see
+/// [`DevShell::schedule_main_diff`].
+const DIFF_DEBOUNCE: Duration = Duration::from_millis(150);
 
 /// What only this client has. The two views, the arguments and `gitten.toml` are
 /// documented once, in `gitten_app::cli::usage`, because they are the same in
@@ -285,15 +287,6 @@ trait Pane {
         Bounds::default()
     }
 
-    /// The fraction of the pane column this tenant claims before the rest
-    /// divide what is left. `None` — every pane built before this existed — is
-    /// an equal share, unchanged. A viewer that is context rather than content
-    /// (the working tree) claims a fixed slice; whatever the window opens *for*
-    /// keeps `None` and stays the star.
-    fn height_share(&self, _cx: &App) -> Option<f32> {
-        None
-    }
-
     fn pan_pixels(&self, _dx: f32, _cx: &App) -> bool {
         false
     }
@@ -315,6 +308,21 @@ trait Pane {
     }
 }
 
+/// Which of the window's two regions the keyboard is in.
+///
+/// Two targets, because the lazygit shape has two: the list column on the
+/// left and the diff on the right. The focused one carries the accent edge,
+/// and [`Modes`] is rebuilt from this — a list's keys move that list, the
+/// diff's keys scroll the diff — which is why there is no third state to
+/// forget to route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Spot {
+    /// The list column: whatever list is showing gets the keys.
+    Column,
+    /// The diff main view.
+    Main,
+}
+
 /// One pane tenant. Built-ins keep repository metadata beside their typed GPUI
 /// view; extensions enter through [`Screen::Custom`].
 ///
@@ -331,9 +339,17 @@ enum Screen {
         generation: Rc<Cell<Generation>>,
         label: Rc<RefCell<String>>,
     },
+    /// The diff main view. The one tenant that is not a column list: it fills
+    /// the right side of the window whatever the column shows.
+    ///
+    /// Its revspec lives behind a cell because it *changes* while the tenant
+    /// does not — every selection change re-aims the same view at another
+    /// commit, so the screen is built once with `None` (nothing loaded yet)
+    /// and re-aimed from [`DevShell::schedule_main_diff`]. A fixture or patch
+    /// launch builds it once with its own source and nothing ever rewrites it.
     Diff {
         view: Entity<views::diff::Diff>,
-        source: Source,
+        source: Rc<RefCell<Option<Source>>>,
         generation: Rc<Cell<Generation>>,
         label: Rc<RefCell<String>>,
     },
@@ -379,13 +395,13 @@ impl Screen {
 
     fn diff(
         view: Entity<views::diff::Diff>,
-        source: Source,
+        source: Option<Source>,
         generation: Generation,
         label: impl Into<String>,
     ) -> Self {
         Self::Diff {
             view,
-            source,
+            source: Rc::new(RefCell::new(source)),
             generation: Rc::new(Cell::new(generation)),
             label: Rc::new(RefCell::new(label.into())),
         }
@@ -527,10 +543,15 @@ impl Screen {
                 generation,
                 label,
             } => {
+                // `None` is "nothing loaded yet" — a window that opened on a
+                // list before its first selection scheduled a diff — and a
+                // `.diff` fixture was never acquired from a repository at
+                // all. Anything else re-acquires its own revspec, exactly as
+                // the stacked pane did.
+                let source = source.borrow().clone()?;
                 if generation.get() >= target || matches!(source, Source::Fixtures) {
                     return None;
                 }
-                let source = source.clone();
                 let load_host = host.clone();
                 let overrides = overrides.clone();
                 let view = view.clone();
@@ -733,21 +754,6 @@ impl Screen {
         }
     }
 
-    /// The slice of the pane column this screen claims — see [`Pane::height_share`].
-    fn height_share(&self, cx: &App) -> Option<f32> {
-        match self {
-            // The working tree is context; whatever the window opened for gets
-            // an equal share and stays the star. The branches pane takes an
-            // equal share with it tonight — a fixed slice would want a second
-            // constant and its own argument, and nothing has asked yet.
-            Screen::Files { .. } => Some(FILES_SHARE),
-            // The stack, more context still.
-            Screen::Stashes { .. } => Some(STASHES_SHARE),
-            Screen::Commits { .. } | Screen::Diff { .. } | Screen::Branches { .. } => None,
-            Screen::Custom(pane) => pane.height_share(cx),
-        }
-    }
-
     /// Moves this screen's text sideways, where it has any — a commit graph has
     /// nothing off the left edge to reach, and says so by not moving. Whether
     /// anything moved decides a redraw.
@@ -860,12 +866,41 @@ impl Screen {
 
 struct DevShell {
     /// The app half of the title, drawn bright: which program this is. Which
-    /// *view* it is showing is the focused pane's to say, because a commit list
-    /// that opened a diff is still a diff while that pane owns the keyboard.
+    /// *view* it is showing is the focused region's to say, because a commit
+    /// list that handed the keyboard to its diff is still a diff while that
+    /// region owns it.
     which: &'static str,
-    /// Stable names make this a registry: reopening a diff replaces the `diff`
-    /// tenant instead of appending a duplicate pane.
+    /// The window's list column. Stable names make this a registry; exactly
+    /// one entry of it renders at a time — [`DevShell::panes`]' focused one —
+    /// so `2`/`3`/`4` swap lists into the column by focusing them, and every
+    /// list keeps its own cursor and scroll state while it waits off screen.
     panes: panes::Panes<Screen>,
+    /// The diff main view: always on screen, right of the column. Built once
+    /// at startup (empty when the window opened on a list) and re-aimed at
+    /// each selection through [`DevShell::schedule_main_diff`] — never rebuilt,
+    /// which is what keeps its scroll state and presentation across commits.
+    ///
+    /// A launch whose first acquisition was itself a diff (`gitten diff …`,
+    /// a fixture, a patch file) builds this from those rows instead and has
+    /// no column at all — see [`DevShell::has_column`].
+    main: Screen,
+    /// Whether the window has a list column. False only for a diff/fixture/
+    /// patch launch, where there is no acquired commit list to show; the
+    /// diff then fills the whole width and the spot never leaves [`Spot::Main`].
+    has_column: bool,
+    /// Which region holds the keyboard.
+    spot: Spot,
+    /// The commit the main view's header names — set the moment a selection
+    /// is scheduled, so the strip is true during the load, not only after it.
+    /// `None` until the first selection (or forever, over a fixture).
+    head: RefCell<Option<Commit>>,
+    /// The newest main-view request. Each schedule bumps it; a timer or a
+    /// finished load applies only if it still equals the value it left with,
+    /// which is how a fast cursor run collapses to exactly one load — the
+    /// settled row's.
+    request: Cell<u64>,
+    /// True between scheduling a main-view load and its rows landing.
+    loading: Cell<bool>,
     stats: Option<Stats>,
     /// How to fetch the diff again with a different algorithm. `None` for a
     /// `.diff` fixture, where there is no repository behind the rows at all.
@@ -947,9 +982,40 @@ struct DevShell {
 }
 
 impl DevShell {
-    /// The screen commands act on.
+    /// The screen commands act on: the column's visible list, or the diff,
+    /// by where the keyboard is. Every dispatch decision reads through here,
+    /// which is what makes routing a change of [`Spot`] and nothing else.
     fn active(&self) -> Option<&Screen> {
-        Some(self.panes.focused())
+        Some(match self.spot {
+            Spot::Column => self.panes.focused(),
+            Spot::Main => &self.main,
+        })
+    }
+
+    /// The column's commits list, when the column has one showing. The one
+    /// place main-view loading learns which screen it reads its selection
+    /// from — a files or branches column keeps whatever the main view already
+    /// holds, whatever the keyboard is doing.
+    fn column_commits(&self) -> Option<Entity<views::commits::Commits>> {
+        if !self.has_column {
+            return None;
+        }
+        match self.panes.focused() {
+            Screen::Commits { view, .. } => Some(view.clone()),
+            _ => None,
+        }
+    }
+
+    /// Moves the keyboard to a region. A fixture window has no column to
+    /// give the keyboard back to, so a `Spot::Main` there is forever.
+    fn set_spot(&mut self, spot: Spot) {
+        if !self.has_column {
+            return;
+        }
+        if self.spot != spot {
+            self.spot = spot;
+            self.sync_modes();
+        }
     }
 
     /// The view name the title strip shows: the active screen's mode — which
@@ -965,11 +1031,12 @@ impl DevShell {
     /// open picker — a menu belongs to the pane it was opened over, and one
     /// left standing after focus changes is invisible but still in
     /// `self.open`, where [`DevShell::on_wheel`] swallows for it forever.
-    /// Called on every change of pane focus or help state — the places
+    /// Called on every change of region focus or help state — the places
     /// [`Modes`] can change.
     fn sync_modes(&mut self) {
         self.modes = Modes::new();
-        if self.panes.len() > 1 {
+        // Cycling the lists needs more than one of them to be worth a key.
+        if self.has_column && self.panes.len() > 1 {
             self.modes.push(panes::MODE);
         }
         if let Some(screen) = self.active() {
@@ -1347,19 +1414,26 @@ impl DevShell {
             self.set_notice(format!("{command} is not supported here"));
             return;
         };
-        match source {
-            Source::Repo { arg, .. } if arg.is_empty() => {}
-            Source::Repo { .. } => {
+        // Copied out of the cell before the refusals: the match arms below
+        // speak into the band, and the borrow must not be alive while they do.
+        let source = source.borrow().clone();
+        match source.as_ref() {
+            None => {
+                self.set_notice("no diff is showing");
+                return;
+            }
+            Some(Source::Repo { arg, .. }) if arg.is_empty() => {}
+            Some(Source::Repo { .. }) => {
                 self.set_notice(
                     "only the working-tree diff can act on hunks — this one is between commits",
                 );
                 return;
             }
-            Source::Fixtures => {
+            Some(Source::Fixtures) => {
                 self.set_notice("a fixture has no repository behind it");
                 return;
             }
-            Source::Patch { .. } => {
+            Some(Source::Patch { .. }) => {
                 self.set_notice("a patch file has no repository behind it");
                 return;
             }
@@ -2194,6 +2268,10 @@ impl DevShell {
                 v.reconcile(&host);
                 v.apply_query(text);
             });
+            // Filtering re-anchors the cursor by sha; when the anchor does
+            // not survive, the keyboard lands somewhere else, and that
+            // somewhere is what the main view should be loading.
+            self.sync_main_diff(cx);
             cx.notify();
         }
     }
@@ -2206,6 +2284,7 @@ impl DevShell {
         };
         let query = query.unwrap_or_default();
         view.update(cx, |v, _| v.apply_query(&query));
+        self.sync_main_diff(cx);
     }
 
     /// The named pane's commits screen, when that is what the name registers:
@@ -2304,6 +2383,10 @@ impl DevShell {
         let refreshes: Vec<Refresh> = self
             .panes
             .iter()
+            // The diff main view rides the same wave: a working-tree revspec
+            // in the main view is exactly as stale as any pane's after a
+            // write. Commit-sha sources pay one cheap no-op re-acquire.
+            .chain(std::iter::once(&self.main))
             .filter_map(|screen| screen.refresh(target, &host, &self.over, repo.clone()))
             .collect();
         if refreshes.is_empty() {
@@ -2358,6 +2441,10 @@ impl DevShell {
                 self.refresh_error = None;
             }
         }
+        // A refresh may have re-anchored the commits cursor — the list it was
+        // on changed under it — which is a selection change as far as the
+        // main view is concerned.
+        self.sync_main_diff(cx);
         cx.notify();
     }
 
@@ -2382,17 +2469,23 @@ impl DevShell {
     /// 8–250 ms respectively, on a click. Cheap enough not to need a spinner and
     /// not cheap enough to do on a keystroke repeat, which is why these are menus
     /// and only the layout is bound to a key.
+    ///
+    /// The main view is the only diff there is, so this reads its revspec off
+    /// [`DevShell::main`] directly rather than off whatever holds the
+    /// keyboard: a picker in the title bar acts on what the title bar's
+    /// pickers describe.
     fn set_overrides(&mut self, next: Overrides, cx: &mut Context<Self>) {
         let Some(rediff) = self.rediff.clone() else {
             return;
         };
-        let (view, revision) = match self.active() {
-            Some(Screen::Diff {
-                view,
-                source: Source::Repo { arg, .. },
-                ..
-            }) => (view.clone(), arg.clone()),
-            _ => return,
+        let Some(revision) = (match &self.main {
+            Screen::Diff { source, .. } => match source.borrow().as_ref() {
+                Some(Source::Repo { arg, .. }) => Some(arg.clone()),
+                _ => None,
+            },
+            _ => None,
+        }) else {
+            return;
         };
         if next == self.over {
             return;
@@ -2403,6 +2496,10 @@ impl DevShell {
                 self.invalidate_refresh();
                 self.over = next;
                 self.error = None;
+                let Screen::Diff { view, .. } = &self.main else {
+                    return;
+                };
+                let view = view.clone();
                 view.update(cx, |d, cx| d.replace(files, &host, cx));
                 let load = view.read(cx).load.clone();
                 if let Some(stats) = &mut self.stats {
@@ -2419,7 +2516,7 @@ impl DevShell {
     /// Costs no re-diff and no `prepare` — only where the lines break moves —
     /// which is why this one needs none of `set_overrides`' machinery.
     fn set_wrap(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(Screen::Diff { view, .. }) = self.active() else {
+        let Screen::Diff { view, .. } = &self.main else {
             return;
         };
         let view = view.clone();
@@ -2429,7 +2526,7 @@ impl DevShell {
     }
 
     fn set_layout(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(Screen::Diff { view, .. }) = self.active() else {
+        let Screen::Diff { view, .. } = &self.main else {
             return;
         };
         let view = view.clone();
@@ -2491,10 +2588,11 @@ impl DevShell {
             "input.cancel" => self.close_input(false, cx),
             "pane.next" => self.cycle_pane(1, cx),
             "pane.prev" => self.cycle_pane(-1, cx),
+            "commits.focus" => self.focus_named("commits", cx),
             "files.focus" => self.focus_named("files", cx),
             "stashes.focus" => self.focus_named("stashes", cx),
             "branches.focus" => self.focus_named("branches", cx),
-            "commits.open-diff" => self.open_diff(cx),
+            "commits.open-diff" => self.focus_main(cx),
             "commits.search" => self.begin_search(cx),
             // History's verbs, aimed at the commit the keyboard is on. Reset
             // and revert read the pane; the write goes through the queue.
@@ -2580,19 +2678,29 @@ impl DevShell {
                 }
             }
         }
+        // The keyboard may just have moved the commits cursor — or a refresh
+        // may have re-anchored it under the last command. Either way this is
+        // the one hook every command leaves through, so it is where the main
+        // view learns its selection changed. One read on the no-op path.
+        self.sync_main_diff(cx);
         cx.notify();
     }
 
-    /// Closes the help, the picker over it, or the focused secondary pane.
+    /// Closes the help, the picker over it, the input field, or the diff
+    /// region's hold on the keyboard.
     ///
     /// One key for all of it, because all of it is "get me out of this" — and
-    /// **innermost first**, or a picker left open after its screen is popped
+    /// **innermost first**, or a picker left open after its context is popped
     /// keeps occluding nothing: invisible, but still in `self.open`, where
     /// [`DevShell::on_wheel`] swallows every event for it forever. So an open
-    /// menu is the whole of this `esc`: closed, pending dropped with it, no
-    /// selection cleared and no pane closed. A selection is inside a pane, so
-    /// it goes next; the root pane is never closed at all — `esc` on the thing
-    /// you started with is not a quit.
+    /// menu is the whole of this `esc`: closed, pending dropped with it.
+    ///
+    /// With nothing stacked above, `esc` hands the keyboard back from the
+    /// diff to the list column — lazygit's way out of a main view. The lists
+    /// themselves are never closed any more: they are the column's residents,
+    /// and closing one would leave the window half empty rather than one pane
+    /// lighter. A selection is inside a list, so it goes after the region
+    /// switch; the diff's own selection stays until its rows are replaced.
     fn back(&mut self, cx: &mut Context<Self>) {
         if self.help {
             self.help = false;
@@ -2609,38 +2717,50 @@ impl DevShell {
             self.close_input(false, cx);
             return;
         }
+        if self.spot == Spot::Main {
+            self.set_spot(Spot::Column);
+            cx.notify();
+            return;
+        }
         if let Some(screen) = self.active() {
             if screen.select(false, cx) {
                 // There was a selection and it is gone; that is the whole of
-                // this `esc`, and the screen underneath stays where it is.
+                // this `esc`.
                 cx.notify();
-                return;
             }
-        }
-        if self.panes.close_focused().is_some() {
-            self.sync_modes();
-            cx.notify();
         }
     }
 
     fn focus_pane(&mut self, at: usize, cx: &mut Context<Self>) {
         if self.panes.focus(at) {
+            // Focusing a list means looking at that list: the keyboard goes
+            // with it, out of the diff if it was there.
+            self.set_spot(Spot::Column);
             self.sync_modes();
             cx.notify();
         }
     }
 
+    /// Cycles the column between its lists — what ctrl-j/ctrl-k do. The
+    /// command names still say *pane*: they were named for the panes that
+    /// used to stack, and a rename would break every `[keys]` file in flight.
     fn cycle_pane(&mut self, by: isize, cx: &mut Context<Self>) {
+        if !self.has_column {
+            self.set_notice("this window has no list column");
+            return;
+        }
         if self.panes.cycle(by) {
+            self.set_spot(Spot::Column);
             self.sync_modes();
             cx.notify();
         }
     }
 
     /// Focuses a tenant by its stable registration name — what `files.focus`
-    /// runs. Said, not swallowed, when nothing is registered under the name: a
-    /// fixture has no working tree to show, and the honest answer to the key
-    /// is the same sentence an unbound one gets.
+    /// and friends run: the named list swaps into the column and takes the
+    /// keyboard. Said, not swallowed, when nothing is registered under the
+    /// name: a fixture has no working tree to show, and the honest answer to
+    /// the key is the same sentence an unbound one gets.
     fn focus_named(&mut self, name: &str, cx: &mut Context<Self>) {
         match self.panes.position(name) {
             Some(at) => self.focus_pane(at, cx),
@@ -2648,62 +2768,178 @@ impl DevShell {
         }
     }
 
-    /// Opens the diff of the commit under the cursor in its registered pane.
-    ///
-    /// The I/O is here and not in the view — the same rule the terminal follows:
-    /// a view takes already-loaded data and never learns what a repository is.
-    fn open_diff(&mut self, cx: &mut Context<Self>) {
-        let Some(Screen::Commits { view, .. }) = self.active() else {
+    /// `commits.open-diff`: hand the keyboard to the diff region, carrying the
+    /// commit under the cursor. The load itself is already riding the
+    /// debounce from the cursor move that got here — enter *flushes* it,
+    /// because pressing enter on a row means that row and not whichever one a
+    /// fast run was settling toward. From the diff, `esc` walks back through
+    /// [`DevShell::back`].
+    fn focus_main(&mut self, cx: &mut Context<Self>) {
+        let Some(view) = self.column_commits() else {
             self.set_notice("no commit selected");
             return;
         };
-        let view = view.clone();
         let host = config::host(cx);
         // Meet the list where it actually is: a scrollbar drag moved the offset
-        // without moving the cursor, and "open this commit" means the one being
+        // without moving the cursor, and "this commit" means the one being
         // *looked at*.
         view.update(cx, |v, _| v.reconcile(&host));
+        if let Some(commit) = view.read(cx).current().cloned() {
+            self.schedule_main_diff(commit, true, cx);
+        }
+        self.set_spot(Spot::Main);
+        cx.notify();
+    }
+
+    /// After anything that may have moved the commits cursor — a key, a
+    /// search edit, a refresh that re-anchored the list: if the commit under
+    /// the keyboard is not the one the main view names, schedule its diff.
+    /// The no-op path is one read of the current row.
+    fn sync_main_diff(&mut self, cx: &mut Context<Self>) {
+        let Some(view) = self.column_commits() else {
+            return;
+        };
         let Some(commit) = view.read(cx).current().cloned() else {
             return;
         };
+        let shown = self
+            .head
+            .borrow()
+            .as_ref()
+            .is_some_and(|h| h.sha == commit.sha);
+        if shown {
+            return;
+        }
+        self.schedule_main_diff(commit, false, cx);
+    }
+
+    /// Aims the main view at `commit`.
+    ///
+    /// **Load-on-settle, by timer guard.** Every schedule bumps
+    /// [`DevShell::request`] and spawns one timer ([`DIFF_DEBOUNCE`], zero
+    /// when flushing); a waking timer proceeds only if its request is still
+    /// the newest, so a fast cursor run leaves one live timer — the settled
+    /// row's — and the dead ones cost a wake and a compare each. The
+    /// acquisition then runs on the background executor behind a second copy
+    /// of the same guard, so an older load can never land over a newer one.
+    ///
+    /// The header is written *now*, not on arrival: the strip naming the
+    /// commit whose diff is coming is what makes the load visible in frame
+    /// one instead of an empty right half. An earlier failure stays on the
+    /// error band until the new rows replace them — a refusal to load does
+    /// not unname what is on screen.
+    fn schedule_main_diff(&mut self, commit: Commit, immediate: bool, cx: &mut Context<Self>) {
+        let shown = self
+            .head
+            .borrow()
+            .as_ref()
+            .is_some_and(|h| h.sha == commit.sha);
+        // Already on screen and resting: nothing to schedule. Shown and still
+        // loading: only a flush (enter) escalates the pending load to now.
+        if shown && !(immediate && self.loading.get()) {
+            return;
+        }
         let Some((path, repo)) = self.repo.clone() else {
-            self.set_notice("a fixture has no repository to diff against");
             return;
         };
+        let req = self.request.get() + 1;
+        self.request.set(req);
+        self.loading.set(true);
+        *self.head.borrow_mut() = Some(commit.clone());
         let source = Source::Repo {
             path,
             arg: commit.sha.clone(),
         };
-        match gitten_app::acquire::acquire(View::Diff, &source, &host, Some(repo.as_ref())) {
-            Ok(loaded) => {
-                let Data::Diff(files) = loaded.data else {
-                    return;
-                };
-                let view = cx.new(|cx| views::diff::Diff::new(files, host.clone(), cx));
-                // The new diff was acquired with the file's own settings, so the
-                // picks start from there too — a stale override would be a strip
-                // describing an algorithm that did not produce this screen.
-                self.over = Overrides::default();
-                // A success says so: an error left up here would be describing
-                // an open that already worked.
-                self.error = None;
-                let screen = Screen::diff(
-                    view,
-                    source,
-                    self.generation,
-                    format!(
-                        "{} {}",
-                        &commit.sha[..commit.sha.len().min(8)],
-                        commit.subject
-                    ),
-                );
-                // Stable registration replaces an older diff tenant rather
-                // than growing a second copy of the same panel.
-                self.panes.register("diff", screen);
-                self.sync_modes();
-            }
-            Err(e) => self.error = Some(e.into()),
+        if let Screen::Diff {
+            source: aim, label, ..
+        } = &self.main
+        {
+            *aim.borrow_mut() = Some(source.clone());
+            // The title names what is *coming*, the same promise the strip
+            // makes — and the same shape `open_diff` labelled its pane with.
+            label.replace(format!(
+                "{} {}",
+                &commit.sha[..commit.sha.len().min(8)],
+                commit.subject
+            ));
         }
+        let delay = match immediate {
+            true => Duration::ZERO,
+            false => DIFF_DEBOUNCE,
+        };
+        cx.spawn(async move |shell, cx| {
+            cx.background_executor().timer(delay).await;
+            // Load half, on the executor: one acquisition plus one prepare.
+            // Built inside the guard so a superseded request never spawns it.
+            let mut job = None;
+            let live = shell
+                .update(cx, |shell, cx| {
+                    if shell.request.get() != req {
+                        return false;
+                    }
+                    // An owned host crosses the thread boundary — the same
+                    // copy a pane refresh carries into its load half.
+                    let host = (*config::host(cx)).clone();
+                    let repo = repo.clone();
+                    let source = source.clone();
+                    job = Some(cx.background_spawn(async move {
+                        let loaded = gitten_app::acquire::reacquire(
+                            View::Diff,
+                            &source,
+                            &host,
+                            Some(repo.as_ref()),
+                            &Overrides::default(),
+                        )?;
+                        let Data::Diff(files) = &loaded.data else {
+                            let e: String = "acquisition returned the wrong view".into();
+                            return Err(e);
+                        };
+                        let prepared = views::diff::prepare_files(files, &host);
+                        Ok((loaded.data, prepared, loaded.label))
+                    }));
+                    true
+                })
+                .unwrap_or(false);
+            let Some(job) = job.filter(|_| live) else {
+                return;
+            };
+            let outcome = job.await;
+            // Apply half, guarded twice more: a newer request wins, and a
+            // window that went away updates nothing.
+            _ = shell.update(cx, move |shell, cx| {
+                if shell.request.get() != req {
+                    return;
+                }
+                shell.loading.set(false);
+                match outcome {
+                    Ok((Data::Diff(files), prepared, label)) => {
+                        let Screen::Diff {
+                            view, generation, ..
+                        } = &shell.main
+                        else {
+                            return;
+                        };
+                        let host = config::host(cx);
+                        view.update(cx, |d, cx| d.replace_prepared(files, prepared, &host, cx));
+                        generation.set(shell.generation);
+                        // The rows were acquired with the file's own settings,
+                        // so the picks say so too — a stale override would be a
+                        // strip describing an algorithm that did not produce
+                        // this diff.
+                        shell.over = Overrides::default();
+                        // A success clears whatever the previous load said.
+                        shell.error = None;
+                        if let Screen::Diff { label: cell, .. } = &shell.main {
+                            cell.replace(label);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => shell.error = Some(e.into()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// `copy.selection`: the mouse's selection, or the keyboard's row. The
@@ -2873,19 +3109,30 @@ impl DevShell {
         if self.help || self.open.is_some() {
             return;
         }
-        // Over one pane's rows, and not over the title bar or a dropdown above
-        // them. Focus it before resolving the wheel: otherwise an unfocused
-        // pane's native list scroller would become a second, unconfigured input
-        // path when this capture handler stood aside.
-        let Some(at) = self
-            .panes
-            .iter()
-            .position(|screen| screen.list_bounds(cx).contains(&ev.position))
-        else {
-            return;
+        // Over one region's rows or the other's, and not over the title bar
+        // or a dropdown above them. Focus that region before resolving the
+        // wheel: otherwise an unfocused pane's native list scroller would
+        // become a second, unconfigured input path when this capture handler
+        // stood aside.
+        let in_column = self.has_column.then(|| {
+            self.panes
+                .iter()
+                .position(|screen| screen.list_bounds(cx).contains(&ev.position))
+        });
+        let over_main = self.main.list_bounds(cx).contains(&ev.position);
+        let screen = match (in_column.flatten(), over_main) {
+            // The column keeps its per-list hit test: whichever list is
+            // showing owns its own box.
+            (Some(at), _) => {
+                self.focus_pane(at, cx);
+                self.panes.focused().clone()
+            }
+            (None, true) => {
+                self.set_spot(Spot::Main);
+                self.main.clone()
+            }
+            (None, false) => return,
         };
-        self.focus_pane(at, cx);
-        let screen = self.panes.focused().clone();
         let mut ongoing = self.ongoing.get();
         let delta = views::diff::locked(
             ev.delta.pixel_delta(window.line_height()),
@@ -3013,12 +3260,13 @@ impl DevShell {
             },
         );
 
-        // Everything below drives the diff view, so there is nothing to draw
-        // when that is not what is on screen: the commit graph gets no strip of
-        // dead controls.
-        let Some(Screen::Diff { view, source, .. }) = self.active() else {
+        // Everything below drives the diff main view, which is always on
+        // screen now — the pickers no longer come and go with what holds the
+        // keyboard.
+        let Screen::Diff { view, source, .. } = &self.main else {
             return vec![theme_picker];
         };
+        let source = source.borrow().clone();
 
         let names = view.read(cx).layout_names();
         let layouts = controls::Picker::new("layout", &names, view.read(cx).layout_index());
@@ -3028,6 +3276,10 @@ impl DevShell {
         let wrap_names = view.read(cx).wrap_names(host);
         let wrap = controls::Picker::new("wrap", &wrap_names, view.read(cx).wrap_index());
 
+        // An algorithm or a whitespace rule only means something when a
+        // repository produced these rows; a fixture was diffed by somebody
+        // else and says so by drawing the control inert.
+        let from_repo = self.rediff.is_some() && matches!(source, Some(Source::Repo { .. }));
         let algorithms = host.differ.names();
         let selected = self
             .over
@@ -3039,7 +3291,7 @@ impl DevShell {
             &algorithms,
             algorithms.iter().position(|n| *n == selected).unwrap_or(0),
         )
-        .enabled(self.rediff.is_some() && matches!(source, Source::Repo { .. }));
+        .enabled(from_repo);
 
         let ws_names: Vec<&str> = Whitespace::ALL.iter().map(|w| w.name()).collect();
         let ws = self.over.whitespace.unwrap_or(host.differ.whitespace);
@@ -3048,7 +3300,7 @@ impl DevShell {
             &ws_names,
             Whitespace::ALL.iter().position(|w| *w == ws).unwrap_or(0),
         )
-        .enabled(self.rediff.is_some() && matches!(source, Source::Repo { .. }));
+        .enabled(from_repo);
 
         vec![
             controls::picker(
@@ -3157,41 +3409,97 @@ impl Render for DevShell {
         let host = config::host(cx);
         let c = host.theme.chrome;
         let f = &host.font;
-        // Every registered tenant gets an equal vertical share. The wrapper is
-        // the focus ring and the click target; the view inside still measures
-        // its own box, so neither diff wrapping nor list virtualization learns
-        // that panes exist.
-        let focused_pane = self.panes.focused_index();
-        let pane_views = self
-            .panes
-            .iter()
-            .enumerate()
-            .map(|(at, screen)| {
-                let focused = at == focused_pane;
-                // Equal shares by default. A tenant that claims a fixed slice
-                // of the column gets it as a basis; the equal-share panes grow
-                // into whatever is left.
-                let sized = match screen.height_share(cx) {
-                    Some(share) => div().flex_basis(relative(share)),
-                    None => div().flex_1(),
-                };
-                sized
-                    .id(("pane", at))
-                    .relative()
-                    .min_h_0()
-                    .overflow_hidden()
-                    .border_1()
-                    .border_color(rgb(match focused {
-                        true => c.accent,
-                        false => c.border,
-                    }))
-                    .debug_selector(move || format!("pane-{at}"))
-                    .capture_any_mouse_down(
-                        cx.listener(move |this, _, _, cx| this.focus_pane(at, cx)),
+
+        // The two regions. **The lazygit shape**: one list column on the left,
+        // the diff filling everything else, both always on screen. Exactly one
+        // column resident renders at a time — the focused one — so swapping
+        // lists is focusing them, and every list keeps its own cursor and
+        // scroll state while it waits off screen. The focused region carries
+        // the accent as a 2px bar on its left edge: two targets, one glance,
+        // no chrome beyond it tonight.
+        //
+        // A window launched on a diff (a fixture, a patch file) has no column
+        // at all; the main view takes the whole width and the spot never
+        // leaves it.
+        let column = self.has_column.then(|| {
+            let focused = self.spot == Spot::Column;
+            let screen = self.panes.focused();
+            div()
+                .id("column")
+                .flex_none()
+                .w(relative(COLUMN_SHARE))
+                .relative()
+                .min_h_0()
+                .overflow_hidden()
+                .border_l_2()
+                .border_color(rgb(match focused {
+                    true => c.accent,
+                    false => c.border,
+                }))
+                .debug_selector(|| "column".to_string())
+                .capture_any_mouse_down(cx.listener(|this, _, _, _cx| this.set_spot(Spot::Column)))
+                .child(screen.any())
+        });
+        let Screen::Diff {
+            view: main_view, ..
+        } = &self.main
+        else {
+            unreachable!("the main view is always a diff");
+        };
+        let head = self.head.borrow().clone();
+        let loading = self.loading.get();
+        let main_region = div()
+            .id("main")
+            .flex_grow(1.0)
+            .min_w_0()
+            .relative()
+            .min_h_0()
+            .overflow_hidden()
+            .v_flex()
+            .border_l_2()
+            .border_color(rgb(match self.spot == Spot::Main {
+                true => c.accent,
+                false => c.border,
+            }))
+            .debug_selector(|| "main".to_string())
+            .capture_any_mouse_down(cx.listener(|this, _, _, _cx| this.set_spot(Spot::Main)))
+            // The header strip: what the diff below is *of*. Dim, one line,
+            // written the moment the selection is scheduled — during the load
+            // it names what is coming, which is what makes frame one show a
+            // star rather than an empty half.
+            .children(head.map(|commit| {
+                let text =
+                    SharedString::from(format!("{} · {} · {}", commit.subject, commit.author, {
+                        let n = commit.sha.len().min(8);
+                        commit.sha[..n].to_string()
+                    }));
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .h(px(BAND_H))
+                    .px_3()
+                    .bg(rgb(c.title_bg))
+                    .border_b_1()
+                    .border_color(rgb(c.border))
+                    .text_color(rgb(c.dim))
+                    .child(
+                        div()
+                            .flex_shrink(1.0)
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis_start()
+                            .child(text),
                     )
-                    .child(screen.any())
-            })
-            .collect::<Vec<_>>();
+                    .children(
+                        loading
+                            .then(|| div().flex_none().text_color(rgb(c.accent)).child("loading")),
+                    )
+            }))
+            .child(main_view.clone());
+
         let which = self.active_view_name();
         let strip = self.strip(&host, cx);
         let error = self.error.clone();
@@ -3199,7 +3507,11 @@ impl Render for DevShell {
         let running = self
             .running
             .clone()
-            .or_else(|| (self.refresh_pending > 0).then(|| "refreshing repository".to_string()));
+            .or_else(|| (self.refresh_pending > 0).then(|| "refreshing repository".to_string()))
+            // The main view's own load, which does not ride the job queue:
+            // said here rather than invented for it, because the band is the
+            // one place a background something is spoken of.
+            .or_else(|| self.loading.get().then(|| "loading diff".to_string()));
         let input = self.input.clone();
 
         // The title is three things, so it is drawn as three: the app bright, the
@@ -3333,7 +3645,14 @@ impl Render for DevShell {
                     .or_else(|| running.map(|n| band(&c, SharedString::from(n), c.dim)))
                     .or_else(|| notice.map(|n| band(&c, SharedString::from(n), c.dim))),
             )
-            .child(div().min_h_0().flex_grow(1.0).v_flex().children(pane_views))
+            .child(
+                div()
+                    .min_h_0()
+                    .flex_grow(1.0)
+                    .flex()
+                    .children(column)
+                    .child(main_region),
+            )
             .children(input)
             // The menu itself is deferred at priority 1. Its transparent
             // priority-0 backdrop blocks the rest of the window without
@@ -3568,7 +3887,7 @@ fn main() {
                         (
                             Screen::diff(
                                 e.clone(),
-                                source.clone(),
+                                Some(source.clone()),
                                 Generation::default(),
                                 label.clone(),
                             ),
@@ -3579,6 +3898,19 @@ fn main() {
                             v.load.clone(),
                         )
                     }
+                };
+                let has_column = matches!(screen, Screen::Commits { .. });
+                // The diff main view. A launch that opened on a *list* starts
+                // it empty — its rows arrive with the first selection's
+                // scheduled load, and the header names the commit from frame
+                // one. A launch that opened on a diff (`gitten diff …`, a
+                // fixture, a patch) *is* this screen: same rows, no column.
+                let main_screen = match &screen {
+                    Screen::Commits { .. } => {
+                        let e = cx.new(|cx| views::diff::Diff::new(Vec::new(), host.clone(), cx));
+                        Screen::diff(e, None, Generation::default(), "")
+                    }
+                    other => other.clone(),
                 };
                 let mut initial_panes = panes::Panes::new(which_name, screen);
 
@@ -3627,15 +3959,10 @@ fn main() {
                     });
                     start::mark("files status done");
                     let (files_prepared, stashes_prepared) = described;
-                    let stashes_label = stashes_prepared.label.clone();
-                    initial_panes.register(
-                        "stashes",
-                        Screen::stashes(
-                            cx.new(|_| views::stashes::Stashes::from_prepared(stashes_prepared)),
-                            Generation::default(),
-                            stashes_label,
-                        ),
-                    );
+                    // Registration order is the column's cycle order — kept
+                    // in step with the number keys, so ctrl-j walks
+                    // 1 → 2 → 3 → 4. Registration focuses what it adds;
+                    // startup keeps the keyboard where it launched.
                     let files_label = files_prepared.label.clone();
                     initial_panes.register(
                         "files",
@@ -3645,8 +3972,6 @@ fn main() {
                             files_label,
                         ),
                     );
-                    // Registration focuses what it adds; startup keeps the
-                    // keyboard where it launched.
                     initial_panes.focus(0);
                     start::mark("files pane built");
 
@@ -3698,6 +4023,20 @@ fn main() {
                     );
                     initial_panes.focus(0);
                     start::mark("branches pane built");
+
+                    // The stack, last in the cycle like its key is last on the
+                    // number row.
+                    let stashes_label = stashes_prepared.label.clone();
+                    initial_panes.register(
+                        "stashes",
+                        Screen::stashes(
+                            cx.new(|_| views::stashes::Stashes::from_prepared(stashes_prepared)),
+                            Generation::default(),
+                            stashes_label,
+                        ),
+                    );
+                    initial_panes.focus(0);
+                    start::mark("stashes pane built");
                 }
                 start::mark("view built");
 
@@ -3755,6 +4094,15 @@ fn main() {
                 let shell = cx.new(|_| DevShell {
                     which: which_name,
                     panes: initial_panes,
+                    main: main_screen,
+                    has_column,
+                    spot: match has_column {
+                        true => Spot::Column,
+                        false => Spot::Main,
+                    },
+                    head: RefCell::new(None),
+                    request: Cell::new(0),
+                    loading: Cell::new(false),
                     stats,
                     rediff,
                     repo,
@@ -3784,8 +4132,14 @@ fn main() {
                 });
                 {
                     let shell = shell.clone();
-                    shell.update(cx, |shell, _| {
+                    shell.update(cx, |shell, cx| {
                         shell.sync_modes();
+                        // Frame one already names its commit: schedule the
+                        // newest one's diff through the same guarded rails
+                        // every later selection rides. The header and the
+                        // band are up before the first paint; the rows land
+                        // one debounce later.
+                        shell.sync_main_diff(cx);
                     });
                 }
                 {
@@ -3918,7 +4272,7 @@ mod tests {
     use gitten_core::Commit;
     use gitten_git::{Pair, Repo};
     use gpui::{AppContext as _, TestAppContext};
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::path::PathBuf;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -4066,7 +4420,12 @@ mod tests {
     /// one key of a chord half-typed — the state `esc` meets most often.
     fn shell(which: Option<Open>, cx: &mut TestAppContext) -> gpui::Entity<DevShell> {
         cx.new(|cx| {
-            let commits = cx.new(|_| Commits::new(Vec::new(), Rc::new(Host::new())));
+            // The live host, so anything a test dispatches through
+            // `config::host` finds one — tests that care replace it.
+            cx.set_global(config::Active(Rc::new(Host::new())));
+            let host = config::host(cx);
+            let commits = cx.new(|_| Commits::new(Vec::new(), host.clone()));
+            let diff = cx.new(|cx| crate::views::diff::Diff::new(Vec::new(), host.clone(), cx));
             let jobs = Runner::new();
             DevShell {
                 which: "commits",
@@ -4074,6 +4433,12 @@ mod tests {
                     "commits",
                     Screen::commits(commits, Source::Fixtures, Generation::default(), "repo"),
                 ),
+                main: Screen::diff(diff, None, Generation::default(), ""),
+                has_column: true,
+                spot: super::Spot::Column,
+                head: RefCell::new(None),
+                request: Cell::new(0),
+                loading: Cell::new(false),
                 stats: None,
                 rediff: None,
                 repo: None,
@@ -4128,10 +4493,26 @@ mod tests {
     }
 
     #[gpui::test]
-    fn esc_without_a_picker_closes_only_the_focused_secondary_pane(cx: &mut TestAppContext) {
-        // The control: nothing open, two panes — back closes the focused
-        // secondary and never closes the root.
+    fn esc_hands_the_keyboard_back_from_the_diff_and_never_closes_a_list(cx: &mut TestAppContext) {
         let shell = shell(None, cx);
+        // From the column, esc with nothing standing does nothing at all —
+        // and closes nothing, because the lists are the column's residents.
+        shell.update(cx, |s, cx| s.back(cx));
+        shell.read_with(cx, |s, _| {
+            assert_eq!(s.panes.len(), 1);
+            assert_eq!(s.spot, super::Spot::Column);
+        });
+
+        // Enter hands the keyboard to the diff region; `esc` brings it back.
+        shell.update(cx, |s, cx| s.run_command("commits.open-diff", cx));
+        shell.read_with(cx, |s, _| {
+            assert_eq!(s.spot, super::Spot::Main);
+            assert_eq!(s.modes.top(), "diff", "the diff owns the keys");
+        });
+        shell.update(cx, |s, cx| s.back(cx));
+        shell.read_with(cx, |s, _| assert_eq!(s.spot, super::Spot::Column));
+
+        // A second registered list survives every esc.
         shell.update(cx, |s, cx| {
             let commits = cx.new(|_| Commits::new(Vec::new(), Rc::new(Host::new())));
             s.panes.register(
@@ -4140,15 +4521,13 @@ mod tests {
             );
             s.sync_modes();
         });
-        assert_eq!(shell.read_with(cx, |s, _| s.panes.len()), 2);
-        shell.update(cx, |s, cx| s.back(cx));
+        for _ in 0..2 {
+            shell.update(cx, |s, cx| s.back(cx));
+        }
         shell.read_with(cx, |s, _| {
-            assert_eq!(s.panes.len(), 1, "the secondary pane was not closed");
-            assert!(s.open.is_none());
+            assert_eq!(s.panes.len(), 2, "esc closed a list");
+            assert_eq!(s.open, None);
         });
-        // And on the last screen esc stops: it was never a quit.
-        shell.update(cx, |s, cx| s.back(cx));
-        shell.read_with(cx, |s, _| assert_eq!(s.panes.len(), 1));
     }
 
     #[gpui::test]
@@ -4288,16 +4667,8 @@ mod tests {
     }
 
     #[gpui::test]
-    fn two_registered_panes_are_stacked_into_equal_nonzero_boxes(cx: &mut TestAppContext) {
+    fn the_column_and_the_main_view_sit_side_by_side(cx: &mut TestAppContext) {
         let shell = shell(None, cx);
-        shell.update(cx, |shell, cx| {
-            let commits = cx.new(|_| Commits::new(Vec::new(), Rc::new(Host::new())));
-            shell.panes.register(
-                "second",
-                Screen::commits(commits, Source::Fixtures, Generation::default(), "second"),
-            );
-            shell.sync_modes();
-        });
         let observed = shell.clone();
         let handle = cx.update(|cx| {
             gpui_component::init(cx);
@@ -4316,46 +4687,56 @@ mod tests {
         });
         let mut cx = gpui::VisualTestContext::from_window(handle.into(), cx);
         cx.run_until_parked();
-        let first = cx.debug_bounds("pane-0").expect("first pane was not drawn");
-        let second = cx
-            .debug_bounds("pane-1")
-            .expect("second pane was not drawn");
+        let column = cx.debug_bounds("column").expect("the column was not drawn");
+        let main = cx
+            .debug_bounds("main")
+            .expect("the main view was not drawn");
 
-        assert!(first.size.height > gpui::px(0.0));
-        assert!(second.size.height > gpui::px(0.0));
-        assert_eq!(first.origin.x, second.origin.x);
-        assert_eq!(first.size.width, second.size.width);
-        assert_eq!(first.bottom(), second.top());
+        // Side by side, both full height, the column in its slice of the
+        // width — 0.32 against the main view's 0.68.
+        assert!(column.size.height > gpui::px(0.0));
+        assert!(main.size.height > gpui::px(0.0));
+        assert_eq!(column.origin.y, main.origin.y);
+        let width = f32::from(column.size.width) + f32::from(main.size.width);
+        let share = f32::from(column.size.width) / width;
         assert!(
-            (f32::from(first.size.height) - f32::from(second.size.height)).abs() < 1.0,
-            "pane heights differ: {} and {}",
-            first.size.height,
-            second.size.height
+            (share - super::COLUMN_SHARE).abs() < 0.01,
+            "the column took {share} of the width"
+        );
+        assert_eq!(column.right(), main.origin.x);
+
+        // A click moves the keyboard between exactly the two regions.
+        cx.simulate_click(main.center(), gpui::Modifiers::default());
+        assert_eq!(
+            observed.read_with(&cx, |shell, _| shell.spot),
+            super::Spot::Main
+        );
+        cx.simulate_click(column.center(), gpui::Modifiers::default());
+        assert_eq!(
+            observed.read_with(&cx, |shell, _| shell.spot),
+            super::Spot::Column
         );
 
-        cx.simulate_event(gpui::ScrollWheelEvent {
-            position: first.center(),
-            delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.0), gpui::px(1.0))),
-            ..Default::default()
+        // And ctrl-j cycles the column's lists without leaving the column.
+        // Registration focuses what it adds, so the keyboard goes back to the
+        // root first — where ctrl-j finds it.
+        observed.update(&mut cx, |shell, cx| {
+            let commits = cx.new(|_| Commits::new(Vec::new(), Rc::new(Host::new())));
+            shell.panes.register(
+                "second",
+                Screen::commits(commits, Source::Fixtures, Generation::default(), "second"),
+            );
+            shell.panes.focus(0);
+            shell.sync_modes();
         });
-        assert_eq!(
-            observed.read_with(&cx, |shell, _| shell.panes.focused_index()),
-            0
-        );
-        cx.simulate_click(second.center(), gpui::Modifiers::default());
-        assert_eq!(
-            observed.read_with(&cx, |shell, _| shell.panes.focused_index()),
-            1
-        );
-        cx.simulate_click(first.center(), gpui::Modifiers::default());
-        assert_eq!(
-            observed.read_with(&cx, |shell, _| shell.panes.focused_index()),
-            0
-        );
         cx.simulate_keystrokes("ctrl-j");
         assert_eq!(
-            observed.read_with(&cx, |shell, _| shell.panes.focused_index()),
-            1
+            observed.read_with(&cx, |shell, _| shell.panes.focused_name().to_string()),
+            "second"
+        );
+        assert_eq!(
+            observed.read_with(&cx, |shell, _| shell.spot),
+            super::Spot::Column
         );
     }
 
@@ -4363,6 +4744,8 @@ mod tests {
     fn files_focus_reaches_the_registered_pane_and_says_so_when_there_is_none(
         cx: &mut TestAppContext,
     ) {
+        // Bound before the name `shell` is taken by a list-carrying one.
+        let bare = shell(None, cx);
         let shell = shell(None, cx);
         shell.update(cx, |shell, cx| {
             let files = cx.new(|_| {
@@ -4383,10 +4766,11 @@ mod tests {
             assert_eq!(shell.active_view_name(), "commits")
         });
 
-        // Named dispatch — the same path the `2` key resolves through.
+        // Named dispatch — the same path the `2` key resolves through. It
+        // swaps the list into the column and takes the keyboard with it.
         shell.update(cx, |shell, cx| shell.run_command("files.focus", cx));
         shell.read_with(cx, |shell, app| {
-            assert_eq!(shell.panes.focused_index(), 1);
+            assert_eq!(shell.panes.focused_name(), "files");
             assert_eq!(shell.modes.top(), "files");
             assert_eq!(
                 shell.active_label(app).as_ref(),
@@ -4394,15 +4778,10 @@ mod tests {
             );
         });
 
-        // And with the pane gone again, the key is answered with a sentence,
-        // not silence.
-        shell.update(cx, |shell, cx| {
-            shell.panes.close_focused();
-            shell.sync_modes();
-            shell.notice = None;
-            shell.run_command("files.focus", cx);
-        });
-        shell.read_with(cx, |shell, _| {
+        // And with no such resident — a fixture has no working tree — the key
+        // is answered with a sentence, not silence.
+        bare.update(cx, |shell, cx| shell.run_command("files.focus", cx));
+        bare.read_with(cx, |shell, _| {
             assert!(shell.notice.is_some(), "a missing pane went unsaid");
         });
     }
@@ -4646,22 +5025,82 @@ mod tests {
         });
     }
 
-    #[gpui::test]
-    fn the_files_pane_claims_a_fixed_slice_and_equal_shares_split_the_rest(
-        cx: &mut TestAppContext,
-    ) {
-        let shell = shell(None, cx);
+    // ------------------------------------------------------- the main view
+
+    /// Installs `raw` as the main view's rows, with no repository behind it —
+    /// the shape a fixture window's main view has.
+    fn install_main(shell: &gpui::Entity<DevShell>, raw: &str, cx: &mut TestAppContext) {
         shell.update(cx, |shell, cx| {
-            let commits = cx.new(|_| Commits::new(Vec::new(), Rc::new(Host::new())));
-            shell.panes.register(
-                "second",
-                Screen::commits(commits, Source::Fixtures, Generation::default(), "second"),
+            let host = Rc::new(Host::new());
+            let view = cx.new(|cx| {
+                crate::views::diff::Diff::new(
+                    gitten_core::parse_unified_diff(raw),
+                    host.clone(),
+                    cx,
+                )
+            });
+            shell.main = Screen::diff(
+                view,
+                Some(Source::Fixtures),
+                Generation::default(),
+                "fixture",
             );
+        });
+    }
+
+    const ONE_HUNK: &str = "\
+diff --git a/one.txt b/one.txt
+--- a/one.txt
++++ b/one.txt
+@@ -1,3 +1,3 @@
+ alpha
+-beta
++BETA
+ gamma
+";
+
+    /// The commits list under the keyboard, however far down the registry it
+    /// sits after other lists registered beside it.
+    fn column_commits(shell: &gpui::Entity<DevShell>, cx: &TestAppContext) -> String {
+        let view = shell.read_with(cx, |shell, _| {
+            let at = shell.panes.position("commits").expect("no commits list");
+            match shell.panes.iter().nth(at) {
+                Some(Screen::Commits { view, .. }) => view.clone(),
+                _ => panic!("the column's resident is not a commits list"),
+            }
+        });
+        view.read_with(cx, |v, _| {
+            v.current().map(|c| c.sha.clone()).unwrap_or_default()
+        })
+    }
+
+    #[gpui::test]
+    fn swapping_lists_preserves_each_list_cursor(cx: &mut TestAppContext) {
+        let shell = commits_shell(cx);
+        // The commit cursor moves two rows down...
+        for _ in 0..2 {
+            shell.update(cx, |shell, cx| shell.run_command("view.down", cx));
+        }
+        assert_eq!(column_commits(&shell, cx), search_commit(2).sha);
+
+        // ...a files list swaps in and its own cursor moves to its bottom...
+        let mut tree = Status::default();
+        tree.staged.push(gitten_core::status::StagedEntry {
+            path: "gone.txt".into(),
+            change: gitten_core::status::Change::Deleted,
+            old_path: None,
+            kind: gitten_core::status::Kind::File,
+            submodule: Default::default(),
+        });
+        tree.unstaged.push(gitten_core::status::UnstagedEntry {
+            path: "notes.md".into(),
+            change: gitten_core::status::Change::Modified,
+            kind: gitten_core::status::Kind::File,
+            submodule: Default::default(),
+        });
+        shell.update(cx, |shell, cx| {
             let files = cx.new(|_| {
-                crate::views::files::Files::from_prepared(crate::views::files::prepare(
-                    Status::default(),
-                    "",
-                ))
+                crate::views::files::Files::from_prepared(crate::views::files::prepare(tree, "r"))
             });
             shell.panes.register(
                 "files",
@@ -4669,44 +5108,101 @@ mod tests {
             );
             shell.sync_modes();
         });
-        let handle = cx.update(|cx| {
-            gpui_component::init(cx);
-            cx.set_global(config::Active(Rc::new(Host::new())));
-            cx.open_window(
-                gpui::WindowOptions {
-                    window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds {
-                        origin: Default::default(),
-                        size: gpui::size(gpui::px(800.0), gpui::px(600.0)),
-                    })),
-                    ..Default::default()
-                },
-                move |_, _| shell,
-            )
-            .unwrap()
-        });
-        let mut cx = gpui::VisualTestContext::from_window(handle.into(), cx);
-        cx.run_until_parked();
-        let first = cx.debug_bounds("pane-0").expect("first pane was not drawn");
-        let second = cx
-            .debug_bounds("pane-1")
-            .expect("second pane was not drawn");
-        let files = cx.debug_bounds("pane-2").expect("files pane was not drawn");
+        shell.update(cx, |shell, cx| shell.run_command("view.bottom", cx));
 
-        // The two unclaimed panes stay equal, and the working tree sits in its
-        // slice — 0.3 of the column against their 0.35 each.
+        // ...and both survive every swap back. The views are never rebuilt —
+        // swapping is focusing.
+        shell.update(cx, |shell, cx| shell.run_command("commits.focus", cx));
+        assert_eq!(column_commits(&shell, cx), search_commit(2).sha);
+        shell.update(cx, |shell, cx| shell.run_command("files.focus", cx));
+        shell.read_with(cx, |shell, cx| match shell.active() {
+            Some(Screen::Files { view, .. }) => {
+                assert_eq!(
+                    view.read(cx).current_file().map(|f| f.path_text.as_ref()),
+                    Some("notes.md"),
+                    "the files cursor did not survive the swaps"
+                );
+            }
+            _ => panic!("the files list is not showing"),
+        });
+    }
+
+    #[gpui::test]
+    fn keys_follow_the_region_the_list_moves_lists_and_j_scrolls_the_diff(cx: &mut TestAppContext) {
+        let shell = commits_shell(cx);
+        install_main(&shell, ONE_HUNK, cx);
+        // From the column, `j` moves the commit list and touches nothing else.
+        shell.update(cx, |shell, cx| shell.run_command("view.down", cx));
+        assert_eq!(column_commits(&shell, cx), search_commit(1).sha);
+        shell.read_with(cx, |shell, cx| match &shell.main {
+            Screen::Diff { view, .. } => assert_eq!(view.read(cx).cursor(), 0),
+            _ => panic!("main view lost"),
+        });
+
+        // Enter hands the keyboard to the diff region...
+        shell.update(cx, |shell, cx| shell.run_command("commits.open-diff", cx));
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.spot, super::Spot::Main);
+            assert_eq!(shell.modes.top(), "diff");
+        });
+
+        // ...and now `j` scrolls the diff, leaving the list where it was.
+        shell.update(cx, |shell, cx| shell.run_command("view.down", cx));
+        shell.read_with(cx, |shell, cx| match &shell.main {
+            Screen::Diff { view, .. } => assert_eq!(view.read(cx).cursor(), 1),
+            _ => panic!("main view lost"),
+        });
+        assert_eq!(column_commits(&shell, cx), search_commit(1).sha);
+    }
+
+    #[gpui::test]
+    fn a_fast_cursor_run_loads_only_the_commit_it_settles_on(cx: &mut TestAppContext) {
+        let (shell, repo) = history_shell(cx);
+        // Five rows of cursor movement inside one debounce window: every row
+        // re-aims the request, and only the last aim survives its guard.
+        for _ in 0..5 {
+            shell.update(cx, |shell, cx| shell.run_command("view.down", cx));
+        }
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.request.get(), 5, "each row re-aimed the request");
+            assert!(shell.loading.get(), "the settled load is in flight");
+        });
         assert!(
-            (f32::from(first.size.height) - f32::from(second.size.height)).abs() < 1.0,
-            "equal shares diverged"
+            repo.diffs_wrote().is_empty(),
+            "a load ran before the cursor settled"
         );
-        let ratio = f32::from(files.size.height) / f32::from(first.size.height);
-        assert!(
-            (ratio - 0.3 / 0.35).abs() < 0.02,
-            "the files pane took {ratio} of an equal share"
-        );
-        // Stacked in registration order, touching, full width.
-        assert_eq!(files.origin.y, second.bottom());
-        assert_eq!(files.origin.x, first.origin.x);
-        assert_eq!(files.size.width, first.size.width);
+
+        // Settled: one timer fires, one acquisition runs, for the final row.
+        cx.executor().advance_clock(super::DIFF_DEBOUNCE);
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, _| assert!(!shell.loading.get()));
+        assert_eq!(repo.diffs_wrote(), vec![search_commit(5).sha]);
+    }
+
+    #[gpui::test]
+    fn startup_names_and_loads_the_newest_commit(cx: &mut TestAppContext) {
+        let (shell, repo) = history_shell(cx);
+        // What main() runs before frame one: schedule through the same rails
+        // every later selection rides.
+        shell.update(cx, |shell, cx| shell.sync_main_diff(cx));
+        // Named before anything loaded — the header strip is true in frame one.
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(
+                shell.head.borrow().as_ref().map(|c| c.sha.clone()),
+                Some(search_commit(0).sha)
+            );
+            assert!(shell.loading.get());
+        });
+        cx.executor().advance_clock(super::DIFF_DEBOUNCE);
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, _| {
+            assert!(!shell.loading.get(), "the startup load never came home");
+            assert_eq!(
+                shell.head.borrow().as_ref().map(|c| c.sha.clone()),
+                Some(search_commit(0).sha)
+            );
+        });
+        assert_eq!(repo.diffs_wrote(), vec![search_commit(0).sha]);
     }
 
     #[test]
@@ -4763,6 +5259,10 @@ mod tests {
         /// What `log` answers — the window of history a rewrite composes
         /// over. Empty until a test serves it.
         log_answer: std::sync::Mutex<Vec<Commit>>,
+        /// Which revspecs `pairs` was asked to diff, in order — the record a
+        /// main-view debounce test reads. Separate from [`Self::calls`] so
+        /// write assertions never see a read.
+        diffs: std::sync::Mutex<Vec<String>>,
     }
 
     impl RecordingRepo {
@@ -4777,11 +5277,17 @@ mod tests {
                 conflict: AtomicBool::new(false),
                 untracked: std::sync::Mutex::new(Vec::new()),
                 log_answer: std::sync::Mutex::new(Vec::new()),
+                diffs: std::sync::Mutex::new(Vec::new()),
             }
         }
 
         fn wrote(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
+        }
+
+        /// The revspecs `pairs` was asked for — one entry per diff acquisition.
+        fn diffs_wrote(&self) -> Vec<String> {
+            self.diffs.lock().unwrap().clone()
         }
 
         /// Serves `log`'s answer — the same commits the pane shows, which is
@@ -4840,7 +5346,8 @@ mod tests {
             Ok(self.log_answer.lock().unwrap().clone())
         }
 
-        fn pairs(&self, _: &str) -> gitten_git::Result<Vec<Pair>> {
+        fn pairs(&self, revspec: &str) -> gitten_git::Result<Vec<Pair>> {
+            self.diffs.lock().unwrap().push(revspec.to_string());
             Ok(Vec::new())
         }
 
@@ -5303,6 +5810,7 @@ mod tests {
             conflict: AtomicBool::new(false),
             untracked: std::sync::Mutex::new(Vec::new()),
             log_answer: std::sync::Mutex::new(Vec::new()),
+            diffs: std::sync::Mutex::new(Vec::new()),
         });
         let handle: gitten_git::Handle = repo.clone();
         let shell = shell(None, cx);
@@ -5373,18 +5881,18 @@ diff --git a/one.txt b/one.txt
             view.update(cx, |d, _| {
                 d.run_view("view.down", &host);
             });
-            shell.panes.register(
+            // The main region is where a diff lives now: installed there and
+            // handed the keyboard, exactly as a selection's enter would.
+            shell.main = Screen::diff(
+                view,
+                Some(Source::Repo {
+                    path: PathBuf::from("/recorded"),
+                    arg: arg.into(),
+                }),
+                Generation::default(),
                 "diff",
-                Screen::diff(
-                    view,
-                    Source::Repo {
-                        path: PathBuf::from("/recorded"),
-                        arg: arg.into(),
-                    },
-                    Generation::default(),
-                    "diff",
-                ),
             );
+            shell.set_spot(super::Spot::Main);
             shell.sync_modes();
             shell.repo = Some((PathBuf::from("/recorded"), handle));
             cx.set_global(config::Active(Rc::new(Host::new())));
@@ -5440,18 +5948,16 @@ diff --git a/fresh.txt b/fresh.txt
             view.update(cx, |d, _| {
                 d.run_view("view.down", &host);
             });
-            shell.panes.register(
+            shell.main = Screen::diff(
+                view,
+                Some(Source::Repo {
+                    path: PathBuf::from("/recorded"),
+                    arg: String::new(),
+                }),
+                Generation::default(),
                 "diff",
-                Screen::diff(
-                    view,
-                    Source::Repo {
-                        path: PathBuf::from("/recorded"),
-                        arg: String::new(),
-                    },
-                    Generation::default(),
-                    "diff",
-                ),
             );
+            shell.set_spot(super::Spot::Main);
             shell.sync_modes();
             shell.repo = Some((PathBuf::from("/recorded"), handle));
             cx.set_global(config::Active(Rc::new(Host::new())));
@@ -5704,6 +6210,7 @@ diff --git a/fresh.txt b/fresh.txt
     fn stashes_focus_reaches_the_registered_pane_and_says_so_when_there_is_none(
         cx: &mut TestAppContext,
     ) {
+        let bare = shell(None, cx);
         let (shell, _repo) = stashes_shell(cx);
         // Registration left the keyboard on the stack; named dispatch gets
         // back there from anywhere.
@@ -5718,15 +6225,10 @@ diff --git a/fresh.txt b/fresh.txt
             assert_eq!(shell.active_label(app).as_ref(), "r · 2 parked");
         });
 
-        // And with the pane gone again, the key is answered with a sentence,
-        // not silence.
-        shell.update(cx, |shell, cx| {
-            shell.panes.close_focused();
-            shell.sync_modes();
-            shell.notice = None;
-            shell.run_command("stashes.focus", cx);
-        });
-        shell.read_with(cx, |shell, _| {
+        // And with no such resident — a fixture has no stash stack — the key
+        // is answered with a sentence, not silence.
+        bare.update(cx, |shell, cx| shell.run_command("stashes.focus", cx));
+        bare.read_with(cx, |shell, _| {
             assert!(shell.notice.is_some(), "a missing pane went unsaid");
         });
     }

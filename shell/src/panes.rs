@@ -32,6 +32,9 @@ impl<T> Panes<T> {
         self.entries.len()
     }
 
+    /// The focused tenant's index. Part of the registry API an extension
+    /// client sees; the two-region window itself no longer reads it.
+    #[allow(dead_code)]
     pub fn focused_index(&self) -> usize {
         self.focused
     }
@@ -89,6 +92,12 @@ impl<T> Panes<T> {
 
     /// Closes the focused secondary tenant. The first pane is the workspace's
     /// root and, like the old screen stack's first entry, is never removed.
+    ///
+    /// The stacked window's `esc` was this method's only caller; in the
+    /// two-region window a list is never closed. Kept because it *is* the
+    /// registry's close verb — an extension pane that can be dismissed will
+    /// be dismissed through here and not through a new seam.
+    #[allow(dead_code)]
     pub fn close_focused(&mut self) -> Option<T> {
         if self.focused == 0 || self.entries.len() == 1 {
             return None;
