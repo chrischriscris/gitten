@@ -171,6 +171,9 @@ enum Row {
 pub struct SplitRows {
     rows: Vec<Row>,
     lines: Vec<Line>,
+    /// Which hunk every row belongs to — see [`super::diff::HunkMap`]. One
+    /// entry per hunk, recorded as the rows are built.
+    hunks: super::diff::HunkMap,
     /// Widest line in the diff, in characters. Not a width any more — a column is
     /// half the window — but it is what says on the overlay how much of the diff
     /// is off the right of it.
@@ -253,12 +256,16 @@ impl Rows for SplitRows {
     }
 
     fn build(&mut self, f: gitten_core::prepared::File) {
+        // Kept beside the rows, which consume the hunks: the hunk map needs
+        // to spell each file the loaded diff spells it.
+        let path = std::sync::Arc::from(f.path.as_str());
         self.rows.push(Row::File {
-            path: f.path.into(),
+            path: std::sync::Arc::clone(&path),
             adds: f.adds,
             dels: f.dels,
         });
-        for h in f.hunks {
+        for (n, h) in f.hunks.into_iter().enumerate() {
+            let at = self.rows.len();
             self.rows.push(Row::Hunk(h.header.into()));
 
             // The alignment is computed from the kinds alone, before the lines
@@ -295,7 +302,12 @@ impl Rows for SplitRows {
                     new: new.map(|i| base + i),
                 });
             }
+            self.hunks.record(at, self.rows.len() - at, &path, n);
         }
+    }
+
+    fn hunk_at(&self, index: usize) -> Option<(&str, usize)> {
+        self.hunks.at(index)
     }
 
     /// The longer of a pair row's two sides, because that is the side that

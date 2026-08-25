@@ -1319,6 +1319,95 @@ impl DevShell {
         }
     }
 
+    /// `diff.stage-hunk` / `diff.unstage-hunk` / `diff.discard-hunk`: act on
+    /// the hunk the keyboard sits on, wherever in it the cursor is — header,
+    /// context, changed line, all one address.
+    ///
+    /// Three gates before anything runs, each said rather than answered
+    /// badly. Only a working-tree diff has an index to aim at; a commit's
+    /// diff is between two snapshots and has neither an index nor a worktree
+    /// in reach. A file with no old side — untracked work — cannot travel as
+    /// a patch, because `git apply --cached` creates an entry only from a
+    /// patch carrying its mode and the line model does not carry one; whole-
+    /// file verbs already serve it from the files pane. And discard confirms
+    /// exactly as `files.discard` does: first press arms the row and asks
+    /// once, any move of the keyboard disarms, second press builds the job.
+    fn hunk_verb(&mut self, command: &str, cx: &mut Context<Self>) {
+        let Some(Screen::Diff { view, source, .. }) = self.active() else {
+            self.set_notice(format!("{command} is not supported here"));
+            return;
+        };
+        match source {
+            Source::Repo { arg, .. } if arg.is_empty() => {}
+            Source::Repo { .. } => {
+                self.set_notice(
+                    "only the working-tree diff can act on hunks — this one is between commits",
+                );
+                return;
+            }
+            Source::Fixtures => {
+                self.set_notice("a fixture has no repository behind it");
+                return;
+            }
+            Source::Patch { .. } => {
+                self.set_notice("a patch file has no repository behind it");
+                return;
+            }
+        }
+        let Some(writes) = self.writes() else {
+            self.set_notice("a fixture has no repository to act on");
+            return;
+        };
+        let view = view.clone();
+        let host = config::host(cx);
+        // Meet the list where its last drag left it, like every reader of the
+        // cursor: the hunk acted on is the one being *looked at*.
+        view.update(cx, |d, _| d.reconcile(&host));
+        let row = view.read(cx).cursor_row_id();
+        let Some((path, hunk)) = view.read(cx).current_hunk() else {
+            self.set_notice("the keyboard is not on a hunk");
+            return;
+        };
+        // The creation case: every line an addition means there was no file
+        // to patch against. Whole-file verbs own it; say where they live.
+        let creation = !hunk.lines.iter().any(|l| l.old_no.is_some());
+        if creation {
+            self.set_notice(match command {
+                "diff.stage-hunk" | "diff.unstage-hunk" => {
+                    "that hunk adds a new file — stage or unstage it whole from the files pane"
+                }
+                _ => "that hunk creates the file — discard it whole from the files pane",
+            });
+            return;
+        }
+        // DESTRUCTIVE asks twice, on the same spot.
+        if command == "diff.discard-hunk"
+            && !view.update(cx, |d, _| d.confirm_or_arm_discard_hunk(row))
+        {
+            self.set_notice(format!(
+                "discard this hunk of {path}? press again to confirm"
+            ));
+            return;
+        }
+        if command == "diff.discard-hunk" {
+            self.notice = None; // the question is spent; the running band speaks next
+        }
+        let patch = gitten_core::patch::emit(&path, &[&hunk]);
+        let built = match command {
+            "diff.stage-hunk" => gitten_app::verbs::Write::stage_patch(&writes.repo, patch),
+            "diff.unstage-hunk" => gitten_app::verbs::Write::unstage_patch(&writes.repo, patch),
+            _ => gitten_app::verbs::Write::discard_patch(&writes.repo, patch),
+        };
+        match built {
+            Ok(job) => {
+                if !writes.send(Box::new(job)) {
+                    self.set_notice("the job queue is shutting down");
+                }
+            }
+            Err(e) => self.set_notice(e),
+        }
+    }
+
     /// `files.stash`: park what the tracked working tree holds on the stash
     /// stack and start again from HEAD. No message tonight — the entry gets
     /// git's own `WIP on …`, which is honest about what it was; a prompt for
@@ -2070,6 +2159,10 @@ impl DevShell {
             "files.stage-all" => self.stage_all(cx),
             "files.ignore" => self.ignore_selected(cx),
             "files.stash" => self.stash_working_tree(cx),
+            // The diff pane's verbs, aimed at the hunk under its keyboard.
+            "diff.stage-hunk" | "diff.unstage-hunk" | "diff.discard-hunk" => {
+                self.hunk_verb(command, cx)
+            }
             // The stash stack's verbs.
             "stashes.apply" | "stashes.pop" | "stashes.drop" => self.stash_selected(command, cx),
             // The branches panel's verbs, over the same two rails.
@@ -4444,6 +4537,33 @@ mod tests {
             Ok(())
         }
 
+        // The patch verbs: the bytes are the payload and no test reads them
+        // back here — recording the size says "it arrived whole" without a
+        // wall of patch text in the assertion.
+        fn stage_patch(&self, patch: &[u8]) -> gitten_git::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("stage-patch {} bytes", patch.len()));
+            Ok(())
+        }
+
+        fn unstage_patch(&self, patch: &[u8]) -> gitten_git::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("unstage-patch {} bytes", patch.len()));
+            Ok(())
+        }
+
+        fn discard_patch(&self, patch: &[u8]) -> gitten_git::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("discard-patch {} bytes", patch.len()));
+            Ok(())
+        }
+
         fn remove_untracked(&self, path: &[u8]) -> gitten_git::Result<()> {
             self.calls
                 .lock()
@@ -4723,6 +4843,108 @@ mod tests {
             shell.panes.register(
                 "stashes",
                 Screen::stashes(view, Generation::default(), "r · 2 parked"),
+            );
+            shell.sync_modes();
+            shell.repo = Some((PathBuf::from("/recorded"), handle));
+            cx.set_global(config::Active(Rc::new(Host::new())));
+        });
+        (shell, repo)
+    }
+
+    /// A shell over a working-tree diff pane: the keyboard on the first line
+    /// row of the first hunk, the repository recording behind it. `arg` is
+    /// the diff's revspec — empty for the working tree, a commit for the
+    /// refusal tests.
+    fn diff_shell(
+        cx: &mut TestAppContext,
+        arg: &'static str,
+    ) -> (gpui::Entity<DevShell>, Arc<RecordingRepo>) {
+        let raw = "\
+diff --git a/one.txt b/one.txt
+--- a/one.txt
++++ b/one.txt
+@@ -1,3 +1,3 @@
+ alpha
+-beta
++BETA
+ gamma
+";
+        let calls = Arc::default();
+        let repo = Arc::new(RecordingRepo::new(Arc::clone(&calls)));
+        let handle: gitten_git::Handle = repo.clone();
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, cx| {
+            let host = Rc::new(Host::new());
+            let view = cx.new(|cx| {
+                crate::views::diff::Diff::new(
+                    gitten_core::parse_unified_diff(raw),
+                    host.clone(),
+                    cx,
+                )
+            });
+            // Off the file header and onto the hunk's first line — where
+            // space means "this hunk".
+            view.update(cx, |d, _| {
+                d.run_view("view.down", &host);
+            });
+            shell.panes.register(
+                "diff",
+                Screen::diff(
+                    view,
+                    Source::Repo {
+                        path: PathBuf::from("/recorded"),
+                        arg: arg.into(),
+                    },
+                    Generation::default(),
+                    "diff",
+                ),
+            );
+            shell.sync_modes();
+            shell.repo = Some((PathBuf::from("/recorded"), handle));
+            cx.set_global(config::Active(Rc::new(Host::new())));
+        });
+        (shell, repo)
+    }
+
+    /// A shell whose diff is an untracked file's whole-addition hunk.
+    fn creation_diff_shell(
+        cx: &mut TestAppContext,
+    ) -> (gpui::Entity<DevShell>, Arc<RecordingRepo>) {
+        let raw = "\
+diff --git a/fresh.txt b/fresh.txt
+--- /dev/null
++++ b/fresh.txt
+@@ -0,0 +1,2 @@
++first
++second
+";
+        let calls = Arc::default();
+        let repo = Arc::new(RecordingRepo::new(Arc::clone(&calls)));
+        let handle: gitten_git::Handle = repo.clone();
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, cx| {
+            let host = Rc::new(Host::new());
+            let view = cx.new(|cx| {
+                crate::views::diff::Diff::new(
+                    gitten_core::parse_unified_diff(raw),
+                    host.clone(),
+                    cx,
+                )
+            });
+            view.update(cx, |d, _| {
+                d.run_view("view.down", &host);
+            });
+            shell.panes.register(
+                "diff",
+                Screen::diff(
+                    view,
+                    Source::Repo {
+                        path: PathBuf::from("/recorded"),
+                        arg: String::new(),
+                    },
+                    Generation::default(),
+                    "diff",
+                ),
             );
             shell.sync_modes();
             shell.repo = Some((PathBuf::from("/recorded"), handle));
@@ -5401,6 +5623,120 @@ mod tests {
             vec!["stage-many notes.md", "unstage-many gone.txt"],
             "the cursor's side decided both directions"
         );
+    }
+
+    // ---------------------------------------------------------- the hunk verbs
+
+    #[gpui::test]
+    fn space_stages_the_hunk_under_the_keyboard(cx: &mut TestAppContext) {
+        let (shell, repo) = diff_shell(cx, "");
+        wire_runner(&shell, cx);
+
+        // Space: the hunk under the keyboard goes to the index as one job,
+        // named for the patch's size because there is no path to name.
+        shell.update(cx, |shell, cx| shell.run_command("diff.stage-hunk", cx));
+        pump_write(&shell, cx);
+        let wrote = repo.wrote();
+        assert_eq!(wrote.len(), 1, "{wrote:?}");
+        assert!(
+            wrote[0].starts_with("stage-patch ") && wrote[0].ends_with(" bytes"),
+            "{wrote:?}"
+        );
+        // One write, one finish: the band is clear and the count moved.
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.generation.get(), 1);
+            assert_eq!(shell.running, None);
+            assert_eq!(shell.error, None);
+        });
+    }
+
+    #[gpui::test]
+    fn u_unstages_the_hunk_back_out_of_the_index(cx: &mut TestAppContext) {
+        // A fresh pane rather than the staged one above: a successful write
+        // re-acquires every repository pane, and the fake behind this shell
+        // answers that read with an empty tree — after which there is no
+        // hunk under the keyboard, exactly as on a cleaned-up working tree.
+        let (shell, repo) = diff_shell(cx, "");
+        wire_runner(&shell, cx);
+
+        shell.update(cx, |shell, cx| shell.run_command("diff.unstage-hunk", cx));
+        pump_write(&shell, cx);
+        assert!(
+            repo.wrote()[0].starts_with("unstage-patch "),
+            "{:?}",
+            repo.wrote()
+        );
+    }
+
+    #[gpui::test]
+    fn a_commit_diff_has_nothing_to_stage_and_says_so(cx: &mut TestAppContext) {
+        let (shell, repo) = diff_shell(cx, "abc1234");
+        wire_runner(&shell, cx);
+
+        for command in ["diff.stage-hunk", "diff.unstage-hunk", "diff.discard-hunk"] {
+            shell.update(cx, |shell, cx| shell.run_command(command, cx));
+            shell.read_with(cx, |shell, _| {
+                let notice = shell.notice.as_deref().unwrap_or_default();
+                assert!(notice.contains("between commits"), "{command}: {notice:?}");
+            });
+        }
+        assert!(repo.wrote().is_empty(), "nothing was queued");
+    }
+
+    #[gpui::test]
+    fn discarding_a_hunk_asks_twice_on_the_same_spot(cx: &mut TestAppContext) {
+        let (shell, repo) = diff_shell(cx, "");
+        wire_runner(&shell, cx);
+
+        shell.update(cx, |shell, cx| shell.run_command("diff.discard-hunk", cx));
+        shell.read_with(cx, |shell, _| {
+            let notice = shell.notice.as_deref().unwrap_or_default();
+            assert!(
+                notice.contains("press again") && notice.contains("hunk"),
+                "{notice:?}"
+            );
+        });
+        assert!(repo.wrote().is_empty(), "the question queued nothing");
+
+        // Second press on the same spot spends the arm and runs.
+        shell.update(cx, |shell, cx| shell.run_command("diff.discard-hunk", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote().len(), 1, "{:?}", repo.wrote());
+        assert!(
+            repo.wrote()[0].starts_with("discard-patch "),
+            "{:?}",
+            repo.wrote()
+        );
+    }
+
+    #[gpui::test]
+    fn an_untracked_file_refuses_hunk_verbs_and_names_the_pane_that_serves_it(
+        cx: &mut TestAppContext,
+    ) {
+        let (shell, repo) = creation_diff_shell(cx);
+        wire_runner(&shell, cx);
+
+        for command in ["diff.stage-hunk", "diff.discard-hunk"] {
+            shell.update(cx, |shell, cx| shell.run_command(command, cx));
+            shell.read_with(cx, |shell, _| {
+                let notice = shell.notice.as_deref().unwrap_or_default();
+                assert!(notice.contains("files pane"), "{command}: {notice:?}");
+            });
+        }
+        assert!(repo.wrote().is_empty(), "the refusal queued nothing");
+    }
+
+    #[gpui::test]
+    fn hunk_verbs_off_a_diff_pane_are_answered_like_unknown_commands(cx: &mut TestAppContext) {
+        let (shell, _repo, _handle) = tree_shell(cx, Status::default());
+
+        shell.update(cx, |shell, cx| shell.run_command("diff.stage-hunk", cx));
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(
+                shell.notice.as_deref(),
+                Some("diff.stage-hunk is not supported here")
+            );
+        });
     }
 
     #[gpui::test]

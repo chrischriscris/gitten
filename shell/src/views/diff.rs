@@ -244,6 +244,20 @@ pub trait Rows {
         false
     }
 
+    /// Which diff hunk logical row `index` belongs to: `(path, hunk)`, where
+    /// `hunk` indexes that file's hunks in the loaded diff. The keyboard's
+    /// address for hunk-level staging — what space, u and D act on.
+    ///
+    /// On the trait rather than computed outside because a hunk's row shape
+    /// is the implementation's own: split pairs a removal with the addition
+    /// that replaced it onto one row, so the same hunk spans a different
+    /// number of rows in each presentation. The default is none, which is
+    /// what makes "the keyboard is not on a hunk" the honest answer from
+    /// anything that draws no hunks — a rendered document, a graph.
+    fn hunk_at(&self, _index: usize) -> Option<(&str, usize)> {
+        None
+    }
+
     /// Width of a visual row in characters. What the widest-row search ranks
     /// rows by, and therefore which row [`Rows::overflow`] is asked about.
     fn width(&self, index: usize, seg: usize) -> usize;
@@ -624,6 +638,11 @@ pub struct Diff {
     /// Index into `order` of the widest visual row: the one row the horizontal
     /// bound is taken from, because it is the one there is furthest to scroll to.
     widest: usize,
+    /// The logical row an armed hunk-discard was aimed at, if a question is
+    /// standing. Any move of the keyboard, wheel or refresh of the diff
+    /// clears it — see [`Diff::confirm_or_arm_discard_hunk`] — so a press
+    /// can never spend an arm on a hunk it was not asked about.
+    armed_hunk: Option<(u16, u32)>,
     /// Where every file header is, in visual rows — what `]` and `[` jump
     /// between. Collected by [`expand`] while it builds the order table, so it
     /// costs one branch per row at rebuild and nothing per frame.
@@ -850,6 +869,8 @@ impl Diff {
                 v.scroll_to((-y / ROW_H).round().max(0.0) as usize);
                 self.view.set(v);
                 self.top.set(v.top());
+                // The wheel is also a move of attention.
+                self.armed_hunk = None;
                 return true;
             }
             // Selection autoscroll parks its own non-strict request. A newer
@@ -875,6 +896,8 @@ impl Diff {
         v.scroll_to((-y / ROW_H).round().max(0.0) as usize);
         self.view.set(v);
         self.synced.set(y);
+        // The wheel is also a move of attention — same rule the arrow keys keep.
+        self.armed_hunk = None;
         true
     }
 
@@ -958,10 +981,16 @@ impl Diff {
                 if host.wrap.len() >= 2 {
                     self.wrap = (self.wrap + 1) % host.wrap.len();
                 }
+                // The rows are about to re-expand; whatever the question was
+                // armed against may land somewhere else in them.
+                self.armed_hunk = None;
                 return true;
             }
             _ => return false,
         }
+        // The keyboard moved. Whatever an armed discard was asked about was
+        // where the keyboard used to be — same rule as the working-tree pane.
+        self.armed_hunk = None;
         self.view.set(v);
         self.show(v);
         true
@@ -1032,6 +1061,8 @@ impl Diff {
         if let Some(t) = target {
             v.go_to(t);
             self.view.set(v);
+            // A file jump is a move of the keyboard; see `run_view`'s tail.
+            self.armed_hunk = None;
             self.show(v);
         }
     }
@@ -1045,6 +1076,48 @@ impl Diff {
     #[allow(dead_code)]
     pub fn cursor(&self) -> usize {
         self.view.get().cursor()
+    }
+
+    /// The logical row the keyboard is on: `(owner, index)`, the identity a
+    /// question is armed against.
+    pub(crate) fn cursor_row_id(&self) -> (u16, u32) {
+        self.order
+            .get(self.view.get().cursor())
+            .map(|r| r.logical())
+            .unwrap_or((u16::MAX, u32::MAX))
+    }
+
+    /// The hunk under the keyboard, as the loaded diff holds it: its file's
+    /// path and the [`Hunk`](gitten_core::Hunk) itself, with every line and
+    /// both sides' numbers — exactly what patch synthesis needs. `None` when
+    /// the keyboard sits on a file header or an empty diff; a presentation
+    /// that draws no hunks answers none for the whole view.
+    ///
+    /// The caller meets the list where the last drag left it first — see
+    /// [`Diff::reconcile`].
+    pub fn current_hunk(&self) -> Option<(String, gitten_core::Hunk)> {
+        let r = *self.order.get(self.view.get().cursor())?;
+        let renderers = self.renderers.borrow();
+        let (path, hunk_no) = renderers.get(r.owner as usize)?.hunk_at(r.index as usize)?;
+        let file = self.files.iter().find(|f| f.path == path)?;
+        Some((path.to_string(), file.hunks.get(hunk_no)?.clone()))
+    }
+
+    /// Arms — or confirms — a discard of the hunk on logical row `id`. The
+    /// first call stores it and returns false: ask, don't act. A second call
+    /// carrying the same id has the keyboard still sitting where the question
+    /// was asked, and spends the arm.
+    pub(crate) fn confirm_or_arm_discard_hunk(&mut self, id: (u16, u32)) -> bool {
+        match self.armed_hunk {
+            Some(armed) if armed == id => {
+                self.armed_hunk = None;
+                true
+            }
+            _ => {
+                self.armed_hunk = Some(id);
+                false
+            }
+        }
     }
 
     /// The text of the row the keyboard is on, or nothing past either end. The
@@ -1142,6 +1215,9 @@ impl Diff {
         self.files = Rc::new(files);
         self.sel = None;
         self.dragging = false;
+        // A refresh is the repository saying things moved; an armed discard
+        // was a promise about how they were, so it dies here first.
+        self.armed_hunk = None;
         self.prepared = Rc::new(prepared);
         let built = arrange(&self.prepared, host, &self.layouts, self.current);
         self.order = Rc::new(built.order);
@@ -1285,6 +1361,7 @@ impl Diff {
             sel: None,
             dragging: false,
             widest: built.widest,
+            armed_hunk: None,
             headers: Rc::new(built.headers),
             scroll: UniformListScrollHandle::new(),
             pan: Pan::default(),
@@ -1310,6 +1387,9 @@ impl Diff {
         // way to carry a selection across two presentations of the same diff —
         // a replace pair is one row here and two there — so it goes.
         self.sel = None;
+        // An armed discard rides the same logic: the row it was asked about
+        // is about to have a different meaning.
+        self.armed_hunk = None;
         let built = arrange(&self.prepared, host, &self.layouts, index);
         self.order = Rc::new(built.order);
         *self.renderers.borrow_mut() = built.renderers;
@@ -1908,11 +1988,63 @@ enum Row {
     },
 }
 
+/// Which hunk each drawn row belongs to.
+///
+/// One entry per hunk — not per row, which is the difference between a table
+/// that grows with a 714k-line diff and one that grows with its hunk count.
+/// Both shipped presentations build their rows in hunk order (a file header,
+/// then each hunk's header and lines), so recording a span at build time is
+/// one push per hunk; reading it back is a binary search. The path travels
+/// as the loaded diff spells it, which is the key the staging verbs aim
+/// [`gitten_core::patch::emit`] with.
+#[derive(Default)]
+pub(crate) struct HunkMap {
+    spans: Vec<SpanEntry>,
+}
+
+struct SpanEntry {
+    /// First logical row of the hunk, inclusive — its header row.
+    start: u32,
+    /// How many logical rows the hunk spans, header included.
+    rows: u32,
+    path: std::sync::Arc<str>,
+    hunk: u16,
+}
+
+impl HunkMap {
+    /// Records one hunk occupying logical rows `at..at+rows`. The path is
+    /// interned once per hunk — hunks number in the hundreds where rows
+    /// number in the hundreds of thousands.
+    pub(crate) fn record(&mut self, at: usize, rows: usize, path: &str, hunk: usize) {
+        self.spans.push(SpanEntry {
+            start: at as u32,
+            rows: rows as u32,
+            path: std::sync::Arc::from(path),
+            hunk: hunk as u16,
+        });
+    }
+
+    /// The hunk under logical row `index`, or nothing for the gaps between
+    /// hunks — today only the file headers.
+    pub(crate) fn at(&self, index: usize) -> Option<(&str, usize)> {
+        let i = self.spans.partition_point(|s| s.start as usize <= index);
+        let s = self.spans.get(i.checked_sub(1)?)?;
+        if index < s.start as usize + s.rows as usize {
+            Some((s.path.as_ref(), s.hunk as usize))
+        } else {
+            None
+        }
+    }
+}
+
 /// The default presentation: one line of text per row, behind a line-number
 /// gutter, coloured by the host's theme.
 #[derive(Default)]
 pub struct TextRows {
     rows: Vec<Row>,
+    /// Which hunk every row belongs to — the staging verbs' map from the
+    /// keyboard's row back to the loaded diff. One entry per hunk.
+    hunks: HunkMap,
     /// How many rows are part of a block that moved, for the overlay. Reported
     /// because move detection is otherwise invisible when it finds nothing, and
     /// "it found nothing" and "it is switched off" look identical on screen.
@@ -1984,15 +2116,23 @@ impl Rows for TextRows {
     }
 
     fn build(&mut self, f: gitten_core::prepared::File) {
+        // Kept beside the rows, which consume the hunks: the hunk map needs
+        // to spell each file the loaded diff spells it.
+        let path = std::sync::Arc::from(f.path.as_str());
         self.rows.push(Row::File {
-            path: f.path.into(),
+            path: std::sync::Arc::clone(&path),
             adds: f.adds,
             dels: f.dels,
         });
-        for h in f.hunks {
+        for (n, h) in f.hunks.into_iter().enumerate() {
+            // The hunk's span opens on its header row and closes after its
+            // last line, so a cursor anywhere inside it — header included —
+            // reads as being *on* the hunk.
+            let at = self.rows.len();
             self.rows.push(Row::Hunk(h.header.into()));
+            let mut moved = 0;
             for l in h.lines {
-                self.moved += l.moved as usize;
+                moved += l.moved as usize;
                 self.rows.push(Row::Line {
                     kind: l.kind,
                     moved: l.moved,
@@ -2003,7 +2143,13 @@ impl Rows for TextRows {
                     tokens: l.tokens,
                 });
             }
+            self.moved += moved;
+            self.hunks.record(at, self.rows.len() - at, &path, n);
         }
+    }
+
+    fn hunk_at(&self, index: usize) -> Option<(&str, usize)> {
+        self.hunks.at(index)
     }
 
     /// Characters, not bytes, and after `trim_end`: a line of box drawing is a
@@ -4621,5 +4767,130 @@ diff --git a/b.md b/b.md
                                              // The path as the diff parsed it: `b/` stripped, which is what the row
                                              // drew and therefore what a copy of it should hold.
         assert_eq!(d.cursor_text(), "a.rs");
+    }
+
+    // ------------------------------------------------------- hunk staging
+
+    /// Two files, two hunks in the first and one in the second — enough
+    /// addresses to prove the map reads the *keyboard's* hunk, not the first
+    /// one it finds.
+    const THREE_HUNKS: &str = "\
+diff --git a/one.txt b/one.txt
+--- a/one.txt
++++ b/one.txt
+@@ -1,3 +1,3 @@
+ alpha
+-beta
++BETA
+ gamma
+@@ -10,2 +10,2 @@
+ delta
+-epsilon old
++epsilon new
+diff --git a/two.txt b/two.txt
+--- a/two.txt
++++ b/two.txt
+@@ -5,2 +5,2 @@
+ zeta
+-eta old
++eta new
+";
+
+    /// The hunk under logical row `index`, through the same walk the view
+    /// does — owner first, then the implementation's own answer.
+    fn hunk_at_row(d: &Diff, index: usize) -> Option<String> {
+        let r = *d.order.get(index)?;
+        let renderers = d.renderers.borrow();
+        let (path, n) = renderers.get(r.owner as usize)?.hunk_at(r.index as usize)?;
+        Some(format!("{path}#{}", n))
+    }
+
+    #[test]
+    fn every_row_of_a_hunk_answers_with_that_hunk() {
+        let host = Host::new();
+        let d = Diff::with_layouts(parse_unified_diff(THREE_HUNKS), &host, Layouts::builtin());
+
+        // Unified layout rows: file header at 0; hunk 0 owns its header row
+        // and its four lines (1..=5); hunk 1 its header and three lines
+        // (6..=9); the second file starts at 10.
+        assert_eq!(hunk_at_row(&d, 0), None, "a file header is no hunk");
+        assert_eq!(hunk_at_row(&d, 1), Some("one.txt#0".into()));
+        assert_eq!(hunk_at_row(&d, 3), Some("one.txt#0".into()), "mid-hunk");
+        assert_eq!(hunk_at_row(&d, 5), Some("one.txt#0".into()));
+        assert_eq!(hunk_at_row(&d, 6), Some("one.txt#1".into()));
+        assert_eq!(hunk_at_row(&d, 8), Some("one.txt#1".into()));
+        assert_eq!(
+            hunk_at_row(&d, 12),
+            Some("two.txt#0".into()),
+            "the second file maps by its own path"
+        );
+    }
+
+    #[test]
+    fn current_hunk_hands_over_the_loaded_diffs_own_hunk() {
+        let host = Rc::new(Host::new());
+        let mut d = Diff::with_layouts(parse_unified_diff(THREE_HUNKS), &host, Layouts::builtin());
+        with_height(&mut d, 20);
+
+        // Walk down to hunk 1's changed line — row 6 is its header, 7 is
+        // `delta` — and ask what space would act on.
+        for _ in 0..7 {
+            d.run_view("view.down", &host);
+        }
+        let (path, hunk) = d.current_hunk().expect("on a hunk");
+        assert_eq!(path, "one.txt");
+        assert!(hunk.header.starts_with("@@ -10"), "{}", hunk.header);
+        assert_eq!(hunk.lines.len(), 3);
+
+        // Back up onto the second file's header: nothing to act on, said
+        // rather than guessed.
+        for _ in 0..7 {
+            d.run_view("view.up", &host);
+        }
+        assert!(d.current_hunk().is_none(), "row 0 is the first file header");
+    }
+
+    #[test]
+    fn split_pairs_a_replace_but_not_the_hunks_address() {
+        // The whole reason the map lives on the trait: split collapses the
+        // beta->BETA replace pair onto one row, so the same hunk is fewer
+        // rows than unified drew — and must still answer with the same hunk.
+        let mut host = Host::new();
+        host.layout = "split".into();
+        let host = Rc::new(host);
+        let mut d = Diff::with_layouts(parse_unified_diff(THREE_HUNKS), &host, Layouts::builtin());
+        with_height(&mut d, 20);
+
+        // Rows: file header 0; hunk 0 = header + [ctx, pair, ctx] = 1..=4;
+        // hunk 1 = header + pair = 5..=6. Walk to the pair of hunk 1.
+        for _ in 0..6 {
+            d.run_view("view.down", &host);
+        }
+        let (path, hunk) = d.current_hunk().expect("on a hunk");
+        assert_eq!(path, "one.txt");
+        assert!(hunk.header.starts_with("@@ -10"), "{}", hunk.header);
+    }
+
+    #[test]
+    fn an_armed_discard_survives_nothing_but_the_same_spot() {
+        let host = Rc::new(Host::new());
+        let mut d = Diff::with_layouts(parse_unified_diff(THREE_HUNKS), &host, Layouts::builtin());
+        with_height(&mut d, 20);
+
+        let id = d.cursor_row_id();
+        assert!(!d.confirm_or_arm_discard_hunk(id), "first press asks");
+        // The keyboard moves — any move disarms before it can lie.
+        d.run_view("view.down", &host);
+        assert!(
+            !d.confirm_or_arm_discard_hunk(id),
+            "the arm died with the cursor move"
+        );
+
+        // Arm here, stay put: the second press spends it, and a third asks
+        // afresh rather than firing twice off one question.
+        let id = d.cursor_row_id();
+        assert!(!d.confirm_or_arm_discard_hunk(id));
+        assert!(d.confirm_or_arm_discard_hunk(id));
+        assert!(!d.confirm_or_arm_discard_hunk(id));
     }
 }

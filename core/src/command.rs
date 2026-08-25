@@ -420,6 +420,16 @@ impl Keymap {
         bind("diff", "[", "diff.prev-file");
         bind("diff", "tab", "diff.next-file");
         bind("diff", "backtab", "diff.prev-file");
+        // The keyboard acts on the hunk it sits on, on lazygit's staging key:
+        // space sends the hunk to the index, `u` brings it back (one less
+        // finger than a shifted key, and nothing else claims it here — the
+        // same trade [branches] makes for rename), and capital D discards
+        // from the working tree, twice-pressed like files.discard. Only a
+        // working-tree diff can answer any of them; a commit's diff has no
+        // index to aim at, and says so.
+        bind("diff", "space", "diff.stage-hunk");
+        bind("diff", "u", "diff.unstage-hunk");
+        bind("diff", "D", "diff.discard-hunk");
 
         bind("commits", "enter", "commits.open-diff");
         bind("commits", "/", "commits.search");
@@ -783,6 +793,18 @@ impl Commands {
             ("diff.prev-file", "the previous file's header"),
             ("diff.cycle-layout", "the next presentation"),
             ("diff.cycle-wrap", "the next wrap"),
+            (
+                "diff.stage-hunk",
+                "stage the hunk under the keyboard into the index",
+            ),
+            (
+                "diff.unstage-hunk",
+                "take the hunk under the keyboard back out of the index",
+            ),
+            (
+                "diff.discard-hunk",
+                "discard the hunk under the keyboard from the working tree, asked twice",
+            ),
             ("theme.cycle", "the next theme"),
             ("commits.open-diff", "the diff for this commit"),
             ("commits.search", "search the commits"),
