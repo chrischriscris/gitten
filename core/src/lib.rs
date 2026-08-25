@@ -15,6 +15,7 @@ pub mod font;
 pub mod graph;
 pub mod host;
 pub mod markdown;
+pub mod patch;
 pub mod prepared;
 pub mod refs;
 pub mod rows;
