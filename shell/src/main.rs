@@ -1326,12 +1326,16 @@ impl DevShell {
     /// Three gates before anything runs, each said rather than answered
     /// badly. Only a working-tree diff has an index to aim at; a commit's
     /// diff is between two snapshots and has neither an index nor a worktree
-    /// in reach. A file with no old side — untracked work — cannot travel as
-    /// a patch, because `git apply --cached` creates an entry only from a
-    /// patch carrying its mode and the line model does not carry one; whole-
-    /// file verbs already serve it from the files pane. And discard confirms
-    /// exactly as `files.discard` does: first press arms the row and asks
-    /// once, any move of the keyboard disarms, second press builds the job.
+    /// in reach. A file git tracks nowhere — untracked work — cannot travel
+    /// as a patch, because `git apply --cached` creates an entry only from a
+    /// patch carrying its mode and the line model does not carry one;
+    /// whole-file verbs already serve it from the files pane, and status —
+    /// the same read the files pane draws from — is what tells the two
+    /// apart, because absence of old line numbers cannot: at `[diff] context
+    /// = 0` an addition to a tracked file carries none either. And discard
+    /// confirms exactly as `files.discard` does: first press arms the row
+    /// and asks once, any move of the keyboard disarms, second press builds
+    /// the job.
     fn hunk_verb(&mut self, command: &str, cx: &mut Context<Self>) {
         let Some(Screen::Diff { view, source, .. }) = self.active() else {
             self.set_notice(format!("{command} is not supported here"));
@@ -1355,7 +1359,9 @@ impl DevShell {
             }
         }
         let Some(writes) = self.writes() else {
-            self.set_notice("a fixture has no repository to act on");
+            // The fixture and patch sources were refused above, so this is
+            // the one case left: the window itself has no repository open.
+            self.set_notice("no repository is open");
             return;
         };
         let view = view.clone();
@@ -1368,9 +1374,28 @@ impl DevShell {
             self.set_notice("the keyboard is not on a hunk");
             return;
         };
-        // The creation case: every line an addition means there was no file
-        // to patch against. Whole-file verbs own it; say where they live.
-        let creation = !hunk.lines.iter().any(|l| l.old_no.is_some());
+        // A hunk whose every line is an addition *looks* like a creation —
+        // but only status knows whether it is one. Absence of old line
+        // numbers is not evidence: at `[diff] context = 0` a mid-file
+        // addition to a tracked modified file carries no old numbers either,
+        // and refusing it here would claim "adds a new file" over work that
+        // is merely new rows. So ask the same read the files pane draws from,
+        // and only for hunks that could be creations — every other shape
+        // pays nothing. An untracked path keeps the refusal that names the
+        // pane serving whole-file verbs; anything else synthesizes normally,
+        // and if the patch still cannot land, git's own refusal says why.
+        let creation = !hunk.lines.iter().any(|l| l.old_no.is_some())
+            && writes
+                .repo
+                .status()
+                .map(|s| {
+                    s.untracked
+                        .iter()
+                        .any(|e| e.path.as_bytes() == path.as_bytes())
+                })
+                // A status that cannot be read is not evidence of a
+                // creation: send the patch and let git answer it.
+                .unwrap_or(false);
         if creation {
             self.set_notice(match command {
                 "diff.stage-hunk" | "diff.unstage-hunk" => {
@@ -4381,6 +4406,10 @@ mod tests {
         /// refused revert leaves behind, which only the next status read
         /// reveals. Interior-mutable so a test arms it before the verb runs.
         conflict: AtomicBool,
+        /// Paths status reports as known to no part of git. Interior-mutable
+        /// so a test arms exactly the files its diff fixture talks about —
+        /// the fact hunk verbs classify creations by.
+        untracked: std::sync::Mutex<Vec<String>>,
     }
 
     impl RecordingRepo {
@@ -4393,6 +4422,7 @@ mod tests {
                 }),
                 distance: std::sync::Mutex::new((0, 0)),
                 conflict: AtomicBool::new(false),
+                untracked: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -4412,6 +4442,12 @@ mod tests {
             *self.head.lock().unwrap() = gitten_core::refs::HeadState::Detached {
                 commit: "0123456789abcdef".into(),
             };
+        }
+
+        /// Names paths the next `status` read reports as untracked — the
+        /// fact a hunk verb classifies a creation by.
+        fn arm_untracked(&self, paths: &[&str]) {
+            *self.untracked.lock().unwrap() = paths.iter().map(|p| p.to_string()).collect();
         }
 
         /// The tracking pair the branches read reports for main.
@@ -4470,6 +4506,11 @@ mod tests {
                 kind: gitten_core::status::Kind::File,
                 submodule: Default::default(),
             });
+            for path in self.untracked.lock().unwrap().iter() {
+                tree.untracked.push(gitten_core::status::UntrackedEntry {
+                    path: path.as_str().into(),
+                });
+            }
             Ok(tree)
         }
 
@@ -4817,6 +4858,7 @@ mod tests {
             }),
             distance: std::sync::Mutex::new((0, 0)),
             conflict: AtomicBool::new(false),
+            untracked: std::sync::Mutex::new(Vec::new()),
         });
         let handle: gitten_git::Handle = repo.clone();
         let shell = shell(None, cx);
@@ -4907,17 +4949,37 @@ diff --git a/one.txt b/one.txt
     }
 
     /// A shell whose diff is an untracked file's whole-addition hunk.
+    ///
+    /// The fake's status names `fresh.txt` untracked — the fact the refusal
+    /// classifies by; a fixture whose status stayed silent would send the
+    /// patch to git instead, as a tracked file's hunk deserves.
     fn creation_diff_shell(
         cx: &mut TestAppContext,
     ) -> (gpui::Entity<DevShell>, Arc<RecordingRepo>) {
-        let raw = "\
+        let (shell, repo) = addition_diff_shell(
+            cx,
+            "\
 diff --git a/fresh.txt b/fresh.txt
 --- /dev/null
 +++ b/fresh.txt
 @@ -0,0 +1,2 @@
 +first
 +second
-";
+",
+        );
+        repo.arm_untracked(&["fresh.txt"]);
+        (shell, repo)
+    }
+
+    /// A shell whose diff is one whole-addition hunk — the shape an
+    /// untracked file's diff and a `[diff] context = 0` insertion share,
+    /// which is exactly why classification is not the numbers' job. Status
+    /// stays as the fake holds it: nothing here is untracked unless a test
+    /// arms it.
+    fn addition_diff_shell(
+        cx: &mut TestAppContext,
+        raw: &str,
+    ) -> (gpui::Entity<DevShell>, Arc<RecordingRepo>) {
         let calls = Arc::default();
         let repo = Arc::new(RecordingRepo::new(Arc::clone(&calls)));
         let handle: gitten_git::Handle = repo.clone();
@@ -5716,7 +5778,7 @@ diff --git a/fresh.txt b/fresh.txt
         let (shell, repo) = creation_diff_shell(cx);
         wire_runner(&shell, cx);
 
-        for command in ["diff.stage-hunk", "diff.discard-hunk"] {
+        for command in ["diff.stage-hunk", "diff.unstage-hunk", "diff.discard-hunk"] {
             shell.update(cx, |shell, cx| shell.run_command(command, cx));
             shell.read_with(cx, |shell, _| {
                 let notice = shell.notice.as_deref().unwrap_or_default();
@@ -5724,6 +5786,43 @@ diff --git a/fresh.txt b/fresh.txt
             });
         }
         assert!(repo.wrote().is_empty(), "the refusal queued nothing");
+    }
+
+    #[gpui::test]
+    fn a_tracked_file_s_addition_hunk_travels_even_with_no_old_numbers(cx: &mut TestAppContext) {
+        // The shape `[diff] context = 0` makes of an insertion mid-file:
+        // every line an addition, no old number anywhere — which looks like
+        // a creation and is not one. Status says the file is tracked work,
+        // so the hunk synthesizes and goes to git; only status can tell
+        // this apart from fresh.txt, and nothing else was asked.
+        let raw = "\
+diff --git a/added.txt b/added.txt
+--- a/added.txt
++++ b/added.txt
+@@ -3,0 +4,2 @@
++added one
++added two
+";
+        let (shell, repo) = addition_diff_shell(cx, raw);
+        wire_runner(&shell, cx);
+
+        shell.update(cx, |shell, cx| shell.run_command("diff.stage-hunk", cx));
+        let notice = shell.read_with(cx, |shell, _| shell.notice.clone());
+        assert_ne!(
+            notice.as_deref(),
+            Some("that hunk adds a new file — stage or unstage it whole from the files pane"),
+            "the numbers alone must not classify this a creation"
+        );
+        // The verb submits; the write lands when the queue drains, as in
+        // every window.
+        pump_write(&shell, cx);
+        let wrote = repo.wrote();
+        assert_eq!(wrote.len(), 1, "notice was {notice:?}");
+        assert!(
+            wrote[0].starts_with("stage-patch "),
+            "the hunk went to git: {:?}",
+            wrote[0]
+        );
     }
 
     #[gpui::test]
