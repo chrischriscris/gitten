@@ -102,16 +102,15 @@ not write a doc, a comment or a plan that assumes a `gix` handle exists — ther
 no `gix` dependency in the tree. The blob-OID diff cache is the cheaper half of
 the same goal and is also not built yet.
 
-**Writes do not exist yet** — there are zero write verbs in `gitten-git`; it is a
-read-only acquisition layer. When writes land (push, pull, merge, rebase, commit)
-they go through the `git` binary, because shelling out means hooks, credential
-helpers, SSH agents and `.gitconfig` behave exactly as they do in the user's
-terminal — don't reimplement any of that; you will get it subtly wrong.
+**Writes go through the `git` binary** — stage, commit, branch, stash, reset,
+push and pull are verbs on the same trait as the reads. Shelling out means
+hooks, credential helpers, SSH agents and `.gitconfig` behave exactly as they
+do in the user's terminal — don't reimplement any of that; you will get it
+subtly wrong.
 
-One trait behind both read paths (and the eventual writes) is the roadmap shape,
-so a frontend never learns which path ran — but it is roadmap item #1, not a fact
-about the code today: `git/src/lib.rs` exports free functions (`log`, `pairs`,
-`diff`, `describe`), not a trait.
+One object-safe trait behind every path — `Repo`, held behind a `Handle` — so
+a frontend never learns which path ran, and a fake stands in for the binary in
+the tests.
 
 **Untracked files are `git status`, never `git diff`.** `git diff` compares the
 index and the working tree against a commit and an untracked file is in none of
