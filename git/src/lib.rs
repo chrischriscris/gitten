@@ -2617,6 +2617,12 @@ mod tests {
             std::fs::create_dir_all(&dir).expect("a temp dir");
             let me = Scratch(dir);
             me.git(&["init", "-q", "-b", "main", "."]);
+            // Repo-local identity: a commit needs an author, and a machine
+            // without a global one — a fresh CI runner, a container — refuses
+            // every commit with "Author identity unknown". The tests must not
+            // care whose machine they run on.
+            me.git(&["config", "user.name", "gitten-test"]);
+            me.git(&["config", "user.email", "test@gitten.local"]);
             me
         }
 
