@@ -272,18 +272,25 @@ impl TodoScript {
     /// to ask a human something through an editor this client does not drive.
     ///
     /// `reword` and `edit` each stop and open `GIT_EDITOR`, a second editor
-    /// beyond the sequencer one, with no scripted answer tonight. Refusing
-    /// here, before any process runs, is what makes the refusal a sentence
-    /// about the plan rather than a background job hung on an invisible
-    /// prompt. Everything else in the vocabulary replays unattended.
+    /// beyond the sequencer one, with no scripted answer tonight; so does
+    /// `fixup -c`, whose lowercase flag exists precisely to edit the melded
+    /// message (capital `-C` keeps it and opens nothing, so it passes).
+    /// Refusing here, before any process runs, is what makes the refusal a
+    /// sentence about the plan rather than a background job hung on an
+    /// invisible prompt. Everything else in the vocabulary replays unattended.
     pub fn validate(&self) -> Result<(), String> {
         for line in &self.lines {
             if let Line::Step(step) = line {
-                if step.action.needs_an_editor() {
+                if step.action.needs_an_editor()
+                    || (step.action == Action::Fixup && step.arg == b"-c")
+                {
+                    let word = match step.action.needs_an_editor() {
+                        true => step.action.word().to_string(),
+                        false => "fixup -c".to_string(),
+                    };
                     return Err(format!(
-                        "'{}' is not supported yet: it opens an editor \
-                         mid-rebase, which this client cannot drive",
-                        step.action.word()
+                        "'{word}' is not supported yet: it opens an editor \
+                         mid-rebase, which this client cannot drive"
                     ));
                 }
             }
@@ -633,6 +640,21 @@ squash
 
         // git's own header validates fine: it survives the rewrite untouched.
         assert_eq!(TodoScript::parse(SAMPLE).validate(), Ok(()));
+    }
+
+    #[test]
+    fn fixup_dash_c_is_refused_and_fixup_capital_c_passes() {
+        // Lowercase `-c` opens GIT_EDITOR to edit the melded message — the
+        // same broken contract as a reword. Capital `-C` keeps the message
+        // and opens nothing, so the tolerance that carries it through parse
+        // and emit unchanged extends to validation too.
+        let editing = TodoScript::parse(b"fixup -c 1111111 a subject\n");
+        let err = editing.validate().expect_err("fixup -c refused");
+        assert!(err.contains("fixup -c"), "{err}");
+        assert!(err.contains("editor"), "{err}");
+
+        let keeping = TodoScript::parse(b"fixup -C 1111111 a subject\n");
+        assert_eq!(keeping.validate(), Ok(()));
     }
 
     /// Five commits in a straight line, newest first — the shape a pane's log
