@@ -115,6 +115,51 @@ fn run_bytes(repo: &Path, args: &[&[u8]]) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
+/// [`run_bytes`] with one argument's worth of bytes riding **stdin**.
+///
+/// A patch is arbitrary text — newlines, quotes, whatever encoding the diff
+/// carried — and argv is none of those things. The same transport
+/// [`Binary::commit_via`] uses for commit messages, generalized: write the
+/// payload, close the pipe (EOF is its end), and let git's exit status tell
+/// the story. A write failure here — a child that quit before reading — is
+/// reported through that status with better words than ours would be.
+fn run_stdin(repo: &Path, args: &[&[u8]], input: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args.iter().map(|a| std::ffi::OsStr::from_bytes(a)))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not run git: {e}"))?;
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let _ = stdin.write_all(input);
+    drop(stdin);
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("git {}: {e}", display_args(args)))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git {}: {}",
+            display_args(args),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// The arguments as a person reads them in an error line — flags and names,
+/// never the stdin payload, which is prose's job to quote or not.
+fn display_args(args: &[&[u8]]) -> String {
+    args.iter()
+        .map(|a| String::from_utf8_lossy(a).into_owned())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The repository's top level. `--raw` and `--porcelain` paths are relative to
 /// it, while the `repo` a caller passes may be any subdirectory (the CLI default
 /// is the cwd), so working-tree reads must join onto this, not onto `repo`.
@@ -333,6 +378,57 @@ pub trait Repo: Send + Sync {
             self.unstage(path)?;
         }
         Ok(())
+    }
+
+    /// Stages exactly what `patch` describes onto the index:
+    /// `git apply --cached`.
+    ///
+    /// The patch arrives as bytes and rides **stdin**, never argv — a patch
+    /// is arbitrary text with its own newlines, quoting rules and encodings,
+    /// which is argv's idea of nothing. Synthesis lives in
+    /// [`gitten_core::patch`](gitten_core::patch); this verb only aims the
+    /// result, so whatever produced it — built-in hunks, an extension's
+    /// selection, a patch pasted by hand — goes through the same door.
+    ///
+    /// An empty patch is refused here rather than spawned: git would answer
+    /// it with a usage error that says nothing about why nothing happened.
+    /// A patch whose context has drifted — the usual case being an index
+    /// that moved since the diff was drawn — fails with git's own sentence,
+    /// verbatim, because "patch does not apply" is advice only the person
+    /// holding both sides can act on.
+    ///
+    /// A patch of pure additions — staging a brand-new file hunk-wise — is
+    /// not served: `git apply --cached` creates the entry only from a patch
+    /// carrying its file mode, and the line model does not carry one. The
+    /// caller that knows it is looking at an untracked file refuses before
+    /// here; the backend's own answer to such a patch is git's, and it says
+    /// the missing side plainly. Whole-file staging of untracked work stays
+    /// with [`stage`](Self::stage), which takes the mode from disk.
+    fn stage_patch(&self, _patch: &[u8]) -> Result<()> {
+        Err(unserved("patch staging"))
+    }
+
+    /// Removes exactly what `patch` describes from the index:
+    /// `git apply --cached --reverse`.
+    ///
+    /// Unstaging at hunk granularity is the same text run backwards against
+    /// the same target — the index — so it shares
+    /// [`stage_patch`](Self::stage_patch)'s transport, refusals and honesty
+    /// about drifted context. The working tree is never touched.
+    fn unstage_patch(&self, _patch: &[u8]) -> Result<()> {
+        Err(unserved("patch unstaging"))
+    }
+
+    /// Removes exactly what `patch` describes from the working tree:
+    /// `git apply --reverse` without `--cached`.
+    ///
+    /// DESTRUCTIVE — the discarded lines end nowhere recoverable unless a
+    /// copy sits staged or committed elsewhere, which is why callers confirm
+    /// before this job is ever built. The index is not touched, so work
+    /// staged earlier survives: discarding aims at the working tree and says
+    /// so, the same line [`discard`](Self::discard) holds for whole files.
+    fn discard_patch(&self, _patch: &[u8]) -> Result<()> {
+        Err(unserved("patch discarding"))
     }
 
     /// Commits what the index holds with `message`, returning the new
@@ -1062,6 +1158,52 @@ impl Repo for Binary {
             return Ok(());
         }
         self.run_chunked(&[b"reset", b"-q", b"HEAD", b"--"], paths)
+    }
+
+    fn stage_patch(&self, patch: &[u8]) -> Result<()> {
+        if patch.is_empty() {
+            return Err("an empty patch stages nothing".into());
+        }
+        // `--whitespace=nowarn` because a synthesized patch's whitespace is
+        // exactly what the diff showed — a warning about it would be git
+        // relitigating a decision already on screen.
+        run_stdin(
+            &self.root,
+            &[b"apply", b"--cached", b"--whitespace=nowarn", b"-"],
+            patch,
+        )
+    }
+
+    fn unstage_patch(&self, patch: &[u8]) -> Result<()> {
+        if patch.is_empty() {
+            return Err("an empty patch unstages nothing".into());
+        }
+        run_stdin(
+            &self.root,
+            &[
+                b"apply",
+                b"--cached",
+                b"--reverse",
+                b"--whitespace=nowarn",
+                b"-",
+            ],
+            patch,
+        )
+    }
+
+    fn discard_patch(&self, patch: &[u8]) -> Result<()> {
+        if patch.is_empty() {
+            return Err("an empty patch discards nothing".into());
+        }
+        // The worktree half of the same text: `--reverse` with no
+        // `--cached`, so the index stands still while the working tree gives
+        // the hunk's lines back. See the trait method for where destruction
+        // is confirmed.
+        run_stdin(
+            &self.root,
+            &[b"apply", b"--reverse", b"--whitespace=nowarn", b"-"],
+            patch,
+        )
     }
 
     fn checkout(&self, name: &[u8]) -> Result<()> {
@@ -4399,6 +4541,7 @@ mod tests {
         // Discard's other mechanics: nothing to check out, so the file just
         // stops existing — off the disk and out of status with one call.
         let r = Scratch::new("discard-untracked");
+
         r.write("seed.txt", b"x\n");
         r.git(&["add", "-A"]);
         r.git(&["commit", "-qm", "init"]);
@@ -4410,6 +4553,290 @@ mod tests {
         let s = g.status().unwrap();
         assert!(s.is_empty(), "{s:?}");
         assert!(!join_raw(&r.0, b"notes.md").exists());
+    }
+
+    /// The HEAD→worktree diff of `path`, through the same free function
+    /// acquisition uses — so a synthesized patch is tested against exactly
+    /// the shape the view would hand over, hunks and all.
+    fn diff_files(g: &Handle) -> Vec<gitten_core::FileDiff> {
+        let differs = gitten_core::differ::Differs::builtin();
+        crate::diff(g.as_ref(), "", &differs, &Default::default()).expect("diffs")
+    }
+
+    #[test]
+    fn staging_a_synthesized_hunk_lands_exactly_its_lines_in_the_index() {
+        // Sixteen lines, two edits six-plus lines apart: two hunks under the
+        // default context. Everything here runs against REAL git apply — the
+        // synthesis golden tests in core prove the bytes; these prove the
+        // bytes are the ones git accepts and aims correctly.
+        let r = Scratch::new("hunk-stage");
+        let base: String = (1..=16).map(|i| format!("line-{i:02}\n")).collect();
+        r.write("f.txt", base.as_bytes());
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        let edited = base
+            .replace("line-02\n", "EDIT-TWO\n")
+            .replace("line-14\n", "EDIT-FOURTEEN\n");
+        r.write("f.txt", edited.as_bytes());
+
+        let g = r.open();
+        let files = diff_files(&g);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].hunks.len(), 2, "the fixture holds two hunks");
+
+        // Stage the first hunk alone.
+        let patch = gitten_core::patch::emit(&files[0].path, &[&files[0].hunks[0]]);
+        assert!(!patch.is_empty());
+        g.stage_patch(&patch)
+            .expect("git apply --cached takes the hunk");
+
+        // The index holds edit one only; the worktree still holds both —
+        // which is exactly what makes status say MM.
+        let porcelain = || -> String {
+            String::from_utf8_lossy(
+                &r.cmd(&["status".into(), "--porcelain".into()])
+                    .output()
+                    .expect("status")
+                    .stdout,
+            )
+            .into_owned()
+        };
+        assert_eq!(
+            porcelain(),
+            "MM f.txt\n",
+            "staged AND unstaged entries for one file"
+        );
+        let indexed = r
+            .cmd(&["show".into(), ":f.txt".into()])
+            .output()
+            .expect("cat-file");
+        assert!(indexed.status.success());
+        let indexed = String::from_utf8_lossy(&indexed.stdout).into_owned();
+        assert!(indexed.contains("EDIT-TWO\n"), "hunk one is in");
+        assert!(indexed.contains("line-14\n"), "hunk two is not");
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            edited.as_bytes(),
+            "the working tree was never touched by --cached"
+        );
+
+        // And running it backwards puts the index back where it was — the
+        // unstage direction of the same text.
+        g.unstage_patch(&patch).expect("reverses cleanly");
+        assert_eq!(porcelain(), " M f.txt\n", "back to unstaged-only");
+        let indexed = String::from_utf8_lossy(
+            &r.cmd(&["rev-parse".into(), ":f.txt".into()])
+                .output()
+                .expect("rev-parse :f.txt")
+                .stdout,
+        )
+        .into_owned();
+        let head = String::from_utf8_lossy(
+            &r.cmd(&["rev-parse".into(), "HEAD:f.txt".into()])
+                .output()
+                .expect("rev-parse HEAD:f.txt")
+                .stdout,
+        )
+        .into_owned();
+        assert_eq!(
+            indexed.trim(),
+            head.trim(),
+            "unstaging restored the index to HEAD exactly"
+        );
+    }
+
+    #[test]
+    fn discarding_a_synthesized_hunk_takes_only_its_lines_from_the_worktree() {
+        let r = Scratch::new("hunk-discard");
+        let base: String = (1..=16).map(|i| format!("line-{i:02}\n")).collect();
+        r.write("f.txt", base.as_bytes());
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        let edited = base
+            .replace("line-02\n", "EDIT-TWO\n")
+            .replace("line-14\n", "EDIT-FOURTEEN\n");
+        r.write("f.txt", edited.as_bytes());
+
+        let g = r.open();
+        let files = diff_files(&g);
+        let patch = gitten_core::patch::emit(&files[0].path, &[&files[0].hunks[1]]);
+
+        // DESTRUCTIVE in the view; here it simply runs.
+        g.discard_patch(&patch).expect("reverses onto the worktree");
+
+        let now = String::from_utf8(std::fs::read(join_raw(&r.0, b"f.txt")).unwrap()).unwrap();
+        assert!(now.contains("line-14\n"), "hunk two's line came back");
+        assert!(
+            now.contains("EDIT-TWO\n"),
+            "hunk one's edit survives — discard aimed at one hunk"
+        );
+        let porcelain = String::from_utf8_lossy(
+            &r.cmd(&["status".into(), "--porcelain".into()])
+                .output()
+                .expect("status")
+                .stdout,
+        )
+        .into_owned();
+        assert_eq!(porcelain, " M f.txt\n", "nothing staged by discarding");
+    }
+
+    #[test]
+    fn a_drifted_index_refuses_the_patch_in_gits_own_words() {
+        // Stage hunk one, then try to stage it again: the lines the patch
+        // removes are no longer in the index, and git says so. That sentence
+        // — not a paraphrase — is what the error band owes the reader.
+        let r = Scratch::new("hunk-drift");
+        let base: String = (1..=16).map(|i| format!("line-{i:02}\n")).collect();
+        r.write("f.txt", base.as_bytes());
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        r.write("f.txt", base.replace("line-02\n", "EDIT-TWO\n").as_bytes());
+
+        let g = r.open();
+        let files = diff_files(&g);
+        let patch = gitten_core::patch::emit(&files[0].path, &[&files[0].hunks[0]]);
+        g.stage_patch(&patch).expect("first apply lands");
+
+        let err = g.stage_patch(&patch).expect_err("second apply refuses");
+        assert!(
+            err.contains("patch failed") || err.contains("does not apply"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_empty_patch_is_refused_before_anything_runs() {
+        let r = Scratch::new("hunk-empty");
+        r.write("seed.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        let g = r.open();
+        for verb in ["stage", "unstage", "discard"] {
+            let err = match verb {
+                "stage" => g.stage_patch(b""),
+                "unstage" => g.unstage_patch(b""),
+                _ => g.discard_patch(b""),
+            }
+            .expect_err("empty refuses");
+            assert!(err.contains("empty patch"), "{verb}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_deletion_synthesizes_and_applies_in_both_directions() {
+        // The /dev/null shape that needs no mode of its own: a deleted file
+        // stages as a deletion — the index already knows the mode — and the
+        // same text reversed lets go again.
+        let r = Scratch::new("hunk-null-side");
+        let base: String = (1..=8).map(|i| format!("line-{i:02}\n")).collect();
+        r.write("kept.txt", base.as_bytes());
+        r.write("doomed.txt", base.as_bytes());
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        std::fs::remove_file(join_raw(&r.0, b"doomed.txt")).expect("rm doomed");
+
+        let g = r.open();
+        let files = diff_files(&g);
+        let doomed = files
+            .iter()
+            .find(|f| f.path == "doomed.txt")
+            .expect("deletion");
+        assert!(!doomed.hunks.is_empty());
+        let patch = gitten_core::patch::emit(&doomed.path, &[&doomed.hunks[0]]);
+
+        g.stage_patch(&patch).expect("deletion stages");
+        let porcelain = || {
+            String::from_utf8_lossy(
+                &r.cmd(&["status".into(), "--porcelain".into()])
+                    .output()
+                    .expect("status")
+                    .stdout,
+            )
+            .into_owned()
+        };
+        assert!(porcelain().contains("D  doomed.txt"), "{}", porcelain());
+
+        // The reverse direction on real apply: the index lets the deletion
+        // go and the path is simply unstaged work again.
+        g.unstage_patch(&patch).expect("deletion reverses");
+        assert!(porcelain().contains(" D doomed.txt"), "{}", porcelain());
+    }
+
+    #[test]
+    fn staging_a_creation_is_gits_refusal_and_it_names_the_missing_side() {
+        // The documented limit: a pure-addition patch has no mode to create
+        // the entry with, so `apply --cached` refuses. The shell refuses
+        // before here; this pins what surfaces if anything ever sends one.
+        let r = Scratch::new("hunk-creation");
+        r.write("seed.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        r.write("fresh.txt", b"a\nb\nc\n");
+
+        let g = r.open();
+        let files = diff_files(&g);
+        let fresh = files
+            .iter()
+            .find(|f| f.path == "fresh.txt")
+            .expect("loose pair");
+        let patch = gitten_core::patch::emit(&fresh.path, &[&fresh.hunks[0]]);
+        let err = g.stage_patch(&patch).expect_err("creation is refused");
+        assert!(err.contains("does not exist in index"), "{err}");
+        // And nothing landed: the refusal left no half-state behind.
+        let s = g.status().unwrap();
+        assert_eq!(s.untracked.len(), 1);
+        assert!(s.staged.is_empty(), "{s:?}");
+    }
+
+    #[test]
+    fn the_patch_verbs_reach_the_trait_through_the_same_stdin_transport() {
+        // A recording backend answers success; the point is the plumbing —
+        // bytes in, no path arguments anywhere.
+        use std::sync::Mutex;
+        struct Patches(Mutex<Vec<Vec<u8>>>);
+        impl Repo for Patches {
+            fn log(&self, _: usize) -> Result<Vec<Commit>> {
+                Ok(Vec::new())
+            }
+            fn pairs(&self, _: &str) -> Result<Vec<Pair>> {
+                Ok(Vec::new())
+            }
+            fn status(&self) -> Result<gitten_core::status::Status> {
+                Ok(Default::default())
+            }
+            fn describe(&self) -> String {
+                "patches".into()
+            }
+            fn stage_patch(&self, p: &[u8]) -> Result<()> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push([b"s".to_vec(), p.to_vec()].concat());
+                Ok(())
+            }
+            fn unstage_patch(&self, p: &[u8]) -> Result<()> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push([b"u".to_vec(), p.to_vec()].concat());
+                Ok(())
+            }
+            fn discard_patch(&self, p: &[u8]) -> Result<()> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push([b"d".to_vec(), p.to_vec()].concat());
+                Ok(())
+            }
+        }
+        let patches = Arc::new(Patches(Mutex::new(Vec::new())));
+        let g: Handle = Arc::clone(&patches) as Handle;
+        g.discard_patch(b"-- hunk\n").expect("discard reaches");
+        assert_eq!(
+            *patches.0.lock().unwrap(),
+            vec![b"d-- hunk\n".to_vec()],
+            "the bytes arrived whole"
+        );
     }
 
     #[test]
