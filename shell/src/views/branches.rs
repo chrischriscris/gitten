@@ -15,6 +15,7 @@
 //! strings so the render path allocates nothing per frame.
 
 use super::{accept_deferred_scroll, DeferredScrollbar, PendingScroll};
+use crate::chrome;
 use crate::graph::ROW_H;
 use gitten_core::host::Host;
 use gitten_core::refs::{Branch, HeadState, RemoteBranch, Upstream};
@@ -345,6 +346,29 @@ pub struct Branches {
     focused: bool,
 }
 
+/// Where the cursor comes to rest after a move that landed it on `at`.
+///
+/// A heading is a fact about the grouping and not a thing a verb can aim
+/// at, so the keyboard never stops on one: it steps on in the direction it
+/// was going, and only when the heading is the list's edge in that direction
+/// — `k` from the first branch onto `LOCAL` — does it settle the other way,
+/// which keeps `k` on row zero's heading from reading as "nothing happened"
+/// and `G` from resting on a `REMOTE` heading with an empty group under it.
+/// `dir` is the sign of the move; zero counts as forward.
+fn settle(rows: &[Row], at: usize, dir: isize) -> usize {
+    let heading = |i: usize| matches!(rows.get(i), Some(Row::Heading { .. }));
+    if !heading(at) {
+        return at;
+    }
+    let forward = (at + 1..rows.len()).find(|&i| !heading(i));
+    let back = (0..at).rev().find(|&i| !heading(i));
+    match dir.is_negative() {
+        false => forward.or(back),
+        true => back.or(forward),
+    }
+    .unwrap_or(at)
+}
+
 impl Branches {
     /// The viewport model with everything live folded in.
     fn live_view(&self, host: &Host) -> Viewport {
@@ -368,10 +392,15 @@ impl Branches {
 
     pub(crate) fn from_prepared(prepared: Prepared) -> Self {
         let Prepared { rows, head, .. } = prepared;
+        // Row zero is usually the `LOCAL` heading; the keyboard starts on
+        // the first branch under it instead.
+        let mut view = Viewport::new();
+        view.set_len(rows.len());
+        view.go_to(settle(&rows, 0, 1));
         Self {
             data: Rc::new(rows),
             scroll: UniformListScrollHandle::new(),
-            view: Rc::new(Cell::new(Viewport::new())),
+            view: Rc::new(Cell::new(view)),
             synced: Rc::new(Cell::new(0.0)),
             pending_scroll: PendingScroll::default(),
             rendered: Rc::new(Cell::new(0)),
@@ -428,7 +457,13 @@ impl Branches {
             .unwrap_or(old.cursor());
         let mut view = old;
         view.set_len(self.data.len());
-        view.go_to(cursor);
+        // A refresh that lands the cursor on a heading — the branch it was
+        // on is gone — steps forward, the way a fresh open does.
+        view.go_to(settle(
+            &self.data,
+            cursor.min(self.data.len().saturating_sub(1)),
+            1,
+        ));
         self.view.set(view);
 
         if self.data.is_empty() {
@@ -520,19 +555,49 @@ impl Branches {
     pub fn run_view(&mut self, command: &str, host: &Host) -> bool {
         self.reconcile(host);
         let mut v = self.live_view(host);
-        match command {
-            "view.down" => v.down(),
-            "view.up" => v.up(),
-            "view.page-down" => v.page(1),
-            "view.page-up" => v.page(-1),
-            "view.scroll-down" => v.scroll_by(host.view.rows as isize),
-            "view.scroll-up" => v.scroll_by(-(host.view.rows as isize)),
-            "view.top" => v.to_top(),
-            "view.bottom" => v.to_bottom(),
+        // Each move carries its sign, so a landing on a heading knows which
+        // way to step off it — see [`settle`].
+        let dir = match command {
+            "view.down" => {
+                v.down();
+                1
+            }
+            "view.up" => {
+                v.up();
+                -1
+            }
+            "view.page-down" => {
+                v.page(1);
+                1
+            }
+            "view.page-up" => {
+                v.page(-1);
+                -1
+            }
+            "view.scroll-down" => {
+                v.scroll_by(host.view.rows as isize);
+                1
+            }
+            "view.scroll-up" => {
+                v.scroll_by(-(host.view.rows as isize));
+                -1
+            }
+            "view.top" => {
+                v.to_top();
+                1
+            }
+            "view.bottom" => {
+                v.to_bottom();
+                -1
+            }
             // Answered without doing anything, like the commit graph: a
             // resolved command must not read as a failed one.
             "view.left" | "view.right" => return true,
             _ => return false,
+        };
+        let settled = settle(&self.data, v.cursor(), dir);
+        if settled != v.cursor() {
+            v.go_to(settled);
         }
         // The keyboard moved; whatever was armed was armed to what it used
         // to be on.
@@ -632,10 +697,6 @@ fn row_target(row: &Row) -> Option<Target> {
     }
 }
 
-/// Air between two text runs that share a row — a heading's count, a name
-/// and the distance trailing it — in characters.
-const MARK_CHARS: f32 = 1.5;
-
 impl Render for Branches {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let c = crate::config::host(cx).theme.chrome;
@@ -666,6 +727,7 @@ impl Render for Branches {
             data.iter()
                 .position(|r| row_target(r).as_ref() == Some(target))
         });
+        let focused = self.focused;
         let list = uniform_list("branches", data.len(), move |range, _, cx| {
             rendered.set(range.len());
             let host = crate::config::host(cx);
@@ -682,12 +744,13 @@ impl Render for Branches {
             }
             let cursor = view.get().cursor();
             range
-                .map(|i| row(&data[i], &host, i == cursor, Some(i) == armed))
+                .map(|i| row(&data[i], &host, i == cursor, focused, Some(i) == armed))
                 .collect()
         })
         .track_scroll(&self.scroll)
-        .size_full()
-        .px_3();
+        // No padding on the list: `ROW_PAD` is the row's own, so the cursor
+        // bar sits on the region's edge and the background runs to it.
+        .size_full();
 
         div()
             .relative()
@@ -703,69 +766,50 @@ impl Render for Branches {
     }
 }
 
-/// One row. `current` paints the keyboard's row in `chrome.selection_bg`;
-/// `armed` tints it toward `chrome.error`, so the thing a second press will
-/// destroy is named by its own colour and not only by the band above it.
-fn row(e: &Row, host: &Host, current: bool, armed: bool) -> AnyElement {
+/// One row, on [`chrome::list_row`]'s furniture: `current` is the keyboard's
+/// row and `focused` says whether its bar is the accent or the faint ink.
+/// `armed` tints the text toward `chrome.error`, so the thing a second press
+/// will destroy is named by its own colour and not only by the band above it.
+///
+/// A ref row is dot, one character of air, name, and — pushed to the right
+/// edge — the tracking distance. The name is the one thing that gives:
+/// `min_w_0` and `truncate` let it end in an ellipsis rather than shove the
+/// distance out of the pane, because `↑2` is the fact a narrow sidebar is
+/// being glanced at for and a name's tail is not. A heading is
+/// [`chrome::section_label`] and never the cursor's — see [`settle`].
+fn row(e: &Row, host: &Host, current: bool, focused: bool, armed: bool) -> AnyElement {
     let ch = host.font.char_width();
     let c = host.theme.chrome;
-    let base = div()
-        .min_w_full()
-        .flex()
-        .items_center()
-        .h(px(ROW_H))
-        .bg(rgb(match current {
-            true => c.selection_bg,
-            false => c.bg,
-        }));
+    // The dot was decided beside the text, at flatten; the draw only paints
+    // it. One character wide plus one of air, so every name aligns.
+    let dot = |d: &Dot| {
+        div()
+            .flex_none()
+            .w(px(ch))
+            .mr(px(ch))
+            .text_color(rgb(d.color))
+            .child(SharedString::from(d.glyph))
+    };
+    let name = |text: SharedString, ink: Option<Rgb>| {
+        div()
+            .min_w_0()
+            .truncate()
+            .when_some(ink, |d, ink| d.text_color(rgb(ink)))
+            .when(armed, |d| d.text_color(rgb(c.error)))
+            .child(text)
+    };
     match e {
-        Row::Detached { dot, text } => base
-            .child(
-                div()
-                    .flex_none()
-                    .w(px(ch))
-                    .text_color(rgb(dot.color))
-                    .child(SharedString::from(dot.glyph)),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .when(armed, |d| d.text_color(rgb(c.error)))
-                    .text_color(rgb(c.dim))
-                    .child(text.clone()),
-            )
+        Row::Heading { count, section } => {
+            chrome::section_label(host, section.name().into(), Some(count.clone()), ROW_H)
+                .into_any_element()
+        }
+        Row::Detached { dot: d, text } => chrome::list_row(host, current, focused, ROW_H)
+            .child(dot(d))
+            .child(name(text.clone(), Some(c.dim)))
             .into_any_element(),
-        Row::Heading { count, section } => base
-            .child(
-                div()
-                    .flex_none()
-                    .text_color(rgb(c.dim))
-                    .child(section.name()),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .ml(px(MARK_CHARS * ch))
-                    .text_color(rgb(c.faint))
-                    .child(count.clone()),
-            )
-            .into_any_element(),
-        Row::Local(l) => base
-            .child(
-                // The dot was decided beside the text, at flatten; the draw
-                // only paints it. One character wide, so every name aligns.
-                div()
-                    .flex_none()
-                    .w(px(ch))
-                    .text_color(rgb(l.dot.color))
-                    .child(SharedString::from(l.dot.glyph)),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .when(armed, |d| d.text_color(rgb(c.error)))
-                    .child(l.name_text.clone()),
-            )
+        Row::Local(l) => chrome::list_row(host, current, focused, ROW_H)
+            .child(dot(&l.dot))
+            .child(name(l.name_text.clone(), None))
             .children(l.counts.clone().map(|text| {
                 div()
                     .flex_none()
@@ -773,7 +817,8 @@ fn row(e: &Row, host: &Host, current: bool, armed: bool) -> AnyElement {
                     // end however wide its name ran; the padding is the floor
                     // under that — the air a squeezed name still leaves.
                     .ml_auto()
-                    .pl(px(MARK_CHARS * ch))
+                    .pl(px(ch))
+                    .pr_2()
                     .text_color(rgb(match l.gone {
                         true => c.faint,
                         false => c.dim,
@@ -781,21 +826,9 @@ fn row(e: &Row, host: &Host, current: bool, armed: bool) -> AnyElement {
                     .child(text)
             }))
             .into_any_element(),
-        Row::Remote(r) => base
-            .child(
-                div()
-                    .flex_none()
-                    .w(px(ch))
-                    .text_color(rgb(r.dot.color))
-                    .child(SharedString::from(r.dot.glyph)),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .when(armed, |d| d.text_color(rgb(c.error)))
-                    .text_color(rgb(c.dim))
-                    .child(r.label.clone()),
-            )
+        Row::Remote(r) => chrome::list_row(host, current, focused, ROW_H)
+            .child(dot(&r.dot))
+            .child(name(r.label.clone(), Some(c.dim)))
             .into_any_element(),
     }
 }
@@ -1079,7 +1112,8 @@ mod tests {
         v.set_len(b.data.len());
         v.set_height(3);
         b.view.set(v);
-        assert!(b.run_view("view.down", &host)); // onto feature
+        // The keyboard opens on `feature`, past the heading; down is `main`.
+        assert!(b.run_view("view.down", &host));
         let target = b.current().expect("a branch under the keyboard");
 
         // First press: asked, not acted.
@@ -1120,7 +1154,8 @@ mod tests {
         v.set_len(b.data.len());
         v.set_height(3);
         b.view.set(v);
-        assert!(b.run_view("view.down", &host)); // onto feature
+        // The keyboard opens on `feature`, past the heading; down is `main`.
+        assert!(b.run_view("view.down", &host));
         let target = b.current().expect("a branch under the keyboard");
         assert!(!b.confirm_or_arm_delete(&target));
         assert_eq!(b.armed_row(), Some(target.clone()));
@@ -1283,5 +1318,100 @@ mod tests {
             }
             other => panic!("three local rows expected, got {other:?}"),
         }
+    }
+
+    /// A pane over `[LOCAL·2] a b [REMOTE·1] origin/a`, three rows tall.
+    fn pane() -> (Branches, Host) {
+        let host = Host::new();
+        let b = Branches::from_prepared(prepare(
+            vec![local("a", true), local("b", false)],
+            vec![remote("a")],
+            None,
+            &host.theme,
+            "",
+        ));
+        b.rendered.set(3);
+        let mut v = b.view.get();
+        v.set_len(b.data.len());
+        v.set_height(3);
+        b.view.set(v);
+        (b, host)
+    }
+
+    fn at(b: &Branches) -> usize {
+        b.view.get().cursor()
+    }
+
+    #[test]
+    fn the_cursor_opens_on_the_first_branch_and_never_rests_on_a_heading() {
+        let (mut b, host) = pane();
+        // Row 0 is `LOCAL`; the keyboard starts under it.
+        assert_eq!(at(&b), 1);
+        assert_eq!(b.current(), Some(Target::Local(RefName::from("a"))));
+
+        // `j` twice: b, then over the `REMOTE` heading onto origin/a.
+        assert!(b.run_view("view.down", &host));
+        assert_eq!(at(&b), 2);
+        assert!(b.run_view("view.down", &host));
+        assert_eq!(at(&b), 4, "down skipped the heading in its own direction");
+
+        // `k` back: over the heading again, landing on b.
+        assert!(b.run_view("view.up", &host));
+        assert_eq!(at(&b), 2, "up skipped the heading in its own direction");
+
+        // `k` from the first branch lands on `LOCAL`, which is the edge —
+        // so it settles forward and the cursor stays where it was.
+        assert!(b.run_view("view.up", &host));
+        assert!(b.run_view("view.up", &host));
+        assert_eq!(at(&b), 1, "the top heading is not a resting place");
+
+        // Jumps obey the same rule: `gg` is the first branch, `G` the last.
+        assert!(b.run_view("view.bottom", &host));
+        assert_eq!(at(&b), 4);
+        assert!(b.run_view("view.top", &host));
+        assert_eq!(at(&b), 1);
+    }
+
+    #[test]
+    fn a_refresh_that_strands_the_cursor_on_a_heading_steps_off_it() {
+        let (mut b, host) = pane();
+        // Onto b.
+        assert!(b.run_view("view.down", &host));
+        // b vanishes and a remote arrives at its place in the list: the
+        // clamped row is now the `REMOTE` heading, and the cursor may not
+        // stay there.
+        b.replace_prepared(
+            prepare(
+                vec![local("a", true)],
+                vec![remote("a"), remote("b")],
+                None,
+                &host.theme,
+                "",
+            ),
+            &host,
+        );
+        assert!(
+            b.current().is_some(),
+            "the cursor rests on a heading after a refresh: row {}",
+            at(&b)
+        );
+    }
+
+    #[test]
+    fn settle_is_the_identity_off_a_heading_and_survives_a_heading_only_list() {
+        let t = Theme::dark();
+        let rows = flatten(&[local("a", true)], &[remote("a")], None, &t);
+        for i in [1, 3] {
+            assert_eq!(super::settle(&rows, i, 1), i);
+            assert_eq!(super::settle(&rows, i, -1), i);
+        }
+        // Nothing to settle onto: the input comes back, and nothing panics.
+        let only = vec![Row::Heading {
+            count: "0".into(),
+            section: super::Section::Local,
+        }];
+        assert_eq!(super::settle(&only, 0, 1), 0);
+        assert_eq!(super::settle(&only, 0, -1), 0);
+        assert_eq!(super::settle(&[], 0, 1), 0);
     }
 }

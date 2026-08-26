@@ -1,4 +1,5 @@
 use super::{accept_deferred_scroll, DeferredScrollbar, PendingScroll};
+use crate::chrome;
 use crate::graph;
 use gitten_core::host::Host;
 use gitten_core::search;
@@ -20,10 +21,6 @@ struct Data {
     /// load-time answer reads as one timestamp. See [`rel_time`] for the
     /// bands.
     times: Vec<SharedString>,
-    /// uniform_list measures exactly ONE row to decide how wide the content is,
-    /// and by default that is row 0. If row 0 is short there is nothing to
-    /// scroll to, however long the rest are. Point it at the real widest row.
-    widest: usize,
     /// One line per commit, the way `copy.selection` copies it — the sha and the
     /// subject, and neither the graph nor the clock beside them. Built at load
     /// with everything else that is derived once.
@@ -516,7 +513,10 @@ impl Commits {
     }
 }
 
-pub(crate) fn prepare(commits: Vec<Commit>, host: &Host) -> Prepared {
+/// The host rides along for the day a load-time derivation reads the font or
+/// the theme again; nothing does today, since the widest-row measurement
+/// went with the sideways scroll.
+pub(crate) fn prepare(commits: Vec<Commit>, _host: &Host) -> Prepared {
     let t = std::time::Instant::now();
     let rows = assign_lanes(&commits);
     let t_lanes = t.elapsed();
@@ -538,34 +538,6 @@ pub(crate) fn prepare(commits: Vec<Commit>, host: &Host) -> Prepared {
         .map(|c| rel_time(c.timestamp, now).into())
         .collect();
 
-    // The widest row is no longer just the longest subject: every row's
-    // graph is only as wide as its own lanes, so a short message behind a
-    // wide graph can still out-reach a long one on the trunk. The furniture
-    // around both — the sha ahead of it, the clock behind it — is the same
-    // width on every row, so which row wins is still decided by graph +
-    // subject alone; counted in full anyway, because an honest estimate is
-    // free and survives the next column.
-    //
-    // One character's width comes from the host's font rather than a constant
-    // measured on whatever the font used to be. It only picks which row
-    // `uniform_list` measures, so an approximation is fine — and it is
-    // meaningless for a proportional face, which is the honest reason a
-    // long subject may then win over a wide graph.
-    let char_w = host.font.char_width();
-    let widest = draws
-        .iter()
-        .zip(&commits)
-        .map(|(d, c)| {
-            SHA_CHARS * char_w
-                + graph::row_width(d)   // lanes + the GAP after them
-                + c.subject.len() as f32 * char_w
-                + (TIME_CHARS + 1.0) * char_w // the clock, plus air before it
-        })
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.total_cmp(b))
-        .map(|(i, _)| i)
-        .unwrap_or(0);
-
     let load = format!(
         "{} commits · {} lanes · lanes {:.0?} draws {:.0?}",
         commits.len(),
@@ -585,7 +557,6 @@ pub(crate) fn prepare(commits: Vec<Commit>, host: &Host) -> Prepared {
             commits,
             draws,
             times,
-            widest,
         },
         load,
     }
@@ -613,6 +584,7 @@ impl Render for Commits {
             .armed
             .as_ref()
             .and_then(|sha| visible.iter().position(|i| data.commits[*i].sha == *sha));
+        let focused = self.focused;
         let list = uniform_list("commits", visible.len(), move |range, _, cx| {
             rendered.set(range.len());
             top.set(range.start);
@@ -641,22 +613,20 @@ impl Render for Commits {
                         &data.draws[c],
                         &host,
                         i == cursor,
+                        focused,
                         Some(i) == armed,
                     )
                 })
                 .collect()
         })
-        // A hidden row can still be the widest thing the filter took away;
-        // clamping keeps the one measurement inside the list that exists.
-        .with_width_from_item(Some(
-            self.data.widest.min(self.visible.len().saturating_sub(1)),
-        ))
+        // Rows are exactly the viewport's width — no `Unconstrained` sizing
+        // and no widest-row measurement. The column is a list, not a diff: a
+        // subject that does not fit ends in an ellipsis, and the clock at the
+        // right edge is always on screen. No padding on the list either:
+        // `ROW_PAD` is the row's own, so the cursor bar sits on the region's
+        // edge.
         .track_scroll(&self.scroll)
-        // Let rows exceed the viewport width instead of being clipped; this is
-        // what turns on horizontal scrolling.
-        .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
-        .size_full()
-        .px_3();
+        .size_full();
 
         // The scrollbar overlays the list, so the container must be positioned.
         // `[view] scrollbar` is read per frame like every other setting: the
@@ -668,7 +638,6 @@ impl Render for Commits {
                 &self.scroll,
                 &self.pending_scroll,
             )))
-            .child(Scrollbar::horizontal(&self.scroll))
         })
     }
 }
@@ -731,37 +700,28 @@ const TIME_CHARS: f32 = 4.0;
 /// immediately, so a commit on the trunk reads from the left instead of
 /// starting behind the widest merge in the repository.
 ///
-/// The clock is pushed to the row's right edge by `ml_auto` against a fixed
-/// four-character cell, right-aligned inside it, so ages sit in one vertical
+/// On [`chrome::list_row`]'s furniture, so the cursor bar sits left of the
+/// graph like every other list's. The subject is the one thing that gives:
+/// `min_w_0` and `truncate` end it in an ellipsis, so the clock — a fixed
+/// four-character cell, right-aligned inside it and pushed to the row's
+/// edge by `ml_auto` — is always on screen and the ages sit in one vertical
 /// line no matter where their subjects stop.
 ///
-/// `current` paints the keyboard's row in `chrome.selection_bg`, the one colour
-/// the terminal uses for exactly this, so the cursor is visible wherever the
-/// keymap moves it. `armed` tints the sha, subject and clock toward
-/// `chrome.error`, so the commit a second press would reset to is named by its
-/// own colour and not only by the band above it. `min_w_full` carries all of
-/// that past the last character: a background that stops at the subject leaves
-/// a ragged margin down a wall of rows — the same rule the diff view's rows
-/// keep — while leaving the widest-row measurement alone, which runs against
-/// max content where a percentage minimum drops out anyway.
+/// `current` is the keyboard's row and `focused` picks its bar's ink.
+/// `armed` tints the sha, subject and clock toward `chrome.error`, so the
+/// commit a second press would reset to is named by its own colour and not
+/// only by the band above it.
 fn row(
     c: &Commit,
     time: &SharedString,
     d: &graph::Draw,
     host: &Rc<Host>,
     current: bool,
+    focused: bool,
     armed: bool,
 ) -> AnyElement {
     let ch = host.font.char_width();
-    div()
-        .flex()
-        .items_center()
-        .min_w_full()
-        .h(px(graph::ROW_H))
-        .bg(rgb(match current {
-            true => host.theme.chrome.selection_bg,
-            false => host.theme.chrome.bg,
-        }))
+    chrome::list_row(host, current, focused, graph::ROW_H)
         .child(graph::row_canvas(d.clone(), host.clone()))
         .child(
             div()
@@ -778,7 +738,9 @@ fn row(
         )
         .child(
             div()
-                .flex_none()
+                .min_w_0()
+                .flex_shrink(1.0)
+                .truncate()
                 // Unarmed keeps the inherited ink; only the question
                 // repaints the row.
                 .when(armed, |d| d.text_color(rgb(host.theme.chrome.error)))
@@ -788,7 +750,12 @@ fn row(
             div()
                 .flex_none()
                 .ml_auto()
-                .w(px(TIME_CHARS * ch))
+                // A character of air before the cell is the floor under the
+                // auto margin — what a squeezed subject still leaves.
+                .pl(px(ch))
+                .pr_2()
+                .w(px((TIME_CHARS + 1.0) * ch))
+                .flex()
                 .justify_end()
                 // Faint rather than dim, and below it in the palette on
                 // purpose: furniture looked up once per glance and not text
