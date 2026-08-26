@@ -1538,12 +1538,15 @@ impl DevShell {
     /// through [`Commits::current`] — the sha under the keyboard, wherever
     /// filtering left it — never a row index.
     ///
-    /// Only hard asks twice, and it asks exactly as `files.discard` does:
+    /// Every strength asks twice, and asks exactly as `files.discard` does:
     /// first press arms the row and says so in the band, any cursor move,
     /// wheel or refresh disarms, second press on the same commit builds the
-    /// job. Soft and mixed destroy nothing recoverable-with-effort — every
-    /// abandoned commit stays in the reflog, and mixed leaves its own step
-    /// sitting in the working tree — so they go straight through.
+    /// job. Soft and mixed destroy nothing — every abandoned commit stays in
+    /// the reflog — but "recoverable" is a promise to someone who knows where
+    /// the reflog is, and the keypress gives no hint it moved history at all.
+    /// A commit list that silently loses its top rows reads as data loss no
+    /// matter what the reflog knows, so the question is asked in the band
+    /// where the eyes are.
     fn reset_selected(&mut self, command: &str, cx: &mut Context<Self>) {
         let Some(Screen::Commits { view, .. }) = self.active() else {
             self.set_notice(format!("{command} is not supported here"));
@@ -1562,23 +1565,20 @@ impl DevShell {
             self.set_notice("a fixture has no repository to reset in");
             return;
         };
-        if command == "commits.reset-hard"
-            && !view.update(cx, |v, _| v.confirm_or_arm_reset(&commit.sha))
-        {
-            self.set_notice(format!(
-                "reset --hard to {}? press again to confirm",
-                commit.short
-            ));
-            return;
-        }
-        if command == "commits.reset-hard" {
-            self.notice = None; // the question is spent; the running band speaks next
-        }
         let mode = match command {
             "commits.reset-soft" => ResetMode::Soft,
             "commits.reset-mixed" => ResetMode::Mixed,
             _ => ResetMode::Hard,
         };
+        if !view.update(cx, |v, _| v.confirm_or_arm_reset(&commit.sha)) {
+            self.set_notice(format!(
+                "reset {} to {}? press again to confirm",
+                mode.flag(),
+                commit.short
+            ));
+            return;
+        }
+        self.notice = None; // the question is spent; the running band speaks next
         let job =
             gitten_app::verbs::Write::reset(&writes.repo, mode, commit.sha.clone().into_bytes());
         if !writes.send(Box::new(job)) {
@@ -6859,15 +6859,38 @@ diff --git a/added.txt b/added.txt
     // ------------------------------------------------- the history verbs
 
     #[gpui::test]
-    fn soft_and_mixed_resets_go_straight_through_the_pump(cx: &mut TestAppContext) {
+    fn soft_and_mixed_resets_ask_twice_too(cx: &mut TestAppContext) {
+        // A reset that silently shortened the commit list read as data loss
+        // to the one person whose opinion of this UI counts, so every strength
+        // asks the same question hard does: arm, say it in the band, spend.
         let (shell, repo) = history_shell(cx);
         let target = "0".repeat(40);
 
         shell.update(cx, |shell, cx| shell.run_command("commits.reset-soft", cx));
+        std::thread::sleep(Duration::from_millis(50));
+        shell.read_with(cx, |shell, _| {
+            assert!(repo.wrote().is_empty(), "the first press must only arm");
+            assert!(
+                shell
+                    .notice
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("reset --soft to abc000?"),
+                "the question went unsaid: {:?}",
+                shell.notice
+            );
+        });
+        shell.update(cx, |shell, cx| shell.run_command("commits.reset-soft", cx));
         pump_write(&shell, cx);
         assert_eq!(repo.wrote(), vec![format!("reset --soft {target}")]);
-        shell.read_with(cx, |shell, _| assert!(shell.generation.get() > 0));
 
+        // A different mode is a different question: the soft arm was spent,
+        // so mixed waits for its own yes.
+        shell.update(cx, |shell, cx| shell.run_command("commits.reset-mixed", cx));
+        std::thread::sleep(Duration::from_millis(50));
+        shell.read_with(cx, |_shell, _| {
+            assert_eq!(repo.wrote().len(), 1, "mixed still waits for its own yes");
+        });
         shell.update(cx, |shell, cx| shell.run_command("commits.reset-mixed", cx));
         pump_write(&shell, cx);
         assert_eq!(
@@ -6876,7 +6899,7 @@ diff --git a/added.txt b/added.txt
                 format!("reset --soft {target}"),
                 format!("reset --mixed {target}")
             ],
-            "neither strength asked twice"
+            "the second press of each strength is the yes"
         );
     }
 
