@@ -125,14 +125,40 @@ fn section_floor(rows: usize) -> f32 {
     SECTION_MIN_H.min(section_height(rows))
 }
 
-/// How far HEAD has drifted from its upstream, for the title chip: ` · ↑2 ↓0`
-/// when either count is non-zero, nothing when both are zero or unknown. Both
-/// arrows once either shows, because `↑2` alone leaves the reader wondering
-/// whether the pull side was zero or unread.
-fn drift(ahead: Option<u32>, behind: Option<u32>) -> Option<String> {
-    let (up, down) = (ahead.unwrap_or(0), behind.unwrap_or(0));
-    (up > 0 || down > 0).then(|| format!(" · ↑{up} ↓{down}"))
+/// The diff header's text, spelled once per change of what it says — see
+/// [`DevShell::header_memo`]. The path is already cut where
+/// [`chrome::path_spans`] wants it.
+#[derive(Clone)]
+struct HeaderText {
+    dir: SharedString,
+    name: SharedString,
+    adds: SharedString,
+    dels: SharedString,
+    hunk: Option<SharedString>,
 }
+
+impl HeaderText {
+    fn of(s: &views::diff::FileSummary) -> Self {
+        let (dir, name) = gitten_core::path::split_dir_name(&s.path);
+        Self {
+            dir: dir.to_string().into(),
+            name: name.to_string().into(),
+            adds: format!("+{}", s.adds).into(),
+            dels: format!("−{}", s.dels).into(),
+            hunk: (s.hunks > 0).then(|| format!("hunk {}/{}", s.hunk, s.hunks).into()),
+        }
+    }
+}
+
+/// The three sidebar panes in reading order: the mode name the registry knows
+/// them by, the key that focuses each, the header's label and the element id.
+/// Static, so a frame spells none of them — and the label is the design's
+/// word, which is `STASH` for a stack the mode calls `stashes`.
+const SIDEBAR: [(&str, &str, &str, &str); 3] = [
+    ("files", "1", "FILES", "side-files"),
+    ("branches", "2", "BRANCHES", "side-branches"),
+    ("stashes", "3", "STASH", "side-stashes"),
+];
 
 /// The repository as the title strip spells it: `(parent, name)` with the
 /// parent under `~` when it is under home and ending in `/`, so the two halves
@@ -1033,6 +1059,15 @@ struct DevShell {
     /// Startup logging, and nothing else: whether [`start::mark`] has already
     /// stamped the first render. One bool read per frame afterwards.
     first_render: Cell<bool>,
+    /// The title strip's two halves — `("~/src/", "plait")` — cut once per
+    /// repository and read per frame. Keyed on the path, because the tests
+    /// swap `repo` in place and a memo that trusted construction would lie.
+    title_memo: RefCell<Option<(std::path::PathBuf, SharedString, SharedString)>>,
+    /// The diff header's spelled-out strings, kept beside the summary they
+    /// were spelled from: a cursor sitting still is the common frame, and it
+    /// must not re-split the path and re-format three numbers to say the
+    /// same thing again.
+    header_memo: RefCell<Option<(views::diff::FileSummary, HeaderText)>>,
     /// Which modes' bindings are live, innermost last: the pane container, the
     /// focused tenant, then input or help over it. Rebuilt by
     /// [`DevShell::sync_modes`] whenever any of those changes.
@@ -3566,11 +3601,9 @@ impl Render for DevShell {
         // not fit, each shrinks from that basis to a floor of two rows and
         // its `uniform_list` scrolls. No measurement, no second frame.
         let sidebar = {
-            let named: [(&str, &'static str); 3] =
-                [("files", "1"), ("branches", "2"), ("stashes", "3")];
-            let focused_name = self.panes.focused_name().to_string();
+            let focused_name = self.panes.focused_name();
             let mut sections: Vec<AnyElement> = Vec::new();
-            for (name, number) in named {
+            for (name, number, label, id) in SIDEBAR {
                 let Some(screen) = self.panes.get(name) else {
                     continue;
                 };
@@ -3592,8 +3625,8 @@ impl Render for DevShell {
                 };
                 sections.push(
                     div()
-                        .id(ElementId::Name(SharedString::from(format!("side-{name}"))))
-                        .debug_selector(move || format!("side-{name}"))
+                        .id(id)
+                        .debug_selector(move || id.to_string())
                         .flex_shrink(1.0)
                         .h(px(section_height(rows)))
                         // The floor never exceeds the basis: a minimum
@@ -3609,7 +3642,7 @@ impl Render for DevShell {
                         .child(chrome::pane_header(
                             &host,
                             number,
-                            name.to_uppercase().into(),
+                            label.into(),
                             count,
                             focused,
                             None,
@@ -3749,22 +3782,24 @@ impl Render for DevShell {
             .capture_any_mouse_down(cx.listener(|this, _, _, cx| this.set_spot(Spot::Main, cx)))
             .child({
                 let summary = main_view.read(cx).file_summary();
-                let adds = SharedString::from(
-                    summary
-                        .as_ref()
-                        .map(|s| format!("+{}", s.adds))
-                        .unwrap_or_default(),
-                );
-                let dels = SharedString::from(
-                    summary
-                        .as_ref()
-                        .map(|s| format!("−{}", s.dels))
-                        .unwrap_or_default(),
-                );
-                let hunk = summary
-                    .as_ref()
-                    .filter(|s| s.hunks > 0)
-                    .map(|s| SharedString::from(format!("hunk {}/{}", s.hunk, s.hunks)));
+                // Spelled once per change of summary, not per frame: the
+                // memo answers while the keyboard sits still, which is the
+                // frame that happens most.
+                let text = summary.as_ref().map(|s| {
+                    let mut memo = self.header_memo.borrow_mut();
+                    match memo.as_ref() {
+                        Some((key, text)) if key == s => text.clone(),
+                        _ => {
+                            let text = HeaderText::of(s);
+                            *memo = Some((s.clone(), text.clone()));
+                            text
+                        }
+                    }
+                });
+                let (adds, dels, hunk) = match &text {
+                    Some(t) => (Some(t.adds.clone()), Some(t.dels.clone()), t.hunk.clone()),
+                    None => (None, None, None),
+                };
                 // File path, then the counts, then the subject last and
                 // shrinking: the path is the one thing that must not
                 // truncate, and the eye finds counts at the right edge.
@@ -3783,13 +3818,13 @@ impl Render for DevShell {
                             .text_color(rgb(c.faint))
                             .child(commit.subject.clone())
                     }))
-                    .children((!adds.is_empty()).then(|| {
+                    .children(adds.map(|adds| {
                         div()
                             .flex_none()
                             .text_color(rgb(host.theme.diff.adds_fg))
                             .child(adds)
                     }))
-                    .children((!dels.is_empty()).then(|| {
+                    .children(dels.map(|dels| {
                         div()
                             .flex_none()
                             .text_color(rgb(host.theme.diff.dels_fg))
@@ -3807,8 +3842,8 @@ impl Render for DevShell {
                     true => c.fg,
                     false => c.dim,
                 };
-                let name = match &summary {
-                    Some(s) => chrome::path_text(&host, s.path.as_str(), name_ink),
+                let name = match &text {
+                    Some(t) => chrome::path_spans(&host, t.dir.clone(), t.name.clone(), name_ink),
                     None => div().text_color(rgb(name_ink)).child("DIFF"),
                 };
                 chrome::pane_header_with(
@@ -3854,8 +3889,18 @@ impl Render for DevShell {
         // acquisition label, which is the only name it has.
         let title: AnyElement = match &self.repo {
             Some((path, _)) => {
-                let (dir, name) = repo_title(path, home());
-                chrome::path_text(&host, &format!("{dir}{name}"), c.fg).into_any_element()
+                // Cut once per repository — see [`DevShell::title_memo`].
+                let mut memo = self.title_memo.borrow_mut();
+                let (dir, name) = match memo.as_ref() {
+                    Some((at, dir, name)) if at == path => (dir.clone(), name.clone()),
+                    _ => {
+                        let (dir, name) = repo_title(path, home());
+                        let (dir, name) = (SharedString::from(dir), SharedString::from(name));
+                        *memo = Some((path.clone(), dir.clone(), name.clone()));
+                        (dir, name)
+                    }
+                };
+                chrome::path_spans(&host, dir, name, c.fg).into_any_element()
             }
             None => div()
                 .whitespace_nowrap()
@@ -3976,17 +4021,11 @@ impl Render for DevShell {
                                 .border_color(rgb(c.border))
                                 .rounded(px(3.0))
                                 .whitespace_nowrap()
-                                .child(
-                                    div()
-                                        .flex_none()
-                                        .text_color(rgb(c.fg))
-                                        .child(SharedString::from(format!("⎇ {}", info.branch))),
-                                )
-                                .children(drift(info.ahead, info.behind).map(|drift| {
-                                    div()
-                                        .flex_none()
-                                        .text_color(rgb(c.dim))
-                                        .child(SharedString::from(drift))
+                                // Both halves were spelled at prepare; a
+                                // frame clones two refcounts.
+                                .child(div().flex_none().text_color(rgb(c.fg)).child(info.chip))
+                                .children(info.drift.map(|drift| {
+                                    div().flex_none().text_color(rgb(c.dim)).child(drift)
                                 })),
                         )
                     }))
@@ -4541,6 +4580,8 @@ fn main() {
                     notice: None,
                     config: shell_config_path,
                     first_render: Cell::new(false),
+                    title_memo: RefCell::new(None),
+                    header_memo: RefCell::new(None),
                     modes: Modes::new(),
                     pending: Vec::new(),
                     help: false,
@@ -4878,6 +4919,8 @@ mod tests {
                 notice: None,
                 config: std::path::PathBuf::new(),
                 first_render: Cell::new(false),
+                title_memo: RefCell::new(None),
+                header_memo: RefCell::new(None),
                 modes: Modes::new(),
                 pending: vec![vec![Key::char('g')]],
                 help: false,
@@ -8692,7 +8735,7 @@ diff --git a/added.txt b/added.txt
 
 #[cfg(test)]
 mod title_tests {
-    use super::{drift, repo_title, section_floor, section_height, SECTION_MIN_H};
+    use super::{repo_title, section_floor, section_height, SECTION_MIN_H};
     use std::path::Path;
 
     #[test]
@@ -8728,14 +8771,6 @@ mod title_tests {
             repo_title(Path::new("/"), None),
             (String::new(), "/".to_string())
         );
-    }
-
-    #[test]
-    fn drift_shows_both_arrows_once_either_is_non_zero_and_nothing_otherwise() {
-        assert_eq!(drift(Some(2), Some(0)).as_deref(), Some(" · ↑2 ↓0"));
-        assert_eq!(drift(None, Some(3)).as_deref(), Some(" · ↑0 ↓3"));
-        assert_eq!(drift(Some(0), Some(0)), None);
-        assert_eq!(drift(None, None), None);
     }
 
     #[test]

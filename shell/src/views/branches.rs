@@ -80,10 +80,22 @@ pub(crate) enum Section {
 }
 
 impl Section {
+    /// The lowercase spelling the tests outline rows with; the drawn heading
+    /// is [`Section::label`].
+    #[cfg(test)]
     fn name(self) -> &'static str {
         match self {
             Section::Local => "local",
             Section::Remote => "remote",
+        }
+    }
+
+    /// The heading drawn over the group, in caps. Static, so the row's frame
+    /// spells nothing.
+    fn label(self) -> &'static str {
+        match self {
+            Section::Local => "LOCAL",
+            Section::Remote => "REMOTE",
         }
     }
 }
@@ -267,6 +279,21 @@ pub struct HeadInfo {
     pub ahead: Option<u32>,
     /// Commits to pull. `None` under the same conditions as [`HeadInfo::ahead`].
     pub behind: Option<u32>,
+    /// `⎇ main` — the chip's bright half, spelled once here so the title
+    /// strip clones a refcount per frame instead of formatting a string.
+    pub chip: SharedString,
+    /// ` · ↑2 ↓0` — the chip's dim half, [`drift`] run once; `None` when
+    /// there is nothing to say.
+    pub drift: Option<SharedString>,
+}
+
+/// How far HEAD has drifted from its upstream, for the title chip: ` · ↑2 ↓0`
+/// when either count is non-zero, nothing when both are zero or unknown. Both
+/// arrows once either shows, because `↑2` alone leaves the reader wondering
+/// whether the pull side was zero or unread.
+pub(crate) fn drift(ahead: Option<u32>, behind: Option<u32>) -> Option<String> {
+    let (up, down) = (ahead.unwrap_or(0), behind.unwrap_or(0));
+    (up > 0 || down > 0).then(|| format!(" · ↑{up} ↓{down}"))
 }
 
 /// Reads [`HeadInfo`] off the model. Pure — the unit-tested half of what the
@@ -276,10 +303,17 @@ fn head_info(head: Option<&HeadState>, local: &[Branch]) -> Option<HeadInfo> {
         Some(HeadState::Branch { .. }) => {}
         _ => return None,
     }
-    local.iter().find(|b| b.head).map(|b| HeadInfo {
-        branch: b.display().into_owned().into(),
-        ahead: b.upstream.as_ref().and_then(|u| u.ahead),
-        behind: b.upstream.as_ref().and_then(|u| u.behind),
+    local.iter().find(|b| b.head).map(|b| {
+        let branch: SharedString = b.display().into_owned().into();
+        let ahead = b.upstream.as_ref().and_then(|u| u.ahead);
+        let behind = b.upstream.as_ref().and_then(|u| u.behind);
+        HeadInfo {
+            chip: format!("⎇ {branch}").into(),
+            drift: drift(ahead, behind).map(SharedString::from),
+            branch,
+            ahead,
+            behind,
+        }
     })
 }
 
@@ -701,15 +735,18 @@ impl Render for Branches {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let c = crate::config::host(cx).theme.chrome;
         // No refs at all is a sentence, not an empty box — an unborn
-        // repository's honest answer.
+        // repository's honest answer. Top-left at `ROW_PAD`, like the files
+        // and stash panes' lines: this is a short section of the sidebar, and
+        // a sentence centred in it would sit where no row ever does.
         if let Some(empty) = self.is_empty().then(|| {
             div()
                 .size_full()
+                .pl(px(chrome::ROW_PAD))
+                .pt_2()
                 .flex()
-                .items_center()
-                .justify_center()
+                .items_start()
                 .text_color(rgb(c.faint))
-                .child("No branches yet")
+                .child("no branches yet")
                 .into_any_element()
         }) {
             return empty;
@@ -800,7 +837,7 @@ fn row(e: &Row, host: &Host, current: bool, focused: bool, armed: bool) -> AnyEl
     };
     match e {
         Row::Heading { count, section } => {
-            chrome::section_label(host, section.name().into(), Some(count.clone()), ROW_H)
+            chrome::section_label(host, section.label().into(), Some(count.clone()), ROW_H)
                 .into_any_element()
         }
         Row::Detached { dot: d, text } => chrome::list_row(host, current, focused, ROW_H)
@@ -836,7 +873,7 @@ fn row(e: &Row, host: &Host, current: bool, focused: bool, armed: bool) -> AnyEl
 #[cfg(test)]
 mod tests {
     use super::{
-        flatten, head_info, prepare, row_target, Branches, HeadInfo, Prepared, Row, Target,
+        drift, flatten, head_info, prepare, row_target, Branches, HeadInfo, Prepared, Row, Target,
     };
     use gitten_core::host::Host;
     use gitten_core::refs::{Branch, HeadState, RefName, RemoteBranch, Upstream};
@@ -1234,8 +1271,10 @@ mod tests {
                 branch: "main".into(),
                 ahead: Some(1),
                 behind: Some(2),
+                chip: "⎇ main".into(),
+                drift: Some(" · ↑1 ↓2".into()),
             }),
-            "the numbers core measured, verbatim"
+            "the numbers core measured, verbatim — and the chip spelled once"
         );
         // And the pane hands it on for the title strip.
         let b = Branches::from_prepared(p);
@@ -1252,6 +1291,15 @@ mod tests {
             (None, None),
             "a vanished ref measures to nothing"
         );
+        assert_eq!(hi.drift, None, "and the chip invents no zeros for it");
+    }
+
+    #[test]
+    fn drift_shows_both_arrows_once_either_is_non_zero_and_nothing_otherwise() {
+        assert_eq!(drift(Some(2), Some(0)).as_deref(), Some(" · ↑2 ↓0"));
+        assert_eq!(drift(None, Some(3)).as_deref(), Some(" · ↑0 ↓3"));
+        assert_eq!(drift(Some(0), Some(0)), None);
+        assert_eq!(drift(None, None), None);
     }
 
     #[test]

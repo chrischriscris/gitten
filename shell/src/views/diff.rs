@@ -617,6 +617,10 @@ impl ScrollbarHandle for Pan {
 /// before anything here ran — which is also why they can never disagree with
 /// what the file's drawn header shows: there is one copy of the numbers, and
 /// both places read it.
+///
+/// `PartialEq`, because the shell memoises the header's spelled-out strings
+/// against the last summary it drew: equal means nothing to re-spell.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileSummary {
     /// As the loaded diff spells it — the same string hunk staging resolves
     /// by, so a header that copies it acts on exactly what it names.

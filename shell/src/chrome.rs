@@ -78,6 +78,8 @@ pub fn list_row(host: &Host, current: bool, focused: bool, h: f32) -> Div {
 /// over the rows and never as one of them: it is not selectable, and a
 /// label that looked like a row would be one the cursor skips for no reason
 /// the eye can see. Same `ROW_PAD` as the rows, so the column stays a column.
+/// `text` arrives already in caps — a static per section — so a heading row
+/// costs the frame no string.
 pub fn section_label(host: &Host, text: SharedString, count: Option<SharedString>, h: f32) -> Div {
     let c = host.theme.chrome;
     div()
@@ -87,34 +89,17 @@ pub fn section_label(host: &Host, text: SharedString, count: Option<SharedString
         .h(px(h))
         .pl(px(ROW_PAD))
         .text_color(rgb(c.faint))
-        .child(
-            div()
-                .flex_none()
-                .child(SharedString::from(text.to_uppercase())),
-        )
+        .child(div().flex_none().child(text))
         .children(count.map(|count| div().flex_none().ml_auto().pr_2().child(count)))
 }
 
 /// A path drawn as the design draws one: directory dim, filename in
-/// `bright` — whatever ink the row has earned. The cut is
-/// [`gitten_core::path::split_dir_name`]'s, so the files pane and the diff
-/// header agree on where the filename starts. Two `flex_none` spans in one
-/// row and no wrapping, because a path is one word to the eye.
-#[allow(dead_code)] // The one-shot form; the lists split at flatten and use `path_spans`.
-pub fn path_text(host: &Host, path: &str, bright: u32) -> Div {
-    let (dir, name) = gitten_core::path::split_dir_name(path);
-    path_spans(
-        host,
-        dir.to_string().into(),
-        name.to_string().into(),
-        bright,
-    )
-}
-
-/// [`path_text`] for a row that already holds its two halves — a list that
-/// flattens once per refresh splits there and hands the pieces over, so the
-/// render path clones two refcounts instead of cutting and copying a string
-/// for every visible row on every frame.
+/// `bright` — whatever ink the row has earned. The two halves arrive already
+/// cut, by [`gitten_core::path::split_dir_name`] at flatten or prepare, so
+/// the files pane, the title strip and the diff header agree on where the
+/// filename starts and the render path clones two refcounts instead of
+/// cutting and copying a string per visible row per frame. Two `flex_none`
+/// spans in one row and no wrapping, because a path is one word to the eye.
 pub fn path_spans(host: &Host, dir: SharedString, name: SharedString, bright: u32) -> Div {
     let c = host.theme.chrome;
     div()
@@ -188,7 +173,7 @@ pub fn pane_header(
 
 /// [`pane_header`] with the name already drawn. For the one header whose
 /// name is not a word but a path — the diff pane's `5 internal/host.go`,
-/// directory dim and filename bright through [`path_text`] — where a single
+/// directory dim and filename bright through [`path_spans`] — where a single
 /// ink for the whole name would throw away the one cut the eye wants. The
 /// caller owns the name's colours; the header owns everything around it.
 pub fn pane_header_with(

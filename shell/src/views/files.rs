@@ -74,12 +74,26 @@ pub enum Section {
 }
 
 impl Section {
+    /// The lowercase spelling the tests outline rows with; the drawn heading
+    /// is [`Section::label`].
+    #[cfg(test)]
     fn name(self) -> &'static str {
         match self {
             Section::Staged => "staged",
             Section::Unstaged => "unstaged",
             Section::Untracked => "untracked",
             Section::Conflicts => "conflicts",
+        }
+    }
+
+    /// The heading drawn over the group, in the caps the design gives it.
+    /// Static, so the row's frame spells nothing.
+    fn label(self) -> &'static str {
+        match self {
+            Section::Staged => "STAGED",
+            Section::Unstaged => "UNSTAGED",
+            Section::Untracked => "UNTRACKED",
+            Section::Conflicts => "CONFLICTS",
         }
     }
 
@@ -773,7 +787,7 @@ fn row(e: &Entry, host: &Host, current: bool, focused: bool, armed: bool) -> Any
     let c = host.theme.chrome;
     match e {
         Entry::Heading { count, section } => {
-            section_label(host, section.name().into(), Some(count.clone()), ROW_H)
+            section_label(host, section.label().into(), Some(count.clone()), ROW_H)
                 .into_any_element()
         }
         Entry::File(f) => list_row(host, current, focused, ROW_H)
