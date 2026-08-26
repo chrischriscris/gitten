@@ -58,6 +58,16 @@ impl Commits {
 /// Characters, never `.len()`: a byte-lengthed CJK subject counted itself
 /// three times too wide and could dethrone a genuinely wider ASCII row,
 /// leaving that row clipped past the last reachable column forever.
+///
+/// Characters shrink the error; they move it rather than close it. Common
+/// scripts measure strictly closer — each CJK glyph counts once instead of
+/// three times, and the count is exact for Cyrillic — while a pure-ASCII
+/// repository ranks identically either way. The comparison is still a sum of
+/// counts rather than of columns, so rankings that mix scripts can invert
+/// where their ASCII:CJK ratios fall inside a miss-window. That residual
+/// window belongs to the approximation the first paragraph already disclaims.
+/// Completing it would mean a display-width table in `core`, dependency-free
+/// like the differs.
 fn estimated_row_width(gutter: &graph::Draw, subject: &str, char_w: f32) -> f32 {
     graph::row_width(gutter) + subject.chars().count() as f32 * char_w
 }
