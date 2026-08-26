@@ -123,8 +123,10 @@ const PASTE_OFF: &[u8] = b"\x1b[?2004l";
 
 /// The terminal, in the state a full-screen app needs it.
 ///
-/// Entering is: raw mode, the alternate screen, and the cursor hidden. Leaving
-/// is the reverse in reverse order, and happens on drop.
+/// Entering is: raw mode, the alternate screen, the cursor hidden, and
+/// bracketed paste negotiated — plus the mouse-tracking modes when asked for.
+/// Leaving runs on drop and unsets what entering set, the off sequences going
+/// out beside their on counterparts rather than in strict reverse order.
 pub struct Term {
     out: BufWriter<Stdout>,
     /// Whether we still owe the terminal a restore. Checked so that an explicit
@@ -574,6 +576,14 @@ mod tests {
         let mut k = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
         k.kind = KeyEventKind::Release;
         assert_eq!(translate_event(Event::Key(k)), None);
+    }
+
+    #[test]
+    fn a_paste_is_not_an_input() {
+        // Pinned because the app takes no text input, so a paste handler here
+        // would be a pasted `q` quitting — removing the negotiation or adding
+        // one on purpose should fail loudly, not silently.
+        assert_eq!(translate_event(Event::Paste("q".into())), None);
     }
 
     #[test]
