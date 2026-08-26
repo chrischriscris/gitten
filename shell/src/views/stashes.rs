@@ -154,6 +154,11 @@ impl Stashes {
         self.data.is_empty()
     }
 
+    /// How many rows the list draws — what sizes this pane's sidebar section.
+    pub fn rows(&self) -> usize {
+        self.data.len()
+    }
+
     /// Replaces repository data while keeping the selection anchored to its
     /// entry's commit. An index cannot anchor — dropping any entry renumbers
     /// everything above it — but the commit under an entry is stable, which

@@ -101,6 +101,72 @@ const LIGHTS_W: f32 = 72.0;
 /// constant on purpose tonight — a drag handle between the regions would own
 /// this properly, and that is polish-pass work.
 const COLUMN_SHARE: f32 = 0.32;
+/// The branch chip's height in the title strip: a row's worth, so it reads
+/// as a label and not as a button, inside a 32px band with air either side.
+const CHIP_H: f32 = 22.0;
+/// The shortest a sidebar section may be squeezed to when the three do not
+/// fit: its header and two rows — the selected one and a neighbour, which
+/// is the least a list can show and still be seen to scroll.
+const SECTION_MIN_H: f32 = chrome::HEADER_H + 2.0 * graph::ROW_H;
+
+/// A sidebar section's natural height: its header plus one row per line it
+/// draws, with a floor of one row for the empty state's line ("working tree
+/// clean", "nothing stashed"). Arithmetic and not measurement, because a view
+/// cannot know its own size during `render` — and a list row is a fixed
+/// [`graph::ROW_H`] precisely so that sums like this one are exact.
+fn section_height(rows: usize) -> f32 {
+    chrome::HEADER_H + rows.max(1) as f32 * graph::ROW_H
+}
+
+/// The shortest a section may be squeezed to: [`SECTION_MIN_H`], unless the
+/// section is naturally shorter than that — a `min_h` above the basis wins
+/// the layout, and an empty list padded to two rows is air nobody asked for.
+fn section_floor(rows: usize) -> f32 {
+    SECTION_MIN_H.min(section_height(rows))
+}
+
+/// How far HEAD has drifted from its upstream, for the title chip: ` · ↑2 ↓0`
+/// when either count is non-zero, nothing when both are zero or unknown. Both
+/// arrows once either shows, because `↑2` alone leaves the reader wondering
+/// whether the pull side was zero or unread.
+fn drift(ahead: Option<u32>, behind: Option<u32>) -> Option<String> {
+    let (up, down) = (ahead.unwrap_or(0), behind.unwrap_or(0));
+    (up > 0 || down > 0).then(|| format!(" · ↑{up} ↓{down}"))
+}
+
+/// The repository as the title strip spells it: `(parent, name)` with the
+/// parent under `~` when it is under home and ending in `/`, so the two halves
+/// concatenate back into the path — `("~/src/", "plait")`. A path with no name
+/// to give (the filesystem root) puts everything in the bright half rather
+/// than drawing nothing.
+fn repo_title(path: &std::path::Path, home: Option<&std::path::Path>) -> (String, String) {
+    let shown = match home.and_then(|home| path.strip_prefix(home).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    };
+    // Drop a trailing slash so the cut lands on the name — unless the slash
+    // *is* the path, which is the root and the one name it has.
+    let trimmed = shown.trim_end_matches('/');
+    let shown = match trimmed.is_empty() {
+        true => shown.as_str(),
+        false => trimmed,
+    };
+    let (dir, name) = gitten_core::path::split_dir_name(shown);
+    match name.is_empty() {
+        true => (String::new(), format!("{dir}{name}")),
+        false => (dir.to_string(), name.to_string()),
+    }
+}
+
+/// `$HOME`, read once for the process: the title strip asks every frame and an
+/// environment lookup is not a per-frame cost worth paying for a string that
+/// does not change.
+fn home() -> Option<&'static std::path::Path> {
+    static HOME: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
+        .as_deref()
+}
 /// How long the commits cursor may keep moving before the main view loads the
 /// commit it settled on. A fast run through the list schedules one timer per
 /// row but only the newest request ever survives its guard to load — see
@@ -3479,9 +3545,10 @@ impl Render for DevShell {
         // which is the design this window follows. Every region is drawn with
         // the same furniture: a short header naming the pane with *the number
         // of the key that focuses it*, and a hairline under it. The keyboard's
-        // region says so in the accent — the column and the diff as a 2px left
-        // edge, a sidebar section through its header's keycap and name — and
-        // the status bar says it again in words.
+        // region says so through its header — the bar on its left edge, the
+        // keycap and name in the accent — and through the selected row's
+        // bar; the regions themselves are parted by hairlines only, so the
+        // one accent on screen is where the keyboard is and nothing else.
         //
         // All three sidebar panes render at once; they are the repository's
         // own three answers (what changed, where am I, what is parked) and
@@ -3490,15 +3557,20 @@ impl Render for DevShell {
         // one is focused — the one place a compiled-in tenant takes the
         // keyboard's whole region, exactly as it did before this window had
         // a sidebar.
+        //
+        // **A section is as tall as its content.** Five files take five
+        // rows and the branches sit directly under them, the way the design
+        // stacks them — not a third of the sidebar each with air nobody
+        // asked for. The height is arithmetic (header plus rows), because a
+        // view cannot measure itself during `render`; and when the three do
+        // not fit, each shrinks from that basis to a floor of two rows and
+        // its `uniform_list` scrolls. No measurement, no second frame.
         let sidebar = {
-            let named: [(&str, &'static str, f32); 3] = [
-                ("files", "1", 4.0),
-                ("branches", "2", 3.0),
-                ("stashes", "3", 3.0),
-            ];
+            let named: [(&str, &'static str); 3] =
+                [("files", "1"), ("branches", "2"), ("stashes", "3")];
             let focused_name = self.panes.focused_name().to_string();
             let mut sections: Vec<AnyElement> = Vec::new();
-            for (name, number, weight) in named {
+            for (name, number) in named {
                 let Some(screen) = self.panes.get(name) else {
                     continue;
                 };
@@ -3512,11 +3584,22 @@ impl Render for DevShell {
                     }
                     _ => None,
                 };
+                let rows = match screen {
+                    Screen::Files { view, .. } => view.read(cx).rows(),
+                    Screen::Branches { view, .. } => view.read(cx).rows(),
+                    Screen::Stashes { view, .. } => view.read(cx).rows(),
+                    _ => 0,
+                };
                 sections.push(
                     div()
                         .id(ElementId::Name(SharedString::from(format!("side-{name}"))))
-                        .flex_grow(weight)
-                        .min_h_0()
+                        .debug_selector(move || format!("side-{name}"))
+                        .flex_shrink(1.0)
+                        .h(px(section_height(rows)))
+                        // The floor never exceeds the basis: a minimum
+                        // above the natural height wins the layout and an
+                        // empty section would be padded to two rows.
+                        .min_h(px(section_floor(rows)))
                         .flex()
                         .flex_col()
                         .overflow_hidden()
@@ -3595,10 +3678,12 @@ impl Render for DevShell {
                             .into_any_element()
                     })
                     .or_else(|| {
+                        // Dim, not accent: the accent is the keyboard's mark
+                        // and a branch name is a fact about the list.
                         branch.map(|branch| {
                             div()
                                 .flex_none()
-                                .text_color(rgb(c.accent))
+                                .text_color(rgb(c.dim))
                                 .child(branch)
                                 .into_any_element()
                         })
@@ -3619,11 +3704,10 @@ impl Render for DevShell {
                 .flex()
                 .flex_col()
                 .overflow_hidden()
-                .border_l_2()
-                .border_color(rgb(match focused {
-                    true => c.accent,
-                    false => c.border,
-                }))
+                // A hairline parts the regions; the header says which one
+                // holds the keyboard.
+                .border_l_1()
+                .border_color(rgb(c.border))
                 .debug_selector(|| "column".to_string())
                 .capture_any_mouse_down(cx.listener(|this, _, _, cx| this.set_spot(Spot::List, cx)))
                 .child(chrome::pane_header(&host, "4", name, None, focused, right))
@@ -3659,11 +3743,8 @@ impl Render for DevShell {
             .flex()
             .flex_col()
             .overflow_hidden()
-            .border_l_2()
-            .border_color(rgb(match main_focused {
-                true => c.accent,
-                false => c.border,
-            }))
+            .border_l_1()
+            .border_color(rgb(c.border))
             .debug_selector(|| "main".to_string())
             .capture_any_mouse_down(cx.listener(|this, _, _, cx| this.set_spot(Spot::Main, cx)))
             .child({
@@ -3719,14 +3800,21 @@ impl Render for DevShell {
                         loading
                             .then(|| div().flex_none().text_color(rgb(c.accent)).child("loading")),
                     );
-                let name: SharedString = match &summary {
-                    Some(s) => s.path.as_str().into(),
-                    None => "DIFF".into(),
+                // The name is a path, so it is drawn as one: directory dim,
+                // filename in the header's own ink — the same cut the files
+                // rows make, so the eye lands on the same word in both.
+                let name_ink = match main_focused {
+                    true => c.fg,
+                    false => c.dim,
                 };
-                chrome::pane_header(
+                let name = match &summary {
+                    Some(s) => chrome::path_text(&host, s.path.as_str(), name_ink),
+                    None => div().text_color(rgb(name_ink)).child("DIFF"),
+                };
+                chrome::pane_header_with(
                     &host,
                     "5",
-                    name,
+                    name.into_any_element(),
                     None,
                     main_focused,
                     Some(right.into_any_element()),
@@ -3757,11 +3845,26 @@ impl Render for DevShell {
             .or_else(|| self.loading.get().then(|| "loading diff".to_string()));
         let input = self.input.clone();
 
-        // The title is three things, so it is drawn as three: the app bright, the
-        // view dim, the repository dimmer and shrinkable. One grey run of text
-        // said none of that, and the separators are punctuation rather than
-        // content — `faint` is where punctuation belongs.
-        let dot = || div().flex_none().text_color(rgb(c.faint)).child("·");
+        // The title is the repository and where HEAD is, and nothing else.
+        // The app's name is the icon's job, the view's name is the status
+        // badge's and the version is the bar's; a strip that said all three
+        // again was chrome reading its own labels aloud. The path is drawn
+        // the way every path here is — parent dim, the name bright — and a
+        // launch with no repository behind it (a fixture, a patch) keeps the
+        // acquisition label, which is the only name it has.
+        let title: AnyElement = match &self.repo {
+            Some((path, _)) => {
+                let (dir, name) = repo_title(path, home());
+                chrome::path_text(&host, &format!("{dir}{name}"), c.fg).into_any_element()
+            }
+            None => div()
+                .whitespace_nowrap()
+                // From the *start*: the label is a path and a revspec, and
+                // `…/git HEAD~2..HEAD` is the half worth keeping.
+                .text_ellipsis_start()
+                .child(self.active_label(cx))
+                .into_any_element(),
+        };
 
         // The one focusable element in the window, and where key dispatch enters
         // it: a capture-phase listener on the root, so a keystroke is translated
@@ -3838,10 +3941,6 @@ impl Render for DevShell {
                     .border_b_1()
                     .border_color(rgb(c.border))
                     .text_color(rgb(c.dim))
-                    .child(div().flex_none().text_color(rgb(c.fg)).child("gitten"))
-                    .child(dot())
-                    .child(div().flex_none().child(which))
-                    .child(dot())
                     // The one thing in the strip that is allowed to shrink, and
                     // everything else is `flex_none`. A repository is the part of
                     // a title a reader can reconstruct; a picker pushed off the
@@ -3852,35 +3951,43 @@ impl Render for DevShell {
                             .flex_shrink(1.0)
                             .min_w_0()
                             .overflow_hidden()
-                            .whitespace_nowrap()
-                            // From the *start*: the label is a path and a
-                            // revspec, and `…/git HEAD~2..HEAD` is the half worth
-                            // keeping.
-                            .text_ellipsis_start()
-                            .child(self.active_label(cx)),
+                            .child(title),
                     )
-                    // The branch chip, the design's `main ↑2 ↓0`: where HEAD
-                    // sits and how far it has drifted, read from the branches
-                    // pane's own prepared head — one small struct per frame,
-                    // no second git call anywhere. A detached HEAD or a
-                    // fixture draws nothing: absence is the honest state.
+                    // The branch chip, the design's `⎇ main · ↑2 ↓0`: where
+                    // HEAD sits and how far it has drifted, read from the
+                    // branches pane's own prepared head — one small struct
+                    // per frame, no second git call anywhere. Outlined and
+                    // not filled: the one filled chip is the status badge,
+                    // and two would compete. A detached HEAD or a fixture
+                    // draws nothing: absence is the honest state.
                     .children(self.panes.get("branches").and_then(|screen| {
                         let Screen::Branches { view, .. } = screen else {
                             return None;
                         };
                         let info = view.read(cx).head_info()?;
-                        let mut chip = info.branch.to_string();
-                        if let Some(ahead) = info.ahead.filter(|n| *n > 0) {
-                            chip.push_str(&format!(" ↑{ahead}"));
-                        }
-                        if let Some(behind) = info.behind.filter(|n| *n > 0) {
-                            chip.push_str(&format!(" ↓{behind}"));
-                        }
                         Some(
                             div()
                                 .flex_none()
-                                .text_color(rgb(c.accent))
-                                .child(SharedString::from(chip)),
+                                .flex()
+                                .items_center()
+                                .h(px(CHIP_H))
+                                .px_2()
+                                .border_1()
+                                .border_color(rgb(c.border))
+                                .rounded(px(3.0))
+                                .whitespace_nowrap()
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_color(rgb(c.fg))
+                                        .child(SharedString::from(format!("⎇ {}", info.branch))),
+                                )
+                                .children(drift(info.ahead, info.behind).map(|drift| {
+                                    div()
+                                        .flex_none()
+                                        .text_color(rgb(c.dim))
+                                        .child(SharedString::from(drift))
+                                })),
                         )
                     }))
                     .children(cfg!(debug_assertions).then(|| {
@@ -4041,7 +4148,11 @@ fn main() {
             let rediff: Rediff = Rc::new(move |host: &Host, over: &Overrides, revision: &str| {
                 gitten_git::diff(for_diff.as_ref(), revision, &host.differ, over)
             });
-            (Some(rediff), Some((path.clone(), repo)))
+            // Canonicalised once, here: `.` is what every launch is handed by
+            // default and has no name to put in a title, and a syscall on the
+            // render path is not the place to find one.
+            let path = path.canonicalize().unwrap_or_else(|_| path.clone());
+            (Some(rediff), Some((path, repo)))
         }
         _ => (None, None),
     };
@@ -5180,25 +5291,33 @@ mod tests {
         assert_eq!(sidebar.origin.y, main.origin.y);
         assert_eq!(sidebar.size.height, main.size.height);
 
-        // Clicking a section's rows focuses *that* pane — the files section
-        // first, a branch section in the middle — and the keyboard moves
-        // with it.
-        cx.simulate_click(
-            gpui::point(
-                sidebar.center().x,
-                sidebar.origin.y + sidebar.size.height * 0.2,
-            ),
-            gpui::Modifiers::default(),
-        );
+        // The sections are as tall as their content — all three empty here,
+        // so a header and the one row the empty-state line takes — and each
+        // sits directly under the one before, from the top of the sidebar.
+        let files = cx.debug_bounds("side-files").expect("no files section");
+        let branches = cx
+            .debug_bounds("side-branches")
+            .expect("no branches section");
+        let stashes = cx.debug_bounds("side-stashes").expect("no stashes section");
+        let natural = gpui::px(super::section_height(0));
+        assert_eq!(files.size.height, natural, "an empty section is one row");
+        assert_eq!(branches.size.height, natural);
+        assert_eq!(stashes.size.height, natural);
+        assert_eq!(files.origin.y, sidebar.origin.y);
+        assert_eq!(files.bottom(), branches.origin.y, "files then branches");
+        assert_eq!(branches.bottom(), stashes.origin.y, "branches then stashes");
+
+        // Clicking a section's rows focuses *that* pane, and the keyboard
+        // moves with it.
+        cx.simulate_click(files.center(), gpui::Modifiers::default());
         assert_eq!(
             observed.read_with(&cx, |shell, _| shell.panes.focused_name().to_string()),
             "files"
         );
-        cx.simulate_click(sidebar.center(), gpui::Modifiers::default());
+        cx.simulate_click(branches.center(), gpui::Modifiers::default());
         assert_eq!(
             observed.read_with(&cx, |shell, _| shell.panes.focused_name().to_string()),
             "branches",
-            "the sidebar's middle is the branches section"
         );
     }
 
@@ -8150,7 +8269,7 @@ diff --git a/added.txt b/added.txt
                 panic!("branches pane lost");
             };
             view.read(cx)
-                .rows()
+                .row_slice()
                 .iter()
                 .find_map(|r| match r {
                     crate::views::branches::Row::Local(l) if l.name.as_bytes() == b"main" => {
@@ -8577,5 +8696,84 @@ diff --git a/added.txt b/added.txt
             };
             assert!(view.read(cx).current().is_some(), "clamped onto a row");
         });
+    }
+}
+
+#[cfg(test)]
+mod title_tests {
+    use super::{drift, repo_title, section_floor, section_height, SECTION_MIN_H};
+    use std::path::Path;
+
+    #[test]
+    fn a_repository_under_home_is_spelled_from_tilde_and_cut_at_its_name() {
+        assert_eq!(
+            repo_title(
+                Path::new("/Users/me/src/plait"),
+                Some(Path::new("/Users/me"))
+            ),
+            ("~/src/".to_string(), "plait".to_string())
+        );
+    }
+
+    #[test]
+    fn a_repository_elsewhere_keeps_its_whole_parent() {
+        assert_eq!(
+            repo_title(Path::new("/srv/git/plait"), Some(Path::new("/Users/me"))),
+            ("/srv/git/".to_string(), "plait".to_string())
+        );
+        assert_eq!(
+            repo_title(Path::new("/srv/git/plait"), None),
+            ("/srv/git/".to_string(), "plait".to_string())
+        );
+    }
+
+    #[test]
+    fn home_itself_and_the_root_still_have_a_bright_half() {
+        assert_eq!(
+            repo_title(Path::new("/Users/me"), Some(Path::new("/Users/me"))),
+            (String::new(), "~".to_string())
+        );
+        assert_eq!(
+            repo_title(Path::new("/"), None),
+            (String::new(), "/".to_string())
+        );
+    }
+
+    #[test]
+    fn drift_shows_both_arrows_once_either_is_non_zero_and_nothing_otherwise() {
+        assert_eq!(drift(Some(2), Some(0)).as_deref(), Some(" · ↑2 ↓0"));
+        assert_eq!(drift(None, Some(3)).as_deref(), Some(" · ↑0 ↓3"));
+        assert_eq!(drift(Some(0), Some(0)), None);
+        assert_eq!(drift(None, None), None);
+    }
+
+    #[test]
+    fn a_section_is_its_header_plus_its_rows_and_never_shorter_than_one_row() {
+        assert_eq!(
+            section_height(0),
+            section_height(1),
+            "the empty line is a row"
+        );
+        assert_eq!(
+            section_height(5) - section_height(1),
+            4.0 * crate::graph::ROW_H
+        );
+        assert!(section_height(2) >= SECTION_MIN_H, "the floor is two rows");
+    }
+
+    #[test]
+    fn the_floor_never_exceeds_the_natural_height() {
+        assert_eq!(
+            section_floor(0),
+            section_height(0),
+            "an empty section is not padded"
+        );
+        assert_eq!(section_floor(1), section_height(1));
+        assert_eq!(section_floor(2), SECTION_MIN_H);
+        assert_eq!(
+            section_floor(40),
+            SECTION_MIN_H,
+            "a long list still squeezes to two rows"
+        );
     }
 }

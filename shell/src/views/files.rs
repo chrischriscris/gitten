@@ -373,6 +373,12 @@ impl Files {
         self.changed
     }
 
+    /// How many rows the list draws, headings included — what sizes this
+    /// pane's sidebar section.
+    pub fn rows(&self) -> usize {
+        self.data.len()
+    }
+
     /// Replaces repository data while keeping the selection anchored to its
     /// path — the semantic cursor anchor of this pane. A file that vanished
     /// falls back to clamping, like a commit list whose sha left the log.
