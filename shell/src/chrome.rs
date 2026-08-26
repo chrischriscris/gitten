@@ -38,7 +38,6 @@ pub const SIDEBAR_SHARE: f32 = 0.21;
 /// Left padding of every list row and section label. One number, because
 /// the eye runs down a column of rows and a row that starts a pixel later
 /// than its neighbours reads as indented on purpose.
-#[allow(dead_code)] // Called by the rows once they take the shared furniture.
 pub const ROW_PAD: f32 = 12.0;
 
 /// The bar on the selected row's left edge — and on the focused pane's
@@ -52,7 +51,6 @@ pub const ROW_BAR: f32 = 2.0;
 /// but the keyboard is elsewhere. The bar is drawn on *every* row, in the
 /// row's own background when it is not selected, so `ROW_PAD` is always the
 /// same distance and the text never shifts a pixel when the cursor moves.
-#[allow(dead_code)] // Called by the rows once they take the shared furniture.
 pub fn list_row(host: &Host, current: bool, focused: bool, h: f32) -> Div {
     let c = host.theme.chrome;
     let bg = match current {
@@ -80,7 +78,6 @@ pub fn list_row(host: &Host, current: bool, focused: bool, h: f32) -> Div {
 /// over the rows and never as one of them: it is not selectable, and a
 /// label that looked like a row would be one the cursor skips for no reason
 /// the eye can see. Same `ROW_PAD` as the rows, so the column stays a column.
-#[allow(dead_code)] // Called by the rows once they take the shared furniture.
 pub fn section_label(host: &Host, text: SharedString, count: Option<SharedString>, h: f32) -> Div {
     let c = host.theme.chrome;
     div()
@@ -103,26 +100,29 @@ pub fn section_label(host: &Host, text: SharedString, count: Option<SharedString
 /// [`gitten_core::path::split_dir_name`]'s, so the files pane and the diff
 /// header agree on where the filename starts. Two `flex_none` spans in one
 /// row and no wrapping, because a path is one word to the eye.
-#[allow(dead_code)] // Called by the rows once they take the shared furniture.
+#[allow(dead_code)] // The one-shot form; the lists split at flatten and use `path_spans`.
 pub fn path_text(host: &Host, path: &str, bright: u32) -> Div {
-    let c = host.theme.chrome;
     let (dir, name) = gitten_core::path::split_dir_name(path);
+    path_spans(
+        host,
+        dir.to_string().into(),
+        name.to_string().into(),
+        bright,
+    )
+}
+
+/// [`path_text`] for a row that already holds its two halves — a list that
+/// flattens once per refresh splits there and hands the pieces over, so the
+/// render path clones two refcounts instead of cutting and copying a string
+/// for every visible row on every frame.
+pub fn path_spans(host: &Host, dir: SharedString, name: SharedString, bright: u32) -> Div {
+    let c = host.theme.chrome;
     div()
         .flex()
         .items_center()
         .whitespace_nowrap()
-        .child(
-            div()
-                .flex_none()
-                .text_color(rgb(c.dim))
-                .child(SharedString::from(dir.to_string())),
-        )
-        .child(
-            div()
-                .flex_none()
-                .text_color(rgb(bright))
-                .child(SharedString::from(name.to_string())),
-        )
+        .child(div().flex_none().text_color(rgb(c.dim)).child(dir))
+        .child(div().flex_none().text_color(rgb(bright)).child(name))
 }
 
 /// The keycap a pane header starts with: the number of the key that focuses

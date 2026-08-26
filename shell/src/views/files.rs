@@ -12,6 +12,7 @@
 //! strings so the render path allocates nothing per frame.
 
 use super::{accept_deferred_scroll, DeferredScrollbar, PendingScroll};
+use crate::chrome::{list_row, path_spans, section_label, ROW_PAD};
 use crate::graph::ROW_H;
 use gitten_core::host::Host;
 use gitten_core::status::{Change, ConflictKind, PathBytes, Status};
@@ -49,6 +50,12 @@ pub(crate) struct FileEntry {
     pub path: PathBytes,
     /// The display form, decoded lossily once at flatten.
     pub path_text: SharedString,
+    /// The display form cut at its last slash — directory (with the slash)
+    /// and filename — so the row draws the two inks without splitting or
+    /// copying per frame. [`gitten_core::path::split_dir_name`]'s cut, the
+    /// same one the diff header makes.
+    pub dir: SharedString,
+    pub name: SharedString,
     /// What a rename moved it from, decoded once; `None` otherwise.
     pub renamed_from: Option<SharedString>,
     /// What happened to it — the letter's meaning and its colour in one.
@@ -237,10 +244,14 @@ fn file(
     mark: Mark,
     letters: &'static str,
 ) -> FileEntry {
+    let path_text = path.to_string_lossy().into_owned();
+    let (dir, name) = gitten_core::path::split_dir_name(&path_text);
     FileEntry {
         section,
         path: path.clone(),
-        path_text: path.to_string_lossy().into_owned().into(),
+        dir: dir.to_string().into(),
+        name: name.to_string().into(),
+        path_text: path_text.into(),
         // The arrow baked in here, not per frame: a rename's origin is
         // furniture drawn dim, and no string is built for it on the render
         // path.
@@ -274,6 +285,21 @@ pub(crate) fn prepare(status: Status, describe: &str) -> Prepared {
         label: format!("{describe} · {changed} changed"),
         changed,
     }
+}
+
+/// Whether row `i` can hold the cursor: a file can, a heading cannot. The
+/// predicate [`Viewport::settle`] runs — the one thing about skipping headings
+/// that is this pane's to say.
+fn selectable(rows: &[Entry], i: usize) -> bool {
+    matches!(rows.get(i), Some(Entry::File(_)))
+}
+
+/// Moves `v` off a heading it landed on, onward from `from`. Called after
+/// every cursor move and every refresh, so the cursor never rests on a
+/// heading — a heading is a label over rows, and a verb aimed at one has
+/// nowhere to go.
+fn settle(rows: &[Entry], v: &mut Viewport, from: usize) {
+    v.settle(from, |i| selectable(rows, i));
 }
 
 /// What an armed discard asks, once, in the notice band. An untracked file
@@ -348,10 +374,15 @@ impl Files {
 
     pub(crate) fn from_prepared(prepared: Prepared) -> Self {
         let Prepared { rows, changed, .. } = prepared;
+        // Row 0 is always a heading when there is anything at all; the cursor
+        // opens on the first file under it.
+        let mut view = Viewport::new();
+        view.set_len(rows.len());
+        settle(&rows, &mut view, 0);
         Self {
             data: Rc::new(rows),
             scroll: UniformListScrollHandle::new(),
-            view: Rc::new(Cell::new(Viewport::new())),
+            view: Rc::new(Cell::new(view)),
             synced: Rc::new(Cell::new(0.0)),
             pending_scroll: PendingScroll::default(),
             rendered: Rc::new(Cell::new(0)),
@@ -416,6 +447,10 @@ impl Files {
         let mut view = old;
         view.set_len(self.data.len());
         view.go_to(cursor);
+        // A vanished anchor can leave the cursor on whatever heading took
+        // its row; the direction is "where it was" so it walks on to the
+        // next file rather than back to the previous section's last.
+        settle(&self.data, &mut view, old.cursor());
         self.view.set(view);
 
         if self.data.is_empty() {
@@ -452,7 +487,9 @@ impl Files {
                 let pixels = self.pending_scroll.wheel(dy);
                 let mut v = self.live_view(host);
                 let y = -(request.item_index as f32 * ROW_H) + pixels;
+                let from = v.cursor();
                 v.scroll_to((-y / ROW_H).round().max(0.0) as usize);
+                settle(&self.data, &mut v, from);
                 self.view.set(v);
                 // The wheel is also a move of attention — same rule the
                 // arrow keys keep.
@@ -475,7 +512,11 @@ impl Files {
             .base_handle
             .set_offset(point(offset.x, px(y)));
         let mut v = self.live_view(host);
+        // The wheel drags the cursor along at the margin; it must not park
+        // it on a heading any more than a keypress may.
+        let from = v.cursor();
         v.scroll_to((-y / ROW_H).round().max(0.0) as usize);
+        settle(&self.data, &mut v, from);
         self.view.set(v);
         self.synced.set(y);
         self.armed = None;
@@ -498,7 +539,9 @@ impl Files {
         if v.top() == shown {
             return;
         }
+        let from = v.cursor();
         v.scroll_to(shown);
+        settle(&self.data, &mut v, from);
         self.view.set(v);
     }
 
@@ -510,6 +553,7 @@ impl Files {
     pub fn run_view(&mut self, command: &str, host: &Host) -> bool {
         self.reconcile(host);
         let mut v = self.live_view(host);
+        let from = v.cursor();
         match command {
             "view.down" => v.down(),
             "view.up" => v.up(),
@@ -525,6 +569,8 @@ impl Files {
             "view.left" | "view.right" => return true,
             _ => return false,
         }
+        // Landed on a heading? Keep going the way the key pointed.
+        settle(&self.data, &mut v, from);
         // The keyboard moved — including the two scrolls above, which leave
         // the cursor but not the question's row in view. Whatever was armed
         // was armed to what the keyboard used to be on.
@@ -557,7 +603,8 @@ impl Files {
 
     /// What the keyboard is on: the whole file entry — section and path
     /// together, which is what a stage verb will need to know where its work
-    /// goes. `None` on a heading or an empty tree.
+    /// goes. `None` only on an empty tree, since the cursor never rests on a
+    /// heading.
     pub(crate) fn current_file(&self) -> Option<&FileEntry> {
         match self.data.get(self.view.get().cursor()) {
             Some(Entry::File(f)) => Some(f),
@@ -565,10 +612,9 @@ impl Files {
         }
     }
 
-    /// Which section the keyboard sits *in* — a heading counts as its own
-    /// section's ground, because that is where the eye puts it. What makes
-    /// the whole-section verb readable: the side of the index under the
-    /// keyboard decides, heading or file alike.
+    /// Which section the keyboard sits *in* — the side of the index under the
+    /// keyboard decides where a whole-section verb goes. A heading answers
+    /// for its section too, though the cursor no longer rests on one.
     pub(crate) fn cursor_section(&self) -> Option<Section> {
         match self.data.get(self.view.get().cursor()) {
             Some(Entry::Heading { section, .. }) => Some(*section),
@@ -652,7 +698,7 @@ impl Render for Files {
         if let Some(empty) = self.is_clean().then(|| {
             div()
                 .size_full()
-                .px_3()
+                .pl(px(ROW_PAD))
                 .pt_2()
                 .flex()
                 .items_start()
@@ -669,6 +715,7 @@ impl Render for Files {
         let scroll = self.scroll.clone();
         let synced = self.synced.clone();
         let pending_scroll = self.pending_scroll.clone();
+        let focused = self.focused;
         // The row an armed discard is waiting on, found once per frame —
         // the tint is a property of the question, not of the draw.
         let armed = self.armed.as_ref().and_then(|(section, path)| {
@@ -692,12 +739,11 @@ impl Render for Files {
             }
             let cursor = view.get().cursor();
             range
-                .map(|i| row(&data[i], &host, i == cursor, Some(i) == armed))
+                .map(|i| row(&data[i], &host, i == cursor, focused, Some(i) == armed))
                 .collect()
         })
         .track_scroll(&self.scroll)
-        .size_full()
-        .px_3();
+        .size_full();
 
         // The scrollbar overlays the list, so the container must be positioned
         // — and only the vertical one: paths clip rather than pan.
@@ -715,40 +761,23 @@ impl Render for Files {
     }
 }
 
-/// One row: a dim heading, or a status letter in its colour beside the path.
-/// `current` paints the keyboard's row in `chrome.selection_bg`, exactly as
-/// the commit list does; `armed` tints that row's letters and path toward
-/// `chrome.error`, so the thing a second press will destroy is named by its
-/// own colour and not only by the band above it.
-fn row(e: &Entry, host: &Host, current: bool, armed: bool) -> AnyElement {
+/// One row: a section label, or a status letter in its colour beside the
+/// path. The frame is [`list_row`]'s — selection tint, the bar on the left
+/// edge in accent while this pane is `focused` — and a heading is
+/// [`section_label`]'s, so it reads as a label over the rows and not as one.
+/// `armed` tints the letters and the path toward `chrome.error`, so the thing
+/// a second press will destroy is named by its own colour and not only by the
+/// band above it.
+fn row(e: &Entry, host: &Host, current: bool, focused: bool, armed: bool) -> AnyElement {
     let ch = host.font.char_width();
     let c = host.theme.chrome;
-    let base = div()
-        .flex()
-        .items_center()
-        .h(px(ROW_H))
-        .bg(rgb(match current {
-            true => c.selection_bg,
-            false => c.bg,
-        }));
     match e {
-        Entry::Heading { count, section } => base
+        Entry::Heading { count, section } => {
+            section_label(host, section.name().into(), Some(count.clone()), ROW_H)
+                .into_any_element()
+        }
+        Entry::File(f) => list_row(host, current, focused, ROW_H)
             .child(
-                div()
-                    .flex_none()
-                    .text_color(rgb(c.dim))
-                    .child(section.name()),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .ml(px(GAP_CHARS * ch))
-                    .text_color(rgb(c.faint))
-                    .child(count.clone()),
-            )
-            .into_any_element(),
-        Entry::File(f) => {
-            base.child(
                 div()
                     .flex_none()
                     .w(px(STATUS_CHARS * ch))
@@ -762,13 +791,15 @@ fn row(e: &Entry, host: &Host, current: bool, armed: bool) -> AnyElement {
                     .child(SharedString::from(f.letters)),
             )
             .child(
-                div()
-                    .flex_none()
-                    .min_w_0()
-                    // Unarmed keeps the inherited ink; only the question
-                    // repaints the row.
-                    .when(armed, |d| d.text_color(rgb(c.error)))
-                    .child(f.path_text.clone()),
+                div().flex_none().min_w_0().child(match armed {
+                    // The question repaints the whole path; unarmed, the
+                    // directory is dim and the name keeps the row's ink.
+                    true => div()
+                        .whitespace_nowrap()
+                        .text_color(rgb(c.error))
+                        .child(f.path_text.clone()),
+                    false => path_spans(host, f.dir.clone(), f.name.clone(), c.fg),
+                }),
             )
             .children(f.renamed_from.as_ref().map(|old| {
                 div()
@@ -777,8 +808,7 @@ fn row(e: &Entry, host: &Host, current: bool, armed: bool) -> AnyElement {
                     .text_color(rgb(c.faint))
                     .child(old.clone())
             }))
-            .into_any_element()
-        }
+            .into_any_element(),
     }
 }
 
@@ -1006,7 +1036,8 @@ mod tests {
         let mut f = files(sample_status());
         with_height(&mut f, 4);
         let last = f.data.len() - 1;
-        // Row 0 is the staged heading; the next is its first file.
+        // Row 0 is the staged heading; the pane opens on the file under it.
+        assert_eq!(f.view.get().cursor(), 1);
         assert!(f.run_view("view.down", &host));
         assert!(f.current_file().is_some());
         for _ in 0..20 {
@@ -1017,12 +1048,56 @@ mod tests {
             last,
             "the last row clamps rather than wrapping"
         );
+        // `gg` lands on the heading and walks forward to the first file.
         assert!(f.run_view("view.top", &host));
-        assert_eq!(f.view.get().cursor(), 0);
+        assert_eq!(f.view.get().cursor(), 1);
         assert!(f.run_view("view.bottom", &host));
         assert_eq!(f.view.get().cursor(), last);
+        // `k` from merged.rs crosses the conflicts heading to notes.md.
         assert!(f.run_view("view.up", &host));
-        assert_eq!(f.view.get().cursor(), last - 1);
+        assert_eq!(f.view.get().cursor(), last - 2);
+    }
+
+    #[test]
+    fn the_cursor_never_rests_on_a_heading() {
+        // Down from the top, one row at a time, across every section: every
+        // stop is a file, and the walk is `Section::all` order — staged,
+        // staged, unstaged, untracked, conflicts.
+        let host = Host::new();
+        let mut f = files(sample_status());
+        with_height(&mut f, 4);
+        f.run_view("view.top", &host);
+        let mut visited = vec![f.cursor_text()];
+        for _ in 0..8 {
+            f.run_view("view.down", &host);
+            assert!(
+                f.current_file().is_some(),
+                "landed on a heading at row {}",
+                f.view.get().cursor()
+            );
+            visited.push(f.cursor_text());
+        }
+        visited.dedup();
+        assert_eq!(
+            visited,
+            vec![
+                "M src/main.rs",
+                "D gone.txt",
+                "M src/main.rs",
+                "? notes.md",
+                "UU merged.rs",
+            ]
+        );
+        // And back up the same way: pages and scrolls settle too.
+        for command in [
+            "view.up",
+            "view.page-up",
+            "view.page-down",
+            "view.scroll-down",
+        ] {
+            f.run_view(command, &host);
+            assert!(f.current_file().is_some(), "{command} parked on a heading");
+        }
     }
 
     #[test]
@@ -1045,12 +1120,16 @@ mod tests {
         let host = Host::new();
         let mut f = files(sample_status());
         with_height(&mut f, 8);
-        // Down past the heading to the first file: `M src/main.rs`.
-        f.run_view("view.down", &host);
+        // The pane opens on the first file: `M src/main.rs`.
         assert_eq!(f.cursor_text(), "M src/main.rs");
-        // Back up onto the heading: nothing to copy, which copy.selection skips.
+        // Up from there has only the heading above, so the cursor stays put
+        // — a heading is never what copy would spell.
         f.run_view("view.up", &host);
-        assert_eq!(f.cursor_text(), "");
+        assert_eq!(f.cursor_text(), "M src/main.rs");
+        f.run_view("view.down", &host);
+        assert_eq!(f.cursor_text(), "D gone.txt");
+        // The empty answer is only an empty tree's.
+        assert_eq!(files(Status::default()).cursor_text(), "");
         assert!(!f.select_all());
         assert!(!f.select_none());
     }
@@ -1060,10 +1139,11 @@ mod tests {
         let host = Host::new();
         let mut f = files(sample_status());
         with_height(&mut f, 9);
-        // Cursor onto `notes.md` (untracked): rows 0–5 are the staged heading,
-        // its two files, the unstaged heading and file, then untracked's.
+        // Cursor onto `notes.md` (untracked): from the first staged file, three
+        // steps — gone.txt, the unstaged main.rs, notes.md — with the headings
+        // between them skipped.
         f.run_view("view.top", &host);
-        for _ in 0..6 {
+        for _ in 0..3 {
             f.run_view("view.down", &host);
         }
         assert_eq!(f.cursor_text(), "? notes.md");
@@ -1085,7 +1165,7 @@ mod tests {
         let mut f = files(sample_status());
         with_height(&mut f, 9);
         f.run_view("view.top", &host);
-        for _ in 0..4 {
+        for _ in 0..2 {
             f.run_view("view.down", &host);
         }
         let before = f.current_file().expect("a file under the cursor");
@@ -1122,25 +1202,33 @@ mod tests {
         assert_eq!((f.view.get().cursor(), f.view.get().top()), (0, 0));
         assert!(f.scroll.0.borrow().deferred_scroll_to_item.is_none());
 
-        // And back to something: the cursor starts at the top again.
+        // And back to something: the cursor starts at the top again — the
+        // first file, past the heading.
         f.replace(sample_status(), &host);
-        assert_eq!(f.view.get().cursor(), 0);
+        assert_eq!(f.view.get().cursor(), 1);
+        assert!(f.current_file().is_some());
     }
 
     #[test]
-    fn a_heading_under_the_cursor_does_not_pretend_to_anchor() {
+    fn a_vanished_anchor_that_leaves_a_heading_under_the_cursor_walks_on() {
         let host = Host::new();
         let mut f = files(sample_status());
         with_height(&mut f, 9);
-        f.run_view("view.top", &host); // cursor on the staged heading
-        assert!(f.current_file().is_none());
+        f.run_view("view.top", &host);
+        f.run_view("view.down", &host); // gone.txt, row 2
+        assert_eq!(f.cursor_text(), "D gone.txt");
 
-        // A refresh that reorders nothing still lands the cursor somewhere
-        // sane — on the same row index, since no file claimed the anchor.
+        // gone.txt leaves the index; row 2 is now the unstaged heading. The
+        // cursor may not rest there, and "where it was" points on, so it
+        // lands on the first unstaged file rather than back on staged's last.
         let mut next = sample_status();
-        next.staged.insert(0, staged("aaa.rs", Change::Added));
+        next.staged.remove(1);
         f.replace(next, &host);
-        assert!(f.view.get().cursor() < f.data.len());
+        let current = f.current_file().expect("never a heading");
+        assert_eq!(
+            (current.section, current.path.as_bytes()),
+            (Section::Unstaged, &b"src/main.rs"[..])
+        );
     }
 
     #[test]
@@ -1150,7 +1238,7 @@ mod tests {
         let host = Host::new();
         let mut f = files(sample_status());
         with_height(&mut f, 9);
-        for _ in 0..6 {
+        for _ in 0..3 {
             f.run_view("view.down", &host);
         }
         let current = f.current_file().expect("a file under the cursor");
@@ -1214,10 +1302,10 @@ mod tests {
     // ------------------------------------------------------- the discard arm
 
     /// Puts the keyboard on the unstaged `src/main.rs` — row 4 of the
-    /// sample, past its heading.
+    /// sample: two steps from the first staged file, the heading skipped.
     fn onto_unstaged(f: &mut Files, host: &Host) {
         f.run_view("view.top", host);
-        for _ in 0..4 {
+        for _ in 0..2 {
             f.run_view("view.down", host);
         }
     }
@@ -1282,14 +1370,14 @@ mod tests {
         let (section, path) = under(&f);
         assert!(!f.confirm_or_arm_discard(section, &path));
 
-        // One step down — onto the untracked *heading*, as it happens: the
-        // keyboard left the question's row either way.
+        // One step down — over the untracked heading onto notes.md: the
+        // keyboard left the question's row.
         assert!(f.run_view("view.down", &host));
-        assert!(f.current_file().is_none());
-        // So the next press asks again about whatever it lands on instead
-        // of executing the stale one.
-        f.run_view("view.down", &host);
+        assert_eq!(f.armed_row(), None);
+        // So the next press asks again about what it landed on instead of
+        // executing the stale one.
         let (section, path) = under(&f);
+        assert_eq!(section, Section::Untracked);
         assert!(!f.confirm_or_arm_discard(section, &path));
 
         // The scroll family moves attention too, even with the cursor still.
@@ -1383,8 +1471,8 @@ mod tests {
         );
         assert!(f.paths_in(Section::Conflicts).len() == 1);
 
-        // And the side the keyboard sits in, headings included: the eye
-        // reading "[staged]" is in staged for a stage-all's purposes.
+        // And the side the keyboard sits in: `gg` settles on the first staged
+        // file, and that file is in staged for a stage-all's purposes.
         f.run_view("view.top", &host);
         assert_eq!(
             f.cursor_section(),
