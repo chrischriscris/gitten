@@ -8,10 +8,10 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 /// The commit column between the sha and the graph, resolved once at load: two
-/// letters and the colour they are drawn in. Not a per-frame job.
+/// letters. Not the colour: that follows the live theme like everything else
+/// on the row.
 struct Who {
     initials: SharedString,
-    color: Rgba,
 }
 
 struct Data {
@@ -77,7 +77,6 @@ impl Commits {
             .iter()
             .map(|c| Who {
                 initials: initials(&c.author).into(),
-                color: rgb(host.theme.author(&c.author)),
             })
             .collect();
 
@@ -192,7 +191,12 @@ fn row(c: &Commit, who: &Who, d: &graph::Draw, host: &Rc<Host>) -> AnyElement {
             div()
                 .flex_none()
                 .w(px(WHO_CHARS * ch))
-                .text_color(who.color)
+                // The colour resolves here, not at construction, so it reads
+                // the live theme like the dim sha and the character width
+                // beside it. Deliberate cost: one byte-fold hash of the author
+                // name per visible row per frame. A memo HashMap arrives only
+                // if profiling ever demands one.
+                .text_color(rgb(host.theme.author(&c.author)))
                 .child(who.initials.clone()),
         )
         .child(graph::row_canvas(d.clone(), host.clone()))
