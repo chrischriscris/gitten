@@ -8052,7 +8052,6 @@ diff --git a/added.txt b/added.txt
         let handle: gitten_git::Handle = repo.clone();
         let shell = shell(None, cx);
         shell.update(cx, |shell, cx| {
-            let host = Rc::new(Host::new());
             let prepared = crate::views::branches::prepare(
                 vec![branch_ref("feature", false), branch_ref("main", true)],
                 vec![gitten_core::refs::RemoteBranch {
@@ -8067,10 +8066,9 @@ diff --git a/added.txt b/added.txt
                 &gitten_core::theme::Theme::default(),
                 "r",
             );
+            // The pane opens past the `LOCAL` heading, on feature: the
+            // cursor never rests on a heading, so no step is needed.
             let view = cx.new(|_| crate::views::branches::Branches::from_prepared(prepared));
-            view.update(cx, |b, _| {
-                b.run_view("view.down", &host); // onto feature
-            });
             shell.panes.register(
                 "branches",
                 Screen::branches(view, Generation::default(), "r · 2 local · 1 remote"),
