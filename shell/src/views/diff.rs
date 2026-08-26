@@ -1549,8 +1549,10 @@ fn arrange(prepared: &Prepared, host: &Host, layouts: &Layouts, current: usize) 
         for index in first..r.len() {
             // One file: the pane header names it, so its own band is noise. The
             // row stays built — hunk numbering, wrapping and the cursor address
-            // rows by index — and only the order table leaves it out.
-            if file_count == 1 && r.is_file_header(index) {
+            // rows by index — and only the order table leaves it out. A file
+            // with no hunks keeps it: the band is then the only row there is,
+            // and an empty pane says less than the name does.
+            if file_count == 1 && !f.hunks.is_empty() && r.is_file_header(index) {
                 continue;
             }
             order.push(RowRef {
@@ -4081,6 +4083,27 @@ diff --git a/a.rs b/a.rs
             renderers[0].selectable(first.index as usize, 0),
             Some("@@ -1,2 +1,2 @@"),
             "the body opens on the hunk header"
+        );
+    }
+
+    #[test]
+    fn a_one_file_diff_with_no_hunks_keeps_its_only_row() {
+        // Nothing opens below the band, so dropping it would draw an empty pane
+        // for a file that did change — a mode flip, a binary. The header stays
+        // and `file_summary` still has a row to read the name from.
+        let host = Rc::new(Host::new());
+        let diff = Diff::with_renderers(
+            vec![FileDiff {
+                path: "bin.dat".into(),
+                hunks: Vec::new(),
+            }],
+            host,
+            vec![Box::new(TextRows::default())],
+        );
+        assert_eq!(diff.order.len(), 1);
+        assert_eq!(
+            diff.file_summary().map(|s| s.path),
+            Some("bin.dat".to_string())
         );
     }
 
