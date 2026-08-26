@@ -35,6 +35,96 @@ pub const STATUS_H: f32 = 26.0;
 /// a point the diff gets.
 pub const SIDEBAR_SHARE: f32 = 0.17;
 
+/// Left padding of every list row and section label. One number, because
+/// the eye runs down a column of rows and a row that starts a pixel later
+/// than its neighbours reads as indented on purpose.
+#[allow(dead_code)] // Called by the rows once they take the shared furniture.
+pub const ROW_PAD: f32 = 12.0;
+
+/// The bar on the selected row's left edge — and on the focused pane's
+/// header. Two pixels: one is a hairline and reads as an edge, three is a
+/// stripe and starts to look like a column of its own.
+pub const ROW_BAR: f32 = 2.0;
+
+/// The frame every list row sits in: a fixed height for `uniform_list`, the
+/// selection tint when `current`, and the bar on the left edge — accent when
+/// the row's pane holds the keyboard, `faint` when the selection is remembered
+/// but the keyboard is elsewhere. The bar is drawn on *every* row, in the
+/// row's own background when it is not selected, so `ROW_PAD` is always the
+/// same distance and the text never shifts a pixel when the cursor moves.
+#[allow(dead_code)] // Called by the rows once they take the shared furniture.
+pub fn list_row(host: &Host, current: bool, focused: bool, h: f32) -> Div {
+    let c = host.theme.chrome;
+    let bg = match current {
+        true => c.selection_bg,
+        false => c.bg,
+    };
+    let bar = match (current, focused) {
+        (true, true) => c.accent,
+        (true, false) => c.faint,
+        (false, _) => bg,
+    };
+    div()
+        .flex()
+        .items_center()
+        .min_w_full()
+        .h(px(h))
+        .bg(rgb(bg))
+        .border_l(px(ROW_BAR))
+        .border_color(rgb(bar))
+        .pl(px(ROW_PAD - ROW_BAR))
+}
+
+/// A section's label inside a list — `STAGED`, `UNSTAGED` — with an optional
+/// count at the right edge. Faint and uppercase so it reads as a heading
+/// over the rows and never as one of them: it is not selectable, and a
+/// label that looked like a row would be one the cursor skips for no reason
+/// the eye can see. Same `ROW_PAD` as the rows, so the column stays a column.
+#[allow(dead_code)] // Called by the rows once they take the shared furniture.
+pub fn section_label(host: &Host, text: SharedString, count: Option<SharedString>, h: f32) -> Div {
+    let c = host.theme.chrome;
+    div()
+        .flex()
+        .items_center()
+        .min_w_full()
+        .h(px(h))
+        .pl(px(ROW_PAD))
+        .text_color(rgb(c.faint))
+        .child(
+            div()
+                .flex_none()
+                .child(SharedString::from(text.to_uppercase())),
+        )
+        .children(count.map(|count| div().flex_none().ml_auto().pr_2().child(count)))
+}
+
+/// A path drawn as the design draws one: directory dim, filename in
+/// `bright` — whatever ink the row has earned. The cut is
+/// [`gitten_core::path::split_dir_name`]'s, so the files pane and the diff
+/// header agree on where the filename starts. Two `flex_none` spans in one
+/// row and no wrapping, because a path is one word to the eye.
+#[allow(dead_code)] // Called by the rows once they take the shared furniture.
+pub fn path_text(host: &Host, path: &str, bright: u32) -> Div {
+    let c = host.theme.chrome;
+    let (dir, name) = gitten_core::path::split_dir_name(path);
+    div()
+        .flex()
+        .items_center()
+        .whitespace_nowrap()
+        .child(
+            div()
+                .flex_none()
+                .text_color(rgb(c.dim))
+                .child(SharedString::from(dir.to_string())),
+        )
+        .child(
+            div()
+                .flex_none()
+                .text_color(rgb(bright))
+                .child(SharedString::from(name.to_string())),
+        )
+}
+
 /// The keycap a pane header starts with: the number of the key that focuses
 /// the pane, in a small outlined square. The square is the whole point — a
 /// bare numeral reads as a count, a keycap reads as *press me* — and it is
@@ -69,7 +159,11 @@ fn keycap(host: &Host, number: &str, focused: bool) -> Div {
 ///
 /// The strip spans its container's width (`w_full`), because the hairline
 /// under it is the region's edge and must reach it whatever the name's
-/// length. The count is right-edge furniture like anything else the caller
+/// length. The focused pane's header also carries a [`ROW_BAR`] on its left
+/// edge, for the header's height only — the same mark a selected row wears,
+/// so "which pane" and "which row" are answered by the same shape. Unfocused
+/// headers draw the bar in the background, so the keycap does not move when
+/// the keyboard does. The count is right-edge furniture like anything else the caller
 /// passes in `right` — the design pins a section's number against its own
 /// right edge, where a drifting count next to a drifting name would wobble
 /// — and both are dropped when the pane has nothing worth counting.
@@ -89,9 +183,26 @@ pub fn pane_header(
         .items_center()
         .gap_2()
         .h(px(HEADER_H))
+        .relative()
         .px_2()
         .border_b_1()
         .border_color(rgb(c.border))
+        .child(
+            // The bar is an absolute child rather than the strip's own left
+            // border: one `border_color` serves every side and the bottom
+            // hairline has to stay `border`. Over the padding, so the keycap
+            // sits where it always did.
+            div()
+                .absolute()
+                .left_0()
+                .top_0()
+                .bottom_0()
+                .w(px(ROW_BAR))
+                .bg(rgb(match focused {
+                    true => c.accent,
+                    false => c.bg,
+                })),
+        )
         .child(keycap(host, number, focused))
         .child(
             div()

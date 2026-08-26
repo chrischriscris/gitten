@@ -317,6 +317,11 @@ pub struct Files {
     /// header prints. A property of the data, decided by [`prepare`] once and
     /// read for free however often a frame wants it.
     changed: usize,
+    /// Whether this pane holds the keyboard, as the shell last told it. A
+    /// row's bar is accent only when its pane is focused, and the view cannot
+    /// ask the shell during render — so the shell writes it here when focus
+    /// moves, and render reads a flag.
+    focused: bool,
 }
 
 impl Files {
@@ -330,6 +335,17 @@ impl Files {
         v
     }
 
+    /// Told by the shell whenever the keyboard moves — never decided here.
+    pub fn set_focused(&mut self, focused: bool) {
+        self.focused = focused;
+    }
+
+    /// Whether this pane holds the keyboard. The rows read it for the bar.
+    #[allow(dead_code)]
+    pub fn focused(&self) -> bool {
+        self.focused
+    }
+
     pub(crate) fn from_prepared(prepared: Prepared) -> Self {
         let Prepared { rows, changed, .. } = prepared;
         Self {
@@ -340,6 +356,7 @@ impl Files {
             pending_scroll: PendingScroll::default(),
             rendered: Rc::new(Cell::new(0)),
             armed: None,
+            focused: false,
             changed,
         }
     }

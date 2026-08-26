@@ -338,6 +338,11 @@ pub struct Branches {
     /// which is a state worth reading on the row above instead of inventing
     /// a branch to name here.
     head: Option<HeadInfo>,
+    /// Whether this pane holds the keyboard, as the shell last told it. A
+    /// row's bar is accent only when its pane is focused, and the view cannot
+    /// ask the shell during render — so the shell writes it here when focus
+    /// moves, and render reads a flag.
+    focused: bool,
 }
 
 impl Branches {
@@ -350,6 +355,17 @@ impl Branches {
         v
     }
 
+    /// Told by the shell whenever the keyboard moves — never decided here.
+    pub fn set_focused(&mut self, focused: bool) {
+        self.focused = focused;
+    }
+
+    /// Whether this pane holds the keyboard. The rows read it for the bar.
+    #[allow(dead_code)]
+    pub fn focused(&self) -> bool {
+        self.focused
+    }
+
     pub(crate) fn from_prepared(prepared: Prepared) -> Self {
         let Prepared { rows, head, .. } = prepared;
         Self {
@@ -360,6 +376,7 @@ impl Branches {
             pending_scroll: PendingScroll::default(),
             rendered: Rc::new(Cell::new(0)),
             armed: None,
+            focused: false,
             head,
         }
     }

@@ -16,6 +16,7 @@ pub mod graph;
 pub mod host;
 pub mod markdown;
 pub mod patch;
+pub mod path;
 pub mod prepared;
 pub mod rebase;
 pub mod refs;

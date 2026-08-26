@@ -1041,13 +1041,37 @@ impl DevShell {
 
     /// Moves the keyboard to a region. A fixture window has no list to give
     /// the keyboard back to, so a `Spot::Main` there is forever.
-    fn set_spot(&mut self, spot: Spot) {
+    fn set_spot(&mut self, spot: Spot, cx: &mut App) {
         if spot == Spot::List && self.list_order().is_empty() {
             return;
         }
         if self.spot != spot {
             self.spot = spot;
             self.sync_modes();
+            self.sync_focus(cx);
+        }
+    }
+
+    /// Tells every list whether it holds the keyboard. A row's bar is accent
+    /// only in the focused pane and the view cannot ask the shell during
+    /// render, so this runs from the two places focus actually moves —
+    /// [`DevShell::set_spot`] and [`DevShell::focus_pane`] — and once at
+    /// startup. The keyboard is in exactly one list when `spot` is the list
+    /// region, and in none when it is the diff.
+    fn sync_focus(&mut self, cx: &mut App) {
+        let at = match self.spot {
+            Spot::List => Some(self.panes.focused_index()),
+            Spot::Main => None,
+        };
+        for (i, screen) in self.panes.iter().enumerate() {
+            let focused = at == Some(i);
+            match screen {
+                Screen::Files { view, .. } => view.update(cx, |v, _| v.set_focused(focused)),
+                Screen::Branches { view, .. } => view.update(cx, |v, _| v.set_focused(focused)),
+                Screen::Stashes { view, .. } => view.update(cx, |v, _| v.set_focused(focused)),
+                Screen::Commits { view, .. } => view.update(cx, |v, _| v.set_focused(focused)),
+                Screen::Diff { .. } | Screen::Custom(_) => {}
+            }
         }
     }
 
@@ -2751,7 +2775,7 @@ impl DevShell {
             return;
         }
         if self.spot == Spot::Main {
-            self.set_spot(Spot::List);
+            self.set_spot(Spot::List, cx);
             cx.notify();
             return;
         }
@@ -2768,8 +2792,9 @@ impl DevShell {
         if self.panes.focus(at) {
             // Focusing a list means looking at that list: the keyboard goes
             // with it, out of the diff if it was there.
-            self.set_spot(Spot::List);
+            self.set_spot(Spot::List, cx);
             self.sync_modes();
+            self.sync_focus(cx);
             cx.notify();
         }
     }
@@ -2826,7 +2851,7 @@ impl DevShell {
         if let Some(commit) = view.read(cx).current().cloned() {
             self.schedule_main_diff(commit, true, cx);
         }
-        self.set_spot(Spot::Main);
+        self.set_spot(Spot::Main, cx);
         cx.notify();
     }
 
@@ -3167,7 +3192,7 @@ impl DevShell {
                 self.panes.focused().clone()
             }
             (None, true) => {
-                self.set_spot(Spot::Main);
+                self.set_spot(Spot::Main, cx);
                 self.main.clone()
             }
             (None, false) => return,
@@ -3600,7 +3625,7 @@ impl Render for DevShell {
                     false => c.border,
                 }))
                 .debug_selector(|| "column".to_string())
-                .capture_any_mouse_down(cx.listener(|this, _, _, _cx| this.set_spot(Spot::List)))
+                .capture_any_mouse_down(cx.listener(|this, _, _, cx| this.set_spot(Spot::List, cx)))
                 .child(chrome::pane_header(&host, "4", name, None, focused, right))
                 .child(
                     div()
@@ -3640,7 +3665,7 @@ impl Render for DevShell {
                 false => c.border,
             }))
             .debug_selector(|| "main".to_string())
-            .capture_any_mouse_down(cx.listener(|this, _, _, _cx| this.set_spot(Spot::Main)))
+            .capture_any_mouse_down(cx.listener(|this, _, _, cx| this.set_spot(Spot::Main, cx)))
             .child({
                 let summary = main_view.read(cx).file_summary();
                 let adds = SharedString::from(
@@ -4417,6 +4442,7 @@ fn main() {
                     let shell = shell.clone();
                     shell.update(cx, |shell, cx| {
                         shell.sync_modes();
+                        shell.sync_focus(cx);
                         // Frame one already names its commit: schedule the
                         // newest one's diff through the same guarded rails
                         // every later selection rides. The header and the
@@ -4773,6 +4799,49 @@ mod tests {
                 assert!(!s.help, "{which:?}: esc reached past the menu");
             });
         }
+    }
+
+    #[gpui::test]
+    fn the_lists_learn_focus_when_it_moves_and_not_in_render(cx: &mut TestAppContext) {
+        // A row's bar is accent only in the pane holding the keyboard; the
+        // flag that says so is written where focus moves, so a test can read
+        // it without a frame ever being drawn.
+        let shell = shell(None, cx);
+        let second = cx.update(|cx| cx.new(|_| Commits::new(Vec::new(), Rc::new(Host::new()))));
+        shell.update(cx, |s, cx| {
+            s.panes.register(
+                "second",
+                Screen::commits(
+                    second.clone(),
+                    Source::Fixtures,
+                    Generation::default(),
+                    "second",
+                ),
+            );
+            s.sync_modes();
+            s.sync_focus(cx);
+        });
+        let first = shell.read_with(cx, |s, _| match s.panes.get("commits") {
+            Some(Screen::Commits { view, .. }) => view.clone(),
+            _ => panic!("no commits list"),
+        });
+        // Registration focuses the newcomer.
+        assert!(!first.read_with(cx, |v, _| v.focused()));
+        assert!(second.read_with(cx, |v, _| v.focused()));
+
+        shell.update(cx, |s, cx| s.focus_named("commits", cx));
+        assert!(first.read_with(cx, |v, _| v.focused()));
+        assert!(!second.read_with(cx, |v, _| v.focused()));
+        shell.update(cx, |s, cx| s.focus_named("second", cx));
+        assert!(!first.read_with(cx, |v, _| v.focused()));
+        assert!(second.read_with(cx, |v, _| v.focused()));
+
+        // The diff holds the keyboard: no list is focused, and the memory of
+        // which one was comes back with `esc`.
+        shell.update(cx, |s, cx| s.set_spot(super::Spot::Main, cx));
+        assert!(!second.read_with(cx, |v, _| v.focused()));
+        shell.update(cx, |s, cx| s.back(cx));
+        assert!(second.read_with(cx, |v, _| v.focused()));
     }
 
     #[gpui::test]
@@ -6285,7 +6354,7 @@ diff --git a/one.txt b/one.txt
                 Generation::default(),
                 "diff",
             );
-            shell.set_spot(super::Spot::Main);
+            shell.set_spot(super::Spot::Main, cx);
             shell.sync_modes();
             shell.repo = Some((PathBuf::from("/recorded"), handle));
             cx.set_global(config::Active(Rc::new(Host::new())));
@@ -6350,7 +6419,7 @@ diff --git a/fresh.txt b/fresh.txt
                 Generation::default(),
                 "diff",
             );
-            shell.set_spot(super::Spot::Main);
+            shell.set_spot(super::Spot::Main, cx);
             shell.sync_modes();
             shell.repo = Some((PathBuf::from("/recorded"), handle));
             cx.set_global(config::Active(Rc::new(Host::new())));

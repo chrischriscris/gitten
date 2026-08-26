@@ -76,9 +76,25 @@ pub struct Commits {
     /// on a sha the list may no longer hold is exactly the accident the
     /// double press exists to prevent.
     armed: Option<String>,
+    /// Whether this pane holds the keyboard, as the shell last told it. A
+    /// row's bar is accent only when its pane is focused, and the view cannot
+    /// ask the shell during render — so the shell writes it here when focus
+    /// moves, and render reads a flag.
+    focused: bool,
 }
 
 impl Commits {
+    /// Told by the shell whenever the keyboard moves — never decided here.
+    pub fn set_focused(&mut self, focused: bool) {
+        self.focused = focused;
+    }
+
+    /// Whether this pane holds the keyboard. The rows read it for the bar.
+    #[allow(dead_code)]
+    pub fn focused(&self) -> bool {
+        self.focused
+    }
+
     /// The viewport model with everything live folded in: the list's length,
     /// the height last measured, and `[view] scrolloff` as the file has it
     /// *now* — see the diff view's `live_view`.
@@ -424,6 +440,7 @@ impl Commits {
             top: Rc::new(Cell::new(0)),
             load,
             armed: None,
+            focused: false,
         }
     }
 
