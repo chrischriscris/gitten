@@ -6496,7 +6496,8 @@ diff --git a/fresh.txt b/fresh.txt
             assert!(shell.generation.get() > 0);
         });
 
-        // Back to the top, down onto gone.txt under *staged*: same key, other
+        // Back to the top — which is gone.txt under *staged*, the heading
+        // above it being furniture the cursor skips: same key, other
         // direction.
         shell.update(cx, |shell, cx| {
             let Some(Screen::Files { view, .. }) = shell.active() else {
@@ -6505,7 +6506,6 @@ diff --git a/fresh.txt b/fresh.txt
             let host = Rc::new(Host::new());
             view.update(cx, |f, _| {
                 f.run_view("view.top", &host);
-                f.run_view("view.down", &host);
             });
         });
         shell.update(cx, |shell, cx| shell.run_command("files.stage", cx));
@@ -6935,14 +6935,9 @@ diff --git a/fresh.txt b/fresh.txt
             );
         });
 
-        // And a clean tree: nothing under the keyboard to act on.
-        let (shell, repo, _handle) = files_shell(cx);
-        shell.update(cx, |shell, cx| {
-            let Some(Screen::Files { view, .. }) = shell.active() else {
-                panic!("files pane lost");
-            };
-            view.update(cx, |f, _| f.run_view("view.top", &Rc::new(Host::new())));
-        });
+        // And a clean tree: nothing under the keyboard to act on. The only
+        // way to have nothing there — the cursor never rests on a heading.
+        let (shell, repo, _handle) = tree_shell(cx, Status::default());
         shell.update(cx, |shell, cx| shell.run_command("files.stage", cx));
         shell.read_with(cx, |shell, _| {
             assert!(
@@ -7030,8 +7025,7 @@ diff --git a/fresh.txt b/fresh.txt
                 panic!("files pane lost");
             };
             view.update(cx, |f, _| {
-                f.run_view("view.top", &Rc::new(Host::new()));
-                f.run_view("view.down", &Rc::new(Host::new())); // gone.txt, staged
+                f.run_view("view.top", &Rc::new(Host::new())); // gone.txt, staged
             });
         });
         shell.update(cx, |shell, cx| shell.run_command("files.discard", cx));
@@ -7082,8 +7076,7 @@ diff --git a/fresh.txt b/fresh.txt
                 panic!("files pane lost");
             };
             view.update(cx, |f, _| {
-                f.run_view("view.top", &Rc::new(Host::new()));
-                f.run_view("view.down", &Rc::new(Host::new()));
+                f.run_view("view.top", &Rc::new(Host::new())); // gone.txt
             });
         });
         shell.update(cx, |shell, cx| shell.run_command("files.stage-all", cx));

@@ -225,6 +225,33 @@ impl Viewport {
         self.follow();
     }
 
+    /// Moves the cursor off a row that cannot hold it — a section heading, a
+    /// separator — and onto the nearest row `selectable` says can, continuing
+    /// in the direction the cursor was travelling from `from` and turning back
+    /// only when that direction has nothing left. So `j` from the last file of
+    /// one section lands on the first file of the next, `k` the reverse, and
+    /// `G` onto a trailing heading walks back up to the last real row rather
+    /// than stopping on furniture.
+    ///
+    /// Here and not in a view because every list with headings has this rule
+    /// and the predicate is the only part that differs. A list with no such
+    /// rows never calls it; a list of nothing but unselectable rows is left
+    /// where it was, which is the one honest answer when no row qualifies.
+    pub fn settle(&mut self, from: usize, selectable: impl Fn(usize) -> bool) {
+        if self.len == 0 || selectable(self.cursor) {
+            return;
+        }
+        let below = (self.cursor + 1..self.len).find(|&i| selectable(i));
+        let above = (0..self.cursor).rev().find(|&i| selectable(i));
+        let target = match self.cursor >= from {
+            true => below.or(above),
+            false => above.or(below),
+        };
+        if let Some(row) = target {
+            self.go_to(row);
+        }
+    }
+
     /// Puts the cursor at the row nearest `at` of the way down the list.
     ///
     /// Rounds *down* and clamps, so `1.0` is the last row rather than one past
@@ -384,6 +411,47 @@ mod tests {
         v.set_len(len);
         v.set_height(height);
         v
+    }
+
+    #[test]
+    fn settle_skips_unselectable_rows_in_the_direction_of_travel() {
+        // Rows 0 and 3 are headings; 1, 2, 4, 5 are files.
+        let heading = |i: usize| i == 0 || i == 3;
+        let file = move |i: usize| !heading(i);
+        let mut v = view(6, 10);
+        v.settle(0, file);
+        assert_eq!(v.cursor(), 1, "a list opens on its first real row");
+        v.down();
+        v.settle(1, file);
+        assert_eq!(v.cursor(), 2);
+        v.down();
+        v.settle(2, file);
+        assert_eq!(v.cursor(), 4, "down over a heading lands past it");
+        v.up();
+        v.settle(4, file);
+        assert_eq!(v.cursor(), 2, "up over a heading lands before it");
+    }
+
+    #[test]
+    fn settle_turns_back_at_the_ends_and_leaves_a_list_of_nothing_alone() {
+        // A trailing heading at row 5: `G` lands on it and must walk back.
+        let file = |i: usize| i != 0 && i != 5;
+        let mut v = view(6, 10);
+        v.to_bottom();
+        v.settle(1, file);
+        assert_eq!(v.cursor(), 4);
+        // `gg` onto the leading heading walks forward.
+        v.to_top();
+        v.settle(4, file);
+        assert_eq!(v.cursor(), 1);
+        // Nothing selectable: stay put rather than invent a row.
+        let mut v = view(3, 10);
+        v.go_to(2);
+        v.settle(0, |_| false);
+        assert_eq!(v.cursor(), 2);
+        let mut empty = view(0, 10);
+        empty.settle(0, |_| true);
+        assert_eq!(empty.cursor(), 0);
     }
 
     #[test]

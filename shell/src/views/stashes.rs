@@ -11,6 +11,7 @@
 //! modal anywhere in the window yet.
 
 use super::{accept_deferred_scroll, DeferredScrollbar, PendingScroll};
+use crate::chrome::{list_row, ROW_PAD};
 use crate::graph::ROW_H;
 use gitten_core::host::Host;
 use gitten_core::refs::Stash;
@@ -370,7 +371,7 @@ impl Render for Stashes {
         if let Some(empty) = self.is_empty().then(|| {
             div()
                 .size_full()
-                .px_3()
+                .pl(px(ROW_PAD))
                 .pt_2()
                 .flex()
                 .items_start()
@@ -388,6 +389,7 @@ impl Render for Stashes {
         let synced = self.synced.clone();
         let pending_scroll = self.pending_scroll.clone();
         let armed = self.armed;
+        let focused = self.focused;
         let list = uniform_list("stashes", data.len(), move |range, _, cx| {
             rendered.set(range.len());
             let host = crate::config::host(cx);
@@ -404,12 +406,11 @@ impl Render for Stashes {
             }
             let cursor = view.get().cursor();
             range
-                .map(|i| row(&data[i], &host, i == cursor, Some(i) == armed))
+                .map(|i| row(&data[i], &host, i == cursor, focused, Some(i) == armed))
                 .collect()
         })
         .track_scroll(&self.scroll)
-        .size_full()
-        .px_3();
+        .size_full();
 
         div()
             .relative()
@@ -426,20 +427,13 @@ impl Render for Stashes {
 }
 
 /// One row: the address dim — furniture, not content — then the message in
-/// the inherited ink. `current` paints `chrome.selection_bg`; `armed` turns
-/// the whole row toward `chrome.error`, the colour the second press spends.
-fn row(e: &Row, host: &Host, current: bool, armed: bool) -> AnyElement {
+/// the pane's own ink. The frame is [`list_row`]'s: selection tint, the bar
+/// on the left edge in accent while this pane is `focused`. `armed` turns the
+/// whole row toward `chrome.error`, the colour the second press spends.
+fn row(e: &Row, host: &Host, current: bool, focused: bool, armed: bool) -> AnyElement {
     let ch = host.font.char_width();
     let c = host.theme.chrome;
-    div()
-        .flex()
-        .items_center()
-        .min_w_full()
-        .h(px(ROW_H))
-        .bg(rgb(match current {
-            true => c.selection_bg,
-            false => c.bg,
-        }))
+    list_row(host, current, focused, ROW_H)
         .child(
             div()
                 .flex_none()
@@ -454,7 +448,11 @@ fn row(e: &Row, host: &Host, current: bool, armed: bool) -> AnyElement {
                 .flex_none()
                 .ml(px(GAP_CHARS * ch))
                 .min_w_0()
-                .when(armed, |d| d.text_color(rgb(c.error)))
+                .whitespace_nowrap()
+                .text_color(rgb(match armed {
+                    true => c.error,
+                    false => c.fg,
+                }))
                 .child(e.message.clone()),
         )
         .into_any_element()
