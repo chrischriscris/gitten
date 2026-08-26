@@ -32,9 +32,10 @@
 //! of another, and the ambiguity cannot arise. Two keys is the useful depth
 //! anyway.
 //!
-//! **Any command's behaviour.** [`Commands`] is a registry of names and one-line
-//! descriptions — enough for a help screen, and enough for the config layer to
-//! say "no such command" instead of binding a key to nothing.
+//! **Any command's behaviour.** [`Commands`] is a registry of names, one-line
+//! descriptions and — for some — the short label a footer draws beside a key:
+//! enough for a help screen, and enough for the config layer to say "no such
+//! command" instead of binding a key to nothing.
 
 use std::fmt;
 
@@ -358,16 +359,15 @@ impl Keymap {
         bind(GLOBAL, "l", "view.right");
         bind(GLOBAL, "right", "view.right");
 
-        // lazygit's panel numbers. A direct jump is global so it works
-        // whatever is focused; each names the list that fills the window's
-        // one list column — nothing opens a second pane any more.
-        bind(GLOBAL, "1", "commits.focus");
-        bind(GLOBAL, "2", "files.focus");
-        // ...and for branches, lazygit's next panel down.
-        bind(GLOBAL, "3", "branches.focus");
-        // lazygit numbers the stash stack 4 (branches take 3); the same
-        // convention, so one keyboard works in both programs.
-        bind(GLOBAL, "4", "stashes.focus");
+        // The panel numbers read down the window's panes: 1 FILES,
+        // 2 BRANCHES, 3 STASH, 4 COMMITS — the pane layout's own order, not
+        // lazygit's (whose log took 1). A direct jump is global so it works
+        // whatever is focused, and registered in that order, so
+        // 1 → 2 → 3 → 4 walks files → branches → stashes → commits.
+        bind(GLOBAL, "1", "files.focus");
+        bind(GLOBAL, "2", "branches.focus");
+        bind(GLOBAL, "3", "stashes.focus");
+        bind(GLOBAL, "4", "commits.focus");
 
         // lazygit's three sync keys, global because they aim past every pane
         // at the branch HEAD sits on: P sends it, p pulls onto its upstream,
@@ -752,7 +752,11 @@ impl Keymap {
                     .get(&b.command)
                     .map(|c| c.doc.clone())
                     .unwrap_or_default();
-                rows.push(HelpRow::Command { keys: all, doc });
+                rows.push(HelpRow::Command {
+                    name: b.command.clone(),
+                    keys: all,
+                    doc,
+                });
             }
             if rows.is_empty() {
                 continue;
@@ -774,6 +778,9 @@ pub enum HelpRow {
     Mode(String),
     /// Every key that runs one command there, joined, and what it does.
     Command {
+        /// The command's registry name — what a client dispatches on, and how
+        /// a client filters these rows without re-walking [`Commands`].
+        name: String,
         /// The chords that run it, joined with `" / "` in keymap order.
         keys: String,
         /// The command's own one-liner, from [`Commands`].
@@ -790,6 +797,9 @@ pub struct Command {
     /// One line, for a help screen. Present tense, no full stop — it sits in a
     /// column beside a key.
     pub doc: String,
+    /// One or two words a status bar draws beside the key, when there is one:
+    /// [`doc`](Self::doc) is a help-screen sentence and will not fit a footer.
+    pub hint: Option<String>,
 }
 
 /// Every command name that exists.
@@ -820,152 +830,217 @@ impl Commands {
     /// does nothing, which is what an unbound key does too.
     pub fn builtin() -> Self {
         let mut c = Self::empty();
-        for (name, doc) in [
-            ("quit", "leave"),
-            ("help", "show the keys"),
-            ("back", "leave the innermost mode"),
-            ("view.down", "one row down"),
-            ("view.up", "one row up"),
-            ("view.page-down", "a screenful down"),
-            ("view.page-up", "a screenful up"),
-            ("view.scroll-down", "the view down, not the cursor"),
-            ("view.scroll-up", "the view up, not the cursor"),
-            ("view.top", "the first row"),
-            ("view.bottom", "the last row"),
-            ("view.left", "scroll the text left"),
-            ("view.right", "scroll the text right"),
-            ("diff.next-file", "the next file's header"),
-            ("diff.prev-file", "the previous file's header"),
-            ("diff.cycle-layout", "the next presentation"),
-            ("diff.cycle-wrap", "the next wrap"),
+        // The third column is the footer hint — `Some` where a status bar
+        // should draw a word or two beside the key. Everything after it is
+        // still [`Command::doc`], the help screen's sentence.
+        for (name, doc, hint) in [
+            ("quit", "leave", Some("quit")),
+            ("help", "show the keys", Some("keys")),
+            ("back", "leave the innermost mode", Some("back")),
+            ("view.down", "one row down", None),
+            ("view.up", "one row up", None),
+            ("view.page-down", "a screenful down", None),
+            ("view.page-up", "a screenful up", None),
+            ("view.scroll-down", "the view down, not the cursor", None),
+            ("view.scroll-up", "the view up, not the cursor", None),
+            ("view.top", "the first row", None),
+            ("view.bottom", "the last row", None),
+            ("view.left", "scroll the text left", None),
+            ("view.right", "scroll the text right", None),
+            (
+                "diff.next-file",
+                "the next file's header",
+                Some("next file"),
+            ),
+            (
+                "diff.prev-file",
+                "the previous file's header",
+                Some("prev file"),
+            ),
+            ("diff.cycle-layout", "the next presentation", None),
+            ("diff.cycle-wrap", "the next wrap", None),
             (
                 "diff.stage-hunk",
                 "stage the hunk under the keyboard into the index",
+                Some("stage hunk"),
             ),
             (
                 "diff.unstage-hunk",
                 "take the hunk under the keyboard back out of the index",
+                Some("unstage hunk"),
             ),
             (
                 "diff.discard-hunk",
                 "discard the hunk under the keyboard from the working tree, asked twice",
+                Some("discard hunk"),
             ),
-            ("theme.cycle", "the next theme"),
+            ("theme.cycle", "the next theme", None),
             (
                 "commits.open-diff",
                 "show the diff pane, loaded with this commit",
+                Some("diff"),
             ),
-            ("commits.search", "search the commits"),
+            ("commits.search", "search the commits", Some("search")),
             (
                 "commits.reset-soft",
                 "move this branch here, keeping every change staged",
+                Some("reset soft"),
             ),
             (
                 "commits.reset-mixed",
                 "move this branch here, unstaging what it holds",
+                Some("reset mixed"),
             ),
             (
                 "commits.reset-hard",
                 "move this branch here and discard the changes, asked twice",
+                Some("reset hard"),
             ),
             (
                 "commits.revert",
                 "undo this commit with a new inverse commit",
+                Some("revert"),
             ),
             (
                 "commits.squash-up",
                 "fold this commit into the one beneath it, keeping both messages, asked twice",
+                Some("squash up"),
             ),
             (
                 "commits.fixup-up",
                 "fold this commit into the one beneath it, discarding this message, asked twice",
+                Some("fixup up"),
             ),
             (
                 "commits.drop-commit",
                 "remove this commit from the branch, asked twice",
+                Some("drop"),
             ),
             (
                 "commits.rebase-onto",
                 "move the current branch onto the selected branch, asked twice",
+                Some("rebase onto"),
             ),
             (
                 "rebase.abort",
                 "give up the rebase in progress and put everything back where it was",
+                None,
             ),
             (
                 "rebase.continue",
                 "carry on the rebase in progress once conflicts are resolved",
+                None,
             ),
             (
                 "commits.cherry-pick",
                 "apply this commit onto the current branch as a new commit",
+                Some("cherry-pick"),
             ),
-            ("commits.new-tag", "name this commit with a new tag"),
+            (
+                "commits.new-tag",
+                "name this commit with a new tag",
+                Some("tag"),
+            ),
             (
                 "commits.cherry-pick-abort",
                 "give up the cherry-pick in progress and put everything back where it was",
+                None,
             ),
             (
                 "commits.cherry-pick-continue",
                 "carry on the cherry-pick in progress once conflicts are resolved",
+                None,
             ),
-            ("files.focus", "swap the working-tree list into the column"),
-            ("files.stage", "stage or unstage the selected file"),
-            ("files.commit", "commit the staged changes"),
+            ("files.focus", "focus the working-tree pane", None),
+            (
+                "files.stage",
+                "stage or unstage the selected file",
+                Some("stage"),
+            ),
+            ("files.commit", "commit the staged changes", Some("commit")),
             (
                 "files.amend",
                 "rewrite HEAD to hold the staged changes under a new message",
+                Some("amend"),
             ),
             (
                 "files.discard",
                 "discard the selected file's changes, asked twice",
+                Some("discard"),
             ),
             (
                 "files.stage-all",
                 "stage everything unstaged, or unstage everything staged",
+                Some("stage all"),
             ),
             (
                 "files.ignore",
                 "add the selected untracked file to .gitignore",
+                Some("ignore"),
             ),
-            ("branches.focus", "swap the branches list into the column"),
-            ("branches.checkout", "check out the selected branch"),
-            ("branches.new", "create a branch"),
-            ("branches.rename", "rename the selected branch"),
-            ("branches.delete", "delete the selected branch, asked twice"),
-            ("stashes.focus", "swap the stash list into the column"),
-            ("commits.focus", "swap the commit list into the column"),
+            ("branches.focus", "focus the branches pane", None),
+            (
+                "branches.checkout",
+                "check out the selected branch",
+                Some("checkout"),
+            ),
+            ("branches.new", "create a branch", Some("new branch")),
+            (
+                "branches.rename",
+                "rename the selected branch",
+                Some("rename"),
+            ),
+            (
+                "branches.delete",
+                "delete the selected branch, asked twice",
+                Some("delete"),
+            ),
+            ("stashes.focus", "focus the stash list", None),
+            ("commits.focus", "focus the commit list", None),
             (
                 "files.stash",
                 "park the working tree's changes on the stash stack",
+                Some("stash"),
             ),
-            ("stashes.apply", "apply this stash, keeping it"),
+            (
+                "stashes.apply",
+                "apply this stash, keeping it",
+                Some("apply"),
+            ),
             (
                 "stashes.pop",
                 "apply this stash and drop it when the apply is clean",
+                Some("pop"),
             ),
-            ("stashes.drop", "drop this stash, asked twice"),
+            ("stashes.drop", "drop this stash, asked twice", Some("drop")),
             (
                 "repo.push",
                 "send the current branch to its remote, setting the upstream if needed",
+                Some("push"),
             ),
             (
                 "repo.pull",
                 "fast-forward the current branch onto its upstream",
+                Some("pull"),
             ),
-            ("repo.fetch", "update the remote-tracking branches"),
-            ("input.accept", "accept the text"),
-            ("input.cancel", "discard the text"),
-            ("pane.next", "the next list in the column"),
-            ("pane.prev", "the previous list in the column"),
-            ("select.all", "select the whole view"),
-            ("select.none", "drop the selection"),
+            (
+                "repo.fetch",
+                "update the remote-tracking branches",
+                Some("fetch"),
+            ),
+            ("input.accept", "accept the text", None),
+            ("input.cancel", "discard the text", None),
+            ("pane.next", "the next list in the column", None),
+            ("pane.prev", "the previous list in the column", None),
+            ("select.all", "select the whole view", None),
+            ("select.none", "drop the selection", None),
             (
                 "copy.selection",
                 "copy the selection, or the row the cursor is on",
+                None,
             ),
         ] {
-            c.register(name, doc);
+            c.add(name, doc, hint);
         }
         c
     }
@@ -973,9 +1048,16 @@ impl Commands {
     /// Adds one, replacing any with the same name — so a built-in's description
     /// can be corrected rather than only added to.
     pub fn register(&mut self, name: impl Into<String>, doc: impl Into<String>) {
+        self.add(name, doc, None);
+    }
+
+    /// [`register`](Self::register)'s engine; only the shipped table carries a
+    /// hint to pass it.
+    fn add(&mut self, name: impl Into<String>, doc: impl Into<String>, hint: Option<&str>) {
         let command = Command {
             name: name.into(),
             doc: doc.into(),
+            hint: hint.map(Into::into),
         };
         match self.0.iter().position(|c| c.name == command.name) {
             Some(i) => self.0[i] = command,
@@ -989,6 +1071,15 @@ impl Commands {
 
     pub fn get(&self, name: &str) -> Option<&Command> {
         self.0.iter().find(|c| c.name == name)
+    }
+
+    /// The short label a status bar draws beside the key, when the command has
+    /// one.
+    ///
+    /// Not [`get`](Self::get)'s [`Command::doc`] — that is the help screen's
+    /// sentence, and a footer has room for "stage hunk", not for what a hunk is.
+    pub fn hint(&self, name: &str) -> Option<&str> {
+        self.get(name).and_then(|c| c.hint.as_deref())
     }
 
     pub fn all(&self) -> &[Command] {
@@ -1240,9 +1331,10 @@ mod tests {
                 "{name} leaked out of [branches]"
             );
         }
-        // The panel jump sits beside files' own: lazygit's numbers.
+        // The panel jump is global, numbered by the pane layout: 2 here,
+        // the same branch pane files' own number sits beside.
         assert_eq!(
-            k.resolve(&Modes::new(), &keys("3")),
+            k.resolve(&Modes::new(), &keys("2")),
             Resolve::Run("branches.focus")
         );
 
@@ -1274,7 +1366,7 @@ mod tests {
         let k = Keymap::builtin();
         // The direct jump works whatever is focused, like files.focus.
         assert_eq!(
-            k.resolve(&Modes::new(), &keys("4")),
+            k.resolve(&Modes::new(), &keys("3")),
             Resolve::Run("stashes.focus")
         );
 
@@ -1514,6 +1606,27 @@ mod tests {
     }
 
     #[test]
+    fn a_hint_resolves_by_name_and_an_unknown_name_has_none() {
+        let commands = Commands::builtin();
+        for c in commands.all() {
+            if let Some(hint) = &c.hint {
+                // Round-trips through the accessor a status bar reads: same
+                // lookup as `get`, so a registered command answers by name.
+                assert_eq!(commands.hint(&c.name), Some(hint.as_str()), "{}", c.name);
+                // One or two words is what fits beside a key.
+                assert!(
+                    hint.split_whitespace().count() <= 2,
+                    "{}: \"{hint}\" will not fit a footer",
+                    c.name
+                );
+            } else {
+                assert_eq!(commands.hint(&c.name), None, "{}", c.name);
+            }
+        }
+        assert_eq!(commands.hint("no.such.command"), None);
+    }
+
+    #[test]
     fn an_extension_registers_a_command_and_binds_a_key_to_it() {
         // Rule 1, for input: nine lines, and nothing in `core` had to know.
         let mut commands = Commands::builtin();
@@ -1685,7 +1798,9 @@ mod tests {
             .iter()
             .map(|row| match row {
                 HelpRow::Mode(name) => format!("[{name}]"),
-                HelpRow::Command { keys, doc } => format!("{keys} · {doc}"),
+                // The name rides along but this projection says only what the
+                // help screen has always said.
+                HelpRow::Command { name: _, keys, doc } => format!("{keys} · {doc}"),
                 HelpRow::Blank => String::new(),
             })
             .collect()

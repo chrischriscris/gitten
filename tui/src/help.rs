@@ -35,7 +35,7 @@ fn rows(keys: &Keymap, commands: &Commands, modes: &Modes) -> Vec<Row> {
         .into_iter()
         .map(|row| match row {
             HelpRow::Mode(name) => Row::Mode(name),
-            HelpRow::Command { keys, doc } => Row::Key { keys, doc },
+            HelpRow::Command { name: _, keys, doc } => Row::Key { keys, doc },
             HelpRow::Blank => Row::Blank,
         })
         .collect()
