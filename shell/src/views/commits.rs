@@ -51,6 +51,17 @@ impl Commits {
     }
 }
 
+/// One row's reach, roughly: the graph gutter plus the subject. An estimate,
+/// because this number only decides which single row `uniform_list` measures
+/// to learn the true scrollable width — see the note in `Data`.
+///
+/// Characters, never `.len()`: a byte-lengthed CJK subject counted itself
+/// three times too wide and could dethrone a genuinely wider ASCII row,
+/// leaving that row clipped past the last reachable column forever.
+fn estimated_row_width(gutter: &graph::Draw, subject: &str, char_w: f32) -> f32 {
+    graph::row_width(gutter) + subject.chars().count() as f32 * char_w
+}
+
 impl Commits {
     pub fn new(commits: Vec<Commit>, host: Rc<Host>) -> Self {
         let t = std::time::Instant::now();
@@ -83,7 +94,7 @@ impl Commits {
         let widest = draws
             .iter()
             .zip(&commits)
-            .map(|(d, c)| graph::row_width(d) + c.subject.len() as f32 * char_w)
+            .map(|(d, c)| estimated_row_width(d, &c.subject, char_w))
             .enumerate()
             .max_by(|(_, a), (_, b)| a.total_cmp(b))
             .map(|(i, _)| i)
@@ -187,4 +198,69 @@ fn row(c: &Commit, who: &Who, d: &graph::Draw, host: &Rc<Host>) -> AnyElement {
         .child(graph::row_canvas(d.clone(), host.clone()))
         .child(div().flex_none().child(c.subject.clone()))
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    // By name, not a glob: `use gpui::*` in the parent shadows `#[test]`.
+    use super::estimated_row_width;
+    use crate::graph;
+    use gitten_core::{assign_lanes, Commit};
+
+    #[test]
+    fn widest_row_ranks_subjects_by_characters_not_bytes() {
+        // Forty-five ASCII characters are also forty-five bytes.
+        let ascii = Commit {
+            sha: "aaaa".into(),
+            short: "aaaa".into(),
+            parents: Vec::new().into(),
+            author: "Ann Author".into(),
+            timestamp: 0,
+            subject: "a".repeat(45),
+        };
+        // Twenty CJK characters are sixty UTF-8 bytes: ranked by byte length
+        // this row wins and the wider ASCII row clips past the last column
+        // `uniform_list` will ever scroll to.
+        let cjk = Commit {
+            sha: "bbbb".into(),
+            short: "bbbb".into(),
+            parents: Vec::new().into(),
+            author: "Bob Blob".into(),
+            timestamp: 0,
+            subject: "日".repeat(20),
+        };
+
+        let commits = vec![ascii, cjk];
+        let rows = assign_lanes(&commits);
+        let draws = graph::row_draws(&commits, &rows);
+        let char_w = 12.0;
+
+        let widest = draws
+            .iter()
+            .zip(&commits)
+            .map(|(d, c)| estimated_row_width(d, &c.subject, char_w))
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        assert_eq!(widest, 0, "the ASCII subject must outrank the CJK one");
+
+        // The inversion itself: the same rows ranked by bytes, as this code
+        // once was, pick the CJK row. This keeps the test from passing
+        // vacuously should both estimates ever drift together.
+        //
+        // The one `str::len` left standing in this file, on purpose: clippy
+        // wants it (needless_as_bytes, bytes_count_to_len reject every other
+        // spelling of byte length), and here it stands in for the regression
+        // being asserted against.
+        let by_bytes = draws
+            .iter()
+            .zip(&commits)
+            .map(|(d, c)| graph::row_width(d) + c.subject.len() as f32 * char_w)
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        assert_eq!(by_bytes, 1, "the byte-lengthed rank picks the CJK row");
+    }
 }
