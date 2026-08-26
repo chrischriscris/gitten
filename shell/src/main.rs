@@ -1,3 +1,4 @@
+mod chrome;
 mod config;
 mod controls;
 mod dispatch;
@@ -17,7 +18,6 @@ use gitten_core::command::{chord_string, Code, Key, Modes, Resolve};
 use gitten_core::differ::{Overrides, Whitespace};
 use gitten_core::host::Host;
 use gitten_core::refs::ResetMode;
-use gitten_core::theme::Rgb;
 use gitten_core::{Commit, FileDiff};
 use gpui::*;
 use gpui_component::*;
@@ -96,12 +96,10 @@ const TITLE_H: f32 = 32.0;
 /// title begins after them.
 const LIGHTS_X: f32 = 10.0;
 const LIGHTS_W: f32 = 72.0;
-/// The error band under the title bar. Shorter than a title bar because it is
-/// one sentence, and it is only there when something has to be said.
-const BAND_H: f32 = 22.0;
-/// The list column's slice of the window's width; the diff takes the rest.
-/// A code constant on purpose tonight — a drag handle between the two regions
-/// would own this properly, and that is polish-pass work.
+/// The commit column's slice of the window's width; the sidebar takes its
+/// own slice ([`chrome::SIDEBAR_SHARE`]) and the diff takes the rest. A code
+/// constant on purpose tonight — a drag handle between the regions would own
+/// this properly, and that is polish-pass work.
 const COLUMN_SHARE: f32 = 0.32;
 /// How long the commits cursor may keep moving before the main view loads the
 /// commit it settled on. A fast run through the list schedules one timer per
@@ -310,15 +308,23 @@ trait Pane {
 
 /// Which of the window's two regions the keyboard is in.
 ///
-/// Two targets, because the lazygit shape has two: the list column on the
-/// left and the diff on the right. The focused one carries the accent edge,
-/// and [`Modes`] is rebuilt from this — a list's keys move that list, the
-/// diff's keys scroll the diff — which is why there is no third state to
-/// forget to route.
+/// Two targets, because the design has two: the lists — the sidebar's three
+/// stacked panes and the commit column, all on screen at once — and the diff
+/// filling the rest. The focused region carries the accent edge, and
+/// [`Modes`] is rebuilt from this — a list's keys move that list, the diff's
+/// keys scroll the diff — which is why there is no third state to forget to
+/// route.
+///
+/// Which *list* has the keyboard is not a spot of its own: it is
+/// [`panes::Panes`]' focused tenant, the same registry that decides what the
+/// column draws when an extension pane takes it over. A sidebar section and
+/// the commit column differ in where they draw, never in what the keyboard
+/// means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Spot {
-    /// The list column: whatever list is showing gets the keys.
-    Column,
+    /// Some list — a sidebar section, the commit column, an extension pane
+    /// standing in for one — holds the keyboard.
+    List,
     /// The diff main view.
     Main,
 }
@@ -686,12 +692,15 @@ impl Screen {
                 let view = view.clone();
                 let generation = generation.clone();
                 let label = label.clone();
+                let theme = host.theme.clone();
                 Some(Refresh::new(
                     target,
                     move || {
                         // The whole of the blocking half: the two ref
                         // listings and HEAD's state, run beside each other —
-                        // four independent processes, one spawn floor.
+                        // four independent processes, one spawn floor. The
+                        // theme rides along because the dots are coloured at
+                        // flatten, once, and not per frame.
                         let prepared = std::thread::scope(|s| {
                             let title = s.spawn(|| repo.describe());
                             let local = s.spawn(|| repo.branches());
@@ -718,7 +727,7 @@ impl Screen {
                                 }
                             };
                             Ok::<_, String>(views::branches::prepare(
-                                local, remote, head, &described,
+                                local, remote, head, &theme, &described,
                             ))
                         });
                         prepared
@@ -870,10 +879,11 @@ struct DevShell {
     /// list that handed the keyboard to its diff is still a diff while that
     /// region owns it.
     which: &'static str,
-    /// The window's list column. Stable names make this a registry; exactly
-    /// one entry of it renders at a time — [`DevShell::panes`]' focused one —
-    /// so `2`/`3`/`4` swap lists into the column by focusing them, and every
-    /// list keeps its own cursor and scroll state while it waits off screen.
+    /// The window's panes, by stable name. The sidebar renders three named
+    /// residents at once and the column renders commits (or an extension
+    /// pane that has taken it over); focus decides whose keys are live, and
+    /// every list keeps its own cursor and scroll state whatever is on
+    /// screen. See [`DevShell::list_order`] for the order the keys walk.
     panes: panes::Panes<Screen>,
     /// The diff main view: always on screen, right of the column. Built once
     /// at startup (empty when the window opened on a list) and re-aimed at
@@ -884,15 +894,20 @@ struct DevShell {
     /// a fixture, a patch file) builds this from those rows instead and has
     /// no column at all — see [`DevShell::has_column`].
     main: Screen,
-    /// Whether the window has a list column. False only for a diff/fixture/
+    /// Whether the window has a commit column. False only for a diff/fixture/
     /// patch launch, where there is no acquired commit list to show; the
-    /// diff then fills the whole width and the spot never leaves [`Spot::Main`].
+    /// diff then fills the whole width, the sidebar's three panes still stand
+    /// (a fixture has no repository, so it has none of them either) and the
+    /// spot never leaves [`Spot::Main`] when no list exists at all.
     has_column: bool,
     /// Which region holds the keyboard.
     spot: Spot,
-    /// The commit the main view's header names — set the moment a selection
-    /// is scheduled, so the strip is true during the load, not only after it.
-    /// `None` until the first selection (or forever, over a fixture).
+    /// The commit the main view is of — set the moment a selection is
+    /// scheduled, so the diff header is true during the load, not only after
+    /// it. Its subject shrinks behind the file name in that header; its
+    /// author and sha live in the list row the keyboard came from, which is
+    /// where a reader looks for them. `None` until the first selection (or
+    /// forever, over a fixture).
     head: RefCell<Option<Commit>>,
     /// The newest main-view request. Each schedule bumps it; a timer or a
     /// finished load applies only if it still equals the value it left with,
@@ -987,29 +1002,47 @@ impl DevShell {
     /// which is what makes routing a change of [`Spot`] and nothing else.
     fn active(&self) -> Option<&Screen> {
         Some(match self.spot {
-            Spot::Column => self.panes.focused(),
+            Spot::List => self.panes.focused(),
             Spot::Main => &self.main,
         })
     }
 
-    /// The column's commits list, when the column has one showing. The one
-    /// place main-view loading learns which screen it reads its selection
-    /// from — a files or branches column keeps whatever the main view already
-    /// holds, whatever the keyboard is doing.
+    /// The column's commits list. With the sidebar holding the other lists,
+    /// the column shows commits whatever the keyboard is doing — so main-view
+    /// loading reads its selection from here even while the files pane is
+    /// focused, which is the design's point: moving through the working tree
+    /// does not take the commit list away. `None` only while an extension
+    /// pane has taken the column over, or on a launch with no column at all.
     fn column_commits(&self) -> Option<Entity<views::commits::Commits>> {
-        if !self.has_column {
+        if !self.has_column || matches!(self.panes.focused(), Screen::Custom(_)) {
             return None;
         }
-        match self.panes.focused() {
-            Screen::Commits { view, .. } => Some(view.clone()),
+        match self.panes.get("commits") {
+            Some(Screen::Commits { view, .. }) => Some(view.clone()),
             _ => None,
         }
     }
 
-    /// Moves the keyboard to a region. A fixture window has no column to
-    /// give the keyboard back to, so a `Spot::Main` there is forever.
+    /// The pane names that are lists, in the order the design's number keys
+    /// name them: the sidebar's three stacked panes, then the column's own
+    /// residents — commits first, then whatever an extension registered.
+    /// A diff-shaped launch has no commits and still has the sidebar, so
+    /// both "is there a list to focus" and the cycle order read through
+    /// here rather than through `has_column`.
+    fn list_order(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = ["files", "branches", "stashes", "commits"]
+            .into_iter()
+            .filter(|name| self.panes.position(name).is_some())
+            .collect();
+        let builtins = ["files", "branches", "stashes", "commits"];
+        names.extend(self.panes.names().filter(|name| !builtins.contains(name)));
+        names
+    }
+
+    /// Moves the keyboard to a region. A fixture window has no list to give
+    /// the keyboard back to, so a `Spot::Main` there is forever.
     fn set_spot(&mut self, spot: Spot) {
-        if !self.has_column {
+        if spot == Spot::List && self.list_order().is_empty() {
             return;
         }
         if self.spot != spot {
@@ -1036,7 +1069,7 @@ impl DevShell {
     fn sync_modes(&mut self) {
         self.modes = Modes::new();
         // Cycling the lists needs more than one of them to be worth a key.
-        if self.has_column && self.panes.len() > 1 {
+        if self.list_order().len() > 1 {
             self.modes.push(panes::MODE);
         }
         if let Some(screen) = self.active() {
@@ -2718,7 +2751,7 @@ impl DevShell {
             return;
         }
         if self.spot == Spot::Main {
-            self.set_spot(Spot::Column);
+            self.set_spot(Spot::List);
             cx.notify();
             return;
         }
@@ -2735,32 +2768,38 @@ impl DevShell {
         if self.panes.focus(at) {
             // Focusing a list means looking at that list: the keyboard goes
             // with it, out of the diff if it was there.
-            self.set_spot(Spot::Column);
+            self.set_spot(Spot::List);
             self.sync_modes();
             cx.notify();
         }
     }
 
-    /// Cycles the column between its lists — what ctrl-j/ctrl-k do. The
-    /// command names still say *pane*: they were named for the panes that
-    /// used to stack, and a rename would break every `[keys]` file in flight.
+    /// Cycles the lists — what ctrl-j/ctrl-k do, walking `1 → 2 → 3 → 4`:
+    /// the sidebar's three panes, then the commit column, then any pane an
+    /// extension registered. The command names still say *pane*: they were
+    /// named for the panes that used to stack, and a rename would break
+    /// every `[keys]` file in flight.
     fn cycle_pane(&mut self, by: isize, cx: &mut Context<Self>) {
-        if !self.has_column {
-            self.set_notice("this window has no list column");
+        let order: Vec<String> = self.list_order().iter().map(|s| s.to_string()).collect();
+        if order.len() < 2 {
+            self.set_notice("this window has no second list to cycle to");
             return;
         }
-        if self.panes.cycle(by) {
-            self.set_spot(Spot::Column);
-            self.sync_modes();
-            cx.notify();
-        }
+        // The focused pane's place in that order; a diff standing in as the
+        // root of a diff-shaped launch is not in it, and cycling from there
+        // starts at the first sidebar pane.
+        let focused = self.panes.focused_name().to_string();
+        let current = order.iter().position(|name| *name == focused).unwrap_or(0);
+        let next = (current as isize + by).rem_euclid(order.len() as isize) as usize;
+        let name = order[next].clone();
+        self.focus_named(&name, cx);
     }
 
     /// Focuses a tenant by its stable registration name — what `files.focus`
-    /// and friends run: the named list swaps into the column and takes the
-    /// keyboard. Said, not swallowed, when nothing is registered under the
-    /// name: a fixture has no working tree to show, and the honest answer to
-    /// the key is the same sentence an unbound one gets.
+    /// and friends run: the named pane takes the keyboard, wherever it draws.
+    /// Said, not swallowed, when nothing is registered under the name: a
+    /// fixture has no working tree to show, and the honest answer to the key
+    /// is the same sentence an unbound one gets.
     fn focus_named(&mut self, name: &str, cx: &mut Context<Self>) {
         match self.panes.position(name) {
             Some(at) => self.focus_pane(at, cx),
@@ -3410,26 +3449,150 @@ impl Render for DevShell {
         let c = host.theme.chrome;
         let f = &host.font;
 
-        // The two regions. **The lazygit shape**: one list column on the left,
-        // the diff filling everything else, both always on screen. Exactly one
-        // column resident renders at a time — the focused one — so swapping
-        // lists is focusing them, and every list keeps its own cursor and
-        // scroll state while it waits off screen. The focused region carries
-        // the accent as a 2px bar on its left edge: two targets, one glance,
-        // no chrome beyond it tonight.
+        // **The three regions**: the sidebar's three stacked panes, the commit
+        // column, and the diff filling the rest — all three on screen at once,
+        // which is the design this window follows. Every region is drawn with
+        // the same furniture: a short header naming the pane with *the number
+        // of the key that focuses it*, and a hairline under it. The keyboard's
+        // region says so in the accent — the column and the diff as a 2px left
+        // edge, a sidebar section through its header's keycap and name — and
+        // the status bar says it again in words.
         //
-        // A window launched on a diff (a fixture, a patch file) has no column
-        // at all; the main view takes the whole width and the spot never
-        // leaves it.
+        // All three sidebar panes render at once; they are the repository's
+        // own three answers (what changed, where am I, what is parked) and
+        // none of them is worth a swap. The column, by contrast, is a
+        // registry: commits by default, an extension pane standing in when
+        // one is focused — the one place a compiled-in tenant takes the
+        // keyboard's whole region, exactly as it did before this window had
+        // a sidebar.
+        let sidebar = {
+            let named: [(&str, &'static str, f32); 3] = [
+                ("files", "1", 4.0),
+                ("branches", "2", 3.0),
+                ("stashes", "3", 3.0),
+            ];
+            let focused_name = self.panes.focused_name().to_string();
+            let mut sections: Vec<AnyElement> = Vec::new();
+            for (name, number, weight) in named {
+                let Some(screen) = self.panes.get(name) else {
+                    continue;
+                };
+                let focused = self.spot == Spot::List && focused_name == name;
+                // The count is the header's only right-edge furniture: the
+                // working tree's distinct changed paths, spelled once per
+                // refresh and read here for free.
+                let count = match screen {
+                    Screen::Files { view, .. } => {
+                        Some(SharedString::from(view.read(cx).changed().to_string()))
+                    }
+                    _ => None,
+                };
+                sections.push(
+                    div()
+                        .id(ElementId::Name(SharedString::from(format!("side-{name}"))))
+                        .flex_grow(weight)
+                        .min_h_0()
+                        .flex()
+                        .flex_col()
+                        .overflow_hidden()
+                        .capture_any_mouse_down(cx.listener(move |this, _, _, cx| {
+                            this.focus_named(name, cx);
+                        }))
+                        .child(chrome::pane_header(
+                            &host,
+                            number,
+                            name.to_uppercase().into(),
+                            count,
+                            focused,
+                            None,
+                        ))
+                        .child(
+                            div()
+                                .min_h_0()
+                                .flex_grow(1.0)
+                                .overflow_hidden()
+                                .child(screen.any()),
+                        )
+                        .into_any_element(),
+                );
+            }
+            (!sections.is_empty()).then(|| {
+                div()
+                    .id("sidebar")
+                    .flex_none()
+                    .w(relative(chrome::SIDEBAR_SHARE))
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .debug_selector(|| "sidebar".to_string())
+                    .children(sections)
+            })
+        };
+        // The column. Focused-and-not-a-sidebar-name is exactly "an extension
+        // pane took the region over", so the header's name and the accent
+        // follow whatever stands there without a third state to check.
         let column = self.has_column.then(|| {
-            let focused = self.spot == Spot::Column;
-            let screen = self.panes.focused();
+            let custom = matches!(self.panes.focused(), Screen::Custom(_));
+            let screen = match custom {
+                true => self.panes.focused(),
+                false => self
+                    .panes
+                    .get("commits")
+                    .unwrap_or_else(|| self.panes.focused()),
+            };
+            let focused =
+                self.spot == Spot::List && (custom || self.panes.focused_name() == "commits");
+            // Right-edge furniture: the branch the list is of — the design
+            // pins it here, where a checkout rewrites it in place — and a
+            // live filter's count when there is one, because the filter is
+            // the thing that changed most recently and the thing a count is
+            // about. Both read from state the refresh wave already paid for.
+            let right = match screen {
+                Screen::Commits { view, .. } => {
+                    // The filter's count, when there is one; otherwise the
+                    // branch the list is of, the way the design pins it.
+                    let note = view.read(cx).filter_note();
+                    let branch = (!note.is_some())
+                        .then(|| {
+                            self.panes.get("branches").and_then(|s| match s {
+                                Screen::Branches { view, .. } => view.read(cx).head_info(),
+                                _ => None,
+                            })
+                        })
+                        .flatten()
+                        .map(|info| info.branch);
+                    note.map(|note| {
+                        div()
+                            .flex_none()
+                            .text_color(rgb(c.faint))
+                            .child(SharedString::from(note))
+                            .into_any_element()
+                    })
+                    .or_else(|| {
+                        branch.map(|branch| {
+                            div()
+                                .flex_none()
+                                .text_color(rgb(c.accent))
+                                .child(branch)
+                                .into_any_element()
+                        })
+                    })
+                }
+                _ => None,
+            };
+            let name: SharedString = match custom {
+                true => screen.label(cx).into(),
+                false => "COMMITS".into(),
+            };
             div()
                 .id("column")
                 .flex_none()
                 .w(relative(COLUMN_SHARE))
                 .relative()
                 .min_h_0()
+                .flex()
+                .flex_col()
                 .overflow_hidden()
                 .border_l_2()
                 .border_color(rgb(match focused {
@@ -3437,8 +3600,15 @@ impl Render for DevShell {
                     false => c.border,
                 }))
                 .debug_selector(|| "column".to_string())
-                .capture_any_mouse_down(cx.listener(|this, _, _, _cx| this.set_spot(Spot::Column)))
-                .child(screen.any())
+                .capture_any_mouse_down(cx.listener(|this, _, _, _cx| this.set_spot(Spot::List)))
+                .child(chrome::pane_header(&host, "4", name, None, focused, right))
+                .child(
+                    div()
+                        .min_h_0()
+                        .flex_grow(1.0)
+                        .overflow_hidden()
+                        .child(screen.any()),
+                )
         });
         let Screen::Diff {
             view: main_view, ..
@@ -3448,56 +3618,95 @@ impl Render for DevShell {
         };
         let head = self.head.borrow().clone();
         let loading = self.loading.get();
+        // The header names the file the keyboard is in, with that file's
+        // change counts and the hunk's place among its siblings — the same
+        // three facts the design's fifth pane carries. The commit's subject
+        // rides along dim and shrinking: a revspec launch (`HEAD~2..HEAD`)
+        // has no row in any list to name it, and a diff that cannot say what
+        // it is of is a diff nobody trusts after a scroll.
+        let main_focused = self.spot == Spot::Main;
         let main_region = div()
             .id("main")
             .flex_grow(1.0)
             .min_w_0()
             .relative()
             .min_h_0()
+            .flex()
+            .flex_col()
             .overflow_hidden()
-            .v_flex()
             .border_l_2()
-            .border_color(rgb(match self.spot == Spot::Main {
+            .border_color(rgb(match main_focused {
                 true => c.accent,
                 false => c.border,
             }))
             .debug_selector(|| "main".to_string())
             .capture_any_mouse_down(cx.listener(|this, _, _, _cx| this.set_spot(Spot::Main)))
-            // The header strip: what the diff below is *of*. Dim, one line,
-            // written the moment the selection is scheduled — during the load
-            // it names what is coming, which is what makes frame one show a
-            // star rather than an empty half.
-            .children(head.map(|commit| {
-                let text =
-                    SharedString::from(format!("{} · {} · {}", commit.subject, commit.author, {
-                        let n = commit.sha.len().min(8);
-                        commit.sha[..n].to_string()
-                    }));
-                div()
-                    .flex_none()
+            .child({
+                let summary = main_view.read(cx).file_summary();
+                let adds = SharedString::from(
+                    summary
+                        .as_ref()
+                        .map(|s| format!("+{}", s.adds))
+                        .unwrap_or_default(),
+                );
+                let dels = SharedString::from(
+                    summary
+                        .as_ref()
+                        .map(|s| format!("−{}", s.dels))
+                        .unwrap_or_default(),
+                );
+                let hunk = summary
+                    .as_ref()
+                    .filter(|s| s.hunks > 0)
+                    .map(|s| SharedString::from(format!("hunk {}/{}", s.hunk, s.hunks)));
+                // File path, then the counts, then the subject last and
+                // shrinking: the path is the one thing that must not
+                // truncate, and the eye finds counts at the right edge.
+                let right = div()
+                    .min_w_0()
                     .flex()
                     .items_center()
-                    .gap_2()
-                    .h(px(BAND_H))
-                    .px_3()
-                    .bg(rgb(c.title_bg))
-                    .border_b_1()
-                    .border_color(rgb(c.border))
-                    .text_color(rgb(c.dim))
-                    .child(
+                    .gap_3()
+                    .children(head.map(|commit| {
                         div()
                             .flex_shrink(1.0)
                             .min_w_0()
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .text_ellipsis_start()
-                            .child(text),
-                    )
+                            .text_color(rgb(c.faint))
+                            .child(commit.subject.clone())
+                    }))
+                    .children((!adds.is_empty()).then(|| {
+                        div()
+                            .flex_none()
+                            .text_color(rgb(host.theme.diff.adds_fg))
+                            .child(adds)
+                    }))
+                    .children((!dels.is_empty()).then(|| {
+                        div()
+                            .flex_none()
+                            .text_color(rgb(host.theme.diff.dels_fg))
+                            .child(dels)
+                    }))
+                    .children(hunk.map(|h| div().flex_none().text_color(rgb(c.faint)).child(h)))
                     .children(
                         loading
                             .then(|| div().flex_none().text_color(rgb(c.accent)).child("loading")),
-                    )
-            }))
+                    );
+                let name: SharedString = match &summary {
+                    Some(s) => s.path.as_str().into(),
+                    None => "DIFF".into(),
+                };
+                chrome::pane_header(
+                    &host,
+                    "5",
+                    name,
+                    None,
+                    main_focused,
+                    Some(right.into_any_element()),
+                )
+            })
             // A flexed box for the view itself: every view roots at
             // `size_full`, which under this column would read the *container*
             // height and slide the last rows behind the header without it.
@@ -3625,6 +3834,30 @@ impl Render for DevShell {
                             .text_ellipsis_start()
                             .child(self.active_label(cx)),
                     )
+                    // The branch chip, the design's `main ↑2 ↓0`: where HEAD
+                    // sits and how far it has drifted, read from the branches
+                    // pane's own prepared head — one small struct per frame,
+                    // no second git call anywhere. A detached HEAD or a
+                    // fixture draws nothing: absence is the honest state.
+                    .children(self.panes.get("branches").and_then(|screen| {
+                        let Screen::Branches { view, .. } = screen else {
+                            return None;
+                        };
+                        let info = view.read(cx).head_info()?;
+                        let mut chip = info.branch.to_string();
+                        if let Some(ahead) = info.ahead.filter(|n| *n > 0) {
+                            chip.push_str(&format!(" ↑{ahead}"));
+                        }
+                        if let Some(behind) = info.behind.filter(|n| *n > 0) {
+                            chip.push_str(&format!(" ↓{behind}"));
+                        }
+                        Some(
+                            div()
+                                .flex_none()
+                                .text_color(rgb(c.accent))
+                                .child(SharedString::from(chip)),
+                        )
+                    }))
                     .children(cfg!(debug_assertions).then(|| {
                         // One word and not the sentence this used to be — "DEBUG
                         // BUILD — timings meaningless, use --release" was fifty
@@ -3642,23 +3875,15 @@ impl Render for DevShell {
                     .child(div().flex_grow(1.0))
                     .children(strip),
             )
-            // Its own band and not a word in the title bar, where it was: an
-            // error is a whole sentence, the strip is already four controls and a
-            // path, and `flex_none` on both meant a long one pushed the pickers
-            // off the window rather than wrapping or truncating. An error wins
-            // over a notice: it describes what failed, the notice describes what
-            // was tried since.
-            .children(
-                error
-                    .map(|e| band(&c, e, c.error))
-                    .or_else(|| running.map(|n| band(&c, SharedString::from(n), c.dim)))
-                    .or_else(|| notice.map(|n| band(&c, SharedString::from(n), c.dim))),
-            )
+            // The three regions in one row: sidebar, column, diff. A fixture
+            // has neither sidebar nor column and the diff fills the window;
+            // a repository has all three.
             .child(
                 div()
                     .min_h_0()
                     .flex_grow(1.0)
                     .flex()
+                    .children(sidebar)
                     .children(column)
                     .child(main_region),
             )
@@ -3668,6 +3893,54 @@ impl Render for DevShell {
             // covering the menu, so capture can leave overlay wheel ownership
             // alone without exposing the native list scroller underneath.
             .children(self.open.is_some().then(controls::picker_backdrop))
+            // The status bar: where the keyboard is, and what the nearest
+            // keys do. A sentence owed to the user — an error, a job's own
+            // finish, an armed question — takes the hints' place rather than
+            // a band of its own: it is the one strip already being read, and
+            // an armed question competing with key hints for a row is two
+            // things saying "look at me" where one will do. An error wins
+            // over a notice: it describes what failed, the notice describes
+            // what was tried since. A prompt empties the hints honestly —
+            // its field owns the keyboard and speaks for itself.
+            .child({
+                let message = error
+                    .map(|e| (e, c.error))
+                    .or_else(|| notice.clone().map(|n| (n.into(), c.dim)))
+                    .or_else(|| running.map(|n| (n.into(), c.dim)));
+                let badge: SharedString = match self.input.is_some() {
+                    true => "PROMPT".into(),
+                    false => which.to_uppercase().into(),
+                };
+                let hints = match (&message, self.input.is_some()) {
+                    (Some(_), _) | (None, true) => Vec::new(),
+                    (None, false) => {
+                        let budget = window.viewport_size().width
+                            - px(host.font.char_width()
+                                * (badge.chars().count() as f32
+                                    + 6.0
+                                    + chrome::version().len() as f32
+                                    + 4.0));
+                        chrome::hints(&host, &self.modes, which, f32::from(budget).max(0.0))
+                    }
+                };
+                match message {
+                    Some((text, ink)) => div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .h(px(chrome::STATUS_H))
+                        .px_2()
+                        .bg(rgb(c.status_bg))
+                        .border_t_1()
+                        .border_color(rgb(c.border))
+                        .text_color(rgb(c.dim))
+                        .child(div().min_w_0().truncate().text_color(rgb(ink)).child(text))
+                        .into_any_element(),
+                    None => chrome::status_bar(&host, badge, &hints, chrome::version())
+                        .into_any_element(),
+                }
+            })
             .children(overlay.map(|(frames, rows, heap, load)| {
                 div()
                     .flex_none()
@@ -3700,21 +3973,6 @@ impl Render for DevShell {
             );
         root
     }
-}
-
-/// One sentence on its own band under the title bar.
-fn band(c: &gitten_core::theme::ChromePalette, text: SharedString, ink: Rgb) -> impl IntoElement {
-    div()
-        .flex_none()
-        .flex()
-        .items_center()
-        .h(px(BAND_H))
-        .px_4()
-        .bg(rgb(c.status_bg))
-        .border_b_1()
-        .border_color(rgb(c.border))
-        .text_color(rgb(ink))
-        .child(div().min_w_0().truncate().child(text))
 }
 
 fn main() {
@@ -3968,10 +4226,14 @@ fn main() {
                     });
                     start::mark("files status done");
                     let (files_prepared, stashes_prepared) = described;
-                    // Registration order is the column's cycle order — kept
-                    // in step with the number keys, so ctrl-j walks
-                    // 1 → 2 → 3 → 4. Registration focuses what it adds;
-                    // startup keeps the keyboard where it launched.
+                    // Registration order is the *startup* order — commits is
+                    // the root tenant, then the three sidebar panes join it.
+                    // The number keys and ctrl-j walk the design's order
+                    // (files → branches → stashes → commits), derived in
+                    // [`DevShell::list_order`], so this list's order is only
+                    // about who was here first. Registration focuses what it
+                    // adds; the `focus(0)` calls put the keyboard back where
+                    // it launched.
                     let files_label = files_prepared.label.clone();
                     initial_panes.register(
                         "files",
@@ -4012,11 +4274,23 @@ fn main() {
                                         None
                                     }
                                 };
-                                views::branches::prepare(local, remote, head, &described)
+                                views::branches::prepare(
+                                    local,
+                                    remote,
+                                    head,
+                                    &host.theme,
+                                    &described,
+                                )
                             }
                             (Err(e), _) | (_, Err(e)) => {
                                 eprintln!("gitten: branch reads failed, empty panel: {e}");
-                                views::branches::prepare(Vec::new(), Vec::new(), None, &described)
+                                views::branches::prepare(
+                                    Vec::new(),
+                                    Vec::new(),
+                                    None,
+                                    &host.theme,
+                                    &described,
+                                )
                             }
                         }
                     });
@@ -4106,7 +4380,7 @@ fn main() {
                     main: main_screen,
                     has_column,
                     spot: match has_column {
-                        true => Spot::Column,
+                        true => Spot::List,
                         false => Spot::Main,
                     },
                     head: RefCell::new(None),
@@ -4444,7 +4718,7 @@ mod tests {
                 ),
                 main: Screen::diff(diff, None, Generation::default(), ""),
                 has_column: true,
-                spot: super::Spot::Column,
+                spot: super::Spot::List,
                 head: RefCell::new(None),
                 request: Cell::new(0),
                 loading: Cell::new(false),
@@ -4509,7 +4783,7 @@ mod tests {
         shell.update(cx, |s, cx| s.back(cx));
         shell.read_with(cx, |s, _| {
             assert_eq!(s.panes.len(), 1);
-            assert_eq!(s.spot, super::Spot::Column);
+            assert_eq!(s.spot, super::Spot::List);
         });
 
         // Enter hands the keyboard to the diff region; `esc` brings it back.
@@ -4519,7 +4793,7 @@ mod tests {
             assert_eq!(s.modes.top(), "diff", "the diff owns the keys");
         });
         shell.update(cx, |s, cx| s.back(cx));
-        shell.read_with(cx, |s, _| assert_eq!(s.spot, super::Spot::Column));
+        shell.read_with(cx, |s, _| assert_eq!(s.spot, super::Spot::List));
 
         // A second registered list survives every esc.
         shell.update(cx, |s, cx| {
@@ -4723,7 +4997,7 @@ mod tests {
         cx.simulate_click(column.center(), gpui::Modifiers::default());
         assert_eq!(
             observed.read_with(&cx, |shell, _| shell.spot),
-            super::Spot::Column
+            super::Spot::List
         );
 
         // And ctrl-j cycles the column's lists without leaving the column.
@@ -4745,7 +5019,117 @@ mod tests {
         );
         assert_eq!(
             observed.read_with(&cx, |shell, _| shell.spot),
-            super::Spot::Column
+            super::Spot::List
+        );
+    }
+
+    /// The design's whole arrangement: sidebar, column, diff — three regions
+    /// side by side, the sidebar's three sections stacked inside the first.
+    /// Drawn from the same geometry the click hit-tests read, which is what
+    /// makes it a test of the real layout and not of a copy of it.
+    #[gpui::test]
+    fn the_window_is_three_regions_sidebar_column_and_diff(cx: &mut TestAppContext) {
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, cx| {
+            let host = config::host(cx);
+            shell.panes.register(
+                "files",
+                Screen::files(
+                    cx.new(|_| {
+                        crate::views::files::Files::from_prepared(crate::views::files::prepare(
+                            Default::default(),
+                            "t",
+                        ))
+                    }),
+                    Generation::default(),
+                    "files",
+                ),
+            );
+            shell.panes.register(
+                "branches",
+                Screen::branches(
+                    cx.new(|_| {
+                        crate::views::branches::Branches::from_prepared(
+                            crate::views::branches::prepare(
+                                Vec::new(),
+                                Vec::new(),
+                                None,
+                                &host.theme,
+                                "t",
+                            ),
+                        )
+                    }),
+                    Generation::default(),
+                    "branches",
+                ),
+            );
+            shell.panes.register(
+                "stashes",
+                Screen::stashes(
+                    cx.new(|_| {
+                        crate::views::stashes::Stashes::from_prepared(
+                            crate::views::stashes::prepare(&[], "t"),
+                        )
+                    }),
+                    Generation::default(),
+                    "stashes",
+                ),
+            );
+            shell.panes.focus(0);
+            shell.sync_modes();
+        });
+        let observed = shell.clone();
+        let handle = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_global(config::Active(Rc::new(Host::new())));
+            cx.open_window(
+                gpui::WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds {
+                        origin: Default::default(),
+                        size: gpui::size(gpui::px(1200.0), gpui::px(600.0)),
+                    })),
+                    ..Default::default()
+                },
+                move |_, _| shell,
+            )
+            .unwrap()
+        });
+        let mut cx = gpui::VisualTestContext::from_window(handle.into(), cx);
+        cx.run_until_parked();
+        let sidebar = cx
+            .debug_bounds("sidebar")
+            .expect("the sidebar was not drawn");
+        let column = cx.debug_bounds("column").expect("the column was not drawn");
+        let main = cx
+            .debug_bounds("main")
+            .expect("the main view was not drawn");
+
+        // Left to right, no gaps, all three the same height: one window
+        // row, three regions.
+        assert_eq!(sidebar.right(), column.origin.x, "sidebar then column");
+        assert_eq!(column.right(), main.origin.x, "column then diff");
+        assert_eq!(sidebar.origin.y, main.origin.y);
+        assert_eq!(sidebar.size.height, main.size.height);
+
+        // Clicking a section's rows focuses *that* pane — the files section
+        // first, a branch section in the middle — and the keyboard moves
+        // with it.
+        cx.simulate_click(
+            gpui::point(
+                sidebar.center().x,
+                sidebar.origin.y + sidebar.size.height * 0.2,
+            ),
+            gpui::Modifiers::default(),
+        );
+        assert_eq!(
+            observed.read_with(&cx, |shell, _| shell.panes.focused_name().to_string()),
+            "files"
+        );
+        cx.simulate_click(sidebar.center(), gpui::Modifiers::default());
+        assert_eq!(
+            observed.read_with(&cx, |shell, _| shell.panes.focused_name().to_string()),
+            "branches",
+            "the sidebar's middle is the branches section"
         );
     }
 
@@ -7155,6 +7539,7 @@ diff --git a/added.txt b/added.txt
                 vec![branch_ref("main", true), branch_ref("other", false)],
                 Vec::new(),
                 None,
+                &gitten_core::theme::Theme::default(),
                 "test",
             );
             let label = prepared.label.clone();
@@ -7610,6 +7995,7 @@ diff --git a/added.txt b/added.txt
                     name: gitten_core::refs::RefName::from("main"),
                     commit: None,
                 }),
+                &gitten_core::theme::Theme::default(),
                 "r",
             );
             let view = cx.new(|_| crate::views::branches::Branches::from_prepared(prepared));
@@ -7699,7 +8085,7 @@ diff --git a/added.txt b/added.txt
                 .iter()
                 .find_map(|r| match r {
                     crate::views::branches::Row::Local(l) if l.name.as_bytes() == b"main" => {
-                        l.upstream.clone()
+                        l.counts.clone()
                     }
                     _ => None,
                 })
@@ -7816,6 +8202,7 @@ diff --git a/added.txt b/added.txt
                         Some(gitten_core::refs::HeadState::Detached {
                             commit: "0123456789abcdef".into(),
                         }),
+                        &gitten_core::theme::Theme::default(),
                         "",
                     ),
                     &host,
@@ -7947,6 +8334,7 @@ diff --git a/added.txt b/added.txt
                 }],
                 Vec::new(),
                 None,
+                &gitten_core::theme::Theme::default(),
                 "r",
             );
             let view = cx.new(|_| crate::views::branches::Branches::from_prepared(prepared));
@@ -8077,6 +8465,7 @@ diff --git a/added.txt b/added.txt
                         name: gitten_core::refs::RefName::from("main"),
                         commit: None,
                     }),
+                    &gitten_core::theme::Theme::default(),
                     "",
                 );
                 b.replace_prepared(prepared, &config::host(cx));
@@ -8106,6 +8495,7 @@ diff --git a/added.txt b/added.txt
                         vec![branch_ref("main", true)],
                         Vec::new(),
                         None,
+                        &gitten_core::theme::Theme::default(),
                         "",
                     ),
                     &config::host(cx),

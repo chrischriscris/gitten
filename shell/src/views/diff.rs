@@ -587,6 +587,28 @@ impl ScrollbarHandle for Pan {
     }
 }
 
+/// What the pane header says about the file the keyboard is in: its path, the
+/// change counts its own header row printed, and which hunk of it holds the
+/// cursor — the mock's `5 internal/extension/host.go   +18 −6   hunk 1/3`.
+///
+/// One shape rather than three arguments because the header redraws whole every
+/// frame and wants one question answered. The counts are the loaded diff's own,
+/// computed by [`prepare`](gitten_core::prepared::prepare) out of `LineKind`
+/// before anything here ran — which is also why they can never disagree with
+/// what the file's drawn header shows: there is one copy of the numbers, and
+/// both places read it.
+pub struct FileSummary {
+    /// As the loaded diff spells it — the same string hunk staging resolves
+    /// by, so a header that copies it acts on exactly what it names.
+    pub path: String,
+    pub adds: u64,
+    pub dels: u64,
+    /// 1-based index of the hunk under the keyboard, within its file.
+    /// `0` when the file has no hunks.
+    pub hunk: usize,
+    pub hunks: usize,
+}
+
 pub struct Diff {
     /// The parsed diff, kept so a layout change can rebuild the rows.
     ///
@@ -1101,6 +1123,52 @@ impl Diff {
         let (path, hunk_no) = renderers.get(r.owner as usize)?.hunk_at(r.index as usize)?;
         let file = self.files.iter().find(|f| f.path == path)?;
         Some((path.to_string(), file.hunks.get(hunk_no)?.clone()))
+    }
+
+    /// Where the keyboard is, as the pane header names it. `None` when nothing
+    /// on screen answers: an empty diff, a cursor past the end, or a row the
+    /// presentation drew outside both vocabularies — a rendered document's
+    /// body rows are nobody's hunk and nobody's header.
+    ///
+    /// A hunk row answers through [`Rows::hunk_at`], the same address `space`
+    /// stages against, so the header and the staging question can never point
+    /// at different hunks. A file-header row owns no hunk — the spans open
+    /// below it — but it still names its file, through [`Rows::selectable`]:
+    /// a header's copyable text *is* its path (that is what makes a selection
+    /// across files paste readable), so the accessor every presentation already
+    /// implements for copying is the one place they all spell the path. One
+    /// lookup against the prepared diff either way; once per frame, not per row.
+    pub fn file_summary(&self) -> Option<FileSummary> {
+        let r = *self.order.get(self.view.get().cursor())?;
+        let index = r.index as usize;
+        let renderers = self.renderers.borrow();
+        let rows = renderers.get(r.owner as usize)?;
+
+        // Which file the keyboard is over, and which of its hunks is under it.
+        // The latter stays absent when no hunk is under it: whether such a
+        // file has any first hunk to name is the file's own fact, read below.
+        let located = match rows.hunk_at(index) {
+            Some((path, n)) => Some((path, Some(n))),
+            None if rows.is_header(index) => {
+                // Wrapping adds visual rows and never changes the logical one
+                // `index` names, so this covers the wrapped tail of a hunk
+                // line exactly as it does the line itself.
+                rows.selectable(index, 0).map(|p| (p, None))
+            }
+            _ => None,
+        }?;
+        let f = self.prepared.files.iter().find(|f| f.path == located.0)?;
+        Some(FileSummary {
+            path: located.0.to_string(),
+            adds: f.adds as u64,
+            dels: f.dels as u64,
+            // The map addresses hunks from zero because that is how the
+            // presentations enumerate them; people count from one.
+            hunk: located
+                .1
+                .map_or_else(|| usize::from(!f.hunks.is_empty()), |n| n + 1),
+            hunks: f.hunks.len(),
+        })
     }
 
     /// Arms — or confirms — a discard of the hunk on logical row `id`. The
@@ -2803,15 +2871,15 @@ mod tests {
     // By name, not a glob: `use gpui::*` in the parent shadows `#[test]` with
     // GPUI's own attribute macro and every test in here fails to expand.
     use super::{
-        line_colors, locked, row_background, Diff, Layouts, Pan, Row, Rows, TextRows, PAD, ROW_H,
-        TEXT_CHROME,
+        line_colors, locked, row_background, Diff, FileSummary, Layouts, Pan, Row, Rows, TextRows,
+        PAD, ROW_H, TEXT_CHROME,
     };
     use gitten_core::host::Host;
     use gitten_core::prepared::{prepare, File as PreparedFile};
     use gitten_core::select::{Caret, Selected, Selection};
     use gitten_core::syntax::{Kind, Token};
     use gitten_core::theme::{Style, Surface, Theme};
-    use gitten_core::{parse_unified_diff, LineKind, Span};
+    use gitten_core::{parse_unified_diff, FileDiff, LineKind, Span};
     use gpui::{
         div, rgb, AnyElement, FontStyle, FontWeight, HighlightStyle, IntoElement, ParentElement,
         ScrollStrategy,
@@ -4848,6 +4916,157 @@ diff --git a/two.txt b/two.txt
             d.run_view("view.up", &host);
         }
         assert!(d.current_hunk().is_none(), "row 0 is the first file header");
+    }
+
+    // ---------------------------------------------------------- file summary
+
+    /// Two files, two hunks each, with totals the other file does not share —
+    /// so a summary resolved against the wrong one fails loudly. `one.txt` is
+    /// +2 −2, `two.txt` is +3 −3.
+    const TWO_FILES_TWO_HUNKS: &str = "\
+diff --git a/one.txt b/one.txt
+--- a/one.txt
++++ b/one.txt
+@@ -1,4 +1,4 @@
+ alpha
+-beta
++BETA
+ gamma
+ delta
+@@ -10,4 +10,4 @@
+-epsilon old
+ zeta
++inserted
+ eta
+ theta
+diff --git a/two.txt b/two.txt
+--- a/two.txt
++++ b/two.txt
+@@ -1,3 +1,3 @@
+ one
+-two old
++two new
+ three
+@@ -20,4 +21,4 @@
+ four
+-five old
+-five more old
++five new
++six new
+ seven
+";
+
+    #[test]
+    fn the_summary_names_the_file_and_hunk_the_keyboard_is_in() {
+        let host = Host::new();
+        let mut d = Diff::with_layouts(
+            parse_unified_diff(TWO_FILES_TWO_HUNKS),
+            &host,
+            Layouts::builtin(),
+        );
+        with_height(&mut d, 30);
+
+        // Unified rows: 0 header; hunk 0 owns 1..=6 (header + five lines);
+        // hunk 1 owns 7..=12. Row 8 — eight downs — is inside the *second*
+        // hunk of one.txt.
+        for _ in 0..8 {
+            d.run_view("view.down", &host);
+        }
+        let s: FileSummary = d.file_summary().expect("on a hunk");
+        assert_eq!(s.path, "one.txt");
+        assert_eq!((s.adds, s.dels), (2, 2));
+        assert_eq!((s.hunk, s.hunks), (2, 2));
+
+        // Twenty-one rows down is still two.txt's second hunk, and its totals
+        // are its own: resolve the summary by path and this passes, resolve it
+        // against whichever file comes first and it cannot.
+        for _ in 8..21 {
+            d.run_view("view.down", &host);
+        }
+        let s = d.file_summary().expect("still on a hunk");
+        assert_eq!(s.path, "two.txt");
+        assert_eq!((s.adds, s.dels), (3, 3));
+        assert_eq!((s.hunk, s.hunks), (2, 2));
+    }
+
+    #[test]
+    fn a_header_row_says_hunk_one_unless_the_file_has_none() {
+        let host = Host::new();
+
+        // A fresh view opens on row 0, which is one.txt's header. The file has
+        // hunks, so "first" exists and is 1.
+        let d = Diff::with_layouts(
+            parse_unified_diff(TWO_FILES_TWO_HUNKS),
+            &host,
+            Layouts::builtin(),
+        );
+        let s = d.file_summary().expect("on a header");
+        assert_eq!(s.path, "one.txt");
+        assert_eq!((s.adds, s.dels), (2, 2));
+        assert_eq!((s.hunk, s.hunks), (1, 2));
+
+        // The second file's header answers with the second file's own counts.
+        let mut d = Diff::with_layouts(
+            parse_unified_diff(TWO_FILES_TWO_HUNKS),
+            &host,
+            Layouts::builtin(),
+        );
+        with_height(&mut d, 30);
+        for _ in 0..13 {
+            d.run_view("view.down", &host);
+        }
+        let s = d.file_summary().expect("on the second header");
+        assert_eq!(s.path, "two.txt");
+        assert_eq!((s.adds, s.dels), (3, 3));
+        assert_eq!((s.hunk, s.hunks), (1, 2));
+
+        // A file with no hunks at all has no first to point at: 0, and zeroed
+        // counts. Built by hand because a unified patch with headers and no
+        // hunks is not text the parser owes an opinion about.
+        let d = Diff::with_layouts(
+            vec![FileDiff {
+                path: "bin.dat".into(),
+                hunks: Vec::new(),
+            }],
+            &host,
+            Layouts::builtin(),
+        );
+        let s = d.file_summary().expect("its header is still there");
+        assert_eq!(s.path, "bin.dat");
+        assert_eq!((s.adds, s.dels), (0, 0));
+        assert_eq!((s.hunk, s.hunks), (0, 0));
+    }
+
+    #[test]
+    fn split_answers_the_same_file_from_fewer_rows() {
+        // Collapsing replace pairs onto one row moves every later row; the
+        // summary must come out identical anyway, because it reads the map
+        // each presentation keeps rather than counting rows itself.
+        let mut host = Host::new();
+        host.layout = "split".into();
+        let mut d = Diff::with_layouts(
+            parse_unified_diff(TWO_FILES_TWO_HUNKS),
+            &host,
+            Layouts::builtin(),
+        );
+        with_height(&mut d, 30);
+
+        // The same walk that lands on hunk 1's pair in unified lands on it in
+        // split too — six downs from the top.
+        for _ in 0..6 {
+            d.run_view("view.down", &host);
+        }
+        let s = d.file_summary().expect("on a hunk in split");
+        assert_eq!(s.path, "one.txt");
+        assert_eq!((s.adds, s.dels), (2, 2));
+        assert_eq!((s.hunk, s.hunks), (2, 2));
+    }
+
+    #[test]
+    fn an_empty_diff_has_nothing_to_name() {
+        let host = Host::new();
+        let d = Diff::with_layouts(Vec::new(), &host, Layouts::builtin());
+        assert!(d.file_summary().is_none());
     }
 
     #[test]

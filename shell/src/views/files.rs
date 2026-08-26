@@ -127,16 +127,21 @@ impl Mark {
         }
     }
 
+    /// The ink each state draws in. Adds and deletes borrow the diff palette,
+    /// where those two words already have colours a theme has tuned; modify
+    /// takes the chrome accent, which is what the design points at it — it is
+    /// the every-minute state and earns the one loud furniture colour — so a
+    /// rename steps aside onto the graph's first lane ink instead. When one
+    /// working tree shows both, the two never share a colour and renames
+    /// cannot read as edits.
     fn color(self, host: &Host) -> Rgb {
         let t = &host.theme;
         match self {
-            // Additions and deletions borrow the diff palette, where those two
-            // words already have colours a theme has tuned.
             Mark::Add => t.diff.adds_fg,
             Mark::Delete => t.diff.dels_fg,
             Mark::Conflict => t.chrome.error,
-            Mark::Rename => t.chrome.accent,
-            Mark::Modify => t.chrome.fg,
+            Mark::Modify => t.chrome.accent,
+            Mark::Rename => t.lanes.first().copied().unwrap_or(t.chrome.accent),
             // Rare enough not to earn a hue of its own; quieter than any of
             // the above is the right amount of loud for a typechange.
             Mark::TypeChange => t.chrome.dim,
@@ -166,6 +171,9 @@ pub(crate) struct Prepared {
     pub(crate) rows: Vec<Entry>,
     /// The title-strip line: who we are and how much changed.
     pub(crate) label: String,
+    /// The distinct-path count the label spells, kept so the pane can hand it
+    /// to the header without recounting — see [`Files::changed`].
+    pub(crate) changed: usize,
 }
 
 /// Flattens a status into display rows: one heading per non-empty section,
@@ -264,6 +272,7 @@ pub(crate) fn prepare(status: Status, describe: &str) -> Prepared {
     Prepared {
         rows,
         label: format!("{describe} · {changed} changed"),
+        changed,
     }
 }
 
@@ -304,6 +313,10 @@ pub struct Files {
     /// and only a cursor move, a wheel or a refresh can make its answer
     /// stale — none of which is a focus change.
     armed: Option<(Section, PathBytes)>,
+    /// The distinct-path count from the last refresh — what the shell's FILES
+    /// header prints. A property of the data, decided by [`prepare`] once and
+    /// read for free however often a frame wants it.
+    changed: usize,
 }
 
 impl Files {
@@ -318,7 +331,7 @@ impl Files {
     }
 
     pub(crate) fn from_prepared(prepared: Prepared) -> Self {
-        let Prepared { rows, .. } = prepared;
+        let Prepared { rows, changed, .. } = prepared;
         Self {
             data: Rc::new(rows),
             scroll: UniformListScrollHandle::new(),
@@ -327,12 +340,20 @@ impl Files {
             pending_scroll: PendingScroll::default(),
             rendered: Rc::new(Cell::new(0)),
             armed: None,
+            changed,
         }
     }
 
     /// Whether the working tree had nothing to say — the empty state's trigger.
     pub fn is_clean(&self) -> bool {
         self.data.is_empty()
+    }
+
+    /// How many distinct paths changed as of the last refresh — what the
+    /// shell's FILES header prints. Computed once by [`prepare`] for the
+    /// title label; reading it costs nothing per frame.
+    pub fn changed(&self) -> usize {
+        self.changed
     }
 
     /// Replaces repository data while keeping the selection anchored to its
@@ -358,7 +379,8 @@ impl Files {
             Some(Entry::File(f)) => Some((f.section, f.path.clone())),
             _ => None,
         };
-        let Prepared { rows, .. } = prepared;
+        let Prepared { rows, changed, .. } = prepared;
+        self.changed = changed;
         self.data = Rc::new(rows);
 
         let cursor = anchored
@@ -601,16 +623,18 @@ const GAP_CHARS: f32 = 1.5;
 impl Render for Files {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let c = crate::config::host(cx).theme.chrome;
-        // A clean tree is a sentence, not an empty box: the pane still exists,
-        // it just has nothing to list.
+        // A clean tree is a quiet line, not an empty box: this pane is a short
+        // section of the sidebar now, not a whole column, so the answer sits
+        // top-left where a reader scans and not centred where nobody looks.
         if let Some(empty) = self.is_clean().then(|| {
             div()
                 .size_full()
+                .px_3()
+                .pt_2()
                 .flex()
-                .items_center()
-                .justify_center()
+                .items_start()
                 .text_color(rgb(c.faint))
-                .child("No changes — working tree clean")
+                .child("working tree clean")
                 .into_any_element()
         }) {
             return empty;
@@ -650,7 +674,7 @@ impl Render for Files {
         })
         .track_scroll(&self.scroll)
         .size_full()
-        .p_4();
+        .px_3();
 
         // The scrollbar overlays the list, so the container must be positioned
         // — and only the vertical one: paths clip rather than pan.
@@ -1117,26 +1141,38 @@ mod tests {
         // Five entries, four paths: src/main.rs sits in staged and unstaged
         // and counts once.
         assert_eq!(prepared.label, "gitten (main) · 4 changed");
+        assert_eq!(
+            prepared.changed, 4,
+            "the count behind the label is the distinct-path count"
+        );
 
         let clean = prepare(Status::default(), "gitten (main)");
         assert_eq!(clean.label, "gitten (main) · 0 changed");
+        assert_eq!(clean.changed, 0);
         assert!(clean.rows.is_empty(), "a clean tree flattens to nothing");
+
+        // And the count travels onto the pane, so the header reads it for
+        // free — the very number `prepare` already spelled in the label.
+        assert_eq!(files(sample_status()).changed(), 4);
+        assert_eq!(files(Status::default()).changed(), 0);
     }
 
     #[test]
     fn the_shipped_keymap_resolves_the_files_binding_through_the_registry() {
         use gitten_core::command::{Code, Commands, HelpRow, Key, Keymap, Modes, Resolve};
 
-        // The command exists and the key resolves to it.
+        // The command exists and the key resolves to it. The sidebar stacks
+        // its sections in reading order, so files are first — `1`, not the
+        // pane-swap digit of the previous column design.
         let k = Keymap::builtin();
         assert_eq!(
-            k.resolve(&Modes::new(), &[Key::char('2')]),
+            k.resolve(&Modes::new(), &[Key::char('1')]),
             Resolve::Run("files.focus")
         );
-        assert_eq!(k.keys_for("files.focus"), vec!["2"]);
+        assert_eq!(k.keys_for("files.focus"), vec!["1"]);
         assert_eq!(
-            Key::parse("2"),
-            Some(Key::plain(Code::Char('2'))),
+            Key::parse("1"),
+            Some(Key::plain(Code::Char('1'))),
             "the binding round-trips through a config file's spelling"
         );
 
@@ -1149,7 +1185,7 @@ mod tests {
             .unwrap();
         assert!(rows[global..]
             .iter()
-            .any(|r| matches!(r, HelpRow::Command { keys, doc } if keys == "2" && doc == "swap the working-tree list into the column")));
+            .any(|r| matches!(r, HelpRow::Command { keys, doc, .. } if keys == "1" && doc == "focus the working-tree pane")));
     }
 
     // ------------------------------------------------------- the discard arm

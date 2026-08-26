@@ -96,7 +96,7 @@ pub fn overlay(host: &Host, modes: &gitten_core::command::Modes) -> AnyElement {
                                 .text_color(rgb(c.accent))
                                 .child(name),
                             HelpRow::Blank => div().h(px(ROW_H / 2.0)),
-                            HelpRow::Command { keys, doc } => div()
+                            HelpRow::Command { keys, doc, .. } => div()
                                 .h(px(ROW_H))
                                 .flex()
                                 .items_center()
@@ -127,7 +127,7 @@ pub(crate) fn panel_width(rows: &[HelpRow], host: &Host) -> f32 {
     let mut key_w = 0.0_f32;
     let mut doc_w = 0.0_f32;
     for row in rows {
-        if let HelpRow::Command { keys, doc } = row {
+        if let HelpRow::Command { keys, doc, .. } = row {
             key_w = key_w.max(str_px(keys, host));
             doc_w = doc_w.max(str_px(doc, host));
         }

@@ -28,12 +28,13 @@ impl<T> Panes<T> {
         }
     }
 
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// The focused tenant's index. Part of the registry API an extension
-    /// client sees; the two-region window itself no longer reads it.
+    /// client sees; the window itself no longer reads it.
     #[allow(dead_code)]
     pub fn focused_index(&self) -> usize {
         self.focused
@@ -48,6 +49,21 @@ impl<T> Panes<T> {
     /// focus moves while it is open.
     pub fn focused_name(&self) -> &str {
         &self.entries[self.focused].name
+    }
+
+    /// A tenant by its stable registration name. The sidebar renders three
+    /// named residents at once — files, branches, stashes — so drawing reads
+    /// through here instead of assuming any index is those panes'.
+    pub fn get(&self, name: &str) -> Option<&T> {
+        self.position(name).map(|at| &self.entries[at].value)
+    }
+
+    /// Every registered name, in registration order. The cycle order is
+    /// *derived* from this rather than being it: the design's number keys
+    /// name the sidebar first, so the shell walks `files, branches, stashes,
+    /// commits` and appends whatever an extension added after.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().map(|entry| entry.name.as_str())
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &T> {
@@ -81,6 +97,12 @@ impl<T> Panes<T> {
         true
     }
 
+    /// Cycles focus by an offset through the registration order. The window
+    /// cycles in the *design's* order now — [`crate::DevShell::list_order`],
+    /// sidebar first — so this is the registry's own verb and no longer the
+    /// window's; kept because it *is* the registry's cycle, which an
+    /// extension host with its own pane order would reach for.
+    #[allow(dead_code)]
     pub fn cycle(&mut self, by: isize) -> bool {
         if self.entries.len() < 2 {
             return false;

@@ -3,31 +3,30 @@ use crate::graph;
 use gitten_core::host::Host;
 use gitten_core::search;
 use gitten_core::view::Viewport;
-use gitten_core::{assign_lanes, initials, Commit};
+use gitten_core::{assign_lanes, Commit};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::scroll::Scrollbar;
 use std::cell::Cell;
 use std::rc::Rc;
 
-/// The commit column between the sha and the graph, resolved once at load: two
-/// letters and the colour they are drawn in. Not a per-frame job.
-struct Who {
-    initials: SharedString,
-    color: Rgba,
-}
-
 struct Data {
     commits: Vec<Commit>,
     draws: Vec<graph::Draw>,
-    who: Vec<Who>,
+    /// The age column, one string per commit and solved once per load:
+    /// `3h`, `2d`, `6mo`. Clock work belongs to load work twice over — a
+    /// frame would reformat all 82k answers for pixels that did not ask,
+    /// and a clock read per frame disagrees with itself row to row where a
+    /// load-time answer reads as one timestamp. See [`rel_time`] for the
+    /// bands.
+    times: Vec<SharedString>,
     /// uniform_list measures exactly ONE row to decide how wide the content is,
     /// and by default that is row 0. If row 0 is short there is nothing to
     /// scroll to, however long the rest are. Point it at the real widest row.
     widest: usize,
     /// One line per commit, the way `copy.selection` copies it — the sha and the
-    /// subject, and neither the graph nor the initials. Built at load with
-    /// everything else that is derived once.
+    /// subject, and neither the graph nor the clock beside them. Built at load
+    /// with everything else that is derived once.
     lines: Vec<String>,
     /// The same list folded for substring search — see
     /// [`gitten_core::search::Index`] for why this is load work and not
@@ -510,17 +509,25 @@ pub(crate) fn prepare(commits: Vec<Commit>, host: &Host) -> Prepared {
     let lanes = graph::lane_count(&rows);
     let t_draws = t.elapsed();
 
-    let who: Vec<Who> = commits
+    // One clock read per load and one [`rel_time`] per commit. The answer is
+    // as stale as any snapshot of the log is — the next refresh recomputes it
+    // here, the same pass that recomputes everything else — and never on a
+    // frame.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let times: Vec<SharedString> = commits
         .iter()
-        .map(|c| Who {
-            initials: initials(&c.author).into(),
-            color: rgb(host.theme.author(&c.author)),
-        })
+        .map(|c| rel_time(c.timestamp, now).into())
         .collect();
 
     // The widest row is no longer just the longest subject: every row's
     // graph is only as wide as its own lanes, so a short message behind a
-    // wide graph can still out-reach a long one on the trunk.
+    // wide graph can still out-reach a long one on the trunk. The furniture
+    // around both — the sha ahead of it, the clock behind it — is the same
+    // width on every row, so which row wins is still decided by graph +
+    // subject alone; counted in full anyway, because an honest estimate is
+    // free and survives the next column.
     //
     // One character's width comes from the host's font rather than a constant
     // measured on whatever the font used to be. It only picks which row
@@ -531,7 +538,12 @@ pub(crate) fn prepare(commits: Vec<Commit>, host: &Host) -> Prepared {
     let widest = draws
         .iter()
         .zip(&commits)
-        .map(|(d, c)| graph::row_width(d) + c.subject.len() as f32 * char_w)
+        .map(|(d, c)| {
+            SHA_CHARS * char_w
+                + graph::row_width(d)   // lanes + the GAP after them
+                + c.subject.len() as f32 * char_w
+                + (TIME_CHARS + 1.0) * char_w // the clock, plus air before it
+        })
         .enumerate()
         .max_by(|(_, a), (_, b)| a.total_cmp(b))
         .map(|(i, _)| i)
@@ -555,7 +567,7 @@ pub(crate) fn prepare(commits: Vec<Commit>, host: &Host) -> Prepared {
             search: search::Index::new(&commits),
             commits,
             draws,
-            who,
+            times,
             widest,
         },
         load,
@@ -608,7 +620,7 @@ impl Render for Commits {
                     let c = visible[i];
                     row(
                         &data.commits[c],
-                        &data.who[c],
+                        &data.times[c],
                         &data.draws[c],
                         &host,
                         i == cursor,
@@ -627,7 +639,7 @@ impl Render for Commits {
         // what turns on horizontal scrolling.
         .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
         .size_full()
-        .p_4();
+        .px_3();
 
         // The scrollbar overlays the list, so the container must be positioned.
         // `[view] scrollbar` is read per frame like every other setting: the
@@ -644,31 +656,80 @@ impl Render for Commits {
     }
 }
 
-/// The sha and the initials columns, in *characters*.
+/// Compact relative age, the way a list glances at it: `now`, `5m`, `3h`,
+/// `2d`, `4w`, `6mo`, `1y`.
 ///
-/// Twelve, because `%h` is seven in a young repository and eleven in git/git,
-/// plus the air after it. In pixels rather than characters these were 90 and 26,
-/// which is 10.7 and 3.1 in the shipped face — so an eleven-character sha
-/// overflowed its own column by two pixels while the comment above it said
-/// eleven — and 5 and 1.4 at the 18px `font.size` the config file will happily
-/// give you. Fixed columns, unlike the graph: the eye scans these vertically, so
-/// they have to *be* columns.
-const SHA_CHARS: f32 = 12.0;
-const WHO_CHARS: f32 = 3.0;
+/// Pure on purpose: the caller owns what "now" is, and here that caller is
+/// [`prepare`], which reads the clock once per load — a read per row would
+/// disagree with itself down the list. A timestamp in the future still reads
+/// as `now`: a committer's clock running ahead of ours must not print a minus
+/// sign into a column meant to be glanced at. The bands are what the eye
+/// already groups — minutes until they stop mattering, hours until a day
+/// starts it, days until a week does, then thirty to the month and three
+/// hundred sixty-five to the year, each folded with integer division because
+/// rough is the point: the alternative is a calendar.
+fn rel_time(timestamp: i64, now: i64) -> String {
+    let secs = now - timestamp;
+    if secs < 60 {
+        return "now".to_string();
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{mins}m");
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        return format!("{hours}h");
+    }
+    let days = hours / 24;
+    if days < 7 {
+        return format!("{days}d");
+    }
+    if days < 30 {
+        return format!("{}w", days / 7);
+    }
+    if days < 365 {
+        return format!("{}mo", days / 30);
+    }
+    format!("{}y", days / 365)
+}
 
-/// lazygit's order — sha, author, graph, subject — and lazygit's spacing: the
-/// subject follows its own row's graph immediately, so a commit on the trunk
-/// reads from the left instead of starting behind the widest merge in the
-/// repository.
+/// The sha column, in *characters*: twelve, because `%h` is seven in a young
+/// repository and eleven in git/git, plus the air after it. In pixels rather
+/// than characters this was 90, which is 10.7 in the shipped face — so an
+/// eleven-character sha overflowed its own column by two pixels while the
+/// comment above it said eleven. Fixed, unlike the graph: the eye scans it
+/// vertically, so it has to *be* a column.
+const SHA_CHARS: f32 = 12.0;
+
+/// The clock column, in *characters*: four covers the whole vocabulary —
+/// thirteen months still labels itself at most `12mo` — and right-alignment
+/// within it keeps a column of ages running straight down the screen instead
+/// of trailing their subjects' ragged ends. Fixed like the sha, for the same
+/// reason.
+const TIME_CHARS: f32 = 4.0;
+
+/// The mock's order — graph, sha, subject, clock — with lazygit's spacing kept
+/// where it earned its place: the subject follows its own row's graph
+/// immediately, so a commit on the trunk reads from the left instead of
+/// starting behind the widest merge in the repository.
+///
+/// The clock is pushed to the row's right edge by `ml_auto` against a fixed
+/// four-character cell, right-aligned inside it, so ages sit in one vertical
+/// line no matter where their subjects stop.
 ///
 /// `current` paints the keyboard's row in `chrome.selection_bg`, the one colour
 /// the terminal uses for exactly this, so the cursor is visible wherever the
-/// keymap moves it. `armed` tints the sha and subject toward `chrome.error`,
-/// so the commit a second press would reset to is named by its own colour
-/// and not only by the band above it.
+/// keymap moves it. `armed` tints the sha, subject and clock toward
+/// `chrome.error`, so the commit a second press would reset to is named by its
+/// own colour and not only by the band above it. `min_w_full` carries all of
+/// that past the last character: a background that stops at the subject leaves
+/// a ragged margin down a wall of rows — the same rule the diff view's rows
+/// keep — while leaving the widest-row measurement alone, which runs against
+/// max content where a percentage minimum drops out anyway.
 fn row(
     c: &Commit,
-    who: &Who,
+    time: &SharedString,
     d: &graph::Draw,
     host: &Rc<Host>,
     current: bool,
@@ -678,11 +739,13 @@ fn row(
     div()
         .flex()
         .items_center()
+        .min_w_full()
         .h(px(graph::ROW_H))
         .bg(rgb(match current {
             true => host.theme.chrome.selection_bg,
             false => host.theme.chrome.bg,
         }))
+        .child(graph::row_canvas(d.clone(), host.clone()))
         .child(
             div()
                 .flex_none()
@@ -699,18 +762,27 @@ fn row(
         .child(
             div()
                 .flex_none()
-                .w(px(WHO_CHARS * ch))
-                .text_color(who.color)
-                .child(who.initials.clone()),
-        )
-        .child(graph::row_canvas(d.clone(), host.clone()))
-        .child(
-            div()
-                .flex_none()
                 // Unarmed keeps the inherited ink; only the question
                 // repaints the row.
                 .when(armed, |d| d.text_color(rgb(host.theme.chrome.error)))
                 .child(c.subject.clone()),
+        )
+        .child(
+            div()
+                .flex_none()
+                .ml_auto()
+                .w(px(TIME_CHARS * ch))
+                .justify_end()
+                // Faint rather than dim, and below it in the palette on
+                // purpose: furniture looked up once per glance and not text
+                // to be read — the same floor reasoning that lets the diff's
+                // gutter recede. Armed reaches here too, so the whole row
+                // asks together.
+                .text_color(rgb(match armed {
+                    true => host.theme.chrome.error,
+                    false => host.theme.chrome.faint,
+                }))
+                .child(time.clone()),
         )
         .into_any_element()
 }
@@ -720,6 +792,7 @@ mod tests {
     // By name, not a glob: `use gpui::*` in the parent shadows `#[test]` with
     // GPUI's own attribute macro and every test in here fails to expand.
     use super::graph;
+    use super::rel_time;
     use super::Commits;
     use gitten_core::host::Host;
     use gitten_core::Commit;
@@ -1185,6 +1258,78 @@ mod tests {
             Some(anchored.as_str())
         );
         assert_eq!(c.filter_note().as_deref(), Some("16/31"));
+    }
+
+    // ----------------------------------------------------------------- clock
+
+    /// A fixed "now", so every age under test is a function of seconds alone
+    /// — the same purity [`rel_time`]'s caller hands it a timestamp for.
+    const NOW: i64 = 1_700_000_000;
+
+    #[test]
+    fn rel_time_reads_now_for_the_recent_and_the_future_alike() {
+        assert_eq!(rel_time(NOW, NOW), "now");
+        assert_eq!(rel_time(NOW - 59, NOW), "now", "59 seconds is still now");
+        assert_eq!(
+            rel_time(NOW + 120, NOW),
+            "now",
+            "a committer's clock ahead of ours prints no minus sign"
+        );
+    }
+
+    #[test]
+    fn rel_time_climbs_through_minutes_hours_and_days() {
+        assert_eq!(
+            rel_time(NOW - 60, NOW),
+            "1m",
+            "the minute band opens at 60s"
+        );
+        assert_eq!(
+            rel_time(NOW - 3_599, NOW),
+            "59m",
+            "the last minute before an hour"
+        );
+        assert_eq!(rel_time(NOW - 3_600, NOW), "1h");
+        assert_eq!(rel_time(NOW - 86_400, NOW), "1d");
+        assert_eq!(
+            rel_time(NOW - 6 * 86_400, NOW),
+            "6d",
+            "the last day inside the week band"
+        );
+    }
+
+    #[test]
+    fn rel_time_folds_weeks_months_and_years_to_whole_numbers() {
+        assert_eq!(
+            rel_time(NOW - 7 * 86_400, NOW),
+            "1w",
+            "the week band opens at 7d"
+        );
+        assert_eq!(
+            rel_time(NOW - 29 * 86_400, NOW),
+            "4w",
+            "the last week inside the month band"
+        );
+        assert_eq!(
+            rel_time(NOW - 30 * 86_400, NOW),
+            "1mo",
+            "the month band opens at 30d"
+        );
+        assert_eq!(
+            rel_time(NOW - 364 * 86_400, NOW),
+            "12mo",
+            "and `12mo` is four characters wide"
+        );
+        assert_eq!(
+            rel_time(NOW - 365 * 86_400, NOW),
+            "1y",
+            "the year band opens at 365d"
+        );
+        assert_eq!(
+            rel_time(NOW - 800 * 86_400, NOW),
+            "2y",
+            "past three hundred sixty-five days the calendar stops being consulted"
+        );
     }
 
     // ------------------------------------------------------------ arming

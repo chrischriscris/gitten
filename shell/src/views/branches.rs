@@ -1,11 +1,14 @@
 //! The repository's branches, as a list.
 //!
-//! lazygit's Branches panel, viewer half: local branches first — HEAD's own
-//! row marked, each tracking pair's distance spelled `↑n`/`↓n` where git can
-//! measure it — then a quiet group of the remote-tracking refs the last fetch
-//! left behind. Detached HEAD draws as its own top row rather than hiding:
-//! half a bisect, a rebase in progress and "just looking at yesterday" are
-//! states worth seeing named, and [`HeadState`] already carries them as data.
+//! lazygit's Branches panel, viewer half: local branches first — each opening
+//! with a one-character dot that says what it *is* (HEAD in the accent, every
+//! other local in a lane ink of its own, remote-tracking copies hollow and
+//! faint) — with each tracking pair's **distance** spelled compactly
+//! `↑n`/`↓n` where git can measure it. The upstream ref is not repeated on
+//! the row: those refs sit below as rows of their own. Detached HEAD draws
+//! as its own top row rather than hiding: half a bisect, a rebase in
+//! progress and "just looking at yesterday" are states worth seeing named,
+//! and [`HeadState`] already carries them as data.
 //!
 //! The list idioms are [`super::files`]'s, on purpose: one `Viewport`, one
 //! scroll-handle dance, rows flattened **once per refresh** into owned display
@@ -16,6 +19,7 @@ use crate::graph::ROW_H;
 use gitten_core::host::Host;
 use gitten_core::refs::{Branch, HeadState, RemoteBranch, Upstream};
 use gitten_core::status::PathBytes;
+use gitten_core::theme::{Rgb, Theme};
 use gitten_core::view::Viewport;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
@@ -26,13 +30,16 @@ use std::rc::Rc;
 /// One flat row of the pane.
 ///
 /// Flattened once per refresh — never per frame. Everything a draw needs that
-/// costs allocation (the lossy names, the upstream line, the spelled-out
-/// counts) is computed at flatten time; what a draw reads per frame is an
-/// enum match and a refcount bump.
+/// costs allocation (the lossy names, the tracking distance, the spelled-out
+/// counts) or a decision (each dot's ink) is computed at flatten time; what a
+/// draw reads per frame is an enum match and a refcount bump.
 #[derive(Debug)]
 pub(crate) enum Row {
     /// Detached HEAD, its own top row: the honest state, not hidden.
     Detached {
+        /// The row's dot — [`Dot`] so the state draws in its own ink like
+        /// every other ref, dim where a branch would glow.
+        dot: Dot,
         /// `(detached at abc12345…)` — abbreviated once, at flatten.
         text: SharedString,
     },
@@ -44,6 +51,23 @@ pub(crate) enum Row {
     },
     Local(LocalRow),
     Remote(RemoteRow),
+}
+
+/// The coloured mark that opens every ref row: one character wide, decided
+/// entirely at flatten — glyph **and** `Rgb` stored on the row — so the draw
+/// never consults the theme, cycles nothing and allocates nothing for it.
+///
+/// The design's grammar: a filled ● is a ref living locally, tinted by what
+/// the row *is* — HEAD alone wears the accent, other locals borrow graph-lane
+/// inks so each branch keeps one colour across the app — while a hollow ○
+/// marks a remote-tracking copy, faint because it names what a fetch already
+/// fetched, not anything checked out here.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Dot {
+    /// `●` locally, `○` for the remote copies.
+    pub glyph: &'static str,
+    /// Handled out at flatten with everything else a draw needs to be free.
+    pub color: Rgb,
 }
 
 /// Which group a row sits under — the two halves of the ref namespace a
@@ -66,19 +90,19 @@ impl Section {
 /// One local branch.
 #[derive(Debug)]
 pub(crate) struct LocalRow {
-    /// HEAD is attached here — the one row that earns its marker.
-    pub head: bool,
     /// The addressing form, byte for byte. Never decoded in place.
     pub name: PathBytes,
     /// The display form, decoded lossily once at flatten.
     pub name_text: SharedString,
-    /// What its tracking pair says, pre-rendered: `origin/main ↑1 ↓2` when
-    /// git can measure, the pair plus `(gone)` when the upstream's ref has
-    /// vanished, `None` when the branch tracks nothing.
-    pub upstream: Option<SharedString>,
-    /// True when that pair exists but cannot be compared — the state the
-    /// word *gone* names, drawn faint so it never reads as "in sync".
+    /// What its tracking pair says, pre-rendered as **distance only** — see
+    /// [`upstream_counts`]. `None` draws no cell at all: the branch tracks
+    /// nothing, or is in sync with what it tracks.
+    pub counts: Option<SharedString>,
+    /// True when a pair exists but cannot be compared — the state the word
+    /// *gone* names, drawn faint so it never reads as "in sync".
     pub gone: bool,
+    /// The row's dot, decided once — HEAD accent, otherwise lane ink.
+    pub dot: Dot,
 }
 
 /// One remote-tracking branch, as the last fetch left it.
@@ -92,6 +116,8 @@ pub(crate) struct RemoteRow {
     /// halves above stay separate because the join loses information: a
     /// remote's name may contain a slash.
     pub label: SharedString,
+    /// The row's dot — hollow and faint, the grammar for "a fetched copy".
+    pub dot: Dot,
 }
 
 /// What the keyboard is on, as verbs aim at it: bytes, never display text.
@@ -110,49 +136,60 @@ pub(crate) enum Target {
     Detached,
 }
 
-/// The upstream half of one local row, rendered once.
+/// The distance half of one local row, rendered once.
 ///
 /// Zeros stay silent — an in-sync branch reads as a bare name, and `↑0 ↓0`
-/// is furniture nobody reads past the first time. Unknowable is the other
-/// word: a pair configured against a ref that is no longer there gets
-/// `(gone)` beside it, faint, because a missing number must not dress up as
-/// a zero.
-fn upstream_line(u: &Upstream) -> (SharedString, bool) {
-    let mut text = format!(
-        "{}/{}",
-        u.remote.to_string_lossy(),
-        u.branch.to_string_lossy()
-    );
-    match (u.ahead, u.behind) {
-        (Some(ahead), Some(behind)) => {
-            if ahead > 0 {
-                text.push_str(&format!(" ↑{ahead}"));
+/// is furniture nobody reads past the first time; both zeros collapse to
+/// `None`, so the pane draws no cell at all. Unknowable is the other word:
+/// a pair configured against a ref that is no longer there gets `(gone)`,
+/// faint, because a missing number must not dress up as a zero. A `None`
+/// on either side means the comparison failed, not half of it, so the word
+/// covers both.
+///
+/// The upstream **ref** is deliberately absent — `origin/main ↑1 ↓2` here is
+/// exactly what the design takes away — because the remote-tracking branch
+/// already sits below as its own row: naming it twice spends the row's width
+/// to say nothing new, and what remains is the only part a glance reads.
+fn upstream_counts(u: &Upstream) -> (Option<SharedString>, bool) {
+    let mut text = String::new();
+    for (count, arrow) in [(u.ahead, "↑"), (u.behind, "↓")] {
+        let Some(n) = count else {
+            return (Some(SharedString::from("(gone)")), true);
+        };
+        if n > 0 {
+            // Joined by a single space; the first arrow comes alone.
+            if !text.is_empty() {
+                text.push(' ');
             }
-            if behind > 0 {
-                text.push_str(&format!(" ↓{behind}"));
-            }
-            (text.into(), false)
-        }
-        _ => {
-            text.push_str(" (gone)");
-            (text.into(), true)
+            text.push_str(arrow);
+            text.push_str(&n.to_string());
         }
     }
+    (
+        (!text.is_empty()).then_some(text).map(SharedString::from),
+        false,
+    )
 }
 
 /// Flattens the repository's refs into display rows: detached HEAD first,
 /// then the local branches, then the remote group. Pure — the unit-tested
-/// half of a refresh.
+/// half of a refresh. The theme rides along because each dot's ink is a
+/// flatten-time decision: it lands on the row, not on the render path.
 pub(crate) fn flatten(
     local: &[Branch],
     remotes: &[RemoteBranch],
     head: Option<&HeadState>,
+    theme: &Theme,
 ) -> Vec<Row> {
     let mut rows = Vec::new();
     if let Some(HeadState::Detached { commit }) = head {
         // Eight characters is what `git log --oneline` abbreviates to and
         // what every git UI shows; the full OID stays in the model.
         rows.push(Row::Detached {
+            dot: Dot {
+                glyph: "●",
+                color: theme.chrome.dim,
+            },
             text: format!("(detached at {}…)", &commit[..commit.len().min(8)]).into(),
         });
     }
@@ -161,17 +198,28 @@ pub(crate) fn flatten(
             count: SharedString::from(local.len().to_string()),
             section: Section::Local,
         });
-        rows.extend(local.iter().map(|b| {
-            let (upstream, gone) = b.upstream.as_ref().map_or((None, false), |u| {
-                let (text, gone) = upstream_line(u);
-                (Some(text), gone)
-            });
+        rows.extend(local.iter().enumerate().map(|(i, b)| {
+            let (counts, gone) = b.upstream.as_ref().map_or((None, false), upstream_counts);
+            // HEAD's branch alone wears the accent; every other local keeps
+            // one lane ink for its whole life in this pane. The index is the
+            // row's place among locals whether or not HEAD marks it, so a
+            // checkout that moves paints only the one dot it moved.
+            let dot = match b.head {
+                true => Dot {
+                    glyph: "●",
+                    color: theme.chrome.accent,
+                },
+                false => Dot {
+                    glyph: "●",
+                    color: theme.lane(i),
+                },
+            };
             Row::Local(LocalRow {
-                head: b.head,
                 name: b.name.clone(),
                 name_text: b.display().into_owned().into(),
-                upstream,
+                counts,
                 gone,
+                dot,
             })
         }));
     }
@@ -190,10 +238,48 @@ pub(crate) fn flatten(
                 remote: r.remote.clone(),
                 branch: r.branch.clone(),
                 label: label.into(),
+                // Hollow and faint: a fetched copy of elsewhere, never a
+                // state of this checkout.
+                dot: Dot {
+                    glyph: "○",
+                    color: theme.chrome.faint,
+                },
             })
         }));
     }
     rows
+}
+
+/// What the title strip names about HEAD: the attached branch and its
+/// tracking distance. The distance is passed through verbatim rather than
+/// re-spelled, because core has already decided what an unknowable means
+/// and dressing that up as a zero here would be wrong exactly where it
+/// matters — a push/pull badge reading "nothing to do" when it cannot know.
+///
+/// Attached without a matching local row (an unborn branch's honest state)
+/// yields `None`: nothing is invented to fill the slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadInfo {
+    /// The branch HEAD sits on, display form, decoded once.
+    pub branch: SharedString,
+    /// Commits to push. `None` while git cannot compare — including gone.
+    pub ahead: Option<u32>,
+    /// Commits to pull. `None` under the same conditions as [`HeadInfo::ahead`].
+    pub behind: Option<u32>,
+}
+
+/// Reads [`HeadInfo`] off the model. Pure — the unit-tested half of what the
+/// title strip asks about this pane.
+fn head_info(head: Option<&HeadState>, local: &[Branch]) -> Option<HeadInfo> {
+    match head {
+        Some(HeadState::Branch { .. }) => {}
+        _ => return None,
+    }
+    local.iter().find(|b| b.head).map(|b| HeadInfo {
+        branch: b.display().into_owned().into(),
+        ahead: b.upstream.as_ref().and_then(|u| u.ahead),
+        behind: b.upstream.as_ref().and_then(|u| u.behind),
+    })
 }
 
 /// [`flatten`] plus what the title strip says about it. The load line goes to
@@ -203,6 +289,7 @@ pub(crate) fn prepare(
     local: Vec<Branch>,
     remotes: Vec<RemoteBranch>,
     head: Option<HeadState>,
+    theme: &Theme,
     describe: &str,
 ) -> Prepared {
     let t = std::time::Instant::now();
@@ -211,16 +298,20 @@ pub(crate) fn prepare(
         local.len(),
         remotes.len()
     );
-    let rows = flatten(&local, &remotes, head.as_ref());
+    let rows = flatten(&local, &remotes, head.as_ref(), theme);
+    let head = head_info(head.as_ref(), &local);
     eprintln!("branches: {label} · flatten {:.0?}", t.elapsed());
-    Prepared { rows, label }
+    Prepared { rows, label, head }
 }
 
-/// The whole branches panel flattened to rows, plus the title-strip line.
+/// The whole branches panel flattened to rows, plus the title-strip line and
+/// who HEAD is.
 pub(crate) struct Prepared {
     pub(crate) rows: Vec<Row>,
     /// The title-strip line: who we are and how much there is.
     pub(crate) label: String,
+    /// Who HEAD is, read by the window's title strip. `None` while detached.
+    pub(crate) head: Option<HeadInfo>,
 }
 
 /// The branches pane. Holds flattened rows behind an `Rc`, so a refresh swaps
@@ -242,6 +333,11 @@ pub struct Branches {
     /// The delete awaiting its second press. One slot — arming a different
     /// row moves the question, it does not queue two.
     armed: Option<Target>,
+    /// Who HEAD is as of the last refresh, for the window's title strip:
+    /// the attached branch and its tracking distance. `None` while detached,
+    /// which is a state worth reading on the row above instead of inventing
+    /// a branch to name here.
+    head: Option<HeadInfo>,
 }
 
 impl Branches {
@@ -255,7 +351,7 @@ impl Branches {
     }
 
     pub(crate) fn from_prepared(prepared: Prepared) -> Self {
-        let Prepared { rows, .. } = prepared;
+        let Prepared { rows, head, .. } = prepared;
         Self {
             data: Rc::new(rows),
             scroll: UniformListScrollHandle::new(),
@@ -264,6 +360,7 @@ impl Branches {
             pending_scroll: PendingScroll::default(),
             rendered: Rc::new(Cell::new(0)),
             armed: None,
+            head,
         }
     }
 
@@ -279,6 +376,13 @@ impl Branches {
         &self.data
     }
 
+    /// Who HEAD is, for anything outside this pane: the window's title strip
+    /// reads this at most once per frame. Cloned rather than borrowed because
+    /// readers sit across an entity boundary; it is one small struct.
+    pub fn head_info(&self) -> Option<HeadInfo> {
+        self.head.clone()
+    }
+
     pub(crate) fn replace_prepared(&mut self, prepared: Prepared, host: &Host) {
         // A refresh is the repository saying things moved; an armed delete
         // was a promise about how they were, so it dies here first.
@@ -289,7 +393,8 @@ impl Branches {
         // heading is a fact about the last refresh's grouping, not a thing
         // the eye was reading.
         let anchored = self.data.get(old.cursor()).and_then(row_target);
-        let Prepared { rows, .. } = prepared;
+        let Prepared { rows, head, .. } = prepared;
+        self.head = head;
         self.data = Rc::new(rows);
 
         let cursor = anchored
@@ -505,7 +610,8 @@ fn row_target(row: &Row) -> Option<Target> {
     }
 }
 
-/// Air around the head marker, in characters.
+/// Air between two text runs that share a row — a heading's count, a name
+/// and the distance trailing it — in characters.
 const MARK_CHARS: f32 = 1.5;
 
 impl Render for Branches {
@@ -559,7 +665,7 @@ impl Render for Branches {
         })
         .track_scroll(&self.scroll)
         .size_full()
-        .p_4();
+        .px_3();
 
         div()
             .relative()
@@ -591,7 +697,14 @@ fn row(e: &Row, host: &Host, current: bool, armed: bool) -> AnyElement {
             false => c.bg,
         }));
     match e {
-        Row::Detached { text } => base
+        Row::Detached { dot, text } => base
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(ch))
+                    .text_color(rgb(dot.color))
+                    .child(SharedString::from(dot.glyph)),
+            )
             .child(
                 div()
                     .flex_none()
@@ -617,16 +730,13 @@ fn row(e: &Row, host: &Host, current: bool, armed: bool) -> AnyElement {
             .into_any_element(),
         Row::Local(l) => base
             .child(
-                // A fixed-width marker column, empty where HEAD is not: the
-                // names align whether or not their row owns the mark.
+                // The dot was decided beside the text, at flatten; the draw
+                // only paints it. One character wide, so every name aligns.
                 div()
                     .flex_none()
                     .w(px(ch))
-                    .child(match l.head {
-                        true => SharedString::from("*"),
-                        false => SharedString::default(),
-                    })
-                    .text_color(rgb(c.accent)),
+                    .text_color(rgb(l.dot.color))
+                    .child(SharedString::from(l.dot.glyph)),
             )
             .child(
                 div()
@@ -634,10 +744,14 @@ fn row(e: &Row, host: &Host, current: bool, armed: bool) -> AnyElement {
                     .when(armed, |d| d.text_color(rgb(c.error)))
                     .child(l.name_text.clone()),
             )
-            .children(l.upstream.clone().map(|text| {
+            .children(l.counts.clone().map(|text| {
                 div()
                     .flex_none()
-                    .ml(px(MARK_CHARS * ch))
+                    // The auto margin carries the distance to the row's far
+                    // end however wide its name ran; the padding is the floor
+                    // under that — the air a squeezed name still leaves.
+                    .ml_auto()
+                    .pl(px(MARK_CHARS * ch))
                     .text_color(rgb(match l.gone {
                         true => c.faint,
                         false => c.dim,
@@ -646,9 +760,13 @@ fn row(e: &Row, host: &Host, current: bool, armed: bool) -> AnyElement {
             }))
             .into_any_element(),
         Row::Remote(r) => base
-            // No marker of its own — remotes cannot be where HEAD is — but
-            // the same empty column keeps both namespaces aligned.
-            .child(div().flex_none().w(px(ch)))
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(ch))
+                    .text_color(rgb(r.dot.color))
+                    .child(SharedString::from(r.dot.glyph)),
+            )
             .child(
                 div()
                     .flex_none()
@@ -662,9 +780,12 @@ fn row(e: &Row, host: &Host, current: bool, armed: bool) -> AnyElement {
 
 #[cfg(test)]
 mod tests {
-    use super::{flatten, prepare, row_target, Branches, Prepared, Row, Target};
+    use super::{
+        flatten, head_info, prepare, row_target, Branches, HeadInfo, Prepared, Row, Target,
+    };
     use gitten_core::host::Host;
     use gitten_core::refs::{Branch, HeadState, RefName, RemoteBranch, Upstream};
+    use gitten_core::theme::Theme;
 
     /// A full-length OID-looking commit id, for shapes rather than values.
     fn sha() -> String {
@@ -700,63 +821,99 @@ mod tests {
         }
     }
 
-    /// Headings and rows in draw order — the shape the tests read.
+    /// Headings and rows in draw order — the shape the tests read. The dots'
+    /// glyphs ride along because a column is only useful while it aligns;
+    /// each row's *colour* argument stays beside that row, in its own test.
     fn outline(rows: &[Row]) -> Vec<String> {
         rows.iter()
             .map(|r| match r {
-                Row::Detached { text } => format!("[detached {text}]"),
+                Row::Detached { dot, text } => format!("{}[detached {text}]", dot.glyph),
                 Row::Heading { count, section } => {
                     format!("[{}·{count}]", section.name())
                 }
-                Row::Local(l) => {
-                    let star = if l.head { "*" } else { "" };
-                    match &l.upstream {
-                        Some(u) => format!("{star}{} {u}", l.name_text),
-                        None => format!("{star}{}", l.name_text),
-                    }
-                }
-                Row::Remote(r) => r.label.to_string(),
+                Row::Local(l) => match &l.counts {
+                    Some(c) => format!("{}{} {c}", l.dot.glyph, l.name_text),
+                    None => format!("{}{}", l.dot.glyph, l.name_text),
+                },
+                Row::Remote(r) => format!("{}{}", r.dot.glyph, r.label),
             })
             .collect()
     }
 
     #[test]
     fn locals_come_first_and_the_remote_group_is_quiet_but_there() {
+        let t = Theme::dark();
         let rows = flatten(
             &[local("feature", false), local("main", true)],
             &[remote("main"), remote("wip")],
             None,
+            &t,
         );
         assert_eq!(
             outline(&rows),
             vec![
                 "[local·2]",
-                "feature",
-                "*main",
+                "●feature",
+                "●main",
                 "[remote·2]",
-                "origin/main",
-                "origin/wip",
+                "○origin/main",
+                "○origin/wip",
             ]
         );
+        // The dots say what every row is: HEAD's branch alone wears the
+        // accent, another local keeps the lane ink for its place among the
+        // locals, and a fetched copy draws hollow and faint.
+        match (&rows[1], &rows[2]) {
+            (Row::Local(feature), Row::Local(main)) => {
+                assert_eq!(
+                    feature.dot.color,
+                    t.lane(0),
+                    "the first local takes the first lane ink"
+                );
+                assert_eq!(
+                    main.dot.color, t.chrome.accent,
+                    "HEAD alone earns the accent"
+                );
+            }
+            other => panic!("two local rows expected, got {other:?}"),
+        }
+        for row in [&rows[4], &rows[5]] {
+            match row {
+                Row::Remote(r) => assert_eq!(
+                    (r.dot.glyph, r.dot.color),
+                    ("○", t.chrome.faint),
+                    "a remote copy is hollow and quiet"
+                ),
+                other => panic!("a remote row expected, got {other:?}"),
+            }
+        }
         // An empty group draws no heading at all.
         assert_eq!(
-            outline(&flatten(&[local("main", true)], &[], None)),
-            vec!["[local·1]", "*main"]
+            outline(&flatten(&[local("main", true)], &[], None, &t)),
+            vec!["[local·1]", "●main"]
         );
     }
 
     #[test]
     fn a_detached_head_is_its_own_top_row_not_a_hidden_state() {
+        let t = Theme::dark();
         let rows = flatten(
             &[local("main", false)],
             &[],
             Some(&HeadState::Detached { commit: sha() }),
+            &t,
         );
         assert_eq!(
             outline(&rows)[0],
-            "[detached (detached at 01234567…)]",
+            "●[detached (detached at 01234567…)]",
             "abbreviated once, at flatten"
         );
+        // A detached state is real but not alive: dim where a checked-out
+        // branch would glow.
+        match &rows[0] {
+            Row::Detached { dot, .. } => assert_eq!(dot.color, t.chrome.dim),
+            other => panic!("the detached row expected, got {other:?}"),
+        }
         // And attached heads put no such row anywhere.
         let attached = flatten(
             &[local("main", true)],
@@ -765,12 +922,14 @@ mod tests {
                 name: RefName::from("main"),
                 commit: None,
             }),
+            &t,
         );
         assert!(!outline(&attached).iter().any(|r| r.contains("detached")));
     }
 
     #[test]
     fn tracking_speaks_in_arrows_and_zeros_stay_silent() {
+        let t = Theme::dark();
         let rows = flatten(
             &[
                 tracked("synced", false, Some(0), Some(0)),
@@ -780,17 +939,24 @@ mod tests {
             ],
             &[],
             None,
+            &t,
         );
         assert_eq!(
             outline(&rows),
             vec![
                 "[local·4]",
-                "synced origin/synced",
-                "ahead origin/ahead ↑2",
-                "*behind origin/behind ↓3",
-                "both origin/both ↑1 ↓4",
-            ]
+                "●synced",
+                "●ahead ↑2",
+                "●behind ↓3",
+                "●both ↑1 ↓4",
+            ],
+            "distance only — the ref itself is the remote group's job"
         );
+        // Fully in sync draws nothing at all: `None`, not an empty string.
+        match &rows[1] {
+            Row::Local(l) => assert_eq!(l.counts, None, "an in-sync branch is bare"),
+            other => panic!("the synced row expected, got {other:?}"),
+        }
     }
 
     #[test]
@@ -798,11 +964,15 @@ mod tests {
         // ahead/behind `None` with the pair still configured: the ref the
         // branch tracks no longer exists locally. A `0` here would invite a
         // push that fixes nothing.
-        let rows = flatten(&[tracked("old", false, None, None)], &[], None);
-        assert_eq!(outline(&rows), vec!["[local·1]", "old origin/old (gone)"]);
+        let t = Theme::dark();
+        let rows = flatten(&[tracked("old", false, None, None)], &[], None, &t);
+        assert_eq!(outline(&rows), vec!["[local·1]", "●old (gone)"]);
         // The row remembers why, for the faint ink the draw gives it.
         match &rows[1] {
-            Row::Local(l) => assert!(l.gone),
+            Row::Local(l) => {
+                assert!(l.gone);
+                assert_eq!(l.counts.as_deref(), Some("(gone)"));
+            }
             other => panic!("the tracked row expected, got {other:?}"),
         }
     }
@@ -810,6 +980,7 @@ mod tests {
     #[test]
     fn names_keep_their_bytes_and_display_lossily_once() {
         // Latin-1 é and ø: legal ref bytes, illegal UTF-8.
+        let t = Theme::dark();
         let rows = flatten(
             &[Branch {
                 name: RefName::from_bytes(b"f\xe9ature"),
@@ -821,6 +992,7 @@ mod tests {
                 commit: sha(),
             }],
             None,
+            &t,
         );
         match &rows[1] {
             Row::Local(l) => {
@@ -843,10 +1015,12 @@ mod tests {
 
     #[test]
     fn targets_are_what_verbs_aim_at_bytes_included() {
+        let t = Theme::dark();
         let rows = flatten(
             &[local("main", true)],
             &[remote("main")],
             Some(&HeadState::Detached { commit: sha() }),
+            &t,
         );
         assert_eq!(
             row_target(&rows[0]),
@@ -875,6 +1049,7 @@ mod tests {
             vec![local("feature", false), local("main", true)],
             Vec::new(),
             None,
+            &host.theme,
             "",
         ));
         b.rendered.set(3);
@@ -915,6 +1090,7 @@ mod tests {
             vec![local("feature", false), local("main", true)],
             Vec::new(),
             None,
+            &host.theme,
             "",
         ));
         b.rendered.set(3);
@@ -933,6 +1109,7 @@ mod tests {
                 vec![local("feature", false), local("main", true)],
                 Vec::new(),
                 None,
+                &host.theme,
                 "",
             ),
             &host,
@@ -945,7 +1122,7 @@ mod tests {
         // The same when the branch itself is gone under the arm.
         assert!(b.confirm_or_arm_delete(&target));
         b.replace_prepared(
-            prepare(vec![local("main", true)], Vec::new(), None, ""),
+            prepare(vec![local("main", true)], Vec::new(), None, &host.theme, ""),
             &host,
         );
         assert_eq!(b.armed_row(), None);
@@ -960,20 +1137,129 @@ mod tests {
 
     #[test]
     fn the_label_counts_both_groups_and_an_empty_repository_flattens_to_nothing() {
+        let host = Host::new();
         let p = prepare(
             vec![local("main", true)],
             vec![remote("main")],
             None,
+            &host.theme,
             "gitten (main)",
         );
         assert_eq!(p.label, "gitten (main) · 1 local · 1 remote");
 
-        let empty = prepare(Vec::new(), Vec::new(), None, "gitten");
+        let empty = prepare(Vec::new(), Vec::new(), None, &host.theme, "gitten");
         assert_eq!(empty.label, "gitten · 0 local · 0 remote");
         assert_eq!(empty.rows.len(), 0);
+        assert_eq!(empty.head, None, "no branch, nothing to name");
 
         // And the prepared type is what a refresh hands the pane.
         let p: Prepared = p;
         assert!(!p.rows.is_empty());
+    }
+
+    #[test]
+    fn head_info_names_the_attached_branch_and_hands_through_its_distance() {
+        let host = Host::new();
+        let attached = HeadState::Branch {
+            name: RefName::from("main"),
+            commit: None,
+        };
+        let p = prepare(
+            vec![tracked("main", true, Some(1), Some(2))],
+            Vec::new(),
+            Some(attached.clone()),
+            &host.theme,
+            "",
+        );
+        assert_eq!(
+            p.head,
+            Some(HeadInfo {
+                branch: "main".into(),
+                ahead: Some(1),
+                behind: Some(2),
+            }),
+            "the numbers core measured, verbatim"
+        );
+        // And the pane hands it on for the title strip.
+        let b = Branches::from_prepared(p);
+        let hi = b.head_info().expect("attached HEAD has a name");
+        assert_eq!(&*hi.branch, "main");
+        assert_eq!((hi.ahead, hi.behind), (Some(1), Some(2)));
+
+        // A gone upstream stays honest: unknowable is not zero, and the
+        // title strip must not invent a badge off a missing ref.
+        let hi = head_info(Some(&attached), &[tracked("main", true, None, None)])
+            .expect("gone still names its branch");
+        assert_eq!(
+            (hi.ahead, hi.behind),
+            (None, None),
+            "a vanished ref measures to nothing"
+        );
+    }
+
+    #[test]
+    fn head_info_says_nothing_while_detached_or_unmarked() {
+        let host = Host::new();
+        // Detached: there is no branch to name, and the row above says so
+        // better than an invented one would.
+        let p = prepare(
+            vec![local("main", false)],
+            Vec::new(),
+            Some(HeadState::Detached { commit: sha() }),
+            &host.theme,
+            "",
+        );
+        assert_eq!(p.head, None);
+
+        // Attached to a name no local row claims — the unborn-branch shape:
+        // nothing invented to fill the slot either way.
+        let bare = prepare(
+            vec![local("other", false)],
+            Vec::new(),
+            Some(HeadState::Branch {
+                name: RefName::from("ghost"),
+                commit: None,
+            }),
+            &host.theme,
+            "",
+        );
+        assert_eq!(bare.head, None);
+
+        let none: Option<HeadInfo> = None;
+        assert_eq!(Branches::from_prepared(bare).head_info(), none);
+    }
+
+    #[test]
+    fn lane_inks_follow_a_locals_place_among_locals_head_excluded() {
+        // The colour a branch carries through the pane belongs to the *row*,
+        // not to HEAD: inserting a branch above shifts the ink down with it,
+        // and HEAD never borrows the cycle whatever its place.
+        let t = Theme::dark();
+        let rows = flatten(
+            &[
+                tracked("held", true, Some(3), Some(0)),
+                local("second", false),
+                local("third", false),
+            ],
+            &[],
+            None,
+            &t,
+        );
+        match (&rows[1], &rows[2], &rows[3]) {
+            (Row::Local(head), Row::Local(second), Row::Local(third)) => {
+                assert_eq!(second.name.as_bytes(), b"second");
+                assert_eq!(
+                    head.dot.color, t.chrome.accent,
+                    "HEAD sits out of the cycle"
+                );
+                assert_eq!(
+                    second.dot.color,
+                    t.lane(1),
+                    "its index counts from the first local, marked or not"
+                );
+                assert_eq!(third.dot.color, t.lane(2));
+            }
+            other => panic!("three local rows expected, got {other:?}"),
+        }
     }
 }
