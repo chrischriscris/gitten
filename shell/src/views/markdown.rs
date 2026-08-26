@@ -59,9 +59,9 @@
 //! decided at load and is a `Copy` field read out of a `Vec`.
 
 use super::diff::{
-    column_at, columns, file_header, header_hit, hunk_header, into_text, line_colors, num,
-    row_frame, scrolled, selected, slice, slice_shared, Hit, Rows, Scratch, PAD, ROW_H, SIGN_W,
-    TEXT_CHROME,
+    column_at, columns, file_header, header_hit, hunk_header, hunk_hit, into_text, line_colors,
+    num, row_frame, scrolled, selected, slice, slice_shared, Hit, Rows, Scratch, PAD, ROW_H,
+    SIGN_W, TEXT_CHROME,
 };
 use gitten_core::host::Host;
 use gitten_core::markdown::{flow_table, lay_out_tables, Block, Grid, Layout, TableRow};
@@ -513,6 +513,10 @@ impl Rows for MarkdownRows {
         self.rows.len()
     }
 
+    fn is_file_header(&self, index: usize) -> bool {
+        matches!(self.rows.get(index), Some(Row::File { .. }))
+    }
+
     fn rows(&self, index: usize) -> usize {
         self.wrapped.rows(index)
     }
@@ -661,7 +665,7 @@ impl Rows for MarkdownRows {
     fn hit(&self, index: usize, seg: usize, x: f32, host: &Host, shift: f32) -> Option<Hit> {
         Some(match self.rows.get(index)? {
             Row::File { path, .. } => header_hit(path, x, host, shift),
-            Row::Hunk(h) => header_hit(h, x, host, shift),
+            Row::Hunk(h) => hunk_hit(h, x, host, shift),
             Row::Line { block, text, .. } => {
                 let text = self
                     .flowed(index)

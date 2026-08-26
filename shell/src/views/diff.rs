@@ -96,6 +96,12 @@ pub(crate) const PAD: f32 = 16.0;
 /// against — see [`columns`].
 pub(crate) const TEXT_CHROME: f32 = 2.0 * PAD + 2.0 * GUTTER_W + SIGN_W;
 
+/// Where a hunk header's text starts: the same x as a code line's text, so the
+/// `@@` sits over the code it addresses rather than under the line numbers.
+/// `TEXT_CHROME` less the right-hand padding, which is what a line has in front
+/// of its first character.
+pub(crate) const HUNK_INDENT: f32 = TEXT_CHROME - PAD;
+
 /// Narrowest wrap budget worth having. A window dragged narrower than its own
 /// gutters would otherwise ask for one character a row, which is a diff turned
 /// into a column of letters; overflowing is the better failure.
@@ -197,6 +203,20 @@ pub trait Rows {
     /// highlighted — see `gitten_core::prepared`. An implementation draws; it does
     /// not redo any of that.
     fn build(&mut self, file: gitten_core::prepared::File);
+
+    /// Whether logical row `index` is a file header — the `path +n -m` band
+    /// [`file_header`] draws.
+    ///
+    /// Asked so the list can leave it out: a diff of exactly one file is named by
+    /// the pane header above it, and a second copy of the name two rows down is
+    /// furniture. With two files or more the band is the separator and stays.
+    /// The row itself is still built and still addressable — only the order
+    /// table skips it — so nothing an implementation indexes by row moves.
+    /// Defaults to `false`, which is "keep everything" for a presentation that
+    /// draws no such row.
+    fn is_file_header(&self, _index: usize) -> bool {
+        false
+    }
 
     /// How many visual rows logical row `index` occupies at the current wrap.
     /// More than one only when its text wraps.
@@ -1527,6 +1547,12 @@ fn arrange(prepared: &Prepared, host: &Host, layouts: &Layouts, current: usize) 
         let first = r.len();
         r.build(f.clone());
         for index in first..r.len() {
+            // One file: the pane header names it, so its own band is noise. The
+            // row stays built — hunk numbering, wrapping and the cursor address
+            // rows by index — and only the order table leaves it out.
+            if file_count == 1 && r.is_file_header(index) {
+                continue;
+            }
             order.push(RowRef {
                 owner: owner as u16,
                 seg: 0,
@@ -2155,6 +2181,10 @@ impl Rows for TextRows {
         self.rows.len()
     }
 
+    fn is_file_header(&self, index: usize) -> bool {
+        matches!(self.rows.get(index), Some(Row::File { .. }))
+    }
+
     fn rows(&self, index: usize) -> usize {
         self.wrapped.rows(index)
     }
@@ -2245,11 +2275,12 @@ impl Rows for TextRows {
         (text - (width - TEXT_CHROME)).max(0.0)
     }
 
-    /// The gutters and the sign column, then the text — and for a header, the
-    /// page padding and nothing else, because that is what it draws.
+    /// The gutters and the sign column, then the text — and for a file header,
+    /// the page padding and nothing else, because that is what it draws. A hunk
+    /// header's text sits where the code does, so it measures from there.
     fn hit(&self, index: usize, seg: usize, x: f32, host: &Host, shift: f32) -> Option<Hit> {
         Some(match self.rows.get(index)? {
-            Row::Hunk(h) => header_hit(h, x, host, shift),
+            Row::Hunk(h) => hunk_hit(h, x, host, shift),
             Row::File { path, .. } => header_hit(path, x, host, shift),
             Row::Line { text, .. } => {
                 let at = self.wrapped.range(index, seg, text);
@@ -2466,16 +2497,26 @@ pub(crate) fn selected(sel: Option<Selected>, part: u16, len: usize) -> Range<us
     }
 }
 
-/// Where a click landed in a file or hunk header.
+/// Where a click landed in a file header.
 ///
-/// Shared for the same reason the two headers themselves are: whoever owns the
-/// lines beneath them, a header is drawn by [`file_header`] or [`hunk_header`] and
-/// its text starts at the page padding. Three presentations working that out
-/// separately is three places for the caret to be a gutter's width off.
+/// Shared for the same reason the header itself is: whoever owns the lines
+/// beneath it, a file header is drawn by [`file_header`] and its text starts at
+/// the page padding. Three presentations working that out separately is three
+/// places for the caret to be a gutter's width off.
 pub(crate) fn header_hit(text: &str, x: f32, host: &Host, shift: f32) -> Hit {
     Hit {
         part: 0,
         off: column_at(text, into_text(x, PAD, shift), host.font.size, host),
+    }
+}
+
+/// Where a click landed in a hunk header, whose text [`hunk_header`] draws at
+/// [`HUNK_INDENT`] — the code column — rather than at the page padding. The same
+/// constant on both sides, or the caret is two gutters off.
+pub(crate) fn hunk_hit(text: &str, x: f32, host: &Host, shift: f32) -> Hit {
+    Hit {
+        part: 0,
+        off: column_at(text, into_text(x, HUNK_INDENT, shift), host.font.size, host),
     }
 }
 
@@ -2647,6 +2688,11 @@ fn split_path(path: &str) -> (Option<&str>, &str) {
 /// The band itself recedes now. It used to be the more prominent of the two
 /// headers, which had the hierarchy backwards: a hunk is a place inside a file,
 /// and the file is the boundary that matters.
+///
+/// Its text starts at [`HUNK_INDENT`], where a code line's does, and not at the
+/// gutter: the `@@` is a coordinate *of the lines under it*, and flush left it
+/// read as a heading over them. Lined up with the code it is a quiet rule
+/// between two runs of it. [`hunk_hit`] measures a click from the same place.
 pub(crate) fn hunk_header(
     header: &std::sync::Arc<str>,
     theme: &Theme,
@@ -2658,7 +2704,8 @@ pub(crate) fn hunk_header(
     let (marker, _) = gitten_core::hunk_parts(header);
     row_frame()
         .items_center()
-        .px_4()
+        .pl(px(HUNK_INDENT))
+        .pr(px(PAD))
         .bg(rgb(row_background(current, p.hunk_bg, theme)))
         .text_color(rgb(p.hunk_fg))
         .child(scrolled(
@@ -3336,8 +3383,8 @@ diff --git a/a.rs b/a.rs
     fn a_selection_over_three_rows_copies_the_lines_between_them() {
         let host = Host::new();
         let mut diff = Diff::with_layouts(parse_unified_diff(SAMPLE), &host, Layouts::builtin());
-        // Rows: the file header, the hunk header, then three lines.
-        diff.sel = Some(select(&diff, (2, 0), (4, 9)));
+        // Rows: the hunk header, then three lines — one file, so no file header.
+        diff.sel = Some(select(&diff, (1, 0), (3, 9)));
         assert_eq!(
             diff.selection(),
             "fn main() {
@@ -3345,7 +3392,7 @@ diff --git a/a.rs b/a.rs
     let x"
         );
         // The anchor is not the start: the same drag backwards is the same text.
-        diff.sel = Some(select(&diff, (4, 9), (2, 0)));
+        diff.sel = Some(select(&diff, (3, 9), (1, 0)));
         assert_eq!(
             diff.selection(),
             "fn main() {
@@ -3416,7 +3463,8 @@ diff --git a/a.rs b/a.rs
         diff.sel = Selection::all(&diff.order);
         assert_eq!(
             diff.selection(),
-            "a.rs\n@@ -1,2 +1,2 @@\nfn main() {\n    let x = 1;\n    let x = 2;"
+            "@@ -1,2 +1,2 @@\nfn main() {\n    let x = 1;\n    let x = 2;",
+            "one file: the pane header names it, so the body has no file header row"
         );
     }
 
@@ -4004,6 +4052,74 @@ diff --git a/a.rs b/a.rs
         assert_eq!(r.len(), 2 + 3, "file header, hunk header, three lines");
         // Widths are answered for every row it built.
         assert!((0..r.len()).all(|i| r.width(i, 0) > 0));
+    }
+
+    #[test]
+    fn a_one_file_diff_leaves_its_file_header_out_of_the_order() {
+        // The pane header above the view names the file, so the band inside it
+        // would name it twice. The row is still built — indices do not move —
+        // but the order table skips it, and the hunk header is the first row.
+        let host = Rc::new(Host::new());
+        let diff = Diff::with_renderers(
+            parse_unified_diff(SAMPLE),
+            host,
+            vec![Box::new(TextRows::default())],
+        );
+        let renderers = diff.renderers.borrow();
+        assert_eq!(
+            renderers[0].len(),
+            5,
+            "file header, hunk header, three lines built"
+        );
+        assert_eq!(diff.order.len(), 4, "but the file header is not drawn");
+        assert!(diff
+            .order
+            .iter()
+            .all(|r| !renderers[0].is_file_header(r.index as usize)));
+        let first = diff.order[0];
+        assert_eq!(
+            renderers[0].selectable(first.index as usize, 0),
+            Some("@@ -1,2 +1,2 @@"),
+            "the body opens on the hunk header"
+        );
+    }
+
+    #[test]
+    fn a_two_file_diff_keeps_both_file_headers() {
+        // With more than one file the band is the separator between them.
+        let host = Rc::new(Host::new());
+        let diff = Diff::with_renderers(
+            parse_unified_diff(TWO_FILES),
+            host,
+            vec![Box::new(TextRows::default())],
+        );
+        let renderers = diff.renderers.borrow();
+        let headers = diff
+            .order
+            .iter()
+            .filter(|r| renderers[0].is_file_header(r.index as usize))
+            .count();
+        assert_eq!(headers, 2);
+        assert_eq!(diff.order.len(), renderers[0].len());
+    }
+
+    #[test]
+    fn a_hunk_header_is_hit_where_the_code_is() {
+        // The `@@` is drawn at the code column, so a click measured from the page
+        // padding would land two gutters early. `x_for` is the code column.
+        let (r, host) = text_rows(SAMPLE);
+        let header = r.selectable(1, 0).expect("the hunk header");
+        assert!(header.starts_with("@@"));
+        for col in [0, 3, 8] {
+            let hit = r.hit(1, 0, x_for(col, &host), &host, 0.0).expect("a hit");
+            assert_eq!((hit.part, hit.off), (0, col), "column {col}");
+        }
+        // The file header still measures from the padding.
+        let hit = r
+            .hit(0, 0, PAD + 0.1 * host.font.char_width(), &host, 0.0)
+            .unwrap();
+        assert_eq!(hit.off, 0);
+        assert_eq!(super::HUNK_INDENT, TEXT_CHROME - PAD);
     }
 
     /// A specialist: what a Markdown or an image presentation would look like

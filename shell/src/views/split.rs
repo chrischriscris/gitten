@@ -49,8 +49,8 @@
 //! many rows it takes.
 
 use super::diff::{
-    column_at, columns, file_header, header_hit, hunk_header, into_text, line_colors, row_frame,
-    scrolled, selected, slice, Hit, Rows, Scratch, PAD, ROW_H,
+    column_at, columns, file_header, header_hit, hunk_header, hunk_hit, into_text, line_colors,
+    row_frame, scrolled, selected, slice, Hit, Rows, Scratch, PAD, ROW_H,
 };
 use gitten_core::align::align;
 use gitten_core::host::Host;
@@ -210,6 +210,10 @@ impl Rows for SplitRows {
         self.rows.len()
     }
 
+    fn is_file_header(&self, index: usize) -> bool {
+        matches!(self.rows.get(index), Some(Row::File { .. }))
+    }
+
     /// A pair row is as tall as its taller side. The shorter one runs out of
     /// text partway down and draws `absent_bg` for the rest, which is the same
     /// thing it already draws opposite a lone addition.
@@ -362,7 +366,7 @@ impl Rows for SplitRows {
     fn hit(&self, index: usize, seg: usize, x: f32, host: &Host, shift: f32) -> Option<Hit> {
         match self.rows.get(index)? {
             Row::File { path, .. } => Some(header_hit(path, x, host, shift)),
-            Row::Hunk(h) => Some(header_hit(h, x, host, shift)),
+            Row::Hunk(h) => Some(hunk_hit(h, x, host, shift)),
             Row::Pair { old, new } => {
                 let cell = PAD + self.cell_px(self.width);
                 let (part, from) = match x < cell + RULE_W {
