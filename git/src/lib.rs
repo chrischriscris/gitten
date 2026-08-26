@@ -213,10 +213,15 @@ where
         // asked — `git show --raw` prints zero records for one — so a merge
         // commit selected in the log would render as an empty diff, silently.
         // First-parent asks for the ordinary single-old/single-new records this
-        // parser already handles; where an older git or `[diff] diffMerges`
-        // config instead emits combined-format records, `parse_raw` below
-        // refuses them rather than decode them into garbage. First-parent is
-        // the honest ordinary answer.
+        // parser already handles. Nothing else reaches this parser: measured on
+        // git 2.55, `-c diffMerges=combined`, `--cc` and `--diff-merges=cc` all
+        // still come back empty for merges — combined raw records belong to
+        // `diff-tree -c`, which this crate never runs — so the refusal in
+        // `parse_raw` below is belt-and-braces against future or unknown shapes,
+        // not a currently-reachable input. First-parent is the honest ordinary
+        // answer. The flag itself needs git >= 2.31 (March 2021); older gits
+        // reject it and every bare-revision open fails wholesale rather than
+        // silently.
         run(
             repo,
             &[
