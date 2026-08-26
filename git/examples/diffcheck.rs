@@ -215,6 +215,8 @@ fn git_diff(
     } else if revspec.contains("..") {
         vec!["-C", dir, "diff", "--no-ext-diff", "-M", revspec]
     } else {
+        // Ask git what pairs() asks: --diff-merges must match the acquisition
+        // layer's show path or a merge answers empty here.
         vec![
             "-C",
             dir,
@@ -222,6 +224,7 @@ fn git_diff(
             "--no-ext-diff",
             "-M",
             "--format=",
+            "--diff-merges=first-parent",
             revspec,
         ]
     };
@@ -262,6 +265,7 @@ fn report_worst(
     } else if revspec.contains("..") {
         vec!["-C", dir, "diff", "--no-ext-diff", "-M", revspec]
     } else {
+        // Same oracle as git_diff: --diff-merges must match pairs()'s show path.
         vec![
             "-C",
             dir,
@@ -269,6 +273,7 @@ fn report_worst(
             "--no-ext-diff",
             "-M",
             "--format=",
+            "--diff-merges=first-parent",
             revspec,
         ]
     };
