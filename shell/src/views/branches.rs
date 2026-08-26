@@ -389,8 +389,13 @@ impl Branches {
     /// The flattened rows of the last refresh, read-only: what the tests
     /// read to see what a refresh actually landed.
     #[cfg(test)]
-    pub(crate) fn rows(&self) -> &[Row] {
+    pub(crate) fn row_slice(&self) -> &[Row] {
         &self.data
+    }
+
+    /// How many rows the list draws — what sizes this pane's sidebar section.
+    pub fn rows(&self) -> usize {
+        self.data.len()
     }
 
     /// Who HEAD is, for anything outside this pane: the window's title strip

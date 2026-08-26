@@ -33,7 +33,7 @@ pub const STATUS_H: f32 = 26.0;
 /// narrowest of the three regions — lists of short paths and branch names
 /// need less room than a commit subject — and every point it gives back is
 /// a point the diff gets.
-pub const SIDEBAR_SHARE: f32 = 0.17;
+pub const SIDEBAR_SHARE: f32 = 0.21;
 
 /// Left padding of every list row and section label. One number, because
 /// the eye runs down a column of rows and a row that starts a pixel later
@@ -176,6 +176,30 @@ pub fn pane_header(
     right: Option<AnyElement>,
 ) -> Div {
     let c = host.theme.chrome;
+    let name = div()
+        .text_color(rgb(match focused {
+            true => c.fg,
+            false => c.dim,
+        }))
+        .child(name)
+        .into_any_element();
+    pane_header_with(host, number, name, count, focused, right)
+}
+
+/// [`pane_header`] with the name already drawn. For the one header whose
+/// name is not a word but a path — the diff pane's `5 internal/host.go`,
+/// directory dim and filename bright through [`path_text`] — where a single
+/// ink for the whole name would throw away the one cut the eye wants. The
+/// caller owns the name's colours; the header owns everything around it.
+pub fn pane_header_with(
+    host: &Host,
+    number: &str,
+    name: AnyElement,
+    count: Option<SharedString>,
+    focused: bool,
+    right: Option<AnyElement>,
+) -> Div {
+    let c = host.theme.chrome;
     div()
         .flex_none()
         .w_full()
@@ -204,15 +228,7 @@ pub fn pane_header(
                 })),
         )
         .child(keycap(host, number, focused))
-        .child(
-            div()
-                .flex_none()
-                .text_color(rgb(match focused {
-                    true => c.fg,
-                    false => c.dim,
-                }))
-                .child(name),
-        )
+        .child(div().flex_none().child(name))
         // Everything after the name is right-edge furniture.
         .child(div().min_w_0().flex_grow(1.0))
         .children(count.map(|count| div().flex_none().text_color(rgb(c.faint)).child(count)))
