@@ -580,10 +580,11 @@ pub struct Diff {
     /// The width and wrap the rows were last expanded for. A resize that does
     /// not cross a character boundary compares equal here and stops.
     applied: (f32, &'static str),
-    /// The font the row tables were built against. `Font` is plain data deriving
-    /// PartialEq, so a value comparison is the fingerprint; a mismatch means the
-    /// metrics the renderers were built with no longer describe what will be
-    /// drawn.
+    /// The font the row tables were built against, seeded at construction with
+    /// the host the renderers were arranged against — the first settled frame
+    /// therefore has nothing to rebuild. `Font` is plain data deriving PartialEq,
+    /// so a value comparison is the fingerprint; a mismatch means the metrics
+    /// the renderers were built with no longer describe what will be drawn.
     font_applied: Option<Font>,
     /// The view's own width in pixels, written during paint by the probe in
     /// [`Diff::render`] and read on the frame after. There is no way to know it
@@ -980,7 +981,10 @@ impl Diff {
             current,
             wrap,
             applied: (0.0, ""),
-            font_applied: None,
+            // Arranged above against this very host, so its font is already
+            // on the rows — recording anything else makes the first settled
+            // reflow pay a redundant second arrange.
+            font_applied: Some(host.font.clone()),
             measured: Rc::new(Cell::new(0.0)),
             renderers: Rc::new(RefCell::new(built.renderers)),
             order: Rc::new(built.order),
@@ -3676,12 +3680,12 @@ diff --git a/b.md b/b.md
         let mut diff = Diff::with_layouts(parse_unified_diff(SAMPLE), &host, layouts);
         let prepared = diff.prepared.clone();
 
-        // Construction built once; the first `reflow` settles the fingerprint,
-        // which starts empty, and pays the second build doing it.
+        // Construction built once and seeded the fingerprint against this very
+        // host, so the first `reflow` finds nothing to rebuild.
         let w = width_for(40, &host);
         diff.reflow(w, &host);
         let settled = builds.get();
-        assert_eq!(settled, 2);
+        assert_eq!(settled, 1);
 
         // Same font again and again: nothing to do.
         diff.reflow(w, &host);
