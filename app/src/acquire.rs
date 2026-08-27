@@ -940,7 +940,7 @@ index 3e7a1b2..9c4d0f1 100644
         );
         assert!(
             !chosen.contains(&(LineKind::Added, "EDIT TWO".into())),
-            "the distant neighbour was staged too: {chosen:?}"
+            "the emitted selection includes the distant neighbour: {chosen:?} — the staged side is pinned by the oracle comparison above"
         );
         assert_eq!(
             std::fs::read_to_string(repo.0.join("f.txt")).expect("the worktree reads"),

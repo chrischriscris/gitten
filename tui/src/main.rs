@@ -1453,7 +1453,7 @@ diff --git a/tracked.txt b/tracked.txt
         );
         assert_eq!(message, "no repository is open");
 
-        let (handle, _state) = fake(&[]);
+        let (handle, state) = fake(&[]);
         let (message, _) = said(
             Source::Repo {
                 path: std::path::PathBuf::from("/fake"),
@@ -1463,6 +1463,10 @@ diff --git a/tracked.txt b/tracked.txt
             0,
         );
         assert_eq!(message, "the keyboard is not on a hunk");
+        assert!(
+            state.lock().unwrap().writes.is_empty(),
+            "a refusal queued a write"
+        );
 
         // An untracked creation is refused by name — and the refusal names
         // the pane that serves whole-file verbs, because a patch cannot

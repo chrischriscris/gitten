@@ -107,10 +107,10 @@ pub struct Entry {
 ///
 /// The address is `(file, hunk)` and not a path: a span is geometry, and the
 /// presentation that recorded it spells the file's name in its own
-/// [`Present::files`] list, where `file` is an index. Keeping content out of
-/// here is also what keeps a *mis*-recorded span from naming the wrong file —
-/// the caller resolves the index through the same presentation that answered,
-/// and a bad one degrades to "no hunk here" rather than to the wrong hunk.
+/// [`Present::files`] list, where `file` is an index. Out-of-range and
+/// malformed maps degrade to "no hunk here"; a span that claims a row it does
+/// not own is trusted as claimed — the window's own hunk map runs on the same
+/// contract, which is why presentation authors record exact spans.
 #[derive(Debug, Default)]
 pub struct Hunks {
     spans: Vec<HunkSpan>,
@@ -149,7 +149,8 @@ impl Hunks {
     }
 
     /// The hunk under logical row `index`, or nothing for the gaps between
-    /// hunks — today only the file headers.
+    /// hunks — today only the file headers. A row a recorded span covers is
+    /// answered with that span's own claim, unverified: see [`Hunks`].
     pub fn at(&self, index: usize) -> Option<(usize, usize)> {
         let i = self.spans.partition_point(|s| s.start <= index);
         let s = self.spans.get(i.checked_sub(1)?)?;

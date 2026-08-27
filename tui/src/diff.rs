@@ -655,8 +655,9 @@ impl Diff {
     /// exactly what [`gitten_core::patch::emit`] aims a patch with. `None` when
     /// the keyboard sits on a file header, on an empty diff, or on a
     /// presentation whose hunk map answers nothing for the row — which is the
-    /// honest answer for a presentation that draws no hunks, and the only one a
-    /// *mis*recorded map is allowed to give.
+    /// honest answer for a presentation that draws no hunks. A span claiming a
+    /// row it does not own is trusted as claimed, the window's own hunk map
+    /// running on the same contract; presentation authors record exact spans.
     ///
     /// The address crosses two lists. The presentation answers `(file, hunk)`
     /// in its own file order, which its own [`Present::files`] spells; that
