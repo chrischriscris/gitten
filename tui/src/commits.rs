@@ -300,6 +300,49 @@ impl Commits {
         self.view.go_to(row);
     }
 
+    /// Swaps in a refreshed list, keeping the selection by identity.
+    ///
+    /// A write moves rows — a commit added above shifts every row down one —
+    /// but the commit the keyboard is on survives more often than its row does,
+    /// so the cursor is anchored by **sha** and not by number. When it survives,
+    /// the view follows it; when it does not, the previous position is clamped
+    /// into whatever the new list can hold. That is the shared
+    /// [`Viewport`] doing the clamping, and nothing here assigns an index the
+    /// list has not blessed.
+    ///
+    /// Glyphs, dimensions and the scrollbar are untouched: the refresh changes
+    /// what the list holds, never how it draws.
+    pub fn replace(&mut self, commits: Vec<Commit>) {
+        let sha = self.current().map(|c| c.sha.clone());
+        let (cursor, top) = (self.view.cursor(), self.view.top());
+        // A drag's range was a promise about rows the refresh may have
+        // renumbered, and the scrollbar was held against a thumb that just
+        // moved. Both are the mouse's, and the mouse has let go.
+        self.sel = None;
+        self.dragging = false;
+        self.grabbed = None;
+        self.commits = commits;
+        let rows = assign_lanes(&self.commits);
+        self.lanes = lane_count(&rows);
+        self.draws = draws(&self.commits, &rows);
+        self.gutter = self
+            .draws
+            .iter()
+            .map(|d| d.lanes * LANE_W)
+            .max()
+            .unwrap_or(0);
+        // The old scroll position first, then the anchor: `go_to` drags the
+        // viewport after the cursor, and the surviving sha's row must be the
+        // one on screen when it survives — restoring the top last could drag
+        // the cursor off the very row it was kept for.
+        self.view.set_len(self.commits.len());
+        self.view.scroll_to(top);
+        let at = sha
+            .and_then(|s| self.commits.iter().position(|c| c.sha == s))
+            .unwrap_or(cursor);
+        self.view.go_to(at);
+    }
+
     // ---------------------------------------------------------------- the mouse
 
     /// The glyphs the scrollbar is drawn with. `--ascii`, or an extension.
@@ -999,6 +1042,52 @@ r\x1fr\x1f\x1fA\x1f1\x1froot\x1e";
         c.go_to(9999);
         assert_eq!(c.cursor(), 99);
         assert_eq!(c.current().map(|x| x.subject.as_str()), Some("c99"));
+    }
+
+    #[test]
+    fn commit_refresh_anchors_by_sha() {
+        let (mut c, _host) = view(&many(50), 60, 10);
+        c.move_by(25);
+        let sha = c.current().expect("the list has the commit").sha.clone();
+        assert_eq!(sha, "c25");
+        // A commit inserted above: every row moved down one, and the cursor
+        // follows the commit it was on rather than the number it was at.
+        let mut inserted = parse_log(&many(50));
+        inserted.insert(
+            0,
+            Commit {
+                sha: "new".into(),
+                short: "newest".into(),
+                parents: Box::from(&["c0".to_string()][..]),
+                author: "Ada Lovelace".into(),
+                timestamp: 1,
+                subject: "newest".into(),
+            },
+        );
+        c.replace(inserted);
+        assert_eq!(c.current().map(|x| x.sha.as_str()), Some("c25"));
+        // A commit removed above: rows moved up, and the anchor holds.
+        let mut removed = parse_log(&many(50));
+        removed.remove(0);
+        c.replace(removed);
+        assert_eq!(c.current().map(|x| x.sha.as_str()), Some("c25"));
+        // The anchored commit vanishes entirely: the previous position
+        // clamps into what the shorter list can hold, and nothing panics.
+        c.replace(parse_log(&many(10)));
+        assert_eq!(c.cursor(), 9, "clamped, not wrapped");
+        assert!(c.current().is_some());
+        // A drag's range was a promise about rows the refresh renumbered.
+        let (mut c, host) = view(&many(50), 60, 10);
+        c.move_by(5);
+        c.press(20, 2, false, &host);
+        c.drag(6, &host);
+        assert!(c.selection().len() > 1);
+        c.replace(parse_log(&many(50)));
+        assert_eq!(c.selection(), "", "a range outlived the rows it held");
+        // Glyphs and dimensions survive: the refresh changed what, not how.
+        let (c, host) = view(&many(50), 60, 10);
+        let rows = painted(&c, &host);
+        assert!(rows[0].starts_with("c000000 AL "), "{:?}", rows[0]);
     }
 
     #[test]
