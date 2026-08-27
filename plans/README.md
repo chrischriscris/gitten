@@ -35,8 +35,17 @@ integrator owns this table and updates it as waves land.
 | 011 | Author colours read the live theme | P2 | S | 010 softly | MERGED (`b7b0d75`, same merge commit) |
 | 012 | A font edit in gitten.toml rebuilds the diff presentation | P2 | M | — | MERGED (`dc14543` + followup `9a860a0`, via `d0b1ca5`) |
 | 013 | Incremental commit search in the terminal (`/`, shared `core::search`) | P1 | M | — | DONE (pass 3, `369503a`+2) — adversarially reviewed **GREEN**; 5 non-blocking notes accepted |
-| 014 | Stage/unstage the selected hunk from the terminal diff | P1 | M | — | IN PROGRESS (pass 3) |
+| 014 | Stage/unstage the selected hunk from the terminal diff | P1 | M | — | DONE (pass 3, `b234f62`+5, fold `196704f`) — reviewed CONCERNS (all non-blocking); 3 folds in |
 | 015 | Render the shared Markdown presentation in the terminal | P2 | L | — | IN PROGRESS (pass 3) |
+
+## Pass 3 follow-ups — surfaced by reviewers, pre-existing, not pass regressions
+
+- `app/src/acquire.rs` `Scratch::git` pins identity via `-c` but not `commit.gpgsign`; a machine with global
+  signing fails fixture setup. Named by plan 014's own stop conditions; one-line fix whenever next touched.
+- `core/src/patch.rs` `coords` doc claims only whole-file selections can empty a side — false at
+  `[diff] context = 0`, where an all-addition hunk in a tracked file emits `--- /dev/null` + `@@ -0,0`
+  and real `git apply --cached` refuses. Shared window+terminal behavior by design (git's own refusal
+  surfaces); the *doc* is the bug. Verified against the real backend by the 014 reviewer.
 
 ## Adversarial-review follow-ups — RESOLVED
 
