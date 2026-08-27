@@ -36,9 +36,10 @@ use gitten_core::prepared::File;
 use gitten_core::rows::{Entry, Flat, Present, Row};
 use gitten_core::runs::{runs, Run};
 use gitten_core::select::{Hit, Selected};
+use gitten_core::syntax::Token;
 use gitten_core::theme::{DiffPalette, Rgb, Style, Surface, Theme};
 use gitten_core::wrap::Wrap;
-use gitten_core::LineKind;
+use gitten_core::{LineKind, Span};
 use std::ops::Range;
 
 /// Everything a row needs to know beyond which row it is.
@@ -180,7 +181,15 @@ impl Layouts {
     /// the shipped configuration uses the seam rather than going around it.
     pub fn builtin() -> Self {
         let mut l = Self(Vec::new());
-        l.register("unified", |_| vec![Box::new(TextRows::default())]);
+        l.register("unified", |_| {
+            vec![
+                Box::new(TextRows::default()),
+                // After the built-in, exactly as the window registers its own:
+                // the last claimant wins, so `.md` files go to the rendered
+                // document and everything else stays with `TextRows`.
+                Box::new(crate::markdown::MarkdownRows::default()),
+            ]
+        });
         // The same name the desktop registers and `gitten.toml` documents:
         // `diff.layout` is data, and one value has to open this presentation
         // from every client that reads the file.
@@ -385,11 +394,83 @@ pub fn text_run(
     pen: &mut Pen,
     out: &mut Vec<Run>,
 ) {
-    runs(span, &line.tokens, &line.spans, line.kind, line.moved, out);
+    draw_runs(
+        &Text::of(line),
+        span,
+        theme,
+        row_ink,
+        shift,
+        sel,
+        Override::default(),
+        pen,
+        out,
+    );
+    pen.wash(row_ink);
+}
+
+/// One row's text and what styles it, borrowed — the same shape whether it
+/// came from a prepared [`Line`](gitten_core::prepared::Line) or a flowed
+/// Markdown row out of `core`. What [`draw_runs`] sweeps, and the only thing a
+/// second presentation has to supply to draw like the built-in.
+pub struct Text<'a> {
+    pub text: &'a str,
+    pub tokens: &'a [Token],
+    pub spans: &'a [Span],
+    pub kind: LineKind,
+    pub moved: bool,
+}
+
+impl<'a> Text<'a> {
+    pub fn of(line: &'a gitten_core::prepared::Line) -> Self {
+        Self {
+            text: &line.text,
+            tokens: &line.tokens,
+            spans: &line.spans,
+            kind: line.kind,
+            moved: line.moved,
+        }
+    }
+}
+
+/// What a presentation adds on top of the runs the theme resolves, when the
+/// row itself says more than its tokens do.
+///
+/// A rendered Markdown heading is bold whatever token covers a piece of it — a
+/// terminal cannot size text, so weight is the whole of what says "this is a
+/// heading" — and an extension's presentation is entitled to the same override
+/// rather than a private fork of the sweep. Empty, it is exactly the built-in.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Override {
+    /// Bold every piece.
+    pub bold: bool,
+    /// One foreground for every piece, over whatever the tokens said.
+    pub fg: Option<Rgb>,
+}
+
+/// The runs of one text, drawn from `span`, without the wash.
+///
+/// [`text_run`] is this plus the wash, and is what a whole-line presentation
+/// wants. A presentation that draws something *after* its text — the Markdown
+/// table's hairline, drawn on the cells the grid occupies — needs the pen
+/// where the text ends and the wash not yet taken, which is the only reason
+/// this is its own function and not a private step of [`text_run`].
+#[allow(clippy::too_many_arguments)]
+pub fn draw_runs(
+    t: &Text<'_>,
+    span: std::ops::Range<usize>,
+    theme: &Theme,
+    row_ink: Ink,
+    shift: usize,
+    sel: Option<Selected>,
+    over: Override,
+    pen: &mut Pen,
+    out: &mut Vec<Run>,
+) {
+    runs(span, t.tokens, t.spans, t.kind, t.moved, out);
     pen.scroll(shift);
-    // Bytes of the *line*, which is what the runs address too — a wrapped row
+    // Bytes of the *text*, which is what the runs address too — a wrapped row
     // draws its own slice of both.
-    let sel = selection(sel, line.text.len());
+    let sel = selection(sel, t.text.len());
     for run in out.iter() {
         // A run is cut into at most three pieces by the selection, and nearly
         // always into one: the loop below runs on every visible row of every
@@ -401,11 +482,10 @@ pub fn text_run(
             ),
             None => (run.at.end, run.at.end),
         };
-        piece(line, run, run.at.start..a, false, theme, row_ink, pen);
-        piece(line, run, a..b, true, theme, row_ink, pen);
-        piece(line, run, b..run.at.end, false, theme, row_ink, pen);
+        piece(t, run, run.at.start..a, false, over, theme, row_ink, pen);
+        piece(t, run, a..b, true, over, theme, row_ink, pen);
+        piece(t, run, b..run.at.end, false, over, theme, row_ink, pen);
     }
-    pen.wash(row_ink);
 }
 
 /// One stretch of a run, selected or not.
@@ -415,11 +495,13 @@ pub fn text_run(
 /// removal, and left alone on the selection's own colour it disappears. That is
 /// `core`'s contrast table doing what it is for, and the window resolves the same
 /// way.
+#[allow(clippy::too_many_arguments)]
 fn piece(
-    line: &gitten_core::prepared::Line,
+    t: &Text<'_>,
     run: &Run,
     at: Range<usize>,
     on: bool,
+    over: Override,
     theme: &Theme,
     row_ink: Ink,
     pen: &mut Pen,
@@ -439,7 +521,7 @@ fn piece(
         (false, true) => theme.background(run.surface),
         (false, false) => row_ink.bg,
     };
-    let style = match run.kind {
+    let mut style = match run.kind {
         Some(kind) => theme.syntax_on(kind, surface),
         // Text no highlighter claimed keeps the row's own foreground rather
         // than a syntax colour it was never given.
@@ -449,7 +531,13 @@ fn piece(
             italic: false,
         },
     };
-    pen.put(&line.text[at], Ink::styled(style, bg));
+    if over.bold {
+        style.bold = true;
+    }
+    if let Some(fg) = over.fg {
+        style.fg = fg;
+    }
+    pen.put(&t.text[at], Ink::styled(style, bg));
 }
 
 // -------------------------------------------------------------- the built-in
@@ -476,7 +564,7 @@ pub struct TextRows {
 
 /// Narrowest a line-number column gets, so a two-file diff does not draw a
 /// gutter one character wide and lose the column the eye scans down.
-const MIN_DIGITS: usize = 2;
+pub(crate) const MIN_DIGITS: usize = 2;
 
 impl TextRows {
     /// Columns one line-number column occupies.

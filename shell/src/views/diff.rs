@@ -2453,16 +2453,6 @@ pub(crate) fn slice(text: &std::sync::Arc<str>, at: &Range<usize>) -> SharedStri
     }
 }
 
-/// The same, for text GPUI already owns — a re-flowed Markdown table row.
-/// Whole-row clones stay refcount bumps there too, and wrapped segments take
-/// the by-reference path [`slice`] does.
-pub(crate) fn slice_shared(text: &SharedString, at: &Range<usize>) -> SharedString {
-    match at.start == 0 && at.end == text.len() {
-        true => text.clone(),
-        false => SharedString::from(&text[at.clone()]),
-    }
-}
-
 /// The frame every row in the list is drawn in: exactly [`ROW_H`] tall, and
 /// never narrower than the window.
 ///

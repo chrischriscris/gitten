@@ -39,6 +39,7 @@
 //! |---|---|
 //! | [`screen`] | cells, ink, the pen, and the diff that becomes escape codes |
 //! | [`rows`] | the `Rows` seam, `Layouts`, and `TextRows` |
+//! | [`markdown`] | `MarkdownRows`: the rendered document, in cells |
 //! | [`split`] | `SplitRows`: the two-column presentation |
 //! | [`diff`] | the diff view: viewport, reflow, horizontal scroll |
 //! | [`commits`] | the commit list, and the graph gutter in box drawing |
@@ -49,6 +50,7 @@
 pub mod commits;
 pub mod diff;
 pub mod help;
+pub mod markdown;
 pub mod rows;
 pub mod screen;
 pub mod scrollbar;
