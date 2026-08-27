@@ -55,6 +55,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+// The registry lands one commit ahead of its tenant: nothing in the app
+// reads it yet, so the whole surface reads as dead until the screen stack
+// comes off. The allow comes off with the stack.
+#[allow(dead_code)]
+mod panes;
+
 const EXTRA: &str = "  --ascii        draw the graph and the scrollbar without box-drawing
   --no-mouse     leave the mouse to the terminal: no wheel, no click, and the
                  emulator's own drag-to-select instead of gitten's
