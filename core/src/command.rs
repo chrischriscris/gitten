@@ -366,15 +366,16 @@ impl Keymap {
         bind(GLOBAL, "<", "view.left");
         bind(GLOBAL, ">", "view.right");
 
-        // The panel numbers read down the window's panes: 1 FILES,
-        // 2 BRANCHES, 3 STASH, 4 COMMITS — the pane layout's own order, not
-        // lazygit's (whose log took 1). A direct jump is global so it works
-        // whatever is focused, and registered in that order, so
-        // 1 → 2 → 3 → 4 walks files → branches → stashes → commits.
-        bind(GLOBAL, "1", "files.focus");
-        bind(GLOBAL, "2", "branches.focus");
-        bind(GLOBAL, "3", "stashes.focus");
+        // The panel numbers read down the window's left stack, lazygit's
+        // order: 1 STATUS, 2 FILES, 3 BRANCHES, 4 COMMITS, 5 STASH — the
+        // stash under the commits, where parking ends a session's work. A
+        // direct jump is global so it works whatever is focused, and
+        // registered in that order, so 1 → 5 walks the stack top to bottom.
+        bind(GLOBAL, "1", "status.focus");
+        bind(GLOBAL, "2", "files.focus");
+        bind(GLOBAL, "3", "branches.focus");
         bind(GLOBAL, "4", "commits.focus");
+        bind(GLOBAL, "5", "stashes.focus");
 
         // lazygit's three sync keys, global because they aim past every pane
         // at the branch HEAD sits on: P sends it, p pulls onto its upstream,
@@ -960,6 +961,7 @@ impl Commands {
                 "carry on the cherry-pick in progress once conflicts are resolved",
                 None,
             ),
+            ("status.focus", "focus the status pane", None),
             ("files.focus", "focus the working-tree pane", None),
             (
                 "files.stage",
@@ -1386,10 +1388,10 @@ mod tests {
                 "{name} leaked out of [branches]"
             );
         }
-        // The panel jump is global, numbered by the pane layout: 2 here,
-        // the same branch pane files' own number sits beside.
+        // The panel jump is global, numbered by the pane layout in lazygit's
+        // order: 3 here, under status and files.
         assert_eq!(
-            k.resolve(&Modes::new(), &keys("2")),
+            k.resolve(&Modes::new(), &keys("3")),
             Resolve::Run("branches.focus")
         );
 
@@ -1419,9 +1421,10 @@ mod tests {
     #[test]
     fn the_stash_verbs_resolve_in_stashes_mode_and_focus_is_global() {
         let k = Keymap::builtin();
-        // The direct jump works whatever is focused, like files.focus.
+        // The direct jump works whatever is focused, like files.focus — 5
+        // here, the foot of the stack.
         assert_eq!(
-            k.resolve(&Modes::new(), &keys("3")),
+            k.resolve(&Modes::new(), &keys("5")),
             Resolve::Run("stashes.focus")
         );
 

@@ -153,11 +153,17 @@ impl HeaderText {
 /// not in this table because it sizes itself differently — the flexible foot,
 /// not content height — and because its slot is the registry's, which an
 /// extension pane can take over.
-const SIDEBAR: [(&str, &str, &str, &str); 3] = [
-    ("files", "1", "FILES", "side-files"),
-    ("branches", "2", "BRANCHES", "side-branches"),
-    ("stashes", "3", "STASH", "side-stashes"),
+const STACK_TOP: [(&str, &str, &str, &str); 3] = [
+    ("status", "1", "STATUS", "side-status"),
+    ("files", "2", "FILES", "side-files"),
+    ("branches", "3", "BRANCHES", "side-branches"),
 ];
+
+/// The stack's content-sized pane *under* the commit list: the stash, whose
+/// key is last because parking is where a session's work ends. A separate
+/// table from [`STACK_TOP`] because drawing order is not registry order —
+/// the commit list is the flexible middle, and the foot renders after it.
+const STACK_FOOT: [(&str, &str, &str, &str); 1] = [("stashes", "5", "STASH", "side-stashes")];
 
 /// The repository as the title strip spells it: `(parent, name)` with the
 /// parent under `~` when it is under home and ending in `/`, so the two halves
@@ -471,6 +477,14 @@ enum Screen {
         generation: Rc<Cell<Generation>>,
         label: Rc<RefCell<String>>,
     },
+    /// The status line: where HEAD sits. It acquires nothing — it reads the
+    /// branches pane's model, which already pays for the window's one `head`
+    /// read — so it has a label and a branch handle and no refresh of its
+    /// own: a branches refresh is its refresh.
+    Status {
+        view: Entity<views::status::Status>,
+        label: Rc<RefCell<String>>,
+    },
     Custom(Rc<dyn Pane>),
 }
 
@@ -539,6 +553,13 @@ impl Screen {
         }
     }
 
+    fn status(view: Entity<views::status::Status>, label: impl Into<String>) -> Self {
+        Self::Status {
+            view,
+            label: Rc::new(RefCell::new(label.into())),
+        }
+    }
+
     fn any(&self) -> AnyView {
         match self {
             Screen::Commits { view, .. } => view.clone().into(),
@@ -546,6 +567,7 @@ impl Screen {
             Screen::Files { view, .. } => view.clone().into(),
             Screen::Stashes { view, .. } => view.clone().into(),
             Screen::Branches { view, .. } => view.clone().into(),
+            Screen::Status { view, .. } => view.clone().into(),
             Screen::Custom(pane) => pane.any(),
         }
     }
@@ -558,6 +580,7 @@ impl Screen {
             Screen::Files { .. } => "files",
             Screen::Stashes { .. } => "stashes",
             Screen::Branches { .. } => "branches",
+            Screen::Status { .. } => "status",
             Screen::Custom(pane) => pane.mode(),
         }
     }
@@ -579,6 +602,7 @@ impl Screen {
             | Screen::Files { label, .. }
             | Screen::Stashes { label, .. } => label.borrow().clone(),
             Screen::Branches { label, .. } => label.borrow().clone(),
+            Screen::Status { label, .. } => label.borrow().clone(),
             Screen::Custom(pane) => pane.label(cx),
         }
     }
@@ -590,6 +614,9 @@ impl Screen {
         repo: gitten_git::Handle,
     ) -> Option<Refresh> {
         match self {
+            // The status pane reads other panes' models and owns no
+            // acquisition, so a refresh wave has nothing to hand it.
+            Screen::Status { .. } => None,
             Screen::Commits {
                 view,
                 source,
@@ -849,6 +876,7 @@ impl Screen {
             Screen::Files { view, .. } => view.read(cx).list_bounds(),
             Screen::Stashes { view, .. } => view.read(cx).list_bounds(),
             Screen::Branches { view, .. } => view.read(cx).list_bounds(),
+            Screen::Status { .. } => Bounds::default(),
             Screen::Custom(pane) => pane.list_bounds(cx),
         }
     }
@@ -863,6 +891,7 @@ impl Screen {
             Screen::Files { view, .. } => view.read(cx).pan_pixels(dx),
             Screen::Stashes { view, .. } => view.read(cx).pan_pixels(dx),
             Screen::Branches { view, .. } => view.read(cx).pan_pixels(dx),
+            Screen::Status { .. } => false,
             Screen::Custom(pane) => pane.pan_pixels(dx, cx),
         }
     }
@@ -908,6 +937,12 @@ impl Screen {
                 }
                 known
             }),
+            // The status pane has no verbs: it says where HEAD is and takes
+            // no commands. Every global still resolves over it — cycling,
+            // the number keys, the pane moves — and a pane-specific verb is
+            // answered by the caller's sentence, the same as a command no
+            // screen owns.
+            Screen::Status { .. } => false,
             Screen::Custom(pane) => pane.run(command, host, writes, cx),
         }
     }
@@ -922,6 +957,7 @@ impl Screen {
             Screen::Files { view, .. } => view.update(cx, |v, _| v.scroll_pixels(dy, host)),
             Screen::Stashes { view, .. } => view.update(cx, |v, _| v.scroll_pixels(dy, host)),
             Screen::Branches { view, .. } => view.update(cx, |b, _| b.scroll_pixels(dy, host)),
+            Screen::Status { .. } => false,
             Screen::Custom(pane) => pane.scroll_pixels(dy, host, cx),
         }
     }
@@ -954,6 +990,7 @@ impl Screen {
                 true => b.select_all(),
                 false => b.select_none(),
             }),
+            Screen::Status { .. } => false,
             Screen::Custom(pane) => pane.select(all, cx),
         }
     }
@@ -1171,7 +1208,7 @@ impl DevShell {
                 Screen::Branches { view, .. } => view.update(cx, |v, _| v.set_focused(focused)),
                 Screen::Stashes { view, .. } => view.update(cx, |v, _| v.set_focused(focused)),
                 Screen::Commits { view, .. } => view.update(cx, |v, _| v.set_focused(focused)),
-                Screen::Diff { .. } | Screen::Custom(_) => {}
+                Screen::Diff { .. } | Screen::Status { .. } | Screen::Custom(_) => {}
             }
         }
     }
@@ -2766,6 +2803,7 @@ impl DevShell {
                 },
                 cx,
             ),
+            "status.focus" => self.focus_named("status", cx),
             "commits.focus" => self.focus_named("commits", cx),
             "files.focus" => self.focus_named("files", cx),
             "stashes.focus" => self.focus_named("stashes", cx),
@@ -3186,7 +3224,9 @@ impl DevShell {
                 let writes = self.writes();
                 pane.run("copy.selection", &host, writes.as_ref(), cx);
             }
-            None => {}
+            // The status pane has no row to copy: nothing selected, nothing
+            // under a cursor.
+            Some(Screen::Status { .. }) | None => {}
         }
     }
 
@@ -3726,12 +3766,12 @@ impl Render for DevShell {
         // one place a compiled-in tenant takes a region of its own, exactly
         // as it did when it had a column to itself.
         let sidebar = {
-            // Owned, not borrowed: the loop below calls back into `self` for
+            // Owned, not borrowed: the loops below call back into `self` for
             // the commit section, and a borrow of the panes would stand
             // across it.
             let focused_name = self.panes.focused_name().to_string();
             let mut sections: Vec<AnyElement> = Vec::new();
-            for (name, number, label, id) in SIDEBAR {
+            for (name, number, label, id) in STACK_TOP {
                 let Some(screen) = self.panes.get(name) else {
                     continue;
                 };
@@ -3785,9 +3825,51 @@ impl Render for DevShell {
                         .into_any_element(),
                 );
             }
-            // The stack's flexible foot: the commit list, or whichever
-            // extension pane took its region over.
+            // The flexible middle, then the content-sized foot — lazygit's
+            // order: the stash under the commits, where parking ends a
+            // session's work.
             self.commits_section(&host, &focused_name, cx, &mut sections);
+            for (name, number, label, id) in STACK_FOOT {
+                let Some(screen) = self.panes.get(name) else {
+                    continue;
+                };
+                let focused = self.spot == Spot::List && focused_name == name;
+                let count: Option<SharedString> = None;
+                let rows = match screen {
+                    Screen::Stashes { view, .. } => view.read(cx).rows(),
+                    _ => 0,
+                };
+                sections.push(
+                    div()
+                        .id(id)
+                        .debug_selector(move || id.to_string())
+                        .flex_shrink(1.0)
+                        .h(px(section_height(rows)))
+                        .min_h(px(section_floor(rows)))
+                        .flex()
+                        .flex_col()
+                        .overflow_hidden()
+                        .capture_any_mouse_down(cx.listener(move |this, _, _, cx| {
+                            this.focus_named(name, cx);
+                        }))
+                        .child(chrome::pane_header(
+                            &host,
+                            number,
+                            label.into(),
+                            count,
+                            focused,
+                            None,
+                        ))
+                        .child(
+                            div()
+                                .min_h_0()
+                                .flex_grow(1.0)
+                                .overflow_hidden()
+                                .child(screen.any()),
+                        )
+                        .into_any_element(),
+                );
+            }
             (!sections.is_empty()).then(|| {
                 div()
                     .id("sidebar")
@@ -3897,7 +3979,7 @@ impl Render for DevShell {
                 };
                 chrome::pane_header_with(
                     &host,
-                    "5",
+                    "6",
                     name.into_any_element(),
                     None,
                     main_focused,
@@ -4410,8 +4492,17 @@ fn main() {
                 // rest of startup acquisition; from the next write on, the
                 // generation-guarded refresh path keeps it current. A fixture
                 // has no repository and so no pane at all.
-                if let Some((_, handle)) = &repo {
+                if let Some((path, handle)) = &repo {
                     start::mark("files status begin");
+                    // The repository's own name, cut the way `describe` cuts
+                    // it — canonicalised first, so `.` still has one. The
+                    // status pane's bright half; solved once here rather
+                    // than re-canonicalising per frame.
+                    let named = path.canonicalize().unwrap_or_else(|_| path.clone());
+                    let repo_name = named
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
                     let described = std::thread::scope(|s| {
                         // Beside, not behind — describe, status and the stash
                         // stack spawn together and are joined only once all
@@ -4520,16 +4611,28 @@ fn main() {
                     });
                     start::mark("branches read done");
                     let label = prepared.label.clone();
+                    let branches = cx.new(|_| views::branches::Branches::from_prepared(prepared));
                     initial_panes.register(
                         "branches",
-                        Screen::branches(
-                            cx.new(|_| views::branches::Branches::from_prepared(prepared)),
-                            Generation::default(),
-                            label,
-                        ),
+                        Screen::branches(branches.clone(), Generation::default(), label),
                     );
                     initial_panes.focus(0);
                     start::mark("branches pane built");
+
+                    // The status line, after branches: it reads who HEAD is
+                    // from the branches pane's model — one `head` read in the
+                    // window, however many panes say it — so it is built once
+                    // that model exists, and never refreshes anything of its
+                    // own.
+                    initial_panes.register(
+                        "status",
+                        Screen::status(
+                            cx.new(|_| views::status::Status::new(repo_name, Some(branches))),
+                            described.clone(),
+                        ),
+                    );
+                    initial_panes.focus(0);
+                    start::mark("status pane built");
 
                     // The stack, last in the cycle like its key is last on the
                     // number row.
@@ -5301,8 +5404,9 @@ mod tests {
     }
 
     /// The design's whole arrangement: stack, diff — two regions side by
-    /// side, the stack's four sections stacked inside the first, the commit
-    /// list the flexible one. Drawn from the same geometry the click
+    /// side, the stack's five sections stacked inside the first in lazygit's
+    /// order — status, files, branches, then the flexible commit list, then
+    /// the stash at the foot. Drawn from the same geometry the click
     /// hit-tests read, which is what makes it a test of the real layout and
     /// not of a copy of it.
     #[gpui::test]
@@ -5310,6 +5414,22 @@ mod tests {
         let shell = shell(None, cx);
         shell.update(cx, |shell, cx| {
             let host = config::host(cx);
+            let branches = cx.new(|_| {
+                crate::views::branches::Branches::from_prepared(crate::views::branches::prepare(
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                    &host.theme,
+                    "t",
+                ))
+            });
+            shell.panes.register(
+                "status",
+                Screen::status(
+                    cx.new(|_| crate::views::status::Status::new("t", Some(branches.clone()))),
+                    "t",
+                ),
+            );
             shell.panes.register(
                 "files",
                 Screen::files(
@@ -5325,21 +5445,7 @@ mod tests {
             );
             shell.panes.register(
                 "branches",
-                Screen::branches(
-                    cx.new(|_| {
-                        crate::views::branches::Branches::from_prepared(
-                            crate::views::branches::prepare(
-                                Vec::new(),
-                                Vec::new(),
-                                None,
-                                &host.theme,
-                                "t",
-                            ),
-                        )
-                    }),
-                    Generation::default(),
-                    "branches",
-                ),
+                Screen::branches(branches, Generation::default(), "branches"),
             );
             shell.panes.register(
                 "stashes",
@@ -5387,28 +5493,35 @@ mod tests {
         assert_eq!(sidebar.origin.y, main.origin.y);
         assert_eq!(sidebar.size.height, main.size.height);
 
-        // The short sections are as tall as their content — all three empty
-        // here, so a header and the one row the empty-state line takes — and
-        // each sits directly under the one before, from the top of the stack.
+        // The short sections are as tall as their content — all empty here,
+        // so a header and the one row the empty-state line takes — and each
+        // sits directly under the one before, from the top of the stack.
+        let status = cx.debug_bounds("side-status").expect("no status section");
         let files = cx.debug_bounds("side-files").expect("no files section");
         let branches = cx
             .debug_bounds("side-branches")
             .expect("no branches section");
         let stashes = cx.debug_bounds("side-stashes").expect("no stashes section");
         let natural = gpui::px(super::section_height(0));
-        assert_eq!(files.size.height, natural, "an empty section is one row");
+        assert_eq!(status.size.height, natural, "an empty section is one row");
+        assert_eq!(files.size.height, natural);
         assert_eq!(branches.size.height, natural);
         assert_eq!(stashes.size.height, natural);
-        assert_eq!(files.origin.y, sidebar.origin.y);
+        assert_eq!(status.origin.y, sidebar.origin.y);
+        assert_eq!(status.bottom(), files.origin.y, "status then files");
         assert_eq!(files.bottom(), branches.origin.y, "files then branches");
-        assert_eq!(branches.bottom(), stashes.origin.y, "branches then stashes");
 
-        // The commit list is the stack's flexible foot: under the short
-        // sections and down to the bottom, whatever height that is.
+        // The commit list is the stack's flexible middle: under the top
+        // sections, above the stash foot, taking the space between.
         let commits = cx.debug_bounds("side-commits").expect("no commits section");
-        assert_eq!(stashes.bottom(), commits.origin.y, "stashes then commits");
-        assert_eq!(commits.bottom(), sidebar.bottom(), "commits fills the foot");
-        assert!(commits.size.height > natural, "the foot is the tall one");
+        assert_eq!(branches.bottom(), commits.origin.y, "branches then commits");
+        assert_eq!(commits.bottom(), stashes.origin.y, "commits then stashes");
+        assert_eq!(
+            stashes.bottom(),
+            sidebar.bottom(),
+            "the stash ends the stack"
+        );
+        assert!(commits.size.height > natural, "the middle is the tall one");
 
         // Clicking a section's rows focuses *that* pane, and the keyboard
         // moves with it.
@@ -7051,6 +7164,7 @@ diff --git a/fresh.txt b/fresh.txt
                             Screen::Custom(_) => "custom",
                             Screen::Diff { .. } => "diff",
                             Screen::Stashes { .. } => "stashes",
+                            Screen::Status { .. } => "status",
                             Screen::Commits { .. }
                             | Screen::Files { .. }
                             | Screen::Branches { .. } => {
@@ -8347,7 +8461,10 @@ diff --git a/added.txt b/added.txt
                     | Screen::Stashes { generation, .. } => {
                         assert_eq!(generation.get(), shell.generation);
                     }
-                    Screen::Commits { .. } | Screen::Diff { .. } | Screen::Custom(_) => {}
+                    Screen::Commits { .. }
+                    | Screen::Diff { .. }
+                    | Screen::Status { .. }
+                    | Screen::Custom(_) => {}
                 }
             }
         });

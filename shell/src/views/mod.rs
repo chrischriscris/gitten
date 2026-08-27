@@ -135,3 +135,4 @@ pub mod files;
 pub mod markdown;
 pub mod split;
 pub mod stashes;
+pub mod status;

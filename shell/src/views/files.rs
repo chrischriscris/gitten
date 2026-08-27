@@ -1286,18 +1286,18 @@ mod tests {
     fn the_shipped_keymap_resolves_the_files_binding_through_the_registry() {
         use gitten_core::command::{Code, Commands, HelpRow, Key, Keymap, Modes, Resolve};
 
-        // The command exists and the key resolves to it. The sidebar stacks
-        // its sections in reading order, so files are first — `1`, not the
-        // pane-swap digit of the previous column design.
+        // The command exists and the key resolves to it. The stack draws in
+        // lazygit's order, so files are second — under status, above the
+        // branches.
         let k = Keymap::builtin();
         assert_eq!(
-            k.resolve(&Modes::new(), &[Key::char('1')]),
+            k.resolve(&Modes::new(), &[Key::char('2')]),
             Resolve::Run("files.focus")
         );
-        assert_eq!(k.keys_for("files.focus"), vec!["1"]);
+        assert_eq!(k.keys_for("files.focus"), vec!["2"]);
         assert_eq!(
-            Key::parse("1"),
-            Some(Key::plain(Code::Char('1'))),
+            Key::parse("2"),
+            Some(Key::plain(Code::Char('2'))),
             "the binding round-trips through a config file's spelling"
         );
 
@@ -1310,7 +1310,7 @@ mod tests {
             .unwrap();
         assert!(rows[global..]
             .iter()
-            .any(|r| matches!(r, HelpRow::Command { keys, doc, .. } if keys == "1" && doc == "focus the working-tree pane")));
+            .any(|r| matches!(r, HelpRow::Command { keys, doc, .. } if keys == "2" && doc == "focus the working-tree pane")));
     }
 
     // ------------------------------------------------------- the discard arm
