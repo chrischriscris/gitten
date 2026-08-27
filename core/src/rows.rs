@@ -97,6 +97,66 @@ pub struct Entry {
     pub row: usize,
 }
 
+/// Which hunk each logical row belongs to, for the verbs that act on one.
+///
+/// One entry per hunk — not per row, which is the difference between a table
+/// that grows with a 714k-line diff and one that grows with its hunk count.
+/// Every hunk-shaped presentation builds its rows in hunk order (a file
+/// header, then each hunk's header and lines), so recording a span at build
+/// time is one push per hunk; reading it back is a binary search.
+///
+/// The address is `(file, hunk)` and not a path: a span is geometry, and the
+/// presentation that recorded it spells the file's name in its own
+/// [`Present::files`] list, where `file` is an index. Keeping content out of
+/// here is also what keeps a *mis*-recorded span from naming the wrong file —
+/// the caller resolves the index through the same presentation that answered,
+/// and a bad one degrades to "no hunk here" rather than to the wrong hunk.
+#[derive(Debug, Default)]
+pub struct Hunks {
+    spans: Vec<HunkSpan>,
+}
+
+#[derive(Debug)]
+struct HunkSpan {
+    /// First logical row of the hunk, inclusive — its header row.
+    start: usize,
+    /// How many logical rows the hunk spans, header included.
+    rows: usize,
+    /// The file, numbered as the recording presentation's own
+    /// [`Present::files`] order does, and the hunk within it.
+    file: usize,
+    hunk: usize,
+}
+
+impl Hunks {
+    /// Records one hunk occupying logical rows `start..start+rows`.
+    ///
+    /// `rows` of zero is refused rather than stored: a span that addresses
+    /// nothing would answer for a row it does not cover, and the honest answer
+    /// for a hunk with no rows is that there is no hunk there. Spans arrive in
+    /// ascending order — the caller walks the diff as it builds it — which is
+    /// what [`Hunks::at`]'s binary search assumes.
+    pub fn record(&mut self, start: usize, rows: usize, file: usize, hunk: usize) {
+        if rows == 0 {
+            return;
+        }
+        self.spans.push(HunkSpan {
+            start,
+            rows,
+            file,
+            hunk,
+        });
+    }
+
+    /// The hunk under logical row `index`, or nothing for the gaps between
+    /// hunks — today only the file headers.
+    pub fn at(&self, index: usize) -> Option<(usize, usize)> {
+        let i = self.spans.partition_point(|s| s.start <= index);
+        let s = self.spans.get(i.checked_sub(1)?)?;
+        (index < s.start + s.rows).then_some((s.file, s.hunk))
+    }
+}
+
 /// The rows of every file a presentation claimed, flat, with a wrap index.
 ///
 /// The storage a [`Present`] implementation is built out of. Both shipped
@@ -106,6 +166,9 @@ pub struct Entry {
 pub struct Flat {
     rows: Vec<Row>,
     files: Vec<Entry>,
+    /// Which hunk every logical row belongs to. Recorded by [`Flat::push`],
+    /// because that is the one walk that knows where each hunk starts.
+    hunks: Hunks,
     /// Rows that are part of a block that moved. Counted because move detection
     /// finding nothing and move detection being switched off look identical on
     /// screen — see [`Flat::report`].
@@ -121,7 +184,13 @@ pub struct Flat {
 
 impl Flat {
     /// Appends one file's rows: a header, then a header and its lines per hunk.
+    ///
+    /// Each hunk's logical span — its header row through its last line — is
+    /// recorded here, because this is the one walk that knows where every hunk
+    /// starts without a second pass over the rows. The file index is this
+    /// flat's own file order, which [`Flat::files`] spells.
     pub fn push(&mut self, f: File) {
+        let file = self.files.len();
         self.files.push(Entry {
             path: f.path.clone(),
             adds: f.adds,
@@ -133,7 +202,12 @@ impl Flat {
             adds: f.adds,
             dels: f.dels,
         });
-        for h in f.hunks {
+        for (hunk, h) in f.hunks.into_iter().enumerate() {
+            // The span opens on the header row about to be pushed and closes
+            // after the hunk's last line. A hunk without lines spans its
+            // header alone — still one row, still a hunk on screen.
+            self.hunks
+                .record(self.rows.len(), 1 + h.lines.len(), file, hunk);
             self.rows.push(Row::Hunk(h.header));
             for l in h.lines {
                 self.moved += l.moved as usize;
@@ -160,6 +234,12 @@ impl Flat {
 
     pub fn files(&self) -> &[Entry] {
         &self.files
+    }
+
+    /// The hunk under logical row `index`, or nothing for the gaps between
+    /// hunks — today only the file headers. See [`Hunks::at`] for the address.
+    pub fn hunk_at(&self, index: usize) -> Option<(usize, usize)> {
+        self.hunks.at(index)
     }
 
     pub fn moved(&self) -> usize {
@@ -310,6 +390,19 @@ pub trait Present {
     fn files(&self) -> &[Entry] {
         &[]
     }
+
+    /// The hunk under logical row `index`, as `(file, hunk)` — the file
+    /// numbered as this presentation's own [`Present::files`] order spells it.
+    ///
+    /// Defaulted to none, for the same reason `files` is: a presentation that
+    /// draws no hunks has nothing actionable under the keyboard, and the verbs
+    /// that act on one say so rather than guess. Both shipped implementations
+    /// record their spans as they build; an extension records its own the same
+    /// way, and a recorded index that answers nothing on [`Present::files`]
+    /// degrades to "no hunk here" rather than to the wrong hunk.
+    fn hunk_at(&self, _index: usize) -> Option<(usize, usize)> {
+        None
+    }
 }
 
 /// So `&[Box<dyn FrontendTrait>]` works wherever `&[impl Present]` is wanted,
@@ -333,6 +426,9 @@ impl<T: Present + ?Sized> Present for Box<T> {
     }
     fn files(&self) -> &[Entry] {
         (**self).files()
+    }
+    fn hunk_at(&self, index: usize) -> Option<(usize, usize)> {
+        (**self).hunk_at(index)
     }
 }
 
@@ -571,6 +667,9 @@ diff --git a/b.md b/b.md
         }
         fn files(&self) -> &[Entry] {
             self.flat.files()
+        }
+        fn hunk_at(&self, index: usize) -> Option<(usize, usize)> {
+            self.flat.hunk_at(index)
         }
     }
 
@@ -828,5 +927,144 @@ diff --git a/b.md b/b.md
         }
         assert_eq!(flat.moved(), 2);
         assert_eq!(flat.report(), "2 moved");
+    }
+
+    // ---------------------------------------------------------------- hunks
+
+    #[test]
+    fn flat_records_exact_hunk_logical_ranges() {
+        // `DIFF`: rows 0–5 are a.rs (header, hunk header, four lines) and
+        // 6–9 are b.md (header, hunk header, two lines).
+        let mut flat = Flat::default();
+        let host = Host::new();
+        for f in prepare(&parse_unified_diff(DIFF), &host.syntax, 2000).files {
+            flat.push(f);
+        }
+        assert_eq!(flat.len(), 10);
+        // A file header owns no hunk: the spans open below it.
+        assert_eq!(flat.hunk_at(0), None);
+        // Header, first line and last line of the first file's hunk.
+        assert_eq!(flat.hunk_at(1), Some((0, 0)));
+        assert_eq!(flat.hunk_at(2), Some((0, 0)), "the hunk's first line");
+        assert_eq!(flat.hunk_at(5), Some((0, 0)), "the hunk's last line");
+        // The gap between the files, and the second file's own hunk.
+        assert_eq!(flat.hunk_at(6), None, "the second file's header");
+        assert_eq!(flat.hunk_at(7), Some((1, 0)));
+        assert_eq!(flat.hunk_at(9), Some((1, 0)), "the last line of the diff");
+        assert_eq!(flat.hunk_at(10), None, "one past the end");
+        // A row index beyond the table is nothing, as everywhere else here.
+        assert_eq!(flat.hunk_at(9999), None);
+    }
+
+    #[test]
+    fn two_hunks_abut_without_one_swallowing_the_other() {
+        // Context one on both sides makes the hunks touch: the last row of
+        // one and the header row of the next are neighbours, and a search
+        // that rounds the wrong way hands one of them to the other.
+        let raw = "\
+diff --git a/a.rs b/a.rs
+@@ -1,3 +1,3 @@
+ one
+-two
++TWO
+ three
+@@ -4,3 +4,3 @@
+ four
+-five
++FIVE
+ six
+";
+        let mut flat = Flat::default();
+        let host = Host::new();
+        for f in prepare(&parse_unified_diff(raw), &host.syntax, 2000).files {
+            flat.push(f);
+        }
+        // Rows 1–5 are hunk 0, rows 6–10 are hunk 1, and nothing lies between.
+        assert_eq!(flat.hunk_at(5), Some((0, 0)), "hunk 0's last line");
+        assert_eq!(flat.hunk_at(6), Some((0, 1)), "hunk 1's header");
+        assert_eq!(flat.hunk_at(10), Some((0, 1)), "hunk 1's last line");
+        assert_eq!(flat.hunk_at(11), None);
+    }
+
+    #[test]
+    fn hunk_lookup_survives_visual_wrapping() {
+        // The spans are in logical rows, so a wrapped line's segments all
+        // answer for the one hunk their line belongs to — that is the whole
+        // reason the address is logical and not visual.
+        let host = Host::new();
+        let mut owners = vec![Text::default()];
+        let a = assemble(&parse_unified_diff(DIFF), &host.syntax, 2000, &mut owners);
+        owners[0].flat.reflow(8, &Word);
+        let re = expand(&a.ordered.order, &owners, None);
+        assert!(re.len() > a.ordered.len(), "nothing wrapped");
+
+        let mut answers: Vec<Option<(usize, usize)>> = Vec::new();
+        for r in &re.order {
+            let answer = owners[0].hunk_at(r.index as usize);
+            // Consecutive segments of one logical row agree.
+            if let Some(previous) = answers.last() {
+                let before = re.order[answers.len() - 1];
+                if before.logical() == r.logical() {
+                    assert_eq!(*previous, answer, "row {:?}", r);
+                }
+            }
+            answers.push(answer);
+        }
+        // The long heading — logical row 8, inside b.md's hunk — wrapped, and
+        // every one of its rows still names the same hunk.
+        assert!(owners[0].rows(8) > 1, "the heading did not wrap");
+        let segments: Vec<Option<(usize, usize)>> = re
+            .order
+            .iter()
+            .filter(|r| r.index == 8)
+            .map(|r| owners[0].hunk_at(r.index as usize))
+            .collect();
+        assert!(segments.len() > 1, "{segments:?}");
+        assert!(segments.iter().all(|s| *s == Some((1, 0))), "{segments:?}");
+    }
+
+    #[test]
+    fn an_unaware_presentation_has_no_actionable_hunk() {
+        // Defaulted on the trait, so this is what an extension gets for free
+        // rather than a special case in the caller: its rows are honestly
+        // nobody's hunk.
+        struct Bare(usize);
+        impl Present for Bare {
+            fn claims(&self, _: &str) -> bool {
+                true
+            }
+            fn len(&self) -> usize {
+                self.0
+            }
+            fn build(&mut self, f: File) {
+                self.0 += 1 + f.hunks.iter().map(|h| 1 + h.lines.len()).sum::<usize>();
+            }
+        }
+        let mut bare = Bare(0);
+        let host = Host::new();
+        for f in prepare(&parse_unified_diff(DIFF), &host.syntax, 2000).files {
+            bare.build(f);
+        }
+        for row in 0..bare.len() {
+            assert_eq!(bare.hunk_at(row), None, "row {row} claimed a hunk");
+        }
+        // And through the `Box` every frontend's registry stores them in.
+        let boxed: Box<dyn Present> = Box::new(Bare(3));
+        assert_eq!(boxed.hunk_at(1), None);
+    }
+
+    #[test]
+    fn a_zero_length_span_is_refused_rather_than_recorded() {
+        // A span that addresses nothing would answer for a row it does not
+        // cover; the honest answer for it is that there is no hunk there.
+        let mut hunks = Hunks::default();
+        hunks.record(4, 0, 0, 0);
+        assert_eq!(hunks.at(4), None);
+        // A real span beside the refused one still answers.
+        hunks.record(5, 2, 1, 1);
+        assert_eq!(hunks.at(4), None, "the refusal did not shift a span");
+        assert_eq!(hunks.at(5), Some((1, 1)));
+        assert_eq!(hunks.at(6), Some((1, 1)));
+        assert_eq!(hunks.at(7), None);
     }
 }
