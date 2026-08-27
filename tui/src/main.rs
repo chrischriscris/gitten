@@ -266,6 +266,10 @@ impl Screens {
                 "view.bottom" => c.to_bottom(),
                 // A commit list has nothing off the left edge to reach.
                 "view.left" | "view.right" => {}
+                // The terminal shows one screen at a time — there is no
+                // second pane to walk to. The commands are still answered:
+                // a key that resolves must not read as one that failed.
+                "pane.left" | "pane.right" => {}
                 _ => return false,
             },
             Screens::Diff(d) => match command {

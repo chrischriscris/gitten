@@ -451,10 +451,12 @@ impl Keymap {
         // strengths — its reset menu lists mixed, soft, hard under exactly
         // these letters. The menu does not exist here (one keypress, one
         // command name), so each strength is a binding of its own; `h`
-        // shadows one global (`view.left`) in this mode, the same
+        // shadows one global (`pane.left`) in this mode, the same
         // mode-overrides-global trade [stashes] already makes for `g` and
-        // `d`. Hard is the destructive one and confirms twice; soft and
-        // mixed keep every change recoverable through reflog or working tree.
+        // `d` — and the left arrow still carries the pane move, which is
+        // why the arrow spellings ride beside the letters. Hard is the
+        // destructive one and confirms twice; soft and mixed keep every
+        // change recoverable through reflog or working tree.
         bind("commits", "s", "commits.reset-soft");
         bind("commits", "m", "commits.reset-mixed");
         bind("commits", "h", "commits.reset-hard");
@@ -1039,6 +1041,8 @@ impl Commands {
             ("input.cancel", "discard the text", None),
             ("pane.next", "the next list in the column", None),
             ("pane.prev", "the previous list in the column", None),
+            ("pane.left", "the pane on the left", None),
+            ("pane.right", "the pane on the right", None),
             ("select.all", "select the whole view", None),
             ("select.none", "drop the selection", None),
             (
@@ -1199,6 +1203,50 @@ mod tests {
         assert_eq!(
             Key::parse("ctrl-wheeldown").unwrap().to_string(),
             "ctrl-wheeldown"
+        );
+    }
+
+    #[test]
+    fn the_pane_moves_are_globals_on_lazygits_pair_and_the_arrows() {
+        let k = Keymap::builtin();
+        let modes = Modes::new();
+        // Both spellings, letter and arrow — the letter is lazygit's h/l and
+        // the arrow is what a Mac user's fingers also know. The text scroll
+        // these keys used to carry keeps its commands on lazygit's own pair.
+        for (chord, name) in [
+            ("h", "pane.left"),
+            ("left", "pane.left"),
+            ("l", "pane.right"),
+            ("right", "pane.right"),
+            ("<", "view.left"),
+            (">", "view.right"),
+        ] {
+            assert_eq!(
+                k.resolve(&modes, &keys(chord)),
+                Resolve::Run(name),
+                "{chord} did not reach {name}"
+            );
+        }
+        // Both registry halves: the command is in the projection a help panel
+        // reads, and the key that resolves it is the one it was bound with.
+        let commands = Commands::builtin();
+        for name in ["pane.left", "pane.right"] {
+            assert!(commands.known(name), "{name} is not registered");
+            assert!(!k.keys_for(name).is_empty(), "{name} is bound to nothing");
+        }
+        // And the one mode with a letter of its own on this chord keeps it:
+        // reset-hard is lazygit's own placement, and the arrow still carries
+        // the pane move there.
+        let mut commits = Modes::new();
+        commits.push("commits");
+        assert_eq!(
+            k.resolve(&commits, &keys("h")),
+            Resolve::Run("commits.reset-hard")
+        );
+        assert_eq!(
+            k.resolve(&commits, &keys("left")),
+            Resolve::Run("pane.left"),
+            "the arrow survives the shadowing"
         );
     }
 
@@ -1445,8 +1493,9 @@ mod tests {
 
         // The reset strengths are lazygit's reset-menu letters — mixed, soft,
         // hard under m, s, h — flattened into three direct bindings. `h`
-        // shadows one global here (`view.left`), exactly as [stashes]
-        // shadows `g`/`d`; revert takes lazygit's own `t`; cherry-pick takes
+        // shadows one global here (`pane.left`), exactly as [stashes]
+        // shadows `g`/`d`; the left arrow still carries the pane move;
+        // revert takes lazygit's own `t`; cherry-pick takes
         // the free capital beside it; a tag takes the letter that names
         // branches in their pane.
         let mut commits = Modes::new();
@@ -1467,7 +1516,7 @@ mod tests {
                 "{chord} did not reach {name} in [commits]"
             );
             // Particular to this pane: a commit list has no stash, no
-            // view.left worth keeping, and no other mode's meanings.
+            // pane.left worth keeping, and no other mode's meanings.
             assert_ne!(
                 k.resolve(&Modes::new(), &keys(chord)),
                 Resolve::Run(name),

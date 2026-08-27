@@ -2746,6 +2746,26 @@ impl DevShell {
             "input.cancel" => self.close_input(false, cx),
             "pane.next" => self.cycle_pane(1, cx),
             "pane.prev" => self.cycle_pane(-1, cx),
+            // lazygit's pane moves, on h/l and the arrows. The window is two
+            // regions — stack, diff — so the move is a spot change, and the
+            // keyboard lands wherever the region's own focus already was:
+            // the stack's focused pane, or the diff's last position. At an
+            // edge the move is answered and stays, which is what `set_spot`
+            // does when nothing changes.
+            "pane.left" => self.set_spot(
+                match self.spot {
+                    Spot::Main => Spot::List,
+                    Spot::List => Spot::List,
+                },
+                cx,
+            ),
+            "pane.right" => self.set_spot(
+                match self.spot {
+                    Spot::List => Spot::Main,
+                    Spot::Main => Spot::Main,
+                },
+                cx,
+            ),
             "commits.focus" => self.focus_named("commits", cx),
             "files.focus" => self.focus_named("files", cx),
             "stashes.focus" => self.focus_named("stashes", cx),
