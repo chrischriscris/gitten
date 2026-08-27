@@ -367,6 +367,7 @@ mod tests {
     use gitten_core::markdown::Block;
     use gitten_core::parse_unified_diff;
     use gitten_core::prepared::prepare;
+    use gitten_core::syntax::Kind;
     use gitten_core::theme::Surface;
 
     /// The committed slice: small enough to review in full, and the
@@ -557,6 +558,24 @@ mod tests {
 
         // The blank that follows is a row with a gutter and nothing else.
         assert_eq!(rows[6], " 4  4", "{:?}", rows[6]);
+
+        // Emphasis: the single-asterisk word loses its markers and draws in
+        // its own kind's colour and slant, resolved against the addition it
+        // sits on — the one token the strong/link pair does not cover.
+        let emph = rows
+            .iter()
+            .position(|r| r.contains("gently"))
+            .expect("the emphasis row");
+        assert!(
+            !rows[emph].contains('*'),
+            "an emphasis marker survived: {:?}",
+            rows[emph]
+        );
+        let x = rows[emph].find("gently").unwrap();
+        let expected = theme.syntax_on(Kind::Emphasis, Surface::Added);
+        let ink = h.screen.ink(x, emph).unwrap();
+        assert_eq!(ink.fg, expected.fg, "the emphasis drew in the body colour");
+        assert_eq!(ink.italic, expected.italic, "the emphasis lost its slant");
 
         // The indented `#` command is prose, not a heading: not bold, its
         // indent kept, and the trailing comment where the source had it.

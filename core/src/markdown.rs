@@ -1012,6 +1012,12 @@ impl FlowedRow {
 /// A resize that crosses no block's budget costs two comparisons — the
 /// distinct-block cache below is what makes that true, and it is why a drag
 /// that moves one pixel does not rescan a 70k-row document.
+///
+/// One ordering rule, because breaking it is silent: **a presentation pushes
+/// first and reflows after.** A [`Self::push`] that follows a [`Self::reflow`]
+/// leaves the break table short of the new rows, and [`Wrapped`]'s fallbacks
+/// would answer them one-row/whole-line without a word of complaint — the next
+/// [`Self::reflow`] says so, loudly, in debug builds.
 pub struct Document {
     rows: Vec<DocRow>,
     files: Vec<Entry>,
@@ -1243,6 +1249,15 @@ impl Document {
         &self.blocks
     }
 
+    /// Whether the break table covers every row. False before the first
+    /// reflow — every row is then one row and the whole of its text by
+    /// definition, which is the state every presentation is built in — and
+    /// false when rows were pushed after a reflow without one to follow,
+    /// which is the misuse [`Self::reflow`] catches loudly in debug builds.
+    fn covered(&self) -> bool {
+        self.wrap.is_empty() || self.wrapped.lines() == self.rows.len()
+    }
+
     /// Rebuilds the break table for a new set of budgets, and says whether
     /// anything moved.
     ///
@@ -1260,6 +1275,18 @@ impl Document {
     /// unflowable table and every header are drawn whole (`Budget::Cols(0)`);
     /// everything else wraps at its own block's budget.
     pub fn reflow(&mut self, budget: &dyn Fn(Block) -> usize, wrap: &dyn Wrap) -> bool {
+        // Before anything else: a stale table would pass the comparison below
+        // whenever the pushed rows brought no new block, and every row past it
+        // would answer one-row/whole-line through [`Wrapped`]'s fallbacks with
+        // no panic and no signal. Loud, in the build where somebody is there.
+        debug_assert!(
+            self.covered(),
+            "rows were pushed after a reflow without one to follow: the break \
+             table covers {} of {} rows — a presentation pushes first and \
+             reflows after",
+            self.wrapped.lines(),
+            self.rows.len(),
+        );
         let budgets: Vec<usize> = self.blocks.iter().map(|b| budget(*b)).collect();
         if budgets == self.budgets && wrap.name() == self.wrap {
             return false;
@@ -2834,6 +2861,49 @@ diff --git a/d.md b/d.md
         assert_eq!(doc.files().len(), 1);
         assert_eq!(doc.files()[0].row, 0);
         assert!(doc.report().starts_with("markdown "), "{}", doc.report());
+    }
+
+    /// One plain-prose file, so a third one's blocks are a subset of the first
+    /// two's and the budget comparison alone would see nothing to do.
+    fn prose_file(name: &str) -> crate::prepared::File {
+        let src = format!(
+            "diff --git a/{name} b/{name}\n@@ -1,1 +1,1 @@\n-some plain prose that runs long \
+             enough to wrap at thirty columns\n+some plain prose that runs long enough to wrap \
+             at thirty columns, yes\n"
+        );
+        let hl = Highlighters::builtin();
+        prepare(&parse_unified_diff(&src), &hl, 2000)
+            .files
+            .remove(0)
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_push_after_a_reflow_is_loud_at_the_next_one() {
+        // Two files, then one reflow: the break table covers every row of both.
+        let mut doc = Document::default();
+        doc.push(prose_file("a.md"));
+        doc.push(prose_file("b.md"));
+        let budget = |_: Block| 30;
+        assert!(doc.reflow(&budget, &crate::wrap::Word));
+        assert_eq!(doc.wrapped.lines(), doc.len(), "the table stopped short");
+
+        // A third file whose every block is already in the set: the budget
+        // comparison below would see nothing to do, and the new rows would
+        // answer one-row/whole-line through [`Wrapped`]'s fallbacks — no
+        // panic, no signal, a long line that never wraps. In debug the next
+        // reflow says so, loudly.
+        doc.push(prose_file("c.md"));
+        // The hook swap is global and the window is one call wide: the panic
+        // fires here and nowhere else's output is touched by it.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(std::boxed::Box::new(|_| {}));
+        let fired = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            doc.reflow(&budget, &crate::wrap::Word);
+        }))
+        .is_err();
+        std::panic::set_hook(prev);
+        assert!(fired, "a break table short of its rows passed silently");
     }
 
     /// The document fixture: every block kind, both sides of the hunk.

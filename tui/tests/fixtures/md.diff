@@ -10,7 +10,7 @@ diff --git a/README.md b/README.md
 -## Usage
 +## Getting started
 +
-+Run the development script:
++Run the development script: *gently*.
      ./dev.sh diff        # rebuild on every save
  
 -- first
