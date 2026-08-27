@@ -457,30 +457,28 @@ impl Keymap {
 
         bind("commits", "enter", "commits.open-diff");
         bind("commits", "/", "commits.search");
-        // Resetting to the commit under the keyboard, on lazygit's own three
-        // strengths — its reset menu lists mixed, soft, hard under exactly
-        // these letters. The menu does not exist here (one keypress, one
-        // command name), so each strength is a binding of its own; `h`
-        // shadows one global (`pane.left`) in this mode, the same
-        // mode-overrides-global trade [stashes] already makes for `g` and
-        // `d` — and the left arrow still carries the pane move, which is
-        // why the arrow spellings ride beside the letters. Hard is the
-        // destructive one and confirms twice; soft and mixed keep every
-        // change recoverable through reflog or working tree.
-        bind("commits", "s", "commits.reset-soft");
-        bind("commits", "m", "commits.reset-mixed");
-        bind("commits", "h", "commits.reset-hard");
+        // Resetting to the commit under the keyboard, exactly lazygit's
+        // shape: `g` opens the question — a mode of its own, pushed only
+        // while it stands — and s/m/h inside it pick the strength, the same
+        // letters lazygit's reset menu lists. Outside the question those
+        // letters are nobody's, and `h` stays the pane move it is
+        // everywhere else; the question captures `h` for hard reset only
+        // while it stands, which is the menu doing its job.
+        bind("commits", "g", "commits.reset-menu");
+        bind("reset", "s", "commits.reset-soft");
+        bind("reset", "m", "commits.reset-mixed");
+        bind("reset", "h", "commits.reset-hard");
         // lazygit's revert key. Nothing is destroyed — the undo arrives as a
         // new commit — so it takes no confirmation dance.
         bind("commits", "t", "commits.revert");
-        // Folding the commit under the keyboard into its parent, on lazygit's
-        // squash and fixup letters pushed up a keyboard row: `s` already
-        // means reset-soft here, and lowercase `f` would shadow repo.fetch,
-        // a sync key meant to work over every pane — the same trade
-        // theme.cycle made for `T`. Drop is lazygit's own letter, free in
-        // this mode. All three rewrite history, so each asks twice.
-        bind("commits", "S", "commits.squash-up");
-        bind("commits", "F", "commits.fixup-up");
+        // Folding the commit under the keyboard into its parent, on
+        // lazygit's own squash and fixup letters. `f` shadows repo.fetch
+        // inside this pane — lazygit makes the same trade — and the fetch
+        // stays one pane away, on any other list. Drop is lazygit's own
+        // letter, free in this mode. All three rewrite history, so each
+        // asks twice.
+        bind("commits", "s", "commits.squash-up");
+        bind("commits", "f", "commits.fixup-up");
         bind("commits", "d", "commits.drop-commit");
         // The way out of a stranded rebase — one that stopped mid-flight on
         // a conflict or a refusal and left its state standing. lazygit
@@ -969,6 +967,11 @@ impl Commands {
                 Some("tag"),
             ),
             (
+                "commits.reset-menu",
+                "choose a strength to reset to this commit",
+                Some("reset"),
+            ),
+            (
                 "commits.new-branch",
                 "grow a new branch from this commit",
                 Some("new branch"),
@@ -1274,20 +1277,45 @@ mod tests {
             assert!(commands.known(name), "{name} is not registered");
             assert!(!k.keys_for(name).is_empty(), "{name} is bound to nothing");
         }
-        // And the one mode with a letter of its own on this chord keeps it:
-        // reset-hard is lazygit's own placement, and the arrow still carries
-        // the pane move there.
+        // And the pane move survives in every mode: no panel owns `h` at
+        // the panel level — lazygit's reset-hard lives inside its reset
+        // question ([reset]), not on the plain key.
         let mut commits = Modes::new();
         commits.push("commits");
+        assert_eq!(k.resolve(&commits, &keys("h")), Resolve::Run("pane.left"));
+    }
+
+    #[test]
+    fn the_reset_question_is_its_own_mode_over_commits() {
+        let k = Keymap::builtin();
+        // Opening it is `g`, lazygit's key; the strengths answer only while
+        // the question's mode is pushed, and `h` inside it is hard reset —
+        // the one place the pane move loses its letter.
+        let mut modes = Modes::new();
+        modes.push("commits");
         assert_eq!(
-            k.resolve(&commits, &keys("h")),
-            Resolve::Run("commits.reset-hard")
+            k.resolve(&modes, &keys("g")),
+            Resolve::Run("commits.reset-menu")
         );
-        assert_eq!(
-            k.resolve(&commits, &keys("left")),
-            Resolve::Run("pane.left"),
-            "the arrow survives the shadowing"
-        );
+        assert_eq!(k.resolve(&modes, &keys("h")), Resolve::Run("pane.left"));
+        modes.push("reset");
+        for (chord, name) in [
+            ("s", "commits.reset-soft"),
+            ("m", "commits.reset-mixed"),
+            ("h", "commits.reset-hard"),
+        ] {
+            assert_eq!(
+                k.resolve(&modes, &keys(chord)),
+                Resolve::Run(name),
+                "{chord} did not reach {name} in [reset]"
+            );
+        }
+        // Movement and escape survive inside the question: it is a question,
+        // not a trap.
+        assert_eq!(k.resolve(&modes, &keys("j")), Resolve::Run("view.down"));
+        assert_eq!(k.resolve(&modes, &keys("esc")), Resolve::Run("back"));
+        // The command is registered, so `?` names it.
+        assert!(Commands::builtin().known("commits.reset-menu"));
     }
 
     #[test]
@@ -1541,21 +1569,19 @@ mod tests {
         );
         assert!(commands.known("files.amend"));
 
-        // The reset strengths are lazygit's reset-menu letters — mixed, soft,
-        // hard under m, s, h — flattened into three direct bindings. `h`
-        // shadows one global here (`pane.left`), exactly as [stashes]
-        // shadows `g`/`d`; the left arrow still carries the pane move;
-        // revert takes lazygit's own `t`; cherry-pick takes
-        // the free capital beside it; tag and new-branch and checkout take
-        // lazygit's own T, n and space, and space shadows the global select
-        // exactly as [files] makes the same trade.
+        // lazygit's own letters for this panel: s squash, f fixup, t revert,
+        // d drop, T tag, n new-branch, space checkout — and g opens the
+        // reset question rather than any strength firing directly. `f`
+        // shadows repo.fetch inside the pane, lazygit's own trade; `h` is
+        // nobody's here, so the pane move keeps it.
         let mut commits = Modes::new();
         commits.push("commits");
         for (chord, name) in [
-            ("s", "commits.reset-soft"),
-            ("m", "commits.reset-mixed"),
-            ("h", "commits.reset-hard"),
+            ("s", "commits.squash-up"),
+            ("f", "commits.fixup-up"),
+            ("d", "commits.drop-commit"),
             ("t", "commits.revert"),
+            ("g", "commits.reset-menu"),
             ("Y", "commits.cherry-pick"),
             ("T", "commits.new-tag"),
             ("n", "commits.new-branch"),
@@ -1576,7 +1602,7 @@ mod tests {
                 "{name} leaked out of [commits]"
             );
             let command = commands.get(name).unwrap_or_else(|| panic!("{name}"));
-            if name == "commits.reset-hard" {
+            if name == "commits.drop-commit" {
                 assert!(command.doc.contains("asked twice"), "{}", command.doc);
             }
         }

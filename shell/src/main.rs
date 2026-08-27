@@ -1027,6 +1027,11 @@ impl Screen {
     }
 }
 
+/// The keymap mode the reset question pushes while it stands — see
+/// [`DevShell::sync_modes`]. Its name is the keymap's `[reset]` section in
+/// `gitten.toml`.
+const RESET_MODE: &str = "reset";
+
 struct DevShell {
     /// The app half of the title, drawn bright: which program this is. Which
     /// *view* it is showing is the focused region's to say, because a commit
@@ -1212,7 +1217,7 @@ impl DevShell {
         }
         if self.spot != spot {
             self.spot = spot;
-            self.sync_modes();
+            self.sync_modes(cx);
             self.sync_focus(cx);
         }
     }
@@ -1254,8 +1259,9 @@ impl DevShell {
     /// left standing after focus changes is invisible but still in
     /// `self.open`, where [`DevShell::on_wheel`] swallows for it forever.
     /// Called on every change of region focus or help state — the places
-    /// [`Modes`] can change.
-    fn sync_modes(&mut self) {
+    /// [`Modes`] can change — and at the tail of [`DevShell::run_command`],
+    /// because a cursor move inside a list can end a standing question.
+    fn sync_modes(&mut self, cx: &App) {
         self.modes = Modes::new();
         // Cycling the lists needs more than one of them to be worth a key.
         if self.list_order().len() > 1 {
@@ -1263,6 +1269,16 @@ impl DevShell {
         }
         if let Some(screen) = self.active() {
             self.modes.push(screen.mode());
+        }
+        // The reset question, lazygit's menu: while the commits view has a
+        // reset armed, its three letters capture s/m/h for the strengths —
+        // `h` included, which outside the question is the pane move. The
+        // question is the pane's own state and survives nothing that moves
+        // the cursor, so this reads it rather than mirrors it.
+        if let Some(Screen::Commits { view, .. }) = self.active() {
+            if view.read(cx).armed() {
+                self.modes.push(RESET_MODE);
+            }
         }
         if self.input.is_some() {
             self.modes.push(input::MODE);
@@ -1300,7 +1316,7 @@ impl DevShell {
         if let Some(previous) = self.input.replace(input) {
             previous.update(cx, |input, cx| input.cancel(cx));
         }
-        self.sync_modes();
+        self.sync_modes(cx);
         cx.notify();
     }
 
@@ -1322,7 +1338,7 @@ impl DevShell {
             true => input.accept(cx),
             false => input.cancel(cx),
         });
-        self.sync_modes();
+        self.sync_modes(cx);
         match (accept, self.prompt.take()) {
             (true, Some(Prompt::CommitMessage)) => self.commit_message(text),
             (true, Some(Prompt::AmendMessage)) => self.amend_message(text),
@@ -1769,6 +1785,44 @@ impl DevShell {
     /// A commit list that silently loses its top rows reads as data loss no
     /// matter what the reflog knows, so the question is asked in the band
     /// where the eyes are.
+    /// `commits.reset-menu`: open the reset question on the commit the
+    /// keyboard is on — lazygit's `g`. The question is the pane's armed slot
+    /// plus the [reset] mode its arming pushes; the band carries the three
+    /// letters, and `esc` drops it. Asking while one already stands closes
+    /// it: the same key opens and dismisses, and nothing but a strength
+    /// letter or `esc` executes anything.
+    fn reset_menu(&mut self, cx: &mut Context<Self>) {
+        let Some(Screen::Commits { view, .. }) = self.active() else {
+            self.set_notice("commits.reset-menu is not supported here");
+            return;
+        };
+        let view = view.clone();
+        let host = config::host(cx);
+        view.update(cx, |v, _| v.reconcile(&host));
+        let Some(commit) = view.read(cx).current().cloned() else {
+            self.set_notice("nothing selected to reset to");
+            return;
+        };
+        if view.update(cx, |v, _| v.confirm_or_arm_reset(&commit.sha)) {
+            // The question was standing and this press spent it.
+            self.set_notice("reset cancelled");
+            return;
+        }
+        self.set_notice(Self::reset_question(&commit));
+        // The arm just opened; the question's letters are live this frame.
+        self.sync_modes(cx);
+    }
+
+    /// The band's sentence for a standing reset question: the target and the
+    /// three answers, each in the ink of nothing — the band is `dim`, and the
+    /// letters are read, not hunted.
+    fn reset_question(commit: &Commit) -> String {
+        format!(
+            "reset to {}? s soft · m mixed · h hard · esc cancels",
+            commit.short
+        )
+    }
+
     fn reset_selected(&mut self, command: &str, cx: &mut Context<Self>) {
         let Some(Screen::Commits { view, .. }) = self.active() else {
             self.set_notice(format!("{command} is not supported here"));
@@ -1792,12 +1846,22 @@ impl DevShell {
             "commits.reset-mixed" => ResetMode::Mixed,
             _ => ResetMode::Hard,
         };
+        // A strength letter answers a standing question and does nothing
+        // else. The check is *before* any arming — the arm is `g`'s to set,
+        // and a letter that opened a question by itself would be two presses
+        // deciding a hard reset. Only a stale mode after a cursor move can
+        // resolve a strength tonight; the mode stack is re-synced so it
+        // stops.
+        if !view.read(cx).armed() {
+            self.set_notice("no reset is being asked — press g to ask");
+            self.sync_modes(cx);
+            return;
+        }
         if !view.update(cx, |v, _| v.confirm_or_arm_reset(&commit.sha)) {
-            self.set_notice(format!(
-                "reset {} to {}? press again to confirm",
-                mode.flag(),
-                commit.short
-            ));
+            // Armed on a different commit — the cursor moved since `g`
+            // without a command running to drop the arm. The row moved; the
+            // question asks again rather than landing on the wrong sha.
+            self.set_notice(Self::reset_question(&commit));
             return;
         }
         self.notice = None; // the question is spent; the running band speaks next
@@ -2631,7 +2695,7 @@ impl DevShell {
         cx: &mut Context<Self>,
     ) {
         self.panes.register(name, Screen::custom(pane));
-        self.sync_modes();
+        self.sync_modes(cx);
         cx.notify();
     }
 
@@ -2903,7 +2967,7 @@ impl DevShell {
             "quit" => cx.quit(),
             "help" => {
                 self.help = !self.help;
-                self.sync_modes();
+                self.sync_modes(cx);
             }
             "back" => self.back(cx),
             "theme.cycle" => self.cycle_theme(cx),
@@ -2952,6 +3016,10 @@ impl DevShell {
             "commits.search" => self.begin_search(cx),
             // History's verbs, aimed at the commit the keyboard is on. Reset
             // and revert read the pane; the write goes through the queue.
+            // The reset question is lazygit's menu: `g` opens it, and the
+            // three strengths answer it only while it stands — see
+            // [`DevShell::sync_modes`] for the mode that captures s/m/h.
+            "commits.reset-menu" => self.reset_menu(cx),
             "commits.reset-soft" | "commits.reset-mixed" | "commits.reset-hard" => {
                 self.reset_selected(command, cx)
             }
@@ -3042,7 +3110,11 @@ impl DevShell {
         // The keyboard may just have moved the commits cursor — or a refresh
         // may have re-anchored it under the last command. Either way this is
         // the one hook every command leaves through, so it is where the main
-        // view learns its selection changed. One read on the no-op path.
+        // view learns its selection changed — and where the mode stack learns
+        // the reset question ended: a cursor move disarms it inside the view,
+        // and the question's letters must stop capturing the moment it is
+        // gone. One read on the no-op path.
+        self.sync_modes(cx);
         self.sync_main_diff(cx);
         cx.notify();
     }
@@ -3065,7 +3137,7 @@ impl DevShell {
     fn back(&mut self, cx: &mut Context<Self>) {
         if self.help {
             self.help = false;
-            self.sync_modes();
+            self.sync_modes(cx);
             return;
         }
         if self.open.take().is_some() {
@@ -3083,6 +3155,15 @@ impl DevShell {
             cx.notify();
             return;
         }
+        // The reset question, before anything else a list could say: `esc`
+        // on a standing question is "never mind", not "move the cursor".
+        if let Some(Screen::Commits { view, .. }) = self.active() {
+            if view.read(cx).armed() {
+                view.update(cx, |v, _| v.disarm());
+                cx.notify();
+                return;
+            }
+        }
         if let Some(screen) = self.active() {
             if screen.select(false, cx) {
                 // There was a selection and it is gone; that is the whole of
@@ -3097,7 +3178,7 @@ impl DevShell {
             // Focusing a list means looking at that list: the keyboard goes
             // with it, out of the diff if it was there.
             self.set_spot(Spot::List, cx);
-            self.sync_modes();
+            self.sync_modes(cx);
             self.sync_focus(cx);
             cx.notify();
         }
@@ -4890,7 +4971,7 @@ fn main() {
                 {
                     let shell = shell.clone();
                     shell.update(cx, |shell, cx| {
-                        shell.sync_modes();
+                        shell.sync_modes(cx);
                         shell.sync_focus(cx);
                         // Frame one already names its commit: schedule the
                         // newest one's diff through the same guarded rails
@@ -5269,7 +5350,7 @@ mod tests {
                     "second",
                 ),
             );
-            s.sync_modes();
+            s.sync_modes(cx);
             s.sync_focus(cx);
         });
         let first = shell.read_with(cx, |s, _| match s.panes.get("commits") {
@@ -5322,7 +5403,7 @@ mod tests {
                 "second",
                 Screen::commits(commits, Source::Fixtures, Generation::default(), "second"),
             );
-            s.sync_modes();
+            s.sync_modes(cx);
         });
         for _ in 0..2 {
             shell.update(cx, |s, cx| s.back(cx));
@@ -5342,7 +5423,7 @@ mod tests {
                 "second",
                 Screen::commits(commits, Source::Fixtures, Generation::default(), "second"),
             );
-            shell.sync_modes();
+            shell.sync_modes(cx);
         });
         shell.read_with(cx, |shell, app| {
             assert_eq!(shell.active_label(app).as_ref(), "second");
@@ -5535,7 +5616,7 @@ mod tests {
                 Screen::commits(commits, Source::Fixtures, Generation::default(), "second"),
             );
             shell.panes.focus(0);
-            shell.sync_modes();
+            shell.sync_modes(cx);
         });
         cx.simulate_keystrokes("ctrl-j");
         assert_eq!(
@@ -5605,7 +5686,7 @@ mod tests {
                 ),
             );
             shell.panes.focus(0);
-            shell.sync_modes();
+            shell.sync_modes(cx);
         });
         let observed = shell.clone();
         let handle = cx.update(|cx| {
@@ -5702,7 +5783,7 @@ mod tests {
             );
             // Registration focuses what it adds; a launch starts on the root.
             shell.panes.focus(0);
-            shell.sync_modes();
+            shell.sync_modes(cx);
         });
         shell.read_with(cx, |shell, _| {
             assert_eq!(shell.active_view_name(), "commits")
@@ -5790,7 +5871,7 @@ mod tests {
                 "commits",
                 Screen::commits(view, Source::Fixtures, Generation::default(), "~/src"),
             );
-            shell.sync_modes();
+            shell.sync_modes(cx);
             shell.repo = Some((PathBuf::from("/recorded"), handle));
         });
         (shell, repo)
@@ -5810,7 +5891,7 @@ mod tests {
                 "commits",
                 Screen::commits(view, Source::Fixtures, Generation::default(), "~/src"),
             );
-            shell.sync_modes();
+            shell.sync_modes(cx);
         });
         shell
     }
@@ -6048,7 +6129,7 @@ diff --git a/one.txt b/one.txt
                 "files",
                 Screen::files(files, Generation::default(), "files"),
             );
-            shell.sync_modes();
+            shell.sync_modes(cx);
         });
         shell.update(cx, |shell, cx| shell.run_command("view.bottom", cx));
 
@@ -6718,7 +6799,7 @@ diff --git a/one.txt b/one.txt
                 "files",
                 Screen::files(files, Generation::default(), "files"),
             );
-            shell.sync_modes();
+            shell.sync_modes(cx);
             shell.repo = Some((PathBuf::from("/recorded"), handle.clone()));
             cx.set_global(config::Active(Rc::new(Host::new())));
         });
@@ -6780,7 +6861,7 @@ diff --git a/one.txt b/one.txt
                 "stashes",
                 Screen::stashes(view, Generation::default(), "r · 2 parked"),
             );
-            shell.sync_modes();
+            shell.sync_modes(cx);
             shell.repo = Some((PathBuf::from("/recorded"), handle));
             cx.set_global(config::Active(Rc::new(Host::new())));
         });
@@ -6835,7 +6916,7 @@ diff --git a/one.txt b/one.txt
                 "diff",
             );
             shell.set_spot(super::Spot::Main, cx);
-            shell.sync_modes();
+            shell.sync_modes(cx);
             shell.repo = Some((PathBuf::from("/recorded"), handle));
             cx.set_global(config::Active(Rc::new(Host::new())));
         });
@@ -6900,7 +6981,7 @@ diff --git a/fresh.txt b/fresh.txt
                 "diff",
             );
             shell.set_spot(super::Spot::Main, cx);
-            shell.sync_modes();
+            shell.sync_modes(cx);
             shell.repo = Some((PathBuf::from("/recorded"), handle));
             cx.set_global(config::Active(Rc::new(Host::new())));
         });
@@ -7156,9 +7237,9 @@ diff --git a/fresh.txt b/fresh.txt
         let (shell, _repo) = stashes_shell(cx);
         // Registration left the keyboard on the stack; named dispatch gets
         // back there from anywhere.
-        shell.update(cx, |shell, _| {
+        shell.update(cx, |shell, cx| {
             shell.panes.focus(0);
-            shell.sync_modes();
+            shell.sync_modes(cx);
         });
         shell.update(cx, |shell, cx| shell.run_command("stashes.focus", cx));
         shell.read_with(cx, |shell, app| {
@@ -7401,7 +7482,7 @@ diff --git a/fresh.txt b/fresh.txt
                 "files",
                 Screen::files(files, Generation::default(), "files"),
             );
-            shell.sync_modes();
+            shell.sync_modes(cx);
         });
         shell.update(cx, |shell, cx| shell.run_command("files.stage", cx));
         shell.read_with(cx, |shell, _| {
@@ -7793,16 +7874,21 @@ diff --git a/added.txt b/added.txt
         let (shell, repo) = history_shell(cx);
         let target = "0".repeat(40);
 
-        shell.update(cx, |shell, cx| shell.run_command("commits.reset-soft", cx));
+        // The question is the asking: `g` opens it — nothing written, the
+        // band says what is being asked — and `s` is the answer, soft.
+        shell.update(cx, |shell, cx| shell.run_command("commits.reset-menu", cx));
         std::thread::sleep(Duration::from_millis(50));
         shell.read_with(cx, |shell, _| {
-            assert!(repo.wrote().is_empty(), "the first press must only arm");
+            assert!(
+                repo.wrote().is_empty(),
+                "opening the question wrote nothing"
+            );
             assert!(
                 shell
                     .notice
                     .as_deref()
                     .unwrap_or_default()
-                    .contains("reset --soft to abc000?"),
+                    .contains("reset to abc000? s soft"),
                 "the question went unsaid: {:?}",
                 shell.notice
             );
@@ -7811,13 +7897,26 @@ diff --git a/added.txt b/added.txt
         pump_write(&shell, cx);
         assert_eq!(repo.wrote(), vec![format!("reset --soft {target}")]);
 
-        // A different mode is a different question: the soft arm was spent,
-        // so mixed waits for its own yes.
+        // The answer spent the question: the mode is gone, so `m` outside a
+        // standing question reaches nothing — `g` must open again first.
         shell.update(cx, |shell, cx| shell.run_command("commits.reset-mixed", cx));
         std::thread::sleep(Duration::from_millis(50));
-        shell.read_with(cx, |_shell, _| {
-            assert_eq!(repo.wrote().len(), 1, "mixed still waits for its own yes");
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(repo.wrote().len(), 1, "no strength fires without its g");
+            // And the orphaned letter does not execute and does not ask:
+            // the asking is `g`'s, and a letter that opened a question by
+            // itself would be two presses deciding a hard reset.
+            assert!(
+                shell
+                    .notice
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("no reset is being asked"),
+                "the orphaned strength went unsaid: {:?}",
+                shell.notice
+            );
         });
+        shell.update(cx, |shell, cx| shell.run_command("commits.reset-menu", cx));
         shell.update(cx, |shell, cx| shell.run_command("commits.reset-mixed", cx));
         pump_write(&shell, cx);
         assert_eq!(
@@ -7838,8 +7937,10 @@ diff --git a/added.txt b/added.txt
             _ => panic!("no commits pane"),
         };
 
-        // First press arms the row the keyboard is on and asks in the band.
-        shell.update(cx, |shell, cx| shell.run_command("commits.reset-hard", cx));
+        // `g` opens the question; nothing has run and the band asks, naming
+        // the three answers — `h` among them, captured only while the
+        // question stands.
+        shell.update(cx, |shell, cx| shell.run_command("commits.reset-menu", cx));
         std::thread::sleep(Duration::from_millis(50));
         shell.read_with(cx, |shell, _| {
             assert!(repo.wrote().is_empty(), "nothing was reset yet");
@@ -7848,7 +7949,7 @@ diff --git a/added.txt b/added.txt
                     .notice
                     .as_deref()
                     .unwrap_or_default()
-                    .contains("reset --hard to abc000?"),
+                    .contains("reset to abc000? s soft · m mixed · h hard"),
                 "the question went unsaid: {:?}",
                 shell.notice
             );
@@ -7857,9 +7958,9 @@ diff --git a/added.txt b/added.txt
             assert_eq!(v.armed_sha(), Some("0".repeat(40)));
         });
 
-        // Second press on the same commit spends the arm — and the whole
-        // production path runs: job queued by dispatch, drained by the same
-        // pump the window runs, generation bumped, panes re-acquired.
+        // `h` answers it — and the whole production path runs: job queued by
+        // dispatch, drained by the same pump the window runs, generation
+        // bumped, panes re-acquired. The asking was g; the letter is the yes.
         shell.update(cx, |shell, cx| shell.run_command("commits.reset-hard", cx));
         pump_write(&shell, cx);
         assert_eq!(
@@ -7872,10 +7973,17 @@ diff --git a/added.txt b/added.txt
     #[gpui::test]
     fn a_cursor_move_disarms_a_hard_reset_before_any_yes_can_land(cx: &mut TestAppContext) {
         let (shell, repo) = history_shell(cx);
+        shell.update(cx, |shell, cx| shell.run_command("commits.reset-menu", cx));
         shell.update(cx, |shell, cx| shell.run_command("commits.reset-hard", cx));
-        std::thread::sleep(Duration::from_millis(50));
+        pump_write(&shell, cx);
+        assert_eq!(
+            repo.wrote(),
+            vec![format!("reset --hard {}", "0".repeat(40))]
+        );
 
-        // The keyboard moves off the armed row.
+        // The keyboard moves off the answered row — without a command in
+        // between, exactly as a wheel does it. The question dies with the
+        // cursor; the mode stack has not heard yet.
         shell.update(cx, |shell, cx| {
             let Some(Screen::Commits { view, .. }) = shell.active() else {
                 panic!("no commits pane");
@@ -7883,21 +7991,23 @@ diff --git a/added.txt b/added.txt
             let host = Rc::new(Host::new());
             view.update(cx, |v, _| v.run_view("view.down", &host));
         });
+        // The stale mode still resolves `h` — and it may not fire and may
+        // not ask: the question it answered is gone, and the asking is g's.
         shell.update(cx, |shell, cx| shell.run_command("commits.reset-hard", cx));
         std::thread::sleep(Duration::from_millis(50));
         shell.read_with(cx, |shell, _| {
-            assert!(
-                repo.wrote().is_empty(),
+            assert_eq!(
+                repo.wrote().len(),
+                1,
                 "a stale yes reached a different commit: {:?}",
                 repo.wrote()
             );
-            // And the question re-armed on the row now under the keyboard.
             assert!(
                 shell
                     .notice
                     .as_deref()
                     .unwrap_or_default()
-                    .contains("abc001?"),
+                    .contains("no reset is being asked"),
                 "{:?}",
                 shell.notice
             );
@@ -7943,7 +8053,7 @@ diff --git a/added.txt b/added.txt
                 "commits",
                 Screen::commits(view, Source::Fixtures, Generation::default(), "~/src"),
             );
-            shell.sync_modes();
+            shell.sync_modes(cx);
             shell.repo = Some((PathBuf::from("/recorded"), handle));
         });
         (shell, repo)
@@ -8036,7 +8146,7 @@ diff --git a/added.txt b/added.txt
                 "commits",
                 Screen::commits(view, Source::Fixtures, Generation::default(), "~/src"),
             );
-            shell.sync_modes();
+            shell.sync_modes(cx);
             shell.repo = Some((PathBuf::from("/recorded"), handle));
         });
 
@@ -8092,7 +8202,7 @@ diff --git a/added.txt b/added.txt
                 "branches",
                 Screen::branches(view, Generation::default(), label),
             );
-            shell.sync_modes();
+            shell.sync_modes(cx);
             shell.repo = Some((PathBuf::from("/recorded"), handle));
         });
         (shell, repo)
@@ -8301,7 +8411,7 @@ diff --git a/added.txt b/added.txt
                 "commits",
                 Screen::commits(commits, Source::Fixtures, Generation::default(), "~/src"),
             );
-            shell.sync_modes();
+            shell.sync_modes(cx);
             shell.repo = Some((PathBuf::from("/recorded"), handle));
             files
         });
@@ -8359,7 +8469,7 @@ diff --git a/added.txt b/added.txt
                 "commits",
                 Screen::commits(commits, Source::Fixtures, Generation::default(), "~/src"),
             );
-            shell.sync_modes();
+            shell.sync_modes(cx);
             shell.repo = Some((PathBuf::from("/recorded"), handle));
             files
         });
@@ -8547,7 +8657,7 @@ diff --git a/added.txt b/added.txt
                 "branches",
                 Screen::branches(view, Generation::default(), "r · 2 local · 1 remote"),
             );
-            shell.sync_modes();
+            shell.sync_modes(cx);
             shell.repo = Some((PathBuf::from("/recorded"), handle.clone()));
             cx.set_global(config::Active(Rc::new(Host::new())));
         });
@@ -8889,7 +8999,7 @@ diff --git a/added.txt b/added.txt
                 "branches",
                 Screen::branches(view, Generation::default(), "branches"),
             );
-            shell.sync_modes();
+            shell.sync_modes(cx);
             shell.repo = Some((PathBuf::from("/recorded"), handle.clone()));
             cx.set_global(config::Active(Rc::new(Host::new())));
         });

@@ -370,7 +370,17 @@ impl Commits {
     }
 
     /// Whether a reset is waiting for its second press — the render's tint of
-    /// the row the question is about.
+    /// the row the question is about, and the shell's signal that the
+    /// question's mode ([`reset`]) is live.
+    pub fn armed(&self) -> bool {
+        self.armed.is_some()
+    }
+
+    /// Drops the question — what `esc` and every disarm path reach. Idempotent.
+    pub fn disarm(&mut self) {
+        self.armed = None;
+    }
+
     #[cfg(test)]
     pub(crate) fn armed_sha(&self) -> Option<String> {
         self.armed.clone()
