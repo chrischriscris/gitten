@@ -102,15 +102,29 @@ watch_run() { # watch_run <crate> <binary> [args...]
   trap cleanup INT TERM
 
   cycle() {
-    # Kill first: two of them fighting over one session file or one port is
-    # confusing, and the binary underneath the running one is about to be
-    # replaced anyway.
+    # Build first: the window on screen stays live through the compile and is
+    # replaced only when the binary replacing it exists. A failed build leaves
+    # the old one alone — yesterday's binary behind an error message beats no
+    # window at all.
+    build "$crate" || return
+
+    # Swap only now, and let the old one finish dying before the new one
+    # starts: web listens on a fixed port and desktop owns
+    # target/gitten-session, and neither hands over while its holder lives.
+    # Graceful TERM, bounded grace, then KILL — a client wedged on quit must
+    # not take the watcher down with it.
     if [ -n "$running" ]; then
       kill "$running" 2>/dev/null
+      local grace=0
+      while kill -0 "$running" 2>/dev/null && [ "$grace" -lt 50 ]; do
+        sleep 0.1
+        grace=$((grace + 1))
+      done
+      kill -0 "$running" 2>/dev/null && kill -9 "$running" 2>/dev/null
       wait "$running" 2>/dev/null
       running=""
     fi
-    build "$crate" || return
+
     "$bin" "$@" &
     running=$!
   }
