@@ -291,6 +291,10 @@ impl Diff {
         self.view.top()
     }
 
+    pub fn height(&self) -> usize {
+        self.view.height()
+    }
+
     pub fn shift(&self) -> usize {
         self.shift
     }
@@ -642,6 +646,81 @@ impl Diff {
             return;
         }
         self.set_wrap((self.wrap + 1) % host.wrap.len(), host);
+    }
+
+    // ------------------------------------------------------------------ writes
+
+    /// The hunk under the keyboard, as the loaded diff holds it: its file's
+    /// path and the [`Hunk`] itself, with every line and both sides' numbers —
+    /// exactly what [`gitten_core::patch::emit`] aims a patch with. `None` when
+    /// the keyboard sits on a file header, on an empty diff, or on a
+    /// presentation whose hunk map answers nothing for the row — which is the
+    /// honest answer for a presentation that draws no hunks, and the only one a
+    /// *mis*recorded map is allowed to give.
+    ///
+    /// The address crosses two lists. The presentation answers `(file, hunk)`
+    /// in its own file order, which its own [`Present::files`] spells; that
+    /// file's path is the key the loaded diff was acquired under, so the hunk
+    /// handed over is the one the diff drew — however many presentations
+    /// claimed their share of the files on the way to the screen.
+    pub fn current_hunk(&self) -> Option<(String, gitten_core::Hunk)> {
+        let r = *self.order.get(self.view.cursor())?;
+        let rows = self.owners.get(r.owner as usize)?;
+        let (file, hunk) = rows.hunk_at(r.index as usize)?;
+        let path = rows.files().get(file)?.path.clone();
+        let loaded = self.files.iter().find(|f| f.path == path)?;
+        Some((path, loaded.hunks.get(hunk)?.clone()))
+    }
+
+    /// Swaps in a refreshed diff, keeping the reading position numerically.
+    ///
+    /// A write leaves no hunk identity to anchor to — the hunk just staged may
+    /// be gone, and nothing honest can be said about where it went — so the
+    /// cursor and the top row are kept as numbers and clamped into whatever the
+    /// new diff can hold. That is the window's fallback, and it is deliberately
+    /// not a fuzzy match: landing on adjacent context is predictable, landing
+    /// on a guess is not. Layout and wrap are untouched; the presentation is
+    /// rebuilt in place, because the refreshed diff has never met either.
+    pub fn replace(&mut self, files: Vec<FileDiff>, host: &Host) {
+        if self.files == files {
+            return;
+        }
+        let (cursor, top, shift) = (self.view.cursor(), self.view.top(), self.shift);
+        // A refresh is the repository saying things moved: a selection was
+        // anchored to how they were, a drag was holding rows that may not be
+        // there, and the scrollbar was held against a thumb that just moved.
+        self.sel = None;
+        self.dragging = false;
+        self.grabbed = None;
+        self.files = files;
+        self.owners = self.layouts.build(self.current, host);
+        let built = assemble(&self.files, host, &mut self.owners);
+        self.order = built.ordered.order;
+        self.widest = built.ordered.widest;
+        self.index_headers();
+        self.file_count = built.files;
+        self.intraline = built.intraline;
+        self.syntax = built.syntax;
+        // The presentations are new objects and have never been told the
+        // width; the next reflow re-applies it.
+        self.applied = (usize::MAX, "");
+        self.view.set_len(self.order.len());
+        self.reflow(host);
+        // The numeric fallback: the same rows if they still exist, clamped
+        // where they do not — `Viewport` does the clamping, and nothing here
+        // assigns an index the row count has not blessed.
+        self.view.go_to(cursor);
+        self.view.scroll_to(top);
+        // The horizontal shift survives up to the refreshed bound. With
+        // wrapping on there is nothing off the edge to be shifted to, and
+        // `reflow` has already zeroed it — restoring a number there would
+        // scroll a diff that cannot scroll.
+        if !host.wrap.at(self.wrap).breaks_lines() {
+            let bound = self.order.get(self.widest).map_or(0, |r| {
+                self.owners[r.owner as usize].width(r.index as usize, r.seg as usize)
+            });
+            self.shift = shift.min(bound);
+        }
     }
 
     fn progress(&self) -> f32 {
@@ -1268,5 +1347,223 @@ mod tests {
         let mut owners: Vec<Box<dyn Rows>> = vec![Box::new(TextRows::default())];
         owners[0].reflow(1, &host, host.wrap.current());
         let _ = &owners;
+    }
+
+    // ------------------------------------------------------------------ hunks
+
+    /// Two files, one hunk each, with content that names which file a hunk
+    /// came from.
+    fn two_hunks() -> Vec<FileDiff> {
+        parse_unified_diff(
+            "diff --git a/one.rs b/one.rs\n@@ -1,3 +1,3 @@\n keep\n-was\n+now\n tail\n\
+             diff --git a/two.rs b/two.rs\n@@ -1,2 +1,2 @@\n-head\n+tail\n",
+        )
+    }
+
+    fn split_view(files: Vec<FileDiff>, cols: usize, height: usize) -> (Diff, Host) {
+        let host = Host::new();
+        let layouts = Layouts::builtin();
+        let split = layouts.position("split").unwrap();
+        let mut d = Diff::with_layouts(files, &host, layouts);
+        d.set_layout(split, &host);
+        d.resize(cols, height, &host);
+        (d, host)
+    }
+
+    #[test]
+    fn the_terminal_finds_the_hunk_under_the_cursor_in_both_layouts() {
+        let loaded = two_hunks();
+        // Split pairs a removal with its addition, so its row numbers differ
+        // from unified's; the hunk under each row must not.
+        let rows = |split: bool| match split {
+            false => (vec![1, 3, 5], 6, vec![7, 9]),
+            true => (vec![1, 3, 4], 5, vec![6, 7]),
+        };
+        for (split, built) in [
+            (false, view(two_hunks(), 60, 20)),
+            (true, split_view(two_hunks(), 80, 20)),
+        ] {
+            let (mut d, _) = built;
+            let (first, gap, second) = rows(split);
+            // A file header is nobody's hunk.
+            d.to_top();
+            assert_eq!(d.current_hunk(), None, "cursor on a file header");
+            // The hunk's header row, its middle and its tail all answer for
+            // the one hunk the loaded diff holds.
+            for row in first {
+                d.to_top();
+                d.move_by(row as isize);
+                let (path, hunk) = d.current_hunk().expect("the keyboard is on a hunk");
+                assert_eq!(path, "one.rs");
+                assert_eq!(hunk, loaded[0].hunks[0], "row {row}");
+            }
+            // The second file's header is a gap; its hunk answers its own.
+            d.to_top();
+            d.move_by(gap as isize);
+            assert_eq!(d.current_hunk(), None, "the second file's header");
+            for row in second {
+                d.to_top();
+                d.move_by(row as isize);
+                let (path, hunk) = d.current_hunk().expect("the second hunk");
+                assert_eq!(path, "two.rs");
+                assert_eq!(hunk, loaded[1].hunks[0], "row {row}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_wrapped_line_resolves_to_its_one_hunk_on_every_segment() {
+        // The address is a logical row, so however many rows a wrapped line
+        // takes, every one of them is the same hunk — the one a verb must
+        // act on when the cursor sits halfway down the line's second row.
+        let long = format!(
+            "diff --git a/a.rs b/a.rs\n@@ -1,1 +1,1 @@\n-{}\n+b\n",
+            "word ".repeat(20)
+        );
+        let loaded = parse_unified_diff(&long);
+        let (mut d, _) = view(loaded.clone(), 30, 20);
+        for row in 0..d.rows() {
+            d.to_top();
+            d.move_by(row as isize);
+            match row {
+                0 => assert_eq!(d.current_hunk(), None, "the file header"),
+                _ => {
+                    let (path, hunk) = d.current_hunk().expect("row {row} is on a hunk");
+                    assert_eq!(path, "a.rs");
+                    assert_eq!(hunk, loaded[0].hunks[0], "row {row}");
+                }
+            }
+        }
+        assert!(d.rows() > 3, "the line did not wrap at 30 columns");
+    }
+
+    #[test]
+    fn a_misrecorded_hunk_map_answers_nothing_rather_than_the_wrong_hunk() {
+        // An extension records its own spans; a bad one must degrade to
+        // "the keyboard is not on a hunk" rather than hand over some other
+        // file's hunk. Three ways to be bad: a file index past the
+        // presentation's own list, a path the loaded diff never heard of,
+        // and a hunk index past the file's hunks.
+        #[derive(Default)]
+        struct Bogus {
+            rows: usize,
+            entries: Vec<gitten_core::rows::Entry>,
+            answer: Option<(usize, usize)>,
+            path: String,
+        }
+        impl Present for Bogus {
+            fn claims(&self, _: &str) -> bool {
+                true
+            }
+            fn len(&self) -> usize {
+                self.rows
+            }
+            fn build(&mut self, f: File) {
+                self.entries.push(gitten_core::rows::Entry {
+                    path: self.path.clone(),
+                    adds: f.adds,
+                    dels: f.dels,
+                    row: self.rows,
+                });
+                self.rows += 1 + f.hunks.iter().map(|h| 1 + h.lines.len()).sum::<usize>();
+            }
+            fn files(&self) -> &[gitten_core::rows::Entry] {
+                &self.entries
+            }
+            fn hunk_at(&self, _: usize) -> Option<(usize, usize)> {
+                self.answer
+            }
+        }
+        impl Rows for Bogus {
+            fn render(
+                &self,
+                _: usize,
+                _: usize,
+                _: &Frame,
+                _: &mut crate::screen::Pen,
+                _: &mut Vec<Run>,
+            ) {
+            }
+        }
+
+        let bogus = |answer: Option<(usize, usize)>, path: &'static str| {
+            let host = Host::new();
+            let mut layouts = Layouts::builtin();
+            layouts.register("bogus", move |_| {
+                vec![Box::new(Bogus {
+                    answer,
+                    path: path.to_string(),
+                    ..Default::default()
+                })]
+            });
+            let at = layouts.position("bogus").unwrap();
+            let mut d = Diff::with_layouts(two_hunks(), &host, layouts);
+            d.set_layout(at, &host);
+            d.resize(60, 20, &host);
+            d
+        };
+
+        for (answer, path) in [
+            (Some((99, 0)), "one.rs"),  // no such file in this presentation
+            (Some((0, 0)), "ghost.rs"), // a path the loaded diff never held
+            (Some((0, 99)), "one.rs"),  // no such hunk in that file
+            (None, "one.rs"),           // honestly off the hunks
+        ] {
+            let mut d = bogus(answer, path);
+            d.move_by(2);
+            assert_eq!(
+                d.current_hunk(),
+                None,
+                "{answer:?} against {path:?} acted on something"
+            );
+        }
+    }
+
+    #[test]
+    fn refresh_replaces_a_diff_without_losing_a_valid_viewport() {
+        let (mut d, host) = view(two_files(), 60, 8);
+        d.move_by(6);
+        assert!(d.top() > 0, "the test wants a view below row zero");
+        let (cursor, top) = (d.cursor(), d.top());
+        // A refresh whose answer is shorter: the rows the cursor was on may
+        // not exist any more, and the viewport cannot point past the end.
+        let refreshed = vec![two_files()[0].clone()];
+        d.replace(refreshed, &host);
+        assert_eq!(d.cursor(), cursor.min(d.rows() - 1), "clamped, not reset");
+        assert_eq!(d.top(), top.min(d.rows().saturating_sub(d.height().max(1))));
+        assert!(d.cursor() < d.rows());
+        assert!(d.top() <= d.cursor());
+        // And a refresh that answers the same diff moves nothing at all.
+        d.replace(two_files(), &host);
+        let (cursor, top) = (d.cursor(), d.top());
+        d.replace(two_files(), &host);
+        assert_eq!((d.cursor(), d.top()), (cursor, top));
+    }
+
+    #[test]
+    fn a_vanished_hunk_clamps_and_a_live_row_survives_the_swap() {
+        let (mut d, host) = view(two_hunks(), 60, 8);
+        // Onto the second file's hunk, then take that file out from under
+        // the keyboard: the hunk vanished and the row no longer exists.
+        d.move_by(7);
+        // The mouse was holding rows that the swap takes away. It moved the
+        // keyboard with it, so the keyboard goes back to the hunk that is
+        // about to vanish before the swap is measured.
+        d.press(12, 2, 2, false, &host);
+        d.release();
+        assert!(!d.selection().is_empty(), "the test wants a selection");
+        d.move_by(3);
+        let refreshed = vec![two_hunks()[0].clone()];
+        d.replace(refreshed, &host);
+        assert_eq!(d.cursor(), d.rows() - 1, "clamped, not wrapped");
+        assert_eq!(d.top(), 0);
+        assert_eq!(d.selection(), "", "a selection outlived the rows it held");
+        // A row that survives lands where it was: the numeric fallback.
+        let (mut d, host) = view(two_hunks(), 60, 8);
+        d.move_by(2);
+        let (cursor, top) = (d.cursor(), d.top());
+        d.replace(vec![two_hunks()[1].clone()], &host);
+        assert_eq!(d.cursor(), cursor);
+        assert!(d.top() <= top);
     }
 }
