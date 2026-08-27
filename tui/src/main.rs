@@ -27,10 +27,14 @@
 
 use gitten_app::acquire::{self, Data};
 use gitten_app::cli::{self, Source, View};
+use gitten_app::jobs::{Event as JobEvent, Generation, Job, Runner, Submitter};
+use gitten_app::verbs::Write;
 use gitten_app::{StartClock, Startup};
 use gitten_core::command::{chord_string, Key, Modes, Resolve};
+use gitten_core::differ::Overrides;
 use gitten_core::host::Host;
 use gitten_core::runs::Run;
+use gitten_core::Hunk;
 use gitten_tui::commits::{Commits, Glyphs};
 use gitten_tui::diff::Diff;
 use gitten_tui::help;
@@ -140,17 +144,135 @@ fn main() {
 }
 
 /// What is on screen. A stack, so `esc` goes back to where you came from.
+///
+/// Each entry carries three things beside its view: the source it was acquired
+/// from, the label it was acquired under, and the invalidation generation it
+/// was acquired at. The first two are what a refresh re-reads and renames; the
+/// third is what tells the two apart — a screen whose generation is behind the
+/// job queue's is stale, and a fixture's never is, because no write anywhere
+/// can stale it.
 enum Screens {
-    Commits(Commits),
-    Diff(Diff),
+    Commits {
+        view: Commits,
+        source: Source,
+        label: String,
+        generation: Generation,
+    },
+    Diff {
+        view: Diff,
+        source: Source,
+        label: String,
+        generation: Generation,
+    },
 }
 
 impl Screens {
     /// Which mode's bindings are live. The name the keymap and `gitten.toml` use.
     fn mode(&self) -> &'static str {
         match self {
-            Screens::Commits(_) => "commits",
-            Screens::Diff(_) => "diff",
+            Screens::Commits { .. } => "commits",
+            Screens::Diff { .. } => "diff",
+        }
+    }
+
+    fn source(&self) -> &Source {
+        match self {
+            Screens::Commits { source, .. } | Screens::Diff { source, .. } => source,
+        }
+    }
+
+    fn label(&self) -> &str {
+        match self {
+            Screens::Commits { label, .. } | Screens::Diff { label, .. } => label,
+        }
+    }
+
+    fn generation(&self) -> Generation {
+        match self {
+            Screens::Commits { generation, .. } | Screens::Diff { generation, .. } => *generation,
+        }
+    }
+
+    /// Re-acquires this screen from the repository when a finished job has
+    /// staled it, applying the result in place. `None` for a screen nothing
+    /// can stale — one already at `target`, or one with no repository behind
+    /// it, whose data no write anywhere can move. `Some(result)` otherwise,
+    /// because a failed re-acquisition is a failed refresh and the caller
+    /// has an error to keep.
+    ///
+    /// Synchronous on the terminal loop, deliberately: the window refreshes
+    /// panes off-thread because it can, and a second terminal background
+    /// protocol is not M-sized work. Measured window costs for the same
+    /// operation run 48–370 ms — one git read plus one prepare pass — so a
+    /// refresh here pauses input for that long and leaves the last frame
+    /// drawn while it does.
+    fn refresh(
+        &mut self,
+        target: Generation,
+        host: &Host,
+        repo: &dyn gitten_git::Repo,
+    ) -> Option<Result<(), String>> {
+        if self.generation() >= target {
+            return None;
+        }
+        // The generation travels with the refresh: a screen that re-acquired
+        // at `target` is exactly as current as `target` says, however many
+        // finishes followed it down the queue.
+        match self {
+            Screens::Commits {
+                view,
+                source,
+                label,
+                generation,
+            } => match source {
+                Source::Repo { .. } => {
+                    let loaded = match acquire::reacquire(
+                        View::Commits,
+                        source,
+                        host,
+                        Some(repo),
+                        &Overrides::default(),
+                    ) {
+                        Ok(loaded) => loaded,
+                        Err(e) => return Some(Err(e)),
+                    };
+                    let Data::Commits(commits) = loaded.data else {
+                        return Some(Err("re-acquisition returned the wrong view".into()));
+                    };
+                    view.replace(commits);
+                    *label = loaded.label;
+                    *generation = target;
+                    Some(Ok(()))
+                }
+                Source::Fixtures | Source::Patch { .. } => None,
+            },
+            Screens::Diff {
+                view,
+                source,
+                label,
+                generation,
+            } => match source {
+                Source::Repo { .. } => {
+                    let loaded = match acquire::reacquire(
+                        View::Diff,
+                        source,
+                        host,
+                        Some(repo),
+                        &Overrides::default(),
+                    ) {
+                        Ok(loaded) => loaded,
+                        Err(e) => return Some(Err(e)),
+                    };
+                    let Data::Diff(files) = loaded.data else {
+                        return Some(Err("re-acquisition returned the wrong view".into()));
+                    };
+                    view.replace(files, host);
+                    *label = loaded.label;
+                    *generation = target;
+                    Some(Ok(()))
+                }
+                Source::Fixtures | Source::Patch { .. } => None,
+            },
         }
     }
 
@@ -162,11 +284,11 @@ impl Screens {
     /// launch, like every other number in that file.
     fn resize(&mut self, cols: usize, rows: usize, host: &Host) {
         match self {
-            Screens::Commits(c) => {
+            Screens::Commits { view: c, .. } => {
                 c.set_scrolloff(host.view.scrolloff);
                 c.resize(cols, rows);
             }
-            Screens::Diff(d) => {
+            Screens::Diff { view: d, .. } => {
                 d.set_scrolloff(host.view.scrolloff);
                 d.resize(cols, rows, host);
             }
@@ -175,15 +297,15 @@ impl Screens {
 
     fn paint(&self, screen: &mut Screen, top: usize, host: &Host, out: &mut Vec<Run>) {
         match self {
-            Screens::Commits(c) => c.paint(screen, top, host),
-            Screens::Diff(d) => d.paint(screen, top, host, out),
+            Screens::Commits { view: c, .. } => c.paint(screen, top, host),
+            Screens::Diff { view: d, .. } => d.paint(screen, top, host, out),
         }
     }
 
     fn status(&self, host: &Host) -> String {
         match self {
-            Screens::Commits(c) => c.status(),
-            Screens::Diff(d) => d.status(host),
+            Screens::Commits { view: c, .. } => c.status(),
+            Screens::Diff { view: d, .. } => d.status(host),
         }
     }
 
@@ -194,8 +316,8 @@ impl Screens {
     /// already-hit-tested numbers exactly as it takes already-loaded data.
     fn press(&mut self, col: usize, row: usize, clicks: u8, extend: bool, host: &Host) {
         match self {
-            Screens::Commits(c) => c.press(col, row, extend, host),
-            Screens::Diff(d) => d.press(col, row, clicks, extend, host),
+            Screens::Commits { view: c, .. } => c.press(col, row, extend, host),
+            Screens::Diff { view: d, .. } => d.press(col, row, clicks, extend, host),
         }
     }
 
@@ -203,15 +325,15 @@ impl Screens {
     /// body is negative and scrolls it.
     fn drag(&mut self, col: usize, row: isize, host: &Host) {
         match self {
-            Screens::Commits(c) => c.drag(row, host),
-            Screens::Diff(d) => d.drag(col, row, host),
+            Screens::Commits { view: c, .. } => c.drag(row, host),
+            Screens::Diff { view: d, .. } => d.drag(col, row, host),
         }
     }
 
     fn release(&mut self) {
         match self {
-            Screens::Commits(c) => c.release(),
-            Screens::Diff(d) => d.release(),
+            Screens::Commits { view: c, .. } => c.release(),
+            Screens::Diff { view: d, .. } => d.release(),
         }
     }
 
@@ -219,8 +341,8 @@ impl Screens {
     /// on when there is none.
     fn copy_text(&self) -> String {
         match self {
-            Screens::Commits(c) => c.copy_text(),
-            Screens::Diff(d) => d.copy_text(),
+            Screens::Commits { view: c, .. } => c.copy_text(),
+            Screens::Diff { view: d, .. } => d.copy_text(),
         }
     }
 
@@ -229,22 +351,22 @@ impl Screens {
     /// only moved the cursor.
     fn selection(&self) -> String {
         match self {
-            Screens::Commits(c) => c.selection(),
-            Screens::Diff(d) => d.selection(),
+            Screens::Commits { view: c, .. } => c.selection(),
+            Screens::Diff { view: d, .. } => d.selection(),
         }
     }
 
     fn select_all(&mut self) {
         match self {
-            Screens::Commits(c) => c.select_all(),
-            Screens::Diff(d) => d.select_all(),
+            Screens::Commits { view: c, .. } => c.select_all(),
+            Screens::Diff { view: d, .. } => d.select_all(),
         }
     }
 
     fn select_none(&mut self) -> bool {
         match self {
-            Screens::Commits(c) => c.select_none(),
-            Screens::Diff(d) => d.select_none(),
+            Screens::Commits { view: c, .. } => c.select_none(),
+            Screens::Diff { view: d, .. } => d.select_none(),
         }
     }
 
@@ -255,7 +377,7 @@ impl Screens {
     /// list scrolls every list, and nothing had to say so twice.
     fn run(&mut self, command: &str, host: &Host) -> bool {
         match self {
-            Screens::Commits(c) => match command {
+            Screens::Commits { view: c, .. } => match command {
                 "view.down" => c.down(),
                 "view.up" => c.up(),
                 "view.page-down" => c.page(1),
@@ -272,7 +394,7 @@ impl Screens {
                 "pane.left" | "pane.right" => {}
                 _ => return false,
             },
-            Screens::Diff(d) => match command {
+            Screens::Diff { view: d, .. } => match command {
                 "view.down" => d.down(),
                 "view.up" => d.up(),
                 "view.page-down" => d.page(1),
@@ -303,7 +425,6 @@ struct App {
     /// nothing, which is what an unbound key does too.
     repo: Option<(std::path::PathBuf, gitten_git::Handle)>,
     stack: Vec<Screens>,
-    label: String,
     screen: Screen,
     modes: Modes,
     /// Keys typed so far that have not resolved to a command. Empty almost
@@ -312,6 +433,15 @@ struct App {
     /// Something to say once, on the status line: an error, or what a key just
     /// did. Cleared by the next keypress, so it cannot go stale.
     message: String,
+    /// The shared write queue. One FIFO worker, owned here, whose finishes
+    /// every client treats the same way: a generation advances — a refusal as
+    /// much as a success — and every repository-backed screen re-acquires.
+    jobs: Runner,
+    /// The cloneable end of [`App::jobs`], handed out to whatever submits.
+    submitter: Submitter,
+    /// The generation the queue has advanced to, and so the one every screen
+    /// in the stack was last refreshed against.
+    generation: Generation,
     help: bool,
     quit: bool,
     /// The theme `theme.cycle` picked, if anything has. `None` means the file's.
@@ -347,6 +477,7 @@ impl App {
             Source::Repo { path, .. } => started.repo.clone().map(|h| (path.clone(), h)),
             Source::Fixtures | Source::Patch { .. } => None,
         };
+        let source = started.source;
         let label = started.loaded.label.clone();
         let host = started.host;
         let bar = match glyphs == Glyphs::ascii() {
@@ -357,23 +488,37 @@ impl App {
             Data::Commits(commits) => {
                 let mut list = Commits::with_glyphs(commits, glyphs);
                 list.set_bar(bar);
-                Screens::Commits(list)
+                Screens::Commits {
+                    view: list,
+                    source,
+                    label,
+                    generation: Generation::default(),
+                }
             }
             Data::Diff(files) => {
                 let mut diff = Diff::new(files, &host);
                 diff.set_bar(bar);
-                Screens::Diff(diff)
+                Screens::Diff {
+                    view: diff,
+                    source,
+                    label,
+                    generation: Generation::default(),
+                }
             }
         };
+        let jobs = Runner::new();
+        let submitter = jobs.submitter();
         let mut app = Self {
             host,
             repo,
             stack: vec![screen],
-            label,
             screen: Screen::new(0, 0),
             modes: Modes::new(),
             pending: Vec::new(),
             message: String::new(),
+            jobs,
+            submitter,
+            generation: Generation::default(),
             help: false,
             quit: false,
             picked_theme: None,
@@ -424,6 +569,13 @@ impl App {
                     Err(e) => format!("could not copy: {e}"),
                 };
             }
+            // Before the frame, for the same reason: a finish re-acquires
+            // synchronously and the frame that follows draws what it found.
+            // With no input the loop wakes on the tick, so a completed write
+            // is noticed within one TICK — the tick bounds notice latency,
+            // never the refresh itself, which is the `Screens::refresh`
+            // call below and is as long as the re-acquisition takes.
+            self.drain_jobs();
             let t = Instant::now();
             self.draw();
             let cells = self.screen.flush(term.out())?;
@@ -551,7 +703,7 @@ impl App {
                 screen.press(m.col, row as usize, clicks, m.shift, host);
                 // Two clicks on a commit open it, which is the one gesture a
                 // terminal has for "go in" besides the key that already does.
-                if clicks == 2 && matches!(self.stack.last(), Some(Screens::Commits(_))) {
+                if clicks == 2 && matches!(self.stack.last(), Some(Screens::Commits { .. })) {
                     self.open_diff();
                 }
             }
@@ -622,6 +774,12 @@ impl App {
                 self.message = format!("theme: {}", self.host.theme.name);
             }
             "commits.open-diff" => self.open_diff(),
+            // The hunk verbs act on the *repository*, not the screen: they
+            // need the source the diff was acquired from and the handle it
+            // was acquired through, and a view is drawing and input only.
+            // Routed here, ahead of the screen, for the same reason the
+            // window routes them in its `run_command`.
+            "diff.stage-hunk" | "diff.unstage-hunk" => self.hunk_verb(command),
             // The clipboard is the terminal's, not this process's — see
             // `Term::copy`. Held until the loop, which is the one place that has
             // a terminal to write to.
@@ -694,7 +852,7 @@ impl App {
     /// repository is. A bare revision is "what did this commit change" to
     /// [`gitten_git::Repo::pairs`], merges included.
     fn open_diff(&mut self) {
-        let Some(Screens::Commits(list)) = self.stack.last() else {
+        let Some(Screens::Commits { view: list, .. }) = self.stack.last() else {
             self.message = "no commit selected".into();
             return;
         };
@@ -720,12 +878,108 @@ impl App {
                 diff.set_bar(self.bar);
                 let (w, h) = self.screen.size();
                 diff.resize(w, h.saturating_sub(2), &self.host);
-                self.stack.push(Screens::Diff(diff));
-                self.label = format!("{} {subject}", &sha[..sha.len().min(8)]);
+                self.stack.push(Screens::Diff {
+                    view: diff,
+                    source,
+                    label: format!("{} {subject}", &sha[..sha.len().min(8)]),
+                    // Acquired this instant, so it is as current as the
+                    // queue's last finish — not a generation older.
+                    generation: self.generation,
+                });
                 self.sync_modes();
             }
             Err(e) => self.message = e,
         }
+    }
+
+    /// `diff.stage-hunk` / `diff.unstage-hunk`: send the hunk the keyboard is
+    /// on to the index, or take it back out. The terminal's share of the
+    /// window's `hunk_verb`: the gates, the patch, the verb — and not one
+    /// line more, because every one of those is shared with an extension
+    /// calling the same command through the same name.
+    fn hunk_verb(&mut self, command: &str) {
+        let source = match self.stack.last() {
+            Some(screen) => screen.source().clone(),
+            None => return,
+        };
+        let hunk = match self.stack.last() {
+            Some(Screens::Diff { view, .. }) => view.current_hunk(),
+            _ => None,
+        };
+        // Everything decided ahead of anything queued: a refusal is said
+        // here, and the queue only ever sees a job that means it.
+        let handle = self.repo.as_ref().map(|(_, handle)| handle);
+        match hunk_action(command, &source, handle, hunk) {
+            Ok(job) => {
+                if self.submitter.submit(job).is_err() {
+                    self.message = "the job queue is shutting down".into();
+                }
+            }
+            Err(e) => self.message = e,
+        }
+    }
+
+    /// Drains the job queue. Called before each frame, so the frame this
+    /// iteration draws is the one the finished jobs produced.
+    ///
+    /// Every `Finished` — a refusal as much as a success, because git can
+    /// answer nonzero with work already left behind — advances the generation
+    /// and re-acquires **every** stale repository-backed screen in the stack,
+    /// the hidden ones included: a commit list under the diff being staged
+    /// into is as stale as the diff itself. The write's own error is the
+    /// message, with at most one refresh failure appended; every screen is
+    /// still attempted even after one of them fails.
+    fn drain_jobs(&mut self) {
+        while let Some(event) = self.jobs.try_next() {
+            match event {
+                JobEvent::Started { name } => self.message = format!("running {name}"),
+                JobEvent::Finished {
+                    outcome,
+                    generation,
+                    done,
+                    ..
+                } => {
+                    let write = outcome.err();
+                    let mut refresh = None;
+                    if generation > self.generation {
+                        self.generation = generation;
+                        refresh = self.refresh_stale(generation).err();
+                    }
+                    self.message = match (write, refresh) {
+                        (Some(write), Some(refresh)) => format!("{write} · {refresh}"),
+                        (Some(write), None) => write,
+                        (None, Some(refresh)) => refresh,
+                        // A clean write's evidence is the refreshed screen
+                        // itself; a job that named its finish gets its word.
+                        (None, None) => done.unwrap_or_default(),
+                    };
+                }
+            }
+        }
+    }
+
+    /// Re-acquires every screen in the stack a finished job has staled.
+    ///
+    /// Synchronous, on the terminal loop — the accepted tradeoff: `git apply`
+    /// itself ran on the shared worker above, and a second terminal background
+    /// protocol is not this plan's scope. The screen stays drawn while it
+    /// blocks; a measured window refresh of the same work runs 48–370 ms.
+    fn refresh_stale(&mut self, target: Generation) -> Result<(), String> {
+        let Some((_, repo)) = self.repo.clone() else {
+            return Ok(());
+        };
+        // Every screen, not only the one on top — and every screen *tried*,
+        // even after one of them fails: the first failure is remembered, the
+        // rest are not skipped, because a stale hidden screen is still stale.
+        let mut first = None;
+        for screen in &mut self.stack {
+            if let Some(result) = screen.refresh(target, &self.host, repo.as_ref()) {
+                if result.is_err() {
+                    first = result.err().or(first);
+                }
+            }
+        }
+        first.map_or(Ok(()), Err)
     }
 
     /// A title row, the screen, a status row.
@@ -745,7 +999,7 @@ impl App {
         title(
             &mut self.screen.row(0),
             &self.host,
-            &self.label,
+            self.stack.last().map(Screens::label).unwrap_or(""),
             self.stack.last().map(Screens::mode),
         );
 
@@ -794,6 +1048,68 @@ impl App {
             help::paint(&mut self.screen, 1, body, &self.host, &self.modes);
         }
     }
+}
+
+/// The gates `diff.stage-hunk` / `diff.unstage-hunk` run, headless, in the
+/// window's own words.
+///
+/// Everything decided before anything is queued: only a working-tree diff has
+/// an index to aim at; a commit's diff is between two snapshots and has
+/// neither index nor worktree in reach; a fixture or a patch has no repository
+/// behind it; the keyboard may not be on a hunk at all. And a hunk whose every
+/// line is an addition *looks* like a creation but only [`Repo::status`] knows
+/// whether it is one — at `[diff] context = 0` a mid-file addition to a tracked
+/// file carries no old numbers either, so absence of them is not evidence.
+/// The status read is the same one the files pane draws from; a status that
+/// cannot be read is not proof of a creation, so the patch is still emitted
+/// and git's own refusal is what surfaces.
+///
+/// The patch is [`gitten_core::patch::emit`]'s and nothing else's; the verb is
+/// a [`Write`] job against the caller's retained handle; the caller owns the
+/// queue. Nothing here runs git and nothing here blocks — a constructor
+/// refusal (an empty patch) comes back as an error and is said, not queued.
+fn hunk_action(
+    command: &str,
+    source: &Source,
+    repo: Option<&gitten_git::Handle>,
+    hunk: Option<(String, Hunk)>,
+) -> Result<Box<dyn Job>, String> {
+    match source {
+        Source::Repo { arg, .. } if arg.is_empty() => {}
+        Source::Repo { .. } => {
+            return Err(
+                "only the working-tree diff can act on hunks — this one is between commits".into(),
+            )
+        }
+        Source::Fixtures => return Err("a fixture has no repository behind it".into()),
+        Source::Patch { .. } => return Err("a patch file has no repository behind it".into()),
+    }
+    let repo = repo.ok_or_else(|| "no repository is open".to_string())?;
+    let Some((path, hunk)) = hunk else {
+        return Err("the keyboard is not on a hunk".into());
+    };
+    // A status read on the path, and only for hunks that could be creations —
+    // every other shape pays nothing and cannot be misread this way.
+    let creation = !hunk.lines.iter().any(|l| l.old_no.is_some())
+        && repo
+            .status()
+            .map(|s| {
+                s.untracked
+                    .iter()
+                    .any(|e| e.path.as_bytes() == path.as_bytes())
+            })
+            .unwrap_or(false);
+    if creation {
+        return Err(
+            "that hunk adds a new file — stage or unstage it whole from the files pane".into(),
+        );
+    }
+    let patch = gitten_core::patch::emit(&path, &[&hunk]);
+    let built = match command {
+        "diff.stage-hunk" => Write::stage_patch(repo, patch),
+        _ => Write::unstage_patch(repo, patch),
+    };
+    built.map(|job| Box::new(job) as Box<dyn Job>)
 }
 
 /// What to say on the status line after a copy.
