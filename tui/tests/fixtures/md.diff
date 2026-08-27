@@ -38,4 +38,4 @@ diff --git a/src/draw.rs b/src/draw.rs
 -    pen.put("markdown", row.ink);
 +    pen.put("markdown rows", row.ink);
 +    pen.wash(row.background());
-}
+ }
