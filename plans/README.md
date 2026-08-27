@@ -36,7 +36,7 @@ integrator owns this table and updates it as waves land.
 | 012 | A font edit in gitten.toml rebuilds the diff presentation | P2 | M | — | MERGED (`dc14543` + followup `9a860a0`, via `d0b1ca5`) |
 | 013 | Incremental commit search in the terminal (`/`, shared `core::search`) | P1 | M | — | DONE (pass 3, `369503a`+2) — adversarially reviewed **GREEN**; 5 non-blocking notes accepted |
 | 014 | Stage/unstage the selected hunk from the terminal diff | P1 | M | — | DONE (pass 3, `b234f62`+5, fold `196704f`) — reviewed CONCERNS (all non-blocking); 3 folds in |
-| 015 | Render the shared Markdown presentation in the terminal | P2 | L | — | IN PROGRESS (pass 3) |
+| 015 | Render the shared Markdown presentation in the terminal | P2 | L | — | DONE (pass 3, `efe00bb`+3, folds `23e7672`) — reviewed CONCERNS (all non-blocking); core markdown.rs is a pure addition; 2 folds in |
 
 ## Pass 3 follow-ups — surfaced by reviewers, pre-existing, not pass regressions
 
@@ -46,6 +46,12 @@ integrator owns this table and updates it as waves land.
   `[diff] context = 0`, where an all-addition hunk in a tracked file emits `--- /dev/null` + `@@ -0,0`
   and real `git apply --cached` refuses. Shared window+terminal behavior by design (git's own refusal
   surfaces); the *doc* is the bug. Verified against the real backend by the 014 reviewer.
+- CJK text inside a *squeezed* table cell shears the grid in display columns — `flow_row` pads by
+  `chars().count()` (core markdown flow, unchanged, both clients affected), and the terminal module
+  doc records the inherited caveat. Same root as the known characters-versus-columns wrap seam.
+- The SGR 58 table hairline: the byte sequence and the SGR-4 fallback are pinned by tests, but its
+  rendering in a terminal without underline-colour support deserves one live eyeball (`./dev dump`)
+  before pass 3's merge is forgotten.
 
 ## Adversarial-review follow-ups — RESOLVED
 
