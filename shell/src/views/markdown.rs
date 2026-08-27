@@ -3,8 +3,10 @@
 //! A [`Rows`] implementation and nothing more: it claims markdown paths, takes
 //! the same prepared lines the built-in takes, and draws them with the markers
 //! gone — `## ` off the front and the row a size larger, `**` off a word that is
-//! now simply bold, a link down to its text. The structural work is
-//! [`gitten_core::markdown`]; what is here is pixels.
+//! now simply bold, a link down to its text. The structural work, the row
+//! store, the table flow and the wrap policy are [`gitten_core::markdown::Document`]
+//! — shared with the terminal, which draws the same model through a pen. What
+//! is here is pixels.
 //!
 //! # What fixed row height buys and costs
 //!
@@ -22,19 +24,21 @@
 //! rows*, never a taller one — `docs/decisions/0017`.
 //!
 //! This is also the only presentation whose column budget differs per row, and
-//! [`MarkdownRows::budget`] is why: a bar, three levels of indent and a bullet
-//! are real pixels, and an 18px heading in a 14px body holds a fifth fewer
-//! characters.
+//! [`Metrics::budget`] is why: a bar, three levels of indent and a bullet are
+//! real pixels, and an 18px heading in a 14px body holds a fifth fewer
+//! characters. The *policy* — which block costs what, which rows keep their
+//! grid whole — is core's; this file turns the semantic furniture into pixels
+//! and the budget into a number.
 //!
 //! A table is the exception to all of it. Its grid is aligned character by
 //! character with the rows around it, so a break at a column shears it — and not
 //! breaking it makes it the widest row in the diff, which drags the whole view
 //! into a horizontal scroll. So a grid too wide for the window is *laid out
-//! again* at the width there is: columns squeezed, cells wrapped inside them, one
-//! row becoming as many rows as its tallest cell needs. That is
-//! [`MarkdownRows::reflow_tables`] over `core`'s `flow_table`, and the rows it
-//! decides reach `Wrapped` as `Budget::At` — the same flat table every other
-//! row's rows are in.
+//! again* at the width there is: columns squeezed, cells wrapped inside them,
+//! one row becoming as many rows as its tallest cell needs. That is
+//! `Document::reflow` over `core`'s `flow_table`, and the rows it decides reach
+//! `Wrapped` as `Budget::At` — the same flat table every other row's rows are
+//! in.
 //!
 //! Within that, three devices do the work:
 //!
@@ -60,17 +64,15 @@
 
 use super::diff::{
     column_at, columns, file_header, header_hit, hunk_header, hunk_hit, into_text, line_colors,
-    num, row_frame, scrolled, selected, slice, slice_shared, Hit, Rows, Scratch, PAD, ROW_H,
-    SIGN_W, TEXT_CHROME,
+    num, row_frame, scrolled, selected, slice, Hit, Rows, Scratch, PAD, ROW_H, SIGN_W, TEXT_CHROME,
 };
 use gitten_core::host::Host;
-use gitten_core::markdown::{flow_table, lay_out_tables, Block, Grid, Layout, TableRow};
+use gitten_core::markdown::{Bar, Block, DocRow, Document};
+use gitten_core::prepared::Line;
 use gitten_core::runs::surfaces;
 use gitten_core::select::Selected;
-use gitten_core::syntax::Token;
 use gitten_core::theme::Rgb;
-use gitten_core::wrap::{Break, Budget, Wrap, Wrapped};
-use gitten_core::{LineKind, Span};
+use gitten_core::wrap::Wrap;
 use gpui::*;
 
 /// How a rendered markdown row is proportioned. A struct rather than constants
@@ -98,7 +100,7 @@ pub struct Metrics {
     /// because it is the font that decides: a monospaced face gets its table
     /// columns padded into a grid, and a proportional one gets its tables left
     /// as written instead of misaligned by a fraction of a glyph per cell.
-    pub layout: Layout,
+    pub layout: gitten_core::markdown::Layout,
 }
 
 impl Default for Metrics {
@@ -108,7 +110,7 @@ impl Default for Metrics {
             indent: 14.0,
             bar: 2.0,
             bullets: &["•", "◦", "▪", "·"],
-            layout: Layout::monospaced(),
+            layout: gitten_core::markdown::Layout::monospaced(),
         }
     }
 }
@@ -133,7 +135,7 @@ impl Metrics {
         }
         Self {
             heading,
-            layout: Layout {
+            layout: gitten_core::markdown::Layout {
                 monospaced: font.monospaced,
                 ..Default::default()
             },
@@ -152,92 +154,83 @@ impl Metrics {
             .copied()
             .unwrap_or(self.bullets[last])
     }
-}
 
-/// One row. `Copy` fields and shared text only: `render` runs per visible row
-/// per redraw, so nothing in here may be worth allocating at that point. The
-/// line's text is the prepared line's own `Arc`, not a copy of it; the headers
-/// are the parsed diff's own strings by handle, and the gutter numbers stay
-/// integers until draw time — see [`Row::Line`](super::diff::Row) for why.
-enum Row {
-    File {
-        path: std::sync::Arc<str>,
-        adds: usize,
-        dels: usize,
-    },
-    Hunk(std::sync::Arc<str>),
-    Line {
-        block: Block,
-        kind: LineKind,
-        moved: bool,
-        old: Option<u32>,
-        new: Option<u32>,
-        text: std::sync::Arc<str>,
-        spans: Box<[Span]>,
-        tokens: Box<[Token]>,
-    },
+    /// How large this block's text is drawn. A heading is the only thing in the
+    /// app with a type size of its own, and it is why a column budget and a
+    /// caret are both per row here rather than per diff.
+    fn text_size(&self, block: Block, host: &Host) -> f32 {
+        match block {
+            Block::Heading(level) => self.size(level),
+            _ => host.font.size,
+        }
+    }
+
+    /// One character of a block's text, in pixels. `Font::char_width` at the
+    /// block's own size rather than the host's, which is the whole of what makes
+    /// a heading's caret and a heading's overflow different from a paragraph's.
+    fn char_width(&self, block: Block, host: &Host) -> f32 {
+        self.text_size(block, host) * host.font.advance
+    }
+
+    /// How many pixels of furniture sit between the sign column and the text: a
+    /// bar, some indent steps, a bullet.
+    ///
+    /// Measured out of the *semantic* furniture core describes, so the budget
+    /// and the caret cannot disagree with the drawing about which block costs
+    /// what. A table gets none of it: its grid is aligned character by character
+    /// against the rows around it, so it is drawn with the gutter and then
+    /// nothing at all.
+    fn furniture(&self, block: Block) -> f32 {
+        let f = block.furniture();
+        self.indent * (f.bar.is_some() as u8 + f.depth + f.bullet as u8) as f32
+    }
+
+    /// How many characters of `block` fit in `width` pixels.
+    ///
+    /// Every other presentation has one budget for the whole diff; this one has a
+    /// budget per row, and that is the reason core's `Wrapped` takes the column
+    /// count per line rather than once. Two things move it:
+    ///
+    /// - **What is drawn in front of the text.** A quote bar, three levels of
+    ///   list indent and a bullet are real pixels, and a wrap that ignored them
+    ///   would overflow by exactly as many as it ignored.
+    /// - **How large the text is.** A `#` heading is drawn at 18px where the body
+    ///   is 14, so the same row holds a fifth fewer characters. Nothing else in
+    ///   the app has two type sizes in one list.
+    ///
+    /// A table's budget is the width its *grid* has to fit, and not a column its
+    /// text may be broken at: a grid is aligned character by character with the
+    /// rows above and below it, so it is re-laid-out by core's `flow_table` —
+    /// cells wrapped inside their own columns — or drawn whole and scrolled to.
+    fn budget(&self, block: Block, width: f32, host: &Host) -> usize {
+        columns(
+            width,
+            TEXT_CHROME + self.furniture(block),
+            self.text_size(block, host),
+            host,
+        )
+    }
 }
 
 /// The rendered-markdown presentation. Register it after the built-in and it
 /// takes every `.md`, `.markdown` and `.mdx` file in the diff.
+///
+/// Rows, blocks, tables, flowed grids and wrap ranges are the core
+/// [`Document`]'s; what this holds is the font-derived [`Metrics`], the paths it
+/// claims, and the scratch buffers drawing borrows.
 pub struct MarkdownRows {
-    rows: Vec<Row>,
+    doc: Document,
     metrics: Metrics,
     /// Which extensions to claim. Owned rather than hardcoded so the same
     /// implementation can be pointed at `.mdown` or `.txt` without editing it.
     extensions: Vec<String>,
-    laid_out: usize,
-    /// Where each row's text breaks. Indexed by row, like the built-in's.
-    wrapped: Wrapped,
-    /// Every distinct [`Block`] in the rows, collected as they were built.
-    ///
-    /// This is what makes a resize cheap here. The other two presentations have
-    /// one column budget and compare it; this one has a budget per *row*, so
-    /// there is no single number — but there are only ever a couple of dozen
-    /// distinct blocks in a document, and the budget is a pure function of the
-    /// block and the width. Comparing the budgets of these is therefore exactly
-    /// as good as comparing all of them, and does not touch a row.
-    ///
-    /// Comparing the raw width instead is the obvious thing and it rescans every
-    /// line of the diff on every pixel of a drag — 3 ms a frame on `md.diff`,
-    /// for an answer that did not change.
-    blocks: Vec<Block>,
-    /// The budgets `blocks` had when `wrapped` was built, and the policy that
-    /// built it.
-    budgets: Vec<usize>,
-    wrap: &'static str,
     /// The width the budgets were computed for, kept so a row can ask what its
     /// own column is. Only one thing needs it — a thematic break is drawn as a
     /// rule and a rule has to be as wide as the text it replaces — and the
     /// alternative is a constant, which was 320 pixels regardless of the window.
     width: f32,
-    /// Which rows are in a table, and which table: `(row, grid)`, ascending by
-    /// row. Sparse, because a table is 1–2.5% of the rows of a diff and a `run`
-    /// field on every row of a 714k-line one is 2.8 MB to answer "no".
-    tables: Vec<(u32, u32)>,
-    /// What each of those tables was aligned to at load: the width every column
-    /// wants, and which way its cells sit. One per run, so a handful.
-    grids: Vec<Grid>,
-    /// The table rows whose grid does not fit the current width, re-laid out onto
-    /// one that does — `(row, flowed)`, ascending. Empty at any width where every
-    /// table fits, and with wrapping off.
-    flows: Vec<(u32, Flowed)>,
     /// What drawing borrows. Cleared per row, grown once ever — see [`Scratch`].
     scratch: std::cell::RefCell<Scratch>,
-}
-
-/// One table row re-laid-out to the window: the sub-rows of its grid laid end to
-/// end, and everything that indexes them.
-///
-/// The shell's copy of [`gitten_core::markdown::FlowRow`], and it exists for one
-/// reason: `SharedString`. A row is sliced per visible row per frame through the
-/// same `slice` every other row uses, and that is a refcount bump on a
-/// `SharedString` and a `to_string` on a `String`.
-struct Flowed {
-    text: SharedString,
-    breaks: Vec<Break>,
-    spans: Vec<Span>,
-    tokens: Vec<Token>,
 }
 
 impl Default for MarkdownRows {
@@ -254,64 +247,16 @@ impl MarkdownRows {
     /// presentation takes. `Default` is the shipped answer to both.
     pub fn new(metrics: Metrics, extensions: &[&str]) -> Self {
         Self {
-            rows: Vec::new(),
+            doc: Document::new(metrics.layout),
             metrics,
             extensions: extensions.iter().map(|s| s.to_string()).collect(),
-            laid_out: 0,
-            wrapped: Wrapped::default(),
-            blocks: Vec::new(),
-            budgets: Vec::new(),
-            wrap: "",
             width: 0.0,
-            tables: Vec::new(),
-            grids: Vec::new(),
-            flows: Vec::new(),
             scratch: std::cell::RefCell::default(),
         }
     }
 
-    /// How many characters of `row` fit in `width` pixels.
-    ///
-    /// Every other presentation has one budget for the whole diff; this one has a
-    /// budget per row, and that is the reason [`Wrapped::build`] takes the column
-    /// count per line rather than once. Two things move it:
-    ///
-    /// - **What is drawn in front of the text.** A quote bar, three levels of
-    ///   list indent and a bullet are real pixels, and a wrap that ignored them
-    ///   would overflow by exactly as many as it ignored.
-    /// - **How large the text is.** A `#` heading is drawn at 18px where the body
-    ///   is 14, so the same row holds a fifth fewer characters. Nothing else in
-    ///   the app has two type sizes in one list.
-    ///
-    /// A table's budget is the width its *grid* has to fit, and not a column its
-    /// text may be broken at: a grid is aligned character by character with the
-    /// rows above and below it, so it is re-laid-out by
-    /// [`flow_table`] — cells wrapped inside their own columns — or drawn whole
-    /// and scrolled to. See [`MarkdownRows::reflow_tables`].
     fn budget(&self, block: Block, width: f32, host: &Host) -> usize {
-        columns(
-            width,
-            TEXT_CHROME + self.furniture(block),
-            self.size(block, host),
-            host,
-        )
-    }
-
-    /// How many pixels of furniture sit between the sign column and the text: a
-    /// bar, some indent steps, a bullet.
-    ///
-    /// One function because two callers must agree about it — the wrap budget
-    /// above and the caret in `hit`. A table gets none of it: its grid is aligned
-    /// character by character against the rows around it, so it is drawn with the
-    /// gutter and then nothing at all.
-    fn furniture(&self, block: Block) -> f32 {
-        if block.is_table() {
-            return 0.0;
-        }
-        let m = &self.metrics;
-        let bar = matches!(block, Block::Quote(_) | Block::Fence | Block::Code);
-        let bullet = matches!(block, Block::Bullet(_));
-        m.indent * (bar as u8 + block.depth() + bullet as u8) as f32
+        self.metrics.budget(block, width, host)
     }
 
     /// How many characters one visual row actually draws, after `trim_end`:
@@ -320,183 +265,10 @@ impl MarkdownRows {
     /// approximations are not good enough — a bound half a character out is a
     /// diff you cannot scroll to the end of.
     fn chars(&self, index: usize, seg: usize) -> usize {
-        let Some(Row::Line { text, .. }) = self.rows.get(index) else {
+        let Some(text) = self.doc.text(index) else {
             return 0;
         };
-        let text = self
-            .flowed(index)
-            .map_or(text.as_ref(), |f| f.text.as_str());
-        text[self.wrapped.range(index, seg, text)]
-            .trim_end()
-            .chars()
-            .count()
-    }
-
-    /// One character of this block's text, in pixels. `Font::char_width` at the
-    /// block's own size rather than the host's, which is the whole of what makes
-    /// a heading's caret and a heading's overflow different from a paragraph's.
-    fn char_width(&self, block: Block, host: &Host) -> f32 {
-        self.size(block, host) * host.font.advance
-    }
-
-    /// How large this block's text is drawn. A heading is the only thing in the
-    /// app with a type size of its own, and it is why a column budget and a
-    /// caret are both per row here rather than per diff.
-    fn size(&self, block: Block, host: &Host) -> f32 {
-        match block {
-            Block::Heading(level) => self.metrics.size(level),
-            _ => host.font.size,
-        }
-    }
-
-    /// Re-lays every table whose grid does not fit `width`, and forgets the ones
-    /// that do.
-    ///
-    /// The one part of a table's layout that is the window's business. Which rows
-    /// are one table, what its columns are and how wide each wants to be were all
-    /// settled at load by `lay_out_tables`; how many of those columns' characters
-    /// there is room for is not knowable until here, and changes on every drag
-    /// that crosses one.
-    ///
-    /// Runs per reflow over the tables and not over the rows, which is the whole
-    /// reason `tables` is sparse: a diff with no table in it does no work here at
-    /// any width.
-    fn reflow_tables(&mut self, width: f32, host: &Host, wrap: &dyn Wrap) {
-        self.flows.clear();
-        if self.tables.is_empty() {
-            return;
-        }
-        // One budget for every table, because a table row draws no furniture and
-        // no heading: the grid gets the whole column.
-        let cols = self.budget(Block::Table, width, host);
-        // Two vectors and not a `filter_map` into one: what comes back is one
-        // flowed row per row passed in, so a row silently dropped on the way in
-        // would attach every flow after it to the wrong row.
-        let mut run: Vec<TableRow> = Vec::new();
-        let mut of: Vec<u32> = Vec::new();
-        let mut i = 0;
-        while i < self.tables.len() {
-            let grid = self.tables[i].1;
-            let start = i;
-            while i < self.tables.len() && self.tables[i].1 == grid {
-                i += 1;
-            }
-            run.clear();
-            of.clear();
-            for (r, _) in &self.tables[start..i] {
-                let Row::Line {
-                    block,
-                    text,
-                    spans,
-                    tokens,
-                    ..
-                } = &self.rows[*r as usize]
-                else {
-                    continue;
-                };
-                of.push(*r);
-                run.push(TableRow {
-                    text,
-                    block: *block,
-                    tokens,
-                    spans,
-                });
-            }
-            let Some(flowed) = flow_table(
-                &run,
-                &self.grids[grid as usize],
-                cols,
-                &self.metrics.layout,
-                wrap,
-            ) else {
-                continue;
-            };
-            for (row, f) in of.iter().zip(flowed) {
-                self.flows.push((
-                    *row,
-                    Flowed {
-                        text: f.text.into(),
-                        breaks: f.breaks,
-                        spans: f.spans,
-                        tokens: f.tokens,
-                    },
-                ));
-            }
-        }
-    }
-
-    /// The re-laid-out grid for a row, if this width needed one.
-    ///
-    /// A binary search and not a field on the row: this is asked once per visible
-    /// row per frame over a list that holds a handful of entries, and the
-    /// alternative costs four bytes on every row of every diff to say "no".
-    fn flowed(&self, index: usize) -> Option<&Flowed> {
-        let at = self
-            .flows
-            .binary_search_by_key(&(index as u32), |(r, _)| *r)
-            .ok()?;
-        Some(&self.flows[at].1)
-    }
-
-    /// Whether a hairline is drawn under this visual row: a rule *between* two
-    /// rows of a table, which is not the same thing as a border around one.
-    ///
-    /// Three ways to answer no, and each is a thing that looked wrong:
-    ///
-    /// - **The last row of a table.** There is nothing under it to be separated
-    ///   from, and a line hanging under an open-bottomed grid reads as a break in
-    ///   the document rather than as part of the table.
-    /// - **A header.** Its separator row is already a rule, and two of them a
-    ///   pixel apart is a double line.
-    /// - **Any sub-row but the last.** A squeezed cell wraps, and a rule through
-    ///   the middle of its own sentence says the row ended where it did not.
-    ///
-    /// One method rather than a condition at the call site, because it is a rule
-    /// about rows and a test can ask it directly.
-    fn ruled(&self, index: usize, seg: usize) -> bool {
-        let Some(Row::Line { block, .. }) = self.rows.get(index) else {
-            return false;
-        };
-        *block == Block::Table
-            && seg + 1 == self.wrapped.rows(index)
-            && matches!(self.rows.get(index + 1), Some(Row::Line { block, .. }) if *block == Block::Table)
-    }
-
-    /// What a row draws and what indexes it: its own text, or the grid this width
-    /// re-laid it out onto. The [`Source`] keeps which one, because slicing a
-    /// row's own `Arc` is a refcount bump and slicing a flowed grid is not.
-    fn text_of<'a>(
-        &'a self,
-        index: usize,
-        text: &'a std::sync::Arc<str>,
-        spans: &'a [Span],
-        tokens: &'a [Token],
-    ) -> (&'a str, &'a [Span], &'a [Token], Source<'a>) {
-        match self.flowed(index) {
-            Some(f) => (
-                f.text.as_str(),
-                &f.spans,
-                &f.tokens,
-                Source::Flowed(&f.text),
-            ),
-            None => (text, spans, tokens, Source::Own(text)),
-        }
-    }
-}
-
-/// Which storage a row's drawn text came from — see [`MarkdownRows::text_of`].
-enum Source<'a> {
-    Own(&'a std::sync::Arc<str>),
-    Flowed(&'a SharedString),
-}
-
-impl Source<'_> {
-    /// One row's worth of it: whole rows come out as refcount bumps either way.
-    fn piece(&self, at: &std::ops::Range<usize>) -> SharedString {
-        match self {
-            Source::Own(t) => slice(t, at),
-            Source::Flowed(t) => slice_shared(t, at),
-        }
+        text[self.doc.range(index, seg)].trim_end().chars().count()
     }
 }
 
@@ -510,102 +282,43 @@ impl Rows for MarkdownRows {
     }
 
     fn len(&self) -> usize {
-        self.rows.len()
+        self.doc.len()
     }
 
     fn is_file_header(&self, index: usize) -> bool {
-        matches!(self.rows.get(index), Some(Row::File { .. }))
+        matches!(self.doc.row(index), Some(DocRow::File { .. }))
     }
 
     fn rows(&self, index: usize) -> usize {
-        self.wrapped.rows(index)
+        self.doc.rows(index)
     }
 
     fn reflow(&mut self, width: f32, host: &Host, wrap: &dyn Wrap) -> bool {
-        let budgets: Vec<usize> = self
-            .blocks
-            .iter()
-            .map(|b| self.budget(*b, width, host))
-            .collect();
-        if budgets == self.budgets && wrap.name() == self.wrap {
-            return false;
+        // The unit adapter: one block's budget, in characters, from the window
+        // width less the fixed diff chrome less this block's furniture measured
+        // in pixels, at this block's own type size. Core sees only the number.
+        let metrics = self.metrics;
+        let budget = move |block: Block| metrics.budget(block, width, host);
+        match self.doc.reflow(&budget, wrap) {
+            true => {
+                self.width = width;
+                true
+            }
+            false => false,
         }
-        self.budgets = budgets;
-        self.wrap = wrap.name();
-        self.width = width;
-        // Before the wrap and not inside it: a table that no longer fits comes
-        // out of this with its rows already decided, and what `Wrapped` does with
-        // it is keep them.
-        self.reflow_tables(width, host, wrap);
-        let wrapped = Wrapped::build_with(
-            self.rows.iter().enumerate().map(|(i, r)| match r {
-                Row::Line { block, text, .. } => match self.flowed(i) {
-                    Some(f) => (f.text.as_ref(), Budget::At(&f.breaks)),
-                    // A grid that fits, or one nothing could be done with, is
-                    // drawn whole: a break at a column shears it.
-                    None if block.is_table() => (text.as_ref(), Budget::Cols(0)),
-                    None => (
-                        text.as_ref(),
-                        Budget::Cols(self.budget(*block, width, host)),
-                    ),
-                },
-                // A header is drawn by the built-in's own function at the built-in's
-                // own width, and a path is not prose. One row, always.
-                _ => ("", Budget::Cols(0)),
-            }),
-            wrap,
-        );
-        self.wrapped = wrapped;
-        true
     }
 
-    fn build(&mut self, mut f: gitten_core::prepared::File) {
-        self.rows.push(Row::File {
-            path: std::mem::take(&mut f.path).into(),
-            adds: f.adds,
-            dels: f.dels,
-        });
-        for mut h in f.hunks {
-            self.rows
-                .push(Row::Hunk(std::mem::take(&mut h.header).into()));
-            // Per hunk, because that is the largest unit whose block structure is
-            // knowable: a fence opened in one hunk and closed in another has
-            // everything between them missing from the diff entirely.
-            let (blocks, tables) = lay_out_tables(&mut h.lines, &self.metrics.layout);
-            self.laid_out += blocks.len();
-            // The grids come along because the window's width is not known here
-            // and a grid too wide for it has to be laid out again — off the same
-            // runs and the same measurements, or the second answer disagrees with
-            // the first. Rebased onto this presentation's own row numbering.
-            let (row, grid) = (self.rows.len() as u32, self.grids.len() as u32);
-            self.grids.extend(tables.grids);
-            self.tables
-                .extend(tables.of_line.iter().map(|(l, g)| (row + l, grid + g)));
-            for (l, block) in h.lines.into_iter().zip(blocks) {
-                if !self.blocks.contains(&block) {
-                    self.blocks.push(block);
-                }
-                self.rows.push(Row::Line {
-                    block,
-                    kind: l.kind,
-                    moved: l.moved,
-                    old: l.old_no,
-                    new: l.new_no,
-                    text: l.text,
-                    spans: l.spans,
-                    tokens: l.tokens,
-                });
-            }
-        }
+    fn build(&mut self, f: gitten_core::prepared::File) {
+        self.doc.push(f);
     }
 
     fn width(&self, index: usize, seg: usize) -> usize {
-        match &self.rows[index] {
+        match self.doc.row(index) {
             // Indent steps cost roughly a character each, and a heading's glyphs
             // are wider than the body's — both approximations, and both only feed
             // the widest-row contest that decides which row the horizontal bound
             // is taken from.
-            Row::Line { text, block, .. } => {
+            Some(DocRow::Line { block, .. }) => {
                 let scale = match block {
                     Block::Heading(l) => self.metrics.size(*l) / 14.0,
                     _ => 1.0,
@@ -614,31 +327,21 @@ impl Rows for MarkdownRows {
                 // squeezed to fit is exactly as wide as the budget, and measuring
                 // the one it was squeezed out of would leave the whole list
                 // scrolling sideways for a row nothing draws.
-                let text = self
-                    .flowed(index)
-                    .map_or(text.as_ref(), |f| f.text.as_str());
+                let text = self.doc.text(index).unwrap_or_default();
                 // `chars`, not `len`: a table row is full of three-byte box
                 // drawing and would otherwise measure three times too wide and
                 // win the widest-row contest for the whole diff.
-                let shown = text[self.wrapped.range(index, seg, text)].trim_end();
+                let shown = text[self.doc.range(index, seg)].trim_end();
                 (shown.chars().count() as f32 * scale) as usize + block.depth() as usize + 2
             }
-            Row::Hunk(h) => h.chars().count(),
-            Row::File { path, .. } => path.chars().count(),
+            Some(DocRow::Hunk(h)) => h.chars().count(),
+            Some(DocRow::File { path, .. }) => path.chars().count(),
+            None => 0,
         }
     }
 
     fn report(&self) -> String {
-        if self.laid_out == 0 {
-            return String::new();
-        }
-        let mut out = format!("markdown {} rows", self.laid_out);
-        // Only when it happened. A table that fits is the common case and saying
-        // "0 squeezed" on every diff is noise on a line that is read at a glance.
-        if !self.flows.is_empty() {
-            out.push_str(&format!(" · {} table rows squeezed", self.flows.len()));
-        }
-        out
+        self.doc.report()
     }
 
     /// A row's own furniture and a row's own type size, which is what makes this
@@ -646,10 +349,10 @@ impl Rows for MarkdownRows {
     /// same text is a fifth wider as an `#` heading and starts three indent steps
     /// further in as a nested bullet.
     fn overflow(&self, index: usize, seg: usize, width: f32, host: &Host) -> f32 {
-        match &self.rows[index] {
-            Row::Line { block, .. } => {
-                let text = self.chars(index, seg) as f32 * self.char_width(*block, host);
-                let room = width - TEXT_CHROME - self.furniture(*block);
+        match self.doc.row(index) {
+            Some(DocRow::Line { block, .. }) => {
+                let text = self.chars(index, seg) as f32 * self.metrics.char_width(*block, host);
+                let room = width - TEXT_CHROME - self.metrics.furniture(*block);
                 (text - room).max(0.0)
             }
             // A header is the built-in's, drawn behind the page padding and
@@ -663,20 +366,18 @@ impl Rows for MarkdownRows {
     /// size. Nothing else in the app has two type sizes in one list, which is why
     /// this is the one presentation whose caret arithmetic is per row.
     fn hit(&self, index: usize, seg: usize, x: f32, host: &Host, shift: f32) -> Option<Hit> {
-        Some(match self.rows.get(index)? {
-            Row::File { path, .. } => header_hit(path, x, host, shift),
-            Row::Hunk(h) => hunk_hit(h, x, host, shift),
-            Row::Line { block, text, .. } => {
-                let text = self
-                    .flowed(index)
-                    .map_or(text.as_ref(), |f| f.text.as_str());
-                let at = self.wrapped.range(index, seg, text);
-                let from = TEXT_CHROME - PAD + self.furniture(*block);
+        Some(match self.doc.row(index)? {
+            DocRow::File { path, .. } => header_hit(path, x, host, shift),
+            DocRow::Hunk(h) => hunk_hit(h, x, host, shift),
+            DocRow::Line { block, .. } => {
+                let text = self.doc.text(index)?;
+                let at = self.doc.range(index, seg);
+                let from = TEXT_CHROME - PAD + self.metrics.furniture(*block);
                 let off = at.start
                     + column_at(
                         &text[at.clone()],
                         into_text(x, from, shift),
-                        self.size(*block, host),
+                        self.metrics.text_size(*block, host),
                         host,
                     );
                 Hit { part: 0, off }
@@ -685,22 +386,16 @@ impl Rows for MarkdownRows {
     }
 
     /// The source line, which is also what is drawn: the markers this
-    /// presentation replaces were taken off the text by `lay_out`, so a copy
-    /// yields what was on screen rather than a bullet nobody can see.
+    /// presentation replaces were taken off the text by core's `lay_out`, so a
+    /// copy yields what was on screen rather than a bullet nobody can see.
     fn selectable(&self, index: usize, _part: u16) -> Option<&str> {
-        Some(match self.rows.get(index)? {
-            // The flowed grid, when there is one, because that is what is on
-            // screen — and what `hit` returned offsets into.
-            Row::Line { text, .. } => self
-                .flowed(index)
-                .map_or(text.as_ref(), |f| f.text.as_str()),
-            Row::Hunk(h) => h.as_ref(),
-            Row::File { path, .. } => path.as_ref(),
-        })
+        // The flowed grid, when there is one, because that is what is on
+        // screen — and what `hit` returned offsets into.
+        self.doc.text(index)
     }
 
     fn is_header(&self, index: usize) -> bool {
-        matches!(self.rows.get(index), Some(Row::File { .. }))
+        matches!(self.doc.row(index), Some(DocRow::File { .. }))
     }
 
     fn render(
@@ -713,43 +408,18 @@ impl Rows for MarkdownRows {
         shift: f32,
     ) -> AnyElement {
         let theme = &host.theme;
-        match &self.rows[index] {
-            Row::File { path, adds, dels } => {
+        match self.doc.row(index) {
+            Some(DocRow::File { path, adds, dels }) => {
                 file_header(path, *adds, *dels, theme, sel, current, shift)
             }
-            Row::Hunk(header) => hunk_header(header, theme, sel, current, shift),
-            Row::Line {
-                block,
-                kind,
-                moved,
-                old,
-                new,
-                text,
-                spans,
-                tokens,
-            } => {
-                let (text, spans, tokens, source) = self.text_of(index, text, spans, tokens);
-                let at = self.wrapped.range(index, seg, text);
-                let rule = self.ruled(index, seg);
-                self.line(
-                    *block,
-                    *kind,
-                    *moved,
-                    *old,
-                    *new,
-                    source.piece(&at),
-                    text.len(),
-                    at,
-                    seg,
-                    spans,
-                    tokens,
-                    rule,
-                    current,
-                    host,
-                    sel,
-                    shift,
-                )
+            Some(DocRow::Hunk(header)) => hunk_header(header, theme, sel, current, shift),
+            Some(DocRow::Line { block, line }) => {
+                self.line(index, seg, *block, line, current, host, sel, shift)
             }
+            // The order table only names rows this presentation built, so this
+            // arm is unreachable; a blank row beats a panic if an index ever
+            // arrives stale.
+            None => div().into_any_element(),
         }
     }
 }
@@ -758,23 +428,10 @@ impl MarkdownRows {
     #[allow(clippy::too_many_arguments)]
     fn line(
         &self,
-        block: Block,
-        kind: LineKind,
-        moved: bool,
-        old: Option<u32>,
-        new: Option<u32>,
-        // What this visual row draws of the line — `slice` or `slice_shared`
-        // of it, already taken.
-        piece: SharedString,
-        // Length of the whole line the piece belongs to, which a selection
-        // range is measured against.
-        full_len: usize,
-        at: std::ops::Range<usize>,
+        index: usize,
         seg: usize,
-        spans: &[Span],
-        tokens: &[Token],
-        // A hairline under this row: a table row with another one under it.
-        rule: bool,
+        block: Block,
+        line: &Line,
         // Whether the keyboard is on this row: the one bar every presentation
         // paints, prose or not — see `row_background`.
         current: bool,
@@ -788,17 +445,25 @@ impl MarkdownRows {
         let theme = &host.theme;
         let m = &self.metrics;
         let md = &theme.markdown;
-        let (bg, fg, sign) = line_colors(kind, moved, &theme.diff);
+        // What core says this row draws in place of its markers: a bar, indent
+        // steps, a bullet slot, a rule, a grid. The drawing below only turns
+        // each into pixels.
+        let f = block.furniture();
+        let (bg, fg, sign) = line_colors(line.kind, line.moved, &theme.diff);
         // The keyboard's row, on prose exactly as on source: the same helper
         // every presentation goes through, so a paragraph cannot be the one row
         // that hides the cursor.
         let bg = super::diff::row_background(current, bg, theme);
-        let surface = surfaces(kind, moved).0;
+        let surface = surfaces(line.kind, line.moved).0;
         // A continuation of a wrapped line: the same furniture, so a wrapped
         // bullet stays indented under its own text and a wrapped quote keeps its
         // bar, and no number and no sign, as everywhere else.
         let blank = seg > 0;
-        let text = &piece;
+        // The whole logical row's text — the flowed grid when this width needed
+        // one — and the bytes of it this visual row draws.
+        let full = self.doc.text(index).unwrap_or_default();
+        let at = self.doc.range(index, seg);
+        let full_len = full.len();
         // One borrow per row: the numbers format into it and the run list sweeps
         // through it, both copied out as the elements take them.
         let mut sc = self.scratch.borrow_mut();
@@ -810,8 +475,8 @@ impl MarkdownRows {
             .items_center()
             .px_4()
             .bg(rgb(bg))
-            .child(num(sc.number(old, blank), theme.gutter_on(surface)))
-            .child(num(sc.number(new, blank), theme.gutter_on(surface)))
+            .child(num(sc.number(line.old_no, blank), theme.gutter_on(surface)))
+            .child(num(sc.number(line.new_no, blank), theme.gutter_on(surface)))
             .child(
                 div()
                     .flex_none()
@@ -824,16 +489,17 @@ impl MarkdownRows {
         // against the rows above and below it. Anything drawn in front of one row
         // and not the next would shear the grid, so a table gets the gutter and
         // then nothing: no bar, no indent, no glyph.
-        if block.is_table() {
+        if f.table {
+            let text = slice(self.doc.shared(index).expect("a line has text"), &at);
             let body = div().text_color(rgb(fg)).child(
                 StyledText::new(text.clone()).with_highlights(
                     sc.merged(
                         at,
-                        tokens,
-                        spans,
+                        self.doc.tokens(index),
+                        self.doc.spans(index),
                         theme,
-                        kind,
-                        moved,
+                        line.kind,
+                        line.moved,
                         selected(sel, 0, full_len),
                     )
                     .iter()
@@ -842,12 +508,11 @@ impl MarkdownRows {
             );
             // The grid is structure, not content, and a separator row is nothing
             // but grid.
-            let body = if block == Block::TableRule {
-                body.text_color(rgb(md.rule))
-            } else {
-                body
+            let body = match block {
+                Block::TableRule => body.text_color(rgb(md.rule)),
+                _ => body,
             };
-            if !rule {
+            if !self.doc.rule_after(index, seg) {
                 return row.child(scrolled(shift, body)).into_any_element();
             }
             // A hairline, not a row of `─`: a rule between two rows of a table is
@@ -890,7 +555,7 @@ impl MarkdownRows {
 
         // A rule draws no text: the dashes were the drawing, so they are replaced
         // by the thing they were drawing.
-        if block == Block::Rule {
+        if f.rule {
             // As wide as the text it stands in for, which is the row's own wrap
             // budget: this used to be 320 pixels whatever the window was doing,
             // so a break was a stub in a wide window and an overhang in a narrow
@@ -901,7 +566,7 @@ impl MarkdownRows {
                 .child(scrolled(shift, div().w(px(w)).h(px(1.)).bg(rgb(md.rule))))
                 .into_any_element();
         }
-        if block == Block::Blank {
+        if f.blank {
             return row.into_any_element();
         }
 
@@ -918,65 +583,72 @@ impl MarkdownRows {
                 .bg(rgb(color))
         };
 
-        let row = match block {
-            Block::Quote(_) => row.child(bar(md.quote_bar)),
-            Block::Fence | Block::Code => row.child(bar(md.code_bar)),
-            _ => row,
+        // The bar repeats on every segment; core's `Bar` says which colour.
+        let row = match f.bar {
+            Some(Bar::Quote) => row.child(bar(md.quote_bar)),
+            Some(Bar::Code) => row.child(bar(md.code_bar)),
+            None => row,
         };
 
         // Indent, then the marker's replacement, then the text. Separate elements
         // rather than padding inside the `StyledText` so the glyph can carry its
         // own colour without becoming a run in the merge.
-        let depth = block.depth();
+        let depth = f.depth;
         let row = if depth > 0 {
             row.child(div().flex_none().w(px(depth as f32 * m.indent)))
         } else {
             row
         };
-        let row = match block {
-            // The glyph on the first row and its width on every one, so a
-            // wrapped item's continuation lines up under its own text rather
-            // than under its bullet.
-            Block::Bullet(d) => row.child(
+        // The glyph on the first row and its width on every one, so a wrapped
+        // item's continuation lines up under its own text rather than under its
+        // bullet. The slot is reserved on every segment either way — the budget
+        // was, so the indent must be.
+        let row = if f.bullet {
+            row.child(
                 div()
                     .flex_none()
                     .w(px(m.indent))
                     .text_color(rgb(md.marker))
-                    .child(if blank { " " } else { m.bullet(d) }),
-            ),
-            _ => row,
+                    .child(if blank { " " } else { m.bullet(depth) }),
+            )
+        } else {
+            row
         };
 
         // An empty fence line is a bare ``` with no language: the bar beside it
         // already says a block opened, so there is nothing left to draw.
-        if text.is_empty() {
+        if full.is_empty() && at.is_empty() {
             return row.into_any_element();
         }
 
+        // One borrow of the row's own storage: whole rows come out as refcount
+        // bumps, wrapped segments as one heap slice each — never a `String`.
+        let text = slice(self.doc.shared(index).expect("a line has text"), &at);
         let body = div().text_color(rgb(fg)).child(
-            StyledText::new(text.clone()).with_highlights(
+            StyledText::new(text).with_highlights(
                 sc.merged(
                     at,
-                    tokens,
-                    spans,
+                    self.doc.tokens(index),
+                    self.doc.spans(index),
                     theme,
-                    kind,
-                    moved,
+                    line.kind,
+                    line.moved,
                     selected(sel, 0, full_len),
                 )
                 .iter()
                 .cloned(),
             ),
         );
-        let body = match block {
-            Block::Heading(level) => body
-                .text_size(px(m.size(level)))
-                .font_weight(FontWeight::BOLD),
+        let body = if let Some(level) = f.heading {
+            body.text_size(px(m.size(level)))
+                .font_weight(FontWeight::BOLD)
+        } else if f.fence_label {
             // A fence's language label is punctuation the reader should be able
             // to skip. A table's pipes are too, but a table is drawn verbatim —
             // see the note on `Block::Table` in `gitten_core::markdown`.
-            Block::Fence => body.text_color(rgb(md.marker)),
-            _ => body,
+            body.text_color(rgb(md.marker))
+        } else {
+            body
         };
         row.child(scrolled(shift, body)).into_any_element()
     }
@@ -985,10 +657,10 @@ impl MarkdownRows {
 #[cfg(test)]
 mod tests {
     // By name, not a glob: `use gpui::*` in the parent shadows `#[test]`.
-    use super::{MarkdownRows, Metrics, Row};
+    use super::{MarkdownRows, Metrics};
     use crate::views::diff::{Diff, Rows, TextRows, PAD, TEXT_CHROME};
     use gitten_core::host::Host;
-    use gitten_core::markdown::Block;
+    use gitten_core::markdown::{Block, Document};
     use gitten_core::prepared::prepare;
     use gitten_core::syntax::Kind;
     use gitten_core::{parse_unified_diff, LineKind};
@@ -1024,22 +696,12 @@ diff --git a/README.md b/README.md
 
     /// The blocks the built rows ended up with, lines only.
     fn blocks(r: &MarkdownRows) -> Vec<Block> {
-        r.rows
-            .iter()
-            .filter_map(|row| match row {
-                super::Row::Line { block, .. } => Some(*block),
-                _ => None,
-            })
-            .collect()
+        (0..r.len()).filter_map(|i| r.doc.block(i)).collect()
     }
 
     fn texts(r: &MarkdownRows) -> Vec<String> {
-        r.rows
-            .iter()
-            .filter_map(|row| match row {
-                super::Row::Line { text, .. } => Some(text.to_string()),
-                _ => None,
-            })
+        (0..r.len())
+            .filter_map(|i| r.doc.block(i).map(|_| r.doc.text(i).unwrap().to_string()))
             .collect()
     }
 
@@ -1157,20 +819,17 @@ diff --git a/README.md b/README.md
         // The row draws the token, so if the cut left it pointing at the wrong
         // bytes the title comes out in the body colour at the wrong size.
         let r = built(DOC);
-        let (text, tokens) = r
-            .rows
-            .iter()
-            .find_map(|row| match row {
-                super::Row::Line {
-                    block: Block::Heading(_),
-                    text,
-                    tokens,
-                    ..
-                } => Some((text.clone(), tokens.clone())),
-                _ => None,
+        let heading = (0..r.len())
+            .find(|i| {
+                r.doc
+                    .block(*i)
+                    .is_some_and(|b| matches!(b, Block::Heading(_)))
             })
             .expect("a heading row");
-        let t = tokens
+        let text = r.doc.text(heading).unwrap();
+        let t = r
+            .doc
+            .tokens(heading)
             .iter()
             .find(|t| t.kind == Kind::Heading)
             .expect("a heading token");
@@ -1182,24 +841,16 @@ diff --git a/README.md b/README.md
         // The one invariant that turns into a panic in GPUI's text layout rather
         // than into a wrong colour.
         let r = built(DOC);
-        for row in &r.rows {
-            let super::Row::Line {
-                text,
-                tokens,
-                spans,
-                ..
-            } = row
-            else {
-                continue;
-            };
-            for t in tokens {
+        for i in 0..r.len() {
+            let Some(text) = r.doc.text(i) else { continue };
+            for t in r.doc.tokens(i) {
                 assert!(t.end as usize <= text.len(), "token {t:?} outside {text:?}");
                 assert!(
                     text.is_char_boundary(t.start as usize)
                         && text.is_char_boundary(t.end as usize)
                 );
             }
-            for s in spans {
+            for s in r.doc.spans(i) {
                 assert!(s.end as usize <= text.len(), "span {s:?} outside {text:?}");
             }
         }
@@ -1210,22 +861,24 @@ diff --git a/README.md b/README.md
         // The intraline spans were computed on the source, so they have to have
         // moved with the text. This is the pair from DOC: bold -> bolder.
         let r = built(DOC);
-        let marked: Vec<String> = r
-            .rows
-            .iter()
-            .filter_map(|row| match row {
-                super::Row::Line {
-                    kind: LineKind::Added,
-                    text,
-                    spans,
-                    ..
-                } if !spans.is_empty() => Some(
-                    spans
+        let marked: Vec<String> = (0..r.len())
+            .filter_map(|i| {
+                let line = r.doc.row(i)?;
+                let kind = match line {
+                    gitten_core::markdown::DocRow::Line { line, .. } => line.kind,
+                    _ => return None,
+                };
+                if kind != LineKind::Added || r.doc.spans(i).is_empty() {
+                    return None;
+                }
+                let text = r.doc.text(i).unwrap();
+                Some(
+                    r.doc
+                        .spans(i)
                         .iter()
                         .map(|s| text[s.start as usize..s.end as usize].to_string())
                         .collect::<Vec<_>>(),
-                ),
-                _ => None,
+                )
             })
             .flatten()
             .collect();
@@ -1440,17 +1093,17 @@ diff --git a/a.md b/a.md
         // And the blocks it collected are the ones the document has, once each —
         // the list is what stands in for every row, so a duplicate is wasted work
         // on every frame of a drag and a miss is a row wrapped to a stale budget.
-        assert!(r.blocks.len() >= 3, "{:?}", r.blocks);
-        for (i, b) in r.blocks.iter().enumerate() {
+        let collected = r.doc.distinct_blocks();
+        assert!(collected.len() >= 3, "{collected:?}");
+        for (i, b) in collected.iter().enumerate() {
             assert!(
-                !r.blocks[..i].contains(b),
-                "{b:?} collected twice: {:?}",
-                r.blocks
+                !collected[..i].contains(b),
+                "{b:?} collected twice: {collected:?}"
             );
         }
         for i in 0..r.len() {
-            if let Row::Line { block, .. } = &r.rows[i] {
-                assert!(r.blocks.contains(block), "{block:?} was never collected");
+            if let Some(block) = r.doc.block(i) {
+                assert!(collected.contains(&block), "{block:?} was never collected");
             }
         }
     }
@@ -1459,22 +1112,15 @@ diff --git a/a.md b/a.md
     fn grid(r: &MarkdownRows) -> Vec<(usize, usize, String)> {
         let mut out = Vec::new();
         for i in 0..r.len() {
-            let Row::Line {
-                block,
-                text,
-                spans,
-                tokens,
-                ..
-            } = &r.rows[i]
-            else {
+            let Some(block) = r.doc.block(i) else {
                 continue;
             };
             if !block.is_table() {
                 continue;
             }
-            let (t, _, _, _) = r.text_of(i, text, spans, tokens);
+            let text = r.doc.text(i).unwrap();
             for seg in 0..r.rows(i) {
-                out.push((i, seg, t[r.wrapped.range(i, seg, t)].to_string()));
+                out.push((i, seg, text[r.doc.range(i, seg)].to_string()));
             }
         }
         out
@@ -1529,16 +1175,15 @@ diff --git a/a.md b/a.md
         let (r, _) = reflowed(PROSE, 12);
         let mut tables = 0;
         for i in 0..r.len() {
-            if let Row::Line { block, .. } = &r.rows[i] {
-                if block.is_table() {
-                    tables += 1;
-                    assert_eq!(r.rows(i), 1, "a table row wrapped");
-                }
+            if r.doc.block(i).is_some_and(|b| b.is_table()) {
+                tables += 1;
+                assert_eq!(r.rows(i), 1, "a table row wrapped");
             }
         }
         assert_eq!(tables, 3, "the fixture lost its table");
-        assert!(
-            r.flows.is_empty(),
+        assert_eq!(
+            r.doc.squeezed(),
+            0,
             "a table nobody can read a word of was squeezed"
         );
     }
@@ -1560,25 +1205,22 @@ diff --git a/a.md b/a.md
 ";
         let (r, _) = reflowed(src, 30);
         let rows: Vec<(usize, Block)> = (0..r.len())
-            .filter_map(|i| match &r.rows[i] {
-                Row::Line { block, .. } if block.is_table() => Some((i, *block)),
-                _ => None,
-            })
+            .filter_map(|i| r.doc.block(i).filter(|b| b.is_table()).map(|b| (i, b)))
             .collect();
         assert_eq!(rows.len(), 4, "header, separator and two rows: {rows:?}");
         let (header, sep, first, last) = (rows[0].0, rows[1].0, rows[2].0, rows[3].0);
 
         assert!(
-            !r.ruled(header, 0),
+            !r.doc.rule_after(header, 0),
             "a header's separator row is already a rule"
         );
         assert_eq!(rows[1].1, Block::TableRule);
         assert!(
-            !r.ruled(sep, 0),
+            !r.doc.rule_after(sep, 0),
             "the separator row drew a second rule under itself"
         );
         assert!(
-            !r.ruled(last, 0),
+            !r.doc.rule_after(last, 0),
             "the last row of the table has nothing under it"
         );
 
@@ -1586,12 +1228,12 @@ diff --git a/a.md b/a.md
         assert!(r.rows(first) > 1, "the fixture stopped wrapping");
         for seg in 0..r.rows(first) - 1 {
             assert!(
-                !r.ruled(first, seg),
+                !r.doc.rule_after(first, seg),
                 "a rule cut through a wrapped cell at {seg}"
             );
         }
         assert!(
-            r.ruled(first, r.rows(first) - 1),
+            r.doc.rule_after(first, r.rows(first) - 1),
             "no rule between the two rows"
         );
     }
@@ -1615,7 +1257,7 @@ diff --git a/a.md b/a.md
         // And a caret still lands inside the sub-row it was clicked on, in the
         // same coordinates the copy is in.
         for seg in 0..r.rows(row) {
-            let at = r.wrapped.range(row, seg, copied);
+            let at = r.doc.range(row, seg);
             let hit = r
                 .hit(row, seg, 60.0, &Host::new(), 0.0)
                 .expect("a table row is hittable");
@@ -1679,14 +1321,8 @@ diff --git a/a.md b/a.md
         // a reader is most likely to select.
         let host = Host::new();
         let r = built(DOC);
-        let rows: Vec<(usize, Block)> = r
-            .rows
-            .iter()
-            .enumerate()
-            .filter_map(|(i, row)| match row {
-                Row::Line { block, .. } => Some((i, *block)),
-                _ => None,
-            })
+        let rows: Vec<(usize, Block)> = (0..r.len())
+            .filter_map(|i| r.doc.block(i).map(|b| (i, b)))
             .collect();
         let plain = rows
             .iter()
@@ -1699,7 +1335,7 @@ diff --git a/a.md b/a.md
             .nth(1)
             .unwrap()
             .0;
-        assert!(r.furniture(Block::Paragraph) < r.furniture(Block::Bullet(1)));
+        assert!(r.metrics.furniture(Block::Paragraph) < r.metrics.furniture(Block::Bullet(1)));
 
         // The same pixel column, two rows: the indented one starts later, so the
         // same x is fewer characters into its text.
@@ -1714,7 +1350,7 @@ diff --git a/a.md b/a.md
         // And a click at the start of a row's own text is byte 0 of it, whatever
         // that row drew in front of itself.
         for (i, block) in &rows {
-            let from = TEXT_CHROME - PAD + r.furniture(*block);
+            let from = TEXT_CHROME - PAD + r.metrics.furniture(*block);
             assert_eq!(
                 r.hit(*i, 0, from, &host, 0.0).unwrap().off,
                 0,
@@ -1731,21 +1367,15 @@ diff --git a/a.md b/a.md
         // is the character `shift` in, at that row's own size.
         let host = Host::new();
         let r = built(DOC);
-        let rows: Vec<(usize, Block)> = r
-            .rows
-            .iter()
-            .enumerate()
-            .filter_map(|(i, row)| match row {
-                Row::Line { block, .. } => Some((i, *block)),
-                _ => None,
-            })
+        let rows: Vec<(usize, Block)> = (0..r.len())
+            .filter_map(|i| r.doc.block(i).map(|b| (i, b)))
             .collect();
         for (i, block) in &rows {
             if r.chars(*i, 0) < 4 {
                 continue;
             }
-            let from = TEXT_CHROME - PAD + r.furniture(*block);
-            let shift = 3.0 * r.char_width(*block, &host);
+            let from = TEXT_CHROME - PAD + r.metrics.furniture(*block);
+            let shift = 3.0 * r.metrics.char_width(*block, &host);
             assert_eq!(
                 r.hit(*i, 0, from, &host, shift).unwrap().off,
                 3,
@@ -1776,11 +1406,11 @@ diff --git a/a.md b/a.md
 
         let mut checked = 0;
         for i in 0..r.len() {
-            let Row::Line { block, .. } = r.rows[i] else {
+            let Some(block) = r.doc.block(i) else {
                 continue;
             };
-            let room = width - TEXT_CHROME - r.furniture(block);
-            let text = r.chars(i, 0) as f32 * r.char_width(block, &host);
+            let room = width - TEXT_CHROME - r.metrics.furniture(block);
+            let text = r.chars(i, 0) as f32 * r.metrics.char_width(block, &host);
             assert_eq!(
                 r.overflow(i, 0, width, &host),
                 (text - room).max(0.0),
@@ -1794,11 +1424,11 @@ diff --git a/a.md b/a.md
         let heading = (0..r.len())
             .find(|i| {
                 matches!(
-                    r.rows[*i],
-                    Row::Line {
+                    r.doc.row(*i),
+                    Some(gitten_core::markdown::DocRow::Line {
                         block: Block::Heading(_),
                         ..
-                    }
+                    })
                 )
             })
             .expect("a heading");
@@ -1809,7 +1439,7 @@ diff --git a/a.md b/a.md
             "a heading measured at the body size"
         );
         assert!(
-            r.furniture(Block::Bullet(1)) > 0.0,
+            r.metrics.furniture(Block::Bullet(1)) > 0.0,
             "a nested bullet costs the text nothing"
         );
     }
@@ -1821,16 +1451,14 @@ diff --git a/a.md b/a.md
         // drifts further right the longer the heading is.
         let host = Host::new();
         let r = built(DOC);
-        let heading = r
-            .rows
-            .iter()
-            .position(|row| {
+        let heading = (0..r.len())
+            .find(|i| {
                 matches!(
-                    row,
-                    Row::Line {
+                    r.doc.row(*i),
+                    Some(gitten_core::markdown::DocRow::Line {
                         block: Block::Heading(_),
                         ..
-                    }
+                    })
                 )
             })
             .expect("a heading");
@@ -1848,5 +1476,54 @@ diff --git a/a.md b/a.md
         assert_eq!(all.len(), r.len(), "a row with nothing to copy");
         assert!(all.contains(&"README.md"), "the file header is in it");
         assert!(all.iter().any(|t| t.contains("bolder")));
+    }
+
+    // -------------------------------------------------------------- parity
+
+    /// The committed slice the terminal tests with too: this adapter and the
+    /// core model must agree about how many rows a file becomes, where its
+    /// visual rows break, and where a table's hairline goes. One model, two
+    /// doors — if these drift, one client is drawing a different document.
+    #[test]
+    fn the_shell_and_the_core_model_agree_about_the_committed_slice() {
+        let raw = include_str!("../../../tui/tests/fixtures/md.diff");
+        let host = Host::new();
+        let width = TEXT_CHROME + (60.5) * host.font.size * host.font.advance;
+        let wrap = host.wrap.current();
+
+        let mut r = MarkdownRows::default();
+        let mut p = prepare(&parse_unified_diff(raw), &host.syntax, 2000);
+        let mut claimed: Vec<_> = p.files.drain(..).filter(|f| r.claims(&f.path)).collect();
+        for f in claimed.drain(..) {
+            r.build(f);
+        }
+        r.reflow(width, &host, wrap);
+
+        let mut doc = Document::new(r.metrics.layout);
+        let mut p = prepare(&parse_unified_diff(raw), &host.syntax, 2000);
+        let mut claimed: Vec<_> = p.files.drain(..).filter(|f| r.claims(&f.path)).collect();
+        for f in claimed.drain(..) {
+            doc.push(f);
+        }
+        let metrics = r.metrics;
+        let budget = |block: Block| metrics.budget(block, width, &host);
+        doc.reflow(&budget, wrap);
+
+        assert_eq!(r.len(), doc.len(), "the two models hold different rows");
+        for i in 0..doc.len() {
+            assert_eq!(r.rows(i), doc.rows(i), "row {i} wraps differently");
+            for seg in 0..doc.rows(i) {
+                assert_eq!(
+                    r.doc.rule_after(i, seg),
+                    doc.rule_after(i, seg),
+                    "row {i}.{seg} rules differently"
+                );
+                // And the pieces agree: what the shell measures for its overflow
+                // is what the model says the row draws.
+                let text = doc.text(i).unwrap();
+                let expected = text[doc.range(i, seg)].trim_end().chars().count();
+                assert_eq!(r.chars(i, seg), expected, "row {i}.{seg}");
+            }
+        }
     }
 }
