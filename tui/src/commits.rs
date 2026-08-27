@@ -33,11 +33,22 @@
 //! --graph`'s spacing, and the reason a diagonal is expressible at all: with one
 //! column per lane there is nowhere to put the `─` that says two lanes are
 //! joined.
+//!
+//! # Filtering, and what a row number names
+//!
+//! `/` filters the list through [`gitten_core::search::Index`], and the full
+//! commits stay resident: the viewport's row numbers address the *visible*
+//! table, and one lookup at the end of every reader — cursor, copy, mouse,
+//! paint — maps back to the source vector. That is the window's order table
+//! (`shell/src/views/commits.rs`) reduced to a terminal's shape, and it is why
+//! filtering cannot desync what the cursor names from what is drawn, copied or
+//! opened. Search itself runs on edits only, never in a frame.
 
 use crate::screen::{Ink, Pen, Screen};
 use crate::scrollbar::{self, Bar};
 use gitten_core::graph::{lane_count, Hues, MAX_LANES};
 use gitten_core::host::Host;
+use gitten_core::search::Index;
 use gitten_core::theme::{Rgb, Theme};
 use gitten_core::view::Viewport;
 use gitten_core::{assign_lanes, initials, Commit, GraphRow};
@@ -156,6 +167,26 @@ struct Draw {
 pub struct Commits {
     commits: Vec<Commit>,
     draws: Vec<Draw>,
+    /// Every commit's search text, folded once at load — see
+    /// [`gitten_core::search::Index`]. Keystrokes fold only their own needle
+    /// and scan; nothing here lowercases on the way to a frame.
+    search: Index,
+    /// The standing query, `None` when the list is whole. Always the *trimmed*
+    /// text, so a query of only spaces is no query — the same normalisation
+    /// [`Commits::apply_query`] applies.
+    query: Option<String>,
+    /// Which source rows the viewport can see, ascending: the one
+    /// visible-to-source table every row reader goes through. Unfiltered it is
+    /// `0..len` and each lookup costs one indirection; filtered it is what
+    /// [`Index::indices`] answered for the query.
+    ///
+    /// Row numbers below this table — the cursor, the selection, the
+    /// scrollbar, everything [`Viewport`] holds — are rows of the *visible*
+    /// list, and only the final lookup names a commit. That is what keeps
+    /// open-diff, copy, the mouse and painting all agreeing with the cursor
+    /// under a filter, and it is the same shape the window keeps in
+    /// `shell/src/views/commits.rs`.
+    visible: Vec<usize>,
     glyphs: Glyphs,
     /// The honest lane count, uncapped, for the status line.
     lanes: usize,
@@ -209,15 +240,22 @@ impl Commits {
         let rows = assign_lanes(&commits);
         let lanes = lane_count(&rows);
         let draws = draws(&commits, &rows);
-        // The widest *row*, not the widest lane index: a row's gutter is only as
+        // Widest *row*, not the widest lane index: a row's gutter is only as
         // wide as its own lanes, and the trunk-only rows of a busy repository
         // are the majority.
         let gutter = draws.iter().map(|d| d.lanes * LANE_W).max().unwrap_or(0);
+        // Search text folded beside the rest of the load work, and the whole
+        // list visible to start.
+        let search = Index::new(&commits);
+        let visible = Vec::from_iter(0..commits.len());
         let mut view = Viewport::new();
-        view.set_len(commits.len());
+        view.set_len(visible.len());
         Self {
             commits,
             draws,
+            search,
+            visible,
+            query: None,
             glyphs,
             lanes,
             gutter,
@@ -230,6 +268,9 @@ impl Commits {
         }
     }
 
+    /// How many commits were loaded, whatever a filter shows. Not the count the
+    /// viewport addresses — that is the visible list's length, and one number
+    /// meaning both would be ambiguous under a query.
     pub fn len(&self) -> usize {
         self.commits.len()
     }
@@ -247,13 +288,81 @@ impl Commits {
     }
 
     /// The commit under the cursor, for whatever opens a diff from it.
+    ///
+    /// Through the visible table and not `commits[cursor]`: the cursor is a row
+    /// of the *filtered* list, and under a query those are not the same
+    /// position. Everything that acts on "this commit" — open-diff, copy —
+    /// reads through here, which is why filtering cannot desync them.
     pub fn current(&self) -> Option<&Commit> {
-        self.commits.get(self.view.cursor())
+        self.commits.get(*self.visible.get(self.view.cursor())?)
     }
 
     pub fn resize(&mut self, cols: usize, height: usize) {
         self.cols = cols;
         self.view.set_height(height);
+    }
+
+    // ----------------------------------------------------------------- search
+
+    /// The live query, for pre-filling a second `/`. `None` when unfiltered.
+    pub fn query(&self) -> Option<&str> {
+        self.query.as_deref()
+    }
+
+    /// The filter while one stands, for a status line: `15/30` — hits over
+    /// loaded. `None` unfiltered, so a note is only drawn when there is one.
+    pub fn filter_note(&self) -> Option<String> {
+        self.query
+            .is_some()
+            .then(|| format!("{}/{}", self.visible.len(), self.commits.len()))
+    }
+
+    /// Sets the filter — once per keystroke, and never anywhere else. The
+    /// visible table is rebuilt here and read everywhere else.
+    ///
+    /// The keyboard stays on the commit it was on: anchored by full sha into
+    /// the next result set wherever it survives the narrower query, and left
+    /// clamped onto the last surviving row when it does not. An empty (or
+    /// whitespace-only) query is no query, so clearing restores the whole list;
+    /// the same trimmed query twice does nothing, so a keystroke that changes
+    /// nothing rebuilds nothing.
+    ///
+    /// A selection is dropped whenever the result set changes: its ends are
+    /// rows of the *visible* list, and a range named against yesterday's table
+    /// would read as different commits under today's.
+    pub fn apply_query(&mut self, query: &str) {
+        let next = Some(query.trim()).filter(|q| !q.is_empty());
+        if self.query.as_deref() == next {
+            return;
+        }
+        // Anchor first: named by sha, because row numbers are about to stop
+        // meaning anything.
+        let anchored = self
+            .visible
+            .get(self.view.cursor())
+            .and_then(|&i| self.commits.get(i))
+            .map(|c| c.sha.clone());
+
+        self.query = next.map(str::to_string);
+        self.visible = match &self.query {
+            Some(q) => self.search.indices(q),
+            None => Vec::from_iter(0..self.commits.len()),
+        };
+        self.sel = None;
+        self.dragging = false;
+        self.grabbed = None;
+        // `set_len` clamps the cursor onto the surviving rows; the anchor, where
+        // it survived, is put back by name.
+        self.view.set_len(self.visible.len());
+        let cursor = anchored
+            .as_deref()
+            .and_then(|sha| {
+                self.visible
+                    .iter()
+                    .position(|&i| self.commits[i].sha == sha)
+            })
+            .unwrap_or_else(|| self.view.cursor());
+        self.view.go_to(cursor);
     }
 
     pub fn move_by(&mut self, by: isize) {
@@ -310,9 +419,10 @@ impl Commits {
     /// Which commits are selected: the drag's range, or the row the cursor is on.
     ///
     /// Never empty on a non-empty list, which is what makes `y` copy this commit
-    /// before anything has been dragged.
+    /// before anything has been dragged. Rows of the visible list — [`Commits::lines`]
+    /// maps them through the table, so a filtered list copies only what is shown.
     pub fn selected(&self) -> std::ops::Range<usize> {
-        if self.commits.is_empty() {
+        if self.visible.is_empty() {
             return 0..0;
         }
         let cursor = self.view.cursor();
@@ -381,11 +491,12 @@ impl Commits {
 
     /// `select.all`.
     pub fn select_all(&mut self) {
-        if self.commits.is_empty() {
+        if self.visible.is_empty() {
             return;
         }
-        self.view.go_to(self.commits.len() - 1);
-        self.sel = Some((0, self.commits.len() - 1));
+        let last = self.visible.len() - 1;
+        self.view.go_to(last);
+        self.sel = Some((0, last));
     }
 
     /// `select.none`. Says whether there was a range to drop, so `esc` can fall
@@ -422,10 +533,17 @@ impl Commits {
     /// the initials — a column of box drawing is not a thing anybody pastes, and
     /// the two fields left are the ones that name the commit to git and to a
     /// person.
+    ///
+    /// `rows` names visible rows, mapped through the table here — the one
+    /// lookup that turns a viewport row back into a commit, so a copy under a
+    /// query names the commits on screen and nothing that was filtered out.
     fn lines(&self, rows: std::ops::Range<usize>) -> String {
-        self.commits[rows.start..rows.end.min(self.commits.len())]
+        self.visible[rows.start..rows.end.min(self.visible.len())]
             .iter()
-            .map(|c| format!("{} {}", c.short, c.subject))
+            .map(|&i| {
+                let c = &self.commits[i];
+                format!("{} {}", c.short, c.subject)
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -442,11 +560,18 @@ impl Commits {
         };
         for i in 0..self.view.height() {
             let row = y + i;
-            let Some(index) = self.view.row_at(i) else {
+            // Two lookups, and both have to be read: `row_at` is the viewport
+            // row, which the cursor and the selection address, and `visible`
+            // names the commit it stands for.
+            let Some(vis) = self.view.row_at(i) else {
                 screen.row(row).wash(blank);
                 continue;
             };
-            let bg = match (index == self.view.cursor(), selected.contains(&index)) {
+            let Some(&index) = self.visible.get(vis) else {
+                screen.row(row).wash(blank);
+                continue;
+            };
+            let bg = match (vis == self.view.cursor(), selected.contains(&vis)) {
                 (true, _) => theme.chrome.selection_bg,
                 (false, true) => theme.chrome.selected_bg,
                 (false, false) => theme.chrome.bg,
@@ -466,6 +591,9 @@ impl Commits {
 
     /// lazygit's order — sha, author, graph, subject — because the graph is the
     /// column that changes width and putting it last would move the subject.
+    ///
+    /// `index` is a *source* index: [`Commits::paint`] has already consulted the
+    /// visible table and hands over the commit it names.
     fn row(&self, pen: &mut Pen, index: usize, bg: Rgb, theme: &Theme) {
         let c = &self.commits[index];
         let d = &self.draws[index];
@@ -582,12 +710,14 @@ impl Commits {
 
     /// One line describing the list, for whatever draws a status bar. The lane
     /// count is the uncapped one: "280 lanes" is worth knowing when twelve are
-    /// drawn.
+    /// drawn. Position is counted over the *visible* rows — what the cursor
+    /// addresses — while `filter_note` is what says the list is narrower than
+    /// what was loaded.
     pub fn status(&self) -> String {
         let mut out = format!(
             "{}/{} · {} lanes",
-            (self.view.cursor() + 1).min(self.commits.len()),
-            self.commits.len(),
+            (self.view.cursor() + 1).min(self.visible.len()),
+            self.visible.len(),
             self.lanes,
         );
         if self.lanes > MAX_LANES {
@@ -696,6 +826,32 @@ r\x1frrrrrrr\x1f\x1fAda Lovelace\x1f1700000100\x1fRoot\x1e";
                 };
                 format!(
                     "c{i}\x1fc{i:06}\x1f{parent}\x1fAda Lovelace\x1f17000000{i:02}\x1fCommit {i}\x1e"
+                )
+            })
+            .collect()
+    }
+
+    /// A linear history of `n` commits alternating half by author and half by
+    /// subject — even rows are Ada/engine, odd rows Grace/compiler — so one
+    /// query hits exactly half of either. The window's search fixture, spelled
+    /// for [`parse_log`].
+    fn mixed(n: usize) -> String {
+        (0..n)
+            .map(|i| {
+                let even = i % 2 == 0;
+                let sha = format!("{i:08}");
+                let parent = match i + 1 < n {
+                    true => format!("{:08}", i + 1),
+                    false => String::new(),
+                };
+                format!(
+                    "{sha}\x1f{sha}\x1f{parent}\x1f{}\x1f1\x1f{}\x1e",
+                    if even { "Ada Lovelace" } else { "Grace Hopper" },
+                    if even {
+                        format!("engine note {i}")
+                    } else {
+                        format!("compiler pass {i}")
+                    },
                 )
             })
             .collect()
@@ -1025,6 +1181,162 @@ r\x1fr\x1f\x1fA\x1f1\x1froot\x1e";
             rows[0].contains('◉'),
             "the graph was clipped first: {:?}",
             rows[0]
+        );
+    }
+
+    // ----------------------------------------------------------------- search
+
+    #[test]
+    fn a_query_filters_all_three_fields_in_source_order() {
+        // Four commits so each of the three fields has its own hit: a sha, an
+        // author and a subject, plus one commit nothing below matches. Shas are
+        // written whole — the index folds `sha`, and a short is a prefix of it.
+        let log = "\
+1111aaaa\x1f1111aaa\x1f2222beef\x1fAda Lovelace\x1f1\x1fthe engine, first\x1e\
+2222beef\x1f2222bee\x1fcafe3333\x1fGrace Hopper\x1f2\x1fnothing interesting\x1e\
+cafe3333\x1fcafe333\x1f4444dddd\x1fÉmile Zola\x1f3\x1fa compiler pass\x1e\
+4444dddd\x1f4444ddd\x1f\x1fAda Lovelace\x1f4\x1fnothing else\x1e";
+        let (mut c, host) = view(log, 60, 4);
+
+        c.apply_query("engine");
+        assert_eq!(c.query(), Some("engine"));
+        assert_eq!(c.filter_note().as_deref(), Some("1/4"));
+        assert_eq!(
+            c.current().map(|x| x.sha.as_str()),
+            Some("1111aaaa"),
+            "a subject hit"
+        );
+
+        c.apply_query("hopper");
+        assert_eq!(c.filter_note().as_deref(), Some("1/4"));
+        assert_eq!(
+            c.current().map(|x| x.sha.as_str()),
+            Some("2222beef"),
+            "an author hit"
+        );
+
+        c.apply_query("333");
+        assert_eq!(c.filter_note().as_deref(), Some("1/4"));
+        assert_eq!(
+            c.current().map(|x| x.sha.as_str()),
+            Some("cafe3333"),
+            "a sha hit, interior of the hash and all"
+        );
+
+        // Two hits, and what is drawn keeps core's order — which is the
+        // source's, ascending, never a search's own idea of relevance.
+        c.apply_query("ada");
+        assert_eq!(c.filter_note().as_deref(), Some("2/4"));
+        let rows = painted(&c, &host);
+        assert!(rows[0].contains("engine, first"), "{:?}", rows[0]);
+        assert!(rows[1].contains("nothing else"), "{:?}", rows[1]);
+        assert!(rows[2].is_empty(), "filtered rows are not drawn: {rows:?}");
+    }
+
+    #[test]
+    fn filtering_anchors_the_cursor_by_sha_and_a_miss_clamps() {
+        let (mut c, host) = view(&mixed(30), 60, 10);
+        // The keyboard sits on an *even* commit — one that survives "ENGINE".
+        for _ in 0..4 {
+            c.down();
+        }
+        let anchored = c.current().expect("a commit under the cursor").sha.clone();
+        // Trimmed like the window trims it: spaces around the needle.
+        c.apply_query("  ENGINE  ");
+        assert_eq!(c.filter_note().as_deref(), Some("15/30"));
+        assert_eq!(
+            c.current().map(|x| x.sha.as_str()),
+            Some(anchored.as_str()),
+            "the cursor left its commit because a row number moved"
+        );
+
+        // Now the anchor cannot survive: the query names the other half, and
+        // the cursor clamps onto the surviving rows instead of pointing past
+        // the end of a list that shrank under it.
+        c.apply_query("compiler");
+        assert_eq!(c.filter_note().as_deref(), Some("15/30"));
+        let vis = c.view.len();
+        assert!(c.cursor() < vis, "the cursor outlived its own list");
+        assert!(c.current().is_some());
+
+        // Zero hits: nothing is current, the numbers stay honest and nothing
+        // panics — the list is empty, not broken.
+        c.apply_query("nothing matches this");
+        assert_eq!(c.filter_note().as_deref(), Some("0/30"));
+        assert_eq!(
+            c.len(),
+            30,
+            "the filter narrows what is shown, never what is loaded"
+        );
+        assert_eq!(c.current(), None);
+        assert_eq!(c.cursor(), 0);
+        assert!(painted(&c, &host).iter().all(|r| r.is_empty()));
+    }
+
+    #[test]
+    fn clearing_a_query_restores_every_row_and_copy_uses_visible_rows() {
+        let (mut c, host) = view(&mixed(30), 60, 10);
+        c.apply_query("engine");
+        assert_eq!(c.filter_note().as_deref(), Some("15/30"));
+
+        // A drag over three visible rows copies three *engine* rows: the
+        // selection speaks visible order, and nothing a query removed can leak
+        // into it through a source-row slice.
+        c.press(20, 0, false, &host);
+        c.drag(2, &host);
+        c.release();
+        let text = c.selection();
+        assert_eq!(text.lines().count(), 3, "{text:?}");
+        assert!(text.contains("engine note 0"), "{text:?}");
+        assert!(
+            !text.contains("compiler"),
+            "a filtered-out row was copied: {text:?}"
+        );
+
+        // Whitespace is as good as empty, and empty is the whole list again.
+        // Clearing anchors by sha: the keyboard keeps its commit — which was
+        // visible row two of the filter and is the history's fifth row whole —
+        // and the copy key names that commit, read through the restored table.
+        let under = c.current().map(|x| x.sha.clone());
+        c.apply_query("   ");
+        assert_eq!(c.query(), None);
+        assert_eq!(c.filter_note(), None);
+        assert_eq!(c.view.len(), 30);
+        assert_eq!(
+            c.current().map(|x| x.sha.as_str()),
+            under.as_deref(),
+            "clearing moved the cursor off its commit"
+        );
+        assert_eq!(c.copy_text(), "00000004 engine note 4");
+    }
+
+    #[test]
+    fn a_filtered_cursor_keeps_the_existing_selection_bar() {
+        // Filtering is the hit marker, exactly as in the window: the cursor's
+        // own row keeps the bar it always had, the surviving rows stay plain —
+        // they are hits, but every row on screen is a hit and a wall of colour
+        // would say nothing — and the drag colour stays the drag's.
+        let (mut c, host) = view(LOG, 60, 4);
+        c.apply_query("branch");
+        assert_eq!(c.filter_note().as_deref(), Some("2/4"));
+        let mut screen = Screen::new(c.cols, 4);
+        screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
+        c.paint(&mut screen, 0, &host);
+        assert_eq!(screen.ink(0, 0).unwrap().bg, host.theme.chrome.selection_bg);
+        assert_eq!(
+            screen.ink(59, 0).unwrap().bg,
+            host.theme.chrome.selection_bg,
+            "the bar runs the whole width"
+        );
+        assert_eq!(
+            screen.ink(0, 1).unwrap().bg,
+            host.theme.chrome.bg,
+            "an ordinary hit is not lit twice"
+        );
+        assert_ne!(
+            screen.ink(0, 1).unwrap().bg,
+            host.theme.chrome.selected_bg,
+            "nothing dragged, nothing selected"
         );
     }
 }
