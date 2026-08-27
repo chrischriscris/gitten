@@ -591,8 +591,17 @@ impl Commits {
             .join("\n")
     }
 
-    /// Draws the visible rows into `screen`, starting at row `y`.
-    pub fn paint(&self, screen: &mut Screen, y: usize, host: &Host) {
+    /// Draws the visible rows into `screen`, at `x` of row `y` onward, inside
+    /// this pane's own columns.
+    ///
+    /// Every row is taken through [`Screen::span`], never [`Screen::row`]:
+    /// the pane is a guest in the row, and a long subject that wrote to the
+    /// whole screen would overwrite the divider and whatever sits beside it.
+    /// draws only when this pane holds the keyboard — `focused` is the
+    /// caller's answer, not something the view knows — while
+    /// a dragged selection keeps its ink either way, because
+    /// focus moves the caret and never what the mouse is holding.
+    pub fn paint(&self, screen: &mut Screen, x: usize, y: usize, focused: bool, host: &Host) {
         let theme = &host.theme;
         let blank = Ink::new(theme.chrome.dim, theme.chrome.bg);
         // A range of one is the cursor and nothing more, so a click looks exactly
@@ -607,29 +616,29 @@ impl Commits {
             // row, which the cursor and the selection address, and `visible`
             // names the commit it stands for.
             let Some(vis) = self.view.row_at(i) else {
-                screen.row(row).wash(blank);
+                screen.span(row, x, self.cols).wash(blank);
                 continue;
             };
             let Some(&index) = self.visible.get(vis) else {
-                screen.row(row).wash(blank);
+                screen.span(row, x, self.cols).wash(blank);
                 continue;
             };
-            let bg = match (vis == self.view.cursor(), selected.contains(&vis)) {
+            let bg = match (
+                focused && vis == self.view.cursor(),
+                selected.contains(&vis),
+            ) {
                 (true, _) => theme.chrome.selection_bg,
                 (false, true) => theme.chrome.selected_bg,
                 (false, false) => theme.chrome.bg,
             };
-            let mut pen = screen.row(row);
+            let mut pen = screen.span(row, x, self.cols);
             self.row(&mut pen, index, bg, theme);
         }
-        scrollbar::paint(
-            screen,
-            self.bar,
-            self.cols.saturating_sub(1),
-            y,
-            &self.view,
-            host,
-        );
+        if self.cols > 0 {
+            // Last, and over the rows rather than beside them — at this pane's
+            // own last column, which is not the screen's.
+            scrollbar::paint(screen, self.bar, x + self.cols - 1, y, &self.view, host);
+        }
     }
 
     /// lazygit's order — sha, author, graph, subject — because the graph is the
@@ -855,7 +864,7 @@ r\x1frrrrrrr\x1f\x1fAda Lovelace\x1f1700000100\x1fRoot\x1e";
     fn painted(c: &Commits, host: &Host) -> Vec<String> {
         let mut screen = Screen::new(c.cols, c.view.height() + 2);
         screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
-        c.paint(&mut screen, 0, host);
+        c.paint(&mut screen, 0, 0, true, host);
         (0..c.view.height()).map(|y| screen.row_text(y)).collect()
     }
 
@@ -958,7 +967,7 @@ r\x1frrrrrrr\x1f\x1fAda Lovelace\x1f1700000100\x1fRoot\x1e";
         c.press(20, 0, false, &host);
         let mut screen = Screen::new(c.cols, 4);
         screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
-        c.paint(&mut screen, 0, &host);
+        c.paint(&mut screen, 0, 0, true, &host);
         assert_eq!(screen.ink(0, 0).unwrap().bg, host.theme.chrome.selection_bg);
         assert_eq!(
             screen.ink(0, 1).unwrap().bg,
@@ -967,7 +976,7 @@ r\x1frrrrrrr\x1f\x1fAda Lovelace\x1f1700000100\x1fRoot\x1e";
         );
         // Now a real drag: the rows behind the cursor take the selected colour.
         c.drag(2, &host);
-        c.paint(&mut screen, 0, &host);
+        c.paint(&mut screen, 0, 0, true, &host);
         assert_eq!(screen.ink(0, 1).unwrap().bg, host.theme.chrome.selected_bg);
         assert_eq!(
             screen.ink(0, 2).unwrap().bg,
@@ -998,7 +1007,7 @@ r\x1frrrrrrr\x1f\x1fAda Lovelace\x1f1700000100\x1fRoot\x1e";
         // And it is drawn where it was clicked.
         let mut screen = Screen::new(60, 10);
         screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
-        c.paint(&mut screen, 0, &host);
+        c.paint(&mut screen, 0, 0, true, &host);
         assert_eq!(screen.char_at(59, 0), Some('█'));
         assert_eq!(screen.char_at(59, 9), Some('│'));
     }
@@ -1093,7 +1102,7 @@ r\x1fr\x1f\x1fA\x1f1\x1froot\x1e";
         let (c, host) = view(LOG, 60, 4);
         let mut screen = Screen::new(60, 4);
         screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
-        c.paint(&mut screen, 0, &host);
+        c.paint(&mut screen, 0, 0, true, &host);
         // The trunk is the first colour the wheel hands out.
         let dot = (0..60)
             .find(|x| screen.char_at(*x, 1) == Some('●'))
@@ -1126,7 +1135,7 @@ r\x1fr\x1f\x1fA\x1f1\x1froot\x1e";
         );
         let mut screen = Screen::new(120, 8);
         screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
-        c.paint(&mut screen, 0, &host);
+        c.paint(&mut screen, 0, 0, true, &host);
         let last = SHA_W + WHO_W + (MAX_LANES - 1) * LANE_W;
         assert_eq!(screen.ink(last, 0).unwrap().fg, host.theme.lane_overflow);
     }
@@ -1148,7 +1157,7 @@ r\x1fr\x1f\x1fA\x1f1\x1froot\x1e";
         assert!(!c.status().contains("drawn"), "{}", c.status());
         let mut screen = Screen::new(120, 4);
         screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
-        c.paint(&mut screen, 0, &host);
+        c.paint(&mut screen, 0, 0, true, &host);
         let last = SHA_W + WHO_W + (MAX_LANES - 1) * LANE_W;
         assert_ne!(screen.ink(last, 0).unwrap().fg, host.theme.lane_overflow);
     }
@@ -1175,11 +1184,102 @@ r\x1fr\x1f\x1fA\x1f1\x1froot\x1e";
         c.down();
         let mut screen = Screen::new(60, 4);
         screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
-        c.paint(&mut screen, 0, &host);
+        c.paint(&mut screen, 0, 0, true, &host);
         let bar = host.theme.chrome.selection_bg;
         assert_eq!(screen.ink(0, 1).unwrap().bg, bar);
         assert_eq!(screen.ink(59, 1).unwrap().bg, bar);
         assert_ne!(screen.ink(0, 0).unwrap().bg, bar);
+    }
+
+    #[test]
+    fn each_pane_clips_to_its_span_and_owns_its_scrollbar() {
+        // The pane is a guest in the row: it draws from column 20 for 30
+        // columns, and the divider on either side of it — and the pane that
+        // owns the rest of the screen — must survive a subject far longer
+        // than the pane is wide. Long enough to scroll, so the bar is there
+        // to be owned.
+        let long = "subject ".repeat(12);
+        let mut log = format!("l\x1flllllll\x1fc1\x1fAda Lovelace\x1f1700000000\x1f{long}\x1e");
+        for i in 1..200 {
+            let parent = format!("c{}", i + 1);
+            log.push_str(&format!(
+                "c{i}\x1fc{i:06}\x1f{parent}\x1fAda Lovelace\x1f17000000{i:02}\x1fCommit {i}\x1e"
+            ));
+        }
+        let (mut c, host) = view(&log, 30, 4);
+        c.press(10, 0, false, &host); // a cursor, to paint ink
+        let mut screen = Screen::new(60, 5);
+        screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
+        // Sentinels on the divider columns, so anything painted outside the
+        // pane's span is visible rather than merely absent.
+        for y in 0..5 {
+            screen.over(19, y, '╎', host.theme.chrome.accent);
+            screen.over(50, y, '╎', host.theme.chrome.accent);
+        }
+        c.paint(&mut screen, 20, 1, true, &host);
+        for y in 0..5 {
+            assert_eq!(
+                screen.char_at(19, y),
+                Some('╎'),
+                "the pane wrote over the left divider at row {y}"
+            );
+            assert_eq!(
+                screen.char_at(50, y),
+                Some('╎'),
+                "the pane wrote over the neighbour at row {y}"
+            );
+        }
+        assert!(
+            screen.row_text(0).chars().all(|c| c == ' ' || c == '╎'),
+            "the pane wrote above its box: {:?}",
+            screen.row_text(0)
+        );
+        // Everything it drew, it drew inside its own columns: nothing past
+        // the pane's right edge, and content inside it.
+        for x in 51..60 {
+            assert_eq!(
+                screen.char_at(x, 1),
+                Some(' '),
+                "the pane drew at column {x}"
+            );
+        }
+        assert!(
+            (20..50).any(|x| screen.char_at(x, 1).is_some_and(|c| c != ' ')),
+            "nothing was drawn inside the pane"
+        );
+        // The bar sits on the pane's last column — not the screen's — over a
+        // row that keeps its background underneath it.
+        assert_eq!(
+            screen.char_at(49, 1),
+            Some('█'),
+            "the bar is not on the pane's last column"
+        );
+        assert_eq!(
+            screen.ink(49, 1).unwrap().bg,
+            host.theme.chrome.selection_bg,
+            "the bar repainted the row it sits on"
+        );
+    }
+
+    #[test]
+    fn an_unfocused_pane_draws_no_cursor_bar_but_keeps_its_selection() {
+        let (mut c, host) = view(LOG, 60, 4);
+        c.press(10, 0, false, &host);
+        c.drag(2, &host);
+        c.release();
+        let mut screen = Screen::new(60, 4);
+        screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
+        c.paint(&mut screen, 0, 0, false, &host);
+        assert_ne!(
+            screen.ink(0, 0).unwrap().bg,
+            host.theme.chrome.selection_bg,
+            "an unfocused pane drew the cursor bar"
+        );
+        assert_eq!(
+            screen.ink(0, 1).unwrap().bg,
+            host.theme.chrome.selected_bg,
+            "focus took the dragged selection's ink with it"
+        );
     }
 
     #[test]
@@ -1410,7 +1510,7 @@ cafe3333\x1fcafe333\x1f4444dddd\x1fÉmile Zola\x1f3\x1fa compiler pass\x1e\
         assert_eq!(c.filter_note().as_deref(), Some("2/4"));
         let mut screen = Screen::new(c.cols, 4);
         screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
-        c.paint(&mut screen, 0, &host);
+        c.paint(&mut screen, 0, 0, true, &host);
         assert_eq!(screen.ink(0, 0).unwrap().bg, host.theme.chrome.selection_bg);
         assert_eq!(
             screen.ink(59, 0).unwrap().bg,

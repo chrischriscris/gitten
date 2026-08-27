@@ -129,7 +129,7 @@ fn main() {
             let frames = number("FRAMES", 50);
             let t = Instant::now();
             for _ in 0..frames {
-                view.paint(&mut screen, 0, &host, &mut out);
+                view.paint(&mut screen, 0, 0, true, &host, &mut out);
             }
             eprintln!(
                 "load {load:.0?} · frame {:.0?} · {} rows",
@@ -166,7 +166,7 @@ fn main() {
             let frames = number("FRAMES", 50);
             let t = Instant::now();
             for _ in 0..frames {
-                view.paint(&mut screen, 0, &host);
+                view.paint(&mut screen, 0, 0, true, &host);
             }
             eprintln!(
                 "load {load:.0?} · frame {:.0?} · {} commits",

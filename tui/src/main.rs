@@ -318,8 +318,10 @@ impl Screens {
 
     fn paint(&self, screen: &mut Screen, top: usize, host: &Host, out: &mut Vec<Run>) {
         match self {
-            Screens::Commits { view: c, .. } => c.paint(screen, top, host),
-            Screens::Diff { view: d, .. } => d.paint(screen, top, host, out),
+            // The whole body is this pane until the stack comes off; the
+            // origin and focus arguments arrive with the pane registry.
+            Screens::Commits { view: c, .. } => c.paint(screen, 0, top, true, host),
+            Screens::Diff { view: d, .. } => d.paint(screen, 0, top, true, host, out),
         }
     }
 
