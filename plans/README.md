@@ -23,6 +23,14 @@ Three passes so far, and pass 4 open:
   Stashes panes) are deliberately deferred until 016's pane registry exists;
   no plan may cite an API nobody built.
 
+## Pass 4 follow-ups — surfaced by reviewers, recorded not folded
+
+- A Down-Down-without-Up (mouse protocol violation by the terminal) leaves a
+  stale one-row selection on the abandoned pane; self-heals on the next press,
+  no cross-pane splice. Only worth fixing with evidence a real emulator does it.
+- Pass-3's recorded follow-ups (gpgsign in `Scratch`, `coords` doc at context 0,
+  CJK-in-squeezed-cells, SGR 58 eyeball) remain open.
+
 Execute pass 3 in the order below unless dependencies say otherwise. Each
 executor: read the plan fully before starting, honor its STOP conditions; the
 integrator owns this table and updates it as waves land.
@@ -46,7 +54,7 @@ integrator owns this table and updates it as waves land.
 | 013 | Incremental commit search in the terminal (`/`, shared `core::search`) | P1 | M | — | DONE (pass 3, `369503a`+2) — adversarially reviewed **GREEN**; 5 non-blocking notes accepted |
 | 014 | Stage/unstage the selected hunk from the terminal diff | P1 | M | — | DONE (pass 3, `b234f62`+5, fold `196704f`) — reviewed CONCERNS (all non-blocking); 3 folds in |
 | 015 | Render the shared Markdown presentation in the terminal | P2 | L | — | DONE (pass 3, `efe00bb`+3, folds `23e7672`) — reviewed CONCERNS (all non-blocking); core markdown.rs is a pure addition; 2 folds in |
-| 016 | The terminal pane focus ring (foundation for lazygit-shaped TUI) | P1 | L | 013–015 | IN PROGRESS (pass 4) |
+| 016 | The terminal pane focus ring (foundation for lazygit-shaped TUI) | P1 | L | 013–015 | DONE (pass 4, `0cfbb41`+4, fold `a1c5b2d`) — reviewed CONCERNS (all non-blocking); 2 folds in; executor's "2-file scope" claim was false (7 files, all inside plan authorization — test/harness fallout), recorded |
 
 ## Pass 3 follow-ups — surfaced by reviewers, pre-existing, not pass regressions
 
