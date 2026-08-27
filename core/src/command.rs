@@ -365,6 +365,10 @@ impl Keymap {
         bind(GLOBAL, "right", "pane.right");
         bind(GLOBAL, "<", "view.left");
         bind(GLOBAL, ">", "view.right");
+        // lazygit's list-panel pair — capitals of the pane moves, scrolling
+        // the text instead. Same commands as `<`/`>`, lazygit's spellings.
+        bind(GLOBAL, "H", "view.left");
+        bind(GLOBAL, "L", "view.right");
 
         // The panel numbers read down the window's left stack, lazygit's
         // order: 1 STATUS, 2 FILES, 3 BRANCHES, 4 COMMITS, 5 STASH — the
@@ -376,8 +380,14 @@ impl Keymap {
         bind(GLOBAL, "3", "branches.focus");
         bind(GLOBAL, "4", "commits.focus");
         bind(GLOBAL, "5", "stashes.focus");
+        // lazygit's 0: the main view, whichever list holds the keyboard.
+        bind(GLOBAL, "0", "diff.focus");
 
-        // lazygit's three sync keys, global because they aim past every pane
+        // lazygit's global R: refresh the git state — re-run every pane's
+        // reads, not a fetch. The queue's own finish does the same dance
+        // after every write; this is the same wave, asked for by hand.
+        bind(GLOBAL, "R", "repo.refresh");
+        // lazygit's sync keys, global because they aim past every pane
         // at the branch HEAD sits on: P sends it, p pulls onto its upstream,
         // f updates what the remotes hold. The capital is lazygit's own
         // asymmetry between sending work and asking for it.
@@ -415,19 +425,18 @@ impl Keymap {
         bind("stashes", "g", "stashes.pop");
         bind("stashes", "d", "stashes.drop");
 
-        // The branches panel: space checks out the branch under the keyboard,
-        // n names a new one, r renames the one under the keyboard (lazygit
-        // uses shift-r; unshifted is one less finger and nothing else claims
-        // it here), d deletes — twice-pressed like every destruction.
+        // The branches panel, on lazygit's own letters: space checks out the
+        // branch under the keyboard, n names a new one, r rebases the
+        // checked-out branch onto the row (lazygit's r; it rewrites this
+        // branch's own commits, so it asks twice), R renames the row
+        // (lazygit's R), d deletes — twice-pressed like every destruction —
+        // and T tags the row's commit.
         bind("branches", "space", "branches.checkout");
         bind("branches", "n", "branches.new");
-        bind("branches", "r", "branches.rename");
+        bind("branches", "r", "commits.rebase-onto");
+        bind("branches", "R", "branches.rename");
         bind("branches", "d", "branches.delete");
-        // Rebasing the branch HEAD is on onto the row the keyboard is on.
-        // lazygit keeps this key in the branches panel too; its natural
-        // letter is rename here, so capital-R sits beside it. Rewrites this
-        // branch's own commits, so it asks twice.
-        bind("branches", "R", "commits.rebase-onto");
+        bind("branches", "T", "branches.new-tag");
 
         bind("diff", "s", "diff.cycle-layout");
         bind("diff", "w", "diff.cycle-wrap");
@@ -487,12 +496,20 @@ impl Keymap {
         // takes no confirmation dance either: dropping the copy undoes the
         // pick.
         bind("commits", "Y", "commits.cherry-pick");
-        // Naming the commit under the keyboard with a tag, on the same
-        // letter that names branches in their pane. `t` is revert's here and
-        // capital-T is theme.cycle everywhere, so neither was available to
-        // take; shadowing a global in one pane costs more than the letter
-        // buys.
-        bind("commits", "n", "commits.new-tag");
+        // Tagging the commit under the keyboard, on lazygit's own T. It
+        // shadows theme.cycle inside this pane — a tag belongs here and the
+        // theme is reachable everywhere else — which is the same
+        // mode-overrides-global trade [branches] makes for its own T.
+        bind("commits", "T", "commits.new-tag");
+        // lazygit's n: a new branch growing from the commit under the
+        // keyboard, named over the field the branches pane names its own
+        // with.
+        bind("commits", "n", "commits.new-branch");
+        // lazygit's space on a commit: check it out detached — the same move
+        // the branches pane's space makes onto a remote-tracking row, aimed
+        // at a commit instead. HEAD's old branch keeps its name, so the
+        // branches pane walks you back.
+        bind("commits", "space", "commits.checkout");
         // The way out of a stranded cherry-pick, beside rebase.abort /
         // rebase.continue's capitals: those answer a *rebase* state, and
         // git's own reply to them over CHERRY_PICK_HEAD is "no rebase in
@@ -952,6 +969,16 @@ impl Commands {
                 Some("tag"),
             ),
             (
+                "commits.new-branch",
+                "grow a new branch from this commit",
+                Some("new branch"),
+            ),
+            (
+                "commits.checkout",
+                "check out this commit, detaching HEAD",
+                Some("checkout"),
+            ),
+            (
                 "commits.cherry-pick-abort",
                 "give up the cherry-pick in progress and put everything back where it was",
                 None,
@@ -1006,6 +1033,11 @@ impl Commands {
                 "delete the selected branch, asked twice",
                 Some("delete"),
             ),
+            (
+                "branches.new-tag",
+                "name the selected branch's commit with a new tag",
+                Some("tag"),
+            ),
             ("stashes.focus", "focus the stash list", None),
             ("commits.focus", "focus the commit list", None),
             (
@@ -1039,6 +1071,12 @@ impl Commands {
                 "update the remote-tracking branches",
                 Some("fetch"),
             ),
+            (
+                "repo.refresh",
+                "re-run every pane's reads from the repository",
+                Some("refresh"),
+            ),
+            ("diff.focus", "focus the diff view", None),
             ("input.accept", "accept the text", None),
             ("input.cancel", "discard the text", None),
             ("pane.next", "the next list in the column", None),
@@ -1371,7 +1409,8 @@ mod tests {
         for (chord, name) in [
             ("space", "branches.checkout"),
             ("n", "branches.new"),
-            ("r", "branches.rename"),
+            ("R", "branches.rename"),
+            ("T", "branches.new-tag"),
             ("d", "branches.delete"),
         ] {
             assert_eq!(
@@ -1388,6 +1427,13 @@ mod tests {
                 "{name} leaked out of [branches]"
             );
         }
+        // lazygit's r: rebase the checked-out branch onto the row. The name
+        // sits in the commits family — it rewrites history — but the pane
+        // decides the aim.
+        assert_eq!(
+            k.resolve(&modes, &keys("r")),
+            Resolve::Run("commits.rebase-onto")
+        );
         // The panel jump is global, numbered by the pane layout in lazygit's
         // order: 3 here, under status and files.
         assert_eq!(
@@ -1401,6 +1447,7 @@ mod tests {
             "branches.checkout",
             "branches.new",
             "branches.rename",
+            "branches.new-tag",
             "branches.delete",
         ] {
             assert!(commands.known(name), "{name} is not registered");
@@ -1499,8 +1546,9 @@ mod tests {
         // shadows one global here (`pane.left`), exactly as [stashes]
         // shadows `g`/`d`; the left arrow still carries the pane move;
         // revert takes lazygit's own `t`; cherry-pick takes
-        // the free capital beside it; a tag takes the letter that names
-        // branches in their pane.
+        // the free capital beside it; tag and new-branch and checkout take
+        // lazygit's own T, n and space, and space shadows the global select
+        // exactly as [files] makes the same trade.
         let mut commits = Modes::new();
         commits.push("commits");
         for (chord, name) in [
@@ -1509,7 +1557,9 @@ mod tests {
             ("h", "commits.reset-hard"),
             ("t", "commits.revert"),
             ("Y", "commits.cherry-pick"),
-            ("n", "commits.new-tag"),
+            ("T", "commits.new-tag"),
+            ("n", "commits.new-branch"),
+            ("space", "commits.checkout"),
             ("Z", "commits.cherry-pick-abort"),
             ("X", "commits.cherry-pick-continue"),
         ] {

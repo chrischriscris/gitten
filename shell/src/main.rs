@@ -276,11 +276,13 @@ enum Prompt {
     /// name, the same promise [`Prompt::Search`] keeps: the answer belongs
     /// to the pane it was typed over.
     BranchName { target: String, what: BranchPrompt },
-    /// A tag name gathered over the commits pane: accepting names the commit
-    /// under the keyboard, whose sha is carried from open time so a cursor
-    /// move inside the field cannot re-aim it. The target is the pane
-    /// registration name, same as [`Prompt::BranchName`].
-    TagName { target: String, sha: String },
+    /// A tag name gathered over a pane: accepting names whatever the pane
+    /// had under the keyboard when the field opened, carried as a **revspec**
+    /// — a sha from the commits pane, a branch name from the branches one —
+    /// because `git tag` aims at both the same way. Captured at open time,
+    /// so a cursor move inside the field cannot re-aim it. The target is the
+    /// pane registration name, same as [`Prompt::BranchName`].
+    TagName { target: String, at: String },
 }
 
 /// What an accepted [`Prompt::BranchName`] does with its text.
@@ -288,6 +290,10 @@ enum Prompt {
 enum BranchPrompt {
     /// Create a branch by this name at HEAD. Creating never checks out.
     New,
+    /// Create a branch by this name growing from `start` — a revspec, the
+    /// commits pane's way of saying "from the commit I was on". Creating
+    /// never checks out, here either.
+    NewAt { start: String },
     /// Rename the carried branch — its bytes, exactly as the panel read
     /// them — to the accepted text.
     Rename { from: Vec<u8> },
@@ -319,6 +325,27 @@ impl Writes {
     /// going away — and saying so is the caller's, who knows what was tried.
     fn send(&self, job: Box<dyn Job>) -> bool {
         self.submit.submit(job).is_ok()
+    }
+}
+
+/// `repo.refresh`: the queue's own finish does the re-acquire wave after
+/// every write — the generation bump is what turns every pane stale — and
+/// this job is that finish with no write in front of it. lazygit's `R`,
+/// refreshed: the band says so, because unlike a write nothing on screen
+/// changed to prove it ran.
+struct RefreshAll;
+
+impl Job for RefreshAll {
+    fn name(&self) -> &str {
+        "refresh"
+    }
+
+    fn confirmation(&self) -> Option<String> {
+        Some("refreshed".into())
+    }
+
+    fn run(self: Box<Self>) -> Result<(), String> {
+        Ok(())
     }
 }
 
@@ -1310,7 +1337,7 @@ impl DevShell {
             (true, Some(Prompt::BranchName { target, what })) => {
                 self.branch_named(&target, what, text)
             }
-            (true, Some(Prompt::TagName { target, sha })) => self.tag_named(&target, sha, text),
+            (true, Some(Prompt::TagName { target, at })) => self.tag_named(&target, at, text),
             _ => {}
         }
         cx.notify();
@@ -2196,6 +2223,102 @@ impl DevShell {
         self.begin_branch_prompt(BranchPrompt::New, "branch name", "", cx);
     }
 
+    /// `commits.new-branch`: the branches pane's own field, aimed one pane
+    /// over — the branch grows from the commit under the keyboard, whose sha
+    /// is captured at open time like a tag's. Same pane guard, said the same
+    /// way: a verb is its pane's, and the sentence names it.
+    fn begin_commit_branch_prompt(&mut self, cx: &mut Context<Self>) {
+        let Some(Screen::Commits { view, .. }) = self.active() else {
+            self.set_notice("commits.new-branch is not supported here");
+            return;
+        };
+        let host = config::host(cx);
+        view.update(cx, |v, _| v.reconcile(&host));
+        let Some(commit) = view.read(cx).current().cloned() else {
+            self.set_notice("nothing selected to branch from");
+            return;
+        };
+        if self.writes().is_none() {
+            self.set_notice("a fixture has no repository to create branches in");
+            return;
+        }
+        self.begin_named_branch_prompt(
+            BranchPrompt::NewAt { start: commit.sha },
+            "new branch from commit",
+            cx,
+        );
+    }
+
+    /// Opens the shared field for a [`BranchPrompt`] over *this* pane,
+    /// whichever kind it is — the branches variant pins the guard to its own
+    /// pane; this one trusts the caller, who has already checked.
+    fn begin_named_branch_prompt(
+        &mut self,
+        what: BranchPrompt,
+        label: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if self.repo.is_none() {
+            self.set_notice("a fixture has no repository to create branches in");
+            return;
+        }
+        let input = cx.new(|cx| input::Input::new(label, "branch name", "", cx));
+        self.open_input(input, cx);
+        // After `open_input`, which may have cancelled a previous prompt.
+        self.prompt = Some(Prompt::BranchName {
+            target: self.panes.focused_name().to_string(),
+            what,
+        });
+    }
+
+    /// `branches.new-tag`: the commits pane's tag field, aimed at the branch
+    /// row. The tag's target is the branch *name* — a revspec git resolves
+    /// the same way it resolves a sha — so no commit read rides along, and
+    /// the tag moves with the branch the way a branch-shaped tag should.
+    fn begin_branch_tag_prompt(&mut self, cx: &mut Context<Self>) {
+        let Some(views::branches::Target::Local(name)) = self.branches_target(cx) else {
+            self.set_notice("only a local branch can be tagged here");
+            return;
+        };
+        if self.writes().is_none() {
+            self.set_notice("a fixture has no repository to tag in");
+            return;
+        }
+        let shown = name.to_string_lossy().into_owned();
+        let input = cx.new(|cx| input::Input::new("new tag", "tag name", "", cx));
+        self.open_input(input, cx);
+        // After `open_input`, which may have cancelled a previous prompt.
+        self.prompt = Some(Prompt::TagName {
+            target: self.panes.focused_name().to_string(),
+            at: shown,
+        });
+    }
+
+    /// `commits.checkout`: detach onto the commit under the keyboard,
+    /// lazygit's space. Not asked twice — nothing is destroyed, HEAD's old
+    /// branch keeps its name and the branches pane's space walks back — and
+    /// refused over a fixture like every write, by the absence of rails.
+    fn checkout_commit(&mut self, cx: &mut Context<Self>) {
+        let Some(Screen::Commits { view, .. }) = self.active() else {
+            self.set_notice("commits.checkout is not supported here");
+            return;
+        };
+        let host = config::host(cx);
+        view.update(cx, |v, _| v.reconcile(&host));
+        let Some(commit) = view.read(cx).current().cloned() else {
+            self.set_notice("nothing selected to check out");
+            return;
+        };
+        let Some(writes) = self.writes() else {
+            self.set_notice("a fixture has no repository to check out in");
+            return;
+        };
+        let job = gitten_app::verbs::Write::checkout(&writes.repo, commit.sha.clone().into_bytes());
+        if !writes.send(Box::new(job)) {
+            self.set_notice("the job queue is shutting down");
+        }
+    }
+
     /// `branches.rename`: the same field, pre-filled with the row's own
     /// name — editing what is there beats retyping it, and accepting
     /// unchanged text answers with git's "already exists", which says more
@@ -2272,7 +2395,7 @@ impl DevShell {
             return;
         }
         if self.panes.position(target).is_none() {
-            self.set_notice("the branches pane is gone");
+            self.set_notice("the pane the branch was asked over is gone");
             return;
         }
         let Some(writes) = self.writes() else {
@@ -2283,6 +2406,11 @@ impl DevShell {
             BranchPrompt::New => {
                 gitten_app::verbs::Write::create_branch(&writes.repo, text.into_bytes(), None)
             }
+            BranchPrompt::NewAt { start } => gitten_app::verbs::Write::create_branch(
+                &writes.repo,
+                text.into_bytes(),
+                Some(start.into_bytes()),
+            ),
             BranchPrompt::Rename { from } => {
                 gitten_app::verbs::Write::rename_branch(&writes.repo, from, text.into_bytes())
             }
@@ -2321,7 +2449,7 @@ impl DevShell {
         // After `open_input`, which may have cancelled a previous prompt.
         self.prompt = Some(Prompt::TagName {
             target: self.panes.focused_name().to_string(),
-            sha: commit.sha,
+            at: commit.sha,
         });
     }
 
@@ -2331,14 +2459,14 @@ impl DevShell {
     /// text, because git would hold the padding as part of the name. A
     /// duplicate rides on to git and comes back in its words ("tag 'v1'
     /// already exists"), which says more than a client-side veto would.
-    fn tag_named(&mut self, target: &str, sha: String, text: String) {
+    fn tag_named(&mut self, target: &str, at: String, text: String) {
         let name = text.trim();
         if name.is_empty() {
             self.set_notice("a tag needs a name");
             return;
         }
         if self.panes.position(target).is_none() {
-            self.set_notice("the commits pane is gone");
+            self.set_notice("the pane the tag was asked over is gone");
             return;
         }
         let Some(writes) = self.writes() else {
@@ -2348,7 +2476,7 @@ impl DevShell {
         let job = gitten_app::verbs::Write::create_tag(
             &writes.repo,
             name.as_bytes().to_vec(),
-            sha.into_bytes(),
+            at.into_bytes(),
             None,
         );
         if !writes.send(Box::new(job)) {
@@ -2804,6 +2932,18 @@ impl DevShell {
                 cx,
             ),
             "status.focus" => self.focus_named("status", cx),
+            // lazygit's R: refresh everything. The wave itself is the queue
+            // finish's; this just rings the bell.
+            "repo.refresh" => {
+                let sent = self.writes().map(|w| w.send(Box::new(RefreshAll)));
+                match sent {
+                    Some(true) => {}
+                    Some(false) => self.set_notice("the job queue is shutting down"),
+                    None => self.set_notice("a fixture has nothing to refresh"),
+                }
+            }
+            // lazygit's 0: the main view, from wherever the keyboard was.
+            "diff.focus" => self.set_spot(Spot::Main, cx),
             "commits.focus" => self.focus_named("commits", cx),
             "files.focus" => self.focus_named("files", cx),
             "stashes.focus" => self.focus_named("stashes", cx),
@@ -2818,6 +2958,10 @@ impl DevShell {
             "commits.revert" => self.revert_selected(cx),
             "commits.cherry-pick" => self.cherry_pick_selected(cx),
             "commits.new-tag" => self.begin_tag_prompt(cx),
+            "commits.new-branch" => self.begin_commit_branch_prompt(cx),
+            // lazygit's space on a commit: detached checkout. HEAD's old
+            // branch keeps its name, so the branches pane walks you back.
+            "commits.checkout" => self.checkout_commit(cx),
             // History's rewrites, composed over the pane's own window of
             // log and run through the queue. All three ask twice.
             "commits.squash-up" | "commits.fixup-up" | "commits.drop-commit" => {
@@ -2843,6 +2987,7 @@ impl DevShell {
             "branches.checkout" => self.checkout_branch(cx),
             "branches.new" => self.begin_branch_new(cx),
             "branches.rename" => self.begin_branch_rename(cx),
+            "branches.new-tag" => self.begin_branch_tag_prompt(cx),
             "branches.delete" => self.delete_branch_selected(cx),
             // Aimed at the branch row the keyboard is on, so it lives with
             // the branches verbs even though the command name sits in the
@@ -8087,7 +8232,7 @@ diff --git a/added.txt b/added.txt
             shell.open_input(field, cx);
             shell.prompt = Some(super::Prompt::TagName {
                 target: "commits".into(),
-                sha: "0".repeat(40),
+                at: "0".repeat(40),
             });
         });
         shell.update(cx, |shell, cx| shell.run_command("input.accept", cx));
@@ -8116,7 +8261,7 @@ diff --git a/added.txt b/added.txt
             shell.open_input(field, cx);
             shell.prompt = Some(super::Prompt::TagName {
                 target: "commits".into(),
-                sha: "0".repeat(40),
+                at: "0".repeat(40),
             });
         });
         shell.update(cx, |shell, cx| shell.run_command("input.accept", cx));
