@@ -1,6 +1,6 @@
 # Implementation Plans
 
-Three passes so far:
+Three passes so far, and pass 4 open:
 
 - **Pass 1** (2026-08-24, audited at `3a8b347`): plans 001–007. All landed on
   main and merged — verified 2026-08-26 against `2dfcb82`
@@ -17,6 +17,11 @@ Three passes so far:
   `-D warnings`, and `cargo test --workspace` all green (1,086 tests).
   **`full/tui` is complete and awaiting its owner's merge decision**; this tree
   is the integration line and nothing has touched `full/full`.
+- **Pass 4** (2026-08-27, planned at `15bff4a`): interface parity — plan 016 is
+  the foundation (the terminal pane focus ring), planned against the pass-3
+  code by Codex and integrator-verified. Plans 017–019 (Files, Branches,
+  Stashes panes) are deliberately deferred until 016's pane registry exists;
+  no plan may cite an API nobody built.
 
 Execute pass 3 in the order below unless dependencies say otherwise. Each
 executor: read the plan fully before starting, honor its STOP conditions; the
@@ -41,6 +46,7 @@ integrator owns this table and updates it as waves land.
 | 013 | Incremental commit search in the terminal (`/`, shared `core::search`) | P1 | M | — | DONE (pass 3, `369503a`+2) — adversarially reviewed **GREEN**; 5 non-blocking notes accepted |
 | 014 | Stage/unstage the selected hunk from the terminal diff | P1 | M | — | DONE (pass 3, `b234f62`+5, fold `196704f`) — reviewed CONCERNS (all non-blocking); 3 folds in |
 | 015 | Render the shared Markdown presentation in the terminal | P2 | L | — | DONE (pass 3, `efe00bb`+3, folds `23e7672`) — reviewed CONCERNS (all non-blocking); core markdown.rs is a pure addition; 2 folds in |
+| 016 | The terminal pane focus ring (foundation for lazygit-shaped TUI) | P1 | L | 013–015 | IN PROGRESS (pass 4) |
 
 ## Pass 3 follow-ups — surfaced by reviewers, pre-existing, not pass regressions
 
