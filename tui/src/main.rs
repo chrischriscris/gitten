@@ -18,6 +18,15 @@
 //!                                                     Screen::run ────┘
 //! ```
 //!
+//! # One line of text
+//!
+//! The one modal input this client has is the commit-list search: `/` opens a
+//! prompt on the status row, each edit filters the list live, and Enter keeps
+//! what was typed while Esc restores the whole list. While it stands, keys are
+//! resolved against exactly the `input` mode — never the full stack — so the
+//! shipped globals cannot read the query, and everything else the prompt takes
+//! arrives as text.
+//!
 //! # The loop is idle until something happens
 //!
 //! It blocks on input with a timeout, and the timeout exists only so a saved
@@ -28,7 +37,7 @@
 use gitten_app::acquire::{self, Data};
 use gitten_app::cli::{self, Source, View};
 use gitten_app::{StartClock, Startup};
-use gitten_core::command::{chord_string, Key, Modes, Resolve};
+use gitten_core::command::{chord_string, Code, Key, Modes, Resolve};
 use gitten_core::host::Host;
 use gitten_core::runs::Run;
 use gitten_tui::commits::{Commits, Glyphs};
@@ -145,6 +154,12 @@ enum Screens {
     Diff(Diff),
 }
 
+/// The mode a text field owns the keyboard in — the name the keymap and
+/// `gitten.toml` use, and the same name the window's input module holds. While
+/// the search prompt stands, bindings are resolved against exactly this mode
+/// and nothing else.
+const INPUT: &str = "input";
+
 impl Screens {
     /// Which mode's bindings are live. The name the keymap and `gitten.toml` use.
     fn mode(&self) -> &'static str {
@@ -248,6 +263,15 @@ impl Screens {
         }
     }
 
+    /// The live filter count, while a search prompt stands over a list. A diff
+    /// has nothing to count, and a note is only drawn when there is one.
+    fn filter_note(&self) -> Option<String> {
+        match self {
+            Screens::Commits(c) => c.filter_note(),
+            Screens::Diff(_) => None,
+        }
+    }
+
     /// Runs a command, or says it does not know it.
     ///
     /// The `view.*` half is the same list for both screens and is what makes
@@ -294,6 +318,19 @@ impl Screens {
     }
 }
 
+/// One edit to the open query, already reduced to text by whoever routed the
+/// event: a character typed, a character removed, or a paste's worth. The
+/// prompt never sees an event, so a pasted `q` is the character `q` and the
+/// keymap never learns a paste happened.
+enum Edit {
+    Char(char),
+    /// Backspace or Delete — both remove backwards, because a status-line
+    /// prompt has no cursor position to delete from.
+    Backspace,
+    /// A bracketed paste, sanitized on its way in.
+    Paste(String),
+}
+
 struct App {
     host: Host,
     /// Where to acquire more from, for opening a commit's diff: the path the
@@ -312,6 +349,15 @@ struct App {
     /// Something to say once, on the status line: an error, or what a key just
     /// did. Cleared by the next keypress, so it cannot go stale.
     message: String,
+    /// The open search prompt, holding the query typed so far. `None` while the
+    /// keyboard belongs to the screens.
+    ///
+    /// Here and not on a screen because collecting terminal text is input — the
+    /// client's to gather, by the same rule that makes it the client's to
+    /// translate a platform event — while [`Commits::apply_query`] stays the
+    /// whole of what a view knows about it. It stands only over
+    /// [`Screens::Commits`]; every reader below can rely on that.
+    search: Option<String>,
     help: bool,
     quit: bool,
     /// The theme `theme.cycle` picked, if anything has. `None` means the file's.
@@ -374,6 +420,7 @@ impl App {
             modes: Modes::new(),
             pending: Vec::new(),
             message: String::new(),
+            search: None,
             help: false,
             quit: false,
             picked_theme: None,
@@ -397,6 +444,12 @@ impl App {
         }
         if self.help {
             self.modes.push("help");
+        }
+        // Above whatever screen it stands over: the prompt is the innermost
+        // thing on screen while it is open, and it is what the help panel
+        // should be listing bindings for.
+        if self.search.is_some() {
+            self.modes.push(INPUT);
         }
     }
 
@@ -439,12 +492,13 @@ impl App {
             }
 
             match Term::poll(TICK)? {
-                Some(Input::Key(key)) => self.press(key),
-                Some(Input::Mouse(m)) => self.mouse(m),
+                // A resize stays in the loop, which keeps the size it compares
+                // against; every other event routes through [`App::input`].
                 Some(Input::Resize(w, h)) => {
                     size = (w, h);
                     self.screen.resize(w, h);
                 }
+                Some(input) => self.input(input),
                 // A tick. The only thing it is for.
                 None => {
                     if dirty.swap(false, Ordering::Relaxed) {
@@ -454,6 +508,27 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    /// One event, routed: a key, a mouse gesture, or a paste.
+    ///
+    /// [`App::run`] and the headless tests meet here, so both exercise the same
+    /// Key/Paste decision and neither has to own a terminal to do it. A resize
+    /// is the loop's, which is the one event that carries no decision.
+    fn input(&mut self, input: Input) {
+        match input {
+            Input::Key(key) => self.press(key),
+            Input::Mouse(m) => self.mouse(m),
+            // A paste is text, and only while a prompt stands is there anywhere
+            // for it to go. It is never a key: pasted `q`, `?` and Enter are
+            // characters, and the keymap never sees them.
+            Input::Paste(text) if self.search.is_some() => self.edit_search(Edit::Paste(text)),
+            // No prompt, no text input anywhere — the paste is dropped whole,
+            // the same nothing `translate_event` returned before there was a
+            // prompt to take one.
+            Input::Paste(_) => {}
+            Input::Resize(..) => {}
+        }
     }
 
     /// Re-reads the config file.
@@ -494,6 +569,13 @@ impl App {
     /// One keypress.
     fn press(&mut self, key: Key) {
         self.message.clear();
+        // While the prompt stands it owns the keyboard, and the full stack
+        // must not see the key: a query is text, and the globals would read
+        // it. See [`App::press_input`].
+        if self.search.is_some() {
+            self.press_input(key);
+            return;
+        }
         self.pending.push(key);
         // Borrowed out of the host before the match, because running a command
         // needs the host and `Resolve` holds a reference into its keymap.
@@ -516,6 +598,136 @@ impl App {
         }
     }
 
+    /// One keypress while the search prompt owns the keyboard.
+    ///
+    /// Resolved against exactly the `input` mode —
+    /// [`Keymap::resolve_mode_any`], and never the full stack — because the
+    /// shipped global bindings must not read the query: `?` would open help,
+    /// `q` would quit, `j` would move the list. A binding written in
+    /// `[keys.input]` still wins first, which is what makes Enter and Esc (or
+    /// their configured replacements) close the prompt; a user who deliberately
+    /// binds `?` there gets a `?` that means what they said, as mode scoping
+    /// has always promised. After that, a plain unmodified character is text
+    /// and nothing else is.
+    ///
+    /// A chord that has begun but not resolved keeps the buffer and waits. One
+    /// that resolves to nothing drops the buffer rather than replaying it as
+    /// text: the keys of a failed chord are a chord, and retyping them as
+    /// characters could execute or duplicate input. That is the trade — a
+    /// configured chord may reserve a printable first key, and this honours it.
+    fn press_input(&mut self, key: Key) {
+        self.pending.push(key);
+        // One spelling per press, one position per key — the same shape
+        // [`Keymap::resolve`] builds, resolved against exactly one mode.
+        let typed: Vec<&[Key]> = self.pending.iter().map(std::slice::from_ref).collect();
+        match self.host.keys.resolve_mode_any(INPUT, &typed) {
+            Resolve::Run(command) => {
+                self.pending.clear();
+                let command = command.to_string();
+                self.dispatch(&command);
+            }
+            // A configured chord may still be forming. Wait for it.
+            Resolve::Pending => {}
+            Resolve::None => {
+                self.pending.clear();
+                match key.code {
+                    Code::Char(c) if !key.ctrl && !key.alt => self.edit_search(Edit::Char(c)),
+                    Code::Backspace | Code::Delete if !key.ctrl && !key.alt => {
+                        self.edit_search(Edit::Backspace)
+                    }
+                    // Modified keys and everything else no binding claimed do
+                    // nothing, and say nothing: a key that does nothing while
+                    // a field owns the keyboard is the field doing its job,
+                    // and none of them may fall through to the globals.
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// `commits.search`: gather a query over the commit list.
+    ///
+    /// Seeded from the standing query, so a second `/` finds the list as the
+    /// first one left it; the full data stays in place, and each edit filters
+    /// it live. Only over the list — a diff has no query, and says so.
+    fn begin_search(&mut self) {
+        let Some(Screens::Commits(list)) = self.stack.last() else {
+            self.message = "commits.search is not supported here".into();
+            return;
+        };
+        let standing = list.query().unwrap_or_default().to_string();
+        self.search = Some(standing);
+        self.pending.clear();
+        self.sync_modes();
+    }
+
+    /// One edit to the open query, and the filter it rebuilds.
+    ///
+    /// Per keystroke and never per frame — the next frame only draws what this
+    /// already decided, which is why nothing in [`App::draw`] searches.
+    fn edit_search(&mut self, edit: Edit) {
+        let Some(query) = self.search.as_mut() else {
+            return;
+        };
+        match edit {
+            Edit::Char(c) => query.push(c),
+            Edit::Backspace => {
+                // A status line has no cursor position: both delete keys
+                // remove the last Unicode scalar, whatever it is. A long query
+                // keeps being edited whether its tail is on screen or not.
+                query.pop();
+            }
+            Edit::Paste(text) => {
+                // One paste, one edit, and never a transcript of keypresses:
+                // line breaks and tabs become spaces and other control
+                // characters are dropped, because that is what fits the one
+                // line the prompt owns. Nothing here can execute, whatever the
+                // paste held — see [`App::input`] for the door this came in.
+                query.extend(text.chars().filter_map(|c| match c {
+                    '\n' | '\r' | '\t' => Some(' '),
+                    c if c.is_control() => None,
+                    c => Some(c),
+                }));
+            }
+        }
+        // The edit is in; the borrow `query` holds ends with it. The query is
+        // copied out rather than borrowed across the call, because the list
+        // filter needs `&mut self` — a line of text, once per keystroke and
+        // never per frame, against a rebuild the filter does anyway.
+        let query = self.search.clone().unwrap_or_default();
+        self.apply_query(&query);
+    }
+
+    /// The filter `query` describes, onto the list under the prompt — an empty
+    /// one is no filter. The one place an edit, an accept or a cancel reaches
+    /// the view, so the prompt and the list stay two things: the prompt is
+    /// input, the list is data, and this is the line between them.
+    fn apply_query(&mut self, query: &str) {
+        // Disjoint field borrows, as everywhere else in this file: the query is
+        // read while the list is written.
+        let Self { stack, .. } = self;
+        if let Some(Screens::Commits(list)) = stack.last_mut() {
+            list.apply_query(query);
+        }
+    }
+
+    /// `input.accept` / `input.cancel` of the open prompt.
+    ///
+    /// Accept keeps the last edit standing — an *empty* accept is how a filter
+    /// comes off — and cancel restores the unfiltered list. Both close the
+    /// prompt and give the keyboard back.
+    fn finish_search(&mut self, accept: bool) {
+        if self.search.is_none() {
+            return;
+        }
+        if !accept {
+            self.apply_query("");
+        }
+        self.search = None;
+        self.pending.clear();
+        self.sync_modes();
+    }
+
     /// One mouse event.
     ///
     /// The whole of the routing, and it is short for the same reason [`press`]
@@ -525,9 +737,10 @@ impl App {
     /// nothing else does.
     fn mouse(&mut self, m: Mouse) {
         let (_, h) = self.screen.size();
-        // The help panel is drawn over the body, so a click that reached a view
-        // through it would act on a row it is hiding.
-        if h < 3 || self.help {
+        // The help panel and the search prompt are drawn over the body, so a
+        // click that reached a view through either would act on a row it is
+        // hiding. The keyboard gathers the query; the mouse waits.
+        if h < 3 || self.help || self.search.is_some() {
             return;
         }
         let body = 1..h - 1;
@@ -622,6 +835,14 @@ impl App {
                 self.message = format!("theme: {}", self.host.theme.name);
             }
             "commits.open-diff" => self.open_diff(),
+            // The prompt's three names, and the whole of what a search is:
+            // open it, accept it, cancel it. Each resolves through the live
+            // keymap — `commits.search` in the commits mode, the other two in
+            // `input` while the prompt stands — so `gitten.toml` moves them
+            // the way it moves everything else.
+            "commits.search" => self.begin_search(),
+            "input.accept" => self.finish_search(true),
+            "input.cancel" => self.finish_search(false),
             // The clipboard is the terminal's, not this process's — see
             // `Term::copy`. Held until the loop, which is the one place that has
             // a terminal to write to.
@@ -756,24 +977,42 @@ impl App {
             screen.paint(&mut self.screen, 1, &self.host, &mut self.runs);
         }
 
-        let status = match self.message.is_empty() {
-            true => self
-                .stack
-                .last()
-                .map(|s| s.status(&self.host))
-                .unwrap_or_default(),
-            false => self.message.clone(),
-        };
         let ink = Ink::new(c.dim, c.status_bg);
         let loud = Ink::new(c.accent, c.status_bg);
-        // The previous frame's cost, not this one's — this one has not been
-        // drawn yet, and a number measured after the fact would be describing a
-        // frame nobody saw.
-        let cost = match self.stats {
-            Some((took, cells)) => format!(" · {took:.0?} · {cells} cells"),
-            None => String::new(),
-        };
-        {
+        // While the prompt stands it owns the status row: `/`, the query, and
+        // a caret — one line, no second viewport. The live count follows in
+        // faint ink when there is room left to say it. A query longer than the
+        // row clips through the pen, and keeps being edited whether its tail
+        // is visible or not.
+        if let Some(query) = self.search.as_deref() {
+            let mut pen = self.screen.row(h - 1);
+            pen.put(" ", ink);
+            pen.put("/", loud);
+            pen.put(query, Ink::new(c.fg, c.status_bg));
+            pen.put("█", loud);
+            if pen.room() > 2 {
+                if let Some(note) = self.stack.last().and_then(Screens::filter_note) {
+                    pen.put(" · ", ink);
+                    pen.put(&note, Ink::new(c.faint, c.status_bg));
+                }
+            }
+            pen.wash(ink);
+        } else {
+            let status = match self.message.is_empty() {
+                true => self
+                    .stack
+                    .last()
+                    .map(|s| s.status(&self.host))
+                    .unwrap_or_default(),
+                false => self.message.clone(),
+            };
+            // The previous frame's cost, not this one's — this one has not been
+            // drawn yet, and a number measured after the fact would be
+            // describing a frame nobody saw.
+            let cost = match self.stats {
+                Some((took, cells)) => format!(" · {took:.0?} · {cells} cells"),
+                None => String::new(),
+            };
             let mut pen = self.screen.row(h - 1);
             pen.put(" ", ink);
             pen.put(&status, if self.message.is_empty() { ink } else { loud });
@@ -837,4 +1076,263 @@ fn title(pen: &mut Pen, host: &Host, label: &str, mode: Option<&str>) {
     pen.fill(pad, ' ', dim);
     pen.put(&hint, dim);
     pen.wash(dim);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gitten_app::acquire::{Data, Loaded};
+    use gitten_app::Started;
+    use gitten_core::parse_log;
+
+    /// Thirty commits alternating half by author and half by subject — even
+    /// rows are Ada/engine, odd rows Grace/compiler — so one query hits exactly
+    /// half of either. The same fixture the window's search tests use, spelled
+    /// for [`parse_log`], which is the door the real data arrives through.
+    fn mixed(n: usize) -> Vec<gitten_core::Commit> {
+        let log: String = (0..n)
+            .map(|i| {
+                let even = i % 2 == 0;
+                let sha = format!("{i:08}");
+                let parent = match i + 1 < n {
+                    true => format!("{:08}", i + 1),
+                    false => String::new(),
+                };
+                format!(
+                    "{sha}\x1f{sha}\x1f{parent}\x1f{}\x1f1\x1f{}\x1e",
+                    if even { "Ada Lovelace" } else { "Grace Hopper" },
+                    if even {
+                        format!("engine note {i}")
+                    } else {
+                        format!("compiler pass {i}")
+                    },
+                )
+            })
+            .collect();
+        parse_log(&log)
+    }
+
+    /// An app headlessly: every field public, no I/O, no terminal. The screen
+    /// is sized by hand, exactly as the loop would have resized it.
+    fn app(n: usize) -> App {
+        let started = Started {
+            view: View::Commits,
+            source: Source::Fixtures,
+            host: Host::new(),
+            loaded: Loaded {
+                label: "test history".into(),
+                data: Data::Commits(mixed(n)),
+            },
+            config: std::path::PathBuf::new(),
+            repo: None,
+        };
+        let mut app = App::new(started, Glyphs::default());
+        app.screen.resize(60, 12);
+        app
+    }
+
+    /// The commits list, which every search test is about.
+    fn list(app: &App) -> &Commits {
+        match app.stack.last() {
+            Some(Screens::Commits(list)) => list,
+            _ => panic!("the commits list is not on screen"),
+        }
+    }
+
+    /// The bottom row of the last drawn frame — the status row the prompt owns.
+    fn status(app: &App) -> String {
+        app.screen.row_text(app.screen.size().1 - 1)
+    }
+
+    /// The body of the last drawn frame, one string per row.
+    fn body(app: &App) -> Vec<String> {
+        let h = app.screen.size().1;
+        (1..h - 1).map(|y| app.screen.row_text(y)).collect()
+    }
+
+    fn type_(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.press(Key::char(c));
+        }
+    }
+
+    #[test]
+    fn slash_types_live_on_the_status_line_and_enter_keeps_the_filter() {
+        let mut app = app(30);
+        app.press(Key::char('/'));
+        assert!(app.search.is_some(), "the prompt did not open");
+        type_(&mut app, "engine");
+        app.draw();
+        assert!(status(&app).contains("/engine"), "{:?}", status(&app));
+        // The filter is live while the prompt stands: fifteen of the thirty,
+        // and only those drawn.
+        assert_eq!(list(&app).filter_note().as_deref(), Some("15/30"));
+        let rows = body(&app);
+        assert!(rows.iter().any(|r| r.contains("engine note 0")), "{rows:?}");
+        assert!(
+            rows.iter().all(|r| !r.contains("compiler")),
+            "a filtered-out row is drawn: {rows:?}"
+        );
+        // Enter closes the prompt and keeps the last edit standing.
+        app.press(Key::plain(Code::Enter));
+        assert!(app.search.is_none());
+        assert_eq!(list(&app).filter_note().as_deref(), Some("15/30"));
+        app.draw();
+        assert!(
+            !status(&app).contains("/engine"),
+            "the prompt is gone; only the filter stands"
+        );
+    }
+
+    #[test]
+    fn escape_cancels_and_a_second_slash_prefills_the_standing_query() {
+        let mut app = app(30);
+        app.press(Key::char('/'));
+        type_(&mut app, "engine");
+        app.press(Key::plain(Code::Enter));
+        assert_eq!(list(&app).filter_note().as_deref(), Some("15/30"));
+
+        // A second `/` finds the query as the first one left it.
+        app.press(Key::char('/'));
+        assert_eq!(app.search.as_deref(), Some("engine"));
+        app.draw();
+        assert!(status(&app).contains("/engine"), "{:?}", status(&app));
+        // Cancel — the edit never stood, and the whole list comes back.
+        app.press(Key::plain(Code::Esc));
+        assert!(app.search.is_none());
+        assert_eq!(list(&app).filter_note(), None);
+        app.draw();
+        assert!(
+            body(&app).iter().any(|r| r.contains("compiler")),
+            "cancel did not restore the list"
+        );
+
+        // An accepted empty query removes the filter too: it is the same door
+        // out, reached by keeping an empty prompt.
+        app.press(Key::char('/'));
+        assert_eq!(app.search.as_deref(), Some(""));
+        app.press(Key::plain(Code::Enter));
+        assert!(app.search.is_none());
+        app.press(Key::char('/'));
+        type_(&mut app, "compiler");
+        app.press(Key::plain(Code::Enter));
+        assert_eq!(list(&app).filter_note().as_deref(), Some("15/30"));
+    }
+
+    #[test]
+    fn question_mark_is_text_in_input_mode_and_help_outside_it() {
+        // The collision the exact-mode rule exists for: the shipped `?` is a
+        // global binding, and a prompt that resolved the full stack would open
+        // help with every character you typed.
+        let mut app = app(30);
+        app.press(Key::char('?'));
+        assert!(app.help, "help did not open while no prompt stood");
+        app.press(Key::char('?'));
+        assert!(!app.help);
+
+        app.press(Key::char('/'));
+        app.press(Key::char('?'));
+        assert!(!app.help, "help opened over the prompt");
+        assert_eq!(app.search.as_deref(), Some("?"), "the ? was not text");
+        // The same for the other printable global: `q` quits nothing here.
+        app.press(Key::char('q'));
+        assert!(!app.quit);
+        assert_eq!(app.search.as_deref(), Some("?q"));
+        app.draw();
+        assert!(status(&app).contains("/?q"), "{:?}", status(&app));
+    }
+
+    #[test]
+    fn pasted_commands_are_query_text_only_while_input_is_open() {
+        // One paste, one edit, through the same [`App::input`] the loop uses —
+        // and never a key: the pasted `q` and `?` are characters in a string,
+        // the keymap is never consulted, and nothing executes between lines.
+        let mut open = app(30);
+        open.press(Key::char('/'));
+        open.input(Input::Paste("q?\nengine\tb".into()));
+        assert!(!open.quit, "a pasted q quit");
+        assert!(!open.help, "a pasted ? opened help");
+        assert_eq!(
+            open.search.as_deref(),
+            Some("q? engine b"),
+            "the paste did not arrive as one sanitized edit"
+        );
+        // It never became commands, but it did become a query: one that
+        // matches nothing, which is the filter doing what the text says.
+        assert_eq!(list(&open).filter_note().as_deref(), Some("0/30"));
+        open.draw();
+        assert!(
+            status(&open).contains("/q? engine b"),
+            "{:?}",
+            status(&open)
+        );
+
+        // With no prompt there is nowhere for a paste to go: it is dropped
+        // whole, and nothing in the app moves.
+        let mut quiet = app(30);
+        quiet.input(Input::Paste("q?".into()));
+        assert!(!quiet.quit);
+        assert!(!quiet.help);
+        assert_eq!(quiet.search.as_deref(), None);
+        assert!(quiet.pending.is_empty());
+        assert_eq!(list(&quiet).filter_note(), None);
+    }
+
+    #[test]
+    fn configured_input_bindings_and_chords_own_the_pending_buffer() {
+        // Exactly what `[keys.input]` would write: the shipped Enter unbound,
+        // accept on another key, and a two-key chord for cancel — the chord is
+        // what exercises `Resolve::Pending`, which a single key never reaches.
+        let mut app = app(30);
+        app.host.keys.unbind(INPUT, "enter");
+        app.host
+            .keys
+            .bind(INPUT, "ctrl-s", "input.accept")
+            .expect("test binding");
+        app.host
+            .keys
+            .bind(INPUT, "alt-x alt-z", "input.cancel")
+            .expect("test binding");
+        app.press(Key::char('/'));
+        type_(&mut app, "engine");
+
+        // The unbound Enter is now an unclaimed key in the input mode: it
+        // edits nothing, and it must not fall through to the globals either.
+        app.press(Key::plain(Code::Enter));
+        assert!(app.search.is_some(), "the unbound enter closed the prompt");
+        assert_eq!(app.search.as_deref(), Some("engine"));
+
+        // The configured accept key closes it, filter standing.
+        app.press(Key::ctrl(Code::Char('s')));
+        assert!(app.search.is_none());
+        assert_eq!(list(&app).filter_note().as_deref(), Some("15/30"));
+        assert!(app.pending.is_empty(), "the buffer did not clear on finish");
+
+        // The chord's first key waits for its continuation and touches nothing.
+        app.press(Key::char('/'));
+        let alt_x = Key::new(Code::Char('x'), false, true, false);
+        let alt_z = Key::new(Code::Char('z'), false, true, false);
+        app.press(alt_x);
+        assert_eq!(
+            app.search.as_deref(),
+            Some("engine"),
+            "a pending chord edited"
+        );
+        assert_eq!(
+            chord_string(&app.pending),
+            "alt-x",
+            "the chord did not wait"
+        );
+        // An invalid continuation drops the buffer rather than replaying it as
+        // text; the character typed is still text.
+        app.press(Key::char('q'));
+        assert_eq!(app.search.as_deref(), Some("engineq"));
+        assert!(app.pending.is_empty());
+        // Completed, the chord cancels: the list is whole again.
+        app.press(alt_x);
+        app.press(alt_z);
+        assert!(app.search.is_none());
+        assert_eq!(list(&app).filter_note(), None);
+        assert!(app.pending.is_empty());
+    }
 }
