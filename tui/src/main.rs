@@ -1154,3 +1154,508 @@ fn title(pen: &mut Pen, host: &Host, label: &str, mode: Option<&str>) {
     pen.put(&hint, dim);
     pen.wash(dim);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gitten_core::command::Code;
+    use gitten_core::parse_unified_diff;
+    use gitten_core::status::Status;
+    use gitten_core::Commit;
+    use gitten_git::{Handle, Pair, Repo};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// The unedited side, and the edited sides: `which` bit-flags the two
+    /// edits into existence — 0 neither, 1 the first, 2 the second, 3 both.
+    fn side(which: usize) -> Vec<Arc<str>> {
+        (0..40usize)
+            .map(|i| match (which & 1 != 0, i) {
+                (true, 4) => Arc::<str>::from("EDIT ONE"),
+                _ => match (which & 2 != 0, i) {
+                    (true, 34) => Arc::<str>::from("EDIT TWO"),
+                    _ => Arc::<str>::from(format!("line {i}").as_str()),
+                },
+            })
+            .collect()
+    }
+
+    fn pair(path: &str, old: Vec<Arc<str>>, new: Vec<Arc<str>>) -> Pair {
+        Pair {
+            path: path.to_string(),
+            old_path: None,
+            status: 'M',
+            old,
+            new,
+            old_oid: None,
+            new_oid: None,
+            binary: false,
+        }
+    }
+
+    /// The working-tree diff the fake answers with before anything lands:
+    /// two hunks, one per edit, under one file.
+    const HUNK_DIFF: &str = "\
+diff --git a/new.txt b/new.txt
+--- /dev/null
++++ b/new.txt
+@@ -0,0 +1,2 @@
++created
++lines
+diff --git a/tracked.txt b/tracked.txt
+--- a/tracked.txt
++++ b/tracked.txt
+@@ -5,0 +6,1 @@
++inserted
+";
+
+    #[derive(Default)]
+    struct FakeState {
+        /// What `pairs` answers before and after the first write lands —
+        /// the world the refresh is supposed to re-read.
+        before: Vec<Pair>,
+        after: Vec<Pair>,
+        applied: usize,
+        /// Patches beginning with one of these are refused: a job that
+        /// fails, without failing the queue.
+        refuses: Vec<Vec<u8>>,
+        /// Every write that reached the repository, recorded.
+        writes: Vec<String>,
+        pairs_reads: usize,
+        log_reads: usize,
+        untracked: Vec<Vec<u8>>,
+    }
+
+    /// A repository that exists only as this struct. Reads answer what the
+    /// test handed in; writes are recorded and — when they land — change
+    /// what the next read answers, which is what lets a test observe a
+    /// refresh reading the world after the write. No process, no tty, no
+    /// window, and nothing recorded is a real repository.
+    struct FakeRepo(Arc<Mutex<FakeState>>);
+
+    fn three_commits() -> Vec<Commit> {
+        ["one", "two", "three"]
+            .map(|sha| Commit {
+                sha: sha.into(),
+                short: sha.into(),
+                parents: Box::from(&[][..]),
+                author: "Ada Lovelace".into(),
+                timestamp: 1,
+                subject: format!("commit {sha}"),
+            })
+            .to_vec()
+    }
+
+    impl Repo for FakeRepo {
+        fn log(&self, _limit: usize) -> gitten_git::Result<Vec<Commit>> {
+            let mut s = self.0.lock().unwrap();
+            s.log_reads += 1;
+            Ok(three_commits())
+        }
+
+        fn pairs(&self, _revspec: &str) -> gitten_git::Result<Vec<Pair>> {
+            let mut s = self.0.lock().unwrap();
+            s.pairs_reads += 1;
+            Ok(match s.applied {
+                0 => s.before.clone(),
+                _ => s.after.clone(),
+            })
+        }
+
+        fn status(&self) -> gitten_git::Result<Status> {
+            let s = self.0.lock().unwrap();
+            Ok(Status {
+                untracked: s
+                    .untracked
+                    .iter()
+                    .map(|p| gitten_core::status::UntrackedEntry {
+                        path: gitten_core::status::PathBytes::from_bytes(p),
+                    })
+                    .collect(),
+                ..Status::default()
+            })
+        }
+
+        fn describe(&self) -> String {
+            "fake (main)".into()
+        }
+
+        fn stage_patch(&self, patch: &[u8]) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            s.writes
+                .push(format!("stage {}", String::from_utf8_lossy(patch)));
+            if s.refuses.iter().any(|r| patch.starts_with(r)) {
+                return Err("the fake refused".into());
+            }
+            s.applied += 1;
+            Ok(())
+        }
+
+        fn unstage_patch(&self, patch: &[u8]) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            s.writes
+                .push(format!("unstage {}", String::from_utf8_lossy(patch)));
+            s.applied += 1;
+            Ok(())
+        }
+    }
+
+    /// The fake's working-tree world: one file, both edits, untracked list
+    /// as given. OIDs are `None` — a worktree pair never caches, so no test
+    /// ever reads a neighbour's answer.
+    fn fake(untracked: &[&str]) -> (Handle, Arc<Mutex<FakeState>>) {
+        let state = Arc::new(Mutex::new(FakeState {
+            before: vec![pair("f.txt", side(0), side(3))],
+            after: vec![pair("f.txt", side(0), side(2))],
+            refuses: vec![b"refuse".to_vec()],
+            untracked: untracked.iter().map(|u| u.as_bytes().to_vec()).collect(),
+            ..Default::default()
+        }));
+        (Arc::new(FakeRepo(Arc::clone(&state))), state)
+    }
+
+    /// An application on one diff screen, from a hand-built `Started`: no
+    /// arguments, no config file, and no terminal — the frame is an
+    /// in-memory `Screen`, which is the whole of what the draw path needs.
+    fn app_on_diff(source: Source, repo: Option<Handle>) -> App {
+        let started = gitten_app::Started {
+            view: View::Diff,
+            source,
+            host: Host::new(),
+            loaded: acquire::Loaded {
+                label: "fake".into(),
+                data: Data::Diff(parse_unified_diff(HUNK_DIFF)),
+            },
+            config: std::path::PathBuf::from("/nonexistent/gitten.toml"),
+            repo,
+        };
+        let mut app = App::new(started, Glyphs::default());
+        app.screen = Screen::new(60, 24);
+        app
+    }
+
+    /// The same, on a repository: the diff the app opens on is what *this*
+    /// handle answers, acquired through the front door, so a refresh
+    /// re-reading the same handle lands on comparable data.
+    fn app_on_fake(source: &Source, handle: &Handle) -> App {
+        let host = Host::new();
+        let loaded =
+            acquire::acquire(View::Diff, source, &host, Some(handle.as_ref())).expect("changes");
+        let started = gitten_app::Started {
+            view: View::Diff,
+            source: source.clone(),
+            host,
+            loaded,
+            config: std::path::PathBuf::from("/nonexistent/gitten.toml"),
+            repo: Some(handle.clone()),
+        };
+        let mut app = App::new(started, Glyphs::default());
+        app.screen = Screen::new(60, 24);
+        app
+    }
+
+    /// `row` keypresses down, one at a time — the same `view.down` the key
+    /// sends, so the cursor lands where the keyboard would have put it.
+    fn move_to(app: &mut App, row: usize) {
+        app.dispatch("view.top");
+        for _ in 0..row {
+            app.dispatch("view.down");
+        }
+    }
+
+    /// Waits for the queue to finish what was submitted, draining as the
+    /// loop would. Bounded, because a broken queue must fail the test and
+    /// not hang it.
+    fn until(deadline: Duration, mut done: impl FnMut() -> bool) -> bool {
+        let end = std::time::Instant::now() + deadline;
+        while std::time::Instant::now() < end {
+            if done() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        false
+    }
+
+    #[test]
+    fn shared_defaults_reach_terminal_dispatch() {
+        // The two names exist under the shipped bindings, and the terminal
+        // resolves them through the same builtin keymap every client reads.
+        let mut modes = Modes::new();
+        modes.push("diff");
+        let keys = Host::new().keys;
+        assert_eq!(
+            keys.resolve(&modes, &[Key::plain(Code::Char(' '))]),
+            Resolve::Run("diff.stage-hunk")
+        );
+        assert_eq!(
+            keys.resolve(&modes, &[Key::plain(Code::Char('u'))]),
+            Resolve::Run("diff.unstage-hunk")
+        );
+
+        // And the dispatch itself answers both, with no local key table
+        // anywhere in this client: the refusal is the repository's, which is
+        // what "the name reached the verb" looks like.
+        let mut app = app_on_diff(
+            Source::Repo {
+                path: std::path::PathBuf::from("/fake"),
+                arg: String::new(),
+            },
+            None,
+        );
+        app.press(Key::plain(Code::Char(' ')));
+        assert_eq!(app.message, "no repository is open");
+        app.press(Key::plain(Code::Char('u')));
+        assert_eq!(app.message, "no repository is open");
+        // A binding under `[keys.diff]` in `gitten.toml` rides the same path.
+        app.host.keys.bind("diff", "p", "diff.stage-hunk").unwrap();
+        app.press(Key::plain(Code::Char('p')));
+        assert_eq!(app.message, "no repository is open");
+    }
+
+    #[test]
+    fn non_working_tree_and_untracked_hunks_are_refused_before_submission() {
+        // Every refusal below names itself in the window's words, and not
+        // one of them reaches the queue.
+        let said = |source: Source, repo: Option<Handle>, row: usize| {
+            let mut app = app_on_diff(source, repo);
+            move_to(&mut app, row);
+            app.dispatch("diff.stage-hunk");
+            (app.message.clone(), app)
+        };
+
+        let (message, _) = said(
+            Source::Repo {
+                path: std::path::PathBuf::from("/fake"),
+                arg: "HEAD~1..HEAD".into(),
+            },
+            None,
+            1,
+        );
+        assert_eq!(
+            message,
+            "only the working-tree diff can act on hunks — this one is between commits"
+        );
+
+        let (message, _) = said(Source::Fixtures, None, 1);
+        assert_eq!(message, "a fixture has no repository behind it");
+
+        let (message, _) = said(Source::Patch { file: None }, None, 1);
+        assert_eq!(message, "a patch file has no repository behind it");
+
+        let (message, _) = said(
+            Source::Repo {
+                path: std::path::PathBuf::from("/fake"),
+                arg: String::new(),
+            },
+            None,
+            1,
+        );
+        assert_eq!(message, "no repository is open");
+
+        let (handle, _state) = fake(&[]);
+        let (message, _) = said(
+            Source::Repo {
+                path: std::path::PathBuf::from("/fake"),
+                arg: String::new(),
+            },
+            Some(handle),
+            0,
+        );
+        assert_eq!(message, "the keyboard is not on a hunk");
+
+        // An untracked creation is refused by name — and the refusal names
+        // the pane that serves whole-file verbs, because a patch cannot
+        // carry the mode `git apply --cached` would need.
+        let (handle, state) = fake(&["new.txt"]);
+        let (message, _) = said(
+            Source::Repo {
+                path: std::path::PathBuf::from("/fake"),
+                arg: String::new(),
+            },
+            Some(handle),
+            1,
+        );
+        assert_eq!(
+            message,
+            "that hunk adds a new file — stage or unstage it whole from the files pane"
+        );
+        assert!(
+            state.lock().unwrap().writes.is_empty(),
+            "a refusal queued a write"
+        );
+
+        // The plausible wrong refusal: this hunk is *also* every line an
+        // addition, but the file is tracked — `[diff] context = 0` makes a
+        // mid-file insertion look exactly like a creation, and geometry
+        // alone does not decide which it is.
+        let (handle, state) = fake(&["new.txt"]);
+        let (message, app) = said(
+            Source::Repo {
+                path: std::path::PathBuf::from("/fake"),
+                arg: String::new(),
+            },
+            Some(handle),
+            6,
+        );
+        assert!(message.is_empty(), "{message}");
+        assert!(
+            until(Duration::from_secs(2), || {
+                !state.lock().unwrap().writes.is_empty()
+            }),
+            "the tracked insertion never reached the repository"
+        );
+        let writes = state.lock().unwrap().writes.clone();
+        assert_eq!(writes.len(), 1, "{writes:?}");
+        assert!(writes[0].starts_with("stage "), "{writes:?}");
+        // The one that landed is the only write the whole table produced:
+        // every refusal above left the queue untouched.
+        assert!(
+            app.submitter.submit(Box::new(Dead)).is_ok(),
+            "the queue still runs"
+        );
+    }
+
+    /// A job that does nothing, for probing the queue's liveness.
+    struct Dead;
+    impl Job for Dead {
+        fn name(&self) -> &str {
+            "dead"
+        }
+        fn run(self: Box<Self>) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn every_finished_generation_refreshes_both_stacked_screens() {
+        let (handle, state) = fake(&[]);
+        let started = gitten_app::Started {
+            view: View::Commits,
+            source: Source::Repo {
+                path: std::path::PathBuf::from("/fake"),
+                arg: String::new(),
+            },
+            host: Host::new(),
+            loaded: acquire::Loaded {
+                label: "fake".into(),
+                data: Data::Commits(three_commits()),
+            },
+            config: std::path::PathBuf::from("/nonexistent/gitten.toml"),
+            repo: Some(Arc::new(FakeRepo(Arc::clone(&state)))),
+        };
+        let mut app = App::new(started, Glyphs::default());
+        app.screen = Screen::new(60, 24);
+        // Open the diff: the stack is a commit list with a diff on top of
+        // it, and the commit list is the hidden one the refresh must not
+        // forget.
+        app.dispatch("commits.open-diff");
+        assert_eq!(app.stack.len(), 2);
+        assert!(matches!(app.stack[0], Screens::Commits { .. }));
+        assert!(matches!(app.stack[1], Screens::Diff { .. }));
+        let open_reads = state.lock().unwrap().pairs_reads;
+
+        // One job that lands and one that is refused — both finish, and
+        // both finishes must stale the whole stack.
+        let first = Write::stage_patch(&handle, b"first".to_vec()).expect("a non-empty patch");
+        assert!(app.submitter.submit(Box::new(first)).is_ok(), "queued");
+        let second = Write::stage_patch(&handle, b"refuse-me".to_vec()).expect("a non-empty patch");
+        assert!(app.submitter.submit(Box::new(second)).is_ok(), "queued");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                let s = state.lock().unwrap();
+                s.log_reads >= 2 && s.pairs_reads >= open_reads + 2
+            }),
+            "the queue never finished both jobs"
+        );
+
+        let s = state.lock().unwrap();
+        // One re-acquire per screen per finish: the commit list is the
+        // hidden screen, and it was refreshed exactly as often as the diff.
+        assert_eq!(s.log_reads, 2, "{}", s.writes.len());
+        assert_eq!(s.pairs_reads, open_reads + 2, "{}", s.log_reads);
+        assert_eq!(s.writes.len(), 2, "{}", s.log_reads);
+        // The refusal is the message; the success's evidence is the screen.
+        assert_eq!(app.message, "the fake refused");
+        // And the generation the queue advanced to is the one every screen
+        // was refreshed against — a refusal's as much as a success's.
+        assert!(app.generation > Generation::default());
+        for screen in &app.stack {
+            assert_eq!(screen.generation(), app.generation);
+        }
+    }
+
+    #[test]
+    fn a_refreshed_frame_is_drawable_headlessly() {
+        let (handle, state) = fake(&[]);
+        let source = Source::Repo {
+            path: std::path::PathBuf::from("/fake"),
+            arg: String::new(),
+        };
+        let mut app = app_on_fake(&source, &handle);
+        // The keyboard is on the first hunk — the one about to be staged.
+        move_to(&mut app, 2);
+        let (path, hunk) = {
+            let Some(Screens::Diff { view, .. }) = app.stack.last() else {
+                panic!("a diff is on top");
+            };
+            view.current_hunk().expect("the keyboard is on a hunk")
+        };
+        assert_eq!(path, "f.txt");
+        let patch = gitten_core::patch::emit(&path, &[&hunk]);
+        // What the fake will be asked to apply is exactly the chosen hunk's
+        // edit and not its distant neighbour's.
+        let applied = parse_unified_diff(&String::from_utf8_lossy(&patch));
+        let changed: Vec<&str> = applied[0]
+            .hunks
+            .iter()
+            .flat_map(|h| &h.lines)
+            .filter(|l| l.kind != gitten_core::LineKind::Context)
+            .map(|l| l.text.as_ref())
+            .collect();
+        assert_eq!(changed, ["line 4", "EDIT ONE"]);
+
+        app.dispatch("diff.stage-hunk");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                !state.lock().unwrap().writes.is_empty()
+            }),
+            "the staged hunk never reached the repository"
+        );
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > Generation::default()
+            }),
+            "the finish was never drained"
+        );
+
+        // The frame the refreshed state produces: the staged hunk is gone
+        // from the diff the fake now answers with, the surviving hunk is
+        // still drawn, and the cursor is a row of the body and not of the
+        // chrome.
+        app.draw();
+        let (w, h) = app.screen.size();
+        let frame: Vec<String> = (0..h).map(|y| app.screen.row_text(y)).collect();
+        assert!(
+            frame.iter().any(|row| row.contains("EDIT TWO")),
+            "the surviving hunk vanished: {frame:?}"
+        );
+        assert!(
+            frame.iter().all(|row| !row.contains("EDIT ONE")),
+            "a staged hunk is still on screen: {frame:?}"
+        );
+        let bar = app.host.theme.chrome.selection_bg;
+        let lit: Vec<usize> = (0..h)
+            .filter(|y| app.screen.ink(0, *y).is_some_and(|ink| ink.bg == bar))
+            .collect();
+        assert_eq!(lit.len(), 1, "{lit:?}");
+        assert!(
+            lit[0] >= 1 && lit[0] < h - 1,
+            "the cursor lit the chrome, not the body: {lit:?}"
+        );
+        let _ = w;
+    }
+}
