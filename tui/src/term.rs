@@ -57,7 +57,7 @@ use std::time::Duration;
 /// `core`'s idea of a keypress at the edge, and everything inland — the keymap,
 /// the modes, `gitten.toml` — is shared with every other client. A second client
 /// on a second platform writes this function and nothing else.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Input {
     /// A keypress — and a wheel notch, which [`Code`] holds a variant for and
     /// which therefore needs nothing here. That is the point of it arriving as a
@@ -74,6 +74,14 @@ pub enum Input {
     Mouse(Mouse),
     /// The terminal changed size. Carries the new one, so nothing has to ask.
     Resize(usize, usize),
+    /// A bracketed paste, whole and unedited.
+    ///
+    /// Text, and deliberately not a sequence of [`Key`]s: the negotiation in
+    /// [`Term::enter`] means the emulator hands the whole paste over as one
+    /// event, so a pasted `q` is a character in a string and never a keypress
+    /// the keymap could resolve. Whether the text has anywhere to go is the
+    /// caller's decision — see `App::input` — and it is never made here.
+    Paste(String),
 }
 
 /// What the pointer did, in cells of the terminal.
@@ -247,15 +255,16 @@ impl Term {
     /// The next input, or `None` if nothing arrived within `timeout`.
     ///
     /// Because bracketed paste is negotiated in [`Term::enter`], an emulator
-    /// delivers a paste as one [`Event`] variant that [`translate_event`]
-    /// drops — `q` inside a pasted paragraph cannot quit anything, where
+    /// delivers a paste as one [`Event::Paste`], which leaves here as one
+    /// [`Input::Paste`] — the text whole, and never a sequence of keys. A pasted
+    /// `q` inside a paragraph is a character for the caller to place, where
     /// without the negotiation it would be typed into the keymap character by
-    /// character. Anything else that is not a keypress, a wheel notch, a left
-    /// button or a resize — a focus change, the right button — is skipped
-    /// rather than surfaced, so a caller gets `None` on a timeout and nothing
-    /// else. Key *release* events are skipped too: terminals with the kitty
-    /// protocol on report both, and acting on each is every binding firing
-    /// twice.
+    /// character and could quit something. Anything else that is not a keypress,
+    /// a wheel notch, a left button or a resize — a focus change, the right
+    /// button — is skipped rather than surfaced, so a caller gets `None` on a
+    /// timeout and nothing else. Key *release* events are skipped too: terminals
+    /// with the kitty protocol on report both, and acting on each is every
+    /// binding firing twice.
     pub fn poll(timeout: Duration) -> io::Result<Option<Input>> {
         if !event::poll(timeout)? {
             return Ok(None);
@@ -302,22 +311,25 @@ fn base64(bytes: &[u8]) -> String {
 
 /// Which events are inputs at all.
 ///
-/// Anything that is not a keypress, a wheel notch, a left button or a resize — a
-/// focus change, a bracketed paste, a horizontal wheel — is dropped, so a caller
-/// sees `None` for a timeout and for noise alike. Key *release* events are
-/// dropped too: terminals with the kitty protocol on report both, and acting on
-/// each is every binding firing twice.
+/// Anything that is not a keypress, a wheel notch, a left button, a resize or a
+/// paste — a focus change, a horizontal wheel — is dropped, so a caller sees
+/// `None` for a timeout and for noise alike. Key *release* events are dropped
+/// too: terminals with the kitty protocol on report both, and acting on each is
+/// every binding firing twice.
 ///
-/// Separate from [`Term::poll`] so it can be tested without a terminal, which is
-/// the same reason every other module in this crate can be.
+/// A paste leaves as one [`Input::Paste`]: text the caller owns, and never a
+/// sequence of keys the keymap could resolve. Separate from [`Term::poll`] so it
+/// can be tested without a terminal, which is the same reason every other module
+/// in this crate can be.
 fn translate_event(event: Event) -> Option<Input> {
     match event {
         Event::Resize(w, h) => Some(Input::Resize(w as usize, h as usize)),
         Event::Key(k) if k.kind != KeyEventKind::Release => translate(k),
         Event::Mouse(m) => mouse(m),
-        // A bracketed paste lands here as `Event::Paste` and is dropped on
-        // purpose: the app takes no text input anywhere, so the correct thing
-        // to do with a paste is nothing.
+        // A bracketed paste lands here whole. It goes out as text and as
+        // nothing else: turning it into keypresses is what would let a pasted
+        // `q` quit, and this is the line that makes that impossible to write.
+        Event::Paste(text) => Some(Input::Paste(text)),
         _ => None,
     }
 }
@@ -579,11 +591,35 @@ mod tests {
     }
 
     #[test]
-    fn a_paste_is_not_an_input() {
-        // Pinned because the app takes no text input, so a paste handler here
-        // would be a pasted `q` quitting — removing the negotiation or adding
-        // one on purpose should fail loudly, not silently.
-        assert_eq!(translate_event(Event::Paste("q".into())), None);
+    fn a_paste_is_one_text_input_and_never_a_key_sequence() {
+        // Bracketed paste is negotiated on purpose, and this is the pin: the
+        // emulator hands the whole paste over as one event, and it leaves here
+        // as one inert piece of text — the original string, unedited. A pasted
+        // `q` is a character in it, and the keymap never sees a thing.
+        let got = match translate_event(Event::Paste("q?\nengine".into())) {
+            Some(Input::Paste(text)) => text,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(got, "q?\nengine", "the paste did not arrive whole");
+    }
+
+    #[test]
+    fn slash_arrives_as_cores_plain_character_key() {
+        // `/` is a character like `j` — no special case anywhere in this file.
+        // What it means is the keymap's business, which is why the search can
+        // open through it without this module knowing search exists.
+        assert_eq!(
+            translate_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('/'),
+                KeyModifiers::NONE
+            ))),
+            Some(Input::Key(Key::char('/')))
+        );
+        let map = Keymap::builtin();
+        let mut modes = Modes::new();
+        modes.push("commits");
+        let press = [Key::char('/')];
+        assert_eq!(map.resolve(&modes, &press), Resolve::Run("commits.search"));
     }
 
     #[test]

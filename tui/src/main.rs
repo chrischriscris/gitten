@@ -319,13 +319,16 @@ impl Screens {
 }
 
 /// One edit to the open query, already reduced to text by whoever routed the
-/// event: a character typed, or a character removed. The prompt never sees an
-/// event, so a key is either claimed by a binding or it is text.
+/// event: a character typed, a character removed, or a paste's worth. The
+/// prompt never sees an event, so a pasted `q` is the character `q` and the
+/// keymap never learns a paste happened.
 enum Edit {
     Char(char),
     /// Backspace or Delete — both remove backwards, because a status-line
     /// prompt has no cursor position to delete from.
     Backspace,
+    /// A bracketed paste, sanitized on its way in.
+    Paste(String),
 }
 
 struct App {
@@ -489,12 +492,13 @@ impl App {
             }
 
             match Term::poll(TICK)? {
-                Some(Input::Key(key)) => self.press(key),
-                Some(Input::Mouse(m)) => self.mouse(m),
+                // A resize stays in the loop, which keeps the size it compares
+                // against; every other event routes through [`App::input`].
                 Some(Input::Resize(w, h)) => {
                     size = (w, h);
                     self.screen.resize(w, h);
                 }
+                Some(input) => self.input(input),
                 // A tick. The only thing it is for.
                 None => {
                     if dirty.swap(false, Ordering::Relaxed) {
@@ -504,6 +508,27 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    /// One event, routed: a key, a mouse gesture, or a paste.
+    ///
+    /// [`App::run`] and the headless tests meet here, so both exercise the same
+    /// Key/Paste decision and neither has to own a terminal to do it. A resize
+    /// is the loop's, which is the one event that carries no decision.
+    fn input(&mut self, input: Input) {
+        match input {
+            Input::Key(key) => self.press(key),
+            Input::Mouse(m) => self.mouse(m),
+            // A paste is text, and only while a prompt stands is there anywhere
+            // for it to go. It is never a key: pasted `q`, `?` and Enter are
+            // characters, and the keymap never sees them.
+            Input::Paste(text) if self.search.is_some() => self.edit_search(Edit::Paste(text)),
+            // No prompt, no text input anywhere — the paste is dropped whole,
+            // the same nothing `translate_event` returned before there was a
+            // prompt to take one.
+            Input::Paste(_) => {}
+            Input::Resize(..) => {}
+        }
     }
 
     /// Re-reads the config file.
@@ -651,6 +676,18 @@ impl App {
                 // remove the last Unicode scalar, whatever it is. A long query
                 // keeps being edited whether its tail is on screen or not.
                 query.pop();
+            }
+            Edit::Paste(text) => {
+                // One paste, one edit, and never a transcript of keypresses:
+                // line breaks and tabs become spaces and other control
+                // characters are dropped, because that is what fits the one
+                // line the prompt owns. Nothing here can execute, whatever the
+                // paste held — see [`App::input`] for the door this came in.
+                query.extend(text.chars().filter_map(|c| match c {
+                    '\n' | '\r' | '\t' => Some(' '),
+                    c if c.is_control() => None,
+                    c => Some(c),
+                }));
             }
         }
         // The edit is in; the borrow `query` holds ends with it. The query is
@@ -1203,6 +1240,42 @@ mod tests {
         assert_eq!(app.search.as_deref(), Some("?q"));
         app.draw();
         assert!(status(&app).contains("/?q"), "{:?}", status(&app));
+    }
+
+    #[test]
+    fn pasted_commands_are_query_text_only_while_input_is_open() {
+        // One paste, one edit, through the same [`App::input`] the loop uses —
+        // and never a key: the pasted `q` and `?` are characters in a string,
+        // the keymap is never consulted, and nothing executes between lines.
+        let mut open = app(30);
+        open.press(Key::char('/'));
+        open.input(Input::Paste("q?\nengine\tb".into()));
+        assert!(!open.quit, "a pasted q quit");
+        assert!(!open.help, "a pasted ? opened help");
+        assert_eq!(
+            open.search.as_deref(),
+            Some("q? engine b"),
+            "the paste did not arrive as one sanitized edit"
+        );
+        // It never became commands, but it did become a query: one that
+        // matches nothing, which is the filter doing what the text says.
+        assert_eq!(list(&open).filter_note().as_deref(), Some("0/30"));
+        open.draw();
+        assert!(
+            status(&open).contains("/q? engine b"),
+            "{:?}",
+            status(&open)
+        );
+
+        // With no prompt there is nowhere for a paste to go: it is dropped
+        // whole, and nothing in the app moves.
+        let mut quiet = app(30);
+        quiet.input(Input::Paste("q?".into()));
+        assert!(!quiet.quit);
+        assert!(!quiet.help);
+        assert_eq!(quiet.search.as_deref(), None);
+        assert!(quiet.pending.is_empty());
+        assert_eq!(list(&quiet).filter_note(), None);
     }
 
     #[test]
