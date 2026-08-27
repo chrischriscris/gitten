@@ -1536,7 +1536,11 @@ impl App {
             for pane in panes.iter_mut() {
                 if let Some(result) = pane.refresh(target, host, repo.as_ref()) {
                     if result.is_err() {
-                        first = result.err().or(first);
+                        // The *first* failure stands, as the contract above
+                        // says: a later pane's error never overwrites an
+                        // earlier one — registration order decides, and the
+                        // reader met that pane first.
+                        first = first.or(result.err());
                     }
                 }
             }
@@ -2620,6 +2624,11 @@ diff --git a/tracked.txt b/tracked.txt
         pairs_reads: usize,
         log_reads: usize,
         untracked: Vec<Vec<u8>>,
+        /// When set, the next log (or pairs) read fails with exactly this
+        /// message — so two panes can fail *simultaneously*, each in its own
+        /// words, and a test can name which of the two errors stood.
+        fail_log: Option<String>,
+        fail_pairs: Option<String>,
     }
 
     /// A repository that exists only as this struct. Reads answer what the
@@ -2646,12 +2655,18 @@ diff --git a/tracked.txt b/tracked.txt
         fn log(&self, _limit: usize) -> gitten_git::Result<Vec<Commit>> {
             let mut s = self.0.lock().unwrap();
             s.log_reads += 1;
+            if let Some(message) = s.fail_log.clone() {
+                return Err(message);
+            }
             Ok(three_commits())
         }
 
         fn pairs(&self, _revspec: &str) -> gitten_git::Result<Vec<Pair>> {
             let mut s = self.0.lock().unwrap();
             s.pairs_reads += 1;
+            if let Some(message) = s.fail_pairs.clone() {
+                return Err(message);
+            }
             Ok(match s.applied {
                 0 => s.before.clone(),
                 _ => s.after.clone(),
@@ -2939,6 +2954,58 @@ diff --git a/tracked.txt b/tracked.txt
         app.press(Key::plain(Code::Esc));
         assert_eq!(app.panes.focused_name(), "diff");
         assert_eq!(app.panes.names().count(), 1, "esc invented a pane");
+    }
+
+    #[test]
+    fn the_empty_diff_pane_refuses_hunk_verbs_until_enter_replaces_it() {
+        // The empty pane a commits launch registers was never acquired: no
+        // source, nothing to act on. The verbs refuse it by name — no write,
+        // no submit, no pretending it holds a working tree — and Enter, the
+        // same key that replaces the tenant, is what makes the path live.
+        let (handle, state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        app.dispatch("diff.focus");
+        assert_eq!(app.panes.focused_name(), "diff");
+
+        app.dispatch("diff.stage-hunk");
+        assert_eq!(app.message, "no diff is open");
+        app.dispatch("diff.unstage-hunk");
+        assert_eq!(app.message, "no diff is open");
+        assert!(
+            state.lock().unwrap().writes.is_empty(),
+            "the empty pane queued a write"
+        );
+
+        // Enter replaces the tenant with a real acquisition — a *commit*
+        // diff, which is what this key opens from a list — and the verb path
+        // is live: the refusal now comes from the verb's own gate reading
+        // the new source, not from the empty pane. (The write itself landing
+        // is `a_refreshed_frame_is_drawable_headlessly`'s, on a launch whose
+        // diff *is* the working tree.)
+        app.dispatch("commits.focus");
+        app.press(Key::plain(Code::Enter));
+        assert_eq!(app.panes.focused_name(), "diff");
+        assert!(matches!(
+            app.panes.get("diff"),
+            Some(Screens::Diff {
+                source: Some(_),
+                ..
+            })
+        ));
+        app.dispatch("diff.stage-hunk");
+        assert_eq!(
+            app.message,
+            "only the working-tree diff can act on hunks — this one is between commits"
+        );
+        app.dispatch("diff.unstage-hunk");
+        assert_eq!(
+            app.message,
+            "only the working-tree diff can act on hunks — this one is between commits"
+        );
+        assert!(
+            state.lock().unwrap().writes.is_empty(),
+            "the refusals queued a write"
+        );
     }
 
     #[test]
@@ -3354,6 +3421,33 @@ diff --git a/tracked.txt b/tracked.txt
                 .unwrap_or_else(|| panic!("{name} is registered"));
             assert_eq!(pane.generation(), app.generation, "{name}");
         }
+    }
+
+    #[test]
+    fn two_failing_panes_surface_the_first_one_s_error() {
+        // Both panes stale, both re-acquisitions failing, each in its own
+        // words: the message that stands is the *first* pane's — commits,
+        // by registration order — and never whichever pane happened to fail
+        // last. The registry made simultaneous failures ordinary, so the
+        // contract "the first failure is remembered" is a test now.
+        let (handle, state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        // A second repository pane, so two refreshes run on one finish.
+        app.dispatch("commits.open-diff");
+        app.dispatch("commits.focus");
+        state.lock().unwrap().fail_log = Some("the log read failed".into());
+        state.lock().unwrap().fail_pairs = Some("the pairs read failed".into());
+
+        assert!(app.submitter.submit(Box::new(Dead)).is_ok(), "queued");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > Generation::default()
+            }),
+            "the finish was never drained"
+        );
+        assert_eq!(app.message, "the log read failed", "the last error stood");
+        assert_ne!(app.message, "the pairs read failed");
     }
 
     #[test]
