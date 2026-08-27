@@ -407,7 +407,8 @@ mod tests {
         }
 
         fn paint(&mut self) {
-            self.d.paint(&mut self.screen, 0, &self.host, &mut self.out);
+            self.d
+                .paint(&mut self.screen, 0, 0, true, &self.host, &mut self.out);
         }
 
         fn rows(&self) -> Vec<String> {

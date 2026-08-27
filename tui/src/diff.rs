@@ -730,13 +730,30 @@ impl Diff {
 
     // ------------------------------------------------------------------ drawing
 
-    /// Draws the visible rows into `screen`, starting at row `y`.
+    /// Draws the visible rows into `screen`, at `x` of row `y` onward, inside
+    /// this pane's own columns.
     ///
     /// Only the visible rows are ever built or measured, which is what
     /// `uniform_list` does for the window and what a `for` over a range does
-    /// here. `out` is the run-list scratch buffer, owned by the caller across
+    /// here. Every row is taken through [`Screen::span`] — the pane is a guest
+    /// in the row, and a long line drawn to the whole screen would overwrite
+    /// the divider and whatever sits beside it, tokens and spans included.
+    /// `out` is the run-list scratch buffer, owned by the caller across
     /// frames so that drawing a row allocates nothing.
-    pub fn paint(&self, screen: &mut Screen, y: usize, host: &Host, out: &mut Vec<Run>) {
+    ///
+    /// The cursor bar is drawn only when this diff holds the keyboard:
+    /// `focused` is the caller's answer, and an unfocused diff keeps its
+    /// viewport, its selection and its scroll without drawing a caret that
+    /// would answer a question the reader did not ask.
+    pub fn paint(
+        &self,
+        screen: &mut Screen,
+        x: usize,
+        y: usize,
+        focused: bool,
+        host: &Host,
+        out: &mut Vec<Run>,
+    ) {
         let blank = Ink::new(host.theme.chrome.dim, host.theme.chrome.bg);
         for i in 0..self.view.height() {
             let row = y + i;
@@ -749,12 +766,12 @@ impl Diff {
                     let at = Frame {
                         host,
                         shift: self.shift,
-                        current: n == self.view.cursor(),
+                        current: focused && n == self.view.cursor(),
                         // Two integer comparisons per visible row, and no search
                         // of the order table: see `gitten_core::select::Caret::at`.
                         sel: self.sel.as_ref().and_then(|s| s.at(n, r.logical())),
                     };
-                    let mut pen = screen.row(row);
+                    let mut pen = screen.span(row, x, self.cols);
                     self.owners[r.owner as usize].render(
                         r.index as usize,
                         r.seg as usize,
@@ -766,19 +783,15 @@ impl Diff {
                 // Past the end of a diff shorter than the screen. Washed in the
                 // chrome's background rather than left as whatever the last
                 // frame drew there.
-                None => screen.row(row).wash(blank),
+                None => screen.span(row, x, self.cols).wash(blank),
             }
         }
-        // Last, and over the rows rather than beside them: a row's colour still
-        // runs to the right edge underneath it.
-        scrollbar::paint(
-            screen,
-            self.bar,
-            self.cols.saturating_sub(1),
-            y,
-            &self.view,
-            host,
-        );
+        if self.cols > 0 {
+            // Last, and over the rows rather than beside them: a row's colour
+            // still runs to the right edge underneath it — this pane's right
+            // edge, not the screen's.
+            scrollbar::paint(screen, self.bar, x + self.cols - 1, y, &self.view, host);
+        }
     }
 
     /// One line describing what is on screen, for whatever draws a status bar.
@@ -1116,7 +1129,7 @@ mod tests {
         screen.clear(Ink::new(0xffffff, 0x000000));
         // Row 0 is reserved for a title bar the assembly owns; the view starts
         // at 1 and must not touch the row above it.
-        d.paint(&mut screen, 1, &host, &mut out);
+        d.paint(&mut screen, 0, 1, true, &host, &mut out);
         assert_eq!(
             screen.ink(0, 0).unwrap().bg,
             0x000000,
@@ -1334,8 +1347,112 @@ mod tests {
         assert_eq!(d.cursor(), 0);
         let mut screen = Screen::new(40, 6);
         let mut out = Vec::new();
-        d.paint(&mut screen, 0, &host, &mut out);
+        d.paint(&mut screen, 0, 0, true, &host, &mut out);
         assert_eq!(screen.dump().trim(), "");
+    }
+
+    #[test]
+    fn each_pane_clips_to_its_span_and_owns_its_scrollbar() {
+        // The pane draws from column 41 for 79 columns of a 120-wide screen —
+        // the sidebar-and-divider arrangement the app assembles — and a long
+        // line must stop where the pane stops, tokens, spans and all.
+        // Long enough to scroll, so the bar is there to be owned, with one
+        // line far longer than the pane is wide.
+        let mut raw = String::from("diff --git a/a.rs b/a.rs\n@@ -1,62 +1,62 @@\n");
+        for i in 0..60 {
+            raw.push_str(&format!(" line {i}\n"));
+        }
+        raw.push_str(&format!("-{}\n", "x".repeat(300)));
+        let (mut d, host) = view(parse_unified_diff(&raw), 79, 10);
+        d.press(60, 2, 1, false, &host); // a cursor and a selection, to paint ink
+        let mut screen = Screen::new(120, 12);
+        screen.clear(Ink::new(0xffffff, 0x000000));
+        for y in 0..12 {
+            screen.over(40, y, '╎', 0xabcdef);
+        }
+        let mut out = Vec::new();
+        d.paint(&mut screen, 41, 1, true, &host, &mut out);
+        for y in 0..12 {
+            assert_eq!(
+                screen.char_at(40, y),
+                Some('╎'),
+                "the diff wrote over the divider at row {y}"
+            );
+        }
+        assert!(
+            screen.row_text(0).chars().all(|c| c == ' ' || c == '╎'),
+            "the diff wrote above its box: {:?}",
+            screen.row_text(0)
+        );
+        // Nothing it drew reaches past the pane's right edge, and something
+        // was drawn inside it.
+        assert!(
+            (41..119).any(|x| screen.char_at(x, 1).is_some_and(|c| c != ' ')),
+            "nothing was drawn inside the pane"
+        );
+        // The bar is on the pane's last column, over a row that keeps its
+        // background — and the pane's last column is not the screen's.
+        assert_eq!(screen.char_at(119, 1), Some('█'));
+        assert_eq!(
+            screen.ink(119, 1).unwrap().bg,
+            screen.ink(118, 1).unwrap().bg,
+            "the bar repainted the row it sits on"
+        );
+    }
+
+    #[test]
+    fn markdown_reflows_in_a_pane_not_the_screen() {
+        // The budget a Markdown presentation wraps at is whatever the caller
+        // passes to `resize` — the pane's content width in the app, which is
+        // not the screen's. The committed fixture wraps at 79 and at 120; the
+        // pane-shaped diff must agree with the former and not the latter.
+        const RAW: &str = include_str!("../tests/fixtures/md.diff");
+        let host = Host::new();
+        let wrap = host.wrap.position("word").expect("a shipped wrap");
+        let files = parse_unified_diff(RAW);
+        let mut pane = Diff::new(files.clone(), &host);
+        pane.set_wrap(wrap, &host);
+        pane.resize(79, 30, &host);
+        let mut whole = Diff::new(files.clone(), &host);
+        whole.set_wrap(wrap, &host);
+        whole.resize(120, 30, &host);
+        assert!(
+            pane.rows() > whole.rows(),
+            "the pane budgeted like the screen: {} vs {}",
+            pane.rows(),
+            whole.rows()
+        );
+        // The pane-shaped rows are narrower than the screen, not just fewer
+        // and wider: nothing it draws reaches the column the sidebar's
+        // divider would sit in, and the logical lines are the same lines.
+        let mut screen = Screen::new(120, 30);
+        let mut out = Vec::new();
+        pane.paint(&mut screen, 41, 0, true, &host, &mut out);
+        for y in 0..30 {
+            assert!(
+                screen.row_text(y).chars().take(41).all(|c| c == ' '),
+                "row {y} drew left of its pane: {:?}",
+                screen.row_text(y)
+            );
+        }
+        // Logical identity survives the narrower budget: a selection made at
+        // the wide width still names the same bytes at the pane width.
+        let mut wide = Diff::new(files, &host);
+        wide.set_wrap(wrap, &host);
+        wide.resize(120, 30, &host);
+        // Somewhere with a word in it, wherever the presentation put one.
+        let mut selected = String::new();
+        for row in 1..wide.rows().min(12) {
+            wide.press(30, row, 2, false, &host);
+            wide.release();
+            selected = wide.selection();
+            if !selected.is_empty() {
+                break;
+            }
+        }
+        assert!(!selected.is_empty(), "the fixture has no words to select");
+        wide.resize(79, 30, &host);
+        assert_eq!(wide.selection(), selected, "the reflow lost the line");
     }
 
     #[test]

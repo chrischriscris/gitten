@@ -381,18 +381,24 @@ fn mouse(m: MouseEvent) -> Option<Input> {
 /// A key with no [`Code`] is dropped rather than guessed at: a binding that
 /// fires on the wrong key is worse than one that does not fire, and `Code` is
 /// deliberately only what a keyboard-first app binds.
+///
+/// **Ctrl-J is Ctrl-J.** It was folded into `Enter` here for years, because
+/// some layers in between — `script`, a few ssh setups, a pty opened by a test
+/// harness — report the return key as LF, which is the same byte, and "the
+/// return key does nothing" is the worst failure a keyboard-first app has.
+/// That fold now costs the shared keymap's `panes` bindings: core binds
+/// Ctrl-J to `pane.next` and Ctrl-K to `pane.prev`, and a translator that
+/// folds one of them into Enter makes those keys unreachable in this client
+/// no matter what any config file says. The fallback is gone deliberately —
+/// see `a_ctrl_j_is_its_own_key_and_the_pane_bindings_reach_the_keymap` — and
+/// ordinary crossterm `KeyCode::Enter`, which every terminal actually sends
+/// for the return key, still arrives as Enter. A pty layer that reports
+/// Return *only* as LF loses the key; that is a trade the shared keymap now
+/// owns, and hiding it by inspecting the active modes here would put a
+/// keymap's worth of opinion inside a byte-stream parser.
 fn translate(k: KeyEvent) -> Option<Input> {
     let m = k.modifiers;
-    // A terminal in raw mode sends CR for the return key and crossterm reports
-    // that as `Enter`. Some layers in between — `script`, a few ssh setups, a
-    // pty opened by a test harness — send LF instead, which arrives as
-    // `Ctrl-J`. Folded into `Enter` here, **modifier and all**: leaving the
-    // control bit set produces `ctrl-enter`, which is not a key anything binds
-    // either. Nothing wants `ctrl-j` for itself, and "the return key does
-    // nothing" is the worst failure a keyboard-first app has.
-    let feed = matches!(k.code, KeyCode::Char('j')) && m.contains(KeyModifiers::CONTROL);
     let code = match k.code {
-        _ if feed => Code::Enter,
         KeyCode::Char(c) => Code::Char(c),
         KeyCode::Up => Code::Up,
         KeyCode::Down => Code::Down,
@@ -414,7 +420,7 @@ fn translate(k: KeyEvent) -> Option<Input> {
     // `Shift-a` arriving as both `A` and `shift-a`.
     Some(Input::Key(Key::new(
         code,
-        m.contains(KeyModifiers::CONTROL) && !feed,
+        m.contains(KeyModifiers::CONTROL),
         m.contains(KeyModifiers::ALT),
         m.contains(KeyModifiers::SHIFT),
     )))
@@ -548,21 +554,52 @@ mod tests {
     }
 
     #[test]
-    fn a_line_feed_is_the_return_key() {
-        // What `script`, and a few ssh setups, send instead of a carriage
-        // return. Both have to be Enter or the key that opens things is dead.
+    fn a_ctrl_j_is_its_own_key_and_the_pane_bindings_reach_the_keymap() {
+        // The compatibility trade, written down where the fold used to be:
+        // Ctrl-J keeps its control bit, so the shared keymap's `panes` mode
+        // bindings are reachable in this client — and a pty layer that
+        // reports Return only as LF has lost the Enter fallback. Normal
+        // `KeyCode::Enter`, which every terminal sends for the return key,
+        // still arrives as Enter.
         assert_eq!(
             key(KeyCode::Enter, KeyModifiers::NONE),
             Some(Key::plain(Code::Enter))
         );
         assert_eq!(
             key(KeyCode::Char('j'), KeyModifiers::CONTROL),
-            Some(Key::plain(Code::Enter))
+            Some(Key::ctrl(Code::Char('j'))),
+            "ctrl-j was folded into enter and core's pane.next is unreachable"
+        );
+        assert_eq!(
+            key(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            Some(Key::ctrl(Code::Char('k')))
         );
         // ...and an unmodified `j` is still `j`.
         assert_eq!(
             key(KeyCode::Char('j'), KeyModifiers::NONE),
             Some(Key::char('j'))
+        );
+
+        // What those keys mean once translated: the shipped keymap's answers,
+        // through the mode the app builds when a second sidebar list exists.
+        let map = Keymap::builtin();
+        let mut modes = Modes::new();
+        modes.push("panes");
+        modes.push("commits");
+        assert_eq!(
+            map.resolve(&modes, &[Key::ctrl(Code::Char('j'))]),
+            Resolve::Run("pane.next")
+        );
+        assert_eq!(
+            map.resolve(&modes, &[Key::ctrl(Code::Char('k'))]),
+            Resolve::Run("pane.prev")
+        );
+        // Enter, resolved where the return key is actually used.
+        let mut commits = Modes::new();
+        commits.push("commits");
+        assert_eq!(
+            map.resolve(&commits, &[Key::plain(Code::Enter)]),
+            Resolve::Run("commits.open-diff")
         );
     }
 
