@@ -59,6 +59,7 @@
 //! vertical axis, which is the one that has to virtualize.
 
 use super::{accept_deferred_scroll, DeferredScrollbar, PendingScroll};
+use gitten_core::font::Font;
 use gitten_core::host::Host;
 use gitten_core::prepared::{prepare, Prepared};
 use gitten_core::rows::{Ordered, RowRef};
@@ -660,6 +661,12 @@ pub struct Diff {
     /// The width and wrap the rows were last expanded for. A resize that does
     /// not cross a character boundary compares equal here and stops.
     applied: (f32, &'static str),
+    /// The font the row tables were built against, seeded at construction with
+    /// the host the renderers were arranged against — the first settled frame
+    /// therefore has nothing to rebuild. `Font` is plain data deriving PartialEq,
+    /// so a value comparison is the fingerprint; a mismatch means the metrics
+    /// the renderers were built with no longer describe what will be drawn.
+    font_applied: Option<Font>,
     /// The view's own width in pixels, written during paint by the probe in
     /// [`Diff::render`] and read on the frame after. There is no way to know it
     /// earlier: a view is handed its box by whatever assembled it, and this one
@@ -776,6 +783,18 @@ impl Diff {
     /// 241 ms on the same fixture, and a resize drag would be a slideshow. See
     /// `docs/measurements.md`.
     fn reflow(&mut self, width: f32, host: &Host) {
+        // Before the width exit, not beside it: a font edit reshapes every
+        // glyph without moving the width, and would otherwise survive until the
+        // next resize happened to cross a boundary. The price is one
+        // `Option<Font>` compare — still O(1) on the common path, which is what
+        // the resize test below pins.
+        if self.font_applied.as_ref() != Some(&host.font) {
+            self.font_applied = Some(host.font.clone());
+            // Reset first: arrange() has already been given today's host, and the
+            // width half of `applied` must re-fire on the rebuilt renderers.
+            self.applied = (0.0, "");
+            self.apply_layout(self.current, host);
+        }
         let wrap = host.wrap.at(self.wrap);
         if (width, wrap.name()) == self.applied || width <= 0.0 {
             return;
@@ -1447,6 +1466,10 @@ impl Diff {
             current,
             wrap,
             applied: (0.0, ""),
+            // Arranged above against this very host, so its font is already
+            // on the rows — recording anything else makes the first settled
+            // reflow pay a redundant second arrange.
+            font_applied: Some(host.font.clone()),
             measured: Rc::new(Cell::new(0.0)),
             renderers: Rc::new(RefCell::new(built.renderers)),
             order: Rc::new(built.order),
@@ -2927,6 +2950,7 @@ mod tests {
         line_colors, locked, row_background, Diff, FileSummary, Layouts, Pan, Row, Rows, TextRows,
         PAD, ROW_H, TEXT_CHROME,
     };
+    use gitten_core::font::Font;
     use gitten_core::host::Host;
     use gitten_core::prepared::{prepare, File as PreparedFile};
     use gitten_core::select::{Caret, Selected, Selection};
@@ -2937,6 +2961,7 @@ mod tests {
         div, rgb, AnyElement, FontStyle, FontWeight, HighlightStyle, IntoElement, ParentElement,
         ScrollStrategy,
     };
+    use std::cell::Cell;
     use std::rc::Rc;
 
     fn tok(start: u32, end: u32, kind: Kind) -> Token {
@@ -4310,6 +4335,90 @@ diff --git a/b.md b/b.md
         assert_eq!((diff.cursor(), diff.view.get().top()), (0, 0));
         assert_eq!(diff.pan.at(), 0.0);
         assert!(diff.scroll.0.borrow().deferred_scroll_to_item.is_none());
+    }
+
+    #[test]
+    fn a_font_change_rebuilds_the_presentation() {
+        // Three claims. Repeated `reflow`s under the same font cost nothing,
+        // by width or by fingerprint; a font edit rebuilds through
+        // `apply_layout`, because the metrics the renderers were built with —
+        // the Markdown heading scale, notably — no longer describe what will be
+        // drawn while the width itself has not moved; and the rebuild rides the
+        // prepared cache rather than re-running either expensive pass.
+        //
+        // The presentation is counted at `Layout::build`, which only `arrange`
+        // invokes: a rebuild and nothing else bumps it. A layout registers its
+        // builders with the live host, so the count is the whole observable.
+        let builds = Rc::new(Cell::new(0));
+        let counted = builds.clone();
+        let mut layouts = Layouts::builtin();
+        layouts.register("counting", move |_| {
+            counted.set(counted.get() + 1);
+            vec![Box::new(TextRows::default())]
+        });
+        let mut host = Host::new();
+        host.layout = "counting".into();
+        let mut diff = Diff::with_layouts(parse_unified_diff(SAMPLE), &host, layouts);
+        let prepared = diff.prepared.clone();
+
+        // Construction built once and seeded the fingerprint against this very
+        // host, so the first `reflow` finds nothing to rebuild.
+        let w = width_for(40, &host);
+        diff.reflow(w, &host);
+        let settled = builds.get();
+        assert_eq!(settled, 1);
+
+        // Same font again and again: nothing to do.
+        diff.reflow(w, &host);
+        diff.reflow(w, &host);
+        assert_eq!(
+            builds.get(),
+            settled,
+            "an unchanged frame rebuilt the renderers"
+        );
+
+        // A bigger face: every glyph moves, the width does not.
+        let mut bigger = Host::new();
+        bigger.layout = "counting".into();
+        bigger.font.size = 18.0;
+        diff.reflow(w, &bigger);
+        assert!(
+            builds.get() > settled,
+            "a font change left the presentation stale"
+        );
+        assert!(
+            Rc::ptr_eq(&prepared, &diff.prepared),
+            "a font change re-prepared the diff"
+        );
+
+        // And it settles again: frames under the new font are free once more.
+        let rebuilt = builds.get();
+        diff.reflow(w, &bigger);
+        diff.reflow(w, &bigger);
+        assert_eq!(
+            builds.get(),
+            rebuilt,
+            "the rebuild fired again on an unchanged frame"
+        );
+    }
+
+    #[test]
+    fn the_font_fingerprint_compares_by_value() {
+        // What the reflow guard leans on: `Font` derives `PartialEq`, so a
+        // value comparison is the whole fingerprint. Each field individually has
+        // to move the outcome, or a config edit that moved only that field
+        // would leave stale metrics behind it.
+        assert_eq!(Some(Font::jetbrains_mono()), Some(Font::jetbrains_mono()));
+        let resized = Font {
+            size: 15.0,
+            ..Font::menlo()
+        };
+        assert_ne!(resized, Font::menlo());
+        let retuned = Font {
+            advance: 0.5,
+            ..Font::menlo()
+        };
+        assert_ne!(retuned, Font::menlo());
     }
 
     #[test]

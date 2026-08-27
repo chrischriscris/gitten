@@ -21,5 +21,6 @@ edition = "2021"
 gitten-app = { path = "../app" }
 gitten-core = { path = "../core" }
 gitten-git = { path = "../git" }
-crossterm = "0.29"
+# Load-bearing: the tui negotiates mode 2004 and needs crossterm's Event::Paste translation (behind this feature; today only via default features) — pinning keeps a future default-feature slimming from silently resurrecting pasted-key typing.
+crossterm = { version = "0.29", features = ["bracketed-paste"] }
 unicode-width = "0.2"

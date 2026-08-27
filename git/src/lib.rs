@@ -968,12 +968,28 @@ impl Repo for Binary {
             )?
         } else {
             // A bare revision means "what did this commit change".
+            //
+            // Merges included. Modern git emits no diff at all for a merge unless
+            // asked — `git show --raw` prints zero records for one — so a merge
+            // commit selected in the log would render as an empty diff, silently.
+            // First-parent asks for the ordinary single-old/single-new records
+            // this parser already handles. Nothing else reaches this parser: the
+            // refusal of two-colon combined records in `parse_raw` below is
+            // belt-and-braces against future or unknown shapes, not a
+            // currently-reachable input. The flag needs git >= 2.31 (March 2021);
+            // older gits reject it and every bare-revision open fails wholesale
+            // rather than silently.
             run(
                 &self.root,
                 &[
                     &["show"],
                     &RAW[..],
-                    &["--format=", "--end-of-options", revspec],
+                    &[
+                        "--format=",
+                        "--diff-merges=first-parent",
+                        "--end-of-options",
+                        revspec,
+                    ],
                 ]
                 .concat(),
             )?
@@ -2033,12 +2049,6 @@ impl Pair {
     }
 }
 
-/// A free function over *any* [`Repo`], and deliberately not a method on the
-/// trait: which lines correspond is decided by the configured registry and only
-/// by it. A `Repo` implementation that answered with its own diff would make
-/// `[diff] algorithm` a lie in every client at once, and rule 1 with it — the
-/// differ an extension registers must be reachable through the same call. This
-/// runs after acquisition, outside the trait, where no implementation can reach.
 ///
 /// The frontend never learns which implementation ran, and never learns whether
 /// the content came from the object database or the working tree.
@@ -2741,7 +2751,8 @@ impl RawChange {
 /// ```
 ///
 /// Everything up to the status letter is space-separated; the paths after it are
-/// NUL-terminated, and a rename or copy carries two of them. Anything that does
+/// NUL-terminated, and a rename or copy carries two of them. Exactly one leading
+/// colon is consumed — the rest of the record has no colons. Anything that does
 /// not start with `:` is skipped rather than guessed at — `git show` prefixes a
 /// commit header that `--format=` does not always suppress.
 ///
@@ -2750,6 +2761,13 @@ impl RawChange {
 /// malformed record can never shift the stream and rename somebody else's
 /// file. A path is whatever bytes git emitted — no decode happens until a
 /// [`Pair`] is built for display.
+///
+/// A record starting with *two* colons is a combined diff (`::100644 100644
+/// 100644 … MM`): git only emits one for a merge when asked, and it carries N
+/// modes, N OIDs and an N-letter status. Decoding that into this parser's five
+/// positional slots fabricates data — mode in place of OID, a hex digit in place
+/// of a status — so such a record is refused, not guessed at. The show path
+/// passes `--diff-merges=first-parent`, which keeps git from sending any.
 fn parse_raw(raw: &[u8]) -> Vec<RawChange> {
     let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
     let mut out = Vec::new();
@@ -2764,6 +2782,12 @@ fn parse_raw(raw: &[u8]) -> Vec<RawChange> {
         else {
             continue;
         };
+        // A second leading colon marks a combined record: N modes, N oids and an
+        // N-letter status that this fixed-slot parser would read as garbage. With
+        // --diff-merges=first-parent git cannot send one; refuse rather than decode.
+        if meta.first() == Some(&b':') {
+            continue;
+        }
         let parts: Vec<&[u8]> = meta
             .split(|b| *b == b' ')
             .filter(|p| !p.is_empty())
@@ -4253,6 +4277,88 @@ mod tests {
     // ------------------------------------------------------- raw-record parsing
 
     #[test]
+    fn a_merge_commit_diffs_against_its_first_parent() {
+        // Modern git emits no `--raw` records at all for a merge, which made a
+        // selected merge commit render as nothing. The show path asks for
+        // first-parent instead, so what arrives here has to be ordinary
+        // single-colon records agreeing with git's own answer between parent
+        // one and the merge — and never a positionally-decoded combined record,
+        // whose tell would be hex digits where status letters belong.
+        let r = Scratch::new("merge");
+        r.write("a.txt", b"one\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "a"]);
+        r.git(&["checkout", "-qb", "side"]);
+        r.write("a.txt", b"one\nCHANGED\n");
+        r.write("side.txt", b"fresh\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "b"]);
+        r.git(&["checkout", "-q", "-"]);
+        // Flags un-bundled: git only lets a short option eat a value when it
+        // is attached, so `-qm msg` leaves -m empty and `msg` as the ref.
+        r.git(&["merge", "--no-ff", "-q", "-m", "merge side", "side"]);
+
+        let git = |args: &[&str]| -> String {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&r.0)
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+
+        let merge = git(&["rev-parse", "HEAD"]).trim().to_string();
+        // `--no-ff` guaranteed a true merge commit: exactly two parents.
+        assert_eq!(
+            git(&["log", "-1", "--format=%P", &merge])
+                .split_whitespace()
+                .count(),
+            2,
+            "the fixture really did produce a merge"
+        );
+
+        let got = open(&r.0).pairs(&merge).expect("a diff for a merge commit");
+        assert!(!got.is_empty(), "a merge renders as a diff, not silence");
+
+        // Git's own answer to the same question: ordinary records between
+        // parent one and the merge, parsed with the same parser rather than
+        // reimplementing its record format here.
+        let expected = parse_raw(
+            git(&[
+                "diff",
+                "--raw",
+                "-z",
+                "-M",
+                "--no-ext-diff",
+                &format!("{merge}^1"),
+                &merge,
+            ])
+            .as_bytes(),
+        );
+        let want: std::collections::BTreeSet<String> = expected
+            .iter()
+            .map(|c| c.path.to_string_lossy().into_owned())
+            .collect();
+        let have: std::collections::BTreeSet<String> = got.iter().map(|p| p.path.clone()).collect();
+        assert_eq!(have, want, "paths must match git's own first-parent diff");
+
+        for p in &got {
+            assert!(
+                p.status.is_alphabetic(),
+                "{}: `{}` is a hex-garbage status, not git's letter",
+                p.path,
+                p.status
+            );
+        }
+    }
+
+    #[test]
     fn a_modified_file_is_one_record() {
         let raw: &[u8] = b":100644 100644 aaa bbb M\0src/main.rs\0";
         assert_eq!(
@@ -4332,6 +4438,34 @@ mod tests {
         assert!(parse_raw(b"").is_empty());
         assert!(parse_raw(b"\0").is_empty());
         assert!(parse_raw(b"not a record\0").is_empty());
+    }
+
+    #[test]
+    fn a_combined_record_is_refused_rather_than_misdecoded() {
+        // Two colons mark a combined merge record: N modes, N oids and an
+        // N-letter status. Read into this parser's five slots, `"100644"`
+        // lands in old_oid, a hex digit becomes the status and whichever blob
+        // sits in slot three gets drawn as real content. One colon is
+        // consumed; a second is a refusal — and because every record is one
+        // `\0`-separated chunk, a skipped record leaves the well-formed one
+        // after it intact.
+        let raw = concat!(
+            "::100644 100644 100644 aaaa bbbb cccc MM\0src/main.rs\0",
+            ":100644 100644 aaa bbb M\0keep.txt\0",
+        );
+        assert_eq!(
+            parse_raw(raw.as_bytes()),
+            vec![RawChange {
+                path: PathBytes::from_bytes(b"keep.txt"),
+                old_path: None,
+                status: 'M',
+                old_mode: "100644".into(),
+                new_mode: "100644".into(),
+                old_oid: "aaa".into(),
+                new_oid: "bbb".into(),
+            }],
+            "the combined record never becomes a RawChange and no field of it leaks"
+        );
     }
 
     #[test]

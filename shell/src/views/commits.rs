@@ -4,12 +4,19 @@ use crate::graph;
 use gitten_core::host::Host;
 use gitten_core::search;
 use gitten_core::view::Viewport;
-use gitten_core::{assign_lanes, Commit};
+use gitten_core::{assign_lanes, initials, Commit};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::scroll::Scrollbar;
 use std::cell::Cell;
 use std::rc::Rc;
+
+/// The commit column between the sha and the graph, resolved once at load: two
+/// letters. Not the colour: that follows the live theme like everything else
+/// on the row.
+struct Who {
+    initials: SharedString,
+}
 
 struct Data {
     commits: Vec<Commit>,
@@ -25,6 +32,9 @@ struct Data {
     /// subject, and neither the graph nor the clock beside them. Built at load
     /// with everything else that is derived once.
     lines: Vec<String>,
+    /// The two-letter author initials per commit, solved once at load — see
+    /// [`Who`]. The colour beside them reads the theme per frame on purpose.
+    who: Vec<Who>,
     /// The same list folded for substring search — see
     /// [`gitten_core::search::Index`] for why this is load work and not
     /// keystroke work.
@@ -422,6 +432,14 @@ impl Commits {
     }
 }
 
+/// One row's reach, roughly: the graph gutter plus the subject. An estimate,
+/// because this number only decides which single row `uniform_list` measures
+/// to learn the true scrollable width — see the note in `Data`.
+///
+/// Characters, never `.len()`: a byte-lengthed CJK subject counted itself
+/// three times too wide and could dethrone a genuinely wider ASCII row,
+/// leaving that row clipped past the last reachable column forever.
+///
 impl Commits {
     pub fn new(commits: Vec<Commit>, host: Rc<Host>) -> Self {
         let Prepared { data, load } = prepare(commits, &host);
@@ -554,6 +572,12 @@ pub(crate) fn prepare(commits: Vec<Commit>, _host: &Host) -> Prepared {
                 .map(|c| format!("{} {}", c.short, c.subject))
                 .collect(),
             search: search::Index::new(&commits),
+            who: commits
+                .iter()
+                .map(|c| Who {
+                    initials: initials(&c.author).into(),
+                })
+                .collect(),
             commits,
             draws,
             times,
@@ -607,15 +631,7 @@ impl Render for Commits {
                     // `visible` is ascending into the full vec, so the arrays
                     // derived at load index directly by it.
                     let c = visible[i];
-                    row(
-                        &data.commits[c],
-                        &data.times[c],
-                        &data.draws[c],
-                        &host,
-                        i == cursor,
-                        focused,
-                        Some(i) == armed,
-                    )
+                    row(c, &data, &host, i == cursor, focused, Some(i) == armed)
                 })
                 .collect()
         })
@@ -687,6 +703,8 @@ fn rel_time(timestamp: i64, now: i64) -> String {
 /// comment above it said eleven. Fixed, unlike the graph: the eye scans it
 /// vertically, so it has to *be* a column.
 const SHA_CHARS: f32 = 12.0;
+/// Two letters of initials beside the sha — see [`Who`].
+const WHO_CHARS: f32 = 3.0;
 
 /// The clock column, in *characters*: four covers the whole vocabulary —
 /// thirteen months still labels itself at most `12mo` — and right-alignment
@@ -712,14 +730,19 @@ const TIME_CHARS: f32 = 4.0;
 /// commit a second press would reset to is named by its own colour and not
 /// only by the band above it.
 fn row(
-    c: &Commit,
-    time: &SharedString,
-    d: &graph::Draw,
+    i: usize,
+    data: &Data,
     host: &Rc<Host>,
     current: bool,
     focused: bool,
     armed: bool,
 ) -> AnyElement {
+    // Every per-commit answer indexes straight into what load derived — see
+    // `visible`'s comment: no lookup, no hashing, one array read each.
+    let c = &data.commits[i];
+    let time = &data.times[i];
+    let who = &data.who[i];
+    let d = &data.draws[i];
     let ch = host.font.char_width();
     chrome::list_row(host, current, focused, graph::ROW_H)
         .child(graph::row_canvas(d.clone(), host.clone()))
@@ -735,6 +758,18 @@ fn row(
                     false => host.theme.chrome.dim,
                 }))
                 .child(c.short.clone()),
+        )
+        .child(
+            div()
+                .flex_none()
+                .w(px(WHO_CHARS * ch))
+                // The colour resolves here, not at construction, so it reads
+                // the live theme like the dim sha and the character width
+                // beside it. Deliberate cost: one byte-fold hash of the author
+                // name per visible row per frame. A memo HashMap arrives only
+                // if profiling ever demands one.
+                .text_color(rgb(host.theme.author(&c.author)))
+                .child(who.initials.clone()),
         )
         .child(
             div()

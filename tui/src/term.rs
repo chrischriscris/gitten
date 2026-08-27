@@ -114,10 +114,19 @@ pub enum MouseKind {
 const MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 const MOUSE_OFF: &[u8] = b"\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 
+/// Bracketed paste (2004). On, the emulator wraps a paste in ESC[200~ /
+/// ESC[201~ sentinels and crossterm hands over one `Event::Paste` instead of
+/// streaming N key events — see `translate_event`. Off is the default in
+/// every terminal, so old ones ignore both sequences silently.
+const PASTE_ON: &[u8] = b"\x1b[?2004h";
+const PASTE_OFF: &[u8] = b"\x1b[?2004l";
+
 /// The terminal, in the state a full-screen app needs it.
 ///
-/// Entering is: raw mode, the alternate screen, and the cursor hidden. Leaving
-/// is the reverse in reverse order, and happens on drop.
+/// Entering is: raw mode, the alternate screen, the cursor hidden, and
+/// bracketed paste negotiated — plus the mouse-tracking modes when asked for.
+/// Leaving runs on drop and unsets what entering set, the off sequences going
+/// out beside their on counterparts rather than in strict reverse order.
 pub struct Term {
     out: BufWriter<Stdout>,
     /// Whether we still owe the terminal a restore. Checked so that an explicit
@@ -130,6 +139,8 @@ impl Term {
     ///
     /// The wheel is a request and not a given because taking it takes
     /// drag-to-select with it — see the note at the top of this file.
+    /// Bracketed paste is negotiated so that a paste arrives as one event
+    /// instead of being typed into the keymap character by character.
     pub fn enter(mouse: bool) -> io::Result<Self> {
         terminal::enable_raw_mode()?;
         let mut out = BufWriter::new(io::stdout());
@@ -140,6 +151,7 @@ impl Term {
         if mouse {
             out.write_all(MOUSE_ON)?;
         }
+        out.write_all(PASTE_ON)?;
         out.flush()?;
         Ok(Self { out, entered: true })
     }
@@ -158,8 +170,10 @@ impl Term {
         // The mouse off unconditionally: a terminal left in a tracking mode
         // prints `<35;61;9M` at the shell every time the pointer moves, and
         // asking whether we turned it on is one more thing to get wrong on the
-        // path that exists to leave nothing behind.
+        // path that exists to leave nothing behind. Paste mode goes the same
+        // way.
         let _ = self.out.write_all(MOUSE_OFF);
+        let _ = self.out.write_all(PASTE_OFF);
         let _ = self.out.write_all(b"\x1b[?25h\x1b[?1049l");
         let _ = self.out.flush();
         let _ = terminal::disable_raw_mode();
@@ -177,6 +191,7 @@ impl Term {
             let _ = terminal::disable_raw_mode();
             let mut out = io::stdout();
             let _ = out.write_all(MOUSE_OFF);
+            let _ = out.write_all(PASTE_OFF);
             let _ = out.write_all(b"\x1b[?25h\x1b[?1049l");
             let _ = out.flush();
             previous(info);
@@ -231,11 +246,16 @@ impl Term {
 
     /// The next input, or `None` if nothing arrived within `timeout`.
     ///
-    /// Anything that is not a keypress, a wheel notch, a left button or a resize
-    /// — a focus change, a bracketed paste, the right button — is skipped rather
-    /// than surfaced, so a caller gets `None` on a timeout and nothing else. Key
-    /// *release* events are skipped too: terminals with the kitty protocol on
-    /// report both, and acting on each is every binding firing twice.
+    /// Because bracketed paste is negotiated in [`Term::enter`], an emulator
+    /// delivers a paste as one [`Event`] variant that [`translate_event`]
+    /// drops — `q` inside a pasted paragraph cannot quit anything, where
+    /// without the negotiation it would be typed into the keymap character by
+    /// character. Anything else that is not a keypress, a wheel notch, a left
+    /// button or a resize — a focus change, the right button — is skipped
+    /// rather than surfaced, so a caller gets `None` on a timeout and nothing
+    /// else. Key *release* events are skipped too: terminals with the kitty
+    /// protocol on report both, and acting on each is every binding firing
+    /// twice.
     pub fn poll(timeout: Duration) -> io::Result<Option<Input>> {
         if !event::poll(timeout)? {
             return Ok(None);
@@ -295,6 +315,9 @@ fn translate_event(event: Event) -> Option<Input> {
         Event::Resize(w, h) => Some(Input::Resize(w as usize, h as usize)),
         Event::Key(k) if k.kind != KeyEventKind::Release => translate(k),
         Event::Mouse(m) => mouse(m),
+        // A bracketed paste lands here as `Event::Paste` and is dropped on
+        // purpose: the app takes no text input anywhere, so the correct thing
+        // to do with a paste is nothing.
         _ => None,
     }
 }
@@ -553,6 +576,14 @@ mod tests {
         let mut k = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
         k.kind = KeyEventKind::Release;
         assert_eq!(translate_event(Event::Key(k)), None);
+    }
+
+    #[test]
+    fn a_paste_is_not_an_input() {
+        // Pinned because the app takes no text input, so a paste handler here
+        // would be a pasted `q` quitting — removing the negotiation or adding
+        // one on purpose should fail loudly, not silently.
+        assert_eq!(translate_event(Event::Paste("q".into())), None);
     }
 
     #[test]
