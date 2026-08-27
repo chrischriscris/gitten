@@ -40,13 +40,15 @@
 //! highlighter's side — see `docs/decisions/0010-markdown-rendered-rows.md`.
 
 use crate::prepared::Line;
+use crate::rows::Entry;
 use crate::syntax::{
     column_indent, fence_marker, for_each_side, heading_level, is_break, is_setext, list_marker,
     Kind, Token,
 };
-use crate::wrap::{Break, Wrap, Wrapped};
+use crate::wrap::{Break, Budget, Wrap, Wrapped};
 use crate::{LineKind, Span};
 use std::ops::Range;
+use std::sync::Arc;
 
 /// What a line is, structurally. One per row, computed per hunk side.
 ///
@@ -856,6 +858,518 @@ fn grid_cells(text: &str, layout: &Layout, out: &mut Vec<Range<usize>>) {
         let end = from + i;
         out.push(trimmed_range(text, from..end));
         from = end + v.len();
+    }
+}
+
+// ------------------------------------------------- the shared presentation
+
+/// The furniture a rendered row draws in place of the markers [`lay_out`]
+/// removed, described as structure and not as drawing.
+///
+/// This is the part a second frontend would otherwise duplicate. Which block
+/// gets a bar and which gets a bullet, how deep an indent a nested list sits
+/// at, whether a row's text is a fence's language label rather than body copy —
+/// each of those is a decision about the *document*, and a window, a terminal
+/// and a test must agree about it or a `.md` file renders differently in each.
+/// What each decision is *worth* — pixels, cells — is the frontend's, exactly
+/// as a column budget is.
+///
+/// Continuation behaviour, spelled out because two clients got it wrong
+/// separately: a **bar repeats** on every visual row of its block — grouping a
+/// run of rows is its whole job; a **bullet reserves its slot on every segment
+/// but draws its glyph only on segment zero**, so a wrapped item continues under
+/// its own text rather than under another bullet; and the **gutter numbers and
+/// signs are blank after segment zero**, which is the gutter's business and
+/// every presentation's shared answer, not this struct's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Furniture {
+    /// Indent steps. One step, whatever a frontend measures a step at.
+    pub depth: u8,
+    /// A bullet's slot: reserved on every segment, its glyph drawn on segment
+    /// zero only. `None` for every block that is not a bullet.
+    pub bullet: bool,
+    /// A bar down the left edge, repeated on every segment.
+    pub bar: Option<Bar>,
+    /// The level of a heading, whose text a renderer may size or bold.
+    pub heading: Option<u8>,
+    /// The row's text is a fence's language label: punctuation a reader should
+    /// be able to skip, drawn quiet.
+    pub fence_label: bool,
+    /// The row draws a rule instead of its text — a thematic break.
+    pub rule: bool,
+    /// The row draws nothing at all. It still occupies a row: the line numbers
+    /// either side of it have to add up.
+    pub blank: bool,
+    /// The row is a table grid, which is its own text: nothing sits in front of
+    /// one row of a grid and not the next, or the columns shear.
+    pub table: bool,
+}
+
+/// Which kind of bar a [`Furniture`] draws, so a renderer can colour it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bar {
+    /// A blockquote's.
+    Quote,
+    /// A fenced code block's, on the fence line and every line inside it.
+    Code,
+}
+
+impl Block {
+    /// The furniture this block's rendered row draws in place of its markers.
+    ///
+    /// A pure function of the block, which is what a column budget needs: the
+    /// budget is asked per distinct block, and it is the same on every visual
+    /// row of the block even where the *glyph* is not — the bullet's slot is
+    /// reserved on a wrapped continuation whether or not the glyph is drawn
+    /// there, because the text does not move.
+    pub fn furniture(self) -> Furniture {
+        if self.is_table() {
+            return Furniture {
+                table: true,
+                ..Furniture::default()
+            };
+        }
+        Furniture {
+            depth: self.depth(),
+            bullet: matches!(self, Block::Bullet(_)),
+            bar: match self {
+                Block::Quote(_) => Some(Bar::Quote),
+                Block::Fence | Block::Code => Some(Bar::Code),
+                _ => None,
+            },
+            heading: match self {
+                Block::Heading(level) => Some(level),
+                _ => None,
+            },
+            fence_label: matches!(self, Block::Fence),
+            rule: self == Block::Rule,
+            blank: self == Block::Blank,
+            table: false,
+        }
+    }
+}
+
+/// One row of the shared presentation: a file header, a hunk header, or a line
+/// with the [`Block`] saying what it became.
+///
+/// `path` and `header` are `Arc<str>` rather than `String` so a client whose
+/// elements must own their text adopts the row's own handle instead of copying
+/// it — the same one-time conversion [`Document::push`] makes, and never a
+/// per-frame one.
+#[derive(Debug)]
+pub enum DocRow {
+    File {
+        path: Arc<str>,
+        adds: usize,
+        dels: usize,
+    },
+    Hunk(Arc<str>),
+    Line {
+        block: Block,
+        line: Line,
+    },
+}
+
+/// One table row re-laid-out onto a grid that fits, as the model holds it
+/// between reflows.
+///
+/// The flowed [`FlowRow`] is converted once, here, into the shape both
+/// frontends read: one shared string the sub-rows are ranges into, and the
+/// tokens and spans moved onto it. A frontend whose elements must own their
+/// text adopts the string by refcount — a per-visible-row `String` is the thing
+/// this conversion exists to prevent.
+#[derive(Debug, Clone)]
+pub struct FlowedRow {
+    /// Every sub-row, joined by the newlines [`FlowRow`] documents.
+    pub text: Arc<str>,
+    pub breaks: Box<[Break]>,
+    pub tokens: Box<[Token]>,
+    pub spans: Box<[Span]>,
+}
+
+impl FlowedRow {
+    fn of(f: FlowRow) -> Self {
+        Self {
+            text: f.text.into(),
+            breaks: f.breaks.into_boxed_slice(),
+            tokens: f.tokens.into_boxed_slice(),
+            spans: f.spans.into_boxed_slice(),
+        }
+    }
+}
+
+/// The presentation of markdown files as a document: rows, blocks, tables,
+/// flowed grids, wrap ranges, and the furniture each row draws.
+///
+/// This is the model the window's `MarkdownRows` used to own privately, lifted
+/// so a terminal (or an extension's) can consume the same decisions instead of
+/// making its own. It consumes prepared files — one [`crate::prepare`] pass,
+/// never a second — and answers every question a renderer asks that is not
+/// about its own units. What a column is worth is not here: [`Self::reflow`]
+/// takes a `Block -> usize` budget the caller measures in whatever it draws
+/// with, and `core` sees only the resulting integers.
+///
+/// A resize that crosses no block's budget costs two comparisons — the
+/// distinct-block cache below is what makes that true, and it is why a drag
+/// that moves one pixel does not rescan a 70k-row document.
+pub struct Document {
+    rows: Vec<DocRow>,
+    files: Vec<Entry>,
+    /// Every distinct [`Block`] in the rows, collected as they were built.
+    ///
+    /// There is a budget per *row* here and so no single number to compare —
+    /// but there are only ever a couple of dozen distinct blocks in a document,
+    /// and the budget is a pure function of the block and the width. Comparing
+    /// these is therefore as good as comparing all of them, and does not touch
+    /// a row.
+    blocks: Vec<Block>,
+    /// The budgets `blocks` had when `wrapped` was built, and the policy that
+    /// built it.
+    budgets: Vec<usize>,
+    wrap: &'static str,
+    wrapped: Wrapped,
+    /// Which rows are in a table, and which table: `(row, grid)`, ascending by
+    /// row. Sparse, because a table is 1–2.5% of the rows of a diff and a field
+    /// on every row of a 714k-line one is 2.8 MB to answer "no".
+    tables: Vec<(u32, u32)>,
+    /// What each of those tables was aligned to at load: the width every column
+    /// wants, and which way its cells sit. One per run, so a handful.
+    grids: Vec<Grid>,
+    /// The table rows whose grid does not fit the current budget, re-laid out
+    /// onto one that does — `(row, flowed)`, ascending. Empty at any budget
+    /// where every table fits, and with wrapping off.
+    flows: Vec<(u32, FlowedRow)>,
+    /// How many lines were laid out, for the report.
+    laid_out: usize,
+    layout: Layout,
+}
+
+impl Default for Document {
+    fn default() -> Self {
+        Self::new(Layout::monospaced())
+    }
+}
+
+impl Document {
+    pub fn new(layout: Layout) -> Self {
+        Self {
+            rows: Vec::new(),
+            files: Vec::new(),
+            blocks: Vec::new(),
+            budgets: Vec::new(),
+            wrap: "",
+            wrapped: Wrapped::default(),
+            tables: Vec::new(),
+            grids: Vec::new(),
+            flows: Vec::new(),
+            laid_out: 0,
+            layout,
+        }
+    }
+
+    /// Appends one file's rows: a header, then a header and its laid-out lines
+    /// per hunk.
+    ///
+    /// Per hunk, because that is the largest unit whose block structure is
+    /// knowable: a fence opened in one hunk and closed in another has everything
+    /// between them missing from the diff entirely.
+    pub fn push(&mut self, mut f: crate::prepared::File) {
+        self.files.push(Entry {
+            path: f.path.clone(),
+            adds: f.adds,
+            dels: f.dels,
+            row: self.rows.len(),
+        });
+        self.rows.push(DocRow::File {
+            path: std::mem::take(&mut f.path).into(),
+            adds: f.adds,
+            dels: f.dels,
+        });
+        for mut h in f.hunks {
+            self.rows
+                .push(DocRow::Hunk(std::mem::take(&mut h.header).into()));
+            let (blocks, tables) = lay_out_tables(&mut h.lines, &self.layout);
+            self.laid_out += blocks.len();
+            // The grids come along because the caller's budget is not known here
+            // and a grid too wide for it has to be laid out again — off the same
+            // runs and the same measurements, or the second answer disagrees
+            // with the first. Rebased onto this document's own row numbering.
+            let (row, grid) = (self.rows.len() as u32, self.grids.len() as u32);
+            self.grids.extend(tables.grids);
+            self.tables
+                .extend(tables.of_line.iter().map(|(l, g)| (row + l, grid + g)));
+            for (l, block) in h.lines.into_iter().zip(blocks) {
+                if !self.blocks.contains(&block) {
+                    self.blocks.push(block);
+                }
+                self.rows.push(DocRow::Line { block, line: l });
+            }
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// How many visual rows logical row `index` occupies at the current wrap.
+    pub fn rows(&self, index: usize) -> usize {
+        self.wrapped.rows(index)
+    }
+
+    pub fn row(&self, index: usize) -> Option<&DocRow> {
+        self.rows.get(index)
+    }
+
+    /// The [`Block`] of a line row, or `None` for a header.
+    pub fn block(&self, index: usize) -> Option<Block> {
+        match self.rows.get(index) {
+            Some(DocRow::Line { block, .. }) => Some(*block),
+            _ => None,
+        }
+    }
+
+    /// The files this document holds, in order, for a jump list.
+    pub fn files(&self) -> &[Entry] {
+        &self.files
+    }
+
+    /// The text this row draws: a header's own, or a line's flowed grid when
+    /// this budget needed one and the line's own text when it did not.
+    ///
+    /// Borrowed, never copied — and it is the text [`Self::range`] and
+    /// [`Self::tokens`] are in the coordinates of, which is what makes a copy
+    /// of a row equal what was drawn.
+    pub fn text(&self, index: usize) -> Option<&str> {
+        match self.rows.get(index) {
+            Some(DocRow::File { path, .. }) => Some(path),
+            Some(DocRow::Hunk(header)) => Some(header),
+            Some(DocRow::Line { .. }) => Some(self.shared(index)?.as_ref()),
+            None => None,
+        }
+    }
+
+    /// The shared string [`Self::text`] borrows, for a client whose elements
+    /// adopt `Arc`-backed text by refcount rather than copying it.
+    pub fn shared(&self, index: usize) -> Option<&Arc<str>> {
+        match self.rows.get(index) {
+            Some(DocRow::Line { line, .. }) => Some(match self.flowed_at(index) {
+                Some(f) => &f.text,
+                None => &line.text,
+            }),
+            _ => None,
+        }
+    }
+
+    /// The tokens covering [`Self::text`] — the flowed row's, moved onto the
+    /// grid, when this budget re-laid one out.
+    pub fn tokens(&self, index: usize) -> &[Token] {
+        match self.rows.get(index) {
+            Some(DocRow::Line { line, .. }) => match self.flowed_at(index) {
+                Some(f) => &f.tokens,
+                None => &line.tokens,
+            },
+            _ => &[],
+        }
+    }
+
+    /// The intraline spans over [`Self::text`], the same way.
+    pub fn spans(&self, index: usize) -> &[Span] {
+        match self.rows.get(index) {
+            Some(DocRow::Line { line, .. }) => match self.flowed_at(index) {
+                Some(f) => &f.spans,
+                None => &line.spans,
+            },
+            _ => &[],
+        }
+    }
+
+    /// The bytes of this row's text that visual row `seg` draws.
+    pub fn range(&self, index: usize, seg: usize) -> Range<usize> {
+        match self.text(index) {
+            Some(text) => self.wrapped.range(index, seg, text),
+            None => 0..0,
+        }
+    }
+
+    /// Whether a hairline belongs *under* this visual row: a rule between two
+    /// rows of a table, which is not the same thing as a border around one.
+    ///
+    /// Three ways to answer no, and each is a thing that looked wrong:
+    ///
+    /// - **The last row of a table.** There is nothing under it to be separated
+    ///   from, and a line hanging under an open-bottomed grid reads as a break
+    ///   in the document rather than as part of the table.
+    /// - **A separator row.** Its own text is already a rule, and two of them a
+    ///   pixel apart is a double line.
+    /// - **Any sub-row but the last.** A squeezed cell wraps, and a rule through
+    ///   the middle of its own sentence says the row ended where it did not.
+    ///
+    /// The renderer draws this as pixels — a 1px rule in the window, a coloured
+    /// underline in a terminal — and never as a row of `─`: a rule between two
+    /// rows of a table is not a line of the file, so drawing it as text would
+    /// need a row the gutter has to skip, and a row count is not a
+    /// presentation's to change.
+    pub fn rule_after(&self, index: usize, seg: usize) -> bool {
+        matches!(
+            self.rows.get(index),
+            Some(DocRow::Line {
+                block: Block::Table,
+                ..
+            })
+        ) && seg + 1 == self.wrapped.rows(index)
+            && matches!(
+                self.rows.get(index + 1),
+                Some(DocRow::Line {
+                    block: Block::Table,
+                    ..
+                })
+            )
+    }
+
+    /// How many table rows this budget squeezed. Zero at any width where every
+    /// table fits, and with wrapping off.
+    pub fn squeezed(&self) -> usize {
+        self.flows.len()
+    }
+
+    /// Every distinct [`Block`] the document holds, once each, in the order they
+    /// were met. What the budget cache compares — and what a stats readout can
+    /// name without touching a row.
+    pub fn distinct_blocks(&self) -> &[Block] {
+        &self.blocks
+    }
+
+    /// Rebuilds the break table for a new set of budgets, and says whether
+    /// anything moved.
+    ///
+    /// `budget` is the caller's unit adapter: one block's text budget, in
+    /// columns, measured however the caller measures — window width less pixel
+    /// furniture less a heading's larger glyphs, or terminal columns less cell
+    /// furniture. `core` never learns which. A table's budget is the width its
+    /// *grid* has to fit, and not a column its text may be broken at: a grid is
+    /// aligned character by character with the rows above and below it, so it is
+    /// re-laid-out by [`flow_table`] — cells wrapped inside their own columns —
+    /// or drawn whole and scrolled to.
+    ///
+    /// Per row, `core` decides which of three things a line asks for: a flowed
+    /// table row keeps the breaks its grid decided (`Budget::At`); an intact or
+    /// unflowable table and every header are drawn whole (`Budget::Cols(0)`);
+    /// everything else wraps at its own block's budget.
+    pub fn reflow(&mut self, budget: &dyn Fn(Block) -> usize, wrap: &dyn Wrap) -> bool {
+        let budgets: Vec<usize> = self.blocks.iter().map(|b| budget(*b)).collect();
+        if budgets == self.budgets && wrap.name() == self.wrap {
+            return false;
+        }
+        self.budgets = budgets;
+        self.wrap = wrap.name();
+        // Before the wrap and not inside it: a table that no longer fits comes
+        // out of this with its rows already decided, and what `Wrapped` does
+        // with it is keep them.
+        self.flow(budget, wrap);
+        self.wrapped = Wrapped::build_with(
+            self.rows.iter().enumerate().map(|(i, r)| match r {
+                DocRow::Line { block, line } => match self.flowed_at(i) {
+                    Some(f) => (f.text.as_ref(), Budget::At(&f.breaks)),
+                    // A grid that fits, or one nothing could be done with, is
+                    // drawn whole: a break at a column shears it.
+                    None if block.is_table() => (line.text.as_ref(), Budget::Cols(0)),
+                    None => (line.text.as_ref(), Budget::Cols(budget(*block))),
+                },
+                // A header is drawn by its own function at its own width, and a
+                // path is not prose. One row, always.
+                _ => ("", Budget::Cols(0)),
+            }),
+            wrap,
+        );
+        true
+    }
+
+    /// Re-lays every table whose grid does not fit the table budget, and
+    /// forgets the ones that do.
+    ///
+    /// The one part of a table's layout that is the caller's business. Which
+    /// rows are one table, what its columns are and how wide each wants to be
+    /// were all settled at load by [`lay_out_tables`]; how many of those
+    /// columns' characters there is room for is not knowable until here, and
+    /// changes on every drag that crosses one.
+    ///
+    /// Runs per reflow over the tables and not over the rows, which is the
+    /// whole reason `tables` is sparse: a diff with no table in it does no work
+    /// here at any width.
+    fn flow(&mut self, budget: &dyn Fn(Block) -> usize, wrap: &dyn Wrap) {
+        self.flows.clear();
+        if self.tables.is_empty() {
+            return;
+        }
+        // One budget for every table, because a table row draws no furniture and
+        // no heading: the grid gets the whole column.
+        let cols = budget(Block::Table);
+        // Two vectors and not a `filter_map` into one: what comes back is one
+        // flowed row per row passed in, so a row silently dropped on the way in
+        // would attach every flow after it to the wrong row.
+        let mut run: Vec<TableRow> = Vec::new();
+        let mut of: Vec<u32> = Vec::new();
+        let mut i = 0;
+        while i < self.tables.len() {
+            let grid = self.tables[i].1;
+            let start = i;
+            while i < self.tables.len() && self.tables[i].1 == grid {
+                i += 1;
+            }
+            run.clear();
+            of.clear();
+            for (r, _) in &self.tables[start..i] {
+                let Some(DocRow::Line { block, line }) = self.rows.get(*r as usize) else {
+                    continue;
+                };
+                of.push(*r);
+                run.push(TableRow {
+                    text: &line.text,
+                    block: *block,
+                    tokens: &line.tokens,
+                    spans: &line.spans,
+                });
+            }
+            let Some(flowed) =
+                flow_table(&run, &self.grids[grid as usize], cols, &self.layout, wrap)
+            else {
+                continue;
+            };
+            for (row, f) in of.iter().zip(flowed) {
+                self.flows.push((*row, FlowedRow::of(f)));
+            }
+        }
+    }
+
+    /// The re-laid-out grid for a row, if this budget needed one.
+    ///
+    /// A binary search and not a field on the row: this is asked once per row
+    /// per reflow over a list that holds a handful of entries, and the
+    /// alternative costs four bytes on every row of every diff to say "no".
+    fn flowed_at(&self, index: usize) -> Option<&FlowedRow> {
+        let at = self
+            .flows
+            .binary_search_by_key(&(index as u32), |(r, _)| *r)
+            .ok()?;
+        Some(&self.flows[at].1)
+    }
+
+    /// What this has to say on a stats overlay, or nothing.
+    pub fn report(&self) -> String {
+        if self.laid_out == 0 {
+            return String::new();
+        }
+        let mut out = format!("markdown {} rows", self.laid_out);
+        // Only when it happened. A table that fits is the common case and saying
+        // "0 squeezed" on every diff is noise on a line that is read at a glance.
+        if !self.flows.is_empty() {
+            out.push_str(&format!(" · {} table rows squeezed", self.flows.len()));
+        }
+        out
     }
 }
 
@@ -2062,4 +2576,280 @@ diff --git a/d.md b/d.md
             );
         }
     }
+
+    // ---------------------------------------------- the shared presentation
+
+    use crate::markdown::{Bar, DocRow, Document, Furniture};
+
+    /// Four rows of one table, every line marked as context. (`WIDE` above is a
+    /// hunk *body*, and its first line lost its marker to the string literal's
+    /// line continuation — `parse_unified_diff` drops a line with no marker.)
+    const TABLE_RUN: &str = "\
+\x20| Resource | Why |
+ |---|---|
+ | ECR repository | push target for the build, and a rollback tag |
+ | Security group | ingress 3000 from the ALB only |
+";
+
+    /// Builds a document over a whole diff the way a presentation does: one
+    /// `prepare` pass, then every file handed to the model.
+    fn document(src: &str) -> Document {
+        let hl = Highlighters::builtin();
+        let mut p = prepare(&parse_unified_diff(src), &hl, 2000);
+        let mut doc = Document::default();
+        for f in p.files.drain(..) {
+            doc.push(f);
+        }
+        doc
+    }
+
+    /// The pieces every visual row of logical row `index` draws.
+    fn pieces(doc: &Document, index: usize) -> Vec<&str> {
+        let text = doc.text(index).unwrap_or_default();
+        (0..doc.rows(index))
+            .map(|seg| &text[doc.range(index, seg)])
+            .collect()
+    }
+
+    #[test]
+    fn document_reflow_uses_each_blocks_budget() {
+        let src = "\
+diff --git a/d.md b/d.md
+@@ -1,11 +1,11 @@
+ # A long heading that will certainly need wrapping
+-- a bullet whose own text runs long enough to wrap somewhere sensible
++> a quote whose text also runs long enough to wrap somewhere sensible
+ some plain prose that runs long enough to need wrapping at twenty columns
+ ```rust
+ let an_identifier = 1;
+ ```
+ | a | b |
+ |---|---|
+ | 1 | 2 |
+";
+        let mut doc = document(src);
+        let budget = |block: Block| match block {
+            // Every distinct block its own budget, deliberately unequal.
+            Block::Heading(_) => 12,
+            Block::Bullet(_) => 10,
+            Block::Quote(_) => 8,
+            Block::Code | Block::Fence => 6,
+            Block::Table => 40,
+            _ => 20,
+        };
+        assert!(doc.reflow(&budget, &crate::wrap::Word));
+
+        let mut checked = 0;
+        for i in 0..doc.len() {
+            let Some(block) = doc.block(i) else {
+                // Headers: one row, always, whatever the budgets say.
+                assert_eq!(doc.rows(i), 1, "row {i} wrapped");
+                continue;
+            };
+            let cols = budget(block);
+            let expected = match block {
+                // An intact table is drawn whole: a break at a column shears it.
+                // A fence's text is its language label and is short by nature.
+                Block::Table | Block::TableRule | Block::Fence => 1,
+                _ => {
+                    assert!(pieces(&doc, i).len() > 1, "{block:?} did not wrap");
+                    usize::MAX
+                }
+            };
+            for (seg, piece) in pieces(&doc, i).iter().enumerate() {
+                assert!(
+                    piece.trim_end().chars().count() <= cols,
+                    "{block:?} seg {seg} drew {piece:?} past its {cols} columns"
+                );
+                assert!(seg < expected, "{block:?} wrapped past its budget");
+            }
+            checked += 1;
+        }
+        assert!(checked >= 8, "only {checked} line rows came through");
+
+        // And the same width again is two comparisons, not a rebuild.
+        assert!(!doc.reflow(&budget, &crate::wrap::Word));
+    }
+
+    #[test]
+    fn flowed_tables_keep_source_rows_and_mark_only_real_boundaries() {
+        let mut doc = document(&format!(
+            "diff --git a/d.md b/d.md\n@@ -1,4 +1,4 @@\n{TABLE_RUN}"
+        ));
+        let before = doc.len();
+        let table: Vec<usize> = (0..doc.len())
+            .filter(|i| doc.block(*i).is_some_and(|b| b.is_table()))
+            .collect();
+        assert_eq!(table.len(), 4, "header, separator and two data rows");
+
+        assert!(doc.reflow(&|_| 44, &crate::wrap::Word));
+        // More visual segments, the same logical rows: a squeezed table is more
+        // rows and never a fabricated one, or the gutter would have to skip.
+        assert_eq!(doc.len(), before, "reflow invented or dropped a row");
+        assert_eq!(doc.squeezed(), 4, "every row of the run was flowed");
+        let total: usize = table.iter().map(|i| doc.rows(*i)).sum();
+        assert!(total > 4, "nothing wrapped: {total} segments");
+
+        for (k, &r) in table.iter().enumerate() {
+            let last = doc.rows(r) - 1;
+            for seg in 0..=last {
+                let expected = doc.block(r) == Some(Block::Table)
+                    && seg == last
+                    && k + 1 < table.len()
+                    && doc.block(table[k + 1]) == Some(Block::Table);
+                assert_eq!(
+                    doc.rule_after(r, seg),
+                    expected,
+                    "row {r}.{seg} ({:?})",
+                    doc.block(r)
+                );
+            }
+        }
+        // The separator and the last row are the two rows a boundary may not
+        // hang under, whatever the budget did.
+        assert!(
+            !doc.rule_after(table[1], 0),
+            "the separator drew a second rule"
+        );
+        assert!(
+            !doc.rule_after(*table.last().unwrap(), 0),
+            "the last row has nothing under it"
+        );
+    }
+
+    #[test]
+    fn a_table_with_no_room_for_a_character_a_column_is_drawn_whole() {
+        // The squeeze floor: two columns cost seven characters of pipes and
+        // padding before a letter is drawn, so at eight columns there is one
+        // character left over for two columns and a grid made of nothing but
+        // grid is worse than a grid you scroll. Nothing is flowed, and every
+        // row stays one row — `Budget::Cols(0)`, the same answer an intact
+        // table gets. (Nine columns would flow at one character a column.)
+        let mut doc = document(&format!(
+            "diff --git a/d.md b/d.md\n@@ -1,4 +1,4 @@\n{TABLE_RUN}"
+        ));
+        assert!(doc.reflow(&|_| 8, &crate::wrap::Word));
+        assert_eq!(doc.squeezed(), 0, "an unreadable grid was squeezed anyway");
+        for i in 0..doc.len() {
+            if doc.block(i).is_some_and(|b| b.is_table()) {
+                assert_eq!(doc.rows(i), 1, "row {i} wrapped");
+            }
+        }
+    }
+
+    #[test]
+    fn indented_hash_stays_prose_beside_a_real_fence() {
+        // The exact line the fixture carries: four columns of indent and a
+        // trailing `# comment`. Past three columns a `#` is a shell comment, not
+        // a heading — and the fence beside it must not swallow the row either.
+        let src = "\
+diff --git a/d.md b/d.md
+@@ -1,4 +1,4 @@
+ ```sh
+ # a real heading inside the fence, which is code
+ ```
+     ./dev.sh diff        # rebuild on every save
+";
+        let doc = document(src);
+        assert_eq!(doc.block(3), Some(Block::Code), "the fence interior");
+        assert_eq!(doc.block(4), Some(Block::Fence), "the closing fence");
+        assert_eq!(
+            doc.block(5),
+            Some(Block::Paragraph),
+            "the indented command was promoted to a heading"
+        );
+    }
+
+    #[test]
+    fn a_bullets_continuation_keeps_its_depth_and_yields_the_slot() {
+        // A source continuation line under a bullet is the previous row's depth
+        // without a bullet of its own: it sits at the bullet's marker column,
+        // and the renderer reserves the slot only on the bullet itself. Both
+        // rows are context, because the sides are classified independently and
+        // a continuation alone on its side has no bullet before it.
+        let src = "\
+diff --git a/d.md b/d.md
+@@ -1,2 +1,2 @@
+ - a bullet whose text runs long enough to need the room
+   and the continuation line the source carried under it
+";
+        let doc = document(src);
+        assert_eq!(doc.block(2), Some(Block::Bullet(0)));
+        assert_eq!(doc.block(3), Some(Block::Ordered(0)), "the continuation");
+        assert!(doc.block(2).unwrap().furniture().bullet);
+        assert!(!doc.block(3).unwrap().furniture().bullet);
+        assert_eq!(
+            doc.block(2).unwrap().furniture().depth,
+            doc.block(3).unwrap().furniture().depth,
+        );
+        // The wrapped bullet reserves its slot on every segment — which is why
+        // its budget is the same on each — and the Furniture says so once.
+        let f = Block::Bullet(1).furniture();
+        assert_eq!(
+            f,
+            Furniture {
+                depth: 1,
+                bullet: true,
+                bar: None,
+                heading: None,
+                fence_label: false,
+                rule: false,
+                blank: false,
+                table: false,
+            }
+        );
+        assert_eq!(Block::Quote(1).furniture().bar, Some(Bar::Quote));
+        assert_eq!(Block::Code.furniture().bar, Some(Bar::Code));
+        assert!(Block::Table.furniture().table);
+        assert!(Block::Table.furniture().depth == 0);
+        assert!(Block::Rule.furniture().rule);
+        assert!(Block::Blank.furniture().blank);
+        assert!(Block::Fence.furniture().fence_label);
+        assert_eq!(Block::Heading(3).furniture().heading, Some(3));
+    }
+
+    #[test]
+    fn the_document_answers_what_a_renderer_and_a_copy_both_need() {
+        // `text`, `range`, `tokens` and `spans` must agree about coordinates or
+        // a copy will not equal what was drawn. This is the whole contract the
+        // two frontends share, in one test.
+        let mut doc = document(DOC_SRC);
+        doc.reflow(&|_| 30, &crate::wrap::Word);
+        for i in 0..doc.len() {
+            let Some(text) = doc.text(i) else { continue };
+            let joined: String = (0..doc.rows(i))
+                .map(|seg| &text[doc.range(i, seg)])
+                .collect();
+            assert_eq!(joined.replace(' ', ""), text.replace(' ', ""), "row {i}");
+            for t in doc.tokens(i) {
+                assert!(t.end as usize <= text.len(), "token {t:?} outside {text:?}");
+            }
+            for s in doc.spans(i) {
+                assert!(s.end as usize <= text.len(), "span {s:?} outside {text:?}");
+            }
+            if let Some(DocRow::File { path, .. }) = doc.row(i) {
+                assert_eq!(&**path, doc.text(i).unwrap());
+            }
+        }
+        assert_eq!(doc.files().len(), 1);
+        assert_eq!(doc.files()[0].row, 0);
+        assert!(doc.report().starts_with("markdown "), "{}", doc.report());
+    }
+
+    /// The document fixture: every block kind, both sides of the hunk.
+    const DOC_SRC: &str = "\
+diff --git a/d.md b/d.md
+@@ -1,9 +1,9 @@
+ # gitten
+
+-A git client with **bold** claims and [a link](https://example.com/long/url).
++A git client with **bolder** claims and [a link](https://example.com/other/url).
+
+ - one
+   - nested
+ > quoted
+ ```rust
+ let x = 1;
+ ```
+";
 }
