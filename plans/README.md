@@ -55,6 +55,9 @@ integrator owns this table and updates it as waves land.
 | 014 | Stage/unstage the selected hunk from the terminal diff | P1 | M | — | DONE (pass 3, `b234f62`+5, fold `196704f`) — reviewed CONCERNS (all non-blocking); 3 folds in |
 | 015 | Render the shared Markdown presentation in the terminal | P2 | L | — | DONE (pass 3, `efe00bb`+3, folds `23e7672`) — reviewed CONCERNS (all non-blocking); core markdown.rs is a pure addition; 2 folds in |
 | 016 | The terminal pane focus ring (foundation for lazygit-shaped TUI) | P1 | L | 013–015 | DONE (pass 4, `0cfbb41`+4, fold `a1c5b2d`) — reviewed CONCERNS (all non-blocking); 2 folds in; executor's "2-file scope" claim was false (7 files, all inside plan authorization — test/harness fallout), recorded |
+| 019 | The terminal stashes pane (apply/pop/drop/push) | P1 | S–M | 016 | IN PROGRESS (pass 4) |
+| 017 | The terminal files pane (sections, all file verbs, commit/amend prompts) | P1 | L | 016 | IN PROGRESS (pass 4) — owns the prompt generalization |
+| 018 | The terminal branches pane (checkout/new/rename/delete/tag; rebase deferred as a named lifecycle follow-up) | P1 | L | 016, 017 | PLANNED (pass 4) — executes after 017's prompt enum lands |
 
 ## Pass 3 follow-ups — surfaced by reviewers, pre-existing, not pass regressions
 
