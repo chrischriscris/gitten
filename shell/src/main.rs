@@ -96,11 +96,6 @@ const TITLE_H: f32 = 32.0;
 /// title begins after them.
 const LIGHTS_X: f32 = 10.0;
 const LIGHTS_W: f32 = 72.0;
-/// The commit column's slice of the window's width; the sidebar takes its
-/// own slice ([`chrome::SIDEBAR_SHARE`]) and the diff takes the rest. A code
-/// constant on purpose tonight — a drag handle between the regions would own
-/// this properly, and that is polish-pass work.
-const COLUMN_SHARE: f32 = 0.32;
 /// The branch chip's height in the title strip: a row's worth, so it reads
 /// as a label and not as a button, inside a 32px band with air either side.
 const CHIP_H: f32 = 22.0;
@@ -150,10 +145,14 @@ impl HeaderText {
     }
 }
 
-/// The three sidebar panes in reading order: the mode name the registry knows
-/// them by, the key that focuses each, the header's label and the element id.
-/// Static, so a frame spells none of them — and the label is the design's
-/// word, which is `STASH` for a stack the mode calls `stashes`.
+/// The stack's three content-sized panes, in reading order: the mode name the
+/// registry knows them by, the key that focuses each, the header's label and
+/// the element id. Static, so a frame spells none of them — and the label is
+/// the design's word, which is `STASH` for a stack the mode calls `stashes`.
+/// The commit list is the stack's fourth section and draws after these; it is
+/// not in this table because it sizes itself differently — the flexible foot,
+/// not content height — and because its slot is the registry's, which an
+/// extension pane can take over.
 const SIDEBAR: [(&str, &str, &str, &str); 3] = [
     ("files", "1", "FILES", "side-files"),
     ("branches", "2", "BRANCHES", "side-branches"),
@@ -400,22 +399,21 @@ trait Pane {
 
 /// Which of the window's two regions the keyboard is in.
 ///
-/// Two targets, because the design has two: the lists — the sidebar's three
-/// stacked panes and the commit column, all on screen at once — and the diff
-/// filling the rest. The focused region carries the accent edge, and
+/// Two targets, because the design has two: the lists — the left stack's
+/// four panes, all on screen at once — and the diff filling the rest. The focused region carries the accent edge, and
 /// [`Modes`] is rebuilt from this — a list's keys move that list, the diff's
 /// keys scroll the diff — which is why there is no third state to forget to
 /// route.
 ///
 /// Which *list* has the keyboard is not a spot of its own: it is
 /// [`panes::Panes`]' focused tenant, the same registry that decides what the
-/// column draws when an extension pane takes it over. A sidebar section and
-/// the commit column differ in where they draw, never in what the keyboard
+/// stack's commit section draws when an extension pane takes it over. One
+/// section and another differ in where they draw, never in what the keyboard
 /// means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Spot {
-    /// Some list — a sidebar section, the commit column, an extension pane
-    /// standing in for one — holds the keyboard.
+    /// Some list — a stack section, an extension pane standing in for the
+    /// commit list — holds the keyboard.
     List,
     /// The diff main view.
     Main,
@@ -437,8 +435,8 @@ enum Screen {
         generation: Rc<Cell<Generation>>,
         label: Rc<RefCell<String>>,
     },
-    /// The diff main view. The one tenant that is not a column list: it fills
-    /// the right side of the window whatever the column shows.
+    /// The diff main view. The one tenant that is not a stack list: it fills
+    /// the right side of the window whatever the stack shows.
     ///
     /// Its revspec lives behind a cell because it *changes* while the tenant
     /// does not — every selection change re-aims the same view at another
@@ -971,24 +969,25 @@ struct DevShell {
     /// list that handed the keyboard to its diff is still a diff while that
     /// region owns it.
     which: &'static str,
-    /// The window's panes, by stable name. The sidebar renders three named
-    /// residents at once and the column renders commits (or an extension
-    /// pane that has taken it over); focus decides whose keys are live, and
-    /// every list keeps its own cursor and scroll state whatever is on
-    /// screen. See [`DevShell::list_order`] for the order the keys walk.
+    /// The window's panes, by stable name. The left stack renders four named
+    /// residents at once — files, branches, stashes, commits — or whichever
+    /// extension pane has taken the commit list's region over; focus decides
+    /// whose keys are live, and every list keeps its own cursor and scroll
+    /// state whatever is on screen. See [`DevShell::list_order`] for the
+    /// order the keys walk.
     panes: panes::Panes<Screen>,
-    /// The diff main view: always on screen, right of the column. Built once
+    /// The diff main view: always on screen, right of the stack. Built once
     /// at startup (empty when the window opened on a list) and re-aimed at
     /// each selection through [`DevShell::schedule_main_diff`] — never rebuilt,
     /// which is what keeps its scroll state and presentation across commits.
     ///
     /// A launch whose first acquisition was itself a diff (`gitten diff …`,
     /// a fixture, a patch file) builds this from those rows instead and has
-    /// no column at all — see [`DevShell::has_column`].
+    /// no commit list at all — see [`DevShell::has_column`].
     main: Screen,
-    /// Whether the window has a commit column. False only for a diff/fixture/
+    /// Whether the window has a commit list. False only for a diff/fixture/
     /// patch launch, where there is no acquired commit list to show; the
-    /// diff then fills the whole width, the sidebar's three panes still stand
+    /// diff then fills the whole width, the stack's other panes still stand
     /// (a fixture has no repository, so it has none of them either) and the
     /// spot never leaves [`Spot::Main`] when no list exists at all.
     has_column: bool,
@@ -1098,8 +1097,8 @@ struct DevShell {
 }
 
 impl DevShell {
-    /// The screen commands act on: the column's visible list, or the diff,
-    /// by where the keyboard is. Every dispatch decision reads through here,
+    /// The screen commands act on: the focused list, or the diff, by where
+    /// the keyboard is. Every dispatch decision reads through here,
     /// which is what makes routing a change of [`Spot`] and nothing else.
     fn active(&self) -> Option<&Screen> {
         Some(match self.spot {
@@ -1108,12 +1107,13 @@ impl DevShell {
         })
     }
 
-    /// The column's commits list. With the sidebar holding the other lists,
-    /// the column shows commits whatever the keyboard is doing — so main-view
+    /// The commits list. With the stack holding the other lists, the commit
+    /// list is on screen whatever the keyboard is doing — so main-view
     /// loading reads its selection from here even while the files pane is
     /// focused, which is the design's point: moving through the working tree
     /// does not take the commit list away. `None` only while an extension
-    /// pane has taken the column over, or on a launch with no column at all.
+    /// pane has taken its region over, or on a launch with no commit list at
+    /// all.
     fn column_commits(&self) -> Option<Entity<views::commits::Commits>> {
         if !self.has_column || matches!(self.panes.focused(), Screen::Custom(_)) {
             return None;
@@ -1125,8 +1125,8 @@ impl DevShell {
     }
 
     /// The pane names that are lists, in the order the design's number keys
-    /// name them: the sidebar's three stacked panes, then the column's own
-    /// residents — commits first, then whatever an extension registered.
+    /// name them and the stack draws them: files, branches, stashes, then
+    /// commits — then whatever an extension registered.
     /// A diff-shaped launch has no commits and still has the sidebar, so
     /// both "is there a list to focus" and the cycle order read through
     /// here rather than through `has_column`.
@@ -2854,8 +2854,8 @@ impl DevShell {
     /// menu is the whole of this `esc`: closed, pending dropped with it.
     ///
     /// With nothing stacked above, `esc` hands the keyboard back from the
-    /// diff to the list column — lazygit's way out of a main view. The lists
-    /// themselves are never closed any more: they are the column's residents,
+    /// diff to the stack — lazygit's way out of a main view. The lists
+    /// themselves are never closed any more: they are the stack's residents,
     /// and closing one would leave the window half empty rather than one pane
     /// lighter. A selection is inside a list, so it goes after the region
     /// switch; the diff's own selection stays until its rows are replaced.
@@ -2901,8 +2901,8 @@ impl DevShell {
     }
 
     /// Cycles the lists — what ctrl-j/ctrl-k do, walking `1 → 2 → 3 → 4`:
-    /// the sidebar's three panes, then the commit column, then any pane an
-    /// extension registered. The command names still say *pane*: they were
+    /// the stack's four panes in drawing order, then any pane an extension
+    /// registered. The command names still say *pane*: they were
     /// named for the panes that used to stack, and a rename would break
     /// every `[keys]` file in flight.
     fn cycle_pane(&mut self, by: isize, cx: &mut Context<Self>) {
@@ -3279,14 +3279,14 @@ impl DevShell {
         // wheel: otherwise an unfocused pane's native list scroller would
         // become a second, unconfigured input path when this capture handler
         // stood aside.
-        let in_column = self.has_column.then(|| {
+        let in_stack = self.has_column.then(|| {
             self.panes
                 .iter()
                 .position(|screen| screen.list_bounds(cx).contains(&ev.position))
         });
         let over_main = self.main.list_bounds(cx).contains(&ev.position);
-        let screen = match (in_column.flatten(), over_main) {
-            // The column keeps its per-list hit test: whichever list is
+        let screen = match (in_stack.flatten(), over_main) {
+            // The stack keeps its per-list hit test: whichever list is
             // showing owns its own box.
             (Some(at), _) => {
                 self.focus_pane(at, cx);
@@ -3547,6 +3547,110 @@ impl DevShell {
             theme_picker,
         ]
     }
+
+    /// The stack's flexible foot: the commit list, or whichever extension
+    /// pane took its region over. Focused-and-not-a-sidebar-name is exactly
+    /// "a custom pane stands here", so the header's name and the accent
+    /// follow it without a third state to check.
+    fn commits_section(
+        &self,
+        host: &Rc<Host>,
+        focused_name: &str,
+        cx: &mut Context<Self>,
+        out: &mut Vec<AnyElement>,
+    ) {
+        if !self.has_column {
+            return;
+        }
+        let c = host.theme.chrome;
+        let custom = matches!(self.panes.focused(), Screen::Custom(_));
+        let screen = match custom {
+            true => self.panes.focused(),
+            false => self
+                .panes
+                .get("commits")
+                .unwrap_or_else(|| self.panes.focused()),
+        };
+        let focused = self.spot == Spot::List && (custom || focused_name == "commits");
+        // Right-edge furniture: the branch the list is of — the design pins
+        // it here, where a checkout rewrites it in place — and a live
+        // filter's count when there is one, because the filter is the thing
+        // that changed most recently and the thing a count is about. Both
+        // read from state the refresh wave already paid for.
+        let right = match screen {
+            Screen::Commits { view, .. } => {
+                let note = view.read(cx).filter_note();
+                let branch = (!note.is_some())
+                    .then(|| {
+                        self.panes.get("branches").and_then(|s| match s {
+                            Screen::Branches { view, .. } => view.read(cx).head_info(),
+                            _ => None,
+                        })
+                    })
+                    .flatten()
+                    .map(|info| info.branch);
+                note.map(|note| {
+                    div()
+                        .flex_none()
+                        .text_color(rgb(c.faint))
+                        .child(SharedString::from(note))
+                        .into_any_element()
+                })
+                .or_else(|| {
+                    // Dim, not accent: the accent is the keyboard's mark and
+                    // a branch name is a fact about the list.
+                    branch.map(|branch| {
+                        div()
+                            .flex_none()
+                            .text_color(rgb(c.dim))
+                            .child(branch)
+                            .into_any_element()
+                    })
+                })
+            }
+            _ => None,
+        };
+        let name: SharedString = match custom {
+            true => screen.label(cx).into(),
+            false => "COMMITS".into(),
+        };
+        out.push(
+            div()
+                .id("side-commits")
+                .debug_selector(|| "side-commits".to_string())
+                .flex_grow(1.0)
+                // A zero basis: the section takes the space the content-sized
+                // sections leave, from nothing — never its own content's idea
+                // of a height, which a virtualized list has not got. The
+                // floor is the least a list can show and still be seen to
+                // scroll.
+                .flex_basis(px(0.0))
+                .min_h(px(SECTION_MIN_H))
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .capture_any_mouse_down(cx.listener(move |this, _, _, cx| {
+                    // A click always means "the keyboard comes back here" —
+                    // including from the diff. Focusing first keeps a
+                    // takeover standing; the spot follows either way, which
+                    // `focus_named` alone would not do when the pane was
+                    // already the focused one.
+                    if !custom {
+                        this.focus_named("commits", cx);
+                    }
+                    this.set_spot(Spot::List, cx);
+                }))
+                .child(chrome::pane_header(host, "4", name, None, focused, right))
+                .child(
+                    div()
+                        .min_h_0()
+                        .flex_grow(1.0)
+                        .overflow_hidden()
+                        .child(screen.any()),
+                )
+                .into_any_element(),
+        );
+    }
 }
 
 // The `Screen` adapter above takes plain arguments so it reads as one thing;
@@ -3575,33 +3679,37 @@ impl Render for DevShell {
         let c = host.theme.chrome;
         let f = &host.font;
 
-        // **The three regions**: the sidebar's three stacked panes, the commit
-        // column, and the diff filling the rest — all three on screen at once,
-        // which is the design this window follows. Every region is drawn with
-        // the same furniture: a short header naming the pane with *the number
-        // of the key that focuses it*, and a hairline under it. The keyboard's
-        // region says so through its header — the bar on its left edge, the
-        // keycap and name in the accent — and through the selected row's
-        // bar; the regions themselves are parted by hairlines only, so the
-        // one accent on screen is where the keyboard is and nothing else.
+        // **The two regions**: the left stack — files, branches, stashes and
+        // the commit list — and the diff filling the rest, lazygit's shape.
+        // Every region is drawn with the same furniture: a short header
+        // naming the pane with *the number of the key that focuses it*, and
+        // a hairline under it. The keyboard's region says so through its
+        // header — the bar on its left edge, the keycap and name in the
+        // accent — and through the selected row's bar; the regions themselves
+        // are parted by one hairline, so the one accent on screen is where
+        // the keyboard is and nothing else.
         //
-        // All three sidebar panes render at once; they are the repository's
-        // own three answers (what changed, where am I, what is parked) and
-        // none of them is worth a swap. The column, by contrast, is a
-        // registry: commits by default, an extension pane standing in when
-        // one is focused — the one place a compiled-in tenant takes the
-        // keyboard's whole region, exactly as it did before this window had
-        // a sidebar.
+        // The stack's short panes render at once and are **as tall as their
+        // content**: five files take five rows and the branches sit directly
+        // under them, the way the design stacks them — not a quarter of the
+        // column each with air nobody asked for. The height is arithmetic
+        // (header plus rows), because a view cannot measure itself during
+        // `render`; and when they do not fit, each shrinks from that basis
+        // to a floor of two rows and its `uniform_list` scrolls. No
+        // measurement, no second frame.
         //
-        // **A section is as tall as its content.** Five files take five
-        // rows and the branches sit directly under them, the way the design
-        // stacks them — not a third of the sidebar each with air nobody
-        // asked for. The height is arithmetic (header plus rows), because a
-        // view cannot measure itself during `render`; and when the three do
-        // not fit, each shrinks from that basis to a floor of two rows and
-        // its `uniform_list` scrolls. No measurement, no second frame.
+        // The commit list is the stack's one *flexible* section: it takes
+        // whatever the short panes leave, the way lazygit's log does — it is
+        // the reason one opens the window, and the one list whose height
+        // nobody would want fixed. It is also a registry slot: commits by
+        // default, an extension pane standing in when one is focused — the
+        // one place a compiled-in tenant takes a region of its own, exactly
+        // as it did when it had a column to itself.
         let sidebar = {
-            let focused_name = self.panes.focused_name();
+            // Owned, not borrowed: the loop below calls back into `self` for
+            // the commit section, and a borrow of the panes would stand
+            // across it.
+            let focused_name = self.panes.focused_name().to_string();
             let mut sections: Vec<AnyElement> = Vec::new();
             for (name, number, label, id) in SIDEBAR {
                 let Some(screen) = self.panes.get(name) else {
@@ -3657,6 +3765,9 @@ impl Render for DevShell {
                         .into_any_element(),
                 );
             }
+            // The stack's flexible foot: the commit list, or whichever
+            // extension pane took its region over.
+            self.commits_section(&host, &focused_name, cx, &mut sections);
             (!sections.is_empty()).then(|| {
                 div()
                     .id("sidebar")
@@ -3670,88 +3781,6 @@ impl Render for DevShell {
                     .children(sections)
             })
         };
-        // The column. Focused-and-not-a-sidebar-name is exactly "an extension
-        // pane took the region over", so the header's name and the accent
-        // follow whatever stands there without a third state to check.
-        let column = self.has_column.then(|| {
-            let custom = matches!(self.panes.focused(), Screen::Custom(_));
-            let screen = match custom {
-                true => self.panes.focused(),
-                false => self
-                    .panes
-                    .get("commits")
-                    .unwrap_or_else(|| self.panes.focused()),
-            };
-            let focused =
-                self.spot == Spot::List && (custom || self.panes.focused_name() == "commits");
-            // Right-edge furniture: the branch the list is of — the design
-            // pins it here, where a checkout rewrites it in place — and a
-            // live filter's count when there is one, because the filter is
-            // the thing that changed most recently and the thing a count is
-            // about. Both read from state the refresh wave already paid for.
-            let right = match screen {
-                Screen::Commits { view, .. } => {
-                    // The filter's count, when there is one; otherwise the
-                    // branch the list is of, the way the design pins it.
-                    let note = view.read(cx).filter_note();
-                    let branch = (!note.is_some())
-                        .then(|| {
-                            self.panes.get("branches").and_then(|s| match s {
-                                Screen::Branches { view, .. } => view.read(cx).head_info(),
-                                _ => None,
-                            })
-                        })
-                        .flatten()
-                        .map(|info| info.branch);
-                    note.map(|note| {
-                        div()
-                            .flex_none()
-                            .text_color(rgb(c.faint))
-                            .child(SharedString::from(note))
-                            .into_any_element()
-                    })
-                    .or_else(|| {
-                        // Dim, not accent: the accent is the keyboard's mark
-                        // and a branch name is a fact about the list.
-                        branch.map(|branch| {
-                            div()
-                                .flex_none()
-                                .text_color(rgb(c.dim))
-                                .child(branch)
-                                .into_any_element()
-                        })
-                    })
-                }
-                _ => None,
-            };
-            let name: SharedString = match custom {
-                true => screen.label(cx).into(),
-                false => "COMMITS".into(),
-            };
-            div()
-                .id("column")
-                .flex_none()
-                .w(relative(COLUMN_SHARE))
-                .relative()
-                .min_h_0()
-                .flex()
-                .flex_col()
-                .overflow_hidden()
-                // A hairline parts the regions; the header says which one
-                // holds the keyboard.
-                .border_l_1()
-                .border_color(rgb(c.border))
-                .debug_selector(|| "column".to_string())
-                .capture_any_mouse_down(cx.listener(|this, _, _, cx| this.set_spot(Spot::List, cx)))
-                .child(chrome::pane_header(&host, "4", name, None, focused, right))
-                .child(
-                    div()
-                        .min_h_0()
-                        .flex_grow(1.0)
-                        .overflow_hidden()
-                        .child(screen.any()),
-                )
-        });
         let Screen::Diff {
             view: main_view, ..
         } = &self.main
@@ -3856,7 +3885,7 @@ impl Render for DevShell {
                 )
             })
             // A flexed box for the view itself: every view roots at
-            // `size_full`, which under this column would read the *container*
+            // `size_full`, which under this region would read the *container*
             // height and slide the last rows behind the header without it.
             .child(
                 div()
@@ -4046,16 +4075,15 @@ impl Render for DevShell {
                     .child(div().flex_grow(1.0))
                     .children(strip),
             )
-            // The three regions in one row: sidebar, column, diff. A fixture
-            // has neither sidebar nor column and the diff fills the window;
-            // a repository has all three.
+            // The two regions in one row: the left stack, the diff. A fixture
+            // has no stack — no repository to list — and the diff fills the
+            // window; a repository has both.
             .child(
                 div()
                     .min_h_0()
                     .flex_grow(1.0)
                     .flex()
                     .children(sidebar)
-                    .children(column)
                     .child(main_region),
             )
             .children(input)
@@ -4134,7 +4162,7 @@ impl Render for DevShell {
                     .child(div().text_color(rgb(c.faint)).child(load))
             }))
             // The help overlay, last so it paints over everything: deferred, so
-            // it escapes the column's paint order; occluding, so the rows under
+            // it escapes the regions' paint order; occluding, so the rows under
             // it get neither the clicks nor the wheel. Its rows come from the
             // same projection the terminal draws, which is why neither client
             // can drift from the other.
@@ -4346,7 +4374,8 @@ fn main() {
                 // it empty — its rows arrive with the first selection's
                 // scheduled load, and the header names the commit from frame
                 // one. A launch that opened on a diff (`gitten diff …`, a
-                // fixture, a patch) *is* this screen: same rows, no column.
+                // fixture, a patch) *is* this screen: same rows, no commit
+                // list.
                 let main_screen = match &screen {
                     Screen::Commits { .. } => {
                         let e = cx.new(|cx| views::diff::Diff::new(Vec::new(), host.clone(), cx));
@@ -5173,7 +5202,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn the_column_and_the_main_view_sit_side_by_side(cx: &mut TestAppContext) {
+    fn the_stack_and_the_main_view_sit_side_by_side(cx: &mut TestAppContext) {
         let shell = shell(None, cx);
         let observed = shell.clone();
         let handle = cx.update(|cx| {
@@ -5193,37 +5222,42 @@ mod tests {
         });
         let mut cx = gpui::VisualTestContext::from_window(handle.into(), cx);
         cx.run_until_parked();
-        let column = cx.debug_bounds("column").expect("the column was not drawn");
+        let stack = cx.debug_bounds("sidebar").expect("the stack was not drawn");
         let main = cx
             .debug_bounds("main")
             .expect("the main view was not drawn");
 
-        // Side by side, both full height, the column in its slice of the
+        // Side by side, both full height, the stack in its slice of the
         // width — 0.32 against the main view's 0.68.
-        assert!(column.size.height > gpui::px(0.0));
+        assert!(stack.size.height > gpui::px(0.0));
         assert!(main.size.height > gpui::px(0.0));
-        assert_eq!(column.origin.y, main.origin.y);
-        let width = f32::from(column.size.width) + f32::from(main.size.width);
-        let share = f32::from(column.size.width) / width;
+        assert_eq!(stack.origin.y, main.origin.y);
+        let width = f32::from(stack.size.width) + f32::from(main.size.width);
+        let share = f32::from(stack.size.width) / width;
         assert!(
-            (share - super::COLUMN_SHARE).abs() < 0.01,
-            "the column took {share} of the width"
+            (share - super::chrome::SIDEBAR_SHARE).abs() < 0.01,
+            "the stack took {share} of the width"
         );
-        assert_eq!(column.right(), main.origin.x);
+        assert_eq!(stack.right(), main.origin.x);
 
-        // A click moves the keyboard between exactly the two regions.
+        // A click moves the keyboard between exactly the two regions. The
+        // commit section answers for the whole stack: focusing it puts the
+        // keyboard back in the list region.
         cx.simulate_click(main.center(), gpui::Modifiers::default());
         assert_eq!(
             observed.read_with(&cx, |shell, _| shell.spot),
             super::Spot::Main
         );
-        cx.simulate_click(column.center(), gpui::Modifiers::default());
+        let commits_section = cx
+            .debug_bounds("side-commits")
+            .expect("the commit section was not drawn");
+        cx.simulate_click(commits_section.center(), gpui::Modifiers::default());
         assert_eq!(
             observed.read_with(&cx, |shell, _| shell.spot),
             super::Spot::List
         );
 
-        // And ctrl-j cycles the column's lists without leaving the column.
+        // And ctrl-j cycles the stack's lists without leaving the stack.
         // Registration focuses what it adds, so the keyboard goes back to the
         // root first — where ctrl-j finds it.
         observed.update(&mut cx, |shell, cx| {
@@ -5246,12 +5280,13 @@ mod tests {
         );
     }
 
-    /// The design's whole arrangement: sidebar, column, diff — three regions
-    /// side by side, the sidebar's three sections stacked inside the first.
-    /// Drawn from the same geometry the click hit-tests read, which is what
-    /// makes it a test of the real layout and not of a copy of it.
+    /// The design's whole arrangement: stack, diff — two regions side by
+    /// side, the stack's four sections stacked inside the first, the commit
+    /// list the flexible one. Drawn from the same geometry the click
+    /// hit-tests read, which is what makes it a test of the real layout and
+    /// not of a copy of it.
     #[gpui::test]
-    fn the_window_is_three_regions_sidebar_column_and_diff(cx: &mut TestAppContext) {
+    fn the_window_is_two_regions_stack_and_diff(cx: &mut TestAppContext) {
         let shell = shell(None, cx);
         shell.update(cx, |shell, cx| {
             let host = config::host(cx);
@@ -5322,21 +5357,19 @@ mod tests {
         let sidebar = cx
             .debug_bounds("sidebar")
             .expect("the sidebar was not drawn");
-        let column = cx.debug_bounds("column").expect("the column was not drawn");
         let main = cx
             .debug_bounds("main")
             .expect("the main view was not drawn");
 
-        // Left to right, no gaps, all three the same height: one window
-        // row, three regions.
-        assert_eq!(sidebar.right(), column.origin.x, "sidebar then column");
-        assert_eq!(column.right(), main.origin.x, "column then diff");
+        // Left to right, no gaps, both the same height: one window row, two
+        // regions.
+        assert_eq!(sidebar.right(), main.origin.x, "sidebar then diff");
         assert_eq!(sidebar.origin.y, main.origin.y);
         assert_eq!(sidebar.size.height, main.size.height);
 
-        // The sections are as tall as their content — all three empty here,
-        // so a header and the one row the empty-state line takes — and each
-        // sits directly under the one before, from the top of the sidebar.
+        // The short sections are as tall as their content — all three empty
+        // here, so a header and the one row the empty-state line takes — and
+        // each sits directly under the one before, from the top of the stack.
         let files = cx.debug_bounds("side-files").expect("no files section");
         let branches = cx
             .debug_bounds("side-branches")
@@ -5349,6 +5382,13 @@ mod tests {
         assert_eq!(files.origin.y, sidebar.origin.y);
         assert_eq!(files.bottom(), branches.origin.y, "files then branches");
         assert_eq!(branches.bottom(), stashes.origin.y, "branches then stashes");
+
+        // The commit list is the stack's flexible foot: under the short
+        // sections and down to the bottom, whatever height that is.
+        let commits = cx.debug_bounds("side-commits").expect("no commits section");
+        assert_eq!(stashes.bottom(), commits.origin.y, "stashes then commits");
+        assert_eq!(commits.bottom(), sidebar.bottom(), "commits fills the foot");
+        assert!(commits.size.height > natural, "the foot is the tall one");
 
         // Clicking a section's rows focuses *that* pane, and the keyboard
         // moves with it.

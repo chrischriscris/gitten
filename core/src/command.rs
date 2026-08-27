@@ -354,10 +354,17 @@ impl Keymap {
         // ignores — a command nothing handles is a key that does nothing.
         bind(GLOBAL, "y", "copy.selection");
         bind(GLOBAL, "ctrl-a", "select.all");
-        bind(GLOBAL, "h", "view.left");
-        bind(GLOBAL, "left", "view.left");
-        bind(GLOBAL, "l", "view.right");
-        bind(GLOBAL, "right", "view.right");
+        // lazygit's pane moves: h/l and the arrows walk the keyboard between
+        // the window's panes — sidebar sections, the commit column, the diff
+        // — whatever each is showing. The sideways text scroll these used to
+        // carry moves to lazygit's own pair, `<`/`>`, which is where a diff
+        // wider than the window scrolls once the arrows mean "which pane".
+        bind(GLOBAL, "h", "pane.left");
+        bind(GLOBAL, "left", "pane.left");
+        bind(GLOBAL, "l", "pane.right");
+        bind(GLOBAL, "right", "pane.right");
+        bind(GLOBAL, "<", "view.left");
+        bind(GLOBAL, ">", "view.right");
 
         // The panel numbers read down the window's panes: 1 FILES,
         // 2 BRANCHES, 3 STASH, 4 COMMITS — the pane layout's own order, not

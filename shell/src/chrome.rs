@@ -4,8 +4,8 @@
 //! short header strip that names the pane with **the number of the key that
 //! focuses it** — `1 FILES`, `4 COMMITS`, `5 <file>` — and one status bar
 //! across the bottom that says where the keyboard is and what the nearest
-//! keys do. Both are drawn here, once, so the three regions cannot drift
-//! into three different ideas of a header.
+//! keys do. Both are drawn here, once, so the two regions cannot drift
+//! into two different ideas of a header.
 //!
 //! Nothing here holds state or makes a decision: a header is a number, a
 //! name and a count; the status bar is a badge, a list of `(key, label)`
@@ -29,11 +29,13 @@ pub const HEADER_H: f32 = 26.0;
 /// the window and should read as a matched pair.
 pub const STATUS_H: f32 = 26.0;
 
-/// The sidebar's slice of the window's width. The design's sidebar is the
-/// narrowest of the three regions — lists of short paths and branch names
-/// need less room than a commit subject — and every point it gives back is
-/// a point the diff gets.
-pub const SIDEBAR_SHARE: f32 = 0.21;
+/// The left column's slice of the window's width — one column, lazygit's
+/// proportions: the three short lists and the commit list stacked in it, the
+/// diff taking the rest. It was 0.21 when the column held only short paths
+/// and branch names and the commits had a region of their own; merged, the
+/// stack inherits the commits' width, because a sha, initials, a subject and
+/// an age all live in a row now.
+pub const SIDEBAR_SHARE: f32 = 0.32;
 
 /// Left padding of every list row and section label. One number, because
 /// the eye runs down a column of rows and a row that starts a pixel later
@@ -139,7 +141,7 @@ fn keycap(host: &Host, number: &str, focused: bool) -> Div {
 /// One pane's header strip: keycap, name, and — pushed to the right edge —
 /// whatever the pane counts, or anything else the caller has to say. The
 /// focused pane's furniture is drawn in the accent and the rest in the
-/// dim inks, so three stacked headers answer "where is the keyboard" at a
+/// dim inks, so the stacked headers answer "where is the keyboard" at a
 /// glance without a single extra pixel of chrome.
 ///
 /// The strip spans its container's width (`w_full`), because the hairline
