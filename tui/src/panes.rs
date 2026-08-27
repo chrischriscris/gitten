@@ -32,6 +32,12 @@
 //! of lists is nobody's fallback here: terminal height is the scarcer axis, and
 //! two short viewports are less useful than one honest one.
 
+/// The mode the keyboard is in while it cycles between lists — the name the
+/// keymap and `gitten.toml` use for the Ctrl-J/Ctrl-K bindings. It is only
+/// ever pushed when a second sidebar list exists; with one list the cycle
+/// has nothing to say and the mode would be a lie on the help panel.
+pub const MODE: &str = "panes";
+
 /// Body width at which the sidebar and the main region sit side by side.
 ///
 /// 40 columns draw an abbreviated sha, an author, a useful graph and a
@@ -240,6 +246,16 @@ impl Layout for BuiltinLayout {
                 let sidebar_w = share.max(SIDEBAR_MIN).min(body.width);
                 let diff_x = body.x.saturating_add(sidebar_w).saturating_add(DIVIDER);
                 let diff_w = body.right().saturating_sub(diff_x);
+                // [`DIFF_MIN`] is not a clamp here — it is what the arithmetic
+                // above already guarantees at [`WIDE_AT`] and wider: the
+                // sidebar's floor of 40 and the one divider leave at least 55
+                // columns of body for the main region. Said where it holds,
+                // so a change to any of the four constants that breaks the
+                // guarantee breaks a build instead of a window.
+                debug_assert!(
+                    diff_w >= DIFF_MIN,
+                    "{body:?}: sidebar {sidebar_w} + divider leaves {diff_w}"
+                );
                 let n = sidebars.len();
                 let height = body.height / n;
                 let extra = body.height % n;
@@ -355,11 +371,6 @@ impl<T> Panes<T> {
         self.entries.iter().position(|e| e.name == name)
     }
 
-    /// The placement a tenant was registered under.
-    pub fn placement(&self, name: &str) -> Option<Placement> {
-        self.position(name).map(|at| self.entries[at].placement)
-    }
-
     /// Every registered name, in registration order. The walk and cycle
     /// orders are *derived* from this rather than being it — see
     /// [`Panes::list_order`].
@@ -367,20 +378,8 @@ impl<T> Panes<T> {
         self.entries.iter().map(|e| e.name.as_str())
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &T> {
-        self.entries.iter().map(|e| &e.value)
-    }
-
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
         self.entries.iter_mut().map(|e| &mut e.value)
-    }
-
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
     }
 
     /// How many times the registry has been registered into. Part of the
@@ -549,13 +548,13 @@ mod tests {
         assert_eq!(p.register("diff", Placement::Main, 2), None);
         assert_eq!(p.register("ext-a", Placement::sidebar("ext-a"), 3), None);
         assert_eq!(p.register("ext-b", Placement::sidebar("ext-b"), 4), None);
-        assert_eq!(p.len(), 4, "a registration appended a duplicate");
+        assert_eq!(p.names().count(), 4, "a registration appended a duplicate");
         assert_eq!(p.focused_name(), "ext-b", "register did not focus");
 
         // Replacing keeps the name where it was, focuses the replacement, and
         // grows nothing.
         assert_eq!(p.register("ext-a", Placement::sidebar("ext-a"), 5), Some(3));
-        assert_eq!(p.len(), 4);
+        assert_eq!(p.names().count(), 4);
         assert_eq!(p.position("ext-a"), Some(2), "a replacement moved");
         assert_eq!(*p.get("ext-a").unwrap(), 5);
         assert_eq!(p.focused_name(), "ext-a", "focus did not stay stable");

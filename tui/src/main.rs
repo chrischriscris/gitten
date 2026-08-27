@@ -15,7 +15,7 @@
 //! ```text
 //!   crossterm event → term::translate → Key → Keymap::resolve → "diff.next-file"
 //!                                                                     │
-//!                                                     Screen::run ────┘
+//!                                                     App::dispatch ──┘
 //! ```
 //!
 //! # One line of text
@@ -55,10 +55,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-// The registry lands one commit ahead of its tenant: nothing in the app
-// reads it yet, so the whole surface reads as dead until the screen stack
-// comes off. The allow comes off with the stack.
-#[allow(dead_code)]
 mod panes;
 
 const EXTRA: &str = "  --ascii        draw the graph and the scrollbar without box-drawing
@@ -158,14 +154,22 @@ fn main() {
     term.leave();
 }
 
-/// What is on screen. A stack, so `esc` goes back to where you came from.
+/// One pane's tenant: a view and what it was acquired from.
 ///
-/// Each entry carries three things beside its view: the source it was acquired
-/// from, the label it was acquired under, and the invalidation generation it
-/// was acquired at. The first two are what a refresh re-reads and renames; the
-/// third is what tells the two apart — a screen whose generation is behind the
-/// job queue's is stale, and a fixture's never is, because no write anywhere
-/// can stale it.
+/// Each tenant carries three things beside its view: the source it was
+/// acquired from, the label it was acquired under, and the invalidation
+/// generation it was acquired at. The first two are what a refresh re-reads
+/// and renames; the third is what tells the two apart — a tenant whose
+/// generation is behind the job queue's is stale, and a fixture's never is,
+/// because no write anywhere can stale it.
+///
+/// The diff tenant carries an [`Option`] where the commit list carries a
+/// source, and that is load-bearing: on a commits launch the diff pane is
+/// registered **empty** — nothing acquired, nothing to refresh, nothing a
+/// hunk verb can act on — and Enter replaces it with a real acquisition.
+/// Pretending it was acquired from the working tree would let staging and
+/// refreshing reach a pane that holds nothing; "not loaded yet" is a state
+/// the type can say.
 enum Screens {
     Commits {
         view: Commits,
@@ -175,11 +179,14 @@ enum Screens {
     },
     Diff {
         view: Diff,
-        source: Source,
+        source: Option<Source>,
         label: String,
         generation: Generation,
     },
 }
+
+/// What an empty diff pane's header says instead of a sha it does not have.
+const EMPTY_DIFF_LABEL: &str = "press enter on a commit";
 
 /// The mode a text field owns the keyboard in — the name the keymap and
 /// `gitten.toml` use, and the same name the window's input module holds. While
@@ -196,12 +203,6 @@ impl Screens {
         }
     }
 
-    fn source(&self) -> &Source {
-        match self {
-            Screens::Commits { source, .. } | Screens::Diff { source, .. } => source,
-        }
-    }
-
     fn label(&self) -> &str {
         match self {
             Screens::Commits { label, .. } | Screens::Diff { label, .. } => label,
@@ -214,12 +215,12 @@ impl Screens {
         }
     }
 
-    /// Re-acquires this screen from the repository when a finished job has
-    /// staled it, applying the result in place. `None` for a screen nothing
-    /// can stale — one already at `target`, or one with no repository behind
-    /// it, whose data no write anywhere can move. `Some(result)` otherwise,
-    /// because a failed re-acquisition is a failed refresh and the caller
-    /// has an error to keep.
+    /// Re-acquires this tenant from the repository when a finished job has
+    /// staled it, applying the result in place. `None` for a tenant nothing
+    /// can stale — one already at `target`, one with no repository behind it,
+    /// or the empty diff, whose data no write anywhere can move because it
+    /// has none. `Some(result)` otherwise, because a failed re-acquisition is
+    /// a failed refresh and the caller has an error to keep.
     ///
     /// Synchronous on the terminal loop, deliberately: the window refreshes
     /// panes off-thread because it can, and a second terminal background
@@ -236,7 +237,7 @@ impl Screens {
         if self.generation() >= target {
             return None;
         }
-        // The generation travels with the refresh: a screen that re-acquired
+        // The generation travels with the refresh: a pane that re-acquired
         // at `target` is exactly as current as `target` says, however many
         // finishes followed it down the queue.
         match self {
@@ -273,7 +274,7 @@ impl Screens {
                 label,
                 generation,
             } => match source {
-                Source::Repo { .. } => {
+                Some(source @ Source::Repo { .. }) => {
                     let loaded = match acquire::reacquire(
                         View::Diff,
                         source,
@@ -292,36 +293,49 @@ impl Screens {
                     *generation = target;
                     Some(Ok(()))
                 }
-                Source::Fixtures | Source::Patch { .. } => None,
+                // A fixture, a patch — or the empty pane, which was never
+                // acquired from anywhere and has nothing to re-read.
+                Some(Source::Fixtures) | Some(Source::Patch { .. }) | None => None,
             },
         }
     }
 
-    /// A new size — and, on the same call, the margin the config file asks for.
+    /// A new size — this pane's own content rectangle, never the whole screen,
+    /// and on the same call the margin the config file asks for.
     ///
-    /// Both per frame, because both are a comparison when nothing changed and
-    /// because this is the one path that has the size *and* the live host. It is
-    /// what makes `[view] scrolloff` land on the next frame rather than the next
-    /// launch, like every other number in that file.
-    fn resize(&mut self, cols: usize, rows: usize, host: &Host) {
+    /// Both per call, because both are a comparison when nothing changed and
+    /// because this is the one path that has the size *and* the live host. It
+    /// is what makes `[view] scrolloff` land on the next frame rather than the
+    /// next launch, like every other number in that file — and what makes a
+    /// Markdown reflow budget against the pane, because [`Diff::resize`] is
+    /// handed the pane's width and passes it down to every presentation.
+    fn resize_to(&mut self, rect: crate::panes::Rect, host: &Host) {
         match self {
             Screens::Commits { view: c, .. } => {
                 c.set_scrolloff(host.view.scrolloff);
-                c.resize(cols, rows);
+                c.resize(rect.width, rect.height);
             }
             Screens::Diff { view: d, .. } => {
                 d.set_scrolloff(host.view.scrolloff);
-                d.resize(cols, rows, host);
+                d.resize(rect.width, rect.height, host);
             }
         }
     }
 
-    fn paint(&self, screen: &mut Screen, top: usize, host: &Host, out: &mut Vec<Run>) {
+    /// Paints into this pane's rectangle: `x` is the pane's first column, `y`
+    /// its first content row.
+    fn paint(
+        &self,
+        screen: &mut Screen,
+        x: usize,
+        y: usize,
+        focused: bool,
+        host: &Host,
+        out: &mut Vec<Run>,
+    ) {
         match self {
-            // The whole body is this pane until the stack comes off; the
-            // origin and focus arguments arrive with the pane registry.
-            Screens::Commits { view: c, .. } => c.paint(screen, 0, top, true, host),
-            Screens::Diff { view: d, .. } => d.paint(screen, 0, top, true, host, out),
+            Screens::Commits { view: c, .. } => c.paint(screen, x, y, focused, host),
+            Screens::Diff { view: d, .. } => d.paint(screen, x, y, focused, host, out),
         }
     }
 
@@ -332,7 +346,8 @@ impl Screens {
         }
     }
 
-    /// A press in the body, at `row` rows down it.
+    /// A press in this pane's content, at `row` rows down it and `col`
+    /// columns across it — both pane-local, already hit-tested.
     ///
     /// The count and the modifier arrive as scalars rather than as an event
     /// type, which is what keeps the views free of `term` — a view takes
@@ -344,8 +359,8 @@ impl Screens {
         }
     }
 
-    /// The pointer moved with the button down. `row` is signed: a row above the
-    /// body is negative and scrolls it.
+    /// The pointer moved with the button down, in this pane's coordinates.
+    /// `row` is signed: a row above the pane is negative and scrolls it.
     fn drag(&mut self, col: usize, row: isize, host: &Host) {
         match self {
             Screens::Commits { view: c, .. } => c.drag(row, host),
@@ -404,9 +419,13 @@ impl Screens {
 
     /// Runs a command, or says it does not know it.
     ///
-    /// The `view.*` half is the same list for both screens and is what makes
+    /// The `view.*` half is the same list for both panes and is what makes
     /// them bindable in [`gitten_core::command::GLOBAL`]: a key that scrolls one
-    /// list scrolls every list, and nothing had to say so twice.
+    /// list scrolls every list, and nothing had to say so twice. The pane
+    /// moves are *not* here — they are the app's, answered from the registry
+    /// before this is ever asked, because a pane command aimed at a view
+    /// would be a pane command that stops working the day a second list
+    /// registers.
     fn run(&mut self, command: &str, host: &Host) -> bool {
         match self {
             Screens::Commits { view: c, .. } => match command {
@@ -420,10 +439,6 @@ impl Screens {
                 "view.bottom" => c.to_bottom(),
                 // A commit list has nothing off the left edge to reach.
                 "view.left" | "view.right" => {}
-                // The terminal shows one screen at a time — there is no
-                // second pane to walk to. The commands are still answered:
-                // a key that resolves must not read as one that failed.
-                "pane.left" | "pane.right" => {}
                 _ => return false,
             },
             Screens::Diff { view: d, .. } => match command {
@@ -469,7 +484,24 @@ struct App {
     /// fixture, which has no repository behind it — and the key then does
     /// nothing, which is what an unbound key does too.
     repo: Option<(std::path::PathBuf, gitten_git::Handle)>,
-    stack: Vec<Screens>,
+    /// The panes, by stable name. `commits` lives in the sidebar, `diff` in
+    /// the main slot; both persist for as long as the process does, and a
+    /// focus change moves the keyboard between them without destroying
+    /// either. Which pane the keyboard is in decides the modes, the command
+    /// routing, the title and the status line — not what was opened last.
+    panes: panes::Panes<Screens>,
+    /// The layout policy that turns the body into pane rectangles. A box so a
+    /// compiled-in client extension can replace the built-in geometry at
+    /// construction without touching the registry or the dispatch.
+    layout: Box<dyn panes::Layout>,
+    /// The pane rectangles, computed by [`App::layout`] and cached on the four
+    /// things that can move them: the screen size, the body height, the
+    /// registry's generation, and which pane is focused (the narrow layout
+    /// shows only the focused one). `draw` reads this and allocates nothing.
+    geometry: Option<((usize, usize, usize, usize), panes::Geometry)>,
+    /// The sidebar list that held the keyboard last, so `back` from the main
+    /// region returns *there* and not to whatever happens to be first.
+    last_list: Option<String>,
     screen: Screen,
     modes: Modes,
     /// Keys typed so far that have not resolved to a command. Empty almost
@@ -479,22 +511,23 @@ struct App {
     /// did. Cleared by the next keypress, so it cannot go stale.
     message: String,
     /// The open search prompt, holding the query typed so far. `None` while the
-    /// keyboard belongs to the screens.
+    /// keyboard belongs to the panes.
     ///
-    /// Here and not on a screen because collecting terminal text is input — the
+    /// Here and not on a pane because collecting terminal text is input — the
     /// client's to gather, by the same rule that makes it the client's to
     /// translate a platform event — while [`Commits::apply_query`] stays the
-    /// whole of what a view knows about it. It stands only over
-    /// [`Screens::Commits`]; every reader below can rely on that.
+    /// whole of what a view knows about it. It stands only over the pane
+    /// named `commits`, by that name and not by focus, so every reader below
+    /// can rely on it and a focus change cannot strand the query.
     search: Option<String>,
     /// The shared write queue. One FIFO worker, owned here, whose finishes
     /// every client treats the same way: a generation advances — a refusal as
-    /// much as a success — and every repository-backed screen re-acquires.
+    /// much as a success — and every repository-backed pane re-acquires.
     jobs: Runner,
     /// The cloneable end of [`App::jobs`], handed out to whatever submits.
     submitter: Submitter,
-    /// The generation the queue has advanced to, and so the one every screen
-    /// in the stack was last refreshed against.
+    /// The generation the queue has advanced to, and so the one every pane
+    /// was last refreshed against.
     generation: Generation,
     help: bool,
     quit: bool,
@@ -520,9 +553,22 @@ struct App {
     /// [`Term`] call and dispatch has views and a host and deliberately no
     /// terminal — the same reason acquisition is in `main` and not in a view.
     copy: Option<String>,
-    /// The last press, for counting a double click: when, and in which cell.
-    clicked: Option<(Instant, usize, usize)>,
+    /// The pane a mouse gesture began in, from Down to Up: drags, releases and
+    /// copy-on-select all belong to the pane where the button went down, even
+    /// after the pointer crosses the divider — one gesture, one pane's
+    /// selection state, never a splice of two.
+    gesture: Option<String>,
+    /// The last press, for counting a double click: when, in which cell, and
+    /// in which pane. The pane is part of the identity, so the same cell
+    /// cannot become another pane's double click after a focus switch moves
+    /// the panes under the pointer.
+    clicked: Option<(Instant, usize, usize, String)>,
     clicks: u8,
+    /// Each pane's advertised focus key, resolved once per host or registry
+    /// change — the first key bound to `<name>.focus`, or empty when the name
+    /// is unbound. Drawing reads this cache, so a frame allocates nothing for
+    /// a header.
+    focus_keys: Vec<(String, String)>,
 }
 
 impl App {
@@ -538,34 +584,67 @@ impl App {
             true => Bar::ascii(),
             false => Bar::default(),
         };
-        let screen = match started.loaded.data {
+        let mut panes = panes::Panes::new();
+        let mut last_list = None;
+        match started.loaded.data {
             Data::Commits(commits) => {
                 let mut list = Commits::with_glyphs(commits, glyphs);
                 list.set_bar(bar);
-                Screens::Commits {
-                    view: list,
-                    source,
-                    label,
-                    generation: Generation::default(),
-                }
+                panes.register(
+                    "commits",
+                    panes::Placement::sidebar("commits"),
+                    Screens::Commits {
+                        view: list,
+                        source,
+                        label,
+                        generation: Generation::default(),
+                    },
+                );
+                last_list = Some("commits".to_string());
+                // The persistent main pane, registered **empty**: no source, no
+                // acquisition, nothing for a hunk verb or a refresh to act on
+                // until Enter replaces it. Its header is drawn like any other
+                // pane's, saying what it is rather than pretending to hold a
+                // diff it does not have.
+                panes.register(
+                    "diff",
+                    panes::Placement::Main,
+                    Screens::Diff {
+                        view: Diff::new(Vec::new(), &host),
+                        source: None,
+                        label: EMPTY_DIFF_LABEL.to_string(),
+                        generation: Generation::default(),
+                    },
+                );
+                // `register` focuses what it registers, so the empty diff has
+                // the keyboard for the length of that call. A commits launch
+                // opens on the list.
+                panes.focus_named("commits");
             }
             Data::Diff(files) => {
                 let mut diff = Diff::new(files, &host);
                 diff.set_bar(bar);
-                Screens::Diff {
-                    view: diff,
-                    source,
-                    label,
-                    generation: Generation::default(),
-                }
+                panes.register(
+                    "diff",
+                    panes::Placement::Main,
+                    Screens::Diff {
+                        view: diff,
+                        source: Some(source),
+                        label,
+                        generation: Generation::default(),
+                    },
+                );
             }
-        };
+        }
         let jobs = Runner::new();
         let submitter = jobs.submitter();
         let mut app = Self {
             host,
             repo,
-            stack: vec![screen],
+            panes,
+            layout: Box::new(panes::BuiltinLayout),
+            geometry: None,
+            last_list,
             screen: Screen::new(0, 0),
             modes: Modes::new(),
             pending: Vec::new(),
@@ -581,29 +660,93 @@ impl App {
             runs: Vec::new(),
             bar,
             copy: None,
+            gesture: None,
             clicked: None,
             clicks: 0,
+            focus_keys: Vec::new(),
         };
+        app.sync_header_keys();
         app.sync_modes();
         app
     }
 
-    /// The mode stack follows what is on screen. Rebuilt rather than pushed and
-    /// popped in step with `stack`, because two things kept in step drift.
+    /// The mode stack follows the keyboard. Rebuilt rather than pushed and
+    /// popped in step with focus, because two things kept in step drift.
+    ///
+    /// `panes` comes first, when a second sidebar list exists to cycle
+    /// between — its Ctrl-J/Ctrl-K bindings would be a lie with one list —
+    /// then the focused pane's own mode, then help and the search prompt.
     fn sync_modes(&mut self) {
         self.modes = Modes::new();
-        if let Some(screen) = self.stack.last() {
+        if self.panes.list_order().len() > 1 {
+            self.modes.push(panes::MODE);
+        }
+        if let Some(screen) = self.panes.focused() {
             self.modes.push(screen.mode());
         }
         if self.help {
             self.modes.push("help");
         }
-        // Above whatever screen it stands over: the prompt is the innermost
+        // Above whatever pane it stands over: the prompt is the innermost
         // thing on screen while it is open, and it is what the help panel
         // should be listing bindings for.
         if self.search.is_some() {
             self.modes.push(INPUT);
         }
+    }
+
+    /// Recomputes the cached pane geometry when anything that can move it
+    /// changed: the screen size, the registrations, or the focus — the narrow
+    /// layout shows only the focused pane, so a focus switch moves every
+    /// rectangle below [`panes::WIDE_AT`]. Two comparisons when nothing did,
+    /// which is the whole reason the result is cached.
+    fn ensure_geometry(&mut self) {
+        let (w, h) = self.screen.size();
+        if w == 0 || h < 3 {
+            self.geometry = None;
+            return;
+        }
+        let key = (w, h, self.panes.generation(), self.panes.focused_index());
+        if self.geometry.as_ref().is_some_and(|(k, _)| *k == key) {
+            return;
+        }
+        let body = crate::panes::Rect {
+            x: 0,
+            y: 1,
+            width: w,
+            height: h - 2,
+        };
+        let geometry = self.layout.arrange(&self.panes.spots(), body);
+        self.geometry = Some((key, geometry));
+    }
+
+    /// A pane's content rectangle — under its one header row — or `None` when
+    /// the layout gave it nothing, which is the narrow layout's answer for
+    /// the pane that does not have the keyboard.
+    fn pane_content(&self, name: &str) -> Option<crate::panes::Rect> {
+        self.geometry.as_ref()?.1.rect(name).map(|r| r.content())
+    }
+
+    /// The focus key each pane's header advertises: the first key bound to
+    /// `<name>.focus`, from the live keymap — or empty when the name is
+    /// unbound, in which case the header shows no key at all. Resolved once
+    /// per host or registry change into [`App::focus_keys`], because a frame
+    /// has no business formatting strings.
+    fn sync_header_keys(&mut self) {
+        let host = &self.host;
+        self.focus_keys = self
+            .panes
+            .names()
+            .map(|name| {
+                let key = host
+                    .keys
+                    .keys_for(&format!("{name}.focus"))
+                    .first()
+                    .cloned()
+                    .unwrap_or_default();
+                (name.to_string(), key)
+            })
+            .collect();
     }
 
     fn run(
@@ -620,6 +763,8 @@ impl App {
             if now != size {
                 size = now;
                 self.screen.resize(size.0, size.1);
+                // The rectangles the gesture was captured under are gone.
+                self.gesture = None;
             }
             // Before the frame, so the message a copy leaves is on the status
             // line of the frame that follows it — OSC 52 has no reply to read,
@@ -657,6 +802,7 @@ impl App {
                 Some(Input::Resize(w, h)) => {
                     size = (w, h);
                     self.screen.resize(w, h);
+                    self.gesture = None;
                 }
                 Some(input) => self.input(input),
                 // A tick. The only thing it is for.
@@ -718,11 +864,27 @@ impl App {
             // alternate screen and would be seen only after quitting.
             false => warnings.join(" · "),
         };
-        // The wrap and the layout are the view's own indices into registries
-        // that may have changed shape; a resize re-applies them safely.
-        let (w, h) = self.screen.size();
-        for screen in &mut self.stack {
-            screen.resize(w, h.saturating_sub(2), &self.host);
+        self.sync_header_keys();
+        // Re-apply geometry to every pane the layout gave a rectangle to, so a
+        // changed `[view] scrolloff` and a reflowed presentation reach the
+        // panes that do not have the keyboard too. A pane hidden by the narrow
+        // layout keeps its last viewport and is resized when it is next shown;
+        // one that merely lost the keyboard — the diff beside a focused list —
+        // reflows here, from its cached rectangle and not the screen's.
+        self.ensure_geometry();
+        let rects: Vec<(String, crate::panes::Rect)> = self
+            .geometry
+            .as_ref()
+            .map(|(_, g)| {
+                g.placed()
+                    .map(|(n, r)| (n.to_string(), r.content()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (name, rect) in &rects {
+            if let Some(pane) = self.panes.get_mut(name) {
+                pane.resize_to(*rect, &self.host);
+            }
         }
     }
 
@@ -809,14 +971,20 @@ impl App {
     ///
     /// Seeded from the standing query, so a second `/` finds the list as the
     /// first one left it; the full data stays in place, and each edit filters
-    /// it live. Only over the list — a diff has no query, and says so.
+    /// it live. Only over the pane *named* `commits` — the prompt holds the
+    /// name, not an index, so however focus moves while it stands the query
+    /// still lands on the list it was opened over — and a diff has no query,
+    /// and says so.
     fn begin_search(&mut self) {
-        let Some(Screens::Commits { view: list, .. }) = self.stack.last() else {
-            self.message = "commits.search is not supported here".into();
-            return;
+        let standing = match self.panes.get("commits") {
+            Some(Screens::Commits { view, .. }) => view.query().unwrap_or_default().to_string(),
+            _ => {
+                self.message = "commits.search is not supported here".into();
+                return;
+            }
         };
-        let standing = list.query().unwrap_or_default().to_string();
         self.search = Some(standing);
+        self.gesture = None;
         self.pending.clear();
         self.sync_modes();
     }
@@ -865,8 +1033,8 @@ impl App {
     fn apply_query(&mut self, query: &str) {
         // Disjoint field borrows, as everywhere else in this file: the query is
         // read while the list is written.
-        let Self { stack, .. } = self;
-        if let Some(Screens::Commits { view: list, .. }) = stack.last_mut() {
+        let Self { panes, .. } = self;
+        if let Some(Screens::Commits { view: list, .. }) = panes.get_mut("commits") {
             list.apply_query(query);
         }
     }
@@ -890,11 +1058,16 @@ impl App {
 
     /// One mouse event.
     ///
-    /// The whole of the routing, and it is short for the same reason [`press`]
-    /// is: the rows this file owns are the title bar and the status line, so
-    /// what is left is "which row of the body" and the view does the rest. The
-    /// day there are panes, this is the function that grows a hit test and
-    /// nothing else does.
+    /// The routing, and it is short: a hit test against the cached pane
+    /// rectangles, then pane-local coordinates into the pane the pointer is
+    /// over. Everything below that — which text, which byte — is the view's,
+    /// because only a presentation knows where its own text starts.
+    ///
+    /// **A gesture is captured by the pane where Down landed**, by stable
+    /// name, until Up: a drag that crosses the divider keeps selecting in the
+    /// pane it started in, and the release reads that pane's finished
+    /// selection — never the pane the pointer happens to be over when the
+    /// button comes up. One gesture, one pane's selection state.
     fn mouse(&mut self, m: Mouse) {
         let (_, h) = self.screen.size();
         // The help panel and the search prompt are drawn over the body, so a
@@ -903,90 +1076,156 @@ impl App {
         if h < 3 || self.help || self.search.is_some() {
             return;
         }
-        let body = 1..h - 1;
-        // Signed, and not clamped: a drag above the body is a negative row and
-        // scrolls it, which is what dragging past the top of a page does.
-        let row = m.row as isize - body.start as isize;
         match m.kind {
             MouseKind::Down => {
-                if !body.contains(&m.row) {
-                    return;
-                }
-                self.message.clear();
-                let clicks = self.count(m.col, m.row);
-                // Disjoint field borrows, as everywhere else in this file: the
-                // host is read while a screen is written, and moving it out and
-                // back would rebuild every theme and every registry per click.
-                let Self { stack, host, .. } = self;
-                let Some(screen) = stack.last_mut() else {
+                let Some((name, rect)) = self.hit(m.col, m.row) else {
                     return;
                 };
-                screen.press(m.col, row as usize, clicks, m.shift, host);
+                self.message.clear();
+                let clicks = self.count(m.col, m.row, &name);
+                // A click in a pane means that pane: the keyboard moves with
+                // the pointer, and the modes and geometry follow.
+                if self.panes.focused_name() != name {
+                    self.focus_named(&name);
+                }
+                // A press on the header focuses and nothing else — the same
+                // answer the window's pane headers give — so a gesture that
+                // started there has a pane to be released against and no more.
+                if m.row == rect.y {
+                    self.gesture = Some(name);
+                    return;
+                }
+                let local_col = m.col - rect.x;
+                let local_row = m.row - rect.y - 1;
+                {
+                    let Self { panes, host, .. } = self;
+                    if let Some(pane) = panes.get_mut(&name) {
+                        pane.press(local_col, local_row, clicks, m.shift, host);
+                    }
+                }
                 // Two clicks on a commit open it, which is the one gesture a
                 // terminal has for "go in" besides the key that already does.
-                if clicks == 2 && matches!(self.stack.last(), Some(Screens::Commits { .. })) {
+                if clicks == 2 && name == "commits" {
                     self.open_diff();
                 }
+                self.gesture = Some(name);
             }
             MouseKind::Drag => {
-                let Self { stack, host, .. } = self;
-                if let Some(screen) = stack.last_mut() {
-                    screen.drag(m.col, row, host);
+                let Some(name) = self.gesture.clone() else {
+                    return;
+                };
+                // The captured pane, wherever it now is: coordinates are
+                // clamped into its own width — a drag cannot select across
+                // the divider by ending in the neighbour — and its overshoot
+                // is relative to its own viewport. A pane the narrow layout
+                // hid holds the gesture still; the button is still down and
+                // its release still belongs to it.
+                let Some(rect) = self.pane_rect(&name) else {
+                    return;
+                };
+                let local_col = m
+                    .col
+                    .saturating_sub(rect.x)
+                    .min(rect.width.saturating_sub(1));
+                let local_row = m.row as isize - rect.y as isize - 1;
+                let Self { panes, host, .. } = self;
+                if let Some(pane) = panes.get_mut(&name) {
+                    pane.drag(local_col, local_row, host);
                 }
             }
             MouseKind::Up => {
-                if let Some(screen) = self.stack.last_mut() {
-                    screen.release();
-                }
+                let Some(name) = self.gesture.take() else {
+                    return;
+                };
                 // Copy-on-select, and this is the only place it can be: a
                 // selection is finished when the button comes up, and writing
                 // one to the terminal per motion event would be an escape
-                // sequence per cell the pointer crossed.
-                if self.host.mouse.copy_on_select {
-                    let text = self
-                        .stack
-                        .last()
-                        .map(Screens::selection)
-                        .unwrap_or_default();
-                    if !text.is_empty() {
-                        self.copy = Some(text);
-                    }
+                // sequence per cell the pointer crossed. The text is the
+                // captured pane's, not the focused one's and not the pane
+                // under the pointer's.
+                let text = {
+                    let Self { panes, .. } = self;
+                    panes
+                        .get_mut(&name)
+                        .map(|pane| {
+                            pane.release();
+                            pane.selection()
+                        })
+                        .unwrap_or_default()
+                };
+                if self.host.mouse.copy_on_select && !text.is_empty() {
+                    self.copy = Some(text);
                 }
             }
         }
     }
 
-    /// How many times this cell has been clicked in quick succession.
+    /// The pane under a cell of the screen, by name and rectangle.
+    fn hit(&self, col: usize, row: usize) -> Option<(String, crate::panes::Rect)> {
+        let (_, geometry) = self.geometry.as_ref()?;
+        let name = geometry.hit(col, row)?;
+        Some((name.to_string(), geometry.rect(name)?))
+    }
+
+    /// A pane's full rectangle, header included, from the cached geometry.
+    fn pane_rect(&self, name: &str) -> Option<crate::panes::Rect> {
+        self.geometry.as_ref()?.1.rect(name)
+    }
+
+    /// How many times this cell of this pane has been clicked in quick
+    /// succession.
     ///
     /// Ours to count because the protocol does not carry it — see [`DOUBLE`].
     /// Capped at three: nothing means more than a row, and an uncapped counter
-    /// would make a fourth click mean something a third did not.
-    fn count(&mut self, col: usize, row: usize) -> u8 {
+    /// would make a fourth click mean something a third did not. The pane is
+    /// part of the identity: the same global cell means a different pane after
+    /// a focus switch, and a double click that moved panes is two clicks.
+    fn count(&mut self, col: usize, row: usize, pane: &str) -> u8 {
         let now = Instant::now();
-        let again = self
-            .clicked
-            .is_some_and(|(at, c, r)| (c, r) == (col, row) && now.duration_since(at) < DOUBLE);
+        let again = self.clicked.as_ref().is_some_and(|(at, c, r, p)| {
+            (*c, *r, p.as_str()) == (col, row, pane) && now.duration_since(*at) < DOUBLE
+        });
         self.clicks = match again {
             true => (self.clicks + 1).min(3),
             false => 1,
         };
-        self.clicked = Some((now, col, row));
+        self.clicked = Some((now, col, row, pane.to_string()));
         self.clicks
     }
 
     /// A command name into an effect.
     ///
-    /// The client's own commands first, then the screen's. That order is what
-    /// lets a screen override `back` one day without this file having to know.
+    /// The pane commands come first — they are the registry's, and answering
+    /// them from a view would make them stop working the day a view stops
+    /// being focused. Then the client's own commands, then the focused pane's.
     fn dispatch(&mut self, command: &str) {
         match command {
+            // The ten names the shared registry ships, answered from the pane
+            // registry and not from any view: h/l and the arrows walk the
+            // reading order — sidebar lists, then the main diff — and stop at
+            // the edges; Ctrl-J/Ctrl-K cycle the sidebar lists; the digits and
+            // `diff.focus` name panes, and a name with no pane is said, not
+            // swallowed. No new command name, no local key table: every one of
+            // these resolved through the same keymap `gitten.toml` writes.
+            "pane.left" => self.pane_walk(-1),
+            "pane.right" => self.pane_walk(1),
+            "pane.next" => self.cycle_pane(1),
+            "pane.prev" => self.cycle_pane(-1),
+            "status.focus" | "files.focus" | "branches.focus" | "commits.focus"
+            | "stashes.focus" | "diff.focus" => {
+                let name = command.strip_suffix(".focus").unwrap_or(command);
+                self.focus_named(name);
+            }
             "quit" => self.quit = true,
             "help" => {
                 self.help = !self.help;
+                // The help panel covers the panes; a gesture captured under
+                // it has nowhere honest to be released into.
+                self.gesture = None;
                 self.sync_modes();
             }
             "back" => self.back(),
-            // The whole window's, so it is here and not on a screen — and the
+            // The whole window's, so it is here and not on a pane — and the
             // name is said, because a palette that changed without saying which
             // one it is now leaves you cycling to find out.
             "theme.cycle" => {
@@ -1003,10 +1242,10 @@ impl App {
             "commits.search" => self.begin_search(),
             "input.accept" => self.finish_search(true),
             "input.cancel" => self.finish_search(false),
-            // The hunk verbs act on the *repository*, not the screen: they
+            // The hunk verbs act on the *repository*, not the pane: they
             // need the source the diff was acquired from and the handle it
             // was acquired through, and a view is drawing and input only.
-            // Routed here, ahead of the screen, for the same reason the
+            // Routed here, ahead of the pane, for the same reason the
             // window routes them in its `run_command`.
             "diff.stage-hunk" | "diff.unstage-hunk" => self.hunk_verb(command),
             // The clipboard is the terminal's, not this process's — see
@@ -1014,8 +1253,8 @@ impl App {
             // a terminal to write to.
             "copy.selection" => {
                 let text = self
-                    .stack
-                    .last()
+                    .panes
+                    .focused()
                     .map(Screens::copy_text)
                     .unwrap_or_default();
                 match text.is_empty() {
@@ -1024,13 +1263,13 @@ impl App {
                 }
             }
             "select.all" => {
-                if let Some(screen) = self.stack.last_mut() {
-                    screen.select_all();
+                if let Some(pane) = self.panes.focused_mut() {
+                    pane.select_all();
                 }
             }
             "select.none" => {
-                if let Some(screen) = self.stack.last_mut() {
-                    screen.select_none();
+                if let Some(pane) = self.panes.focused_mut() {
+                    pane.select_none();
                 }
             }
             // Disjoint field borrows rather than moving the host out and
@@ -1038,8 +1277,8 @@ impl App {
             // whole resolved contrast table, and doing that per keypress is a
             // thing that would never have shown up in a timing.
             _ => {
-                let known = match self.stack.last_mut() {
-                    Some(screen) => screen.run(command, &self.host),
+                let known = match self.panes.focused_mut() {
+                    Some(pane) => pane.run(command, &self.host),
                     None => false,
                 };
                 if !known {
@@ -1049,43 +1288,107 @@ impl App {
         }
     }
 
-    /// Closes the help, or leaves the innermost screen.
+    /// Focuses the pane registered under `name` — what `commits.focus` and
+    /// friends run, and what the walk and the cycle land on. Said, not
+    /// swallowed, when nothing is registered under the name: an absent pane
+    /// is the honest answer to an honest question, and the same sentence the
+    /// window gives.
+    fn focus_named(&mut self, name: &str) {
+        match self.panes.position(name) {
+            Some(_) => {
+                self.panes.focus_named(name);
+                // The keyboard is on a list again: `back` from the diff comes
+                // here, to the list that held it last.
+                if matches!(
+                    self.panes.focused_placement(),
+                    Some(panes::Placement::Sidebar { .. })
+                ) {
+                    self.last_list = Some(name.to_string());
+                }
+                self.sync_modes();
+            }
+            None => self.message = format!("no {name} pane"),
+        }
+    }
+
+    /// Walks the keyboard one pane over — what h/l and the arrows run. The
+    /// order is the reading order: the sidebar's lists top to bottom, then the
+    /// main diff as the last stop. Left of the diff is the sidebar's foot;
+    /// right of the last list is the diff; an edge answers and stays, which is
+    /// what a walk that refuses to wrap must do to keep h/l a line and not a
+    /// ring — the number keys already cover the jumping.
+    fn pane_walk(&mut self, by: isize) {
+        let Some(name) = self.panes.walk(by).map(str::to_string) else {
+            return;
+        };
+        self.focus_named(&name);
+    }
+
+    /// Cycles the lists — what ctrl-j/ctrl-k do once a second list registers.
+    /// The command names say *pane*: they were named for the panes that used
+    /// to stack, and a rename would break every `[keys]` file in flight.
+    fn cycle_pane(&mut self, by: isize) {
+        if self.panes.list_order().len() < 2 {
+            self.message = "no second list to cycle to".into();
+            return;
+        }
+        if self.panes.cycle_sidebar(by) {
+            self.sync_modes();
+        }
+    }
+
+    /// Closes the help, or leaves the main pane for the lists.
     ///
     /// One key for both, because both are "get me out of this" and a reader does
-    /// not distinguish them. The last screen is never popped: `esc` on the thing
-    /// you started with is not a quit, and a client that vanished on it would be
-    /// a client you could not trust the key in.
+    /// not distinguish them. From the diff it goes back to the list that held
+    /// the keyboard — **without clearing or destroying the diff**, which stays
+    /// exactly as it was, its cursor and its selection included: it is the
+    /// window's persistent main pane, not a screen that a key dismissed. In a
+    /// list it drops the mouse's selection first, and otherwise does nothing:
+    /// `esc` on the thing you started with is not a quit, and a client that
+    /// vanished on it would be a client you could not trust the key in.
     fn back(&mut self) {
-        // Innermost first, and a selection is inside a screen: `esc` drops what
-        // the mouse is holding before it leaves the diff the mouse was holding
-        // it in. One key, one direction, no order to remember.
         if self.help {
             self.help = false;
-        } else if self.stack.last_mut().is_some_and(Screens::select_none) {
+        } else if matches!(self.panes.focused_placement(), Some(panes::Placement::Main))
+            && !self.panes.list_order().is_empty()
+        {
+            let name = self
+                .last_list
+                .clone()
+                .unwrap_or_else(|| self.panes.list_order()[0].to_string());
+            self.focus_named(&name);
+        } else if self.panes.focused_mut().is_some_and(Screens::select_none) {
             // There was a selection and it is gone; that is the whole of this
-            // `esc`, and the screen underneath stays where it is.
-        } else if self.stack.len() > 1 {
-            self.stack.pop();
-            let (w, h) = self.screen.size();
-            if let Some(screen) = self.stack.last_mut() {
-                screen.resize(w, h.saturating_sub(2), &self.host);
-            }
+            // `esc`, and the pane underneath stays where it is.
         }
         self.sync_modes();
     }
 
-    /// Opens the diff of the commit under the cursor, on top of the list.
+    /// Opens the diff of the commit under the cursor, into the main pane.
     ///
     /// The I/O is here and not in the view, which is the same rule the GPUI
     /// client follows: a view takes already-loaded data and never learns what a
     /// repository is. A bare revision is "what did this commit change" to
     /// [`gitten_git::Repo::pairs`], merges included.
+    ///
+    /// The pane named `commits` is read by that name and not by focus, the way
+    /// the window reads its commit column: opening a diff is about the list's
+    /// cursor, not about whoever has the keyboard. On success the diff tenant
+    /// is **replaced in place** — the registry never grows, and the empty pane
+    /// a commits launch registered becomes a real one — resized to the
+    /// geometry the diff pane already has, and focused. On a failure the old
+    /// diff survives untouched and so does the focus; the error is the
+    /// message.
     fn open_diff(&mut self) {
-        let Some(Screens::Commits { view: list, .. }) = self.stack.last() else {
-            self.message = "no commit selected".into();
-            return;
+        let commit = match self.panes.get("commits") {
+            Some(Screens::Commits { view, .. }) => view.current().cloned(),
+            _ => {
+                self.message = "no commit selected".into();
+                return;
+            }
         };
-        let Some(commit) = list.current() else { return };
+        let Some(commit) = commit else { return };
         let (sha, subject) = (commit.sha.clone(), commit.subject.clone());
         let Some((path, repo)) = self.repo.clone() else {
             self.message = "a fixture has no repository to diff against".into();
@@ -1097,24 +1400,32 @@ impl App {
         };
         match acquire::acquire(View::Diff, &source, &self.host, Some(repo.as_ref())) {
             Ok(loaded) => {
-                let mut diff = Diff::new(
-                    match loaded.data {
-                        Data::Diff(files) => files,
-                        Data::Commits(_) => return,
-                    },
-                    &self.host,
-                );
+                let files = match loaded.data {
+                    Data::Diff(files) => files,
+                    Data::Commits(_) => return,
+                };
+                let mut diff = Diff::new(files, &self.host);
                 diff.set_bar(self.bar);
-                let (w, h) = self.screen.size();
-                diff.resize(w, h.saturating_sub(2), &self.host);
-                self.stack.push(Screens::Diff {
-                    view: diff,
-                    source,
-                    label: format!("{} {subject}", &sha[..sha.len().min(8)]),
-                    // Acquired this instant, so it is as current as the
-                    // queue's last finish — not a generation older.
-                    generation: self.generation,
-                });
+                self.ensure_geometry();
+                if let Some(rect) = self.pane_content("diff") {
+                    diff.set_scrolloff(self.host.view.scrolloff);
+                    diff.resize(rect.width, rect.height, &self.host);
+                }
+                self.panes.register(
+                    "diff",
+                    panes::Placement::Main,
+                    Screens::Diff {
+                        view: diff,
+                        source: Some(source),
+                        label: format!("{} {subject}", &sha[..sha.len().min(8)]),
+                        // Acquired this instant, so it is as current as the
+                        // queue's last finish — not a generation older.
+                        generation: self.generation,
+                    },
+                );
+                // A registry replacement: whatever the mouse was holding was
+                // holding a pane that no longer exists.
+                self.gesture = None;
                 self.sync_modes();
             }
             Err(e) => self.message = e,
@@ -1126,19 +1437,36 @@ impl App {
     /// window's `hunk_verb`: the gates, the patch, the verb — and not one
     /// line more, because every one of those is shared with an extension
     /// calling the same command through the same name.
+    ///
+    /// The verbs reach only a diff that was actually acquired: the empty pane
+    /// a commits launch registers has no source, and "not loaded yet" refuses
+    /// rather than pretending — no fake source, no fake generation, no patch
+    /// against nothing.
     fn hunk_verb(&mut self, command: &str) {
-        let source = match self.stack.last() {
-            Some(screen) => screen.source().clone(),
-            None => return,
-        };
-        let hunk = match self.stack.last() {
-            Some(Screens::Diff { view, .. }) => view.current_hunk(),
-            _ => None,
+        let (source, hunk) = match self.panes.focused() {
+            Some(Screens::Diff {
+                view,
+                source: Some(source),
+                ..
+            }) => (Some(source.clone()), view.current_hunk()),
+            Some(Screens::Diff { source: None, .. }) => {
+                self.message = "no diff is open".into();
+                return;
+            }
+            _ => {
+                self.message = "the keyboard is not on a diff".into();
+                return;
+            }
         };
         // Everything decided ahead of anything queued: a refusal is said
         // here, and the queue only ever sees a job that means it.
         let handle = self.repo.as_ref().map(|(_, handle)| handle);
-        match hunk_action(command, &source, handle, hunk) {
+        match hunk_action(
+            command,
+            source.as_ref().expect("a diff with a source"),
+            handle,
+            hunk,
+        ) {
             Ok(job) => {
                 if self.submitter.submit(job).is_err() {
                     self.message = "the job queue is shutting down".into();
@@ -1153,11 +1481,11 @@ impl App {
     ///
     /// Every `Finished` — a refusal as much as a success, because git can
     /// answer nonzero with work already left behind — advances the generation
-    /// and re-acquires **every** stale repository-backed screen in the stack,
-    /// the hidden ones included: a commit list under the diff being staged
-    /// into is as stale as the diff itself. The write's own error is the
-    /// message, with at most one refresh failure appended; every screen is
-    /// still attempted even after one of them fails.
+    /// and re-acquires **every** stale repository-backed pane on the
+    /// registry, the hidden ones included: a commit list beside the diff
+    /// being staged into is as stale as the diff itself. The write's own
+    /// error is the message, with at most one refresh failure appended;
+    /// every pane is still attempted even after one of them fails.
     fn drain_jobs(&mut self) {
         while let Some(event) = self.jobs.try_next() {
             match event {
@@ -1187,35 +1515,42 @@ impl App {
         }
     }
 
-    /// Re-acquires every screen in the stack a finished job has staled.
+    /// Re-acquires every registered pane a finished job has staled.
     ///
     /// Synchronous, on the terminal loop — the accepted tradeoff: `git apply`
     /// itself ran on the shared worker above, and a second terminal background
     /// protocol is not this plan's scope. The screen stays drawn while it
     /// blocks; a measured window refresh of the same work runs 48–370 ms.
+    ///
+    /// Every registered pane, not only the focused or visible one — and every
+    /// pane *tried*, even after one of them fails: the first failure is
+    /// remembered, the rest are not skipped, because a stale pane the narrow
+    /// layout has hidden is still stale.
     fn refresh_stale(&mut self, target: Generation) -> Result<(), String> {
         let Some((_, repo)) = self.repo.clone() else {
             return Ok(());
         };
-        // Every screen, not only the one on top — and every screen *tried*,
-        // even after one of them fails: the first failure is remembered, the
-        // rest are not skipped, because a stale hidden screen is still stale.
         let mut first = None;
-        for screen in &mut self.stack {
-            if let Some(result) = screen.refresh(target, &self.host, repo.as_ref()) {
-                if result.is_err() {
-                    first = result.err().or(first);
+        {
+            let Self { panes, host, .. } = self;
+            for pane in panes.iter_mut() {
+                if let Some(result) = pane.refresh(target, host, repo.as_ref()) {
+                    if result.is_err() {
+                        first = result.err().or(first);
+                    }
                 }
             }
         }
         first.map_or(Ok(()), Err)
     }
 
-    /// A title row, the screen, a status row.
+    /// A title row, the panes, a status row.
     ///
-    /// Two rows of chrome and everything else given to the view, because the
-    /// view is the reason the window is open. The title says what you are
-    /// looking at; the status says where you are in it.
+    /// Row 0 is the title and row `h - 1` the status or search prompt; the
+    /// rows between belong to the panes, each inside the rectangle the cached
+    /// geometry gave it — its own one-row header, then its view. Nothing in
+    /// this function computes geometry: that happened once, when the size or
+    /// the focus or the registrations changed, and everything here is a read.
     fn draw(&mut self) {
         let (w, h) = self.screen.size();
         if w == 0 || h < 3 {
@@ -1224,19 +1559,70 @@ impl App {
         let c = self.host.theme.chrome;
         self.screen.clear(Ink::new(c.dim, c.bg));
         let body = h - 2;
+        self.ensure_geometry();
 
-        title(
-            &mut self.screen.row(0),
-            &self.host,
-            self.stack.last().map(Screens::label).unwrap_or(""),
-            self.stack.last().map(Screens::mode),
-        );
-
-        if let Some(screen) = self.stack.last_mut() {
-            screen.resize(w, body, &self.host);
+        // The title says what you are looking at — the pane that holds the
+        // keyboard, and what that pane is showing.
+        {
+            let Self {
+                screen,
+                panes,
+                host,
+                ..
+            } = self;
+            let name = panes.focused_name();
+            let label = panes.focused().map(Screens::label).unwrap_or("");
+            title(&mut screen.row(0), host, name, label);
         }
-        if let Some(screen) = self.stack.last() {
-            screen.paint(&mut self.screen, 1, &self.host, &mut self.runs);
+
+        // Each placed pane: resize to its own content rectangle (two
+        // comparisons when nothing moved — the views cache their applied
+        // width), draw its header, then its view, clipped to its columns.
+        {
+            let Self {
+                panes,
+                geometry,
+                screen,
+                host,
+                runs,
+                focus_keys,
+                ..
+            } = self;
+            let Some((_, geometry)) = geometry.as_ref() else {
+                return;
+            };
+            for (name, rect) in geometry.placed() {
+                if let Some(pane) = panes.get_mut(name) {
+                    pane.resize_to(rect.content(), host);
+                }
+            }
+            for (name, rect) in geometry.placed() {
+                let Some(pane) = panes.get(name) else {
+                    continue;
+                };
+                let focused = panes.focused_name() == name;
+                let key = focus_keys
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, k)| k.as_str())
+                    .unwrap_or("");
+                // The header pen is the rectangle's own header row, and the
+                // content pen its content — the same subdivision the resize
+                // above used, read back rather than recomputed.
+                let head = rect.header();
+                header(
+                    &mut screen.span(head.y, head.x, head.width),
+                    host,
+                    key,
+                    name,
+                    pane.label(),
+                    focused,
+                );
+                let content = rect.content();
+                if content.width > 0 && content.height > 0 {
+                    pane.paint(&mut *screen, content.x, content.y, focused, host, runs);
+                }
+            }
         }
 
         let ink = Ink::new(c.dim, c.status_bg);
@@ -1253,18 +1639,27 @@ impl App {
             pen.put(query, Ink::new(c.fg, c.status_bg));
             pen.put("█", loud);
             if pen.room() > 2 {
-                if let Some(note) = self.stack.last().and_then(Screens::filter_note) {
+                if let Some(note) = self.panes.get("commits").and_then(Screens::filter_note) {
                     pen.put(" · ", ink);
                     pen.put(&note, Ink::new(c.faint, c.status_bg));
                 }
             }
             pen.wash(ink);
         } else {
+            // The normal status names the focused pane first, then lets the
+            // pane say where it is — one line answering "where am I" with the
+            // same word the title used.
             let status = match self.message.is_empty() {
                 true => self
-                    .stack
-                    .last()
-                    .map(|s| s.status(&self.host))
+                    .panes
+                    .focused()
+                    .map(|pane| {
+                        format!(
+                            "{} · {}",
+                            self.panes.focused_name(),
+                            pane.status(&self.host)
+                        )
+                    })
                     .unwrap_or_default(),
                 false => self.message.clone(),
             };
@@ -1377,17 +1772,19 @@ fn stats_on() -> bool {
 }
 
 /// The title row: what you are looking at, and what would change it.
-fn title(pen: &mut Pen, host: &Host, label: &str, mode: Option<&str>) {
+///
+/// The focused pane is named here in the same word its header and the status
+/// line use — one name, three places, so "where is the keyboard" has one
+/// answer.
+fn title(pen: &mut Pen, host: &Host, pane: &str, label: &str) {
     let c = &host.theme.chrome;
     let ink = Ink::new(c.fg, c.title_bg);
     let dim = Ink::new(c.dim, c.title_bg);
     pen.put(" ", ink);
     pen.put("gitten", Ink::new(c.accent, c.title_bg).bold());
     pen.put("  ", dim);
-    if let Some(mode) = mode {
-        pen.put(mode, ink);
-        pen.put("  ", dim);
-    }
+    pen.put(pane, ink);
+    pen.put("  ", dim);
     pen.put(label, dim);
     // The one key worth advertising, right-aligned. *Which* key comes from the
     // keymap, so rebinding `?` moves this too — the same reason the help panel
@@ -1399,6 +1796,40 @@ fn title(pen: &mut Pen, host: &Host, label: &str, mode: Option<&str>) {
     let pad = pen.room().saturating_sub(gitten_tui::screen::width(&hint));
     pen.fill(pad, ' ', dim);
     pen.put(&hint, dim);
+    pen.wash(dim);
+}
+
+/// A pane's header row: its focus key, its stable name, and what it is showing.
+///
+/// The key is the first one bound to `<name>.focus` in the live keymap — a
+/// config file that moves or unbinds it moves the header without a line of
+/// code, and an unbound pane advertises no key at all rather than a stale one.
+/// The focused pane's key and name draw in the theme accent, which is the one
+/// "which pane" mark a cell grid gets; the label is what the pane was acquired
+/// under, faint, because it is the least of the three.
+fn header(pen: &mut Pen, host: &Host, key: &str, name: &str, label: &str, focused: bool) {
+    let c = &host.theme.chrome;
+    let bg = c.title_bg;
+    let key_ink = match focused {
+        true => Ink::new(c.accent, bg),
+        false => Ink::new(c.faint, bg),
+    };
+    let name_ink = match focused {
+        true => Ink::new(c.accent, bg).bold(),
+        false => Ink::new(c.dim, bg),
+    };
+    let label_ink = Ink::new(c.faint, bg);
+    let dim = Ink::new(c.faint, bg);
+    pen.put("  ", dim);
+    if !key.is_empty() {
+        pen.put(key, key_ink);
+        pen.put("  ", dim);
+    }
+    pen.put(name, name_ink);
+    if !label.is_empty() {
+        pen.put("  ", dim);
+        pen.put(label, label_ink);
+    }
     pen.wash(dim);
 }
 
@@ -1455,11 +1886,20 @@ mod tests {
         app
     }
 
-    /// The commits list, which every search test is about.
+    /// The commits list, which every search test is about — read through the
+    /// registry by name, as the app itself reads it.
     fn list(app: &App) -> &Commits {
-        match app.stack.last() {
+        match app.panes.get("commits") {
             Some(Screens::Commits { view: list, .. }) => list,
-            _ => panic!("the commits list is not on screen"),
+            _ => panic!("the commits pane is not registered"),
+        }
+    }
+
+    /// The diff view, for tests that look at what the main pane holds.
+    fn diff_view(app: &App) -> &Diff {
+        match app.panes.get("diff") {
+            Some(Screens::Diff { view, .. }) => view,
+            _ => panic!("the diff pane is not registered"),
         }
     }
 
@@ -1478,6 +1918,158 @@ mod tests {
         for c in text.chars() {
             app.press(Key::char(c));
         }
+    }
+
+    /// A mouse event at a cell of the screen, button unmodified.
+    fn click(kind: MouseKind, col: usize, row: usize) -> Mouse {
+        Mouse {
+            kind,
+            col,
+            row,
+            ctrl: false,
+            alt: false,
+            shift: false,
+        }
+    }
+
+    #[test]
+    fn shared_defaults_focus_the_registered_terminal_panes() {
+        // The shipped map resolves the pane moves and the digits — through
+        // `Host::new().keys`, the same map every client reads, and not
+        // through anything this client owns. There is no terminal key table
+        // and no terminal command name anywhere in the chain: `h` is a key
+        // with a shared meaning, `pane.left` is a name this file answers.
+        let keys = Host::new().keys;
+        let mut commits = Modes::new();
+        commits.push("commits");
+        assert_eq!(
+            keys.resolve(&commits, &[Key::char('h')]),
+            Resolve::Run("pane.left")
+        );
+        assert_eq!(
+            keys.resolve(&commits, &[Key::char('l')]),
+            Resolve::Run("pane.right")
+        );
+        assert_eq!(
+            keys.resolve(&commits, &[Key::plain(Code::Char('4'))]),
+            Resolve::Run("commits.focus")
+        );
+        assert_eq!(
+            keys.resolve(&commits, &[Key::plain(Code::Char('0'))]),
+            Resolve::Run("diff.focus")
+        );
+        // Ctrl-J/Ctrl-K in `panes` mode — the mode `sync_modes` builds only
+        // when a second sidebar list exists; `term.rs` proves the translation.
+        let mut panes = Modes::new();
+        panes.push("panes");
+        panes.push("commits");
+        assert_eq!(
+            keys.resolve(&panes, &[Key::ctrl(Code::Char('j'))]),
+            Resolve::Run("pane.next")
+        );
+        assert_eq!(
+            keys.resolve(&panes, &[Key::ctrl(Code::Char('k'))]),
+            Resolve::Run("pane.prev")
+        );
+
+        // And the dispatch answers them: the walk runs and stops at the
+        // edges, the digits name panes, and an absent pane is said, exactly.
+        let mut app = app(30);
+        app.press(Key::char('h'));
+        assert_eq!(
+            app.panes.focused_name(),
+            "commits",
+            "left from the first pane wrapped to the diff"
+        );
+        app.press(Key::char('l'));
+        assert_eq!(app.panes.focused_name(), "diff");
+        app.press(Key::char('l'));
+        assert_eq!(
+            app.panes.focused_name(),
+            "diff",
+            "right past the main pane wrapped to the lists"
+        );
+        app.press(Key::plain(Code::Left));
+        assert_eq!(
+            app.panes.focused_name(),
+            "commits",
+            "the arrows stopped walking"
+        );
+
+        app.press(Key::plain(Code::Char('0')));
+        assert_eq!(app.panes.focused_name(), "diff");
+        app.press(Key::plain(Code::Char('4')));
+        assert_eq!(app.panes.focused_name(), "commits");
+        for (digit, name) in [
+            ('1', "status"),
+            ('2', "files"),
+            ('3', "branches"),
+            ('5', "stashes"),
+        ] {
+            app.press(Key::plain(Code::Char(digit)));
+            assert_eq!(
+                app.panes.focused_name(),
+                "commits",
+                "{name} stole the focus"
+            );
+            assert_eq!(app.message, format!("no {name} pane"), "{name}");
+        }
+        // The cycle is a registry answer too, and with one sidebar list it
+        // says so rather than pretending.
+        app.dispatch("pane.next");
+        assert_eq!(app.message, "no second list to cycle to");
+        assert_eq!(app.panes.focused_name(), "commits");
+    }
+
+    #[test]
+    fn search_prompt_isolated_over_the_commits_pane() {
+        // The prompt stands over the pane *named* commits — by name, not by
+        // index — and while it stands, neither the mouse nor a pane focus key
+        // reaches either view: the keys are query text, resolved against
+        // exactly the `input` mode, and the mouse waits.
+        let mut app = app(30);
+        app.press(Key::char('/'));
+        assert!(app.search.is_some(), "the prompt did not open");
+
+        // The shipped focus keys are text while the prompt owns the keyboard.
+        app.press(Key::plain(Code::Char('4')));
+        assert_eq!(app.search.as_deref(), Some("4"), "4 was not text");
+        assert_eq!(app.panes.focused_name(), "commits", "4 moved the focus");
+        app.press(Key::char('h'));
+        assert_eq!(app.search.as_deref(), Some("4h"), "h was not text");
+        assert_eq!(app.panes.focused_name(), "commits", "h moved the focus");
+        // The mouse is inert under the prompt.
+        app.draw();
+        app.mouse(click(MouseKind::Down, 10, 4));
+        assert_eq!(
+            list(&app).cursor(),
+            0,
+            "the mouse moved the list under the prompt"
+        );
+        app.mouse(click(MouseKind::Up, 10, 4));
+
+        // Esc cancels and restores the unfiltered list.
+        app.press(Key::plain(Code::Esc));
+        assert!(app.search.is_none(), "esc did not cancel the prompt");
+        assert_eq!(
+            list(&app).filter_note(),
+            None,
+            "esc did not restore the list"
+        );
+
+        // And the prompt is drawn over the pane the narrow layout shows: at
+        // 60 columns the commits pane is the visible one, live-filtered.
+        app.press(Key::char('/'));
+        type_(&mut app, "engine");
+        app.draw();
+        let rows = body(&app);
+        assert!(rows.iter().any(|r| r.contains("engine note 0")), "{rows:?}");
+        assert!(
+            rows.iter().all(|r| !r.contains("compiler")),
+            "a filtered-out row is drawn under the prompt: {rows:?}"
+        );
+        assert!(status(&app).contains("/engine"), "{:?}", status(&app));
+        assert_eq!(list(&app).filter_note().as_deref(), Some("15/30"));
     }
 
     #[test]
@@ -1659,6 +2251,304 @@ mod tests {
         assert_eq!(list(&app).filter_note(), None);
         assert!(app.pending.is_empty());
     }
+
+    #[test]
+    fn markdown_reflows_to_the_diff_pane_not_the_screen() {
+        // The committed Markdown fixture, in the diff pane of a 120-column
+        // frame. The sidebar takes its share and the divider one column, so
+        // the diff pane's content is 79 wide — and *that* is the budget the
+        // Markdown presentation wraps at, because [`Diff::resize`] is handed
+        // the pane's width and passes it down. The screen's 120 never
+        // reaches the presentation.
+        const MD: &str = include_str!("../tests/fixtures/md.diff");
+        let mut app = app(30);
+        app.screen = Screen::new(120, 24);
+        // The fixture is a patch: a diff tenant over a patch source, exactly
+        // as a `--patch` launch would register one. Nothing here is
+        // repository-backed, so no refresh can touch it.
+        let files = gitten_core::parse_unified_diff(MD);
+        let mut diff = Diff::new(files.clone(), &app.host);
+        diff.set_bar(app.bar);
+        app.panes.register(
+            "diff",
+            panes::Placement::Main,
+            Screens::Diff {
+                view: diff,
+                source: Some(Source::Patch { file: None }),
+                label: "md.diff".into(),
+                generation: app.generation,
+            },
+        );
+        app.sync_modes();
+        app.draw();
+
+        // The geometry: sidebar 40, one divider, diff 79 — and the diff
+        // pane's rows are the 79-column answer, not the 120-column one.
+        let content = app.pane_content("diff").expect("the diff pane is visible");
+        assert_eq!(
+            content,
+            crate::panes::Rect {
+                x: 41,
+                y: 2,
+                width: 79,
+                height: 21
+            }
+        );
+        let host = Host::new();
+        let mut at_pane = Diff::new(files.clone(), &host);
+        at_pane.resize(79, 21, &host);
+        let mut at_screen = Diff::new(files, &host);
+        at_screen.resize(120, 21, &host);
+        assert_eq!(
+            diff_view(&app).rows(),
+            at_pane.rows(),
+            "the pane drew at another width"
+        );
+        assert!(
+            at_pane.rows() > at_screen.rows(),
+            "the fixture does not wrap differently at 79 and 120: {} vs {}",
+            at_pane.rows(),
+            at_screen.rows()
+        );
+
+        // Every painted row stays inside the diff span: the divider column
+        // the layout owns is blank, and the text starts at the pane's edge.
+        let (w, h) = app.screen.size();
+        for y in 2..h - 1 {
+            assert_eq!(
+                app.screen.char_at(40, y),
+                Some(' '),
+                "row {y} drew into the divider"
+            );
+        }
+        assert!(
+            (2..h - 1).any(|y| (41..w).any(|x| app.screen.char_at(x, y).is_some_and(|c| c != ' '))),
+            "nothing was drawn in the diff pane"
+        );
+
+        // Down at 95 columns the layout is narrow: the diff takes the whole
+        // body, reflows to *that* width — and the Markdown model is not
+        // rebuilt: a selection made before the switch still names the same
+        // bytes, through the same logical lines.
+        // Wherever the presentation put a word: a double click takes one.
+        let mut selected = String::new();
+        for row in 3..20 {
+            app.mouse(click(MouseKind::Down, 60, row));
+            app.mouse(click(MouseKind::Up, 60, row));
+            app.mouse(click(MouseKind::Down, 60, row));
+            app.mouse(click(MouseKind::Up, 60, row));
+            selected = diff_view(&app).selection();
+            if !selected.is_empty() {
+                break;
+            }
+        }
+        assert!(!selected.is_empty(), "the double click took no word");
+        app.screen.resize(95, 24);
+        app.draw();
+        assert_eq!(
+            app.pane_content("diff"),
+            Some(crate::panes::Rect {
+                x: 0,
+                y: 2,
+                width: 95,
+                height: 21
+            })
+        );
+        // The narrow reflow used the *new* width: the same row count the
+        // presentation produces when a pane of exactly that width asks for
+        // it. (This fixture happens to wrap identically at 79 and 95; it is
+        // 79 against 120 that differs, asserted above.)
+        let mut at_narrow = Diff::new(gitten_core::parse_unified_diff(MD), &host);
+        at_narrow.resize(95, 21, &host);
+        assert_eq!(diff_view(&app).rows(), at_narrow.rows());
+        assert_eq!(
+            diff_view(&app).selection(),
+            selected,
+            "the reflow lost the line the selection was on"
+        );
+    }
+
+    #[test]
+    fn title_headers_and_status_name_the_focus_from_live_keys() {
+        let mut app = app(30);
+        app.screen = Screen::new(120, 24);
+        app.draw();
+        let (w, h) = app.screen.size();
+        let _ = w;
+        let c = app.host.theme.chrome;
+
+        // Both headers, each naming its pane and its first configured focus
+        // key — 4 for commits, 0 for diff, straight out of the shipped map.
+        let commits_header = app.screen.row_text(1)[..40.min(w)].to_string();
+        assert!(commits_header.contains('4'), "{commits_header:?}");
+        assert!(commits_header.contains("commits"), "{commits_header:?}");
+        let diff_header = app.screen.row_text(1)[41..].to_string();
+        assert!(diff_header.contains('0'), "{diff_header:?}");
+        assert!(diff_header.contains("diff"), "{diff_header:?}");
+        assert!(
+            diff_header.contains(EMPTY_DIFF_LABEL),
+            "the empty pane did not say so: {diff_header:?}"
+        );
+
+        // The focused header wears the accent; the other does not. The name
+        // starts five columns into each header — two spaces, the key, two
+        // more.
+        assert_eq!(
+            app.screen.ink(5, 1).unwrap().fg,
+            c.accent,
+            "commits is focused"
+        );
+        assert_eq!(
+            app.screen.ink(46, 1).unwrap().fg,
+            c.dim,
+            "the diff header drew as if it had the keyboard"
+        );
+        assert!(
+            app.screen.row_text(0).contains("commits"),
+            "the title did not name the focus"
+        );
+        assert!(
+            app.screen.row_text(h - 1).contains("commits ·"),
+            "the status did not name the focus: {:?}",
+            app.screen.row_text(h - 1)
+        );
+
+        // Focus moves — the accent, the title and the status all follow.
+        app.press(Key::plain(Code::Char('0')));
+        app.draw();
+        assert_eq!(
+            app.screen.ink(46, 1).unwrap().fg,
+            c.accent,
+            "diff took the accent"
+        );
+        assert_eq!(
+            app.screen.ink(5, 1).unwrap().fg,
+            c.dim,
+            "commits kept the accent"
+        );
+        assert!(
+            app.screen.row_text(0).contains("diff"),
+            "the title did not follow"
+        );
+        assert!(
+            app.screen.row_text(h - 1).contains("diff ·"),
+            "{:?}",
+            app.screen.row_text(h - 1)
+        );
+
+        // A config override changes the displayed key without changing pane
+        // code: the header reads the live keymap through the cache, and an
+        // unbound pane advertises no key at all.
+        app.press(Key::plain(Code::Char('4')));
+        assert!(app.host.keys.unbind("global", "4"));
+        app.sync_header_keys();
+        app.draw();
+        let header = app.screen.row_text(1);
+        assert!(
+            !header.contains('4'),
+            "the unbound key is still advertised: {header:?}"
+        );
+        assert!(header.contains("commits"), "{header:?}");
+
+        // Narrow: only the focused pane draws a header at all.
+        app.press(Key::plain(Code::Char('0')));
+        app.screen.resize(60, 12);
+        app.draw();
+        assert!(
+            app.screen.row_text(1).contains("diff"),
+            "{:?}",
+            app.screen.row_text(1)
+        );
+        assert!(
+            !app.screen.row_text(1).contains("commits"),
+            "the hidden pane drew a header: {:?}",
+            app.screen.row_text(1)
+        );
+    }
+
+    #[test]
+    fn help_and_config_reload_follow_the_focused_pane() {
+        let mut app = app(30);
+        // Tall enough that the help panel shows past the global section into
+        // the focused mode's own bindings — the property under test.
+        app.screen = Screen::new(60, 50);
+
+        // Help is a function of the active modes, and the focused pane is
+        // what decides those: over the commits pane it lists the commits
+        // bindings and not the diff's, and over the diff pane the other way.
+        app.dispatch("help");
+        app.draw();
+        let rows = body(&app);
+        // The panel shows keys and what they do, not command names — the
+        // commits binding's own description is the marker.
+        assert!(
+            rows.iter().any(|r| r.contains("show the diff pane")),
+            "help did not follow the commits mode: {rows:?}"
+        );
+        assert!(
+            rows.iter().all(|r| !r.contains("the next presentation")),
+            "help listed a diff binding over the commits pane"
+        );
+        app.dispatch("help");
+        app.press(Key::plain(Code::Char('0')));
+        app.dispatch("help");
+        app.draw();
+        let rows = body(&app);
+        assert!(
+            rows.iter().any(|r| r.contains("the next presentation")),
+            "help did not follow the diff mode: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .all(|r| !r.contains("show the diff pane, loaded")),
+            "help listed the commits bindings over the diff"
+        );
+        app.dispatch("help");
+
+        // A reload rebuilds the host from the file and re-applies geometry to
+        // every pane — and keeps the focus, the live search and the
+        // rectangles it cached.
+        let path =
+            std::env::temp_dir().join(format!("gitten-tui-test-{}.toml", std::process::id()));
+        std::fs::write(&path, "[view]\nscrolloff = 3\n").expect("a config file");
+        // Back on the commits pane, where `/` lives, then the prompt.
+        app.press(Key::plain(Code::Char('4')));
+        app.press(Key::char('/'));
+        type_(&mut app, "engine");
+        app.reload(&path);
+        assert!(app.search.is_some(), "the reload closed the live prompt");
+        assert_eq!(list(&app).filter_note().as_deref(), Some("15/30"));
+        assert_eq!(
+            app.panes.focused_name(),
+            "commits",
+            "the reload moved the focus"
+        );
+        assert_eq!(app.message, "gitten.toml reloaded", "{:?}", app.message);
+        // The focused pane keeps its cached rectangle; the diff the narrow
+        // layout hides keeps its viewport and is resized when next shown.
+        assert!(app.pane_content("commits").is_some());
+        assert!(
+            app.pane_content("diff").is_none(),
+            "a hidden pane kept a rectangle"
+        );
+        app.press(Key::plain(Code::Enter));
+        assert!(app.search.is_none());
+        assert_eq!(list(&app).filter_note().as_deref(), Some("15/30"));
+        app.draw();
+        assert!(
+            body(&app).iter().any(|r| r.contains("engine")),
+            "the reload left the frame unusable"
+        );
+        // And "when next shown" is now: the focus switch resizes the pane
+        // before painting it, at the body's own width.
+        app.press(Key::plain(Code::Char('0')));
+        app.draw();
+        assert!(
+            app.pane_content("diff").is_some(),
+            "a hidden pane was not resized on show"
+        );
+        std::fs::remove_file(&path).ok();
+    }
 }
 
 #[cfg(test)]
@@ -1820,6 +2710,32 @@ diff --git a/tracked.txt b/tracked.txt
         (Arc::new(FakeRepo(Arc::clone(&state))), state)
     }
 
+    /// The fake's working-tree world, tall in *hunks* and not just in lines:
+    /// an edit every ten lines, so the diff the pane shows has twenty hunks
+    /// and hundreds of rows. A diff shorter than its pane never moves `top`,
+    /// however hard the wheel is spun — the pane has nothing to scroll — and
+    /// two edits in a four-hundred-line file are still one screen of hunks.
+    /// Same shape as [`fake`]: one file, `applied` flipping `before` to
+    /// `after` on the first write.
+    fn fake_tall(untracked: &[&str]) -> (Handle, Arc<Mutex<FakeState>>) {
+        let side = |edited: bool| -> Vec<Arc<str>> {
+            (0..200usize)
+                .map(|i| match edited && i % 10 == 4 {
+                    true => Arc::<str>::from(format!("EDIT {i}").as_str()),
+                    false => Arc::<str>::from(format!("line {i}").as_str()),
+                })
+                .collect()
+        };
+        let state = Arc::new(Mutex::new(FakeState {
+            before: vec![pair("f.txt", side(false), side(true))],
+            after: vec![pair("f.txt", side(false), side(false))],
+            refuses: vec![b"refuse".to_vec()],
+            untracked: untracked.iter().map(|u| u.as_bytes().to_vec()).collect(),
+            ..Default::default()
+        }));
+        (Arc::new(FakeRepo(Arc::clone(&state))), state)
+    }
+
     /// An application on one diff screen, from a hand-built `Started`: no
     /// arguments, no config file, and no terminal — the frame is an
     /// in-memory `Screen`, which is the whole of what the draw path needs.
@@ -1881,6 +2797,343 @@ diff --git a/tracked.txt b/tracked.txt
             std::thread::sleep(Duration::from_millis(2));
         }
         false
+    }
+
+    /// A hundred commits, so a pane's viewport has something to scroll.
+    fn hundred_commits() -> Vec<Commit> {
+        (0..100)
+            .map(|i| {
+                let sha = format!("{i:08}");
+                let parent = match i + 1 < 100 {
+                    true => format!("{:08}", i + 1),
+                    false => String::new(),
+                };
+                Commit {
+                    sha: sha.clone(),
+                    short: sha,
+                    parents: match parent.is_empty() {
+                        true => Vec::new().into_boxed_slice(),
+                        false => vec![parent].into_boxed_slice(),
+                    },
+                    author: "Ada Lovelace".into(),
+                    timestamp: 1,
+                    subject: format!("commit {i}"),
+                }
+            })
+            .collect()
+    }
+
+    /// A wide application on a repository: the commits pane focused, the
+    /// empty diff beside it, both visible at 120 columns.
+    fn commits_app(handle: &Handle) -> App {
+        let started = gitten_app::Started {
+            view: View::Commits,
+            source: Source::Repo {
+                path: std::path::PathBuf::from("/fake"),
+                arg: String::new(),
+            },
+            host: Host::new(),
+            loaded: acquire::Loaded {
+                label: "fake".into(),
+                data: Data::Commits(hundred_commits()),
+            },
+            config: std::path::PathBuf::from("/nonexistent/gitten.toml"),
+            repo: Some(handle.clone()),
+        };
+        let mut app = App::new(started, Glyphs::default());
+        app.screen = Screen::new(120, 24);
+        app
+    }
+
+    fn commits_of(app: &App) -> &Commits {
+        match app.panes.get("commits") {
+            Some(Screens::Commits { view, .. }) => view,
+            _ => panic!("the commits pane is not registered"),
+        }
+    }
+
+    fn diff_of(app: &App) -> &Diff {
+        match app.panes.get("diff") {
+            Some(Screens::Diff { view, .. }) => view,
+            _ => panic!("the diff pane is not registered"),
+        }
+    }
+
+    /// A mouse event at a cell of the screen, button unmodified.
+    fn click(kind: MouseKind, col: usize, row: usize) -> Mouse {
+        Mouse {
+            kind,
+            col,
+            row,
+            ctrl: false,
+            alt: false,
+            shift: false,
+        }
+    }
+
+    #[test]
+    fn enter_replaces_and_focuses_a_persistent_diff_and_back_returns() {
+        let (handle, state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        app.draw();
+        assert_eq!(app.panes.focused_name(), "commits");
+        let open_reads = state.lock().unwrap().pairs_reads;
+
+        // Enter acquires the selected commit's diff exactly once, replaces
+        // the empty tenant — never appends — and focuses it.
+        app.press(Key::plain(Code::Enter));
+        assert_eq!(app.panes.focused_name(), "diff");
+        assert_eq!(app.panes.names().count(), 2, "enter appended a pane");
+        assert_eq!(state.lock().unwrap().pairs_reads, open_reads + 1);
+        assert!(
+            matches!(
+                app.panes.get("diff"),
+                Some(Screens::Diff {
+                    source: Some(_),
+                    ..
+                })
+            ),
+            "the diff pane was not really acquired"
+        );
+        // The commits pane stays resident, its cursor where it was.
+        assert_eq!(commits_of(&app).cursor(), 0);
+
+        // The diff's state is its own: move it, leave, and it is unchanged —
+        // `esc` moved the keyboard, not the pane.
+        app.dispatch("view.down");
+        app.dispatch("view.down");
+        assert_eq!(diff_of(&app).cursor(), 2);
+        app.press(Key::plain(Code::Esc));
+        assert_eq!(app.panes.focused_name(), "commits");
+        assert!(
+            matches!(
+                app.panes.get("diff"),
+                Some(Screens::Diff {
+                    source: Some(_),
+                    ..
+                })
+            ),
+            "back destroyed the diff"
+        );
+        assert_eq!(
+            diff_of(&app).cursor(),
+            2,
+            "back disturbed the diff's cursor"
+        );
+        assert_eq!(diff_of(&app).layout_name(), "unified");
+
+        // A second Enter replaces the same tenant, again exactly once.
+        let reads = state.lock().unwrap().pairs_reads;
+        app.press(Key::plain(Code::Enter));
+        assert_eq!(
+            app.panes.names().count(),
+            2,
+            "a second enter appended a pane"
+        );
+        assert_eq!(app.panes.focused_name(), "diff");
+        assert_eq!(state.lock().unwrap().pairs_reads, reads + 1);
+
+        // A direct diff launch has one tenant and `esc` goes nowhere.
+        let mut app = app_on_diff(Source::Fixtures, None);
+        assert_eq!(app.panes.names().count(), 1);
+        app.press(Key::plain(Code::Esc));
+        assert_eq!(app.panes.focused_name(), "diff");
+        assert_eq!(app.panes.names().count(), 1, "esc invented a pane");
+    }
+
+    #[test]
+    fn view_commands_and_wheel_reach_only_the_focused_viewport() {
+        let (handle, _state) = fake_tall(&[]);
+        let mut app = commits_app(&handle);
+        app.draw();
+        // Both tenants long: the diff loaded, the list a hundred deep.
+        app.dispatch("commits.open-diff");
+        app.dispatch("commits.focus");
+        app.draw();
+
+        // Under the commits focus, `view.down` and the wheel move the commits
+        // viewport and touch nothing else.
+        let (dc, dt) = (diff_of(&app).cursor(), diff_of(&app).top());
+        app.dispatch("view.down");
+        assert_eq!(commits_of(&app).cursor(), 1);
+        assert_eq!((diff_of(&app).cursor(), diff_of(&app).top()), (dc, dt));
+        app.input(Input::Key(Key::plain(Code::WheelDown)));
+        assert!(
+            commits_of(&app).top() > 0,
+            "the wheel did not scroll the list"
+        );
+        assert_eq!(diff_of(&app).top(), dt);
+
+        // Under the diff focus, the same commands move the diff alone.
+        app.dispatch("diff.focus");
+        let (cc, ct) = (commits_of(&app).cursor(), commits_of(&app).top());
+        app.dispatch("view.down");
+        assert_eq!(diff_of(&app).cursor(), dc + 1);
+        assert_eq!(
+            (commits_of(&app).cursor(), commits_of(&app).top()),
+            (cc, ct)
+        );
+        app.input(Input::Key(Key::plain(Code::WheelDown)));
+        assert!(
+            diff_of(&app).top() > dt,
+            "the wheel did not scroll the diff"
+        );
+        assert_eq!(commits_of(&app).top(), ct);
+
+        // And the frame agrees: the unfocused pane draws no cursor bar, the
+        // focused one exactly one.
+        app.draw();
+        let (w, h) = app.screen.size();
+        let bar = app.host.theme.chrome.selection_bg;
+        let lit = |x0: usize, x1: usize| {
+            (1..h - 1)
+                .filter(|y| (x0..x1).any(|x| app.screen.ink(x, *y).is_some_and(|i| i.bg == bar)))
+                .count()
+        };
+        assert_eq!(lit(0, 40), 0, "the unfocused list drew a cursor bar");
+        assert_eq!(
+            lit(41, w),
+            1,
+            "the focused diff did not draw exactly one bar"
+        );
+    }
+
+    #[test]
+    fn mouse_down_focuses_the_hit_pane_and_drag_stays_captured() {
+        let (handle, state) = fake_tall(&[]);
+        let mut app = commits_app(&handle);
+        app.draw();
+        app.dispatch("commits.open-diff");
+        app.dispatch("commits.focus");
+        app.draw();
+
+        // Down in the commits rectangle presses it, in its own coordinates.
+        app.mouse(click(MouseKind::Down, 5, 4));
+        assert_eq!(app.panes.focused_name(), "commits");
+        assert_eq!(
+            commits_of(&app).cursor(),
+            2,
+            "the press did not translate to pane-local rows"
+        );
+
+        // Down in the diff rectangle focuses the diff and presses *it*.
+        app.mouse(click(MouseKind::Down, 60, 6));
+        assert_eq!(app.panes.focused_name(), "diff");
+
+        // A drag that crosses the divider back into the commits region is
+        // still the diff's gesture: it selects in the diff, splices nothing
+        // into the list, and the release reads the pane the button went
+        // down in — not the one under the pointer when it came up.
+        app.mouse(click(MouseKind::Drag, 10, 8));
+        app.mouse(click(MouseKind::Up, 10, 8));
+        assert_eq!(app.panes.focused_name(), "diff");
+        assert!(
+            !diff_of(&app).selection().is_empty(),
+            "the drag never selected"
+        );
+        assert_eq!(
+            commits_of(&app).selection(),
+            "",
+            "the gesture spliced two panes"
+        );
+        assert_eq!(
+            app.copy.as_deref(),
+            Some(diff_of(&app).selection().as_str()),
+            "copy-on-select did not read the captured pane"
+        );
+
+        // A press on the diff's scrollbar: its own last column, not the
+        // screen's, and the drag follows the thumb.
+        let top = diff_of(&app).top();
+        app.mouse(click(MouseKind::Down, 119, 5));
+        app.mouse(click(MouseKind::Drag, 119, 12));
+        assert!(diff_of(&app).top() > top, "the bar did not take the drag");
+        app.mouse(click(MouseKind::Up, 119, 12));
+
+        // Two quick clicks in the commits pane open the diff — the clock
+        // counts, and the pane it counted in is part of what it counted.
+        app.dispatch("commits.focus");
+        let reads = state.lock().unwrap().pairs_reads;
+        app.mouse(click(MouseKind::Down, 10, 4));
+        app.mouse(click(MouseKind::Up, 10, 4));
+        app.mouse(click(MouseKind::Down, 10, 4));
+        assert_eq!(
+            app.panes.focused_name(),
+            "diff",
+            "the double click did not open the diff"
+        );
+        assert_eq!(
+            state.lock().unwrap().pairs_reads,
+            reads + 1,
+            "opened twice or never"
+        );
+
+        // The same cell under a different pane is not a double click: the
+        // narrow layout puts the diff where the commits was, and the clock
+        // counts per pane.
+        app.screen.resize(60, 24);
+        app.draw();
+        app.mouse(click(MouseKind::Down, 10, 4));
+        assert_eq!(app.clicks, 1, "the clock counted across panes");
+        app.mouse(click(MouseKind::Up, 10, 4));
+        assert_eq!(diff_of(&app).selection(), "", "a single click selected");
+        // ...and a second quick click in the *same* pane is a double.
+        app.mouse(click(MouseKind::Down, 10, 4));
+        assert_eq!(app.clicks, 2);
+        app.mouse(click(MouseKind::Up, 10, 4));
+        assert!(
+            !diff_of(&app).selection().is_empty(),
+            "two clicks in one pane did not take a word"
+        );
+    }
+
+    #[test]
+    fn copy_on_select_finishes_once_in_the_captured_pane() {
+        let (handle, _state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        app.draw();
+        app.dispatch("commits.open-diff");
+        app.dispatch("commits.focus");
+        app.draw();
+
+        // A drag in the commits pane: the Up queues exactly its selection,
+        // once, and the feedback counts lines.
+        app.mouse(click(MouseKind::Down, 5, 4));
+        app.mouse(click(MouseKind::Drag, 5, 7));
+        app.mouse(click(MouseKind::Up, 5, 7));
+        let commits_text = commits_of(&app).selection();
+        assert!(
+            !commits_text.is_empty(),
+            "the drag in the list selected nothing"
+        );
+        assert_eq!(app.copy.as_deref(), Some(commits_text.as_str()));
+        assert_eq!(
+            copied(&commits_text),
+            format!("copied {} lines", commits_text.lines().count())
+        );
+
+        // The same gesture in the diff: its Up queues the diff's text, not
+        // the list's and not a splice of both.
+        app.dispatch("diff.focus");
+        app.mouse(click(MouseKind::Down, 60, 4));
+        app.mouse(click(MouseKind::Drag, 60, 6));
+        app.mouse(click(MouseKind::Up, 60, 6));
+        let diff_text = diff_of(&app).selection();
+        assert!(
+            !diff_text.is_empty(),
+            "the drag in the diff selected nothing"
+        );
+        assert_ne!(diff_text, commits_text);
+        assert_eq!(app.copy.as_deref(), Some(diff_text.as_str()));
+
+        // `copy.selection` reads the focused pane, with its keyboard
+        // fallback — and what is queued is text only: the loop owns the
+        // terminal, so nothing here emits an OSC byte.
+        app.dispatch("copy.selection");
+        assert_eq!(
+            app.copy.as_deref(),
+            Some(diff_of(&app).copy_text().as_str())
+        );
     }
 
     #[test]
@@ -2038,7 +3291,7 @@ diff --git a/tracked.txt b/tracked.txt
     }
 
     #[test]
-    fn every_finished_generation_refreshes_both_stacked_screens() {
+    fn staging_refreshes_focused_and_unfocused_panes() {
         let (handle, state) = fake(&[]);
         let started = gitten_app::Started {
             view: View::Commits,
@@ -2056,17 +3309,18 @@ diff --git a/tracked.txt b/tracked.txt
         };
         let mut app = App::new(started, Glyphs::default());
         app.screen = Screen::new(60, 24);
-        // Open the diff: the stack is a commit list with a diff on top of
-        // it, and the commit list is the hidden one the refresh must not
-        // forget.
+        // Open the diff, then put the keyboard back on the list: the commit
+        // list is the focused pane and the diff is the registered one the
+        // refresh must not forget — hidden by the narrow layout or not.
         app.dispatch("commits.open-diff");
-        assert_eq!(app.stack.len(), 2);
-        assert!(matches!(app.stack[0], Screens::Commits { .. }));
-        assert!(matches!(app.stack[1], Screens::Diff { .. }));
+        assert_eq!(app.panes.names().count(), 2, "open-diff appended a pane");
+        assert!(matches!(app.panes.get("diff"), Some(Screens::Diff { .. })));
+        app.dispatch("commits.focus");
+        assert_eq!(app.panes.focused_name(), "commits");
         let open_reads = state.lock().unwrap().pairs_reads;
 
         // One job that lands and one that is refused — both finish, and
-        // both finishes must stale the whole stack.
+        // both finishes must stale both panes.
         let first = Write::stage_patch(&handle, b"first".to_vec()).expect("a non-empty patch");
         assert!(app.submitter.submit(Box::new(first)).is_ok(), "queued");
         let second = Write::stage_patch(&handle, b"refuse-me".to_vec()).expect("a non-empty patch");
@@ -2081,18 +3335,24 @@ diff --git a/tracked.txt b/tracked.txt
         );
 
         let s = state.lock().unwrap();
-        // One re-acquire per screen per finish: the commit list is the
-        // hidden screen, and it was refreshed exactly as often as the diff.
+        // One re-acquire per pane per finish: the commit list is the focused
+        // one, the diff the unfocused one, and each was refreshed exactly as
+        // often as the other.
         assert_eq!(s.log_reads, 2, "{}", s.writes.len());
         assert_eq!(s.pairs_reads, open_reads + 2, "{}", s.log_reads);
         assert_eq!(s.writes.len(), 2, "{}", s.log_reads);
-        // The refusal is the message; the success's evidence is the screen.
+        // The refusal is the message; the success's evidence is the pane.
         assert_eq!(app.message, "the fake refused");
-        // And the generation the queue advanced to is the one every screen
-        // was refreshed against — a refusal's as much as a success's.
+        // And the generation the queue advanced to is the one every pane
+        // was refreshed against — a refusal's as much as a success's, the
+        // focused pane's as much as the hidden one's.
         assert!(app.generation > Generation::default());
-        for screen in &app.stack {
-            assert_eq!(screen.generation(), app.generation);
+        for name in ["commits", "diff"] {
+            let pane = app
+                .panes
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} is registered"));
+            assert_eq!(pane.generation(), app.generation, "{name}");
         }
     }
 
@@ -2106,11 +3366,11 @@ diff --git a/tracked.txt b/tracked.txt
         let mut app = app_on_fake(&source, &handle);
         // The keyboard is on the first hunk — the one about to be staged.
         move_to(&mut app, 2);
-        let (path, hunk) = {
-            let Some(Screens::Diff { view, .. }) = app.stack.last() else {
-                panic!("a diff is on top");
-            };
-            view.current_hunk().expect("the keyboard is on a hunk")
+        let (path, hunk) = match app.panes.get("diff") {
+            Some(Screens::Diff { view, .. }) => {
+                view.current_hunk().expect("the keyboard is on a hunk")
+            }
+            _ => panic!("a diff is registered"),
         };
         assert_eq!(path, "f.txt");
         let patch = gitten_core::patch::emit(&path, &[&hunk]);
