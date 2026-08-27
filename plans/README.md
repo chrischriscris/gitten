@@ -11,8 +11,12 @@ Three passes so far:
 - **Pass 3** (2026-08-27, planned at `67fee3d`): plans 013–015 — the terminal
   client catches up with the window. Plans drafted by Codex from live source,
   baseline facts independently verified by the integrator, executed by OpenCode
-  subagents in isolated worktrees off `full/tui`. This tree is the integration
-  line; nothing merges into `full/full` without its owner's say-so.
+  subagents in isolated worktrees off `full/tui`, adversarially reviewed
+  (GREEN / CONCERNS-dispositioned / CONCERNS-dispositioned), folds applied,
+  merged into `full/tui` in this tree. Integrated gate: fmt, workspace clippy
+  `-D warnings`, and `cargo test --workspace` all green (1,086 tests).
+  **`full/tui` is complete and awaiting its owner's merge decision**; this tree
+  is the integration line and nothing has touched `full/full`.
 
 Execute pass 3 in the order below unless dependencies say otherwise. Each
 executor: read the plan fully before starting, honor its STOP conditions; the
