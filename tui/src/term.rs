@@ -634,4 +634,23 @@ mod tests {
             Resolve::Run("view.page-down")
         );
     }
+
+    #[test]
+    fn the_hunk_verbs_resolve_in_diff_mode_from_the_keys_this_module_produces() {
+        // `space` and `u` are the shipped staging keys, bound in the shared
+        // keymap's `diff` mode — so the terminal must arrive at them through
+        // translation and resolution alone, and a release must not fire one
+        // twice (guarded above; named here, because these are the keys that
+        // write).
+        let map = Keymap::builtin();
+        let mut modes = Modes::new();
+        modes.push("diff");
+        for (code, name) in [
+            (KeyCode::Char(' '), "diff.stage-hunk"),
+            (KeyCode::Char('u'), "diff.unstage-hunk"),
+        ] {
+            let press = key(code, KeyModifiers::NONE).expect("a key the terminal reports");
+            assert_eq!(map.resolve(&modes, &[press]), Resolve::Run(name));
+        }
+    }
 }
