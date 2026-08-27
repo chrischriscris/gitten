@@ -1,6 +1,6 @@
 # Implementation Plans
 
-Two passes so far:
+Three passes so far:
 
 - **Pass 1** (2026-08-24, audited at `3a8b347`): plans 001–007. All landed on
   main and merged — verified 2026-08-26 against `2dfcb82`
@@ -8,10 +8,15 @@ Two passes so far:
 - **Pass 2** (2026-08-26, audited at `2dfcb82`): plans 008–012. Executed by
   subagents in isolated worktrees, adversarially reviewed, and **all merged
   into main** on 2026-08-26 — see the status table and the follow-ups section.
+- **Pass 3** (2026-08-27, planned at `67fee3d`): plans 013–015 — the terminal
+  client catches up with the window. Plans drafted by Codex from live source,
+  baseline facts independently verified by the integrator, executed by OpenCode
+  subagents in isolated worktrees off `full/tui`. This tree is the integration
+  line; nothing merges into `full/full` without its owner's say-so.
 
-Execute pass 2 in the order below unless dependencies say otherwise. Each
-executor: read the plan fully before starting, honor its STOP conditions, and
-update your row when done.
+Execute pass 3 in the order below unless dependencies say otherwise. Each
+executor: read the plan fully before starting, honor its STOP conditions; the
+integrator owns this table and updates it as waves land.
 
 ## Execution order & status
 
@@ -29,6 +34,9 @@ update your row when done.
 | 010 | Pick the commit list's widest row in characters, not bytes | P2 | S | — | MERGED (`d485bcb`, via `54f9272`) |
 | 011 | Author colours read the live theme | P2 | S | 010 softly | MERGED (`b7b0d75`, same merge commit) |
 | 012 | A font edit in gitten.toml rebuilds the diff presentation | P2 | M | — | MERGED (`dc14543` + followup `9a860a0`, via `d0b1ca5`) |
+| 013 | Incremental commit search in the terminal (`/`, shared `core::search`) | P1 | M | — | IN PROGRESS (pass 3) |
+| 014 | Stage/unstage the selected hunk from the terminal diff | P1 | M | — | IN PROGRESS (pass 3) |
+| 015 | Render the shared Markdown presentation in the terminal | P2 | L | — | IN PROGRESS (pass 3) |
 
 ## Adversarial-review follow-ups — RESOLVED
 
