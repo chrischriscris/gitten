@@ -28,6 +28,14 @@ struct Data {
     /// load-time answer reads as one timestamp. See [`rel_time`] for the
     /// bands.
     times: Vec<SharedString>,
+    /// The sha column's width, in *characters*: the longest `%h` this
+    /// repository actually produced plus one of air. Twelve was the constant —
+    /// `%h` is seven in a young repository and eleven in git/git — but the
+    /// air a constant carries is dead space everywhere else: four blank
+    /// characters between every hash and its initials here, for a repo nobody
+    /// was looking at. Still fixed within a load, unlike the graph: the eye
+    /// scans it vertically, so it has to *be* a column.
+    sha_chars: usize,
     /// One line per commit, the way `copy.selection` copies it — the sha and the
     /// subject, and neither the graph nor the clock beside them. Built at load
     /// with everything else that is derived once.
@@ -565,6 +573,15 @@ pub(crate) fn prepare(commits: Vec<Commit>, _host: &Host) -> Prepared {
     );
     eprintln!("{load}");
 
+    // The sha column hugs what this history produces — see [`Data::sha_chars`]
+    // — and characters, never bytes: the width is paid in cells of `char_width`.
+    let sha_chars = commits
+        .iter()
+        .map(|c| c.short.chars().count())
+        .max()
+        .unwrap_or(0)
+        + 1;
+
     Prepared {
         data: Data {
             lines: commits
@@ -578,6 +595,7 @@ pub(crate) fn prepare(commits: Vec<Commit>, _host: &Host) -> Prepared {
                     initials: initials(&c.author).into(),
                 })
                 .collect(),
+            sha_chars,
             commits,
             draws,
             times,
@@ -696,13 +714,6 @@ fn rel_time(timestamp: i64, now: i64) -> String {
     format!("{}y", days / 365)
 }
 
-/// The sha column, in *characters*: twelve, because `%h` is seven in a young
-/// repository and eleven in git/git, plus the air after it. In pixels rather
-/// than characters this was 90, which is 10.7 in the shipped face — so an
-/// eleven-character sha overflowed its own column by two pixels while the
-/// comment above it said eleven. Fixed, unlike the graph: the eye scans it
-/// vertically, so it has to *be* a column.
-const SHA_CHARS: f32 = 12.0;
 /// Two letters of initials beside the sha — see [`Who`].
 const WHO_CHARS: f32 = 3.0;
 
@@ -749,7 +760,7 @@ fn row(
         .child(
             div()
                 .flex_none()
-                .w(px(SHA_CHARS * ch))
+                .w(px(data.sha_chars as f32 * ch))
                 // The error colour is already this palette's "this row ends
                 // work" foreground — conflicts and armed destructions draw
                 // with it — so the tint spends nothing new.
