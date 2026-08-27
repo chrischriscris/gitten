@@ -1193,18 +1193,20 @@ impl DevShell {
         }
     }
 
-    /// The pane names that are lists, in the order the design's number keys
-    /// name them and the stack draws them: files, branches, stashes, then
-    /// commits — then whatever an extension registered.
-    /// A diff-shaped launch has no commits and still has the sidebar, so
-    /// both "is there a list to focus" and the cycle order read through
-    /// here rather than through `has_column`.
+    /// The pane names that are lists, in the order the number keys name them
+    /// and the stack draws them — lazygit's: status, files, branches,
+    /// commits, then the stash at the foot, then whatever an extension
+    /// registered. The pane moves' walk ([`DevShell::pane_walk`]) and the
+    /// ctrl-j cycle both read this, so a pane out of this order is a pane
+    /// the keyboard visits out of order; a diff-shaped launch has no commits
+    /// and still has the sidebar, so both "is there a list to focus" and the
+    /// cycle order read through here rather than through `has_column`.
     fn list_order(&self) -> Vec<&str> {
-        let mut names: Vec<&str> = ["files", "branches", "stashes", "commits"]
+        let mut names: Vec<&str> = ["status", "files", "branches", "commits", "stashes"]
             .into_iter()
             .filter(|name| self.panes.position(name).is_some())
             .collect();
-        let builtins = ["files", "branches", "stashes", "commits"];
+        let builtins = ["status", "files", "branches", "stashes", "commits"];
         names.extend(self.panes.names().filter(|name| !builtins.contains(name)));
         names
     }
@@ -2975,26 +2977,12 @@ impl DevShell {
             "input.cancel" => self.close_input(false, cx),
             "pane.next" => self.cycle_pane(1, cx),
             "pane.prev" => self.cycle_pane(-1, cx),
-            // lazygit's pane moves, on h/l and the arrows. The window is two
-            // regions — stack, diff — so the move is a spot change, and the
-            // keyboard lands wherever the region's own focus already was:
-            // the stack's focused pane, or the diff's last position. At an
-            // edge the move is answered and stays, which is what `set_spot`
-            // does when nothing changes.
-            "pane.left" => self.set_spot(
-                match self.spot {
-                    Spot::Main => Spot::List,
-                    Spot::List => Spot::List,
-                },
-                cx,
-            ),
-            "pane.right" => self.set_spot(
-                match self.spot {
-                    Spot::List => Spot::Main,
-                    Spot::Main => Spot::Main,
-                },
-                cx,
-            ),
+            // lazygit's pane moves, on h/l and the arrows: a walk across
+            // every pane the window has, in reading order — the stack's
+            // lists top to bottom, then the diff last. At either end the
+            // move is answered and stays.
+            "pane.left" => self.pane_walk(-1, cx),
+            "pane.right" => self.pane_walk(1, cx),
             "status.focus" => self.focus_named("status", cx),
             // lazygit's R: refresh everything. The wave itself is the queue
             // finish's; this just rings the bell.
@@ -3174,9 +3162,14 @@ impl DevShell {
     }
 
     fn focus_pane(&mut self, at: usize, cx: &mut Context<Self>) {
-        if self.panes.focus(at) {
-            // Focusing a list means looking at that list: the keyboard goes
-            // with it, out of the diff if it was there.
+        // Focusing a list means looking at that list: the keyboard goes
+        // with it, out of the diff if it was there. The spot moves even
+        // when the tenant was *already* the focused one — walking back
+        // left from the diff lands on the pane that held the keyboard
+        // before it left, and `5` from the diff must reach the stash it
+        // names — which is why the registry's "no change" answer is not
+        // allowed to end this method before the spot has.
+        if self.panes.focus(at) || self.spot != Spot::List {
             self.set_spot(Spot::List, cx);
             self.sync_modes(cx);
             self.sync_focus(cx);
@@ -3203,6 +3196,48 @@ impl DevShell {
         let next = (current as isize + by).rem_euclid(order.len() as isize) as usize;
         let name = order[next].clone();
         self.focus_named(&name, cx);
+    }
+
+    /// Walks the keyboard one pane over — what h/l and the arrows run. The
+    /// order is the window's reading order: the stack's lists top to bottom
+    /// ([`DevShell::list_order`], the same walk the number keys spell out),
+    /// then the diff as the last stop. Left of the diff is the stack's foot;
+    /// right of the last list is the diff; an edge answers and stays, which
+    /// is what a walk that refuses to wrap must do to keep h/l a line and
+    /// not a ring — the number keys already cover the jumping.
+    fn pane_walk(&mut self, by: isize, cx: &mut Context<Self>) {
+        let order: Vec<String> = self.list_order().iter().map(|s| s.to_string()).collect();
+        if order.is_empty() {
+            // A diff-shaped launch: the diff is the only pane there is.
+            return;
+        }
+        match self.spot {
+            Spot::Main => {
+                if by < 0 {
+                    let name = order[order.len() - 1].clone();
+                    self.focus_named(&name, cx);
+                }
+            }
+            Spot::List => {
+                let focused = self.panes.focused_name().to_string();
+                let Some(at) = order.iter().position(|name| *name == focused) else {
+                    // The focused tenant is not in the walk order — it can
+                    // only be an extension registered after this frame's
+                    // order was read. The stack's top is the honest home.
+                    if by < 0 {
+                        self.focus_named(&order[0], cx);
+                    }
+                    return;
+                };
+                let next = at as isize + by;
+                if next >= order.len() as isize {
+                    self.set_spot(Spot::Main, cx);
+                } else if next >= 0 {
+                    let name = order[next as usize].clone();
+                    self.focus_named(&name, cx);
+                }
+            }
+        }
     }
 
     /// Focuses a tenant by its stable registration name — what `files.focus`
@@ -5450,6 +5485,109 @@ mod tests {
         shell.read_with(cx, |shell, app| {
             assert_eq!(shell.active_label(app).as_ref(), "second");
             assert_eq!(shell.panes.focused_index(), 1);
+        });
+    }
+
+    #[gpui::test]
+    fn the_pane_moves_walk_every_pane_in_reading_order(cx: &mut TestAppContext) {
+        let shell = shell(None, cx);
+        // The whole stack, so the walk has all six stops: five lists and
+        // the diff.
+        shell.update(cx, |shell, cx| {
+            let host = config::host(cx);
+            let branches = cx.new(|_| {
+                crate::views::branches::Branches::from_prepared(crate::views::branches::prepare(
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                    &host.theme,
+                    "t",
+                ))
+            });
+            shell.panes.register(
+                "status",
+                Screen::status(
+                    cx.new(|_| crate::views::status::Status::new("t", Some(branches.clone()))),
+                    "t",
+                ),
+            );
+            shell.panes.register(
+                "files",
+                Screen::files(
+                    cx.new(|_| {
+                        crate::views::files::Files::from_prepared(crate::views::files::prepare(
+                            Default::default(),
+                            "t",
+                        ))
+                    }),
+                    Generation::default(),
+                    "files",
+                ),
+            );
+            shell.panes.register(
+                "branches",
+                Screen::branches(branches, Generation::default(), "branches"),
+            );
+            shell.panes.register(
+                "stashes",
+                Screen::stashes(
+                    cx.new(|_| {
+                        crate::views::stashes::Stashes::from_prepared(
+                            crate::views::stashes::prepare(&[], "t"),
+                        )
+                    }),
+                    Generation::default(),
+                    "stashes",
+                ),
+            );
+            shell.run_command("status.focus", cx);
+        });
+
+        // Right from the top walks down the stack and lands on the diff:
+        // status → files → branches → commits → stashes → diff.
+        for expected in ["files", "branches", "commits", "stashes"] {
+            shell.update(cx, |shell, cx| shell.run_command("pane.right", cx));
+            shell.read_with(cx, |shell, _| {
+                assert_eq!(
+                    shell.panes.focused_name(),
+                    expected,
+                    "walking right from the top"
+                );
+                assert_eq!(shell.spot, super::Spot::List);
+            });
+        }
+        shell.update(cx, |shell, cx| shell.run_command("pane.right", cx));
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(
+                shell.spot,
+                super::Spot::Main,
+                "right of the foot is the diff"
+            );
+        });
+        // And the edge is an edge: right on the diff answers, moves nothing.
+        shell.update(cx, |shell, cx| shell.run_command("pane.right", cx));
+        shell.read_with(cx, |shell, _| assert_eq!(shell.spot, super::Spot::Main));
+
+        // Left from the diff walks back up the stack, and the top is the
+        // other edge.
+        for expected in ["stashes", "commits", "branches", "files", "status"] {
+            shell.update(cx, |shell, cx| shell.run_command("pane.left", cx));
+            shell.read_with(cx, |shell, _| {
+                assert_eq!(
+                    shell.panes.focused_name(),
+                    expected,
+                    "walking left from the diff"
+                );
+                assert_eq!(shell.spot, super::Spot::List);
+            });
+        }
+        shell.update(cx, |shell, cx| shell.run_command("pane.left", cx));
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(
+                shell.panes.focused_name(),
+                "status",
+                "the top is the left edge"
+            );
         });
     }
 
