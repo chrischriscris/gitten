@@ -17,11 +17,16 @@ Three passes so far, and pass 4 open:
   `-D warnings`, and `cargo test --workspace` all green (1,086 tests).
   **`full/tui` is complete and awaiting its owner's merge decision**; this tree
   is the integration line and nothing has touched `full/full`.
-- **Pass 4** (2026-08-27, planned at `15bff4a`): interface parity — plan 016 is
-  the foundation (the terminal pane focus ring), planned against the pass-3
-  code by Codex and integrator-verified. Plans 017–019 (Files, Branches,
-  Stashes panes) are deliberately deferred until 016's pane registry exists;
-  no plan may cite an API nobody built.
+- **Pass 4** (2026-08-27/28, planned at `15bff4a`): interface parity — COMPLETE.
+  016 (the pane focus ring), 017 (files), 019 (stashes) and 018 (branches) are
+  implemented, adversarially reviewed, folded where the findings earned it, and
+  merged into `full/tui` in this tree. The terminal is lazygit-shaped: five
+  tenants (files, branches, commits, stashes + the diff main), every verb the
+  window ships reachable through the same command names, the same
+  `gitten.toml`, the same keymap. Rebase-onto/abort/continue are deliberately
+  deferred as one named follow-up ("TUI rebase lifecycle") with a scope-fence
+  test pinning the gap. **`full/tui` awaits its owner's merge decision**;
+  nothing has touched `full/full`.
 
 ## Pass 4 follow-ups — surfaced by reviewers, recorded not folded
 
@@ -57,7 +62,7 @@ integrator owns this table and updates it as waves land.
 | 016 | The terminal pane focus ring (foundation for lazygit-shaped TUI) | P1 | L | 013–015 | DONE (pass 4, `0cfbb41`+4, fold `a1c5b2d`) — reviewed CONCERNS (all non-blocking); 2 folds in; executor's "2-file scope" claim was false (7 files, all inside plan authorization — test/harness fallout), recorded |
 | 019 | The terminal stashes pane (apply/pop/drop/push) | P1 | S–M | 016 | DONE (pass 4, `ba49f9c`+3, fold `754c032`) — reviewed CONCERNS (all non-blocking); 2 folds in (unavailable-state regression test + unfocused armed-ink assert); drop-arm renumbering probed and unbroken |
 | 017 | The terminal files pane (sections, all file verbs, commit/amend prompts) | P1 | L | 016 | DONE (pass 4, `c99cc1f`+3, fold `20b1415`) — reviewed CONCERNS (all non-blocking); 3 folds in; merged with the stashes tenant at `e58cd1d` |
-| 018 | The terminal branches pane (checkout/new/rename/delete/tag; rebase deferred as a named lifecycle follow-up) | P1 | L | 016, 017 | IN PROGRESS (pass 4) — executes on the merged four-tenant tree |
+| 018 | The terminal branches pane (checkout/new/rename/delete/tag; rebase deferred as a named lifecycle follow-up) | P1 | L | 016, 017 | DONE (pass 4, `91e3876`+5, fold `4b65866`) — reviewed CONCERNS (all non-blocking); integrator ruling: the destructive arm outlives focus round-trips on every pane, matching the window (the ctrl-j bypass finding became the consistency fix); zero-alloc armed matching |
 
 ## Pass 3 follow-ups — surfaced by reviewers, pre-existing, not pass regressions
 
