@@ -43,6 +43,7 @@
 //! | [`split`] | `SplitRows`: the two-column presentation |
 //! | [`diff`] | the diff view: viewport, reflow, horizontal scroll |
 //! | [`commits`] | the commit list, and the graph gutter in box drawing |
+//! | [`stashes`] | the stash stack, one flat address-and-message list |
 //! | [`scrollbar`] | where you are in a list, drawn over its right-hand column |
 //! | [`help`] | what the keys do, as a function of the keymap |
 //! | [`term`] | the only module that touches `crossterm` |
@@ -55,6 +56,7 @@ pub mod rows;
 pub mod screen;
 pub mod scrollbar;
 pub mod split;
+pub mod stashes;
 pub mod term;
 
 /// The two rendering budgets, from `gitten_app` — where they are shared rather
