@@ -49,6 +49,7 @@ use gitten_tui::diff::Diff;
 use gitten_tui::help;
 use gitten_tui::screen::{Ink, Pen, Screen};
 use gitten_tui::scrollbar::Bar;
+use gitten_tui::stashes::Stashes;
 use gitten_tui::term::{Input, Mouse, MouseKind, Term};
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -183,10 +184,25 @@ enum Screens {
         label: String,
         generation: Generation,
     },
+    /// The stash stack. No source: the pane is only ever registered behind a
+    /// repository — a fixture and a patch are not shaped like a stack — so a
+    /// refresh is a plain re-read through the handle the app holds, and the
+    /// generation rail is the whole of its staleness story.
+    Stashes {
+        view: Stashes,
+        label: String,
+        generation: Generation,
+    },
 }
 
 /// What an empty diff pane's header says instead of a sha it does not have.
 const EMPTY_DIFF_LABEL: &str = "press enter on a commit";
+
+/// What a stash pane's header says when its side read failed — never
+/// `nothing stashed`, which would assert a successful read that did not
+/// happen. The exact error goes to the status line; the next refresh
+/// re-reads the stack, and a read that succeeds replaces this pane outright.
+const STASH_UNAVAILABLE: &str = "unavailable";
 
 /// The mode a text field owns the keyboard in — the name the keymap and
 /// `gitten.toml` use, and the same name the window's input module holds. While
@@ -200,18 +216,23 @@ impl Screens {
         match self {
             Screens::Commits { .. } => "commits",
             Screens::Diff { .. } => "diff",
+            Screens::Stashes { .. } => "stashes",
         }
     }
 
     fn label(&self) -> &str {
         match self {
-            Screens::Commits { label, .. } | Screens::Diff { label, .. } => label,
+            Screens::Commits { label, .. }
+            | Screens::Diff { label, .. }
+            | Screens::Stashes { label, .. } => label,
         }
     }
 
     fn generation(&self) -> Generation {
         match self {
-            Screens::Commits { generation, .. } | Screens::Diff { generation, .. } => *generation,
+            Screens::Commits { generation, .. }
+            | Screens::Diff { generation, .. }
+            | Screens::Stashes { generation, .. } => *generation,
         }
     }
 
@@ -297,6 +318,27 @@ impl Screens {
                 // acquired from anywhere and has nothing to re-read.
                 Some(Source::Fixtures) | Some(Source::Patch { .. }) | None => None,
             },
+            // The stack has no source to consult: it is only ever
+            // registered behind a repository, so every refresh is a plain
+            // re-read through the handle the caller holds. A failed read
+            // keeps the last good rows, their label and their generation —
+            // the tenant stays exactly where it was, the caller hears the
+            // error, and the next finish tries this pane again.
+            Screens::Stashes {
+                view,
+                label,
+                generation,
+            } => {
+                let loaded = match acquire::stashes(repo) {
+                    Ok(loaded) => loaded,
+                    Err(e) => return Some(Err(e)),
+                };
+                let parked = loaded.stashes.len();
+                view.replace(loaded.stashes);
+                *label = stash_label(&loaded.label, parked);
+                *generation = target;
+                Some(Ok(()))
+            }
         }
     }
 
@@ -319,6 +361,10 @@ impl Screens {
                 d.set_scrolloff(host.view.scrolloff);
                 d.resize(rect.width, rect.height, host);
             }
+            Screens::Stashes { view: s, .. } => {
+                s.set_scrolloff(host.view.scrolloff);
+                s.resize(rect.width, rect.height);
+            }
         }
     }
 
@@ -336,6 +382,7 @@ impl Screens {
         match self {
             Screens::Commits { view: c, .. } => c.paint(screen, x, y, focused, host),
             Screens::Diff { view: d, .. } => d.paint(screen, x, y, focused, host, out),
+            Screens::Stashes { view: s, .. } => s.paint(screen, x, y, focused, host),
         }
     }
 
@@ -343,6 +390,7 @@ impl Screens {
         match self {
             Screens::Commits { view: c, .. } => c.status(),
             Screens::Diff { view: d, .. } => d.status(host),
+            Screens::Stashes { view: s, .. } => s.status(),
         }
     }
 
@@ -356,6 +404,7 @@ impl Screens {
         match self {
             Screens::Commits { view: c, .. } => c.press(col, row, extend, host),
             Screens::Diff { view: d, .. } => d.press(col, row, clicks, extend, host),
+            Screens::Stashes { view: s, .. } => s.press(col, row, extend, host),
         }
     }
 
@@ -365,6 +414,7 @@ impl Screens {
         match self {
             Screens::Commits { view: c, .. } => c.drag(row, host),
             Screens::Diff { view: d, .. } => d.drag(col, row, host),
+            Screens::Stashes { view: s, .. } => s.drag(row, host),
         }
     }
 
@@ -372,6 +422,7 @@ impl Screens {
         match self {
             Screens::Commits { view: c, .. } => c.release(),
             Screens::Diff { view: d, .. } => d.release(),
+            Screens::Stashes { view: s, .. } => s.release(),
         }
     }
 
@@ -381,6 +432,7 @@ impl Screens {
         match self {
             Screens::Commits { view: c, .. } => c.copy_text(),
             Screens::Diff { view: d, .. } => d.copy_text(),
+            Screens::Stashes { view: s, .. } => s.copy_text(),
         }
     }
 
@@ -391,6 +443,7 @@ impl Screens {
         match self {
             Screens::Commits { view: c, .. } => c.selection(),
             Screens::Diff { view: d, .. } => d.selection(),
+            Screens::Stashes { view: s, .. } => s.selection(),
         }
     }
 
@@ -398,6 +451,7 @@ impl Screens {
         match self {
             Screens::Commits { view: c, .. } => c.select_all(),
             Screens::Diff { view: d, .. } => d.select_all(),
+            Screens::Stashes { view: s, .. } => s.select_all(),
         }
     }
 
@@ -405,6 +459,7 @@ impl Screens {
         match self {
             Screens::Commits { view: c, .. } => c.select_none(),
             Screens::Diff { view: d, .. } => d.select_none(),
+            Screens::Stashes { view: s, .. } => s.select_none(),
         }
     }
 
@@ -413,7 +468,7 @@ impl Screens {
     fn filter_note(&self) -> Option<String> {
         match self {
             Screens::Commits { view: c, .. } => c.filter_note(),
-            Screens::Diff { .. } => None,
+            Screens::Diff { .. } | Screens::Stashes { .. } => None,
         }
     }
 
@@ -456,6 +511,19 @@ impl Screens {
                 "diff.prev-file" => d.jump_file(-1),
                 "diff.cycle-layout" => d.cycle_layout(host),
                 "diff.cycle-wrap" => d.cycle_wrap(host),
+                _ => return false,
+            },
+            Screens::Stashes { view: s, .. } => match command {
+                "view.down" => s.down(),
+                "view.up" => s.up(),
+                "view.page-down" => s.page(1),
+                "view.page-up" => s.page(-1),
+                "view.scroll-down" => s.scroll_y(host.view.rows as isize),
+                "view.scroll-up" => s.scroll_y(-(host.view.rows as isize)),
+                "view.top" => s.to_top(),
+                "view.bottom" => s.to_bottom(),
+                // A stack has nothing off the left edge to reach.
+                "view.left" | "view.right" => {}
                 _ => return false,
             },
         }
@@ -584,6 +652,33 @@ impl App {
             true => Bar::ascii(),
             false => Bar::default(),
         };
+        // The ancillary stack, read beside the view that was asked for: one
+        // more `git stash list` after startup already holds the requested
+        // view, through the same handle. A read that fails says so and the
+        // launch goes on — the pane opens as unavailable, the exact error is
+        // kept for the status line, and the next refresh re-reads the stack.
+        let mut stash_error = None;
+        let stash_tenant =
+            repo.as_ref()
+                .map(|(_, handle)| match acquire::stashes(handle.as_ref()) {
+                    Ok(loaded) => {
+                        let parked = loaded.stashes.len();
+                        let mut view = Stashes::new(loaded.stashes);
+                        view.set_bar(bar);
+                        (view, stash_label(&loaded.label, parked))
+                    }
+                    Err(e) => {
+                        let mut view = Stashes::unavailable();
+                        view.set_bar(bar);
+                        stash_error = Some(e);
+                        (view, STASH_UNAVAILABLE.to_string())
+                    }
+                });
+        let stash_tenant = stash_tenant.map(|(view, label)| Screens::Stashes {
+            view,
+            label,
+            generation: Generation::default(),
+        });
         let mut panes = panes::Panes::new();
         let mut last_list = None;
         match started.loaded.data {
@@ -601,6 +696,13 @@ impl App {
                     },
                 );
                 last_list = Some("commits".to_string());
+                // The stack, between the list and the main pane in
+                // registration order — the order `names` reports and the
+                // order the refresh rail walks. Only a repository launch
+                // has one; a fixture and a patch have no stack to read.
+                if let Some(pane) = stash_tenant {
+                    panes.register("stashes", panes::Placement::sidebar("stashes"), pane);
+                }
                 // The persistent main pane, registered **empty**: no source, no
                 // acquisition, nothing for a hunk verb or a refresh to act on
                 // until Enter replaces it. Its header is drawn like any other
@@ -622,6 +724,12 @@ impl App {
                 panes.focus_named("commits");
             }
             Data::Diff(files) => {
+                // The stack beside the diff a repository launch asked for,
+                // ahead of it in registration order; a fixture or a patch
+                // has no repository and so no tenant.
+                if let Some(pane) = stash_tenant {
+                    panes.register("stashes", panes::Placement::sidebar("stashes"), pane);
+                }
                 let mut diff = Diff::new(files, &host);
                 diff.set_bar(bar);
                 panes.register(
@@ -634,6 +742,12 @@ impl App {
                         generation: Generation::default(),
                     },
                 );
+                // `register` focuses what it registers, and the diff was
+                // registered last — but the restoration is written out, the
+                // same as the commits branch: a launch keeps the view it
+                // asked for, and an ancillary pane never steals startup
+                // focus.
+                panes.focus_named("diff");
             }
         }
         let jobs = Runner::new();
@@ -665,6 +779,13 @@ impl App {
             clicks: 0,
             focus_keys: Vec::new(),
         };
+        // A failed side read is kept, not fatal: the pane opened as
+        // unavailable and its header says so; the exact error goes to the
+        // status line, where the person launching can read it, and not to
+        // stderr, which sits behind the alternate screen.
+        if let Some(e) = stash_error {
+            app.message = e;
+        }
         app.sync_header_keys();
         app.sync_modes();
         app
@@ -1768,6 +1889,12 @@ fn copied(text: &str) -> String {
     }
 }
 
+/// A stash pane's label: whose repository, and how much is parked — the
+/// window's title-strip line, one cell row tall here.
+fn stash_label(describe: &str, parked: usize) -> String {
+    format!("{describe} · {parked} parked")
+}
+
 /// Whether to report what a frame cost. `GITTEN_STATS=0` turns it off, so
 /// `./dev` can set it and a caller can still say no — the same rule the window's
 /// overlay follows.
@@ -2560,6 +2687,7 @@ mod staging {
     use super::*;
     use gitten_core::command::Code;
     use gitten_core::parse_unified_diff;
+    use gitten_core::refs::Stash;
     use gitten_core::status::Status;
     use gitten_core::Commit;
     use gitten_git::{Handle, Pair, Repo};
@@ -2629,6 +2757,16 @@ diff --git a/tracked.txt b/tracked.txt
         /// words, and a test can name which of the two errors stood.
         fail_log: Option<String>,
         fail_pairs: Option<String>,
+        /// The stack the ancillary read answers, newest first, and how many
+        /// times it was read. Writes record the address they aimed at and,
+        /// when they land, change what the next read answers — which is what
+        /// lets a test observe a refresh reading the stack after a drop.
+        stashes: Vec<Stash>,
+        stash_writes: Vec<String>,
+        stash_reads: usize,
+        /// When set, the next stash write fails with exactly this message and
+        /// changes nothing: git's refusal, with the stack left as it was.
+        refuse_stash: Option<String>,
     }
 
     /// A repository that exists only as this struct. Reads answer what the
@@ -2691,6 +2829,76 @@ diff --git a/tracked.txt b/tracked.txt
             "fake (main)".into()
         }
 
+        fn stashes(&self) -> gitten_git::Result<Vec<Stash>> {
+            let mut s = self.0.lock().unwrap();
+            s.stash_reads += 1;
+            Ok(s.stashes.clone())
+        }
+
+        fn stash_push(&self, message: Option<&str>) -> gitten_git::Result<usize> {
+            let mut s = self.0.lock().unwrap();
+            if let Some(e) = s.refuse_stash.clone() {
+                return Err(e);
+            }
+            // git's own semantics: a new entry at the top, every later index
+            // shifted by one. The commit is the fake's stand-in for the stash
+            // object's identity — what a refresh anchors by.
+            let landed = format!("pushed{}", s.stash_writes.len());
+            for (i, entry) in s.stashes.iter_mut().enumerate() {
+                entry.index = i + 1;
+            }
+            s.stashes.insert(
+                0,
+                Stash {
+                    index: 0,
+                    message: "WIP on fake (main)".into(),
+                    commit: landed,
+                },
+            );
+            s.stash_writes
+                .push(format!("push {}", message.unwrap_or("")));
+            Ok(0)
+        }
+
+        fn stash_apply(&self, index: usize) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            if let Some(e) = s.refuse_stash.clone() {
+                return Err(e);
+            }
+            // An apply keeps the entry; only the write is recorded.
+            s.stash_writes.push(format!("apply stash@{{{index}}}"));
+            Ok(())
+        }
+
+        fn stash_pop(&self, index: usize) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            if let Some(e) = s.refuse_stash.clone() {
+                return Err(e);
+            }
+            // A clean pop drops the entry and renumbers everything above it.
+            s.stash_writes.push(format!("pop stash@{{{index}}}"));
+            let at = index.min(s.stashes.len().saturating_sub(1));
+            s.stashes.remove(at);
+            for (i, entry) in s.stashes.iter_mut().enumerate() {
+                entry.index = i;
+            }
+            Ok(())
+        }
+
+        fn stash_drop(&self, index: usize) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            if let Some(e) = s.refuse_stash.clone() {
+                return Err(e);
+            }
+            s.stash_writes.push(format!("drop stash@{{{index}}}"));
+            let at = index.min(s.stashes.len().saturating_sub(1));
+            s.stashes.remove(at);
+            for (i, entry) in s.stashes.iter_mut().enumerate() {
+                entry.index = i;
+            }
+            Ok(())
+        }
+
         fn stage_patch(&self, patch: &[u8]) -> gitten_git::Result<()> {
             let mut s = self.0.lock().unwrap();
             s.writes
@@ -2711,6 +2919,23 @@ diff --git a/tracked.txt b/tracked.txt
         }
     }
 
+    /// The fake's stack: two entries, newest first, whose commits are the
+    /// identity a refresh anchors by.
+    fn two_stashes() -> Vec<Stash> {
+        vec![
+            Stash {
+                index: 0,
+                message: "On main: wip things".into(),
+                commit: "aaa".into(),
+            },
+            Stash {
+                index: 1,
+                message: "On dev: other work".into(),
+                commit: "bbb".into(),
+            },
+        ]
+    }
+
     /// The fake's working-tree world: one file, both edits, untracked list
     /// as given. OIDs are `None` — a worktree pair never caches, so no test
     /// ever reads a neighbour's answer.
@@ -2720,6 +2945,7 @@ diff --git a/tracked.txt b/tracked.txt
             after: vec![pair("f.txt", side(0), side(2))],
             refuses: vec![b"refuse".to_vec()],
             untracked: untracked.iter().map(|u| u.as_bytes().to_vec()).collect(),
+            stashes: two_stashes(),
             ..Default::default()
         }));
         (Arc::new(FakeRepo(Arc::clone(&state))), state)
@@ -2746,6 +2972,7 @@ diff --git a/tracked.txt b/tracked.txt
             after: vec![pair("f.txt", side(false), side(false))],
             refuses: vec![b"refuse".to_vec()],
             untracked: untracked.iter().map(|u| u.as_bytes().to_vec()).collect(),
+            stashes: two_stashes(),
             ..Default::default()
         }));
         (Arc::new(FakeRepo(Arc::clone(&state))), state)
@@ -2797,6 +3024,13 @@ diff --git a/tracked.txt b/tracked.txt
         app.dispatch("view.top");
         for _ in 0..row {
             app.dispatch("view.down");
+        }
+    }
+
+    /// Types a query into the open prompt, one character per key.
+    fn type_(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.press(Key::char(c));
         }
     }
 
@@ -2895,10 +3129,11 @@ diff --git a/tracked.txt b/tracked.txt
         let open_reads = state.lock().unwrap().pairs_reads;
 
         // Enter acquires the selected commit's diff exactly once, replaces
-        // the empty tenant — never appends — and focuses it.
+        // the empty tenant — never appends — and focuses it. (The third
+        // tenant is the stack a repository launch always carries.)
         app.press(Key::plain(Code::Enter));
         assert_eq!(app.panes.focused_name(), "diff");
-        assert_eq!(app.panes.names().count(), 2, "enter appended a pane");
+        assert_eq!(app.panes.names().count(), 3, "enter appended a pane");
         assert_eq!(state.lock().unwrap().pairs_reads, open_reads + 1);
         assert!(
             matches!(
@@ -2942,7 +3177,7 @@ diff --git a/tracked.txt b/tracked.txt
         app.press(Key::plain(Code::Enter));
         assert_eq!(
             app.panes.names().count(),
-            2,
+            3,
             "a second enter appended a pane"
         );
         assert_eq!(app.panes.focused_name(), "diff");
@@ -3380,33 +3615,37 @@ diff --git a/tracked.txt b/tracked.txt
         // list is the focused pane and the diff is the registered one the
         // refresh must not forget — hidden by the narrow layout or not.
         app.dispatch("commits.open-diff");
-        assert_eq!(app.panes.names().count(), 2, "open-diff appended a pane");
+        assert_eq!(app.panes.names().count(), 3, "open-diff appended a pane");
         assert!(matches!(app.panes.get("diff"), Some(Screens::Diff { .. })));
         app.dispatch("commits.focus");
         assert_eq!(app.panes.focused_name(), "commits");
         let open_reads = state.lock().unwrap().pairs_reads;
 
         // One job that lands and one that is refused — both finish, and
-        // both finishes must stale both panes.
+        // both finishes must stale all three panes, the stack included.
         let first = Write::stage_patch(&handle, b"first".to_vec()).expect("a non-empty patch");
         assert!(app.submitter.submit(Box::new(first)).is_ok(), "queued");
         let second = Write::stage_patch(&handle, b"refuse-me".to_vec()).expect("a non-empty patch");
         assert!(app.submitter.submit(Box::new(second)).is_ok(), "queued");
+        let open_stash_reads = state.lock().unwrap().stash_reads;
         assert!(
             until(Duration::from_secs(2), || {
                 app.drain_jobs();
                 let s = state.lock().unwrap();
-                s.log_reads >= 2 && s.pairs_reads >= open_reads + 2
+                s.log_reads >= 2
+                    && s.pairs_reads >= open_reads + 2
+                    && s.stash_reads >= open_stash_reads + 2
             }),
             "the queue never finished both jobs"
         );
 
         let s = state.lock().unwrap();
         // One re-acquire per pane per finish: the commit list is the focused
-        // one, the diff the unfocused one, and each was refreshed exactly as
-        // often as the other.
+        // one, the diff and the stack the unfocused ones, and each was
+        // refreshed exactly as often as the others.
         assert_eq!(s.log_reads, 2, "{}", s.writes.len());
         assert_eq!(s.pairs_reads, open_reads + 2, "{}", s.log_reads);
+        assert_eq!(s.stash_reads, open_stash_reads + 2, "{}", s.log_reads);
         assert_eq!(s.writes.len(), 2, "{}", s.log_reads);
         // The refusal is the message; the success's evidence is the pane.
         assert_eq!(app.message, "the fake refused");
@@ -3521,5 +3760,331 @@ diff --git a/tracked.txt b/tracked.txt
             "the cursor lit the chrome, not the body: {lit:?}"
         );
         let _ = w;
+    }
+
+    #[test]
+    fn repository_launch_registers_stashes_in_the_existing_ring() {
+        // The shipped map already binds the digit and the three verbs: the
+        // terminal adds no name, no alias and no key table anywhere in the
+        // chain, and the focus key resolves through `Host::new().keys` — the
+        // same map `gitten.toml` writes — exactly as it did before this pane
+        // had a tenant.
+        let keys = Host::new().keys;
+        let mut commits = Modes::new();
+        commits.push("commits");
+        assert_eq!(
+            keys.resolve(&commits, &[Key::plain(Code::Char('5'))]),
+            Resolve::Run("stashes.focus")
+        );
+        let mut stashes_mode = Modes::new();
+        stashes_mode.push("panes");
+        stashes_mode.push("stashes");
+        assert_eq!(
+            keys.resolve(&stashes_mode, &[Key::char('g')]),
+            Resolve::Run("stashes.pop"),
+            "the mode override is the shared map's, not a terminal table"
+        );
+
+        // A repository-backed commits launch: three tenants, the stack in
+        // its canonical sidebar slot between the list and the main pane —
+        // both in the registration order `names` reports and the refresh
+        // rail walks — and the requested startup focus restored over
+        // whatever the registrations focused last.
+        let (handle, _state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        let names: Vec<&str> = app.panes.names().collect();
+        assert_eq!(names, ["commits", "stashes", "diff"], "{names:?}");
+        assert_eq!(app.panes.focused_name(), "commits");
+        assert_eq!(app.panes.list_order(), ["commits", "stashes"]);
+        assert_eq!(app.panes.reading_order(), ["commits", "stashes", "diff"]);
+
+        // `5` reaches it — through the keymap, and the mode follows the
+        // keyboard.
+        app.press(Key::plain(Code::Char('5')));
+        assert_eq!(app.panes.focused_name(), "stashes");
+        assert_eq!(
+            app.panes.focused().map(|pane| pane.mode()),
+            Some("stashes"),
+            "the keyboard is in stashes mode"
+        );
+        assert_eq!(
+            app.panes.focused_placement(),
+            Some(panes::Placement::Sidebar { rank: 4 }),
+            "canonical rank 4, from the registry and not a layout edit"
+        );
+
+        // A repository-backed diff launch registers it the same way, and
+        // the diff keeps the focus the launch asked for.
+        let source = Source::Repo {
+            path: std::path::PathBuf::from("/fake"),
+            arg: String::new(),
+        };
+        let diff_app = app_on_fake(&source, &handle);
+        assert_eq!(
+            diff_app.panes.names().collect::<Vec<_>>(),
+            ["stashes", "diff"]
+        );
+        assert_eq!(diff_app.panes.focused_name(), "diff");
+
+        // No repository, no tenant: a fixture and a patch launch answer the
+        // focus command with the same sentence an absent pane always got.
+        for mut app in [
+            app_on_diff(Source::Fixtures, None),
+            app_on_diff(Source::Patch { file: None }, None),
+        ] {
+            assert!(
+                app.panes.get("stashes").is_none(),
+                "a repository-free launch invented a stash pane"
+            );
+            app.dispatch("stashes.focus");
+            assert_eq!(app.message, "no stashes pane");
+        }
+    }
+
+    #[test]
+    fn wide_and_narrow_frames_place_the_stash_tenant_without_layout_edits() {
+        let (handle, _state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        app.draw();
+
+        // Wide: the sidebar splits into two canonical slices — commits on
+        // top, the stack at the foot — and the diff takes the rest, one
+        // divider column between. No geometry module changed to make room:
+        // this is the registry's equal-slice answer to a third tenant.
+        assert_eq!(
+            app.pane_rect("commits"),
+            Some(crate::panes::Rect {
+                x: 0,
+                y: 1,
+                width: 40,
+                height: 11
+            })
+        );
+        assert_eq!(
+            app.pane_rect("stashes"),
+            Some(crate::panes::Rect {
+                x: 0,
+                y: 12,
+                width: 40,
+                height: 11
+            })
+        );
+        assert_eq!(
+            app.pane_rect("diff"),
+            Some(crate::panes::Rect {
+                x: 41,
+                y: 1,
+                width: 79,
+                height: 22
+            })
+        );
+
+        // Headers name the live configured focus keys — 4 and 5, straight
+        // out of the shipped map — and the stack says whose repository it
+        // is and how much is parked.
+        let commits_header = app.screen.row_text(1)[..40].to_string();
+        assert!(
+            commits_header.contains('4') && commits_header.contains("commits"),
+            "{commits_header:?}"
+        );
+        let stashes_header = app.screen.row_text(12);
+        assert!(stashes_header.contains('5'), "{stashes_header:?}");
+        assert!(stashes_header.contains("stashes"), "{stashes_header:?}");
+        assert!(
+            stashes_header.contains("fake (main) · 2 parked"),
+            "{stashes_header:?}"
+        );
+
+        // The divider is nobody's: blank from the top of the body to the
+        // bottom, including across both sidebar headers.
+        for y in 2..23 {
+            assert_eq!(
+                app.screen.char_at(40, y),
+                Some(' '),
+                "row {y} drew into the divider"
+            );
+        }
+
+        // And the stack itself drew: both rows, address first.
+        let rows: Vec<String> = (13..23).map(|y| app.screen.row_text(y)).collect();
+        assert!(rows.iter().any(|r| r.contains("stash@{0}")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("stash@{1}")), "{rows:?}");
+
+        // Narrow: only the focused pane, at the full body. `5` is what both
+        // focuses the stack and reveals it.
+        app.screen.resize(80, 24);
+        app.draw();
+        assert_eq!(app.panes.focused_name(), "commits");
+        assert!(
+            app.pane_content("stashes").is_none(),
+            "a hidden pane kept a rectangle"
+        );
+        app.press(Key::plain(Code::Char('5')));
+        app.draw();
+        assert_eq!(
+            app.pane_content("stashes"),
+            Some(crate::panes::Rect {
+                x: 0,
+                y: 2,
+                width: 80,
+                height: 21
+            })
+        );
+
+        // The geometry cache still answers for its key: an unchanged frame
+        // reuses the rectangles it cached, and only a size, registry or
+        // focus change invalidates them.
+        let cached = app.geometry.as_ref().map(|(k, _)| *k);
+        app.draw();
+        assert_eq!(app.geometry.as_ref().map(|(k, _)| *k), cached);
+    }
+
+    #[test]
+    fn wave_one_and_plan_016_features_survive_stash_registration() {
+        let (handle, state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        app.draw();
+        app.dispatch("commits.open-diff");
+        app.draw();
+
+        // Focus: the digits and the cycle still walk the ring, and the
+        // title, header and status all follow the keyboard.
+        app.press(Key::plain(Code::Char('4')));
+        assert_eq!(app.panes.focused_name(), "commits");
+        app.dispatch("pane.next");
+        assert_eq!(
+            app.panes.focused_name(),
+            "stashes",
+            "the cycle did not reach the second list"
+        );
+        app.dispatch("pane.next");
+        assert_eq!(
+            app.panes.focused_name(),
+            "commits",
+            "the cycle did not wrap"
+        );
+        app.press(Key::plain(Code::Char('5')));
+        assert_eq!(app.panes.focused_name(), "stashes");
+        app.draw();
+        assert!(
+            app.screen.row_text(0).contains("stashes"),
+            "the title did not follow: {:?}",
+            app.screen.row_text(0)
+        );
+        assert!(
+            app.screen.row_text(12).contains('5') && app.screen.row_text(12).contains("stashes"),
+            "the header did not advertise the stack: {:?}",
+            app.screen.row_text(12)
+        );
+        assert!(
+            app.screen
+                .row_text(23)
+                .contains("stashes · 1/2 · stash@{0}"),
+            "the status did not follow: {:?}",
+            app.screen.row_text(23)
+        );
+
+        // Search still targets the commit list — by the pane's own name,
+        // not by whoever holds the keyboard. The expected count is a direct
+        // filter's answer, so the assertion is about routing and not about
+        // re-deriving the search index here.
+        app.press(Key::plain(Code::Char('4')));
+        app.press(Key::char('/'));
+        assert!(app.search.is_some(), "the prompt did not open");
+        type_(&mut app, "commit 9");
+        app.press(Key::plain(Code::Enter));
+        let mut direct = Commits::new(hundred_commits());
+        direct.apply_query("commit 9");
+        let filtered = match app.panes.get("commits") {
+            Some(Screens::Commits { view, .. }) => view.filter_note(),
+            _ => panic!("the commits pane is registered"),
+        };
+        assert_eq!(
+            filtered,
+            direct.filter_note(),
+            "search did not reach the list"
+        );
+        assert!(filtered.is_some(), "the query filtered nothing");
+
+        // Hunk verbs still route to the diff pane and its own gate — not to
+        // the pane that holds the keyboard, and not to the stack.
+        app.press(Key::plain(Code::Char('0')));
+        app.dispatch("diff.stage-hunk");
+        assert_eq!(
+            app.message,
+            "only the working-tree diff can act on hunks — this one is between commits"
+        );
+        assert!(
+            state.lock().unwrap().stash_writes.is_empty(),
+            "the hunk verb reached the stack"
+        );
+
+        // Mouse capture: a drag in the commit list selects its rows and its
+        // release reads that pane; a press in the stack's slice moves the
+        // keyboard there, and a drag inside the stack builds no selection —
+        // a stack is acted on one entry at a time.
+        app.dispatch("commits.focus");
+        app.mouse(click(MouseKind::Down, 5, 4));
+        app.mouse(click(MouseKind::Drag, 5, 7));
+        app.mouse(click(MouseKind::Up, 5, 7));
+        assert!(
+            !commits_of(&app).selection().is_empty(),
+            "the drag in the list selected nothing"
+        );
+        app.mouse(click(MouseKind::Down, 5, 15));
+        assert_eq!(
+            app.panes.focused_name(),
+            "stashes",
+            "the press did not move the keyboard to the stack"
+        );
+        app.mouse(click(MouseKind::Up, 5, 15));
+        app.mouse(click(MouseKind::Down, 5, 16));
+        app.mouse(click(MouseKind::Drag, 5, 17));
+        app.mouse(click(MouseKind::Up, 5, 17));
+        assert_eq!(
+            app.panes.get("stashes").map(|pane| pane.selection()),
+            Some(String::new()),
+            "a drag built a stash selection"
+        );
+
+        // A reload rebuilds the host and re-applies geometry to every placed
+        // pane — the stack included — and keeps the focus where it was.
+        let path =
+            std::env::temp_dir().join(format!("gitten-tui-stash-{}.toml", std::process::id()));
+        std::fs::write(&path, "[view]\nscrolloff = 1\n").expect("a config file");
+        app.reload(&path);
+        assert_eq!(
+            app.panes.focused_name(),
+            "stashes",
+            "the reload moved the focus"
+        );
+        assert!(app.pane_content("stashes").is_some());
+        std::fs::remove_file(&path).ok();
+
+        // Narrow mode, stack focused: the hidden list and diff are stale
+        // all the same when a job finishes.
+        app.screen.resize(60, 24);
+        app.draw();
+        assert!(
+            app.pane_content("commits").is_none(),
+            "narrow mode showed the hidden list"
+        );
+        let reads = state.lock().unwrap().log_reads;
+        let job = Write::stash_apply(&handle, 0);
+        assert!(app.submitter.submit(Box::new(job)).is_ok(), "queued");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                state.lock().unwrap().log_reads > reads
+            }),
+            "the hidden tenants were not refreshed"
+        );
+        for name in ["commits", "stashes", "diff"] {
+            assert_eq!(
+                app.panes.get(name).unwrap().generation(),
+                app.generation,
+                "{name} was not refreshed to the generation"
+            );
+        }
     }
 }
