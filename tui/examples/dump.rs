@@ -170,7 +170,7 @@ fn main() {
                 // The bar's column is the app's, not the pane's: this example
                 // is one pane over the whole body, so its boundary is the
                 // screen's edge — the rail the paint loop would choose.
-                view.paint_bar(&mut screen, cols - 1, 0, &host);
+                view.paint_bar(&mut screen, cols - 1, None, 0, &host);
             }
             eprintln!(
                 "load {load:.0?} · frame {:.0?} · {} commits",

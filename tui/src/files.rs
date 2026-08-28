@@ -725,11 +725,17 @@ impl Files {
         }
     }
 
-    /// The bar, at whatever column the app hands [`App::paint_scrollbar`] —
-    /// the divider the layout owns for a pane that has one, the screen's
-    /// edge for one that does not. The pane does not choose.
-    pub fn paint_bar(&self, screen: &mut Screen, x: usize, y: usize, host: &Host) {
-        scrollbar::paint(screen, self.bar, x, y, &self.view, host);
+    /// The bar at the edge geometry [`App::paint_scrollbar`] hands it. The
+    /// pane does not choose.
+    pub fn paint_bar(
+        &self,
+        screen: &mut Screen,
+        x: usize,
+        divider: Option<usize>,
+        y: usize,
+        host: &Host,
+    ) {
+        scrollbar::paint(screen, self.bar, x, divider, y, &self.view, host);
     }
 
     /// One row: a quiet caps heading with its count at the right, or a
@@ -1202,10 +1208,9 @@ mod tests {
             1,
             "a press past the heading took the file under it"
         );
-        // Painted, the pane leaves its own last column alone; the app hangs
-        // the bar on the divider past it, and it keeps whatever background
-        // the row it sits on earned — the cursor row's selection tint runs
-        // under it, a plain row's quiet one does.
+        // Painted, the app overlays the bar on the pane's last cell and keeps
+        // whatever background the row earned — the cursor row's selection
+        // tint runs under it, a plain row's quiet one does.
         let mut screen = Screen::new(60, 6);
         screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
         f.paint(&mut screen, 10, 0, true, &host);
@@ -1214,26 +1219,39 @@ mod tests {
             Some(' '),
             "the pane painted a bar into its own last column"
         );
-        f.paint_bar(&mut screen, 40, 0, &host);
+        let selected_under = screen.ink(39, 1).unwrap().bg;
+        let plain_under = screen.ink(39, 4).unwrap().bg;
+        let divider_under = screen.ink(40, 0).unwrap().bg;
+        f.paint_bar(&mut screen, 39, Some(40), 0, &host);
+        assert_eq!(
+            screen.char_at(39, 0),
+            Some('▐'),
+            "the bar's inner half is missing"
+        );
+        assert_eq!(
+            screen.char_at(39, 5),
+            Some(' '),
+            "the built-in drew a track under the thumb"
+        );
+        assert_eq!(
+            screen.ink(39, 1).unwrap().bg,
+            selected_under,
+            "the bar replaced the selected row background"
+        );
+        assert_eq!(
+            screen.ink(39, 4).unwrap().bg,
+            plain_under,
+            "the bar replaced the plain row background"
+        );
         assert_eq!(
             screen.char_at(40, 0),
-            Some('┃'),
-            "the bar is not on the divider"
+            Some('▌'),
+            "the divider half is missing"
         );
         assert_eq!(
-            screen.char_at(40, 5),
-            Some('│'),
-            "the track is not under the thumb"
-        );
-        assert_eq!(
-            screen.ink(40, 1).unwrap().bg,
-            host.theme.chrome.bg,
-            "the bar invented a background of its own"
-        );
-        assert_eq!(
-            screen.ink(40, 4).unwrap().bg,
-            host.theme.chrome.bg,
-            "the bar invented a background of its own"
+            screen.ink(40, 0).unwrap().bg,
+            divider_under,
+            "the bar replaced the divider background"
         );
     }
 

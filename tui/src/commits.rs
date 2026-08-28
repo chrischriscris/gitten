@@ -619,11 +619,17 @@ impl Commits {
         }
     }
 
-    /// The bar, at whatever column the app hands [`App::paint_scrollbar`] —
-    /// the divider the layout owns for a pane that has one, the screen's
-    /// edge for one that does not. The pane does not choose.
-    pub fn paint_bar(&self, screen: &mut Screen, x: usize, y: usize, host: &Host) {
-        scrollbar::paint(screen, self.bar, x, y, &self.view, host);
+    /// The bar at the edge geometry [`App::paint_scrollbar`] hands it. The
+    /// pane does not choose.
+    pub fn paint_bar(
+        &self,
+        screen: &mut Screen,
+        x: usize,
+        divider: Option<usize>,
+        y: usize,
+        host: &Host,
+    ) {
+        scrollbar::paint(screen, self.bar, x, divider, y, &self.view, host);
     }
 
     /// lazygit's order — sha, author, graph, subject — because the graph is the
@@ -1252,23 +1258,30 @@ r\x1fr\x1f\x1fA\x1f1\x1froot\x1e";
             Some(' '),
             "the pane painted a bar into its own last column"
         );
-        // The app then hangs the bar on the divider — the column past the
-        // pane — over a row that keeps its background underneath it.
-        c.paint_bar(&mut screen, 50, 1, &host);
+        let under = screen.ink(49, 1).unwrap().bg;
+        let divider_under = screen.ink(50, 1).unwrap().bg;
+        // The app overlays the bar on the pane's last cell, whose right edge
+        // meets the divider, and keeps the row's background underneath it.
+        c.paint_bar(&mut screen, 49, Some(50), 1, &host);
+        assert_eq!(
+            screen.char_at(49, 1),
+            Some('▐'),
+            "the bar's inner half is missing"
+        );
+        assert_eq!(
+            screen.ink(49, 1).unwrap().bg,
+            under,
+            "the bar replaced the row background underneath it"
+        );
         assert_eq!(
             screen.char_at(50, 1),
-            Some('┃'),
-            "the bar is not on the divider"
+            Some('▌'),
+            "the bar's divider half is missing"
         );
         assert_eq!(
             screen.ink(50, 1).unwrap().bg,
-            host.theme.chrome.bg,
-            "the bar invented a background of its own"
-        );
-        assert_eq!(
-            screen.char_at(49, 1),
-            Some(' '),
-            "the bar reached into the pane's own columns"
+            divider_under,
+            "the bar replaced the divider background"
         );
     }
 

@@ -31,15 +31,16 @@ the wheel's, and the bar is the one thing on screen that says where in a
 714k-row diff you are — at half-cell resolution, never smaller than a cell of
 ink.
 
-**Where it sits** (added the same day, when the position was looked at next to
-lazygit's): the bar hangs on the pane's right *boundary*, not on its last
-column of text. A sidebar pane's boundary is the divider the layout owns — a
-column no pane writes, so the bar costs no text and no reflow, and the old
-overlay trade retires for every pane that has one. The main region's boundary
-is the screen's edge, where the overlay trade survives for the reason 0022
-stated: with wrapping on nothing reaches that column, and with wrapping off
-the line is being scrolled sideways underneath it. The pane paints itself;
-the bar's column is the paint loop's.
+**Where it sits** (corrected after looking at the cell geometry next to
+lazygit's): at an internal boundary the block is `▐▌` — the right half of the
+pane's last cell and the left half of the divider cell. Together they are one
+cell wide and their right edge lands exactly on the divider's centred rule. A
+whole block in either cell alone is wrong: inside leaves half a cell black;
+outside straddles the boundary. At the screen edge, where no divider cell
+exists, the block fills the last cell. The overlay costs no reflow for the
+reason 0022 stated: with wrapping on nothing reaches that column, and with
+wrapping off the line is being scrolled sideways underneath it. The pane
+paints itself; the edge geometry is the paint loop's.
 
 The window keeps its draggable bar. That is a difference between the doors,
 not a gap in this one — the same kind `split.rs` already documents for
@@ -84,9 +85,9 @@ does not move.
 
 ## Consequences
 
-A press on the divider is a press in no pane, and nothing is painted where the
-mouse might want text: the bar's column is the boundary, and the boundary is
-not content.
+A press on the divider is still a press in no pane. The bar overlays the pane's
+last content cell but takes no mouse input; a press there remains a press on
+the row underneath it.
 
 `Viewport::top_at` stays in `core` untouched. It is the seam, not the
 implementation — `core`'s tests still pin it as `thumb`'s exact inverse, and a

@@ -575,17 +575,23 @@ impl Screens {
     }
 
     /// The bar at the column the paint loop chose for it. The choice is the
-    /// app's because the column is the app's: the divider the layout owns for
-    /// a pane that has one — a column no pane writes, so the bar costs no
-    /// text and no reflow — and the screen's edge for the one pane that runs
-    /// to it. See [0027](../docs/decisions/0027-the-scrollbar-is-an-indicator.md).
-    fn paint_scrollbar(&self, screen: &mut Screen, x: usize, y: usize, host: &Host) {
+    /// app's because the edge is the app's: across the two half-cells around
+    /// a divider, or in the last whole cell at the screen's edge. See
+    /// [0027](../docs/decisions/0027-the-scrollbar-is-an-indicator.md).
+    fn paint_scrollbar(
+        &self,
+        screen: &mut Screen,
+        x: usize,
+        divider: Option<usize>,
+        y: usize,
+        host: &Host,
+    ) {
         match self {
-            Screens::Commits { view: c, .. } => c.paint_bar(screen, x, y, host),
-            Screens::Diff { view: d, .. } => d.paint_bar(screen, x, y, host),
-            Screens::Stashes { view: s, .. } => s.paint_bar(screen, x, y, host),
-            Screens::Files { view: f, .. } => f.paint_bar(screen, x, y, host),
-            Screens::Branches { view: b, .. } => b.paint_bar(screen, x, y, host),
+            Screens::Commits { view: c, .. } => c.paint_bar(screen, x, divider, y, host),
+            Screens::Diff { view: d, .. } => d.paint_bar(screen, x, divider, y, host),
+            Screens::Stashes { view: s, .. } => s.paint_bar(screen, x, divider, y, host),
+            Screens::Files { view: f, .. } => f.paint_bar(screen, x, divider, y, host),
+            Screens::Branches { view: b, .. } => b.paint_bar(screen, x, divider, y, host),
         }
     }
 
@@ -2808,16 +2814,15 @@ impl App {
                 let content = rect.content();
                 if content.width > 0 && content.height > 0 {
                     pane.paint(&mut *screen, content.x, content.y, focused, host, runs);
-                    // The bar rides the pane's right boundary. The column
-                    // past the pane is the layout's divider when there is
-                    // one — free, because no pane writes it — and the
-                    // screen's edge when there is not, which is the one
-                    // place overlay survives: with wrapping on nothing
-                    // reaches that column anyway, and with wrapping off the
-                    // line is being scrolled sideways underneath it.
+                    // A terminal divider is centred in its cell. The built-in
+                    // spans the right half of the pane's last cell and the
+                    // left half of the divider cell: one cell of ink whose
+                    // right edge lands exactly on the divider. At the screen
+                    // edge there is no outside half, so it draws a whole cell.
                     let past = content.x + content.width;
-                    let rail = past.min(screen.width().saturating_sub(1));
-                    pane.paint_scrollbar(&mut *screen, rail, content.y, host);
+                    let rail = past.saturating_sub(1).min(screen.width().saturating_sub(1));
+                    let divider = (past < screen.width()).then_some(past);
+                    pane.paint_scrollbar(&mut *screen, rail, divider, content.y, host);
                 }
             }
         }
@@ -3651,7 +3656,7 @@ mod tests {
         let (w, h) = app.screen.size();
         for y in 2..h - 1 {
             assert!(
-                matches!(app.screen.char_at(40, y), Some(' ' | '│' | '┃' | '╻' | '╹')),
+                matches!(app.screen.char_at(40, y), Some(' ' | '│' | '▌' | '▘' | '▖')),
                 "row {y} drew text into the divider"
             );
         }
@@ -3703,11 +3708,10 @@ mod tests {
     }
 
     #[test]
-    fn the_bar_hangs_on_the_boundary_divider_for_a_sidebar_edge_for_the_main() {
+    fn the_bar_sits_inside_the_right_edge_of_each_container() {
         // A 120-column frame: sidebar 40, divider 40, diff 41..120. The
-        // commits bar hangs on the divider — the column past the pane, the
-        // one the layout owns and no pane writes — and the diff's hangs on
-        // the screen's edge, which is the only boundary it has.
+        // commits bar fills the pane's last cell, immediately left of the
+        // divider, and the diff's fills the screen's last cell.
         const MD: &str = include_str!("../tests/fixtures/md.diff");
         let mut app = app(30);
         app.screen = Screen::new(120, 24);
@@ -3726,29 +3730,30 @@ mod tests {
         );
         app.sync_modes();
         app.draw();
-        let is_bar = |at: Option<char>| matches!(at, Some('│' | '┃' | '╻' | '╹'));
-
         let commits = app.pane_content("commits").expect("the sidebar is visible");
         let divider = commits.x + commits.width;
         assert_eq!(divider, 40, "the sidebar does not end at the divider");
-        assert!(
-            is_bar(app.screen.char_at(divider, commits.y)),
-            "the sidebar's bar is not on the divider"
+        assert_eq!(
+            app.screen.char_at(divider - 1, commits.y),
+            Some('▐'),
+            "the inner half of the sidebar bar is missing"
         );
-        assert!(
-            !is_bar(app.screen.char_at(divider - 1, commits.y)),
-            "the bar reached into the pane's own columns"
+        assert_eq!(
+            app.screen.char_at(divider, commits.y),
+            Some('▌'),
+            "the divider half of the sidebar bar is missing"
         );
 
         let diff = app.pane_content("diff").expect("the diff pane is visible");
         let edge = diff.x + diff.width - 1;
         assert_eq!(edge, 119, "the diff pane does not run to the screen's edge");
-        assert!(
-            is_bar(app.screen.char_at(edge, diff.y)),
+        assert_eq!(
+            app.screen.char_at(edge, diff.y),
+            Some('█'),
             "the main pane's bar is not on the screen's edge"
         );
         assert!(
-            !is_bar(app.screen.char_at(edge - 1, diff.y)),
+            !matches!(app.screen.char_at(edge - 1, diff.y), Some('█' | '▐' | '▌')),
             "the diff's bar reached into its own columns"
         );
     }
@@ -6628,7 +6633,7 @@ diff --git a/tracked.txt b/tracked.txt
         // including across every sidebar header.
         for y in 2..23 {
             assert!(
-                matches!(app.screen.char_at(40, y), Some(' ' | '│' | '┃' | '╻' | '╹')),
+                matches!(app.screen.char_at(40, y), Some(' ' | '│' | '▌' | '▘' | '▖')),
                 "row {y} drew text into the divider"
             );
         }

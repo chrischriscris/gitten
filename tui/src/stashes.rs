@@ -398,11 +398,17 @@ impl Stashes {
         }
     }
 
-    /// The bar, at whatever column the app hands [`App::paint_scrollbar`] —
-    /// the divider the layout owns for a pane that has one, the screen's
-    /// edge for one that does not. The pane does not choose.
-    pub fn paint_bar(&self, screen: &mut Screen, x: usize, y: usize, host: &Host) {
-        scrollbar::paint(screen, self.bar, x, y, &self.view, host);
+    /// The bar at the edge geometry [`App::paint_scrollbar`] hands it. The
+    /// pane does not choose.
+    pub fn paint_bar(
+        &self,
+        screen: &mut Screen,
+        x: usize,
+        divider: Option<usize>,
+        y: usize,
+        host: &Host,
+    ) {
+        scrollbar::paint(screen, self.bar, x, divider, y, &self.view, host);
     }
 
     /// One line describing the pane, for whatever draws a status bar: where

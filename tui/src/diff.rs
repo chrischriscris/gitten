@@ -774,11 +774,17 @@ impl Diff {
         }
     }
 
-    /// The bar, at whatever column the app hands [`App::paint_scrollbar`] —
-    /// the screen's edge for this pane, which is the one pane with no
-    /// divider to ride. The pane does not choose.
-    pub fn paint_bar(&self, screen: &mut Screen, x: usize, y: usize, host: &Host) {
-        scrollbar::paint(screen, self.bar, x, y, &self.view, host);
+    /// The bar at the edge geometry [`App::paint_scrollbar`] hands it. The
+    /// pane does not choose.
+    pub fn paint_bar(
+        &self,
+        screen: &mut Screen,
+        x: usize,
+        divider: Option<usize>,
+        y: usize,
+        host: &Host,
+    ) {
+        scrollbar::paint(screen, self.bar, x, divider, y, &self.view, host);
     }
 
     /// One line describing what is on screen, for whatever draws a status bar.
@@ -1367,16 +1373,16 @@ mod tests {
             (41..119).any(|x| screen.char_at(x, 1).is_some_and(|c| c != ' ')),
             "nothing was drawn inside the pane"
         );
-        // The diff is the main region: its right boundary is the screen's
-        // edge, and the pane itself paints no bar there — the app hangs it
-        // on the boundary afterwards, over a row that keeps its background.
+        // The diff is the main region: its last cell meets the screen's edge.
+        // The pane itself paints no bar there; the app overlays it afterwards
+        // on a row that keeps its background.
         assert_eq!(
             screen.char_at(119, 1),
             Some(' '),
             "the pane painted a bar into its own last column"
         );
-        d.paint_bar(&mut screen, 119, 1, &host);
-        assert_eq!(screen.char_at(119, 1), Some('┃'));
+        d.paint_bar(&mut screen, 119, None, 1, &host);
+        assert_eq!(screen.char_at(119, 1), Some('█'));
         assert_eq!(
             screen.ink(119, 1).unwrap().bg,
             screen.ink(118, 1).unwrap().bg,

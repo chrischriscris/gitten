@@ -1,6 +1,6 @@
 # Implementation Plans
 
-Three passes so far, and pass 4 open:
+Passes so far, and pass 5 open (020–022, the 2026-08-28 audit wave):
 
 - **Pass 1** (2026-08-24, audited at `3a8b347`): plans 001–007. All landed on
   main and merged — verified 2026-08-26 against `2dfcb82`
@@ -27,6 +27,26 @@ Three passes so far, and pass 4 open:
   deferred as one named follow-up ("TUI rebase lifecycle") with a scope-fence
   test pinning the gap. **`full/tui` awaits its owner's merge decision**;
   nothing has touched `full/full`.
+
+- **Pass 5** (2026-08-28, audited at `eb888e1`): plans 020–022 from the
+  terminal-vs-window audit. **The maintainer's working tree moved during
+  execution** — the scrollbar-indicator refactor (decision 0027) grew the
+  uncommitted state from three to eight tui files — so each advisor branch's
+  `carry:` commit is a snapshot of all eight files taken 2026-08-28 late
+  (`target/gitten-wip3.patch`), rebuilt after two bootstrap defects the
+  executors correctly STOPPED on (a patch-file carry, then a partial carry).
+  docs/decisions 0027 + its README edit remain live-tree only (docs, not
+  build-relevant). 020 (transactional terminal entry) verdict **APPROVE**;
+  021 (`diff.discard-hunk` + command-parity guard) re-dispatched on the
+  repaired carry; 022 (async loads/refreshes) branches from 021. Direction
+  items surfaced but not planned this wave: TUI status pane, live algorithm /
+  whitespace pickers, cursor-follow diff preview, a grapheme-aware prompt
+  editor, and the armed-hunk render tint (deferred in 021 — a `Frame` field
+  ripples through every presentation). **Merging is the owner's; the advisor
+  never merges.** Merge order: commit or stash the working-tree WIP first,
+  then merge `advisor/020` and `advisor/022` (`advisor/022` contains 021);
+  the branches' carries and your local WIP are the same content at the same
+  snapshot, so the merge is a fast-forward-shaped no-op for the carried files.
 
 ## Pass 4 follow-ups — surfaced by reviewers, recorded not folded
 
@@ -63,6 +83,9 @@ integrator owns this table and updates it as waves land.
 | 019 | The terminal stashes pane (apply/pop/drop/push) | P1 | S–M | 016 | DONE (pass 4, `ba49f9c`+3, fold `754c032`) — reviewed CONCERNS (all non-blocking); 2 folds in (unavailable-state regression test + unfocused armed-ink assert); drop-arm renumbering probed and unbroken |
 | 017 | The terminal files pane (sections, all file verbs, commit/amend prompts) | P1 | L | 016 | DONE (pass 4, `c99cc1f`+3, fold `20b1415`) — reviewed CONCERNS (all non-blocking); 3 folds in; merged with the stashes tenant at `e58cd1d` |
 | 018 | The terminal branches pane (checkout/new/rename/delete/tag; rebase deferred as a named lifecycle follow-up) | P1 | L | 016, 017 | DONE (pass 4, `91e3876`+5, fold `4b65866`) — reviewed CONCERNS (all non-blocking); integrator ruling: the destructive arm outlives focus round-trips on every pane, matching the window (the ctrl-j bypass finding became the consistency fix); zero-alloc armed matching |
+| 020 | Transactional terminal entry — a failed start cannot leave raw mode on | P1 | S | — | DONE (advisor/020-transactional-terminal-entry, 3 commits on the 8-file carry) — verdict APPROVE: all gates re-run by reviewer (tests 175 lib, clippy, fmt clean), scope clean, diff read; one report inaccuracy (test count "174→178"; actual 171→175), work unaffected; branch carry repaired by orchestrator |
+| 021 | `diff.discard-hunk` in the terminal + the client command-parity guard | P1 | M | — | DONE (advisor/021-tui-discard-hunk-parity-guard, 6 commits on the 8-file carry) — verdict APPROVE: gates re-run by reviewer (182 lib + 60 bin tests, clippy, fmt), scope clean (diff.rs + main.rs), diff read, sabotage re-verified by reviewer (guard fails "copy.selection lost its arm" under a renamed arm, recovers on revert). Judgment calls accepted, documented: `view.*` is ten names not twelve (derived from real arms); four diff-pane names sweep after `diff.focus`; fake `Repo` gained a test-only `discard_patch`; job built before the arm is spent (a tightening of the window's order) |
+| 022 | Repository loads and refreshes off the terminal loop (loader thread, supersede guards) | P1 | L | 021 | DONE (advisor/022-tui-async-loads, 6 commits on 021's tip) — verdict APPROVE: gates re-run by reviewer on a cold isolated target dir (182 lib + 63 bin, clippy, fmt), scope read hunk-by-hunk (apply-time guards: batch id, target generation, request id; first-error stands; FIFO composition order documented), migrated assertions verified verbatim, both new guard tests assert real state. Accepted deviations, documented: `Screens` not `Send` → `Tenant` extraction + associated `acquire_snapshot` on the loader thread (the window's own model); snapshot variants carry labels (behavior-preserving); `catch_unwind` in the loader mirroring the write Runner; one scope extension — `Panes::iter_mut` deleted (4 lines, dead after step 3, caught by the plan's own clippy gate) |
 
 ## Pass 3 follow-ups — surfaced by reviewers, pre-existing, not pass regressions
 
@@ -105,6 +128,9 @@ GREEN (009), CONCERNS-all-nonblocking (010/011), GREEN (012). Disposition:
 
 ## Dependency notes
 
+- 022 branches from 021's advisor branch (both rework `tui/src/main.rs`'s
+  job/refresh paths, and 022's tests must cover the discard verb's refresh
+  path). 020 is independent and may land in either order.
 - No hard ordering among 008–012; they touch disjoint files except 010→011
   (`shell/src/views/commits.rs`), which is why 010 is listed first.
 - Do 008 before any future golden-corpus work: the merge-record case it fixes

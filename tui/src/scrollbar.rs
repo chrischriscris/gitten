@@ -7,24 +7,18 @@
 //!
 //! # It rides the container's edge
 //!
-//! The caller hands [`paint`] the column, and the column is the pane's right
-//! boundary — the divider the layout owns for a pane that has one, the
-//! screen's edge for one that runs to it. That is where a scrollbar belongs:
-//! on lazygit's containers the bar *is* the right border with a brighter
-//! segment on it, and a bar one column in from the edge reads as a second,
-//! brighter rule floating inside the pane.
+//! The caller hands [`paint`] the cells around the pane's edge. At a divider
+//! the thumb is `▐▌`: the right half of the last inside cell and the left half
+//! of the divider cell, one cell wide with its right edge exactly on the rule.
+//! At the screen edge it is one full cell. That is lazygit's geometry.
 //!
-//! The boundary column is nearly free. A divider is a column the layout
-//! already owns and no pane writes, so the bar costs no text and no reflow —
-//! which retires the old trade: the bar used to sit *on* the pane's last
-//! column of text, because reserving a column is a different wrap, a
-//! different row count, a different scrollbar. The one pane still paying it
-//! is the main region, whose right boundary is the screen's edge, with no
-//! divider to ride — and with wrapping on nothing reaches that column anyway,
-//! and with wrapping off the line is being scrolled sideways underneath it.
+//! It overlays those cells rather than reserving one: reserving a column is a
+//! different wrap, a different row count, and therefore a different scrollbar.
+//! With wrapping on nothing reaches the edge; with wrapping off the line is
+//! being scrolled sideways underneath it.
 //!
 //! [`Screen::over`] and not a [`Pen`](crate::screen::Pen), still: whatever the
-//! boundary cell holds, the cell's background stays — a removal's red runs to
+//! edge cell holds, the cell's background stays — a removal's red runs to
 //! the edge underneath the main pane's bar.
 //!
 //! # It is an indicator, and the mouse cannot have it
@@ -43,8 +37,8 @@
 //!
 //! # Half rows
 //!
-//! A terminal moves a thumb in whole cells, but a cell is not the finest line
-//! the grid can draw: `╻` and `╹` each paint half of a vertical stroke, so the
+//! A terminal moves a thumb in whole cells, but a cell is not the finest block
+//! the grid can draw: `▀` and `▄` each paint half of a cell, so the
 //! thumb is computed by the same [`Viewport::thumb`] arithmetic over a track
 //! twice as tall and lands between two rows where that is where it belongs.
 //! The bar is a coordinate, and twice the resolution is twice the reading.
@@ -68,50 +62,75 @@ use gitten_core::view::Viewport;
 /// extension that would rather have a Nerd Font's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Bar {
-    /// The part of the track the thumb is not on.
-    pub track: char,
+    /// Optional furniture outside the thumb. The built-ins leave the container
+    /// untouched; an extension can deliberately supply a visible track.
+    pub track: Option<char>,
     pub thumb: char,
     /// The thumb's upper and lower half, when the alphabet can draw them.
     ///
-    /// `Some(('╻', '╹'))` lets the thumb land between two rows, which is
+    /// `Some(('▀', '▄'))` lets the thumb land between two rows, which is
     /// where it usually is — see *Half rows* above. `None` rounds back to
     /// whole rows: [`Bar::ascii`], or an alphabet without the glyphs, draws
     /// exactly the bar this module always drew.
     pub halves: Option<(char, char)>,
+    /// Horizontal halves for a boundary between two terminal cells.
+    ///
+    /// Each pair is `(inside, divider)` for a whole, upper-half and
+    /// lower-half thumb cell. `None` falls back to drawing `thumb` in the
+    /// pane's last cell, as ASCII must.
+    pub boundary: Option<Boundary>,
+}
+
+/// Glyphs that make one-cell-wide ink straddle a two-cell pane boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Boundary {
+    pub whole: (char, char),
+    pub upper: (char, char),
+    pub lower: (char, char),
 }
 
 impl Default for Bar {
     fn default() -> Self {
-        Self::line()
+        Self::block()
     }
 }
 
 impl Bar {
-    /// The shipped set: a light line for the track, a heavy one for the thumb.
+    /// The shipped set: a solid thumb and no track, at the container's edge.
     ///
-    /// The thumb is a segment of the same stroke the track draws — brighter,
-    /// heavier, never a different *kind* of mark. A full block was the
-    /// shipped thumb once, and beside a hairline track it read as a blob the
-    /// line ran into: two widths touching is a junction, and a scrollbar is
-    /// not a junction. The old objection to `┃` — that a line-width thumb
-    /// reads as another lane of the graph — was written when the bar floated
-    /// inside the pane beside the graph; on the boundary column no lane ever
-    /// arrives, and the reference the eye already knows, lazygit's bar, is a
-    /// brighter segment of the border line.
+    /// This is lazygit's shape: the thumb is the only mark. On a divider the
+    /// pane's existing rule remains visible above and below it; at the screen's
+    /// edge nothing invents a second line through otherwise empty space.
+    pub fn block() -> Self {
+        Self {
+            track: None,
+            thumb: '█',
+            halves: Some(('▀', '▄')),
+            boundary: Some(Boundary {
+                whole: ('▐', '▌'),
+                upper: ('▝', '▘'),
+                lower: ('▗', '▖'),
+            }),
+        }
+    }
+
+    /// A tracked alternative for an extension that wants the old line shape.
     pub fn line() -> Self {
         Self {
-            track: '│',
+            track: Some('│'),
             thumb: '┃',
             halves: Some(('╻', '╹')),
+            boundary: None,
         }
     }
 
     /// Nothing outside ASCII, for a terminal or a font that cannot draw the rest.
     pub fn ascii() -> Self {
         Self {
-            track: '|',
+            track: None,
             thumb: '#',
             halves: None,
+            boundary: None,
         }
     }
 
@@ -146,12 +165,21 @@ impl Bar {
 
 /// Draws the bar for `view` down column `x`, over the rows `y..y + height`.
 ///
-/// `x` is the pane's right boundary — the divider, or the screen's edge — and
-/// is the caller's to choose; see *It rides the container's edge* above. A
+/// `x` is the last cell inside the pane. `divider` is the next cell when there
+/// is one; together their facing halves make the edge-aligned thumb. See *It
+/// rides the container's edge* above. A
 /// no-op when the config file says no, when the list fits, or when the view
 /// has not been given a height yet. Costs one `over` per visible row and
 /// allocates nothing.
-pub fn paint(screen: &mut Screen, bar: Bar, x: usize, y: usize, view: &Viewport, host: &Host) {
+pub fn paint(
+    screen: &mut Screen,
+    bar: Bar,
+    x: usize,
+    divider: Option<usize>,
+    y: usize,
+    view: &Viewport,
+    host: &Host,
+) {
     let Some(thumb) = bar.range(view, host) else {
         return;
     };
@@ -168,13 +196,21 @@ pub fn paint(screen: &mut Screen, bar: Bar, x: usize, y: usize, view: &Viewport,
             Some(_) => (thumb.contains(&(cell * 2)), thumb.contains(&(cell * 2 + 1))),
             None => (thumb.contains(&cell), thumb.contains(&cell)),
         };
-        let (ch, fg) = match (top, bottom) {
-            (false, false) => (bar.track, c.faint),
-            (true, true) => (bar.thumb, c.dim),
-            (true, false) => (upper, c.dim),
-            (false, true) => (lower, c.dim),
+        let painted = match (top, bottom) {
+            (false, false) => bar.track.map(|ch| (ch, c.faint, None)),
+            (true, true) => Some((bar.thumb, c.dim, bar.boundary.map(|b| b.whole))),
+            (true, false) => Some((upper, c.dim, bar.boundary.map(|b| b.upper))),
+            (false, true) => Some((lower, c.dim, bar.boundary.map(|b| b.lower))),
         };
-        screen.over(x, y + cell, ch, fg);
+        if let Some((ch, fg, across)) = painted {
+            match (divider, across) {
+                (Some(divider), Some((inside, outside))) => {
+                    screen.over(x, y + cell, inside, fg);
+                    screen.over(divider, y + cell, outside, fg);
+                }
+                _ => screen.over(x, y + cell, ch, fg),
+            }
+        }
     }
 }
 
@@ -199,9 +235,13 @@ mod tests {
             screen.row(y + 1).wash(Ink::new(0xffffff, 0x330000));
         }
         let v = view(100, 10);
-        paint(&mut screen, Bar::line(), 19, 1, &v, &host);
-        assert_eq!(screen.char_at(19, 1), Some('┃'), "the thumb is at the top");
-        assert_eq!(screen.char_at(19, 9), Some('│'));
+        paint(&mut screen, Bar::block(), 19, None, 1, &v, &host);
+        assert_eq!(screen.char_at(19, 1), Some('█'), "the thumb is at the top");
+        assert_eq!(
+            screen.char_at(19, 9),
+            Some(' '),
+            "the built-in drew a track"
+        );
         assert_eq!(
             screen.ink(19, 9).unwrap().bg,
             0x330000,
@@ -215,7 +255,7 @@ mod tests {
         let mut screen = Screen::new(20, 12);
         screen.clear(Ink::new(0xffffff, 0x000000));
         let v = view(5, 10);
-        paint(&mut screen, Bar::line(), 19, 1, &v, &host);
+        paint(&mut screen, Bar::block(), 19, None, 1, &v, &host);
         assert_eq!(screen.char_at(19, 1), Some(' '));
     }
 
@@ -225,7 +265,15 @@ mod tests {
         host.view.scrollbar = false;
         let mut screen = Screen::new(20, 12);
         screen.clear(Ink::new(0xffffff, 0x000000));
-        paint(&mut screen, Bar::line(), 19, 1, &view(100, 10), &host);
+        paint(
+            &mut screen,
+            Bar::block(),
+            19,
+            None,
+            1,
+            &view(100, 10),
+            &host,
+        );
         assert_eq!(screen.char_at(19, 1), Some(' '));
     }
 
@@ -239,26 +287,26 @@ mod tests {
         v.scroll_to(45);
         let mut screen = Screen::new(20, 12);
         screen.clear(Ink::new(0xffffff, 0x000000));
-        paint(&mut screen, Bar::line(), 19, 1, &v, &host);
+        paint(&mut screen, Bar::block(), 19, None, 1, &v, &host);
         assert_eq!(
             screen.char_at(19, 3),
-            Some('│'),
-            "the track above the thumb"
+            Some(' '),
+            "the screen edge above the thumb stays empty"
         );
         assert_eq!(
             screen.char_at(19, 5),
-            Some('╹'),
+            Some('▄'),
             "the thumb's first half row is the bottom of cell 4"
         );
         assert_eq!(
             screen.char_at(19, 6),
-            Some('╻'),
+            Some('▀'),
             "the thumb's last half row is the top of cell 5"
         );
         assert_eq!(
             screen.char_at(19, 7),
-            Some('│'),
-            "the track below the thumb"
+            Some(' '),
+            "the screen edge below the thumb stays empty"
         );
     }
 
@@ -269,12 +317,12 @@ mod tests {
         v.scroll_to(45);
         let mut screen = Screen::new(20, 12);
         screen.clear(Ink::new(0xffffff, 0x000000));
-        paint(&mut screen, Bar::ascii(), 19, 1, &v, &host);
+        paint(&mut screen, Bar::ascii(), 19, None, 1, &v, &host);
         assert_eq!(screen.char_at(19, 6), Some('#'), "cell 5 whole, as always");
         for y in 1..11 {
             let ch = screen.char_at(19, y).unwrap();
             assert!(
-                ch == '#' || ch == '|',
+                ch == '#' || ch == ' ',
                 "no half of a cell is ever drawn: {ch}"
             );
         }
@@ -290,8 +338,8 @@ mod tests {
         v.scroll_to(90);
         let mut screen = Screen::new(20, 12);
         screen.clear(Ink::new(0xffffff, 0x000000));
-        paint(&mut screen, Bar::line(), 19, 1, &v, &host);
-        assert_eq!(screen.char_at(19, 10), Some('┃'), "the last row whole");
-        assert_eq!(screen.char_at(19, 9), Some('│'), "track above it");
+        paint(&mut screen, Bar::block(), 19, None, 1, &v, &host);
+        assert_eq!(screen.char_at(19, 10), Some('█'), "the last row whole");
+        assert_eq!(screen.char_at(19, 9), Some(' '), "no track above it");
     }
 }
