@@ -261,15 +261,23 @@ impl Term {
     /// without the negotiation it would be typed into the keymap character by
     /// character and could quit something. Anything else that is not a keypress,
     /// a wheel notch, a left button or a resize — a focus change, the right
-    /// button — is skipped rather than surfaced, so a caller gets `None` on a
-    /// timeout and nothing else. Key *release* events are skipped too: terminals
-    /// with the kitty protocol on report both, and acting on each is every
-    /// binding firing twice.
+    /// button — is skipped rather than surfaced, and the skip happens *inside*
+    /// the wait: a dropped event does not end the call, so `None` means there
+    /// was nothing to act on and never that noise interrupted the read. That is
+    /// what makes a zero timeout a drain — `None` then says the queue is empty,
+    /// the property the input batch in `run` leans on to draw one frame for a
+    /// whole burst of wheel notches instead of one a notch. Key *release*
+    /// events are skipped too: terminals with the kitty protocol on report
+    /// both, and acting on each is every binding firing twice.
     pub fn poll(timeout: Duration) -> io::Result<Option<Input>> {
-        if !event::poll(timeout)? {
-            return Ok(None);
+        loop {
+            if !event::poll(timeout)? {
+                return Ok(None);
+            }
+            if let Some(input) = translate_event(event::read()?) {
+                return Ok(Some(input));
+            }
         }
-        Ok(translate_event(event::read()?))
     }
 }
 

@@ -100,8 +100,6 @@ pub struct Diff {
     /// True between a press and a release on the text, so a motion event that
     /// belongs to nothing does not extend a selection made minutes ago.
     dragging: bool,
-    /// Where in the scrollbar's thumb it was taken hold of, while it is held.
-    grabbed: Option<usize>,
     bar: Bar,
 }
 
@@ -160,7 +158,6 @@ impl Diff {
             file_count: 0,
             sel: None,
             dragging: false,
-            grabbed: None,
             bar: Bar::default(),
         };
         view.rebuild(host, 0.0);
@@ -437,12 +434,7 @@ impl Diff {
     /// A press on nothing selectable *clears*, which is the whole reason a fresh
     /// [`Selection`] is empty until something extends it: a click has to be able
     /// to mean "no longer selected".
-    pub fn press(&mut self, col: usize, row: usize, clicks: u8, extend: bool, host: &Host) {
-        if scrollbar::hit(col, self.cols, &self.view, host) {
-            let row = row.min(self.view.height().saturating_sub(1));
-            self.grabbed = Some(scrollbar::grab(&mut self.view, host, row));
-            return;
-        }
+    pub fn press(&mut self, col: usize, row: usize, clicks: u8, extend: bool, _host: &Host) {
         let Some(visual) = self.view.row_at(row) else {
             self.sel = None;
             return;
@@ -496,11 +488,7 @@ impl Diff {
     /// side-by-side diff stays in the column it started in and runs to that
     /// column's edge, because the alternative is a paste with the old and the new
     /// file interleaved.
-    pub fn drag(&mut self, col: usize, row: isize, host: &Host) {
-        if let Some(grabbed) = self.grabbed {
-            scrollbar::drag(&mut self.view, host, row.max(0) as usize, grabbed);
-            return;
-        }
+    pub fn drag(&mut self, col: usize, row: isize, _host: &Host) {
         if !self.dragging {
             return;
         }
@@ -536,11 +524,10 @@ impl Diff {
         }
     }
 
-    /// The button came up, wherever it came up. Ends a drag and lets go of the
-    /// scrollbar; the selection itself stays, because that is what it is for.
+    /// The button came up, wherever it came up. Ends a drag; the selection
+    /// itself stays, because that is what it is for.
     pub fn release(&mut self) {
         self.dragging = false;
-        self.grabbed = None;
     }
 
     /// The text of one row, for a word or a whole-row selection.
@@ -688,11 +675,10 @@ impl Diff {
         }
         let (cursor, top, shift) = (self.view.cursor(), self.view.top(), self.shift);
         // A refresh is the repository saying things moved: a selection was
-        // anchored to how they were, a drag was holding rows that may not be
-        // there, and the scrollbar was held against a thumb that just moved.
+        // anchored to how they were, and a drag was holding rows that may
+        // not be there.
         self.sel = None;
         self.dragging = false;
-        self.grabbed = None;
         self.files = files;
         self.owners = self.layouts.build(self.current, host);
         let built = assemble(&self.files, host, &mut self.owners);
@@ -786,12 +772,13 @@ impl Diff {
                 None => screen.span(row, x, self.cols).wash(blank),
             }
         }
-        if self.cols > 0 {
-            // Last, and over the rows rather than beside them: a row's colour
-            // still runs to the right edge underneath it — this pane's right
-            // edge, not the screen's.
-            scrollbar::paint(screen, self.bar, x + self.cols - 1, y, &self.view, host);
-        }
+    }
+
+    /// The bar, at whatever column the app hands [`App::paint_scrollbar`] —
+    /// the screen's edge for this pane, which is the one pane with no
+    /// divider to ride. The pane does not choose.
+    pub fn paint_bar(&self, screen: &mut Screen, x: usize, y: usize, host: &Host) {
+        scrollbar::paint(screen, self.bar, x, y, &self.view, host);
     }
 
     /// One line describing what is on screen, for whatever draws a status bar.
@@ -1304,24 +1291,14 @@ mod tests {
     }
 
     #[test]
-    fn a_click_on_the_scrollbar_scrolls_and_does_not_select() {
+    fn a_click_on_the_bar_column_is_text_and_the_list_does_not_jump() {
         let (mut d, host) = view(diff(200), 40, 10);
-        // The last column, half way down the track.
+        // The last column, half way down the track: it is the row underneath
+        // it now. A click there places the caret like on any column, and the
+        // list does not move.
         d.press(39, 5, 1, false, &host);
-        assert!(d.top() > 0, "the bar did not take the click");
-        assert_eq!(d.selection(), "", "the bar started a selection");
-        assert_eq!(d.cursor(), d.cursor().min(d.rows()));
-        d.drag(39, 9, &host);
-        assert_eq!(
-            d.top(),
-            d.rows() - 10,
-            "the end of the track is the end of the list"
-        );
-        d.release();
-        // Once released, the bar is not holding the pointer any more.
-        let top = d.top();
-        d.drag(39, 0, &host);
-        assert_eq!(d.top(), top);
+        assert_eq!(d.top(), 0, "the bar column did not scroll the list");
+        assert_eq!(d.cursor(), 5, "the click is a place, as on any column");
     }
 
     #[test]
@@ -1390,9 +1367,16 @@ mod tests {
             (41..119).any(|x| screen.char_at(x, 1).is_some_and(|c| c != ' ')),
             "nothing was drawn inside the pane"
         );
-        // The bar is on the pane's last column, over a row that keeps its
-        // background — and the pane's last column is not the screen's.
-        assert_eq!(screen.char_at(119, 1), Some('█'));
+        // The diff is the main region: its right boundary is the screen's
+        // edge, and the pane itself paints no bar there — the app hangs it
+        // on the boundary afterwards, over a row that keeps its background.
+        assert_eq!(
+            screen.char_at(119, 1),
+            Some(' '),
+            "the pane painted a bar into its own last column"
+        );
+        d.paint_bar(&mut screen, 119, 1, &host);
+        assert_eq!(screen.char_at(119, 1), Some('┃'));
         assert_eq!(
             screen.ink(119, 1).unwrap().bg,
             screen.ink(118, 1).unwrap().bg,

@@ -340,8 +340,6 @@ pub struct Branches {
     /// a config reload, a refresh. Losing the keyboard alone does none of
     /// those things.
     armed: Option<Target>,
-    /// Where in the scrollbar's thumb it was taken hold of, while it is held.
-    grabbed: Option<usize>,
     /// How many of the rows are selectable — the status line's denominator,
     /// counted by the same pass that numbers them.
     total: usize,
@@ -372,7 +370,6 @@ impl Branches {
             bar: Bar::default(),
             marks,
             armed: None,
-            grabbed: None,
             total,
         }
     }
@@ -419,11 +416,9 @@ impl Branches {
     /// forward the way a fresh open does.
     ///
     /// A refresh is the repository saying things moved; an armed delete was a
-    /// a promise about how they were, so it dies here first — and so does the
-    /// mouse's hold on a thumb that may no longer mean anything.
+    /// a promise about how they were, so it dies here first.
     pub fn replace(&mut self, rows: Vec<Row>) {
         self.armed = None;
-        self.grabbed = None;
         let old = self.view;
         let anchored = match self.rows.get(old.cursor()) {
             Some(r) => row_target(r),
@@ -545,26 +540,14 @@ impl Branches {
         self.armed = None;
     }
 
-    /// A press in the list: the cursor moves there, unless the press landed
-    /// on the scrollbar — its own last column, not the screen's.
+    /// A press in the list: the cursor moves there. `extend` is accepted for
+    /// the shape every list's press shares and deliberately ignored — there is
+    /// no drag selection over a ref list: the mouse moves the cursor and
+    /// nothing else.
     ///
     /// A press on another row takes the armed question's row out from under
-    /// it; a press on the same row leaves the question standing. There is no
-    /// drag selection over a ref list: the mouse moves the cursor and
-    /// nothing else.
-    pub fn press(&mut self, col: usize, row: usize, _extend: bool, host: &Host) {
-        if scrollbar::hit(col, self.cols, &self.view, host) {
-            let row = row.min(self.view.height().saturating_sub(1));
-            let before = self.view.top();
-            self.grabbed = Some(scrollbar::grab(&mut self.view, host, row));
-            // A press on the track can jump the thumb: a moving scrollbar is
-            // a moving list, and the question was asked about a row of the
-            // list that was.
-            if self.view.top() != before {
-                self.armed = None;
-            }
-            return;
-        }
+    /// it; a press on the same row leaves the question standing.
+    pub fn press(&mut self, _col: usize, row: usize, _extend: bool, _host: &Host) {
         let Some(index) = self.view.row_at(row) else {
             return;
         };
@@ -575,22 +558,6 @@ impl Branches {
         if self.armed.is_some() && Some(self.view.cursor()) != armed_on {
             self.armed = None;
         }
-    }
-
-    /// The pointer moved with the button down. Only the scrollbar's own grab
-    /// means anything — a ref list has no drag selection to grow.
-    pub fn drag(&mut self, row: isize, host: &Host) {
-        if let Some(grabbed) = self.grabbed {
-            let before = self.view.top();
-            scrollbar::drag(&mut self.view, host, row.max(0) as usize, grabbed);
-            if self.view.top() != before {
-                self.armed = None;
-            }
-        }
-    }
-
-    pub fn release(&mut self) {
-        self.grabbed = None;
     }
 
     /// What `copy.selection` copies here: the row the keyboard is on, as git
@@ -681,11 +648,13 @@ impl Branches {
             let mut pen = screen.span(row, x, self.cols);
             self.row(&mut pen, index, bg, host, armed == Some(index));
         }
-        if self.cols > 0 {
-            // Last, and over the rows rather than beside them — at this
-            // pane's own last column, which is not the screen's.
-            scrollbar::paint(screen, self.bar, x + self.cols - 1, y, &self.view, host);
-        }
+    }
+
+    /// The bar, at whatever column the app hands [`App::paint_scrollbar`] —
+    /// the divider the layout owns for a pane that has one, the screen's
+    /// edge for one that does not. The pane does not choose.
+    pub fn paint_bar(&self, screen: &mut Screen, x: usize, y: usize, host: &Host) {
+        scrollbar::paint(screen, self.bar, x, y, &self.view, host);
     }
 
     /// One row: a quiet caps heading with its count at the right, or a mark,
@@ -1138,7 +1107,6 @@ mod tests {
         assert_eq!(raw.as_bytes(), b"f\xe9ature");
         assert!(!b.confirm_or_arm_delete(&Target::Local(raw.clone())));
         assert_eq!(b.armed_row().as_ref(), Some(&Target::Local(raw.clone())));
-        b.grabbed = Some(1);
 
         // A refresh that *reorders* the locals: the anchor is the bytes, so
         // the keyboard goes with the branch to wherever it now sits.
@@ -1161,7 +1129,6 @@ mod tests {
             "the anchor did not survive the reorder byte-for-byte"
         );
         assert_eq!(b.armed_row(), None, "the arm survived its own refresh");
-        assert_eq!(b.grabbed, None, "the grab survived its own refresh");
 
         // The branch itself is gone: clamp onto what survives, then settle
         // onto a row a verb can act on.

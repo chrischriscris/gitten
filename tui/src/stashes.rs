@@ -84,8 +84,6 @@ pub struct Stashes {
     /// it, because the question sits on the row it was asked about.
     armed: Option<usize>,
     dragging: bool,
-    /// Where in the scrollbar's thumb it was taken hold of, while it is held.
-    grabbed: Option<usize>,
 }
 
 impl Stashes {
@@ -102,7 +100,6 @@ impl Stashes {
             bar: Bar::default(),
             armed: None,
             dragging: false,
-            grabbed: None,
         }
     }
 
@@ -118,7 +115,6 @@ impl Stashes {
             bar: Bar::default(),
             armed: None,
             dragging: false,
-            grabbed: None,
         }
     }
 
@@ -137,7 +133,6 @@ impl Stashes {
     pub fn replace(&mut self, stashes: Vec<Stash>) {
         self.armed = None;
         self.dragging = false;
-        self.grabbed = None;
         self.available = true;
         let (cursor, top) = (self.view.cursor(), self.view.top());
         let anchored = self.rows.get(cursor).map(|r| r.commit.clone());
@@ -232,19 +227,7 @@ impl Stashes {
     /// A press that moves the keyboard off the armed row takes the question
     /// with it; a click on the armed row itself is neither an answer nor a
     /// re-ask, and the question stands until its key is pressed again.
-    pub fn press(&mut self, col: usize, row: usize, _extend: bool, host: &Host) {
-        if scrollbar::hit(col, self.cols, &self.view, host) {
-            let row = row.min(self.view.height().saturating_sub(1));
-            let before = self.view.top();
-            self.grabbed = Some(scrollbar::grab(&mut self.view, host, row));
-            // A press on the track can jump the thumb: a moving scrollbar is
-            // a moving list, and the question was asked about a row of the
-            // list that was.
-            if self.view.top() != before {
-                self.armed = None;
-            }
-            return;
-        }
+    pub fn press(&mut self, _col: usize, row: usize, _extend: bool, _host: &Host) {
         let Some(index) = self.view.row_at(row) else {
             return;
         };
@@ -254,16 +237,8 @@ impl Stashes {
 
     /// The pointer moved with the button down. A row above or below the body
     /// scrolls by the overshoot; a drag never builds a range, so what it can
-    /// move is the cursor or the scrollbar and nothing else.
-    pub fn drag(&mut self, row: isize, host: &Host) {
-        if let Some(grabbed) = self.grabbed {
-            let before = self.view.top();
-            scrollbar::drag(&mut self.view, host, row.max(0) as usize, grabbed);
-            if self.view.top() != before {
-                self.armed = None;
-            }
-            return;
-        }
+    /// move is the cursor and nothing else.
+    pub fn drag(&mut self, row: isize, _host: &Host) {
         if !self.dragging {
             return;
         }
@@ -288,7 +263,6 @@ impl Stashes {
 
     pub fn release(&mut self) {
         self.dragging = false;
-        self.grabbed = None;
     }
 
     /// The press or drag landed the keyboard on row `index`; the question,
@@ -422,11 +396,13 @@ impl Stashes {
                 pen.wash(body);
             }
         }
-        if self.cols > 0 {
-            // Last, and over the rows rather than beside them — at this
-            // pane's own last column, which is not the screen's.
-            scrollbar::paint(screen, self.bar, x + self.cols - 1, y, &self.view, host);
-        }
+    }
+
+    /// The bar, at whatever column the app hands [`App::paint_scrollbar`] —
+    /// the divider the layout owns for a pane that has one, the screen's
+    /// edge for one that does not. The pane does not choose.
+    pub fn paint_bar(&self, screen: &mut Screen, x: usize, y: usize, host: &Host) {
+        scrollbar::paint(screen, self.bar, x, y, &self.view, host);
     }
 
     /// One line describing the pane, for whatever draws a status bar: where

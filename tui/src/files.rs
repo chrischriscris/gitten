@@ -336,8 +336,6 @@ pub struct Files {
     /// move, a wheel or a refresh can make its answer stale — none of which
     /// is a focus change.
     armed: Option<(Section, PathBytes)>,
-    /// Where in the scrollbar's thumb it was taken hold of, while it is held.
-    grabbed: Option<usize>,
     /// How many of the rows are files — the status line's denominator, kept
     /// by the same pass that numbers the rows.
     total: usize,
@@ -374,7 +372,6 @@ impl Files {
             bar: Bar::default(),
             available: true,
             armed: None,
-            grabbed: None,
             total,
             opened: false,
         }
@@ -391,7 +388,6 @@ impl Files {
             bar: Bar::default(),
             available: false,
             armed: None,
-            grabbed: None,
             total: 0,
             opened: false,
         }
@@ -626,19 +622,13 @@ impl Files {
         self.armed = None;
     }
 
-    /// A press in the list: the cursor moves there, unless the press landed
-    /// on the scrollbar — its own last column, not the screen's.
+    /// A press in the list: the cursor moves there.
     ///
     /// A press on another row takes the armed question's row out from under
     /// it; a press on the same row leaves the question standing. There is no
     /// drag selection over a file list: the mouse moves the cursor and
     /// nothing else.
-    pub fn press(&mut self, col: usize, row: usize, _clicks: u8, _extend: bool, host: &Host) {
-        if scrollbar::hit(col, self.cols, &self.view, host) {
-            let row = row.min(self.view.height().saturating_sub(1));
-            self.grabbed = Some(scrollbar::grab(&mut self.view, host, row));
-            return;
-        }
+    pub fn press(&mut self, _col: usize, row: usize, _clicks: u8, _extend: bool, _host: &Host) {
         let Some(index) = self.view.row_at(row) else {
             return;
         };
@@ -649,18 +639,6 @@ impl Files {
         if self.armed.is_some() && Some(self.view.cursor()) != armed_on {
             self.armed = None;
         }
-    }
-
-    /// The pointer moved with the button down. Only the scrollbar's own grab
-    /// means anything — a file list has no drag selection to grow.
-    pub fn drag(&mut self, _col: usize, row: isize, host: &Host) {
-        if let Some(grabbed) = self.grabbed {
-            scrollbar::drag(&mut self.view, host, row.max(0) as usize, grabbed);
-        }
-    }
-
-    pub fn release(&mut self) {
-        self.grabbed = None;
     }
 
     /// What `copy.selection` copies here: the row the keyboard is on, as git
@@ -745,11 +723,13 @@ impl Files {
             let mut pen = screen.span(row, x, self.cols);
             self.row(&mut pen, index, bg, host, armed == Some(index));
         }
-        if self.cols > 0 {
-            // Last, and over the rows rather than beside them — at this
-            // pane's own last column, which is not the screen's.
-            scrollbar::paint(screen, self.bar, x + self.cols - 1, y, &self.view, host);
-        }
+    }
+
+    /// The bar, at whatever column the app hands [`App::paint_scrollbar`] —
+    /// the divider the layout owns for a pane that has one, the screen's
+    /// edge for one that does not. The pane does not choose.
+    pub fn paint_bar(&self, screen: &mut Screen, x: usize, y: usize, host: &Host) {
+        scrollbar::paint(screen, self.bar, x, y, &self.view, host);
     }
 
     /// One row: a quiet caps heading with its count at the right, or a
@@ -1196,7 +1176,7 @@ mod tests {
     }
 
     #[test]
-    fn the_scrollbar_is_pane_local_and_takes_a_drag() {
+    fn the_scrollbar_is_pane_local_and_the_mouse_cannot_have_it() {
         let mut status = Status::default();
         for i in 0..40 {
             status
@@ -1205,17 +1185,15 @@ mod tests {
         }
         let (mut f, host) = view(&status, 30, 6);
         assert_eq!(f.top(), 0);
-        // The bar lives on the pane's *last local column*, not the screen's:
-        // a press at local col 29 of 30 is a press on the bar.
+        // The bar lives on the pane's *last local column*, not the screen's,
+        // and it is an indicator: a press there is a press on the row under
+        // it, and nothing about the bar itself scrolls or grabs.
         f.press(29, 5, 1, false, &host);
+        assert_eq!(f.top(), 0, "a press on the bar did not scroll");
         assert!(
-            f.top() > 0,
-            "the end of the track is not the end of the list"
+            f.current_file().is_some(),
+            "the row under the bar took the press"
         );
-        let top = f.top();
-        f.drag(29, 0, &host);
-        assert!(f.top() < top, "the drag did not follow the thumb");
-        f.release();
         // A body press moves the cursor instead of the viewport, past the
         // heading under it.
         f.press(10, 0, 1, false, &host);
@@ -1224,29 +1202,36 @@ mod tests {
             1,
             "a press past the heading took the file under it"
         );
-        // Painted, the bar sits on the pane's last column, and it keeps
-        // whatever background the row it sits on earned — the cursor row's
-        // selection tint runs under it, a plain row's quiet one does.
+        // Painted, the pane leaves its own last column alone; the app hangs
+        // the bar on the divider past it, and it keeps whatever background
+        // the row it sits on earned — the cursor row's selection tint runs
+        // under it, a plain row's quiet one does.
         let mut screen = Screen::new(60, 6);
         screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
         f.paint(&mut screen, 10, 0, true, &host);
         assert_eq!(
             screen.char_at(39, 0),
-            Some('█'),
-            "the bar is not at x + cols - 1"
+            Some(' '),
+            "the pane painted a bar into its own last column"
+        );
+        f.paint_bar(&mut screen, 40, 0, &host);
+        assert_eq!(
+            screen.char_at(40, 0),
+            Some('┃'),
+            "the bar is not on the divider"
         );
         assert_eq!(
-            screen.char_at(39, 5),
+            screen.char_at(40, 5),
             Some('│'),
             "the track is not under the thumb"
         );
         assert_eq!(
-            screen.ink(39, 1).unwrap().bg,
-            host.theme.chrome.selection_bg,
-            "the bar repainted the row it sits on"
+            screen.ink(40, 1).unwrap().bg,
+            host.theme.chrome.bg,
+            "the bar invented a background of its own"
         );
         assert_eq!(
-            screen.ink(39, 4).unwrap().bg,
+            screen.ink(40, 4).unwrap().bg,
             host.theme.chrome.bg,
             "the bar invented a background of its own"
         );
@@ -1507,8 +1492,6 @@ mod tests {
         let mut clean = Files::unavailable();
         clean.resize(20, 4);
         clean.press(5, 1, 1, false, &host);
-        clean.drag(5, 1, &host);
-        clean.release();
         clean.down();
         assert_eq!(clean.cursor(), 0);
         // A pane whose heading and count cannot both fit keeps the label.

@@ -219,8 +219,6 @@ pub struct Commits {
     /// meaning to. A keyboard *move* clears it outright, for the same reason.
     sel: Option<(usize, usize)>,
     dragging: bool,
-    /// Where in the scrollbar's thumb it was taken hold of, while it is held.
-    grabbed: Option<usize>,
 }
 
 impl Commits {
@@ -263,7 +261,6 @@ impl Commits {
             bar: Bar::default(),
             sel: None,
             dragging: false,
-            grabbed: None,
         }
     }
 
@@ -349,7 +346,6 @@ impl Commits {
         };
         self.sel = None;
         self.dragging = false;
-        self.grabbed = None;
         // `set_len` clamps the cursor onto the surviving rows; the anchor, where
         // it survived, is put back by name.
         self.view.set_len(self.visible.len());
@@ -424,11 +420,9 @@ impl Commits {
         let sha = self.current().map(|c| c.sha.clone());
         let (cursor, top) = (self.view.cursor(), self.view.top());
         // A drag's range was a promise about rows the refresh may have
-        // renumbered, and the scrollbar was held against a thumb that just
-        // moved. Both are the mouse's, and the mouse has let go.
+        // renumbered. It is the mouse's, and the mouse has let go.
         self.sel = None;
         self.dragging = false;
-        self.grabbed = None;
         self.commits = commits;
         let rows = assign_lanes(&self.commits);
         self.lanes = lane_count(&rows);
@@ -477,12 +471,7 @@ impl Commits {
     /// `row` is a row of the body, and `extend` is shift — which moves the free
     /// end of the range rather than starting a new one, so a range longer than
     /// the screen needs no drag that has to scroll.
-    pub fn press(&mut self, col: usize, row: usize, extend: bool, host: &Host) {
-        if scrollbar::hit(col, self.cols, &self.view, host) {
-            let row = row.min(self.view.height().saturating_sub(1));
-            self.grabbed = Some(scrollbar::grab(&mut self.view, host, row));
-            return;
-        }
+    pub fn press(&mut self, _col: usize, row: usize, extend: bool, _host: &Host) {
         let Some(index) = self.view.row_at(row) else {
             return;
         };
@@ -497,11 +486,7 @@ impl Commits {
 
     /// The pointer moved with the button down. A row above or below the body
     /// scrolls by the overshoot and keeps selecting, exactly as in the diff.
-    pub fn drag(&mut self, row: isize, host: &Host) {
-        if let Some(grabbed) = self.grabbed {
-            scrollbar::drag(&mut self.view, host, row.max(0) as usize, grabbed);
-            return;
-        }
+    pub fn drag(&mut self, row: isize, _host: &Host) {
         if !self.dragging {
             return;
         }
@@ -528,7 +513,6 @@ impl Commits {
 
     pub fn release(&mut self) {
         self.dragging = false;
-        self.grabbed = None;
     }
 
     /// `select.all`.
@@ -633,11 +617,13 @@ impl Commits {
             let mut pen = screen.span(row, x, self.cols);
             self.row(&mut pen, index, bg, theme);
         }
-        if self.cols > 0 {
-            // Last, and over the rows rather than beside them — at this pane's
-            // own last column, which is not the screen's.
-            scrollbar::paint(screen, self.bar, x + self.cols - 1, y, &self.view, host);
-        }
+    }
+
+    /// The bar, at whatever column the app hands [`App::paint_scrollbar`] —
+    /// the divider the layout owns for a pane that has one, the screen's
+    /// edge for one that does not. The pane does not choose.
+    pub fn paint_bar(&self, screen: &mut Screen, x: usize, y: usize, host: &Host) {
+        scrollbar::paint(screen, self.bar, x, y, &self.view, host);
     }
 
     /// lazygit's order — sha, author, graph, subject — because the graph is the
@@ -994,20 +980,20 @@ r\x1frrrrrrr\x1f\x1fAda Lovelace\x1f1700000100\x1fRoot\x1e";
     }
 
     #[test]
-    fn the_scrollbar_takes_a_click_and_the_list_does_not() {
+    fn the_bar_column_is_the_row_under_it_and_the_list_does_not_jump() {
         let (mut c, host) = view(&many(200), 60, 10);
-        c.press(59, 9, false, &host);
-        assert_eq!(c.top(), 190, "the end of the track is the end of the list");
-        assert_eq!(c.cursor(), c.cursor().min(199));
-        c.drag(0, &host);
-        assert_eq!(c.top(), 0);
+        // The bar is an indicator: a press on its column is a press on the
+        // row underneath, like any other column, and nothing about the bar
+        // itself scrolls or grabs.
+        let top = c.top();
+        c.press(59, 4, false, &host);
+        assert_eq!(c.top(), top, "a press on the bar column did not scroll");
+        assert_eq!(
+            c.selected(),
+            4..5,
+            "it selected the row under the bar, as a column of text"
+        );
         c.release();
-        // And it is drawn where it was clicked.
-        let mut screen = Screen::new(60, 10);
-        screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
-        c.paint(&mut screen, 0, 0, true, &host);
-        assert_eq!(screen.char_at(59, 0), Some('█'));
-        assert_eq!(screen.char_at(59, 9), Some('│'));
     }
 
     #[test]
@@ -1259,17 +1245,30 @@ r\x1fr\x1f\x1fA\x1f1\x1froot\x1e";
             (20..50).any(|x| screen.char_at(x, 1).is_some_and(|c| c != ' ')),
             "nothing was drawn inside the pane"
         );
-        // The bar sits on the pane's last column — not the screen's — over a
-        // row that keeps its background underneath it.
+        // The pane paints no bar of its own — the column past its span is
+        // the app's, and the pane's paint leaves it exactly as it found it.
         assert_eq!(
             screen.char_at(49, 1),
-            Some('█'),
-            "the bar is not on the pane's last column"
+            Some(' '),
+            "the pane painted a bar into its own last column"
+        );
+        // The app then hangs the bar on the divider — the column past the
+        // pane — over a row that keeps its background underneath it.
+        c.paint_bar(&mut screen, 50, 1, &host);
+        assert_eq!(
+            screen.char_at(50, 1),
+            Some('┃'),
+            "the bar is not on the divider"
         );
         assert_eq!(
-            screen.ink(49, 1).unwrap().bg,
-            host.theme.chrome.selection_bg,
-            "the bar repainted the row it sits on"
+            screen.ink(50, 1).unwrap().bg,
+            host.theme.chrome.bg,
+            "the bar invented a background of its own"
+        );
+        assert_eq!(
+            screen.char_at(49, 1),
+            Some(' '),
+            "the bar reached into the pane's own columns"
         );
     }
 

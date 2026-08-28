@@ -78,6 +78,19 @@ const EXTRA: &str = "  --ascii        draw the graph and the scrollbar without b
 /// same reason. It costs one `poll` syscall per interval and no redraw.
 const TICK: Duration = Duration::from_millis(150);
 
+/// The most input one frame takes from the queue.
+///
+/// A wheel burst arrives as dozens of notches, and a frame per notch is the
+/// rubber-band: the hand outruns the screen, and then the screen keeps moving
+/// after the hand has stopped. The queue is drained before the frame is drawn,
+/// so a burst costs one [`App::draw`] no matter how many notches are already in
+/// it — every event still resolves through the keymap exactly as it did, only
+/// the frames between them are gone. The bound exists for the pathological
+/// case alone: a pipe or a runaway source feeding events faster than they can
+/// be handled would otherwise never draw again, and sixty-four handled events
+/// is far past anything a hand produces between two frames.
+const INPUT_BATCH: usize = 64;
+
 /// Longest gap between two presses that still counts as a double click.
 ///
 /// A terminal reports a press and nothing else — there is no `click_count` in
@@ -561,6 +574,21 @@ impl Screens {
         }
     }
 
+    /// The bar at the column the paint loop chose for it. The choice is the
+    /// app's because the column is the app's: the divider the layout owns for
+    /// a pane that has one — a column no pane writes, so the bar costs no
+    /// text and no reflow — and the screen's edge for the one pane that runs
+    /// to it. See [0027](../docs/decisions/0027-the-scrollbar-is-an-indicator.md).
+    fn paint_scrollbar(&self, screen: &mut Screen, x: usize, y: usize, host: &Host) {
+        match self {
+            Screens::Commits { view: c, .. } => c.paint_bar(screen, x, y, host),
+            Screens::Diff { view: d, .. } => d.paint_bar(screen, x, y, host),
+            Screens::Stashes { view: s, .. } => s.paint_bar(screen, x, y, host),
+            Screens::Files { view: f, .. } => f.paint_bar(screen, x, y, host),
+            Screens::Branches { view: b, .. } => b.paint_bar(screen, x, y, host),
+        }
+    }
+
     /// A press in this pane's content, at `row` rows down it and `col`
     /// columns across it — both pane-local, already hit-tested.
     ///
@@ -584,8 +612,9 @@ impl Screens {
             Screens::Commits { view: c, .. } => c.drag(row, host),
             Screens::Diff { view: d, .. } => d.drag(col, row, host),
             Screens::Stashes { view: s, .. } => s.drag(row, host),
-            Screens::Files { view: f, .. } => f.drag(col, row, host),
-            Screens::Branches { view: b, .. } => b.drag(row, host),
+            // A list with no drag selection and an indicator bar has nothing
+            // a held button can do.
+            Screens::Files { .. } | Screens::Branches { .. } => {}
         }
     }
 
@@ -594,8 +623,8 @@ impl Screens {
             Screens::Commits { view: c, .. } => c.release(),
             Screens::Diff { view: d, .. } => d.release(),
             Screens::Stashes { view: s, .. } => s.release(),
-            Screens::Files { view: f, .. } => f.release(),
-            Screens::Branches { view: b, .. } => b.release(),
+            // Nothing held here either — see `drag`.
+            Screens::Files { .. } | Screens::Branches { .. } => {}
         }
     }
 
@@ -1210,6 +1239,46 @@ impl App {
         let mut size = (0, 0);
         let mut first = true;
         while !self.quit {
+            // The first frame draws before anything waits, so its poll does not
+            // block; every later frame blocks here for the first event, or the
+            // tick, which is the only thing that bounds how soon a saved config
+            // is noticed.
+            match Term::poll(if first { Duration::ZERO } else { TICK })? {
+                // A resize stays in the loop, which keeps the size it compares
+                // against; every other event routes through [`App::input`].
+                Some(Input::Resize(w, h)) => {
+                    size = (w, h);
+                    self.screen.resize(w, h);
+                    self.gesture = None;
+                }
+                Some(input) => self.input(input),
+                // A tick. The only thing it is for.
+                None => {
+                    if dirty.swap(false, Ordering::Relaxed) {
+                        self.reload(config_path);
+                    }
+                }
+            }
+            // Then everything already queued, before drawing: a burst of wheel
+            // notches is one frame, not one frame a notch. Bounded, so a flood
+            // of piped input cannot starve the screen — see [`INPUT_BATCH`].
+            for _ in 0..INPUT_BATCH {
+                if self.quit {
+                    break;
+                }
+                match Term::poll(Duration::ZERO)? {
+                    Some(Input::Resize(w, h)) => {
+                        size = (w, h);
+                        self.screen.resize(w, h);
+                        self.gesture = None;
+                    }
+                    Some(input) => self.input(input),
+                    None => break,
+                }
+            }
+            if self.quit {
+                break;
+            }
             let now = Term::size();
             if now != size {
                 size = now;
@@ -1245,23 +1314,6 @@ impl App {
             }
             if stats_on() {
                 self.stats = Some((t.elapsed(), cells));
-            }
-
-            match Term::poll(TICK)? {
-                // A resize stays in the loop, which keeps the size it compares
-                // against; every other event routes through [`App::input`].
-                Some(Input::Resize(w, h)) => {
-                    size = (w, h);
-                    self.screen.resize(w, h);
-                    self.gesture = None;
-                }
-                Some(input) => self.input(input),
-                // A tick. The only thing it is for.
-                None => {
-                    if dirty.swap(false, Ordering::Relaxed) {
-                        self.reload(config_path);
-                    }
-                }
             }
         }
         Ok(())
@@ -2756,6 +2808,16 @@ impl App {
                 let content = rect.content();
                 if content.width > 0 && content.height > 0 {
                     pane.paint(&mut *screen, content.x, content.y, focused, host, runs);
+                    // The bar rides the pane's right boundary. The column
+                    // past the pane is the layout's divider when there is
+                    // one — free, because no pane writes it — and the
+                    // screen's edge when there is not, which is the one
+                    // place overlay survives: with wrapping on nothing
+                    // reaches that column anyway, and with wrapping off the
+                    // line is being scrolled sideways underneath it.
+                    let past = content.x + content.width;
+                    let rail = past.min(screen.width().saturating_sub(1));
+                    pane.paint_scrollbar(&mut *screen, rail, content.y, host);
                 }
             }
         }
@@ -3584,13 +3646,13 @@ mod tests {
         );
 
         // Every painted row stays inside the diff span: the divider column
-        // the layout owns is blank, and the text starts at the pane's edge.
+        // the layout owns holds blank or the sidebar's bar — which hangs
+        // there now — and never a pane's text.
         let (w, h) = app.screen.size();
         for y in 2..h - 1 {
-            assert_eq!(
-                app.screen.char_at(40, y),
-                Some(' '),
-                "row {y} drew into the divider"
+            assert!(
+                matches!(app.screen.char_at(40, y), Some(' ' | '│' | '┃' | '╻' | '╹')),
+                "row {y} drew text into the divider"
             );
         }
         assert!(
@@ -3637,6 +3699,57 @@ mod tests {
             diff_view(&app).selection(),
             selected,
             "the reflow lost the line the selection was on"
+        );
+    }
+
+    #[test]
+    fn the_bar_hangs_on_the_boundary_divider_for_a_sidebar_edge_for_the_main() {
+        // A 120-column frame: sidebar 40, divider 40, diff 41..120. The
+        // commits bar hangs on the divider — the column past the pane, the
+        // one the layout owns and no pane writes — and the diff's hangs on
+        // the screen's edge, which is the only boundary it has.
+        const MD: &str = include_str!("../tests/fixtures/md.diff");
+        let mut app = app(30);
+        app.screen = Screen::new(120, 24);
+        let files = gitten_core::parse_unified_diff(MD);
+        let mut diff = Diff::new(files, &app.host);
+        diff.set_bar(app.bar);
+        app.panes.register(
+            "diff",
+            panes::Placement::Main,
+            Screens::Diff {
+                view: diff,
+                source: Some(Source::Patch { file: None }),
+                label: "md.diff".into(),
+                generation: app.generation,
+            },
+        );
+        app.sync_modes();
+        app.draw();
+        let is_bar = |at: Option<char>| matches!(at, Some('│' | '┃' | '╻' | '╹'));
+
+        let commits = app.pane_content("commits").expect("the sidebar is visible");
+        let divider = commits.x + commits.width;
+        assert_eq!(divider, 40, "the sidebar does not end at the divider");
+        assert!(
+            is_bar(app.screen.char_at(divider, commits.y)),
+            "the sidebar's bar is not on the divider"
+        );
+        assert!(
+            !is_bar(app.screen.char_at(divider - 1, commits.y)),
+            "the bar reached into the pane's own columns"
+        );
+
+        let diff = app.pane_content("diff").expect("the diff pane is visible");
+        let edge = diff.x + diff.width - 1;
+        assert_eq!(edge, 119, "the diff pane does not run to the screen's edge");
+        assert!(
+            is_bar(app.screen.char_at(edge, diff.y)),
+            "the main pane's bar is not on the screen's edge"
+        );
+        assert!(
+            !is_bar(app.screen.char_at(edge - 1, diff.y)),
+            "the diff's bar reached into its own columns"
         );
     }
 
@@ -5946,13 +6059,13 @@ diff --git a/tracked.txt b/tracked.txt
             "copy-on-select did not read the captured pane"
         );
 
-        // A press on the diff's scrollbar: its own last column, not the
-        // screen's, and the drag follows the thumb.
+        // A press on the diff's scrollbar column: it is the row underneath
+        // now — text, and nothing about the bar itself scrolls or grabs.
         let top = diff_of(&app).top();
         app.mouse(click(MouseKind::Down, 119, 5));
         app.mouse(click(MouseKind::Drag, 119, 12));
-        assert!(diff_of(&app).top() > top, "the bar did not take the drag");
         app.mouse(click(MouseKind::Up, 119, 12));
+        assert_eq!(diff_of(&app).top(), top, "the bar column did not scroll");
 
         // Two quick clicks in the commits pane open the diff — the clock
         // counts, and the pane it counted in is part of what it counted.
@@ -6510,13 +6623,13 @@ diff --git a/tracked.txt b/tracked.txt
             "{stashes_header:?}"
         );
 
-        // The divider is nobody's: blank from the top of the body to the
-        // bottom, including across every sidebar header.
+        // The divider is nobody's: blank, or the bar that hangs on it now —
+        // never a pane's text — from the top of the body to the bottom,
+        // including across every sidebar header.
         for y in 2..23 {
-            assert_eq!(
-                app.screen.char_at(40, y),
-                Some(' '),
-                "row {y} drew into the divider"
+            assert!(
+                matches!(app.screen.char_at(40, y), Some(' ' | '│' | '┃' | '╻' | '╹')),
+                "row {y} drew text into the divider"
             );
         }
 
