@@ -183,12 +183,11 @@ fn main() {
 /// because no write anywhere can stale it.
 ///
 /// The diff tenant carries an [`Option`] where the commit list carries a
-/// source, and that is load-bearing: on a commits launch the diff pane is
-/// registered **empty** — nothing acquired, nothing to refresh, nothing a
-/// hunk verb can act on — and Enter replaces it with a real acquisition.
-/// Pretending it was acquired from the working tree would let staging and
-/// refreshing reach a pane that holds nothing; "not loaded yet" is a state
-/// the type can say.
+/// source, and that is load-bearing: a repository commit list immediately
+/// replaces the temporary empty tenant with the highlighted commit's preview;
+/// a fixture cannot. Pretending an empty tenant was acquired from the working
+/// tree would let staging and refreshing reach a pane that holds nothing;
+/// "not loaded" remains a state the type can say honestly.
 ///
 /// The files tenant carries no source at all, and that is the third shape: it
 /// is only ever registered when startup opened a repository, so everything it
@@ -235,7 +234,7 @@ enum Screens {
 }
 
 /// What an empty diff pane's header says instead of a sha it does not have.
-const EMPTY_DIFF_LABEL: &str = "press enter on a commit";
+const EMPTY_DIFF_LABEL: &str = "commit preview unavailable";
 
 /// What a stash pane's header says when its side read failed — never
 /// `nothing stashed`, which would assert a successful read that did not
@@ -877,6 +876,9 @@ struct App {
     /// was last refreshed against.
     generation: Generation,
     help: bool,
+    /// First key row visible in the help modal. Independent of every pane's
+    /// cursor and viewport, as a modal's reading position must be.
+    help_scroll: usize,
     quit: bool,
     /// The theme `theme.cycle` picked, if anything has. `None` means the file's.
     picked_theme: Option<String>,
@@ -988,11 +990,10 @@ impl App {
                 if let Some(pane) = stash_tenant {
                     panes.register("stashes", panes::Placement::sidebar("stashes"), pane);
                 }
-                // The persistent main pane, registered **empty**: no source, no
-                // acquisition, nothing for a hunk verb or a refresh to act on
-                // until Enter replaces it. Its header is drawn like any other
-                // pane's, saying what it is rather than pretending to hold a
-                // diff it does not have.
+                // The persistent main pane starts empty, then
+                // [`App::sync_main_diff`] below replaces it from row zero
+                // before construction returns. Keeping the honest empty shape
+                // here also covers a fixture, which has no repository to ask.
                 panes.register(
                     "diff",
                     panes::Placement::Main,
@@ -1133,6 +1134,7 @@ impl App {
             submitter,
             generation: Generation::default(),
             help: false,
+            help_scroll: 0,
             quit: false,
             picked_theme: None,
             stats: None,
@@ -1153,6 +1155,10 @@ impl App {
         app.message = branch_error.or(stash_error).unwrap_or_default();
         app.sync_header_keys();
         app.sync_modes();
+        // A commits launch opens with row zero highlighted, so the main pane
+        // names and draws that commit immediately. Enter is only the focus
+        // transfer; it is never the trigger that makes the preview exist.
+        app.sync_main_diff(false);
         app
     }
 
@@ -1442,7 +1448,11 @@ impl App {
     /// to scroll and consumes nothing.
     fn wheel(&mut self, key: Key, col: usize, row: usize) {
         let (_, h) = self.screen.size();
-        if h < 3 || self.help || self.prompt.is_some() {
+        if h < 3 || self.prompt.is_some() {
+            return;
+        }
+        if self.help {
+            self.press(key);
             return;
         }
         let Some((name, _)) = self.hit(col, row) else {
@@ -1917,11 +1927,15 @@ impl App {
     /// the view, so the prompt and the list stay two things: the prompt is
     /// input, the list is data, and this is the line between them.
     fn apply_query(&mut self, query: &str) {
+        let before = self.current_commit_sha();
         // Disjoint field borrows, as everywhere else in this file: the query is
         // read while the list is written.
         let Self { panes, .. } = self;
         if let Some(Screens::Commits { view: list, .. }) = panes.get_mut("commits") {
             list.apply_query(query);
+        }
+        if self.current_commit_sha() != before {
+            self.sync_main_diff(false);
         }
     }
 
@@ -2026,25 +2040,33 @@ impl App {
                 };
                 self.message.clear();
                 let clicks = self.count(m.col, m.row, &name);
-                // A click in a pane means that pane: the keyboard moves with
-                // the pointer, and the modes and geometry follow.
-                if self.panes.focused_name() != name {
-                    self.focus_named(&name);
-                }
+                let was_focused = self.panes.focused_name() == name;
                 // A press on the header focuses and nothing else — the same
                 // answer the window's pane headers give — so a gesture that
                 // started there has a pane to be released against and no more.
                 if m.row == rect.y {
+                    if !was_focused {
+                        self.focus_named(&name);
+                    }
                     self.gesture = Some(name);
                     return;
                 }
                 let local_col = m.col - rect.x;
                 let local_row = m.row - rect.y - 1;
+                let before = self.current_commit_sha();
                 {
                     let Self { panes, host, .. } = self;
                     if let Some(pane) = panes.get_mut(&name) {
                         pane.press(local_col, local_row, clicks, m.shift, host);
                     }
+                }
+                // Apply the row before transferring focus: commits focus then
+                // previews exactly the clicked row, never the row that used to
+                // be highlighted on the way there.
+                if !was_focused {
+                    self.focus_named(&name);
+                } else if name == "commits" && self.current_commit_sha() != before {
+                    self.sync_main_diff(false);
                 }
                 // Two clicks on a commit open it, which is the one gesture a
                 // terminal has for "go in" besides the key that already does.
@@ -2151,6 +2173,9 @@ impl App {
     /// A wheel supplies its hit-tested pane, while app-wide commands keep their
     /// ordinary meaning regardless of where their binding originated.
     fn dispatch_to(&mut self, command: &str, target: Option<&str>) {
+        if self.help && self.scroll_help(command) {
+            return;
+        }
         match command {
             // The ten names the shared registry ships, answered from the pane
             // registry and not from any view: h/l and the arrows walk the
@@ -2171,6 +2196,9 @@ impl App {
             "quit" => self.quit = true,
             "help" => {
                 self.help = !self.help;
+                if self.help {
+                    self.help_scroll = 0;
+                }
                 // The help panel covers the panes; a gesture captured under
                 // it has nowhere honest to be released into.
                 self.gesture = None;
@@ -2259,6 +2287,12 @@ impl App {
             // whole resolved contrast table, and doing that per keypress is a
             // thing that would never have shown up in a timing.
             _ => {
+                let routed = target
+                    .unwrap_or_else(|| self.panes.focused_name())
+                    .to_string();
+                let before = (routed == "commits")
+                    .then(|| self.current_commit_sha())
+                    .flatten();
                 let known = match target {
                     Some(name) => self
                         .panes
@@ -2269,11 +2303,50 @@ impl App {
                         .focused_mut()
                         .is_some_and(|pane| pane.run(command, &self.host)),
                 };
+                if known
+                    && routed == "commits"
+                    && self.panes.focused_name() == "commits"
+                    && self.current_commit_sha() != before
+                {
+                    self.sync_main_diff(false);
+                }
                 if !known {
                     self.message = format!("{command} does nothing here");
                 }
             }
         }
+    }
+
+    /// Runs the shared list-navigation commands against the modal viewport.
+    /// Returning false leaves app-wide commands such as `help`, `back`, and
+    /// `quit` to their ordinary handlers below.
+    fn scroll_help(&mut self, command: &str) -> bool {
+        let (_, h) = self.screen.size();
+        let body = h.saturating_sub(2);
+        let (page, max) = help::scroll_bounds(body, &self.host, &self.modes);
+        let by = match command {
+            "view.down" => 1,
+            "view.up" => -1,
+            "view.page-down" => page.saturating_sub(1).max(1) as isize,
+            "view.page-up" => -(page.saturating_sub(1).max(1) as isize),
+            "view.scroll-down" => self.host.view.rows as isize,
+            "view.scroll-up" => -(self.host.view.rows as isize),
+            "view.top" => {
+                self.help_scroll = 0;
+                return true;
+            }
+            "view.bottom" => {
+                self.help_scroll = max;
+                return true;
+            }
+            _ => return false,
+        };
+        self.help_scroll = if by.is_negative() {
+            self.help_scroll.saturating_sub(by.unsigned_abs())
+        } else {
+            self.help_scroll.saturating_add(by as usize).min(max)
+        };
+        true
     }
 
     /// Focuses the pane registered under `name` — what `commits.focus` and
@@ -2301,6 +2374,13 @@ impl App {
                 // refreshes — and a prompt or a reload, through
                 // [`App::disarm_branches`].
                 self.sync_modes();
+                // An unfocused commits pane may have scrolled under the
+                // pointer, but its cursor is independent and stays put. When
+                // focus arrives, that same highlighted row is still the main
+                // preview's source.
+                if name == "commits" {
+                    self.sync_main_diff(false);
+                }
             }
             None => self.message = format!("no {name} pane"),
         }
@@ -2360,35 +2440,56 @@ impl App {
         self.sync_modes();
     }
 
-    /// Opens the diff of the commit under the cursor, into the main pane.
+    /// Gives the main pane focus after synchronising it to the highlighted
+    /// commit. Moving the highlight already loaded the preview; Enter merely
+    /// flushes a missing or failed load and transfers the keyboard.
+    fn open_diff(&mut self) {
+        self.sync_main_diff(true);
+    }
+
+    /// Keeps the main diff on the commit highlighted in the commits pane.
     ///
     /// The I/O is here and not in the view, which is the same rule the GPUI
     /// client follows: a view takes already-loaded data and never learns what a
     /// repository is. A bare revision is "what did this commit change" to
     /// [`gitten_git::Repo::pairs`], merges included.
     ///
-    /// The pane named `commits` is read by that name and not by focus, the way
-    /// the window reads its commit column: opening a diff is about the list's
-    /// cursor, not about whoever has the keyboard. On success the diff tenant
-    /// is **replaced in place** — the registry never grows, and the empty pane
-    /// a commits launch registered becomes a real one — resized to the
-    /// geometry the diff pane already has, and focused. On a failure the old
-    /// diff survives untouched and so does the focus; the error is the
-    /// message.
-    fn open_diff(&mut self) {
+    /// The pane named `commits` is read by that name and not by focus. On
+    /// success the diff tenant is replaced in place and the old focus is
+    /// restored unless `focus` asks Enter's one extra action. A preview already
+    /// naming this sha costs no acquisition.
+    fn sync_main_diff(&mut self, focus: bool) {
         let commit = match self.panes.get("commits") {
             Some(Screens::Commits { view, .. }) => view.current().cloned(),
             _ => {
-                self.message = "no commit selected".into();
+                if focus {
+                    self.message = "no commit selected".into();
+                }
                 return;
             }
         };
         let Some(commit) = commit else { return };
         let (sha, subject) = (commit.sha.clone(), commit.subject.clone());
+        let shown = matches!(
+            self.panes.get("diff"),
+            Some(Screens::Diff {
+                source: Some(Source::Repo { arg, .. }),
+                ..
+            }) if arg == &sha
+        );
+        if shown {
+            if focus {
+                self.focus_named("diff");
+            }
+            return;
+        }
         let Some((path, repo)) = self.repo.clone() else {
-            self.message = "a fixture has no repository to diff against".into();
+            if focus {
+                self.message = "a fixture has no repository to diff against".into();
+            }
             return;
         };
+        let old_focus = self.panes.focused_name().to_string();
         let source = Source::Repo {
             path,
             arg: sha.clone(),
@@ -2418,12 +2519,29 @@ impl App {
                         generation: self.generation,
                     },
                 );
-                // A registry replacement: whatever the mouse was holding was
-                // holding a pane that no longer exists.
-                self.gesture = None;
+                // Only a gesture captured in the tenant just replaced became
+                // stale. A click in commits is what requested this preview and
+                // must still receive its release.
+                if self.gesture.as_deref() == Some("diff") {
+                    self.gesture = None;
+                }
+                let target = match focus {
+                    true => "diff",
+                    false => &old_focus,
+                };
+                self.panes.focus_named(target);
                 self.sync_modes();
             }
             Err(e) => self.message = e,
+        }
+    }
+
+    /// Full sha under the commits cursor, for detecting a real selection
+    /// change around generic pane input without teaching dispatch about rows.
+    fn current_commit_sha(&self) -> Option<String> {
+        match self.panes.get("commits") {
+            Some(Screens::Commits { view, .. }) => view.current().map(|c| c.sha.clone()),
+            _ => None,
         }
     }
 
@@ -2963,7 +3081,15 @@ impl App {
         }
 
         if self.help {
-            help::paint(&mut self.screen, 1, body, &self.host, &self.modes);
+            help::paint(
+                &mut self.screen,
+                1,
+                body,
+                &self.host,
+                &self.modes,
+                self.help_scroll,
+                self.bar,
+            );
         }
     }
 }
@@ -3914,6 +4040,35 @@ mod tests {
     }
 
     #[test]
+    fn help_navigation_owns_keys_and_wheel_until_the_modal_closes() {
+        let mut app = app(30);
+        app.screen = Screen::new(140, 40);
+        app.dispatch("help");
+        let (_, max) = help::scroll_bounds(38, &app.host, &app.modes);
+        assert!(max > 0, "the help fixture unexpectedly fits");
+
+        app.press(Key::char('j'));
+        assert_eq!(app.help_scroll, 1);
+        let cursor = list(&app).cursor();
+        app.input(Input::Wheel {
+            key: Key::plain(Code::WheelDown),
+            col: 0,
+            row: 0,
+        });
+        assert!(app.help_scroll > 1, "the wheel did not scroll the modal");
+        assert_eq!(list(&app).cursor(), cursor, "the pane moved under help");
+
+        app.press(Key::plain(Code::End));
+        assert_eq!(app.help_scroll, max);
+        app.press(Key::plain(Code::Home));
+        assert_eq!(app.help_scroll, 0);
+
+        app.dispatch("help");
+        app.dispatch("help");
+        assert_eq!(app.help_scroll, 0, "reopening did not start at the top");
+    }
+
+    #[test]
     fn help_and_config_reload_follow_the_focused_pane() {
         let mut app = app(30);
         // Tall enough that the help panel shows past the global section into
@@ -3924,6 +4079,7 @@ mod tests {
         // what decides those: over the commits pane it lists the commits
         // bindings and not the diff's, and over the diff pane the other way.
         app.dispatch("help");
+        app.dispatch("view.bottom");
         app.draw();
         let rows = body(&app);
         // The panel shows keys and what they do, not command names — the
@@ -3939,6 +4095,7 @@ mod tests {
         app.dispatch("help");
         app.press(Key::plain(Code::Char('0')));
         app.dispatch("help");
+        app.dispatch("view.bottom");
         app.draw();
         let rows = body(&app);
         assert!(
@@ -5673,31 +5830,28 @@ diff --git a/tracked.txt b/tracked.txt
     }
 
     #[test]
-    fn enter_replaces_and_focuses_a_persistent_diff_and_back_returns() {
+    fn highlighted_commit_previews_and_enter_only_focuses_the_persistent_diff() {
         let (handle, state) = fake(&[]);
         let mut app = commits_app(&handle);
         app.draw();
         assert_eq!(app.panes.focused_name(), "commits");
         let open_reads = state.lock().unwrap().pairs_reads;
 
-        // Enter acquires the selected commit's diff exactly once, replaces
-        // the empty tenant — never appends — and focuses it. (Five tenants:
-        // the files, branches and stash panes every repository launch
-        // registers, commits, diff.)
+        // Startup already previewed the highlighted commit while leaving the
+        // keyboard on the list. Enter focuses that tenant without another
+        // read or another registration. (Five tenants: files, branches,
+        // stashes, commits, diff.)
+        assert!(matches!(
+            app.panes.get("diff"),
+            Some(Screens::Diff {
+                source: Some(_),
+                ..
+            })
+        ));
         app.press(Key::plain(Code::Enter));
         assert_eq!(app.panes.focused_name(), "diff");
         assert_eq!(app.panes.names().count(), 5, "enter appended a pane");
-        assert_eq!(state.lock().unwrap().pairs_reads, open_reads + 1);
-        assert!(
-            matches!(
-                app.panes.get("diff"),
-                Some(Screens::Diff {
-                    source: Some(_),
-                    ..
-                })
-            ),
-            "the diff pane was not really acquired"
-        );
+        assert_eq!(state.lock().unwrap().pairs_reads, open_reads);
         // The commits pane stays resident, its cursor where it was.
         assert_eq!(commits_of(&app).cursor(), 0);
 
@@ -5725,7 +5879,21 @@ diff --git a/tracked.txt b/tracked.txt
         );
         assert_eq!(diff_of(&app).layout_name(), "unified");
 
-        // A second Enter replaces the same tenant, again exactly once.
+        // Moving the list highlight replaces the preview immediately without
+        // moving focus. Enter after that is only the focus transfer.
+        let reads = state.lock().unwrap().pairs_reads;
+        app.dispatch("view.down");
+        assert_eq!(app.panes.focused_name(), "commits");
+        assert_eq!(state.lock().unwrap().pairs_reads, reads + 1);
+        assert!(matches!(
+            app.panes.get("diff"),
+            Some(Screens::Diff {
+                source: Some(Source::Repo { arg, .. }),
+                ..
+            }) if arg == "00000001"
+        ));
+
+        // Enter on that already-shown commit does no acquisition.
         let reads = state.lock().unwrap().pairs_reads;
         app.press(Key::plain(Code::Enter));
         assert_eq!(
@@ -5734,7 +5902,7 @@ diff --git a/tracked.txt b/tracked.txt
             "a second enter appended a pane"
         );
         assert_eq!(app.panes.focused_name(), "diff");
-        assert_eq!(state.lock().unwrap().pairs_reads, reads + 1);
+        assert_eq!(state.lock().unwrap().pairs_reads, reads);
 
         // A direct diff launch has one tenant and `esc` goes nowhere.
         let mut app = app_on_diff(Source::Fixtures, None);
@@ -5745,31 +5913,31 @@ diff --git a/tracked.txt b/tracked.txt
     }
 
     #[test]
-    fn the_empty_diff_pane_refuses_hunk_verbs_until_enter_replaces_it() {
-        // The empty pane a commits launch registers was never acquired: no
-        // source, nothing to act on. The verbs refuse it by name — no write,
-        // no submit, no pretending it holds a working tree — and Enter, the
-        // same key that replaces the tenant, is what makes the path live.
+    fn the_commit_preview_refuses_working_tree_hunk_verbs() {
+        // A commits launch immediately previews its highlighted row. That is
+        // a real commit diff, but never a working-tree diff, so staging verbs
+        // refuse it at the source gate and queue nothing.
         let (handle, state) = fake(&[]);
         let mut app = commits_app(&handle);
         app.dispatch("diff.focus");
         assert_eq!(app.panes.focused_name(), "diff");
 
         app.dispatch("diff.stage-hunk");
-        assert_eq!(app.message, "no diff is open");
+        assert_eq!(
+            app.message,
+            "only the working-tree diff can act on hunks — this one is between commits"
+        );
         app.dispatch("diff.unstage-hunk");
-        assert_eq!(app.message, "no diff is open");
+        assert_eq!(
+            app.message,
+            "only the working-tree diff can act on hunks — this one is between commits"
+        );
         assert!(
             state.lock().unwrap().writes.is_empty(),
             "the empty pane queued a write"
         );
 
-        // Enter replaces the tenant with a real acquisition — a *commit*
-        // diff, which is what this key opens from a list — and the verb path
-        // is live: the refusal now comes from the verb's own gate reading
-        // the new source, not from the empty pane. (The write itself landing
-        // is `a_refreshed_frame_is_drawable_headlessly`'s, on a launch whose
-        // diff *is* the working tree.)
+        // Enter merely focuses the preview and changes none of that.
         app.dispatch("commits.focus");
         app.press(Key::plain(Code::Enter));
         assert_eq!(app.panes.focused_name(), "diff");
@@ -6025,7 +6193,7 @@ diff --git a/tracked.txt b/tracked.txt
 
     #[test]
     fn keyboard_uses_focus_and_wheel_uses_the_pane_below_the_pointer() {
-        let (handle, _state) = fake_tall(&[]);
+        let (handle, state) = fake_tall(&[]);
         let mut app = commits_app(&handle);
         app.draw();
         // Both tenants long: the diff loaded, the list a hundred deep.
@@ -6084,8 +6252,30 @@ diff --git a/tracked.txt b/tracked.txt
         });
         assert_eq!((commits_of(&app).top(), diff_of(&app).top()), (ct, dt));
 
+        // Scrolling commits while branches owns the keyboard moves only the
+        // list's viewport. Its selected commit and the main diff are unchanged,
+        // both before and after focus returns.
+        app.dispatch("branches.focus");
+        app.draw();
+        let commits = app.pane_rect("commits").expect("commits placed");
+        let selected = commits_of(&app).cursor();
+        let reads = state.lock().unwrap().pairs_reads;
+        app.input(Input::Wheel {
+            key: Key::plain(Code::WheelDown),
+            col: commits.x + 1,
+            row: commits.y + 1,
+        });
+        assert_eq!(app.panes.focused_name(), "branches");
+        assert_eq!(commits_of(&app).cursor(), selected);
+        assert_eq!(state.lock().unwrap().pairs_reads, reads);
+
+        app.dispatch("commits.focus");
+        assert_eq!(app.panes.focused_name(), "commits");
+        assert_eq!(state.lock().unwrap().pairs_reads, reads);
+
         // And the frame agrees: the unfocused pane draws no cursor bar, the
         // focused one exactly one.
+        app.dispatch("diff.focus");
         app.draw();
         let (w, h) = app.screen.size();
         let bar = app.host.theme.chrome.selection_bg;
@@ -8670,6 +8860,7 @@ diff --git a/tracked.txt b/tracked.txt
         // own bindings.
         app.screen = Screen::new(120, 50);
         app.press(Key::char('?'));
+        app.press(Key::plain(Code::End));
         app.draw();
         let help = (0..50)
             .map(|y| app.screen.row_text(y))
@@ -8754,8 +8945,8 @@ diff --git a/tracked.txt b/tracked.txt
             app.screen.row_text(23)
         );
 
-        // Enter still replaces and focuses the persistent diff, and Back
-        // returns to the last list — the branches pane included in `last_list`.
+        // Enter still focuses the persistent preview, and Back returns to the
+        // last list — the branches pane included in `last_list`.
         app.dispatch("commits.open-diff");
         assert_eq!(app.panes.focused_name(), "diff");
         app.dispatch("back");

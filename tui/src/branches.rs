@@ -519,12 +519,10 @@ impl Branches {
         self.armed = None;
     }
 
-    /// Scrolls without moving the cursor further than it has to — the wheel.
+    /// Scrolls the viewport without moving the cursor — the wheel.
     /// Also a move of attention, and it disarms like one.
     pub fn scroll_y(&mut self, by: isize) {
-        let from = self.view.cursor();
-        self.view.scroll_by(by);
-        self.settle(from);
+        self.view.pan_by(by);
         self.armed = None;
     }
 

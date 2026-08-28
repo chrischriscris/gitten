@@ -420,13 +420,8 @@ impl Files {
             if height > 1 {
                 self.view.scroll_to(0);
             }
-            // The scroll clamps the cursor back into what the new viewport
-            // can show, and what it clamps onto may be a heading — a pane
-            // constructed, walked to its bottom, then resized short reaches
-            // exactly that. One comparison on the common path, where the
-            // cursor is already on a file; a never-resting cursor is the
-            // pane's own invariant, and a public view keeps it under every
-            // order of calls.
+            // The scroll may clamp onto a heading; settle keeps the cursor on
+            // a file under every construction and refresh order.
             self.settle(0);
         }
     }
@@ -601,12 +596,10 @@ impl Files {
         self.armed = None;
     }
 
-    /// Scrolls without moving the cursor further than it has to — the wheel.
+    /// Scrolls the viewport without moving the cursor — the wheel.
     /// Also a move of attention, and it disarms like one.
     pub fn scroll_y(&mut self, by: isize) {
-        let from = self.view.cursor();
-        self.view.scroll_by(by);
-        self.settle(from);
+        self.view.pan_by(by);
         self.armed = None;
     }
 
@@ -1490,9 +1483,7 @@ mod tests {
         screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
         f.paint(&mut screen, 0, 0, true, &host);
         assert!(screen.row_text(1).trim().is_empty());
-        // A one-row pane over a many-row list draws its one row — the one
-        // the cursor is on, which is the only row a viewport of one can
-        // honestly show.
+        // A one-row pane over a many-row list draws its selected file.
         f.resize(20, 1);
         let mut screen = Screen::new(20, 1);
         screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));

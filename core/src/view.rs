@@ -23,12 +23,9 @@
 //! # And why scrolling is not the same verb
 //!
 //! [`Viewport::scroll_by`] moves `top` directly and drags the *cursor* along
-//! only as far as it must. That is the wheel, and a wheel that moved the
-//! selection would be a mouse editing your place in the file. What it must not
-//! do is leave the cursor off screen: everything above still anchors to it, so a
-//! resize would yank the view back to a row scrolled past minutes ago. So the
-//! cursor is pushed to the near edge and stops there — vim's behaviour, arrived
-//! at from the same constraint.
+//! only as far as it must. [`Viewport::pan_by`] is the deliberately disjoint
+//! alternative: it changes visibility and never selection. A client chooses
+//! between those contracts rather than reimplementing either arithmetic.
 
 use std::ops::Range;
 
@@ -85,8 +82,9 @@ impl Default for Scrolling {
 ///
 /// Holds no rows: `len` is all it knows about them, because a viewport over a
 /// commit list and one over a wrapped diff differ in nothing else. Every method
-/// leaves both positions valid — clamped into the list and into each other — so
-/// there is no order to call them in and no state to repair afterwards.
+/// leaves both positions valid — clamped into the list and, except for an
+/// explicit [`Viewport::pan_by`], into each other — so there is no state to
+/// repair afterwards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Viewport {
     len: usize,
@@ -125,6 +123,9 @@ impl Viewport {
 
     /// How many rows are drawn at once.
     pub fn set_height(&mut self, height: usize) {
+        if self.height == height {
+            return;
+        }
         self.height = height;
         self.follow();
     }
@@ -264,10 +265,7 @@ impl Viewport {
 
     /// Scrolls the view `by` rows without treating it as a cursor move.
     ///
-    /// The cursor comes along only when it would otherwise leave the screen, and
-    /// stops at the same margin [`follow`](Self::follow) keeps — except at the
-    /// ends of the list, where there is nothing beyond the edge to preview and
-    /// the margin would just make the first and last rows unreachable.
+    /// The cursor comes along only when it would otherwise leave the screen.
     pub fn scroll_by(&mut self, by: isize) {
         let to = match by.is_negative() {
             true => self.top.saturating_sub(by.unsigned_abs()),
@@ -295,9 +293,20 @@ impl Viewport {
             true => last,
             false => (self.top + self.height.saturating_sub(1)).saturating_sub(pad),
         };
-        // `low` first, so a viewport shorter than twice the margin cannot invert
-        // the two and panic in `clamp`.
         self.cursor = self.cursor.clamp(low.min(high), high.max(low)).min(last);
+    }
+
+    /// Pans the visible rows by `by` without changing the selected row.
+    ///
+    /// This is the terminal wheel's contract: the pointer may inspect any pane
+    /// while the keyboard selection remains exactly where it was. A later
+    /// cursor move calls [`follow`](Self::follow) and reveals that selection.
+    pub fn pan_by(&mut self, by: isize) {
+        let top = match by.is_negative() {
+            true => self.top.saturating_sub(by.unsigned_abs()),
+            false => self.top.saturating_add(by as usize),
+        };
+        self.top = top.min(self.max_top());
     }
 
     // ----------------------------------------------------------- the scrollbar
@@ -522,13 +531,28 @@ mod tests {
     fn a_scroll_drags_the_cursor_rather_than_leaving_it_off_screen() {
         let mut v = view(100, 20);
         v.go_to(50);
-        // Far enough that the cursor cannot stay: it lands on the margin.
         v.scroll_by(30);
         assert_eq!(v.top(), 64);
         assert_eq!(v.cursor(), 67, "the top row plus the margin");
         v.scroll_by(-60);
         assert_eq!(v.top(), 4);
         assert_eq!(v.cursor(), 20, "the bottom row less the margin");
+    }
+
+    #[test]
+    fn a_pan_never_changes_the_cursor_even_when_it_leaves_the_screen() {
+        let mut v = view(100, 20);
+        v.go_to(50);
+        v.pan_by(30);
+        assert_eq!((v.cursor(), v.top()), (50, 64));
+        v.set_height(20);
+        assert_eq!(
+            (v.cursor(), v.top()),
+            (50, 64),
+            "an unchanged layout snapped the pan back to selection"
+        );
+        v.pan_by(-60);
+        assert_eq!((v.cursor(), v.top()), (50, 4));
     }
 
     #[test]
@@ -547,8 +571,7 @@ mod tests {
         let mut v = view(100, 20);
         v.to_bottom();
         assert_eq!((v.top(), v.cursor()), (80, 99));
-        // Scrolling into the end it is already at moves nothing: a margin here
-        // would drag the cursor *off* the last row for no reason.
+        // Scrolling into the end it is already at moves nothing.
         v.scroll_by(5);
         assert_eq!((v.top(), v.cursor()), (80, 99));
     }

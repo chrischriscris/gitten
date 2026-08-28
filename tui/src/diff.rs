@@ -312,9 +312,9 @@ impl Diff {
         self.view.page(pages);
     }
 
-    /// Scrolls without moving the cursor further than it has to go. The wheel.
+    /// Scrolls the viewport without moving the cursor. The wheel.
     pub fn scroll_y(&mut self, by: isize) {
-        self.view.scroll_by(by);
+        self.view.pan_by(by);
     }
 
     /// How much lead the cursor keeps at the edge. `[view] scrolloff`.

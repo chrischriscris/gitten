@@ -213,10 +213,8 @@ pub struct Commits {
     /// [`Commits::selection`] decides what a commit copies as.
     ///
     /// `None` means "just the row the cursor is on", which is what makes the copy
-    /// key useful before the mouse has been touched at all. Held here rather than
-    /// read off the cursor, because the wheel moves the cursor when it has to and
-    /// a selection that grew while you scrolled is one you would paste without
-    /// meaning to. A keyboard *move* clears it outright, for the same reason.
+    /// key useful before the mouse has been touched at all. A dragged range is
+    /// held here rather than inferred again, and a keyboard *move* clears it.
     sel: Option<(usize, usize)>,
     dragging: bool,
 }
@@ -378,9 +376,9 @@ impl Commits {
         self.view.page(pages);
     }
 
-    /// Scrolls without moving the cursor further than it has to go. The wheel.
+    /// Scrolls the viewport without moving the cursor. The wheel.
     pub fn scroll_y(&mut self, by: isize) {
-        self.view.scroll_by(by);
+        self.view.pan_by(by);
     }
 
     /// How much lead the cursor keeps at the edge. `[view] scrolloff`.
@@ -919,8 +917,8 @@ r\x1frrrrrrr\x1f\x1fAda Lovelace\x1f1700000100\x1fRoot\x1e";
 
     #[test]
     fn the_wheel_keeps_a_dragged_range_and_a_keyboard_move_drops_it() {
-        // The wheel drags the cursor along when it has to, so a range read off
-        // the cursor would silently grow while you were only looking around.
+        // The viewport and cursor are independent, and an explicit dragged
+        // range stays independent of both.
         let (mut c, host) = view(&many(50), 60, 6);
         c.press(20, 0, false, &host);
         c.drag(2, &host);

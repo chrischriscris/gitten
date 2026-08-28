@@ -202,7 +202,7 @@ impl Stashes {
     /// question still sits on the row it was asked about.
     pub fn scroll_y(&mut self, by: isize) {
         let before = self.view.top();
-        self.view.scroll_by(by);
+        self.view.pan_by(by);
         if self.view.top() != before {
             self.armed = None;
         }
