@@ -421,10 +421,17 @@ impl Files {
         self.view.set_height(height);
         if !self.opened && height > 0 {
             self.opened = true;
-            self.settle(0);
             if height > 1 {
                 self.view.scroll_to(0);
             }
+            // The scroll clamps the cursor back into what the new viewport
+            // can show, and what it clamps onto may be a heading — a pane
+            // constructed, walked to its bottom, then resized short reaches
+            // exactly that. One comparison on the common path, where the
+            // cursor is already on a file; a never-resting cursor is the
+            // pane's own invariant, and a public view keeps it under every
+            // order of calls.
+            self.settle(0);
         }
     }
 
@@ -1452,6 +1459,22 @@ mod tests {
         assert_eq!(f.status(), "1/6 files");
         f.to_bottom();
         assert_eq!(f.status(), "6/6 files");
+    }
+
+    #[test]
+    fn a_view_resized_short_after_a_bottom_opening_never_parks_on_a_heading() {
+        // The probe behind the settle in `resize`: a pane constructed, sent
+        // to its bottom, then given its first (short) size — the clamp that
+        // puts the cursor back on screen lands on the heading that took the
+        // row, and the settle is what walks it onto a file.
+        let mut f = Files::new(prepare(&twin_status(), "").rows);
+        f.to_bottom();
+        assert!(f.current_file().is_some(), "the pane opened off a file");
+        f.resize(40, 3);
+        assert!(
+            f.current_file().is_some(),
+            "the short resize parked the cursor on a heading"
+        );
     }
 
     #[test]

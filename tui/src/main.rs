@@ -815,7 +815,7 @@ impl App {
                     (view, label)
                 }
                 Err(e) => {
-                    eprintln!("gitten-tui: status failed, showing an empty files pane: {e}");
+                    eprintln!("gitten-tui: status failed, the files pane starts unavailable: {e}");
                     (Files::unavailable(), files::unavailable_label(&described))
                 }
             };
@@ -3934,8 +3934,9 @@ diff --git a/tracked.txt b/tracked.txt
             "the raw bytes did not survive the bulk"
         );
 
-        // Cursor anywhere else — including the conflicts heading's section —
-        // stages unstaged and untracked and leaves the conflict alone.
+        // Cursor on the unstaged row (two steps down from the first staged
+        // file): staging gathers unstaged and untracked and leaves the
+        // conflict alone.
         app.dispatch("view.down");
         app.dispatch("view.down");
         let writes = state.lock().unwrap().writes.len();
