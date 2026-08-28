@@ -3946,9 +3946,12 @@ diff --git a/tracked.txt b/tracked.txt
         head_reads: usize,
         /// Every branch or tag write that reached the repository — as the
         /// person-readable line a test asserts against, and as the raw bytes
-        /// the lossy line cannot carry. Tags keep their name/target pair.
+        /// the lossy line cannot carry. Tags keep their name/target pair,
+        /// and a rename keeps the bytes it was aimed *from* — the half of
+        /// the verb whose exactness a lossy line can never show.
         branch_writes: Vec<String>,
         branch_bytes: Vec<Vec<u8>>,
+        rename_froms: Vec<Vec<u8>>,
         tags_written: Vec<(Vec<u8>, Vec<u8>)>,
         /// When set, the next branch/tag write fails with exactly this
         /// message and changes nothing: git's refusal, verbatim.
@@ -4124,6 +4127,7 @@ diff --git a/tracked.txt b/tracked.txt
                 String::from_utf8_lossy(to)
             ));
             s.branch_bytes.push(to.to_vec());
+            s.rename_froms.push(from.to_vec());
             if let Some(b) = s.locals.iter_mut().find(|b| b.name.as_bytes() == from) {
                 b.name = RefName::from_bytes(to);
             }
@@ -4340,6 +4344,41 @@ diff --git a/tracked.txt b/tracked.txt
                 commit: Some("f00d".into()),
             },
         )
+    }
+
+    /// The branches world the verb tests launch into, layered over the seed:
+    /// `main` under HEAD, a second local whose name is legal bytes and not
+    /// text, and two remotes — one whose branch half holds a slash, so a
+    /// joined refname is information only the joiner can add. Flattened the
+    /// pane reads: `main`, `f<e9>ature`, `origin/feat/ure`, `origin/main`.
+    fn branch_world(state: &Mutex<FakeState>) {
+        let mut s = state.lock().unwrap();
+        s.locals = vec![
+            Branch {
+                name: RefName::from("main"),
+                commit: "f00d".into(),
+                upstream: None,
+                head: true,
+            },
+            Branch {
+                name: RefName::from_bytes(b"f\xe9ature"),
+                commit: "beef".into(),
+                upstream: None,
+                head: false,
+            },
+        ];
+        s.remotes = vec![
+            RemoteBranch {
+                remote: RefName::from("origin"),
+                branch: RefName::from("feat/ure"),
+                commit: "f00d".into(),
+            },
+            RemoteBranch {
+                remote: RefName::from("origin"),
+                branch: RefName::from("main"),
+                commit: "f00d".into(),
+            },
+        ];
     }
 
     /// The fake's stack: two entries, newest first, whose commits are the
@@ -7396,6 +7435,535 @@ diff --git a/tracked.txt b/tracked.txt
             !app.message.contains("branch reads failed"),
             "the stale error outlived its recovery: {:?}",
             app.message
+        );
+    }
+
+    #[test]
+    fn checkout_jobs_local_and_remote_bytes_and_refuses_detached() {
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        let mut app = commits_app(&handle);
+        app.press(Key::plain(Code::Char('3')));
+        assert_eq!(branches_of(&app).status(), "1/4 · main");
+
+        // Space on a local submits `Write::checkout` once, with the row's
+        // raw bytes — whole, and exactly once.
+        app.press(Key::plain(Code::Char(' ')));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                !state.lock().unwrap().branch_writes.is_empty()
+            }),
+            "the checkout never queued"
+        );
+        assert_eq!(state.lock().unwrap().branch_bytes, [b"main".to_vec()]);
+
+        // The non-text local is aimed at by bytes too: the job never saw a
+        // lossy spelling of its name.
+        app.dispatch("view.down");
+        app.press(Key::plain(Code::Char(' ')));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                state.lock().unwrap().branch_writes.len() == 2
+            }),
+            "the second checkout never queued"
+        );
+        assert_eq!(
+            state.lock().unwrap().branch_bytes[1],
+            b"f\xe9ature".to_vec()
+        );
+
+        // A remote row checks out detached, and the refname is joined from
+        // the halves exactly once — the slash in the branch half must not
+        // make two.
+        app.dispatch("view.down");
+        app.press(Key::plain(Code::Char(' ')));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                state.lock().unwrap().branch_writes.len() == 3
+            }),
+            "the remote checkout never queued"
+        );
+        assert_eq!(
+            state.lock().unwrap().branch_bytes[2],
+            b"origin/feat/ure".to_vec()
+        );
+
+        // The fake detached onto the fetched commit; the refreshed pane
+        // leads with the detached row, and that row refuses by name — a
+        // place, not a branch to move to.
+        app.draw();
+        app.dispatch("view.top");
+        assert!(matches!(
+            branches_of(&app).current(),
+            Some(Target::Detached)
+        ));
+        app.press(Key::plain(Code::Char(' ')));
+        app.drain_jobs();
+        assert_eq!(app.message, "HEAD is already detached here");
+        assert_eq!(
+            state.lock().unwrap().branch_writes.len(),
+            3,
+            "a detached checkout queued"
+        );
+
+        // A refusal is git's sentence verbatim, and it still staled the
+        // panes: the finish advances the generation however the job ended.
+        state.lock().unwrap().refuse_branch =
+            Some("error: Your local changes would be overwritten".into());
+        app.dispatch("view.down");
+        app.press(Key::plain(Code::Char(' ')));
+        let gen = app.generation;
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > gen
+            }),
+            "the refused checkout never finished"
+        );
+        assert_eq!(
+            app.message,
+            "error: Your local changes would be overwritten"
+        );
+        assert_eq!(
+            state.lock().unwrap().branch_writes.len(),
+            3,
+            "a refused checkout recorded a write"
+        );
+
+        // An empty pane has nothing to aim at, and says so before the queue.
+        let (handle, state) = fake(&[]);
+        {
+            let mut s = state.lock().unwrap();
+            s.locals.clear();
+            s.remotes.clear();
+        }
+        let mut app = commits_app(&handle);
+        app.press(Key::plain(Code::Char('3')));
+        app.dispatch("branches.checkout");
+        assert_eq!(app.message, "nothing selected to check out");
+        assert!(state.lock().unwrap().branch_writes.is_empty());
+    }
+
+    #[test]
+    fn new_branch_prompt_accepts_one_name_and_never_checks_it_out() {
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        let mut app = commits_app(&handle);
+        app.press(Key::plain(Code::Char('3')));
+
+        // `n` opens one blank field; the typed text is inert until accept.
+        app.press(Key::char('n'));
+        assert!(matches!(app.prompt, Some(Prompt::BranchNew { .. })));
+        app.draw();
+        assert!(status(&app).contains("branch: "), "{:?}", status(&app));
+        type_(&mut app, "topic");
+        app.draw();
+        assert!(status(&app).contains("branch: topic"), "{:?}", status(&app));
+        assert!(
+            state.lock().unwrap().branch_writes.is_empty(),
+            "typing queued a branch"
+        );
+
+        // A paste is one sanitized edit, never a transcript of keypresses:
+        // the newline and the tab become spaces, the control character is
+        // dropped, and the keymap sees none of it.
+        app.input(Input::Paste(" ab\ncd\tef\u{7}".into()));
+        app.draw();
+        assert!(
+            status(&app).contains("branch: topic ab cd ef"),
+            "{:?}",
+            status(&app)
+        );
+
+        // Enter submits `Write::create_branch` once — at HEAD, and nothing
+        // is checked out — and closes the field.
+        app.press(Key::plain(Code::Enter));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                !state.lock().unwrap().branch_writes.is_empty()
+            }),
+            "the create never queued"
+        );
+        assert_eq!(
+            state.lock().unwrap().branch_writes,
+            ["branch topic ab cd ef at HEAD"]
+        );
+        assert_eq!(
+            state.lock().unwrap().branch_bytes,
+            [b"topic ab cd ef".to_vec()]
+        );
+        assert!(app.prompt.is_none(), "the field outlived its accept");
+        assert_eq!(
+            branches_of(&app).status(),
+            "1/5 · main",
+            "the created branch did not land in the refreshed pane"
+        );
+
+        // Whitespace-only accept is refused beside the field, without a job.
+        app.press(Key::char('n'));
+        type_(&mut app, "   ");
+        app.press(Key::plain(Code::Enter));
+        assert_eq!(app.message, "a branch needs a name");
+        assert!(app.prompt.is_none(), "a refused accept left the field open");
+        assert_eq!(state.lock().unwrap().branch_writes.len(), 1);
+
+        // Esc cancels: the text was the field's and dies with it.
+        app.press(Key::char('n'));
+        type_(&mut app, "ghost");
+        app.press(Key::plain(Code::Esc));
+        assert!(app.prompt.is_none());
+        app.drain_jobs();
+        assert_eq!(state.lock().unwrap().branch_writes.len(), 1);
+
+        // An empty (unborn) repository's pane still answers `n`: creating
+        // reads no row, and whether HEAD is a valid start is the backend's
+        // to say, not the view's.
+        let (handle, state) = fake(&[]);
+        {
+            let mut s = state.lock().unwrap();
+            s.locals.clear();
+            s.remotes.clear();
+            s.head = Some(HeadState::Branch {
+                name: RefName::from("main"),
+                commit: None,
+            });
+        }
+        let mut app = commits_app(&handle);
+        app.press(Key::plain(Code::Char('3')));
+        assert_eq!(branches_of(&app).status(), "no branches");
+        app.press(Key::char('n'));
+        type_(&mut app, "first");
+        app.press(Key::plain(Code::Enter));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                !state.lock().unwrap().branch_writes.is_empty()
+            }),
+            "the unborn-repository create never queued"
+        );
+        assert_eq!(
+            state.lock().unwrap().branch_writes,
+            ["branch first at HEAD"]
+        );
+        assert_eq!(
+            branches_of(&app).status(),
+            "1/1 · first",
+            "the created branch did not land in the refreshed pane"
+        );
+    }
+
+    #[test]
+    fn rename_prompt_captures_raw_from_and_prefills_only_utf8() {
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        let mut app = commits_app(&handle);
+        app.press(Key::plain(Code::Char('3')));
+
+        // A text name is prefilled and wholly selected: the first edit
+        // replaces it, it is not glued to the front of whatever was typed.
+        app.press(Key::char('R'));
+        assert!(matches!(app.prompt, Some(Prompt::BranchRename { .. })));
+        app.draw();
+        assert!(status(&app).contains("rename: main"), "{:?}", status(&app));
+        type_(&mut app, "x");
+        app.draw();
+        assert!(status(&app).contains("rename: x"), "{:?}", status(&app));
+        assert!(
+            !status(&app).contains("main"),
+            "the prefill survived the first edit"
+        );
+
+        // Unchanged accept is allowed through to git — its "already
+        // exists" says more than a client-side veto would.
+        app.press(Key::plain(Code::Esc));
+        app.press(Key::char('R'));
+        app.press(Key::plain(Code::Enter));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                !state.lock().unwrap().branch_writes.is_empty()
+            }),
+            "the unchanged rename never queued"
+        );
+        assert_eq!(state.lock().unwrap().branch_writes, ["rename main → main"]);
+        assert_eq!(state.lock().unwrap().rename_froms, [b"main".to_vec()]);
+
+        // The non-text local opens *blank* — a lossy prefill would rename
+        // the branch to its own mojibake — while `from` keeps the exact
+        // bytes and the job aims at them.
+        app.dispatch("view.down");
+        app.press(Key::char('R'));
+        app.draw();
+        assert!(status(&app).contains("rename: "), "{:?}", status(&app));
+        assert!(
+            !status(&app).contains('\u{fffd}'),
+            "the field opened with lossy bytes: {:?}",
+            status(&app)
+        );
+        type_(&mut app, "renamed");
+        app.press(Key::plain(Code::Enter));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                state.lock().unwrap().branch_writes.len() == 2
+            }),
+            "the byte-preserving rename never queued"
+        );
+        assert_eq!(
+            state.lock().unwrap().branch_writes[1],
+            "rename f\u{fffd}ature → renamed"
+        );
+        assert_eq!(
+            state.lock().unwrap().rename_froms[1],
+            b"f\xe9ature".to_vec()
+        );
+        assert_eq!(state.lock().unwrap().branch_bytes[1], b"renamed".to_vec());
+
+        // Empty accept queues nothing.
+        app.press(Key::char('R'));
+        type_(&mut app, "  ");
+        app.press(Key::plain(Code::Enter));
+        assert_eq!(app.message, "a branch needs a name");
+        assert_eq!(state.lock().unwrap().branch_writes.len(), 2);
+
+        // A remote row refuses before any field stands.
+        app.dispatch("view.down");
+        app.dispatch("view.down");
+        app.press(Key::char('R'));
+        assert_eq!(app.message, "only a local branch can be renamed");
+        assert!(app.prompt.is_none());
+        assert_eq!(state.lock().unwrap().branch_writes.len(), 2);
+
+        // So does the detached row, in a world that opens detached.
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        {
+            let mut s = state.lock().unwrap();
+            s.head = Some(HeadState::Detached {
+                commit: "f00d".into(),
+            });
+            s.locals[0].head = false;
+        }
+        let mut app = commits_app(&handle);
+        app.press(Key::plain(Code::Char('3')));
+        app.dispatch("view.top");
+        assert!(matches!(
+            branches_of(&app).current(),
+            Some(Target::Detached)
+        ));
+        app.press(Key::char('R'));
+        assert_eq!(app.message, "only a local branch can be renamed");
+        assert!(app.prompt.is_none());
+    }
+
+    #[test]
+    fn new_tag_captures_local_raw_target_and_creates_lightweight_tag() {
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        let mut app = commits_app(&handle);
+        app.press(Key::plain(Code::Char('3')));
+        app.dispatch("view.down");
+
+        // `T` opens one blank tag field over the row's branch — captured at
+        // open, so nothing a cursor does while the field holds the keyboard
+        // can re-aim the tag.
+        app.press(Key::char('T'));
+        assert!(matches!(app.prompt, Some(Prompt::TagNew { .. })));
+        app.draw();
+        assert!(status(&app).contains("tag: "), "{:?}", status(&app));
+        type_(&mut app, "v1");
+        app.press(Key::plain(Code::Enter));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                !state.lock().unwrap().tags_written.is_empty()
+            }),
+            "the tag never queued"
+        );
+        assert_eq!(
+            state.lock().unwrap().tags_written,
+            [(b"v1".to_vec(), b"f\xe9ature".to_vec())],
+            "the tag was not aimed at the row's raw bytes"
+        );
+        assert_eq!(
+            state.lock().unwrap().branch_writes,
+            ["tag v1 at f\u{fffd}ature"],
+            "a lightweight tag carries no message"
+        );
+
+        // The name is trimmed before it is queued — git would hold the
+        // padding as part of the name.
+        app.dispatch("view.top");
+        app.press(Key::char('T'));
+        type_(&mut app, "  v2  ");
+        app.press(Key::plain(Code::Enter));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                state.lock().unwrap().tags_written.len() == 2
+            }),
+            "the second tag never queued"
+        );
+        assert_eq!(
+            state.lock().unwrap().tags_written[1],
+            (b"v2".to_vec(), b"main".to_vec())
+        );
+
+        // A duplicate rides on to git and comes back in its words.
+        state.lock().unwrap().refuse_tag = Some("fatal: tag 'v2' already exists".into());
+        app.press(Key::char('T'));
+        type_(&mut app, "v2");
+        app.press(Key::plain(Code::Enter));
+        let gen = app.generation;
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > gen
+            }),
+            "the refused tag never finished"
+        );
+        assert_eq!(app.message, "fatal: tag 'v2' already exists");
+        assert_eq!(state.lock().unwrap().tags_written.len(), 2);
+
+        // Whitespace says so beside the field, without a job.
+        app.press(Key::char('T'));
+        type_(&mut app, "   ");
+        app.press(Key::plain(Code::Enter));
+        assert_eq!(app.message, "a tag needs a name");
+        assert!(app.prompt.is_none());
+        assert_eq!(state.lock().unwrap().tags_written.len(), 2);
+
+        // A remote row refuses before any field stands.
+        app.dispatch("view.down");
+        app.dispatch("view.down");
+        app.press(Key::char('T'));
+        assert_eq!(app.message, "only a local branch can be tagged here");
+        assert!(app.prompt.is_none());
+
+        // So does the detached row.
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        {
+            let mut s = state.lock().unwrap();
+            s.head = Some(HeadState::Detached {
+                commit: "f00d".into(),
+            });
+            s.locals[0].head = false;
+        }
+        let mut app = commits_app(&handle);
+        app.press(Key::plain(Code::Char('3')));
+        app.dispatch("view.top");
+        app.press(Key::char('T'));
+        assert_eq!(app.message, "only a local branch can be tagged here");
+        assert!(app.prompt.is_none());
+        assert!(state.lock().unwrap().tags_written.is_empty());
+    }
+
+    #[test]
+    fn generic_prompt_preserves_search_lifecycle_and_mouse_inertness() {
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        let mut app = commits_app(&handle);
+
+        // The search lifecycle, still green after the prompt became a typed
+        // enum: live filtering, keep on Enter, restore on Esc.
+        app.press(Key::char('/'));
+        assert!(matches!(app.prompt, Some(Prompt::Search { .. })));
+        type_(&mut app, "commit 9");
+        let live = commits_of(&app).filter_note();
+        assert!(live.is_some(), "the edit did not filter live");
+        app.press(Key::plain(Code::Enter));
+        assert_eq!(
+            commits_of(&app).filter_note(),
+            live,
+            "enter did not keep the query"
+        );
+        let standing = commits_of(&app).filter_note();
+
+        // A branch name field is the same one-line prompt with a different
+        // consumer — and a standing query is nobody's business while it
+        // edits: neither the typing nor the cancel touches the list's
+        // filter, and nothing moves under the field.
+        app.press(Key::plain(Code::Char('3')));
+        let cursor = branches_of(&app).cursor();
+        app.press(Key::char('n'));
+        assert!(matches!(app.prompt, Some(Prompt::BranchNew { .. })));
+        type_(&mut app, "topic");
+        assert_eq!(
+            commits_of(&app).filter_note(),
+            standing,
+            "a name edit reached the search"
+        );
+        app.press(Key::plain(Code::Esc));
+        assert!(app.prompt.is_none());
+        assert_eq!(
+            commits_of(&app).filter_note(),
+            standing,
+            "a name cancel cleared the search"
+        );
+        assert_eq!(
+            branches_of(&app).cursor(),
+            cursor,
+            "the field moved the cursor"
+        );
+        app.drain_jobs();
+        assert!(state.lock().unwrap().branch_writes.is_empty());
+
+        // While any field stands the keyboard is input's: a digit does not
+        // focus a pane — it is text — a mouse press moves nothing, and the
+        // field survives both.
+        app.draw();
+        app.press(Key::char('n'));
+        app.press(Key::plain(Code::Char('4')));
+        assert!(
+            matches!(app.prompt, Some(Prompt::BranchNew { .. })),
+            "the digit closed the field"
+        );
+        app.draw();
+        assert!(status(&app).contains("4"), "the digit never became text");
+        assert_eq!(
+            app.panes.focused_name(),
+            "branches",
+            "the digit focused a pane from the field"
+        );
+        app.mouse(click(MouseKind::Down, 5, 15));
+        app.mouse(click(MouseKind::Up, 5, 15));
+        assert_eq!(
+            app.panes.focused_name(),
+            "branches",
+            "the mouse moved focus under a field"
+        );
+        assert!(
+            matches!(app.prompt, Some(Prompt::BranchNew { .. })),
+            "the mouse closed the field"
+        );
+        app.press(Key::plain(Code::Esc));
+        assert!(app.prompt.is_none());
+
+        // And a name prompt accepted after all of it still creates — the
+        // field is input, and the world was only ever waiting. The standing
+        // query outlives it too; the note's *denominator* is the list's own
+        // business, and the fake's re-read log is shorter than the hundred
+        // the pane was constructed with.
+        app.press(Key::char('n'));
+        type_(&mut app, "made-later");
+        app.press(Key::plain(Code::Enter));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                !state.lock().unwrap().branch_writes.is_empty()
+            }),
+            "the create never queued"
+        );
+        assert_eq!(state.lock().unwrap().branch_bytes, [b"made-later".to_vec()]);
+        assert_eq!(
+            commits_of(&app).query(),
+            Some("commit 9"),
+            "an accept reached the search"
         );
     }
 }
