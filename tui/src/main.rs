@@ -7355,13 +7355,13 @@ diff --git a/tracked.txt b/tracked.txt
         // The next successful wave fills what failed — the same generation
         // rail any write finish rides — and the error leaves the status line.
         state.lock().unwrap().fail_locals = None;
-        let reads = state.lock().unwrap().branch_reads;
+        let gen = app.generation;
         let job = Write::stash_apply(&handle, 0);
         assert!(app.submitter.submit(Box::new(job)).is_ok(), "queued");
         assert!(
             until(Duration::from_secs(2), || {
                 app.drain_jobs();
-                state.lock().unwrap().branch_reads > reads
+                app.generation > gen
             }),
             "the recovery never re-read the refs"
         );
@@ -7378,13 +7378,13 @@ diff --git a/tracked.txt b/tracked.txt
         // so; a later wave retries.
         state.lock().unwrap().fail_locals = Some("fatal: bad object refs/heads".into());
         let before = app.panes.get("branches").unwrap().generation();
-        let reads = state.lock().unwrap().branch_reads;
+        let gen = app.generation;
         let job = Write::stash_apply(&handle, 0);
         assert!(app.submitter.submit(Box::new(job)).is_ok(), "queued");
         assert!(
             until(Duration::from_secs(2), || {
                 app.drain_jobs();
-                state.lock().unwrap().branch_reads > reads
+                app.generation > gen
             }),
             "the failed wave never finished"
         );
@@ -7421,13 +7421,13 @@ diff --git a/tracked.txt b/tracked.txt
         // And the recovery is the same rail: the head read repeats on the
         // next wave and the error leaves.
         state.lock().unwrap().fail_head = None;
-        let reads = state.lock().unwrap().head_reads;
+        let gen = app.generation;
         let job = Write::stash_apply(&handle, 0);
         assert!(app.submitter.submit(Box::new(job)).is_ok(), "queued");
         assert!(
             until(Duration::from_secs(2), || {
                 app.drain_jobs();
-                state.lock().unwrap().head_reads > reads
+                app.generation > gen
             }),
             "the head re-read never happened"
         );
@@ -7448,11 +7448,12 @@ diff --git a/tracked.txt b/tracked.txt
 
         // Space on a local submits `Write::checkout` once, with the row's
         // raw bytes — whole, and exactly once.
+        let gen = app.generation;
         app.press(Key::plain(Code::Char(' ')));
         assert!(
             until(Duration::from_secs(2), || {
                 app.drain_jobs();
-                !state.lock().unwrap().branch_writes.is_empty()
+                app.generation > gen
             }),
             "the checkout never queued"
         );
@@ -7461,11 +7462,12 @@ diff --git a/tracked.txt b/tracked.txt
         // The non-text local is aimed at by bytes too: the job never saw a
         // lossy spelling of its name.
         app.dispatch("view.down");
+        let gen = app.generation;
         app.press(Key::plain(Code::Char(' ')));
         assert!(
             until(Duration::from_secs(2), || {
                 app.drain_jobs();
-                state.lock().unwrap().branch_writes.len() == 2
+                app.generation > gen
             }),
             "the second checkout never queued"
         );
@@ -7478,11 +7480,12 @@ diff --git a/tracked.txt b/tracked.txt
         // the halves exactly once — the slash in the branch half must not
         // make two.
         app.dispatch("view.down");
+        let gen = app.generation;
         app.press(Key::plain(Code::Char(' ')));
         assert!(
             until(Duration::from_secs(2), || {
                 app.drain_jobs();
-                state.lock().unwrap().branch_writes.len() == 3
+                app.generation > gen
             }),
             "the remote checkout never queued"
         );
@@ -7580,11 +7583,12 @@ diff --git a/tracked.txt b/tracked.txt
 
         // Enter submits `Write::create_branch` once — at HEAD, and nothing
         // is checked out — and closes the field.
+        let gen = app.generation;
         app.press(Key::plain(Code::Enter));
         assert!(
             until(Duration::from_secs(2), || {
                 app.drain_jobs();
-                !state.lock().unwrap().branch_writes.is_empty()
+                app.generation > gen
             }),
             "the create never queued"
         );
@@ -7637,11 +7641,12 @@ diff --git a/tracked.txt b/tracked.txt
         assert_eq!(branches_of(&app).status(), "no branches");
         app.press(Key::char('n'));
         type_(&mut app, "first");
+        let gen = app.generation;
         app.press(Key::plain(Code::Enter));
         assert!(
             until(Duration::from_secs(2), || {
                 app.drain_jobs();
-                !state.lock().unwrap().branch_writes.is_empty()
+                app.generation > gen
             }),
             "the unborn-repository create never queued"
         );
@@ -7681,11 +7686,12 @@ diff --git a/tracked.txt b/tracked.txt
         // exists" says more than a client-side veto would.
         app.press(Key::plain(Code::Esc));
         app.press(Key::char('R'));
+        let gen = app.generation;
         app.press(Key::plain(Code::Enter));
         assert!(
             until(Duration::from_secs(2), || {
                 app.drain_jobs();
-                !state.lock().unwrap().branch_writes.is_empty()
+                app.generation > gen
             }),
             "the unchanged rename never queued"
         );
@@ -7705,11 +7711,12 @@ diff --git a/tracked.txt b/tracked.txt
             status(&app)
         );
         type_(&mut app, "renamed");
+        let gen = app.generation;
         app.press(Key::plain(Code::Enter));
         assert!(
             until(Duration::from_secs(2), || {
                 app.drain_jobs();
-                state.lock().unwrap().branch_writes.len() == 2
+                app.generation > gen
             }),
             "the byte-preserving rename never queued"
         );
@@ -7951,11 +7958,12 @@ diff --git a/tracked.txt b/tracked.txt
         // the pane was constructed with.
         app.press(Key::char('n'));
         type_(&mut app, "made-later");
+        let gen = app.generation;
         app.press(Key::plain(Code::Enter));
         assert!(
             until(Duration::from_secs(2), || {
                 app.drain_jobs();
-                !state.lock().unwrap().branch_writes.is_empty()
+                app.generation > gen
             }),
             "the create never queued"
         );
@@ -7965,5 +7973,655 @@ diff --git a/tracked.txt b/tracked.txt
             Some("commit 9"),
             "an accept reached the search"
         );
+    }
+
+    #[test]
+    fn delete_arms_same_raw_target_then_submits_non_force_once() {
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        let mut app = commits_app(&handle);
+        app.draw();
+        app.press(Key::plain(Code::Char('3')));
+
+        // First press: the exact question, nothing queued, and the armed
+        // row itself in the chrome's error ink — the thing a second press
+        // destroys is named by its own colour, focused or not.
+        app.press(Key::char('d'));
+        app.draw();
+        assert_eq!(
+            app.message, "delete branch main? press again to confirm",
+            "{:?}",
+            app.message
+        );
+        assert!(state.lock().unwrap().branch_writes.is_empty());
+        assert!(
+            branches_of(&app).armed_row().is_some(),
+            "the first press did not arm"
+        );
+        {
+            let rect = app.pane_rect("branches").expect("placed");
+            let ink = app
+                .screen
+                .ink(rect.x + 2, rect.y + 1)
+                .expect("a drawn cell");
+            assert_eq!(
+                ink.fg, app.host.theme.chrome.error,
+                "the armed row is not error-tinted"
+            );
+        }
+
+        // A cursor move disarms: the question was about the row the
+        // keyboard used to be on.
+        app.dispatch("view.down");
+        assert_eq!(
+            branches_of(&app).armed_row(),
+            None,
+            "the arm survived a cursor move"
+        );
+
+        // The non-text local arms under its lossy display name, and the arm
+        // is keyed by the raw bytes — the question and the job name the same
+        // branch.
+        app.press(Key::char('d'));
+        assert_eq!(
+            app.message,
+            "delete branch f\u{fffd}ature? press again to confirm"
+        );
+        assert_eq!(
+            branches_of(&app).armed_row(),
+            Some(Target::Local(RefName::from_bytes(b"f\xe9ature")))
+        );
+
+        // Second press on the same raw target: one non-force deletion, the
+        // arm spent, and the refreshed pane without the row.
+        let gen = app.generation;
+        app.press(Key::char('d'));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > gen
+            }),
+            "the confirmed delete never queued"
+        );
+        assert_eq!(
+            state.lock().unwrap().branch_writes,
+            ["delete branch f\u{fffd}ature"]
+        );
+        assert_eq!(state.lock().unwrap().branch_bytes, [b"f\xe9ature".to_vec()]);
+        assert_eq!(
+            branches_of(&app).armed_row(),
+            None,
+            "the arm outlived its spend"
+        );
+        assert_eq!(
+            branches_of(&app).status(),
+            "2/3 · origin/feat/ure",
+            "the deleted branch did not leave the pane"
+        );
+
+        // Focus loss disarms: arm, leave the pane, return — no question
+        // standing. The cursor rests on the row the settle chose after the
+        // delete; back to a local row first, so `d` arms.
+        app.dispatch("view.top");
+        app.press(Key::char('d'));
+        assert!(branches_of(&app).armed_row().is_some());
+        app.press(Key::plain(Code::Char('4')));
+        assert_eq!(
+            branches_of(&app).armed_row(),
+            None,
+            "the arm survived losing the keyboard"
+        );
+        app.press(Key::plain(Code::Char('3')));
+
+        // A prompt disarms too — a question nobody can answer while the
+        // field holds the keyboard is a trap, not a question.
+        app.press(Key::char('d'));
+        assert!(branches_of(&app).armed_row().is_some());
+        app.press(Key::char('n'));
+        assert_eq!(
+            branches_of(&app).armed_row(),
+            None,
+            "the arm survived a prompt"
+        );
+        app.press(Key::plain(Code::Esc));
+
+        // So does a config reload.
+        app.press(Key::char('d'));
+        assert!(branches_of(&app).armed_row().is_some());
+        let path =
+            std::env::temp_dir().join(format!("gitten-tui-branch-{}.toml", std::process::id()));
+        std::fs::write(&path, "[view]\nscrolloff = 1\n").expect("a config file");
+        app.reload(&path);
+        assert_eq!(
+            branches_of(&app).armed_row(),
+            None,
+            "the arm survived a reload"
+        );
+        std::fs::remove_file(&path).ok();
+
+        // The mouse moves the question only by moving the keyboard: a press
+        // on the armed row leaves it standing — that row is still what the
+        // second press would confirm — and a press on another row clears it.
+        app.dispatch("view.top");
+        app.press(Key::char('d'));
+        app.mouse(click(MouseKind::Down, 2, 9));
+        app.mouse(click(MouseKind::Up, 2, 9));
+        assert!(
+            branches_of(&app).armed_row().is_some(),
+            "the arm died on its own row"
+        );
+        app.mouse(click(MouseKind::Down, 2, 11));
+        app.mouse(click(MouseKind::Up, 2, 11));
+        assert_eq!(
+            branches_of(&app).armed_row(),
+            None,
+            "the arm survived a mouse move to another row"
+        );
+
+        // A remote row refuses outright: a tracking ref is the remote's
+        // shadow, and this key is not fetch's prune.
+        app.press(Key::char('d'));
+        assert_eq!(
+            app.message,
+            "a remote branch is its remote's to delete — fetch prunes it here"
+        );
+        assert_eq!(
+            state.lock().unwrap().branch_writes.len(),
+            1,
+            "a remote deletion queued"
+        );
+
+        // So does the detached row, in a world that opens detached.
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        {
+            let mut s = state.lock().unwrap();
+            s.head = Some(HeadState::Detached {
+                commit: "f00d".into(),
+            });
+            s.locals[0].head = false;
+        }
+        let mut app = commits_app(&handle);
+        app.press(Key::plain(Code::Char('3')));
+        app.press(Key::char('d'));
+        assert_eq!(app.message, "a detached HEAD is not a branch");
+
+        // And git's own "not fully merged" comes back verbatim: the force
+        // decision's proper home is git's, and nothing here upgrades the
+        // key behind the reader's back.
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        state.lock().unwrap().refuse_branch =
+            Some("error: the branch 'main' is not fully merged".into());
+        let mut app = commits_app(&handle);
+        app.press(Key::plain(Code::Char('3')));
+        app.press(Key::char('d'));
+        app.press(Key::char('d'));
+        let gen = app.generation;
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > gen
+            }),
+            "the refused delete never finished"
+        );
+        assert_eq!(app.message, "error: the branch 'main' is not fully merged");
+        assert!(state.lock().unwrap().branch_writes.is_empty());
+    }
+
+    #[test]
+    fn every_branch_write_refreshes_every_registered_repository_pane() {
+        for verb in ["checkout", "create", "rename", "delete", "tag"] {
+            let (handle, state) = fake(&[]);
+            branch_world(&state);
+            let mut app = commits_app(&handle);
+            // An acquired diff, so every tenant has something the finish can
+            // stale — the empty pane has nothing to re-read by design.
+            app.dispatch("commits.open-diff");
+            app.press(Key::plain(Code::Char('3')));
+            let (branches_before, remotes_before, head_before) = {
+                let s = state.lock().unwrap();
+                (s.branch_reads, s.remote_reads, s.head_reads)
+            };
+            let (log_before, pairs_before) = {
+                let s = state.lock().unwrap();
+                (s.log_reads, s.pairs_reads)
+            };
+
+            // The verb, as the keys send it.
+            match verb {
+                "checkout" => {
+                    app.dispatch("view.down");
+                    app.press(Key::plain(Code::Char(' ')));
+                }
+                "create" => {
+                    app.press(Key::char('n'));
+                    type_(&mut app, "made");
+                    app.press(Key::plain(Code::Enter));
+                }
+                "rename" => {
+                    app.dispatch("view.down");
+                    app.press(Key::char('R'));
+                    type_(&mut app, "renamed");
+                    app.press(Key::plain(Code::Enter));
+                }
+                "delete" => {
+                    app.dispatch("view.down");
+                    app.press(Key::char('d'));
+                    app.press(Key::char('d'));
+                }
+                _ => {
+                    app.dispatch("view.down");
+                    app.press(Key::char('T'));
+                    type_(&mut app, "v1");
+                    app.press(Key::plain(Code::Enter));
+                }
+            }
+            let gen = app.generation;
+            assert!(
+                until(Duration::from_secs(2), || {
+                    app.drain_jobs();
+                    app.generation > gen
+                }),
+                "{verb}: the write never finished"
+            );
+
+            // The ref reads repeat — all three, the snapshot re-taken — and
+            // the panes nobody is looking at re-read too: the hidden commit
+            // list and the acquired diff behind the focused branches pane.
+            let s = state.lock().unwrap();
+            assert!(
+                s.branch_reads > branches_before
+                    && s.remote_reads > remotes_before
+                    && s.head_reads > head_before,
+                "{verb}: the ref reads did not repeat"
+            );
+            assert!(
+                s.log_reads > log_before,
+                "{verb}: the list was not refreshed"
+            );
+            assert!(
+                s.pairs_reads > pairs_before,
+                "{verb}: the diff was not refreshed"
+            );
+            assert!(!s.branch_writes.is_empty(), "{verb}: no write was recorded");
+            drop(s);
+            for name in app.panes.names().collect::<Vec<_>>() {
+                assert_eq!(
+                    app.panes.get(name).unwrap().generation(),
+                    app.generation,
+                    "{verb}: {name} was not refreshed to the generation"
+                );
+            }
+
+            // And the change itself landed in the refreshed pane, where the
+            // verb's semantics say it should.
+            let status = branches_of(&app).status();
+            match verb {
+                "checkout" => {
+                    assert_eq!(status, "2/4 · f\u{fffd}ature", "{verb}");
+                    app.draw();
+                    let rect = app.pane_rect("branches").expect("placed");
+                    let rows: Vec<String> = ((rect.y + 1)..(rect.y + rect.height))
+                        .map(|y| app.screen.row_text(y))
+                        .collect();
+                    assert!(
+                        rows.iter().any(|r| r.starts_with("● f")),
+                        "{verb}: the checked-out branch is not marked current: {rows:?}"
+                    );
+                    assert!(
+                        rows.iter().any(|r| r.starts_with("• m")),
+                        "{verb}: the branch HEAD left is still marked current: {rows:?}"
+                    );
+                }
+                "create" => assert_eq!(status, "1/5 · main", "{verb}"),
+                "rename" => assert_eq!(status, "2/4 · renamed", "{verb}"),
+                "delete" => assert_eq!(status, "2/3 · origin/feat/ure", "{verb}"),
+                _ => assert_eq!(status, "2/4 · f\u{fffd}ature", "{verb}"),
+            }
+        }
+
+        // Hidden tenants: narrow mode, the branches pane unplaced — and a
+        // branch write still re-reads it, with every other tenant, to the
+        // same generation. The diff is opened first so it, too, has
+        // something a finish can stale.
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        let mut app = commits_app(&handle);
+        app.dispatch("commits.open-diff");
+        app.screen.resize(60, 24);
+        app.press(Key::plain(Code::Char('4')));
+        app.draw();
+        assert!(
+            app.pane_content("branches").is_none(),
+            "narrow mode showed the hidden pane"
+        );
+        let job = Write::create_branch(&handle, b"made-hidden".to_vec(), None);
+        assert!(app.submitter.submit(Box::new(job)).is_ok(), "queued");
+        let gen = app.generation;
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > gen
+            }),
+            "the hidden tenant was not refreshed"
+        );
+        for name in ["commits", "stashes", "diff", "files", "branches"] {
+            assert_eq!(
+                app.panes.get(name).unwrap().generation(),
+                app.generation,
+                "{name} was not refreshed while hidden"
+            );
+        }
+
+        // One refresh failure does not skip the tenants after it: the files
+        // read fails mid-wave, and the branches pane — later in the
+        // registration order — still reaches the generation while the first
+        // error is the one the status line keeps.
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        let mut app = commits_app(&handle);
+        state.lock().unwrap().fail_status = Some("fatal: unable to read the working tree".into());
+        app.press(Key::plain(Code::Char('3')));
+        app.press(Key::char('d'));
+        app.press(Key::char('d'));
+        let gen = app.generation;
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > gen
+            }),
+            "the wave with a failing tenant never finished"
+        );
+        assert_eq!(
+            app.message, "fatal: unable to read the working tree",
+            "the first refresh error did not stand: {:?}",
+            app.message
+        );
+        assert!(
+            app.panes.get("files").unwrap().generation() < app.generation,
+            "a failed tenant claimed the generation"
+        );
+        assert_eq!(
+            app.panes.get("branches").unwrap().generation(),
+            app.generation,
+            "a later tenant was skipped by an earlier one's failure"
+        );
+
+        // A refused write is the same contract: the finish advances the
+        // generation and the refs are re-read, refusal or not.
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        state.lock().unwrap().refuse_branch =
+            Some("error: the branch 'main' is not fully merged".into());
+        let mut app = commits_app(&handle);
+        app.press(Key::plain(Code::Char('3')));
+        let reads = state.lock().unwrap().branch_reads;
+        app.press(Key::plain(Code::Char(' ')));
+        let gen = app.generation;
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > gen && state.lock().unwrap().branch_reads > reads
+            }),
+            "the refused write did not trigger the refresh"
+        );
+        assert_eq!(
+            app.panes.get("branches").unwrap().generation(),
+            app.generation,
+            "the refused write's finish did not refresh the pane"
+        );
+    }
+
+    #[test]
+    fn branch_header_status_copy_and_help_use_live_registry_data() {
+        let (handle, _state) = fake(&[]);
+        branch_world(&_state);
+        let mut app = commits_app(&handle);
+        app.press(Key::plain(Code::Char('3')));
+        app.draw();
+
+        // The header says the pane's name, the focus key out of the *live*
+        // keymap — the shipped `3`, here without any local table — and the
+        // label counting the groups the read brought back.
+        let rect = app.pane_rect("branches").expect("placed");
+        let header = app
+            .screen
+            .row_text(rect.y)
+            .chars()
+            .take(40)
+            .collect::<String>();
+        assert!(header.contains("branches"), "{header:?}");
+        assert!(header.contains('3'), "{header:?}");
+        assert!(header.contains("fake (main) · 2 local"), "{header:?}");
+
+        // The title and the status line follow the keyboard.
+        assert!(
+            app.screen.row_text(0).contains("branches"),
+            "the title did not follow: {:?}",
+            app.screen.row_text(0)
+        );
+        assert!(
+            app.screen.row_text(23).contains("branches · 1/4 · main"),
+            "the status did not follow: {:?}",
+            app.screen.row_text(23)
+        );
+
+        // `y` copies exactly the selected refname, as git spells it — the
+        // bare name here, the joined remote/branch there, and nothing at all
+        // for a row no verb can act on.
+        app.dispatch("copy.selection");
+        assert_eq!(app.copy.as_deref(), Some("main"));
+        app.dispatch("view.down");
+        app.dispatch("view.down");
+        app.dispatch("copy.selection");
+        assert_eq!(app.copy.as_deref(), Some("origin/feat/ure"));
+
+        // The help panel lists the five included verbs straight out of the
+        // shared registry — and the rebase row core binds in this mode,
+        // which this pass deliberately leaves unhandled: the gap is visible
+        // in the one place that exists for it, not hidden. Tall enough that
+        // the panel shows past the global section into the focused mode's
+        // own bindings.
+        app.screen = Screen::new(120, 50);
+        app.press(Key::char('?'));
+        app.draw();
+        let help = (0..50)
+            .map(|y| app.screen.row_text(y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for doc in [
+            "focus the branches pane",
+            "check out the selected branch",
+            "create a branch",
+            "rename the selected branch",
+            // The panel's column is finite and the longest descriptions
+            // truncate; each marker below survives its own truncation.
+            "delete the selected branch",
+            "name the selected branch's",
+            "move the current branch onto",
+        ] {
+            assert!(help.contains(doc), "help is missing {doc:?}: {help:?}");
+        }
+    }
+
+    #[test]
+    fn rebase_commands_remain_explicitly_deferred() {
+        // The scope fence for the named lifecycle follow-up — rebase-onto,
+        // conflict state, abort and continue — not the desired final
+        // product: the keys keep saying they do nothing here, and no job is
+        // ever submitted.
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        let mut app = commits_app(&handle);
+        app.press(Key::plain(Code::Char('3')));
+
+        // The key resolves through core's branches mode — lowercase `r` —
+        // and lands on the same unimplemented name.
+        app.press(Key::char('r'));
+        assert_eq!(app.message, "commits.rebase-onto does nothing here");
+        app.dispatch("commits.rebase-onto");
+        assert_eq!(app.message, "commits.rebase-onto does nothing here");
+
+        // From the commits pane, the two exits say the same thing.
+        app.press(Key::plain(Code::Char('4')));
+        app.dispatch("rebase.abort");
+        assert_eq!(app.message, "rebase.abort does nothing here");
+        app.dispatch("rebase.continue");
+        assert_eq!(app.message, "rebase.continue does nothing here");
+
+        app.drain_jobs();
+        let s = state.lock().unwrap();
+        assert!(
+            s.branch_writes.is_empty() && s.writes.is_empty(),
+            "a rebase job was submitted: {:?}",
+            s.branch_writes
+        );
+    }
+
+    #[test]
+    fn wave_one_and_plan_016_features_survive_a_third_tenant() {
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        let mut app = commits_app(&handle);
+        app.draw();
+        app.dispatch("commits.open-diff");
+        app.draw();
+
+        // Focus: the digits and the cycle still walk the ring, and the
+        // title, header and status all follow the keyboard.
+        app.press(Key::plain(Code::Char('3')));
+        assert_eq!(app.panes.focused_name(), "branches");
+        app.draw();
+        assert!(
+            app.screen.row_text(0).contains("branches"),
+            "the title did not follow: {:?}",
+            app.screen.row_text(0)
+        );
+        assert!(
+            app.screen.row_text(7).contains('3') && app.screen.row_text(7).contains("branches"),
+            "the header did not advertise the pane: {:?}",
+            app.screen.row_text(7)
+        );
+        assert!(
+            app.screen.row_text(23).contains("branches · 1/4 · main"),
+            "the status did not follow: {:?}",
+            app.screen.row_text(23)
+        );
+
+        // Enter still replaces and focuses the persistent diff, and Back
+        // returns to the last list — the branches pane included in `last_list`.
+        app.dispatch("commits.open-diff");
+        assert_eq!(app.panes.focused_name(), "diff");
+        app.dispatch("back");
+        assert_eq!(app.panes.focused_name(), "branches", "back lost the list");
+        app.dispatch("commits.open-diff");
+        app.press(Key::plain(Code::Char('4')));
+        app.dispatch("back");
+        assert_eq!(app.panes.focused_name(), "commits");
+
+        // Search still targets the commit list — by the pane's own name,
+        // not by whoever holds the keyboard.
+        app.press(Key::char('/'));
+        assert!(matches!(app.prompt, Some(Prompt::Search { .. })));
+        type_(&mut app, "commit 9");
+        app.press(Key::plain(Code::Enter));
+        let mut direct = Commits::new(hundred_commits());
+        direct.apply_query("commit 9");
+        assert_eq!(
+            commits_of(&app).filter_note(),
+            direct.filter_note(),
+            "search did not reach the list"
+        );
+
+        // Hunk verbs still route to the diff pane and its own gate — not to
+        // the pane that holds the keyboard, and not to the branches.
+        app.press(Key::plain(Code::Char('0')));
+        app.dispatch("diff.stage-hunk");
+        assert_eq!(
+            app.message,
+            "only the working-tree diff can act on hunks — this one is between commits"
+        );
+        assert!(
+            state.lock().unwrap().branch_writes.is_empty(),
+            "the hunk verb reached the branches"
+        );
+
+        // Mouse capture: a drag in the commit list selects its rows and its
+        // release reads that pane; a press in the branches slice moves the
+        // keyboard there, and a drag inside it builds no selection — a ref
+        // list is acted on one row at a time.
+        app.dispatch("commits.focus");
+        app.mouse(click(MouseKind::Down, 5, 15));
+        app.mouse(click(MouseKind::Drag, 5, 17));
+        app.mouse(click(MouseKind::Up, 5, 17));
+        assert!(
+            !commits_of(&app).selection().is_empty(),
+            "the drag in the list selected nothing"
+        );
+        app.mouse(click(MouseKind::Down, 5, 9));
+        assert_eq!(
+            app.panes.focused_name(),
+            "branches",
+            "the press did not move the keyboard to the branches"
+        );
+        app.mouse(click(MouseKind::Up, 5, 9));
+        app.mouse(click(MouseKind::Down, 5, 9));
+        app.mouse(click(MouseKind::Drag, 5, 11));
+        app.mouse(click(MouseKind::Up, 5, 11));
+        assert_eq!(
+            app.panes.get("branches").map(|pane| pane.selection()),
+            Some(String::new()),
+            "a drag built a branch selection"
+        );
+
+        // Copy on the list still copies the row the keyboard is on.
+        app.press(Key::plain(Code::Char('4')));
+        app.dispatch("copy.selection");
+        assert!(app.copy.is_some(), "the list copied nothing");
+
+        // A reload rebuilds the host and re-applies geometry to every placed
+        // pane — the branches pane included — and keeps the focus where it
+        // was.
+        let path = std::env::temp_dir().join(format!(
+            "gitten-tui-branch-wave-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, "[view]\nscrolloff = 1\n").expect("a config file");
+        app.press(Key::plain(Code::Char('3')));
+        app.reload(&path);
+        assert_eq!(
+            app.panes.focused_name(),
+            "branches",
+            "the reload moved the focus"
+        );
+        assert!(app.pane_content("branches").is_some());
+        std::fs::remove_file(&path).ok();
+
+        // Narrow mode, branches focused: the *other* lists are unplaced —
+        // and stale all the same when a branch write finishes.
+        app.screen.resize(60, 24);
+        app.draw();
+        assert!(
+            app.pane_content("commits").is_none(),
+            "narrow mode showed the hidden pane"
+        );
+        let job = Write::create_branch(&handle, b"made-hidden".to_vec(), None);
+        assert!(app.submitter.submit(Box::new(job)).is_ok(), "queued");
+        let gen = app.generation;
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > gen
+            }),
+            "the hidden tenants were not refreshed"
+        );
+        for name in ["commits", "stashes", "diff", "files", "branches"] {
+            assert_eq!(
+                app.panes.get(name).unwrap().generation(),
+                app.generation,
+                "{name} was not refreshed to the generation"
+            );
+        }
     }
 }
