@@ -2842,6 +2842,10 @@ diff --git a/tracked.txt b/tracked.txt
         /// words, and a test can name which of the two errors stood.
         fail_log: Option<String>,
         fail_pairs: Option<String>,
+        /// When set, the stash *read* fails with exactly this message — the
+        /// ancillary read that happens at `App::new`, so a test can launch
+        /// into the unavailable tenant rather than only probing it.
+        fail_stashes: Option<String>,
         /// The stack the ancillary read answers, newest first, and how many
         /// times it was read. Writes record the address they aimed at and,
         /// when they land, change what the next read answers — which is what
@@ -2917,6 +2921,9 @@ diff --git a/tracked.txt b/tracked.txt
         fn stashes(&self) -> gitten_git::Result<Vec<Stash>> {
             let mut s = self.0.lock().unwrap();
             s.stash_reads += 1;
+            if let Some(e) = s.fail_stashes.clone() {
+                return Err(e);
+            }
             Ok(s.stashes.clone())
         }
 
@@ -4523,5 +4530,98 @@ diff --git a/tracked.txt b/tracked.txt
         );
         // The refusal removed nothing: the refreshed stack still holds both.
         assert_eq!(s.stashes.len(), 2);
+    }
+
+    #[test]
+    fn a_failed_stash_read_opens_as_unavailable_and_recovers_on_refresh() {
+        let (handle, state) = fake(&[]);
+        // The launch itself carries the failure: the ancillary read at
+        // `App::new` is what fails here, so the unavailable tenant is the
+        // shipped state and not a probe's construction.
+        state.lock().unwrap().fail_stashes = Some("fatal: bad object refs/stash".into());
+        let mut app = commits_app(&handle);
+
+        // A failed side read must not abort a launch the main view made
+        // good: three tenants, the requested startup focus untouched, and
+        // the exact error kept for the status line.
+        assert_eq!(
+            app.panes.names().collect::<Vec<_>>(),
+            ["commits", "stashes", "diff"]
+        );
+        assert_eq!(app.panes.focused_name(), "commits");
+        assert_eq!(app.message, "fatal: bad object refs/stash");
+        app.draw();
+        assert!(
+            app.screen
+                .row_text(23)
+                .contains("fatal: bad object refs/stash"),
+            "the error is not on the status line: {:?}",
+            app.screen.row_text(23)
+        );
+
+        // The tenant is drawn and behaved as *unavailable* — the failure
+        // line, never the empty-stack line that would assert a read that
+        // never succeeded, and no row for a verb to address.
+        assert!(
+            app.screen.row_text(12).contains("unavailable"),
+            "the header did not say so: {:?}",
+            app.screen.row_text(12)
+        );
+        let rows: Vec<String> = (13..23).map(|y| app.screen.row_text(y)).collect();
+        assert!(
+            rows.iter().any(|r| r.contains("stash list unavailable")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().all(|r| !r.contains("nothing stashed")),
+            "a failed read drew as a clean empty stack: {rows:?}"
+        );
+        {
+            let stash = match app.panes.get("stashes") {
+                Some(Screens::Stashes { view, .. }) => view,
+                _ => panic!("the stack is registered"),
+            };
+            assert_eq!(stash.current(), None, "an unavailable stack exposed a row");
+        }
+
+        // The read recovers: the failure mode off, one finish, and the same
+        // tenant re-reads through the existing generation rail and draws
+        // the real stack under its parked label.
+        state.lock().unwrap().fail_stashes = None;
+        let job = Write::stash_apply(&handle, 0);
+        assert!(app.submitter.submit(Box::new(job)).is_ok(), "queued");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > Generation::default()
+            }),
+            "the finish was never drained"
+        );
+        app.draw();
+        assert!(
+            app.screen.row_text(12).contains("fake (main) · 2 parked"),
+            "the header did not recover: {:?}",
+            app.screen.row_text(12)
+        );
+        let rows: Vec<String> = (13..23).map(|y| app.screen.row_text(y)).collect();
+        assert!(rows.iter().any(|r| r.contains("stash@{0}")), "{rows:?}");
+        assert!(
+            !app.screen.row_text(23).contains("fatal:"),
+            "the stale error outlived its recovery: {:?}",
+            app.screen.row_text(23)
+        );
+        assert_eq!(
+            app.panes.get("stashes").map(Screens::generation).as_ref(),
+            Some(&app.generation),
+            "the tenant was not refreshed to the finish"
+        );
+        {
+            let stash = match app.panes.get("stashes") {
+                Some(Screens::Stashes { view, .. }) => view,
+                _ => panic!("the stack is registered"),
+            };
+            assert_eq!(stash.current(), Some(0));
+            assert_eq!(stash.status(), "1/2 · stash@{0}");
+        }
     }
 }

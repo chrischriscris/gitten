@@ -653,13 +653,15 @@ mod tests {
         // trip — moves nothing: the question sits on its row.
         let mut screen = Screen::new(44, 6);
         v.paint(&mut screen, 0, 0, false, &host);
-        v.paint(&mut screen, 0, 0, true, &host);
         assert_eq!(v.armed, Some(0));
-        // The armed row wears the error ink, focused or not — the address
-        // keeps its furniture ink, the message is the thing being asked
-        // about.
+        // The armed row wears the error ink with the keyboard *elsewhere*:
+        // the address keeps its furniture ink, the message is the thing
+        // being asked about, and neither waits for focus.
         let c = &host.theme.chrome;
         assert_eq!(screen.ink(0, 0).unwrap().fg, c.dim);
+        assert_eq!(screen.ink(11, 0).unwrap().fg, c.error);
+        v.paint(&mut screen, 0, 0, true, &host);
+        assert_eq!(v.armed, Some(0), "the focus round trip moved nothing");
         assert_eq!(screen.ink(11, 0).unwrap().fg, c.error);
 
         // And the question is the address, spoken once, exactly.
