@@ -43,12 +43,14 @@
 //! | [`split`] | `SplitRows`: the two-column presentation |
 //! | [`diff`] | the diff view: viewport, reflow, horizontal scroll |
 //! | [`commits`] | the commit list, and the graph gutter in box drawing |
+//! | [`branches`] | the repository's branches: sections, marks, and the armed delete |
 //! | [`stashes`] | the stash stack, one flat address-and-message list |
 //! | [`files`] | the working tree: sections, files, and the armed discard |
 //! | [`scrollbar`] | where you are in a list, drawn over its right-hand column |
 //! | [`help`] | what the keys do, as a function of the keymap |
 //! | [`term`] | the only module that touches `crossterm` |
 
+pub mod branches;
 pub mod commits;
 pub mod diff;
 pub mod files;

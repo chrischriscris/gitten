@@ -47,6 +47,7 @@ use gitten_core::differ::Overrides;
 use gitten_core::host::Host;
 use gitten_core::runs::Run;
 use gitten_core::Hunk;
+use gitten_tui::branches::{self, delete_question, Branches, Marks, Target};
 use gitten_tui::commits::{Commits, Glyphs};
 use gitten_tui::diff::Diff;
 use gitten_tui::files::{self, Files};
@@ -208,6 +209,16 @@ enum Screens {
         label: String,
         generation: Generation,
     },
+    /// The repository's branches. No source, like the files tenant: the pane
+    /// is only ever registered behind a repository — a fixture and a patch
+    /// have no refs to read — so a refresh is a plain re-read through the
+    /// handle the app holds, and the generation rail is the whole of its
+    /// staleness story.
+    Branches {
+        view: Branches,
+        label: String,
+        generation: Generation,
+    },
 }
 
 /// What an empty diff pane's header says instead of a sha it does not have.
@@ -241,6 +252,23 @@ enum Prompt {
     /// `files.amend`'s field — the same field, aimed one step back. Starts
     /// empty: HEAD's old subject is nothing to prefill a rewrite with.
     AmendMessage { text: String },
+    /// `branches.new`'s field. Reads no row: creating is at HEAD, so it is
+    /// available in an empty or unborn repository too. Accepting submits
+    /// [`Write::create_branch`] and checks nothing out.
+    BranchNew { text: String },
+    /// `branches.rename`'s field. `from` is the raw bytes of the branch being
+    /// renamed — what the job is aimed at, whatever the field shows — and
+    /// `selected` says the prefilled name is wholly selected, so the first
+    /// edit replaces it rather than appending to it.
+    BranchRename {
+        from: Vec<u8>,
+        text: String,
+        selected: bool,
+    },
+    /// `branches.new-tag`'s field. `at` is the raw bytes of the local branch
+    /// the tag names — a revspec git resolves, so the tag moves with the
+    /// branch — captured at open and never re-read from the pane.
+    TagNew { at: Vec<u8>, text: String },
 }
 
 impl Prompt {
@@ -248,8 +276,11 @@ impl Prompt {
     fn text(&self) -> &str {
         match self {
             Prompt::Search { query } => query,
-            Prompt::CommitMessage { text } => text,
-            Prompt::AmendMessage { text } => text,
+            Prompt::CommitMessage { text }
+            | Prompt::AmendMessage { text }
+            | Prompt::BranchNew { text }
+            | Prompt::BranchRename { text, .. }
+            | Prompt::TagNew { text, .. } => text,
         }
     }
 
@@ -258,8 +289,11 @@ impl Prompt {
     fn text_mut(&mut self) -> &mut String {
         match self {
             Prompt::Search { query } => query,
-            Prompt::CommitMessage { text } => text,
-            Prompt::AmendMessage { text } => text,
+            Prompt::CommitMessage { text }
+            | Prompt::AmendMessage { text }
+            | Prompt::BranchNew { text }
+            | Prompt::BranchRename { text, .. }
+            | Prompt::TagNew { text, .. } => text,
         }
     }
 
@@ -270,6 +304,9 @@ impl Prompt {
             Prompt::Search { .. } => "/",
             Prompt::CommitMessage { .. } => "commit: ",
             Prompt::AmendMessage { .. } => "amend: ",
+            Prompt::BranchNew { .. } => "branch: ",
+            Prompt::BranchRename { .. } => "rename: ",
+            Prompt::TagNew { .. } => "tag: ",
         }
     }
 }
@@ -282,6 +319,7 @@ impl Screens {
             Screens::Diff { .. } => "diff",
             Screens::Stashes { .. } => "stashes",
             Screens::Files { .. } => "files",
+            Screens::Branches { .. } => "branches",
         }
     }
 
@@ -289,7 +327,8 @@ impl Screens {
         match self {
             Screens::Commits { label, .. }
             | Screens::Diff { label, .. }
-            | Screens::Stashes { label, .. } => label,
+            | Screens::Stashes { label, .. }
+            | Screens::Branches { label, .. } => label,
             Screens::Files { label, .. } => label,
         }
     }
@@ -298,7 +337,8 @@ impl Screens {
         match self {
             Screens::Commits { generation, .. }
             | Screens::Diff { generation, .. }
-            | Screens::Stashes { generation, .. } => *generation,
+            | Screens::Stashes { generation, .. }
+            | Screens::Branches { generation, .. } => *generation,
             Screens::Files { generation, .. } => *generation,
         }
     }
@@ -425,6 +465,33 @@ impl Screens {
                 *generation = target;
                 Some(Ok(()))
             }
+            Screens::Branches {
+                view,
+                label,
+                generation,
+            } => {
+                // The whole of the blocking half: three ref reads, run
+                // beside each other — the same reads the pane was built
+                // from, and the same registration-wide wave every other
+                // pane rides. Nothing here touches the view until the reads
+                // have come back, so a failed refresh leaves the last good
+                // rows standing, at its old generation, for a later wave to
+                // retry.
+                let reads = load_branches(repo);
+                if let Some(e) = reads.error {
+                    return Some(Err(e));
+                }
+                let branches::Prepared { rows, label: next } = branches::prepare(
+                    &reads.local,
+                    &reads.remotes,
+                    reads.head.as_ref(),
+                    &reads.described,
+                );
+                *label = next;
+                view.replace(rows);
+                *generation = target;
+                Some(Ok(()))
+            }
         }
     }
 
@@ -455,6 +522,10 @@ impl Screens {
                 f.set_scrolloff(host.view.scrolloff);
                 f.resize(rect.width, rect.height);
             }
+            Screens::Branches { view: b, .. } => {
+                b.set_scrolloff(host.view.scrolloff);
+                b.resize(rect.width, rect.height);
+            }
         }
     }
 
@@ -476,6 +547,7 @@ impl Screens {
             // The files pane needs no run-list buffer: its rows are cells,
             // not shaped spans.
             Screens::Files { view: f, .. } => f.paint(screen, x, y, focused, host),
+            Screens::Branches { view: b, .. } => b.paint(screen, x, y, focused, host),
         }
     }
 
@@ -485,6 +557,7 @@ impl Screens {
             Screens::Diff { view: d, .. } => d.status(host),
             Screens::Stashes { view: s, .. } => s.status(),
             Screens::Files { view: f, .. } => f.status(),
+            Screens::Branches { view: b, .. } => b.status(),
         }
     }
 
@@ -500,6 +573,7 @@ impl Screens {
             Screens::Diff { view: d, .. } => d.press(col, row, clicks, extend, host),
             Screens::Stashes { view: s, .. } => s.press(col, row, extend, host),
             Screens::Files { view: f, .. } => f.press(col, row, clicks, extend, host),
+            Screens::Branches { view: b, .. } => b.press(col, row, extend, host),
         }
     }
 
@@ -511,6 +585,7 @@ impl Screens {
             Screens::Diff { view: d, .. } => d.drag(col, row, host),
             Screens::Stashes { view: s, .. } => s.drag(row, host),
             Screens::Files { view: f, .. } => f.drag(col, row, host),
+            Screens::Branches { view: b, .. } => b.drag(row, host),
         }
     }
 
@@ -520,6 +595,7 @@ impl Screens {
             Screens::Diff { view: d, .. } => d.release(),
             Screens::Stashes { view: s, .. } => s.release(),
             Screens::Files { view: f, .. } => f.release(),
+            Screens::Branches { view: b, .. } => b.release(),
         }
     }
 
@@ -531,6 +607,7 @@ impl Screens {
             Screens::Diff { view: d, .. } => d.copy_text(),
             Screens::Stashes { view: s, .. } => s.copy_text(),
             Screens::Files { view: f, .. } => f.copy_text(),
+            Screens::Branches { view: b, .. } => b.copy_text(),
         }
     }
 
@@ -545,6 +622,7 @@ impl Screens {
             // A file list has no drag selection, so copy-on-select has
             // nothing to fire on here — the empty answer is the mechanism.
             Screens::Files { view: f, .. } => f.selection(),
+            Screens::Branches { view: b, .. } => b.selection(),
         }
     }
 
@@ -554,6 +632,7 @@ impl Screens {
             Screens::Diff { view: d, .. } => d.select_all(),
             Screens::Stashes { view: s, .. } => s.select_all(),
             Screens::Files { view: f, .. } => f.select_all(),
+            Screens::Branches { view: b, .. } => b.select_all(),
         }
     }
 
@@ -563,6 +642,7 @@ impl Screens {
             Screens::Diff { view: d, .. } => d.select_none(),
             Screens::Stashes { view: s, .. } => s.select_none(),
             Screens::Files { view: f, .. } => f.select_none(),
+            Screens::Branches { view: b, .. } => b.select_none(),
         }
     }
 
@@ -571,7 +651,10 @@ impl Screens {
     fn filter_note(&self) -> Option<String> {
         match self {
             Screens::Commits { view: c, .. } => c.filter_note(),
-            Screens::Diff { .. } | Screens::Stashes { .. } | Screens::Files { .. } => None,
+            Screens::Diff { .. }
+            | Screens::Stashes { .. }
+            | Screens::Files { .. }
+            | Screens::Branches { .. } => None,
         }
     }
 
@@ -639,6 +722,20 @@ impl Screens {
                 "view.top" => f.to_top(),
                 "view.bottom" => f.to_bottom(),
                 // Nothing off the left edge to reach: paths clip rather
+                // than pan.
+                "view.left" | "view.right" => {}
+                _ => return false,
+            },
+            Screens::Branches { view: b, .. } => match command {
+                "view.down" => b.down(),
+                "view.up" => b.up(),
+                "view.page-down" => b.page(1),
+                "view.page-up" => b.page(-1),
+                "view.scroll-down" => b.scroll_y(host.view.rows as isize),
+                "view.scroll-up" => b.scroll_y(-(host.view.rows as isize)),
+                "view.top" => b.to_top(),
+                "view.bottom" => b.to_bottom(),
+                // Nothing off the left edge to reach: names clip rather
                 // than pan.
                 "view.left" | "view.right" => {}
                 _ => return false,
@@ -799,6 +896,12 @@ impl App {
             true => Bar::ascii(),
             false => Bar::default(),
         };
+        // The same trade for the branches pane's marks: `--ascii` replaces
+        // the ref alphabet the way it replaces the graph's and the bar's.
+        let marks = match glyphs == Glyphs::ascii() {
+            true => Marks::ascii(),
+            false => Marks::default(),
+        };
         // The ancillary stack, read beside the view that was asked for: one
         // more `git stash list` after startup already holds the requested
         // view, through the same handle. A read that fails says so and the
@@ -910,6 +1013,7 @@ impl App {
         // drawing a clean tree it cannot prove. The error is logged here,
         // before raw mode, where stderr still goes somewhere readable.
         let launch_focus = panes.focused_name().to_string();
+        let mut branch_error = None;
         if let Some((_, handle)) = &repo {
             let described = handle.describe();
             let (view, files_label) = match handle.status() {
@@ -933,6 +1037,45 @@ impl App {
                     generation: Generation::default(),
                 },
             );
+            // The branches pane, the same product choice one slot over: three
+            // ref reads run beside each other — one spawn floor covers them
+            // all — and the tenant registers whether or not they all came
+            // back. A read that lost the branch lists registers honest
+            // emptiness and keeps the error for the status line; a HEAD-only
+            // failure keeps the rows it did read — the current bit rode in on
+            // the list, not on the head read — and merely loses the detached
+            // row. Either way the launch goes on: a failed side read must
+            // not abort the view the person actually asked for.
+            let reads = load_branches(handle.as_ref());
+            let (rows, branches_label) = match reads.error.as_ref() {
+                // The lists themselves were lost: the pane's data is not
+                // "empty", it is unread, and the label says so while the
+                // error rides to the status line.
+                Some(_) if reads.local.is_empty() && reads.remotes.is_empty() => {
+                    (Vec::new(), branches::unavailable_label(&reads.described))
+                }
+                _ => {
+                    let prepared = branches::prepare(
+                        &reads.local,
+                        &reads.remotes,
+                        reads.head.as_ref(),
+                        &reads.described,
+                    );
+                    (prepared.rows, prepared.label)
+                }
+            };
+            let mut view = Branches::with_marks(rows, marks);
+            view.set_bar(bar);
+            panes.register(
+                "branches",
+                panes::Placement::sidebar("branches"),
+                Screens::Branches {
+                    view,
+                    label: branches_label,
+                    generation: Generation::default(),
+                },
+            );
+            branch_error = reads.error;
             // `register` focuses what it adds; the keyboard goes back to
             // whatever the launch opened on — the commit list or the diff.
             panes.focus_named(&launch_focus);
@@ -969,10 +1112,10 @@ impl App {
         // A failed side read is kept, not fatal: the pane opened as
         // unavailable and its header says so; the exact error goes to the
         // status line, where the person launching can read it, and not to
-        // stderr, which sits behind the alternate screen.
-        if let Some(e) = stash_error {
-            app.message = e;
-        }
+        // stderr, which sits behind the alternate screen. A branch read
+        // failure outranks a stash one only because there is one line and
+        // both panes refresh either way.
+        app.message = branch_error.or(stash_error).unwrap_or_default();
         app.sync_header_keys();
         app.sync_modes();
         app
@@ -1173,6 +1316,10 @@ impl App {
             false => warnings.join(" · "),
         };
         self.sync_header_keys();
+        // A reload is a change of the world the armed question was asked in:
+        // the keymap, the theme and every cached rectangle move at once, so
+        // the question dies with the frame it was asked in.
+        self.disarm_branches();
         // Re-apply geometry to every pane the layout gave a rectangle to, so a
         // changed `[view] scrolloff` and a reflowed presentation reach the
         // panes that do not have the keyboard too. A pane hidden by the narrow
@@ -1332,14 +1479,282 @@ impl App {
         });
     }
 
+    // ------------------------------------------------------- the branch verbs
+
+    /// The focused branches pane's target — what the keyboard is on, as
+    /// verbs aim at it, raw bytes included. `None` when the pane is absent,
+    /// empty, or not the one that holds the keyboard.
+    fn branch_target(&self) -> Option<Target> {
+        match self.panes.focused() {
+            Some(Screens::Branches { view, .. }) => view.current(),
+            _ => None,
+        }
+    }
+
+    /// Whether the keyboard is on the branches pane — the guard every branch
+    /// verb opens with, said the way every wrong-focus refusal here is said.
+    fn branches_focused(&mut self, command: &str) -> bool {
+        match self.panes.focused() {
+            Some(Screens::Branches { .. }) => true,
+            _ => {
+                self.message = format!("{command} is not supported here");
+                false
+            }
+        }
+    }
+
+    /// `branches.checkout`: move HEAD onto the row the keyboard is on.
+    ///
+    /// A remote-tracking row checks out too, and detaches onto the fetched
+    /// commit — git's own answer to "look at what the server has", and the
+    /// reason [`Target`] carries remotes at all; the full refname is joined
+    /// from the halves the model keeps apart, because either may hold a
+    /// slash. The one refusal said here is the detached row itself: already
+    /// a place, not a branch to move to. Everything else — dirty tree,
+    /// unknown name — is git's sentence, surfaced verbatim by the job.
+    fn checkout_branch(&mut self) {
+        if !self.branches_focused("branches.checkout") {
+            return;
+        }
+        let Some(target) = self.branch_target() else {
+            self.message = "nothing selected to check out".into();
+            return;
+        };
+        if matches!(target, Target::Detached) {
+            self.message = "HEAD is already detached here".into();
+            return;
+        }
+        let Some((_, repo)) = self.repo.as_ref() else {
+            self.message = "a fixture has no repository to check out in".into();
+            return;
+        };
+        let name = match target {
+            Target::Local(name) => name,
+            Target::Remote { remote, branch } => {
+                let mut full = remote.as_bytes().to_vec();
+                full.push(b'/');
+                full.extend_from_slice(branch.as_bytes());
+                gitten_core::status::PathBytes::from_bytes(&full)
+            }
+            Target::Detached => unreachable!("refused above"),
+        };
+        let job = Write::checkout(repo, name.as_bytes().to_vec());
+        self.submit(Box::new(job));
+    }
+
+    /// `branches.new`: gather a name on the status row; accept creates at
+    /// HEAD. Reads no row and no repository state — creating never checks
+    /// out, and the backend, not the view, decides whether HEAD is a valid
+    /// start, which is why an empty repository's branches pane still answers
+    /// this key.
+    fn begin_branch_new(&mut self) {
+        if !self.branches_focused("branches.new") {
+            return;
+        }
+        if self.repo.is_none() {
+            self.message = "a fixture has no repository to create branches in".into();
+            return;
+        }
+        self.open_prompt(Prompt::BranchNew {
+            text: String::new(),
+        });
+    }
+
+    /// The accepted branch name, as a job. Empty refused again here — the
+    /// trait refuses it too, but saying so beside the field that just closed
+    /// beats making the reader find out twice.
+    fn submit_branch_new(&mut self, name: String) {
+        if name.trim().is_empty() {
+            self.message = "a branch needs a name".into();
+            return;
+        }
+        if self.panes.get("branches").is_none() {
+            self.message = "the pane the branch was asked over is gone".into();
+            return;
+        }
+        let Some((_, repo)) = self.repo.as_ref() else {
+            self.message = "a fixture has no repository to create branches in".into();
+            return;
+        };
+        let job = Write::create_branch(repo, name.into_bytes(), None);
+        self.submit(Box::new(job));
+    }
+
+    /// `branches.rename`: the same field, pre-filled with the row's own name
+    /// — editing what is there beats retyping it, and accepting unchanged
+    /// text answers with git's "already exists", which says more than a
+    /// client-side veto would. The prefill is the visible spelling only when
+    /// those bytes *are* text: a legal Latin-1 name decodes lossily into
+    /// something with U+FFFD in it — a different name than the branch has —
+    /// so those open blank instead, while `from` stays the exact bytes.
+    fn begin_branch_rename(&mut self) {
+        if !self.branches_focused("branches.rename") {
+            return;
+        }
+        let Some(Target::Local(name)) = self.branch_target() else {
+            self.message = "only a local branch can be renamed".into();
+            return;
+        };
+        if self.repo.is_none() {
+            self.message = "a fixture has no repository to rename in".into();
+            return;
+        }
+        let initial = std::str::from_utf8(name.as_bytes()).unwrap_or("");
+        self.open_prompt(Prompt::BranchRename {
+            from: name.as_bytes().to_vec(),
+            text: initial.to_string(),
+            selected: !initial.is_empty(),
+        });
+    }
+
+    /// The accepted rename, as a job — the same empty refusal the create
+    /// field gives, because the field that failed is the same field.
+    fn submit_branch_rename(&mut self, from: Vec<u8>, name: String) {
+        if name.trim().is_empty() {
+            self.message = "a branch needs a name".into();
+            return;
+        }
+        if self.panes.get("branches").is_none() {
+            self.message = "the pane the branch was asked over is gone".into();
+            return;
+        }
+        let Some((_, repo)) = self.repo.as_ref() else {
+            self.message = "a fixture has no repository to rename in".into();
+            return;
+        };
+        let job = Write::rename_branch(repo, from, name.into_bytes());
+        self.submit(Box::new(job));
+    }
+
+    /// `branches.new-tag`: gather a name on the status row; accept names the
+    /// selected branch with a lightweight tag. The tag's target is the
+    /// branch's raw bytes — a revspec git resolves the same way it resolves a
+    /// sha — captured when the field opens, so nothing a cursor does while
+    /// the field holds the keyboard can re-aim the tag.
+    fn begin_branch_tag(&mut self) {
+        if !self.branches_focused("branches.new-tag") {
+            return;
+        }
+        let Some(Target::Local(name)) = self.branch_target() else {
+            self.message = "only a local branch can be tagged here".into();
+            return;
+        };
+        if self.repo.is_none() {
+            self.message = "a fixture has no repository to tag in".into();
+            return;
+        }
+        self.open_prompt(Prompt::TagNew {
+            at: name.as_bytes().to_vec(),
+            text: String::new(),
+        });
+    }
+
+    /// The accepted tag name, as a job. The text is trimmed before it is
+    /// queued, because git would hold the padding as part of the name; a
+    /// duplicate rides on to git and comes back in its words.
+    fn submit_branch_tag(&mut self, at: Vec<u8>, name: String) {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            self.message = "a tag needs a name".into();
+            return;
+        }
+        if self.panes.get("branches").is_none() {
+            self.message = "the pane the tag was asked over is gone".into();
+            return;
+        }
+        let Some((_, repo)) = self.repo.as_ref() else {
+            self.message = "a fixture has no repository to tag in".into();
+            return;
+        };
+        let job = Write::create_tag(repo, name.into_bytes(), at, None);
+        self.submit(Box::new(job));
+    }
+
+    /// `branches.delete`: the destructive verb of this pane, confirmed on
+    /// the keyboard exactly as `files.discard` is. First press arms the row
+    /// and asks once in the band; second press on the same row deletes —
+    /// merged work only (`force = false`), because an unmerged branch comes
+    /// back refused in git's own words and that sentence is the force
+    /// decision's proper home. Remote rows refuse outright, on purpose: a
+    /// tracking ref is the remote's shadow, and deleting it here would be a
+    /// fetch's prune done by hand under a key that reads as something
+    /// stronger.
+    fn delete_branch_selected(&mut self) {
+        if !self.branches_focused("branches.delete") {
+            return;
+        }
+        let Some(target) = self.branch_target() else {
+            self.message = "nothing selected to delete".into();
+            return;
+        };
+        let shown = match &target {
+            Target::Local(name) => name.to_string_lossy().into_owned(),
+            Target::Remote { remote, branch } => {
+                format!("{}/{}", remote.to_string_lossy(), branch.to_string_lossy())
+            }
+            Target::Detached => {
+                self.message = "a detached HEAD is not a branch".into();
+                return;
+            }
+        };
+        if matches!(target, Target::Remote { .. }) {
+            self.message =
+                "a remote branch is its remote's to delete — fetch prunes it here".into();
+            return;
+        }
+        let Some((_, repo)) = self.repo.as_ref() else {
+            self.message = "a fixture has no repository to delete branches from".into();
+            return;
+        };
+        // Arm, or spend the arm. False means the question was just asked.
+        let confirmed = match self.panes.focused_mut() {
+            Some(Screens::Branches { view, .. }) => view.confirm_or_arm_delete(&target),
+            _ => return,
+        };
+        if !confirmed {
+            self.message = delete_question(&shown);
+            return;
+        }
+        // The question is spent; the running band speaks next.
+        let Target::Local(name) = target else {
+            unreachable!("remotes and detached refuse above");
+        };
+        let job = Write::delete_branch(repo, name.as_bytes().to_vec(), false);
+        self.submit(Box::new(job));
+    }
+
     /// Stands a prompt up and gives it the keyboard — the one path every
     /// prompt opens through, so none can stand while another does and the
-    /// modes always follow.
+    /// modes always follow. A prompt also covers the body, which is why
+    /// every destructive arm dies here: a question nobody can see or answer
+    /// is not a question, it is a trap.
     fn open_prompt(&mut self, prompt: Prompt) {
+        self.disarm_branches();
         self.prompt = Some(prompt);
         self.gesture = None;
         self.pending.clear();
         self.sync_modes();
+    }
+
+    /// Drops the branches pane's destructive arm, if one stands and the pane
+    /// exists. The one place a prompt and a reload both reach — the arm's own
+    /// clearing on moves, wheels, mouse rows and refreshes lives on the view,
+    /// where the keyboard is. Focus is deliberately missing: a round-trip
+    /// across the ring leaves the question standing on its row, the window's
+    /// contract and the files pane's.
+    fn disarm_branches(&mut self) {
+        if let Some(Screens::Branches { view, .. }) = self.panes.get_mut("branches") {
+            view.disarm();
+        }
+    }
+
+    /// Queues a write, or says the queue is going away. The one sentence
+    /// every verb's failure mode shares, factored so a new verb cannot
+    /// forget it.
+    fn submit(&mut self, job: Box<dyn Job>) {
+        if self.submitter.submit(job).is_err() {
+            self.message = "the job queue is shutting down".into();
+        }
     }
 
     /// One edit to the open prompt's text, and the routing the variant asks
@@ -1350,12 +1765,38 @@ impl App {
     /// The edit itself is generic — a character, a removal, a sanitized
     /// paste — and only the search routes the result anywhere: the list
     /// filter rebuilds under it live, because a message being typed is
-    /// nobody else's business until Enter says so.
+    /// nobody else's business until Enter says so. A rename's prefilled name
+    /// is the one other state an edit touches: it arrives wholly selected,
+    /// so the first character or paste replaces it and Backspace clears it —
+    /// editing what is there beats retyping it, but keeping the old name
+    /// glued to the front of whatever was typed serves nobody.
     fn edit_prompt(&mut self, edit: Edit) {
         let routes_live = matches!(&self.prompt, Some(Prompt::Search { .. }));
         let Some(prompt) = self.prompt.as_mut() else {
             return;
         };
+        if let Prompt::BranchRename { text, selected, .. } = prompt {
+            if *selected {
+                // The selection is spent by the first edit, whichever it is.
+                *selected = false;
+                match edit {
+                    Edit::Char(c) => {
+                        text.clear();
+                        text.push(c);
+                        return;
+                    }
+                    Edit::Backspace => {
+                        text.clear();
+                        return;
+                    }
+                    Edit::Paste(pasted) => {
+                        text.clear();
+                        apply_edit(text, Edit::Paste(pasted));
+                        return;
+                    }
+                }
+            }
+        }
         apply_edit(prompt.text_mut(), edit);
         if !routes_live {
             return;
@@ -1403,6 +1844,11 @@ impl App {
             }
             Prompt::CommitMessage { text } if accept => self.submit_commit(text),
             Prompt::AmendMessage { text } if accept => self.submit_amend(text),
+            Prompt::BranchNew { text } if accept => self.submit_branch_new(text),
+            Prompt::BranchRename { from, text, .. } if accept => {
+                self.submit_branch_rename(from, text)
+            }
+            Prompt::TagNew { at, text } if accept => self.submit_branch_tag(at, text),
             // Cancelled: the text was the prompt's and dies with it.
             _ => {}
         }
@@ -1665,6 +2111,16 @@ impl App {
             "files.stage-all" => self.files_stage_all(),
             "files.discard" => self.files_discard(),
             "files.ignore" => self.files_ignore(),
+            // The branch verbs, the same story again: the row the keyboard
+            // is on — bytes, not display text — and the shared `Write` that
+            // means it. Routed here ahead of the pane, because their work
+            // belongs to the job queue, not to a view; rename and tag open
+            // the one prompt field on their way through.
+            "branches.checkout" => self.checkout_branch(),
+            "branches.new" => self.begin_branch_new(),
+            "branches.rename" => self.begin_branch_rename(),
+            "branches.delete" => self.delete_branch_selected(),
+            "branches.new-tag" => self.begin_branch_tag(),
             // The clipboard is the terminal's, not this process's — see
             // `Term::copy`. Held until the loop, which is the one place that has
             // a terminal to write to.
@@ -1722,6 +2178,13 @@ impl App {
                 ) {
                     self.last_list = Some(name.to_string());
                 }
+                // No disarm here, deliberately. A focus round-trip does not
+                // answer a destructive question: the window keeps the arm
+                // across focus, the files pane ships the same contract, and
+                // the branches pane matches them both. What disarms is the
+                // view's own list — cursor moves, wheels, mouse rows,
+                // refreshes — and a prompt or a reload, through
+                // [`App::disarm_branches`].
                 self.sync_modes();
             }
             None => self.message = format!("no {name} pane"),
@@ -2323,7 +2786,11 @@ impl App {
                         }
                     }
                 }
-                Prompt::CommitMessage { .. } | Prompt::AmendMessage { .. } => {
+                Prompt::CommitMessage { .. }
+                | Prompt::AmendMessage { .. }
+                | Prompt::BranchNew { .. }
+                | Prompt::BranchRename { .. }
+                | Prompt::TagNew { .. } => {
                     let room = pen.room().saturating_sub(1);
                     pen.put(tail(prompt.text(), room), text_ink);
                     pen.put("█", loud);
@@ -2437,6 +2904,86 @@ fn hunk_action(
         _ => Write::unstage_patch(repo, patch),
     };
     built.map(|job| Box::new(job) as Box<dyn Job>)
+}
+
+/// The three branch reads one launch or one refresh needs, and the honest
+/// story of any that failed.
+///
+/// The reads run concurrently — `std::thread::scope`, the same shape the
+/// window's branches load uses — because three `git` subprocesses in a row on
+/// the road to the first frame are three spawn floors where one would do, and
+/// because a pane that reads them one at a time would draw a snapshot torn
+/// across the gaps. What comes back is one prepared-able snapshot or an
+/// account of which leg failed; nothing here touches a view.
+struct BranchReads {
+    local: Vec<gitten_core::refs::Branch>,
+    remotes: Vec<gitten_core::refs::RemoteBranch>,
+    head: Option<gitten_core::refs::HeadState>,
+    /// Whose repository these are — the describe the label is spelled with.
+    described: String,
+    /// The first read that failed, in the sentence the status line says.
+    /// `None` is a clean read. The caller — not this helper — decides what a
+    /// failed leg costs: the lists are honest while they stand, and a lost
+    /// HEAD read costs the detached row alone.
+    error: Option<String>,
+}
+
+/// Runs the three ref reads beside each other and keeps what came back.
+///
+/// A failed leg is not a fatal one: the caller decides — at startup the lists
+/// being lost means an honest empty tenant and a message, at refresh it means
+/// the last good rows stand — but the error itself travels verbatim, because
+/// `git` already said the useful thing.
+fn load_branches(repo: &dyn gitten_git::Repo) -> BranchReads {
+    let (local, remotes, head, described) = std::thread::scope(|s| {
+        let local = s.spawn(|| repo.branches());
+        let remotes = s.spawn(|| repo.remote_branches());
+        let head = s.spawn(|| repo.head());
+        let described = s.spawn(|| repo.describe());
+        (
+            join_read(local),
+            join_read(remotes),
+            join_read(head),
+            join_read(described),
+        )
+    });
+    let mut error = None;
+    // The lists first: they are the pane's data, and the order of the two
+    // error arms is the order a person would read the failures in. The
+    // sentence names what failed — a bare git error beside a pane would read
+    // as a commit read's or a status read's.
+    let (local, remotes) = match (local, remotes) {
+        (Ok(local), Ok(remotes)) => (local, remotes),
+        (Err(e), _) | (_, Err(e)) => {
+            error.get_or_insert(format!("branch reads failed: {e}"));
+            (Vec::new(), Vec::new())
+        }
+    };
+    // A HEAD-only failure still leaves rows to draw. What it costs is the
+    // detached row: the current bit is not this read's to lose — it travels
+    // on each `Branch` from the same `for-each-ref` that named it, exactly
+    // the bit the window marks from — so an attached repository keeps its
+    // marking and a detached one simply has no detached row to show.
+    let head = match head {
+        Ok(head) => Some(head),
+        Err(e) => {
+            error.get_or_insert(format!("branch reads failed: {e}"));
+            None
+        }
+    };
+    BranchReads {
+        local,
+        remotes,
+        head,
+        described,
+        error,
+    }
+}
+
+/// Joins a spawned read, resuming a panic on the caller's thread — the same
+/// answer the app layer gives its own spawned reads.
+fn join_read<T>(h: std::thread::ScopedJoinHandle<'_, T>) -> T {
+    h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))
 }
 
 /// The longest suffix of `s` that fits `budget` columns, by the screen's own
@@ -3281,7 +3828,7 @@ mod staging {
     use super::*;
     use gitten_core::command::Code;
     use gitten_core::parse_unified_diff;
-    use gitten_core::refs::Stash;
+    use gitten_core::refs::{Branch, HeadState, RefName, RemoteBranch, Stash};
     use gitten_core::status::{
         Change, ConflictEntry, ConflictKind, Kind, PathBytes, StagedEntry, Status, Submodule,
         UnstagedEntry, UntrackedEntry,
@@ -3380,6 +3927,37 @@ diff --git a/tracked.txt b/tracked.txt
         /// When set, the next stash write fails with exactly this message and
         /// changes nothing: git's refusal, with the stack left as it was.
         refuse_stash: Option<String>,
+        /// The branches the ref reads answer, the branches the remotes hold,
+        /// and where HEAD is — the world the branches pane draws, mutated by
+        /// the writes that land, which is what lets a test observe a refresh
+        /// reading the world after a checkout or a rename.
+        locals: Vec<Branch>,
+        remotes: Vec<RemoteBranch>,
+        head: Option<HeadState>,
+        /// When set, the next branch/tag *read* fails with exactly this
+        /// message — the ancillary reads that happen at `App::new`, so a
+        /// test can launch into the failed tenant rather than only probing
+        /// it. They are three knobs because a HEAD-only failure and a lost
+        /// list are different panes' stories.
+        fail_locals: Option<String>,
+        fail_remotes: Option<String>,
+        fail_head: Option<String>,
+        branch_reads: usize,
+        remote_reads: usize,
+        head_reads: usize,
+        /// Every branch or tag write that reached the repository — as the
+        /// person-readable line a test asserts against, and as the raw bytes
+        /// the lossy line cannot carry. Tags keep their name/target pair,
+        /// and a rename keeps the bytes it was aimed *from* — the half of
+        /// the verb whose exactness a lossy line can never show.
+        branch_writes: Vec<String>,
+        branch_bytes: Vec<Vec<u8>>,
+        rename_froms: Vec<Vec<u8>>,
+        tags_written: Vec<(Vec<u8>, Vec<u8>)>,
+        /// When set, the next branch/tag write fails with exactly this
+        /// message and changes nothing: git's refusal, verbatim.
+        refuse_branch: Option<String>,
+        refuse_tag: Option<String>,
     }
 
     /// A repository that exists only as this struct. Reads answer what the
@@ -3444,6 +4022,137 @@ diff --git a/tracked.txt b/tracked.txt
                 return Err(e);
             }
             Ok(s.stashes.clone())
+        }
+
+        fn branches(&self) -> gitten_git::Result<Vec<Branch>> {
+            let mut s = self.0.lock().unwrap();
+            s.branch_reads += 1;
+            if let Some(e) = s.fail_locals.clone() {
+                return Err(e);
+            }
+            Ok(s.locals.clone())
+        }
+
+        fn remote_branches(&self) -> gitten_git::Result<Vec<RemoteBranch>> {
+            let mut s = self.0.lock().unwrap();
+            s.remote_reads += 1;
+            if let Some(e) = s.fail_remotes.clone() {
+                return Err(e);
+            }
+            Ok(s.remotes.clone())
+        }
+
+        fn head(&self) -> gitten_git::Result<HeadState> {
+            let mut s = self.0.lock().unwrap();
+            s.head_reads += 1;
+            if let Some(e) = s.fail_head.clone() {
+                return Err(e);
+            }
+            Ok(s.head.clone().unwrap_or(HeadState::Detached {
+                commit: "f00d".into(),
+            }))
+        }
+
+        fn checkout(&self, name: &[u8]) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            if let Some(e) = s.refuse_branch.clone() {
+                return Err(e);
+            }
+            s.branch_writes
+                .push(format!("checkout {}", String::from_utf8_lossy(name)));
+            s.branch_bytes.push(name.to_vec());
+            // git's own semantics: an attached checkout moves HEAD onto the
+            // named branch; a remote-tracking ref detaches onto its commit.
+            for b in &mut s.locals {
+                b.head = b.name.as_bytes() == name;
+            }
+            s.head = Some(match s.locals.iter().any(|b| b.head) {
+                true => HeadState::Branch {
+                    name: RefName::from_bytes(name),
+                    commit: Some("f00d".into()),
+                },
+                false => HeadState::Detached {
+                    commit: "f00d".into(),
+                },
+            });
+            Ok(())
+        }
+
+        fn create_branch(&self, name: &[u8], start: Option<&[u8]>) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            if let Some(e) = s.refuse_branch.clone() {
+                return Err(e);
+            }
+            s.branch_writes.push(format!(
+                "branch {} at {}",
+                String::from_utf8_lossy(name),
+                start
+                    .map(|s| String::from_utf8_lossy(s).into_owned())
+                    .unwrap_or_else(|| "HEAD".into())
+            ));
+            s.branch_bytes.push(name.to_vec());
+            // Nothing is checked out: the branch exists and HEAD stays put.
+            s.locals.push(Branch {
+                name: RefName::from_bytes(name),
+                commit: "f00d".into(),
+                upstream: None,
+                head: false,
+            });
+            Ok(())
+        }
+
+        fn delete_branch(&self, name: &[u8], force: bool) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            if let Some(e) = s.refuse_branch.clone() {
+                return Err(e);
+            }
+            let word = match force {
+                true => "force-delete branch",
+                false => "delete branch",
+            };
+            s.branch_writes
+                .push(format!("{word} {}", String::from_utf8_lossy(name)));
+            s.branch_bytes.push(name.to_vec());
+            s.locals.retain(|b| b.name.as_bytes() != name);
+            Ok(())
+        }
+
+        fn rename_branch(&self, from: &[u8], to: &[u8]) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            if let Some(e) = s.refuse_branch.clone() {
+                return Err(e);
+            }
+            s.branch_writes.push(format!(
+                "rename {} → {}",
+                String::from_utf8_lossy(from),
+                String::from_utf8_lossy(to)
+            ));
+            s.branch_bytes.push(to.to_vec());
+            s.rename_froms.push(from.to_vec());
+            if let Some(b) = s.locals.iter_mut().find(|b| b.name.as_bytes() == from) {
+                b.name = RefName::from_bytes(to);
+            }
+            Ok(())
+        }
+
+        fn create_tag(
+            &self,
+            name: &[u8],
+            target: &[u8],
+            message: Option<&str>,
+        ) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            if let Some(e) = s.refuse_tag.clone() {
+                return Err(e);
+            }
+            s.branch_writes.push(format!(
+                "tag {} at {}{}",
+                String::from_utf8_lossy(name),
+                String::from_utf8_lossy(target),
+                message.map(|m| format!(" ({m})")).unwrap_or_default()
+            ));
+            s.tags_written.push((name.to_vec(), target.to_vec()));
+            Ok(())
         }
 
         fn stash_push(&self, message: Option<&str>) -> gitten_git::Result<usize> {
@@ -3619,6 +4328,60 @@ diff --git a/tracked.txt b/tracked.txt
         }
     }
 
+    /// The fake's branches: `main` checked out, no remotes, HEAD attached —
+    /// the honest seed every repository-shaped constructor starts from. A
+    /// test that wants a different world overwrites the state directly.
+    fn one_branch() -> (Vec<Branch>, Vec<RemoteBranch>, HeadState) {
+        (
+            vec![Branch {
+                name: RefName::from("main"),
+                commit: "f00d".into(),
+                upstream: None,
+                head: true,
+            }],
+            Vec::new(),
+            HeadState::Branch {
+                name: RefName::from("main"),
+                commit: Some("f00d".into()),
+            },
+        )
+    }
+
+    /// The branches world the verb tests launch into, layered over the seed:
+    /// `main` under HEAD, a second local whose name is legal bytes and not
+    /// text, and two remotes — one whose branch half holds a slash, so a
+    /// joined refname is information only the joiner can add. Flattened the
+    /// pane reads: `main`, `f<e9>ature`, `origin/feat/ure`, `origin/main`.
+    fn branch_world(state: &Mutex<FakeState>) {
+        let mut s = state.lock().unwrap();
+        s.locals = vec![
+            Branch {
+                name: RefName::from("main"),
+                commit: "f00d".into(),
+                upstream: None,
+                head: true,
+            },
+            Branch {
+                name: RefName::from_bytes(b"f\xe9ature"),
+                commit: "beef".into(),
+                upstream: None,
+                head: false,
+            },
+        ];
+        s.remotes = vec![
+            RemoteBranch {
+                remote: RefName::from("origin"),
+                branch: RefName::from("feat/ure"),
+                commit: "f00d".into(),
+            },
+            RemoteBranch {
+                remote: RefName::from("origin"),
+                branch: RefName::from("main"),
+                commit: "f00d".into(),
+            },
+        ];
+    }
+
     /// The fake's stack: two entries, newest first, whose commits are the
     /// identity a refresh anchors by.
     fn two_stashes() -> Vec<Stash> {
@@ -3649,12 +4412,16 @@ diff --git a/tracked.txt b/tracked.txt
                 .collect(),
             ..Default::default()
         };
+        let (locals, remotes, head) = one_branch();
         let state = Arc::new(Mutex::new(FakeState {
             before: vec![pair("f.txt", side(0), side(3))],
             after: vec![pair("f.txt", side(0), side(2))],
             refuses: vec![b"refuse".to_vec()],
             stashes: two_stashes(),
             status,
+            locals,
+            remotes,
+            head: Some(head),
             ..Default::default()
         }));
         (Arc::new(FakeRepo(Arc::clone(&state))), state)
@@ -3676,6 +4443,7 @@ diff --git a/tracked.txt b/tracked.txt
                 })
                 .collect()
         };
+        let (locals, remotes, head) = one_branch();
         let state = Arc::new(Mutex::new(FakeState {
             before: vec![pair("f.txt", side(false), side(true))],
             after: vec![pair("f.txt", side(false), side(false))],
@@ -3690,6 +4458,9 @@ diff --git a/tracked.txt b/tracked.txt
                     .collect(),
                 ..Default::default()
             },
+            locals,
+            remotes,
+            head: Some(head),
             ..Default::default()
         }));
         (Arc::new(FakeRepo(Arc::clone(&state))), state)
@@ -3834,6 +4605,21 @@ diff --git a/tracked.txt b/tracked.txt
         }
     }
 
+    /// The branches view, and the label its tenant was registered under.
+    fn branches_of(app: &App) -> &Branches {
+        match app.panes.get("branches") {
+            Some(Screens::Branches { view, .. }) => view,
+            _ => panic!("the branches pane is not registered"),
+        }
+    }
+
+    fn branches_label(app: &App) -> &str {
+        match app.panes.get("branches") {
+            Some(Screens::Branches { label, .. }) => label,
+            _ => panic!("the branches pane is not registered"),
+        }
+    }
+
     /// A mouse event at a cell of the screen, button unmodified.
     fn click(kind: MouseKind, col: usize, row: usize) -> Mouse {
         Mouse {
@@ -3901,8 +4687,9 @@ diff --git a/tracked.txt b/tracked.txt
             app.screen.row_text(3)
         );
 
-        // Wide: files and commits split the sidebar into canonical equal
-        // slices beside the diff, and no row crosses the divider column.
+        // Wide: the four sidebar lists split the sidebar into canonical
+        // equal slices beside the diff, and no row crosses the divider
+        // column.
         app.screen.resize(120, 24);
         app.draw();
         let files_rect = app.pane_rect("files").expect("files placed");
@@ -3911,10 +4698,10 @@ diff --git a/tracked.txt b/tracked.txt
         assert_eq!((files_rect.x, files_rect.width), (0, 40));
         assert_eq!((commits_rect.x, commits_rect.width), (0, 40));
         assert_eq!(files_rect.y, 1);
-        assert_eq!(commits_rect.y, files_rect.y + files_rect.height);
-        // Three slices over the sidebar: the odd row goes to the first.
-        assert_eq!(files_rect.height, 8, "the first slice takes the remainder");
-        assert_eq!(commits_rect.height, 7, "unequal slices");
+        assert_eq!(commits_rect.y, files_rect.y + files_rect.height + 6);
+        // Four slices over the sidebar: the odd rows go to the first two.
+        assert_eq!(files_rect.height, 6, "the first slice takes the remainder");
+        assert_eq!(commits_rect.height, 5, "unequal slices");
         assert_eq!((diff_rect.x, diff_rect.width), (41, 79));
         for y in 1..24 {
             assert_eq!(
@@ -3965,9 +4752,10 @@ diff --git a/tracked.txt b/tracked.txt
 
     #[test]
     fn repository_startup_registers_files_into_the_sidebar_ring() {
-        // A commits launch: three tenants — the files pane every repository
-        // start registers, commits, the empty diff — with the launch focus
-        // restored over the registration that focused its own addition.
+        // A commits launch: five tenants — the files pane and the branches
+        // pane and the stash stack every repository start registers, commits,
+        // the empty diff — with the launch focus restored over the
+        // registration that focused its own addition.
         let (handle, _state) = fake(&[]);
         let mut app = commits_app(&handle);
         assert_eq!(
@@ -3976,19 +4764,28 @@ diff --git a/tracked.txt b/tracked.txt
             "the launch focus was not restored"
         );
         assert!(app.panes.get("files").is_some(), "no files tenant");
-        assert_eq!(app.panes.names().count(), 4);
-        // The sidebar's canonical order: files (rank 1) above commits
-        // (rank 3) above stashes (rank 4), with nothing in panes.rs the
+        assert_eq!(app.panes.names().count(), 5);
+        // The sidebar's canonical order: files (rank 1), branches (rank 2),
+        // commits (rank 3), stashes (rank 4) — with nothing in panes.rs the
         // wiser.
-        assert_eq!(app.panes.list_order(), ["files", "commits", "stashes"]);
+        assert_eq!(
+            app.panes.list_order(),
+            ["files", "branches", "commits", "stashes"]
+        );
 
         // `2` is the shared files.focus binding, and it now lands.
         app.press(Key::plain(Code::Char('2')));
         assert_eq!(app.panes.focused_name(), "files");
         assert_eq!(app.message, "", "focusing a registered pane said nothing");
-        // Ctrl-J/Ctrl-K cycle both directions through the two lists.
+        // Ctrl-J/Ctrl-K cycle both directions through the canonical order:
+        // files, then the branches pane the branches registration put
+        // between them, then commits.
+        app.press(Key::ctrl(Code::Char('j')));
+        assert_eq!(app.panes.focused_name(), "branches");
         app.press(Key::ctrl(Code::Char('j')));
         assert_eq!(app.panes.focused_name(), "commits");
+        app.press(Key::ctrl(Code::Char('k')));
+        assert_eq!(app.panes.focused_name(), "branches");
         app.press(Key::ctrl(Code::Char('k')));
         assert_eq!(app.panes.focused_name(), "files");
         // Headers derive live keys: files advertises `2` like any other pane.
@@ -4008,6 +4805,10 @@ diff --git a/tracked.txt b/tracked.txt
         assert!(
             direct.panes.get("files").is_some(),
             "a diff launch got no files pane"
+        );
+        assert!(
+            direct.panes.get("branches").is_some(),
+            "a diff launch got no branches pane"
         );
         assert_eq!(direct.panes.focused_name(), "diff");
         // ...and the diff launch's keyboard stays put under a key that is
@@ -4700,12 +5501,12 @@ diff --git a/tracked.txt b/tracked.txt
         let open_reads = state.lock().unwrap().pairs_reads;
 
         // Enter acquires the selected commit's diff exactly once, replaces
-        // the empty tenant — never appends — and focuses it. (Four tenants:
-        // the files pane and the stash stack every repository launch
+        // the empty tenant — never appends — and focuses it. (Five tenants:
+        // the files, branches and stash panes every repository launch
         // registers, commits, diff.)
         app.press(Key::plain(Code::Enter));
         assert_eq!(app.panes.focused_name(), "diff");
-        assert_eq!(app.panes.names().count(), 4, "enter appended a pane");
+        assert_eq!(app.panes.names().count(), 5, "enter appended a pane");
         assert_eq!(state.lock().unwrap().pairs_reads, open_reads + 1);
         assert!(
             matches!(
@@ -4749,7 +5550,7 @@ diff --git a/tracked.txt b/tracked.txt
         app.press(Key::plain(Code::Enter));
         assert_eq!(
             app.panes.names().count(),
-            4,
+            5,
             "a second enter appended a pane"
         );
         assert_eq!(app.panes.focused_name(), "diff");
@@ -5109,9 +5910,9 @@ diff --git a/tracked.txt b/tracked.txt
         app.draw();
 
         // Down in the commits rectangle presses it, in its own coordinates.
-        // The sidebar splits three ways now, so the commits slice is the
-        // middle third of the sidebar column.
-        app.mouse(click(MouseKind::Down, 5, 12));
+        // The sidebar splits four ways now, so the commits slice is the
+        // third of them: local row 2 is three content rows down.
+        app.mouse(click(MouseKind::Down, 5, 16));
         assert_eq!(app.panes.focused_name(), "commits");
         assert_eq!(
             commits_of(&app).cursor(),
@@ -5418,7 +6219,7 @@ diff --git a/tracked.txt b/tracked.txt
         // list is the focused pane and the diff is the registered one the
         // refresh must not forget — hidden by the narrow layout or not.
         app.dispatch("commits.open-diff");
-        assert_eq!(app.panes.names().count(), 4, "open-diff appended a pane");
+        assert_eq!(app.panes.names().count(), 5, "open-diff appended a pane");
         assert!(matches!(app.panes.get("diff"), Some(Screens::Diff { .. })));
         app.dispatch("commits.focus");
         assert_eq!(app.panes.focused_name(), "commits");
@@ -5456,7 +6257,7 @@ diff --git a/tracked.txt b/tracked.txt
         // was refreshed against — a refusal's as much as a success's, the
         // focused pane's as much as the hidden one's.
         assert!(app.generation > Generation::default());
-        for name in ["commits", "diff", "files"] {
+        for name in ["commits", "diff", "files", "branches"] {
             let pane = app
                 .panes
                 .get(name)
@@ -5596,12 +6397,19 @@ diff --git a/tracked.txt b/tracked.txt
         let (handle, _state) = fake(&[]);
         let mut app = commits_app(&handle);
         let names: Vec<&str> = app.panes.names().collect();
-        assert_eq!(names, ["commits", "stashes", "diff", "files"], "{names:?}");
+        assert_eq!(
+            app.panes.names().collect::<Vec<_>>(),
+            ["commits", "stashes", "diff", "files", "branches"],
+            "{names:?}"
+        );
         assert_eq!(app.panes.focused_name(), "commits");
-        assert_eq!(app.panes.list_order(), ["files", "commits", "stashes"]);
+        assert_eq!(
+            app.panes.list_order(),
+            ["files", "branches", "commits", "stashes"]
+        );
         assert_eq!(
             app.panes.reading_order(),
-            ["files", "commits", "stashes", "diff"]
+            ["files", "branches", "commits", "stashes", "diff"]
         );
 
         // `5` reaches it — through the keymap, and the mode follows the
@@ -5628,7 +6436,7 @@ diff --git a/tracked.txt b/tracked.txt
         let diff_app = app_on_fake(&source, &handle);
         assert_eq!(
             diff_app.panes.names().collect::<Vec<_>>(),
-            ["stashes", "diff", "files"]
+            ["stashes", "diff", "files", "branches"]
         );
         assert_eq!(diff_app.panes.focused_name(), "diff");
 
@@ -5653,27 +6461,27 @@ diff --git a/tracked.txt b/tracked.txt
         let mut app = commits_app(&handle);
         app.draw();
 
-        // Wide: the sidebar splits into three canonical slices — files on
-        // top, commits under it, the stack at the foot — and the diff takes
-        // the rest, one divider column between. No geometry module changed
-        // to make room: this is the registry's equal-slice answer to the
-        // tenants there are.
+        // Wide: the sidebar splits into four canonical slices — files on
+        // top, branches under it, commits next, the stack at the foot — and
+        // the diff takes the rest, one divider column between. No geometry
+        // module changed to make room: this is the registry's equal-slice
+        // answer to the tenants there are.
         assert_eq!(
             app.pane_rect("commits"),
             Some(crate::panes::Rect {
                 x: 0,
-                y: 9,
+                y: 13,
                 width: 40,
-                height: 7
+                height: 5
             })
         );
         assert_eq!(
             app.pane_rect("stashes"),
             Some(crate::panes::Rect {
                 x: 0,
-                y: 16,
+                y: 18,
                 width: 40,
-                height: 7
+                height: 5
             })
         );
         assert_eq!(
@@ -5689,12 +6497,12 @@ diff --git a/tracked.txt b/tracked.txt
         // Headers name the live configured focus keys — 4 and 5, straight
         // out of the shipped map — and the stack says whose repository it
         // is and how much is parked.
-        let commits_header = app.screen.row_text(9).chars().take(40).collect::<String>();
+        let commits_header = app.screen.row_text(13).chars().take(40).collect::<String>();
         assert!(
             commits_header.contains('4') && commits_header.contains("commits"),
             "{commits_header:?}"
         );
-        let stashes_header = app.screen.row_text(16);
+        let stashes_header = app.screen.row_text(18);
         assert!(stashes_header.contains('5'), "{stashes_header:?}");
         assert!(stashes_header.contains("stashes"), "{stashes_header:?}");
         assert!(
@@ -5703,7 +6511,7 @@ diff --git a/tracked.txt b/tracked.txt
         );
 
         // The divider is nobody's: blank from the top of the body to the
-        // bottom, including across both sidebar headers.
+        // bottom, including across every sidebar header.
         for y in 2..23 {
             assert_eq!(
                 app.screen.char_at(40, y),
@@ -5713,7 +6521,7 @@ diff --git a/tracked.txt b/tracked.txt
         }
 
         // And the stack itself drew: both rows, address first.
-        let rows: Vec<String> = (13..23).map(|y| app.screen.row_text(y)).collect();
+        let rows: Vec<String> = (19..23).map(|y| app.screen.row_text(y)).collect();
         assert!(rows.iter().any(|r| r.contains("stash@{0}")), "{rows:?}");
         assert!(rows.iter().any(|r| r.contains("stash@{1}")), "{rows:?}");
 
@@ -5775,9 +6583,9 @@ diff --git a/tracked.txt b/tracked.txt
             app.screen.row_text(0)
         );
         assert!(
-            app.screen.row_text(16).contains('5') && app.screen.row_text(16).contains("stashes"),
+            app.screen.row_text(18).contains('5') && app.screen.row_text(18).contains("stashes"),
             "the header did not advertise the stack: {:?}",
-            app.screen.row_text(16)
+            app.screen.row_text(18)
         );
         assert!(
             app.screen
@@ -5828,25 +6636,26 @@ diff --git a/tracked.txt b/tracked.txt
         // Mouse capture: a drag in the commit list selects its rows and its
         // release reads that pane; a press in the stack's slice moves the
         // keyboard there, and a drag inside the stack builds no selection —
-        // a stack is acted on one entry at a time.
+        // a stack is acted on one entry at a time. The commits slice is the
+        // third of the sidebar's four; the stack is the foot.
         app.dispatch("commits.focus");
-        app.mouse(click(MouseKind::Down, 5, 12));
-        app.mouse(click(MouseKind::Drag, 5, 14));
-        app.mouse(click(MouseKind::Up, 5, 14));
+        app.mouse(click(MouseKind::Down, 5, 15));
+        app.mouse(click(MouseKind::Drag, 5, 17));
+        app.mouse(click(MouseKind::Up, 5, 17));
         assert!(
             !commits_of(&app).selection().is_empty(),
             "the drag in the list selected nothing"
         );
-        app.mouse(click(MouseKind::Down, 5, 17));
+        app.mouse(click(MouseKind::Down, 5, 20));
         assert_eq!(
             app.panes.focused_name(),
             "stashes",
             "the press did not move the keyboard to the stack"
         );
-        app.mouse(click(MouseKind::Up, 5, 17));
-        app.mouse(click(MouseKind::Down, 5, 18));
-        app.mouse(click(MouseKind::Drag, 5, 19));
-        app.mouse(click(MouseKind::Up, 5, 19));
+        app.mouse(click(MouseKind::Up, 5, 20));
+        app.mouse(click(MouseKind::Down, 5, 21));
+        app.mouse(click(MouseKind::Drag, 5, 22));
+        app.mouse(click(MouseKind::Up, 5, 22));
         assert_eq!(
             app.panes.get("stashes").map(|pane| pane.selection()),
             Some(String::new()),
@@ -6256,11 +7065,11 @@ diff --git a/tracked.txt b/tracked.txt
         let mut app = commits_app(&handle);
 
         // A failed side read must not abort a launch the main view made
-        // good: four tenants, the requested startup focus untouched, and
+        // good: five tenants, the requested startup focus untouched, and
         // the exact error kept for the status line.
         assert_eq!(
             app.panes.names().collect::<Vec<_>>(),
-            ["commits", "stashes", "diff", "files"]
+            ["commits", "stashes", "diff", "files", "branches"]
         );
         assert_eq!(app.panes.focused_name(), "commits");
         assert_eq!(app.message, "fatal: bad object refs/stash");
@@ -6277,11 +7086,11 @@ diff --git a/tracked.txt b/tracked.txt
         // line, never the empty-stack line that would assert a read that
         // never succeeded, and no row for a verb to address.
         assert!(
-            app.screen.row_text(16).contains("unavailable"),
+            app.screen.row_text(18).contains("unavailable"),
             "the header did not say so: {:?}",
-            app.screen.row_text(16)
+            app.screen.row_text(18)
         );
-        let rows: Vec<String> = (17..23).map(|y| app.screen.row_text(y)).collect();
+        let rows: Vec<String> = (19..23).map(|y| app.screen.row_text(y)).collect();
         assert!(
             rows.iter().any(|r| r.contains("stash list unavailable")),
             "{rows:?}"
@@ -6313,11 +7122,11 @@ diff --git a/tracked.txt b/tracked.txt
         );
         app.draw();
         assert!(
-            app.screen.row_text(16).contains("fake (main) · 2 parked"),
+            app.screen.row_text(18).contains("fake (main) · 2 parked"),
             "the header did not recover: {:?}",
-            app.screen.row_text(16)
+            app.screen.row_text(18)
         );
-        let rows: Vec<String> = (17..23).map(|y| app.screen.row_text(y)).collect();
+        let rows: Vec<String> = (19..23).map(|y| app.screen.row_text(y)).collect();
         assert!(rows.iter().any(|r| r.contains("stash@{0}")), "{rows:?}");
         assert!(
             !app.screen.row_text(23).contains("fatal:"),
@@ -6336,6 +7145,1526 @@ diff --git a/tracked.txt b/tracked.txt
             };
             assert_eq!(stash.current(), Some(0));
             assert_eq!(stash.status(), "1/2 · stash@{0}");
+        }
+    }
+
+    #[test]
+    fn repository_launch_registers_branches_in_the_existing_ring() {
+        // The shipped map already binds the digit and the mode's letters: the
+        // terminal adds no name, no alias and no key table anywhere in the
+        // chain — the focus key and every verb resolve through
+        // `Host::new().keys`, the same map `gitten.toml` writes.
+        let keys = Host::new().keys;
+        let mut commits = Modes::new();
+        commits.push("commits");
+        assert_eq!(
+            keys.resolve(&commits, &[Key::plain(Code::Char('3'))]),
+            Resolve::Run("branches.focus")
+        );
+        let mut branches_mode = Modes::new();
+        branches_mode.push("panes");
+        branches_mode.push("branches");
+        assert_eq!(
+            keys.resolve(&branches_mode, &[Key::plain(Code::Char(' '))]),
+            Resolve::Run("branches.checkout")
+        );
+        assert_eq!(
+            keys.resolve(&branches_mode, &[Key::char('R')]),
+            Resolve::Run("branches.rename"),
+            "the mode override is the shared map's, not a terminal table"
+        );
+
+        // A repository-backed commits launch: five tenants, branches in its
+        // canonical sidebar rank — between files and commits — and the
+        // requested startup focus restored over whatever the registrations
+        // focused last.
+        let (handle, _state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        let names: Vec<&str> = app.panes.names().collect();
+        assert_eq!(
+            app.panes.names().collect::<Vec<_>>(),
+            ["commits", "stashes", "diff", "files", "branches"],
+            "{names:?}"
+        );
+        assert_eq!(app.panes.focused_name(), "commits");
+        assert_eq!(
+            app.panes.list_order(),
+            ["files", "branches", "commits", "stashes"]
+        );
+        assert_eq!(
+            app.panes.reading_order(),
+            ["files", "branches", "commits", "stashes", "diff"]
+        );
+
+        // `3` reaches it — through the keymap — and the keyboard's modes
+        // follow, because the mode stack is built from the focused screen.
+        app.press(Key::plain(Code::Char('3')));
+        assert_eq!(app.panes.focused_name(), "branches");
+        assert_eq!(
+            app.panes.focused().map(|pane| pane.mode()),
+            Some("branches")
+        );
+        assert_eq!(
+            app.panes.focused_placement(),
+            Some(panes::Placement::Sidebar { rank: 2 }),
+            "canonical rank 2, from the registry and not a layout edit"
+        );
+
+        // Ctrl-J cycles the now-real sidebar ring from it: branches' next
+        // list is commits', and the walk h/l reaches it too.
+        app.dispatch("pane.next");
+        assert_eq!(app.panes.focused_name(), "commits");
+        app.press(Key::plain(Code::Char('3')));
+        app.dispatch("pane.left");
+        assert_eq!(app.panes.focused_name(), "files", "the walk skipped a list");
+
+        // A repository-backed diff launch registers the tenant the same way —
+        // `App::new` never assumed commits exists — and the diff keeps the
+        // focus the launch asked for.
+        let source = Source::Repo {
+            path: std::path::PathBuf::from("/fake"),
+            arg: String::new(),
+        };
+        let diff_app = app_on_fake(&source, &handle);
+        assert!(diff_app.panes.get("branches").is_some());
+        assert_eq!(diff_app.panes.focused_name(), "diff");
+    }
+
+    #[test]
+    fn direct_diff_gets_branches_while_fixtures_do_not() {
+        let (handle, _state) = fake(&[]);
+        let source = Source::Repo {
+            path: std::path::PathBuf::from("/fake"),
+            arg: String::new(),
+        };
+
+        // A repository diff launch: branches beside the diff it asked for.
+        let mut app = app_on_fake(&source, &handle);
+        assert_eq!(
+            app.panes.names().collect::<Vec<_>>(),
+            ["stashes", "diff", "files", "branches"]
+        );
+        assert_eq!(app.panes.focused_name(), "diff");
+
+        // Narrow — below the wide breakpoint — only the focused pane is
+        // placed, and `3` swaps that full-width visibility to branches. The
+        // diff keeps no rectangle while it is hidden.
+        app.screen.resize(95, 24);
+        app.draw();
+        app.press(Key::plain(Code::Char('3')));
+        app.draw();
+        assert_eq!(app.panes.focused_name(), "branches");
+        assert_eq!(
+            app.pane_rect("branches"),
+            Some(crate::panes::Rect {
+                x: 0,
+                y: 1,
+                width: 95,
+                height: 22
+            }),
+            "narrow mode gives the focused pane the whole body"
+        );
+        assert!(
+            app.pane_rect("diff").is_none(),
+            "the hidden diff kept a rectangle"
+        );
+
+        // Wide: branches and diff occupy the foundation's disjoint
+        // rectangles — the sidebar's foot slice and the main region. No
+        // layout branch learned the name; this is the registry's own answer
+        // to a third sidebar list.
+        app.screen.resize(96, 24);
+        app.draw();
+        let branches = app.pane_rect("branches").expect("branches is placed wide");
+        let diff = app.pane_rect("diff").expect("the diff is placed wide");
+        assert_eq!(
+            branches,
+            crate::panes::Rect {
+                x: 0,
+                y: 9,
+                width: 40,
+                height: 7
+            }
+        );
+        assert_eq!(
+            diff,
+            crate::panes::Rect {
+                x: 41,
+                y: 1,
+                width: 55,
+                height: 22
+            }
+        );
+        assert!(
+            branches.x + branches.width <= diff.x,
+            "the sidebar drew into the main region"
+        );
+
+        // No repository, no tenant: a fixture and a patch launch keep their
+        // previous tenant counts and answer the focus command with the same
+        // sentence an absent pane always got.
+        for mut app in [
+            app_on_diff(Source::Fixtures, None),
+            app_on_diff(Source::Patch { file: None }, None),
+        ] {
+            assert!(
+                app.panes.get("branches").is_none(),
+                "a repository-free launch invented a branches pane"
+            );
+            app.dispatch("branches.focus");
+            assert_eq!(app.message, "no branches pane");
+        }
+    }
+
+    #[test]
+    fn branch_reads_fail_softly_at_start_and_retry_on_generation() {
+        // A lost branch list: the launch keeps its requested view and focus,
+        // the tenant registers honest *unread* — never a clean zero — and
+        // the exact error rides to the status line.
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().fail_locals = Some("fatal: bad object refs/heads".into());
+        let mut app = commits_app(&handle);
+        assert_eq!(
+            app.panes.names().collect::<Vec<_>>(),
+            ["commits", "stashes", "diff", "files", "branches"]
+        );
+        assert_eq!(
+            app.panes.focused_name(),
+            "commits",
+            "a failed side read stole the launch"
+        );
+        assert_eq!(
+            app.message,
+            "branch reads failed: fatal: bad object refs/heads"
+        );
+        assert_eq!(branches_label(&app), "fake (main) · branches unavailable");
+        assert_eq!(
+            branches_of(&app).status(),
+            "no branches",
+            "a failed read drew as an empty pane"
+        );
+        // Nothing falsely advanced: every tenant sits at the launch
+        // generation, the failed one included.
+        for name in app.panes.names().collect::<Vec<_>>() {
+            assert_eq!(
+                app.panes.get(name).unwrap().generation(),
+                app.generation,
+                "{name} was born stale"
+            );
+        }
+
+        // The next successful wave fills what failed — the same generation
+        // rail any write finish rides — and the error leaves the status line.
+        state.lock().unwrap().fail_locals = None;
+        let gen = app.generation;
+        let job = Write::stash_apply(&handle, 0);
+        assert!(app.submitter.submit(Box::new(job)).is_ok(), "queued");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > gen
+            }),
+            "the recovery never re-read the refs"
+        );
+        assert_eq!(branches_label(&app), "fake (main) · 1 local · 0 remote");
+        assert_eq!(branches_of(&app).status(), "1/1 · main");
+        assert_eq!(
+            app.panes.get("branches").unwrap().generation(),
+            app.generation,
+            "the recovered tenant did not reach the generation"
+        );
+
+        // A refresh that fails keeps the last good rows at their own
+        // generation — no fabricated emptiness, no false advance — and says
+        // so; a later wave retries.
+        state.lock().unwrap().fail_locals = Some("fatal: bad object refs/heads".into());
+        let before = app.panes.get("branches").unwrap().generation();
+        let gen = app.generation;
+        let job = Write::stash_apply(&handle, 0);
+        assert!(app.submitter.submit(Box::new(job)).is_ok(), "queued");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > gen
+            }),
+            "the failed wave never finished"
+        );
+        assert_eq!(
+            app.message,
+            "branch reads failed: fatal: bad object refs/heads"
+        );
+        assert!(
+            app.generation > Generation::default(),
+            "the finish did not advance"
+        );
+        assert_eq!(
+            app.panes.get("branches").unwrap().generation(),
+            before,
+            "a failed refresh advanced the tenant"
+        );
+        assert_eq!(
+            branches_of(&app).status(),
+            "1/1 · main",
+            "a failed refresh replaced the rows"
+        );
+
+        // A HEAD-only failure is the other story: the rows survive — the
+        // current bit rode in on the list read, the same bit the window
+        // marks from — and the leg that failed is the one the status line
+        // names.
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().fail_head = Some("fatal: bad object HEAD".into());
+        let mut app = commits_app(&handle);
+        assert_eq!(app.message, "branch reads failed: fatal: bad object HEAD");
+        assert_eq!(branches_label(&app), "fake (main) · 1 local · 0 remote");
+        assert_eq!(branches_of(&app).status(), "1/1 · main");
+
+        // And the recovery is the same rail: the head read repeats on the
+        // next wave and the error leaves.
+        state.lock().unwrap().fail_head = None;
+        let gen = app.generation;
+        let job = Write::stash_apply(&handle, 0);
+        assert!(app.submitter.submit(Box::new(job)).is_ok(), "queued");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > gen
+            }),
+            "the head re-read never happened"
+        );
+        assert!(
+            !app.message.contains("branch reads failed"),
+            "the stale error outlived its recovery: {:?}",
+            app.message
+        );
+    }
+
+    #[test]
+    fn checkout_jobs_local_and_remote_bytes_and_refuses_detached() {
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        let mut app = commits_app(&handle);
+        app.press(Key::plain(Code::Char('3')));
+        assert_eq!(branches_of(&app).status(), "1/4 · main");
+
+        // Space on a local submits `Write::checkout` once, with the row's
+        // raw bytes — whole, and exactly once.
+        let gen = app.generation;
+        app.press(Key::plain(Code::Char(' ')));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > gen
+            }),
+            "the checkout never queued"
+        );
+        assert_eq!(state.lock().unwrap().branch_bytes, [b"main".to_vec()]);
+
+        // The non-text local is aimed at by bytes too: the job never saw a
+        // lossy spelling of its name.
+        app.dispatch("view.down");
+        let gen = app.generation;
+        app.press(Key::plain(Code::Char(' ')));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > gen
+            }),
+            "the second checkout never queued"
+        );
+        assert_eq!(
+            state.lock().unwrap().branch_bytes[1],
+            b"f\xe9ature".to_vec()
+        );
+
+        // A remote row checks out detached, and the refname is joined from
+        // the halves exactly once — the slash in the branch half must not
+        // make two.
+        app.dispatch("view.down");
+        let gen = app.generation;
+        app.press(Key::plain(Code::Char(' ')));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > gen
+            }),
+            "the remote checkout never queued"
+        );
+        assert_eq!(
+            state.lock().unwrap().branch_bytes[2],
+            b"origin/feat/ure".to_vec()
+        );
+
+        // The fake detached onto the fetched commit; the refreshed pane
+        // leads with the detached row, and that row refuses by name — a
+        // place, not a branch to move to.
+        app.draw();
+        app.dispatch("view.top");
+        assert!(matches!(
+            branches_of(&app).current(),
+            Some(Target::Detached)
+        ));
+        app.press(Key::plain(Code::Char(' ')));
+        app.drain_jobs();
+        assert_eq!(app.message, "HEAD is already detached here");
+        assert_eq!(
+            state.lock().unwrap().branch_writes.len(),
+            3,
+            "a detached checkout queued"
+        );
+
+        // A refusal is git's sentence verbatim, and it still staled the
+        // panes: the finish advances the generation however the job ended.
+        state.lock().unwrap().refuse_branch =
+            Some("error: Your local changes would be overwritten".into());
+        app.dispatch("view.down");
+        app.press(Key::plain(Code::Char(' ')));
+        let gen = app.generation;
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > gen
+            }),
+            "the refused checkout never finished"
+        );
+        assert_eq!(
+            app.message,
+            "error: Your local changes would be overwritten"
+        );
+        assert_eq!(
+            state.lock().unwrap().branch_writes.len(),
+            3,
+            "a refused checkout recorded a write"
+        );
+
+        // An empty pane has nothing to aim at, and says so before the queue.
+        let (handle, state) = fake(&[]);
+        {
+            let mut s = state.lock().unwrap();
+            s.locals.clear();
+            s.remotes.clear();
+        }
+        let mut app = commits_app(&handle);
+        app.press(Key::plain(Code::Char('3')));
+        app.dispatch("branches.checkout");
+        assert_eq!(app.message, "nothing selected to check out");
+        assert!(state.lock().unwrap().branch_writes.is_empty());
+    }
+
+    #[test]
+    fn new_branch_prompt_accepts_one_name_and_never_checks_it_out() {
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        let mut app = commits_app(&handle);
+        app.press(Key::plain(Code::Char('3')));
+
+        // `n` opens one blank field; the typed text is inert until accept.
+        app.press(Key::char('n'));
+        assert!(matches!(app.prompt, Some(Prompt::BranchNew { .. })));
+        app.draw();
+        assert!(status(&app).contains("branch: "), "{:?}", status(&app));
+        type_(&mut app, "topic");
+        app.draw();
+        assert!(status(&app).contains("branch: topic"), "{:?}", status(&app));
+        assert!(
+            state.lock().unwrap().branch_writes.is_empty(),
+            "typing queued a branch"
+        );
+
+        // A paste is one sanitized edit, never a transcript of keypresses:
+        // the newline and the tab become spaces, the control character is
+        // dropped, and the keymap sees none of it.
+        app.input(Input::Paste(" ab\ncd\tef\u{7}".into()));
+        app.draw();
+        assert!(
+            status(&app).contains("branch: topic ab cd ef"),
+            "{:?}",
+            status(&app)
+        );
+
+        // Enter submits `Write::create_branch` once — at HEAD, and nothing
+        // is checked out — and closes the field.
+        let gen = app.generation;
+        app.press(Key::plain(Code::Enter));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > gen
+            }),
+            "the create never queued"
+        );
+        assert_eq!(
+            state.lock().unwrap().branch_writes,
+            ["branch topic ab cd ef at HEAD"]
+        );
+        assert_eq!(
+            state.lock().unwrap().branch_bytes,
+            [b"topic ab cd ef".to_vec()]
+        );
+        assert!(app.prompt.is_none(), "the field outlived its accept");
+        assert_eq!(
+            branches_of(&app).status(),
+            "1/5 · main",
+            "the created branch did not land in the refreshed pane"
+        );
+
+        // Whitespace-only accept is refused beside the field, without a job.
+        app.press(Key::char('n'));
+        type_(&mut app, "   ");
+        app.press(Key::plain(Code::Enter));
+        assert_eq!(app.message, "a branch needs a name");
+        assert!(app.prompt.is_none(), "a refused accept left the field open");
+        assert_eq!(state.lock().unwrap().branch_writes.len(), 1);
+
+        // Esc cancels: the text was the field's and dies with it.
+        app.press(Key::char('n'));
+        type_(&mut app, "ghost");
+        app.press(Key::plain(Code::Esc));
+        assert!(app.prompt.is_none());
+        app.drain_jobs();
+        assert_eq!(state.lock().unwrap().branch_writes.len(), 1);
+
+        // An empty (unborn) repository's pane still answers `n`: creating
+        // reads no row, and whether HEAD is a valid start is the backend's
+        // to say, not the view's.
+        let (handle, state) = fake(&[]);
+        {
+            let mut s = state.lock().unwrap();
+            s.locals.clear();
+            s.remotes.clear();
+            s.head = Some(HeadState::Branch {
+                name: RefName::from("main"),
+                commit: None,
+            });
+        }
+        let mut app = commits_app(&handle);
+        app.press(Key::plain(Code::Char('3')));
+        assert_eq!(branches_of(&app).status(), "no branches");
+        app.press(Key::char('n'));
+        type_(&mut app, "first");
+        let gen = app.generation;
+        app.press(Key::plain(Code::Enter));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > gen
+            }),
+            "the unborn-repository create never queued"
+        );
+        assert_eq!(
+            state.lock().unwrap().branch_writes,
+            ["branch first at HEAD"]
+        );
+        assert_eq!(
+            branches_of(&app).status(),
+            "1/1 · first",
+            "the created branch did not land in the refreshed pane"
+        );
+    }
+
+    #[test]
+    fn rename_prompt_captures_raw_from_and_prefills_only_utf8() {
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        let mut app = commits_app(&handle);
+        app.press(Key::plain(Code::Char('3')));
+
+        // A text name is prefilled and wholly selected: the first edit
+        // replaces it, it is not glued to the front of whatever was typed.
+        app.press(Key::char('R'));
+        assert!(matches!(app.prompt, Some(Prompt::BranchRename { .. })));
+        app.draw();
+        assert!(status(&app).contains("rename: main"), "{:?}", status(&app));
+        type_(&mut app, "x");
+        app.draw();
+        assert!(status(&app).contains("rename: x"), "{:?}", status(&app));
+        assert!(
+            !status(&app).contains("main"),
+            "the prefill survived the first edit"
+        );
+
+        // Unchanged accept is allowed through to git — its "already
+        // exists" says more than a client-side veto would.
+        app.press(Key::plain(Code::Esc));
+        app.press(Key::char('R'));
+        let gen = app.generation;
+        app.press(Key::plain(Code::Enter));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > gen
+            }),
+            "the unchanged rename never queued"
+        );
+        assert_eq!(state.lock().unwrap().branch_writes, ["rename main → main"]);
+        assert_eq!(state.lock().unwrap().rename_froms, [b"main".to_vec()]);
+
+        // The non-text local opens *blank* — a lossy prefill would rename
+        // the branch to its own mojibake — while `from` keeps the exact
+        // bytes and the job aims at them.
+        app.dispatch("view.down");
+        app.press(Key::char('R'));
+        app.draw();
+        assert!(status(&app).contains("rename: "), "{:?}", status(&app));
+        assert!(
+            !status(&app).contains('\u{fffd}'),
+            "the field opened with lossy bytes: {:?}",
+            status(&app)
+        );
+        type_(&mut app, "renamed");
+        let gen = app.generation;
+        app.press(Key::plain(Code::Enter));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > gen
+            }),
+            "the byte-preserving rename never queued"
+        );
+        assert_eq!(
+            state.lock().unwrap().branch_writes[1],
+            "rename f\u{fffd}ature → renamed"
+        );
+        assert_eq!(
+            state.lock().unwrap().rename_froms[1],
+            b"f\xe9ature".to_vec()
+        );
+        assert_eq!(state.lock().unwrap().branch_bytes[1], b"renamed".to_vec());
+
+        // Empty accept queues nothing.
+        app.press(Key::char('R'));
+        type_(&mut app, "  ");
+        app.press(Key::plain(Code::Enter));
+        assert_eq!(app.message, "a branch needs a name");
+        assert_eq!(state.lock().unwrap().branch_writes.len(), 2);
+
+        // A remote row refuses before any field stands.
+        app.dispatch("view.down");
+        app.dispatch("view.down");
+        app.press(Key::char('R'));
+        assert_eq!(app.message, "only a local branch can be renamed");
+        assert!(app.prompt.is_none());
+        assert_eq!(state.lock().unwrap().branch_writes.len(), 2);
+
+        // So does the detached row, in a world that opens detached.
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        {
+            let mut s = state.lock().unwrap();
+            s.head = Some(HeadState::Detached {
+                commit: "f00d".into(),
+            });
+            s.locals[0].head = false;
+        }
+        let mut app = commits_app(&handle);
+        app.press(Key::plain(Code::Char('3')));
+        app.dispatch("view.top");
+        assert!(matches!(
+            branches_of(&app).current(),
+            Some(Target::Detached)
+        ));
+        app.press(Key::char('R'));
+        assert_eq!(app.message, "only a local branch can be renamed");
+        assert!(app.prompt.is_none());
+    }
+
+    #[test]
+    fn new_tag_captures_local_raw_target_and_creates_lightweight_tag() {
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        let mut app = commits_app(&handle);
+        app.press(Key::plain(Code::Char('3')));
+        app.dispatch("view.down");
+
+        // `T` opens one blank tag field over the row's branch — captured at
+        // open, so nothing a cursor does while the field holds the keyboard
+        // can re-aim the tag.
+        app.press(Key::char('T'));
+        assert!(matches!(app.prompt, Some(Prompt::TagNew { .. })));
+        app.draw();
+        assert!(status(&app).contains("tag: "), "{:?}", status(&app));
+        type_(&mut app, "v1");
+        app.press(Key::plain(Code::Enter));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                !state.lock().unwrap().tags_written.is_empty()
+            }),
+            "the tag never queued"
+        );
+        assert_eq!(
+            state.lock().unwrap().tags_written,
+            [(b"v1".to_vec(), b"f\xe9ature".to_vec())],
+            "the tag was not aimed at the row's raw bytes"
+        );
+        assert_eq!(
+            state.lock().unwrap().branch_writes,
+            ["tag v1 at f\u{fffd}ature"],
+            "a lightweight tag carries no message"
+        );
+
+        // The name is trimmed before it is queued — git would hold the
+        // padding as part of the name.
+        app.dispatch("view.top");
+        app.press(Key::char('T'));
+        type_(&mut app, "  v2  ");
+        app.press(Key::plain(Code::Enter));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                state.lock().unwrap().tags_written.len() == 2
+            }),
+            "the second tag never queued"
+        );
+        assert_eq!(
+            state.lock().unwrap().tags_written[1],
+            (b"v2".to_vec(), b"main".to_vec())
+        );
+
+        // A duplicate rides on to git and comes back in its words.
+        state.lock().unwrap().refuse_tag = Some("fatal: tag 'v2' already exists".into());
+        app.press(Key::char('T'));
+        type_(&mut app, "v2");
+        app.press(Key::plain(Code::Enter));
+        let gen = app.generation;
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > gen
+            }),
+            "the refused tag never finished"
+        );
+        assert_eq!(app.message, "fatal: tag 'v2' already exists");
+        assert_eq!(state.lock().unwrap().tags_written.len(), 2);
+
+        // Whitespace says so beside the field, without a job.
+        app.press(Key::char('T'));
+        type_(&mut app, "   ");
+        app.press(Key::plain(Code::Enter));
+        assert_eq!(app.message, "a tag needs a name");
+        assert!(app.prompt.is_none());
+        assert_eq!(state.lock().unwrap().tags_written.len(), 2);
+
+        // A remote row refuses before any field stands.
+        app.dispatch("view.down");
+        app.dispatch("view.down");
+        app.press(Key::char('T'));
+        assert_eq!(app.message, "only a local branch can be tagged here");
+        assert!(app.prompt.is_none());
+
+        // So does the detached row.
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        {
+            let mut s = state.lock().unwrap();
+            s.head = Some(HeadState::Detached {
+                commit: "f00d".into(),
+            });
+            s.locals[0].head = false;
+        }
+        let mut app = commits_app(&handle);
+        app.press(Key::plain(Code::Char('3')));
+        app.dispatch("view.top");
+        app.press(Key::char('T'));
+        assert_eq!(app.message, "only a local branch can be tagged here");
+        assert!(app.prompt.is_none());
+        assert!(state.lock().unwrap().tags_written.is_empty());
+    }
+
+    #[test]
+    fn generic_prompt_preserves_search_lifecycle_and_mouse_inertness() {
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        let mut app = commits_app(&handle);
+
+        // The search lifecycle, still green after the prompt became a typed
+        // enum: live filtering, keep on Enter, restore on Esc.
+        app.press(Key::char('/'));
+        assert!(matches!(app.prompt, Some(Prompt::Search { .. })));
+        type_(&mut app, "commit 9");
+        let live = commits_of(&app).filter_note();
+        assert!(live.is_some(), "the edit did not filter live");
+        app.press(Key::plain(Code::Enter));
+        assert_eq!(
+            commits_of(&app).filter_note(),
+            live,
+            "enter did not keep the query"
+        );
+        let standing = commits_of(&app).filter_note();
+
+        // A branch name field is the same one-line prompt with a different
+        // consumer — and a standing query is nobody's business while it
+        // edits: neither the typing nor the cancel touches the list's
+        // filter, and nothing moves under the field.
+        app.press(Key::plain(Code::Char('3')));
+        let cursor = branches_of(&app).cursor();
+        app.press(Key::char('n'));
+        assert!(matches!(app.prompt, Some(Prompt::BranchNew { .. })));
+        type_(&mut app, "topic");
+        assert_eq!(
+            commits_of(&app).filter_note(),
+            standing,
+            "a name edit reached the search"
+        );
+        app.press(Key::plain(Code::Esc));
+        assert!(app.prompt.is_none());
+        assert_eq!(
+            commits_of(&app).filter_note(),
+            standing,
+            "a name cancel cleared the search"
+        );
+        assert_eq!(
+            branches_of(&app).cursor(),
+            cursor,
+            "the field moved the cursor"
+        );
+        app.drain_jobs();
+        assert!(state.lock().unwrap().branch_writes.is_empty());
+
+        // While any field stands the keyboard is input's: a digit does not
+        // focus a pane — it is text — a mouse press moves nothing, and the
+        // field survives both.
+        app.draw();
+        app.press(Key::char('n'));
+        app.press(Key::plain(Code::Char('4')));
+        assert!(
+            matches!(app.prompt, Some(Prompt::BranchNew { .. })),
+            "the digit closed the field"
+        );
+        app.draw();
+        assert!(status(&app).contains("4"), "the digit never became text");
+        assert_eq!(
+            app.panes.focused_name(),
+            "branches",
+            "the digit focused a pane from the field"
+        );
+        app.mouse(click(MouseKind::Down, 5, 15));
+        app.mouse(click(MouseKind::Up, 5, 15));
+        assert_eq!(
+            app.panes.focused_name(),
+            "branches",
+            "the mouse moved focus under a field"
+        );
+        assert!(
+            matches!(app.prompt, Some(Prompt::BranchNew { .. })),
+            "the mouse closed the field"
+        );
+        app.press(Key::plain(Code::Esc));
+        assert!(app.prompt.is_none());
+
+        // And a name prompt accepted after all of it still creates — the
+        // field is input, and the world was only ever waiting. The standing
+        // query outlives it too; the note's *denominator* is the list's own
+        // business, and the fake's re-read log is shorter than the hundred
+        // the pane was constructed with.
+        app.press(Key::char('n'));
+        type_(&mut app, "made-later");
+        let gen = app.generation;
+        app.press(Key::plain(Code::Enter));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > gen
+            }),
+            "the create never queued"
+        );
+        assert_eq!(state.lock().unwrap().branch_bytes, [b"made-later".to_vec()]);
+        assert_eq!(
+            commits_of(&app).query(),
+            Some("commit 9"),
+            "an accept reached the search"
+        );
+    }
+
+    #[test]
+    fn delete_arms_same_raw_target_then_submits_non_force_once() {
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        let mut app = commits_app(&handle);
+        app.draw();
+        app.press(Key::plain(Code::Char('3')));
+
+        // First press: the exact question, nothing queued, and the armed
+        // row itself in the chrome's error ink — the thing a second press
+        // destroys is named by its own colour, focused or not.
+        app.press(Key::char('d'));
+        app.draw();
+        assert_eq!(
+            app.message, "delete branch main? press again to confirm",
+            "{:?}",
+            app.message
+        );
+        assert!(state.lock().unwrap().branch_writes.is_empty());
+        assert!(
+            branches_of(&app).armed_row().is_some(),
+            "the first press did not arm"
+        );
+        {
+            let rect = app.pane_rect("branches").expect("placed");
+            let ink = app
+                .screen
+                .ink(rect.x + 2, rect.y + 1)
+                .expect("a drawn cell");
+            assert_eq!(
+                ink.fg, app.host.theme.chrome.error,
+                "the armed row is not error-tinted"
+            );
+        }
+
+        // A cursor move disarms: the question was about the row the
+        // keyboard used to be on.
+        app.dispatch("view.down");
+        assert_eq!(
+            branches_of(&app).armed_row(),
+            None,
+            "the arm survived a cursor move"
+        );
+
+        // The non-text local arms under its lossy display name, and the arm
+        // is keyed by the raw bytes — the question and the job name the same
+        // branch.
+        app.press(Key::char('d'));
+        assert_eq!(
+            app.message,
+            "delete branch f\u{fffd}ature? press again to confirm"
+        );
+        assert_eq!(
+            branches_of(&app).armed_row(),
+            Some(Target::Local(RefName::from_bytes(b"f\xe9ature")))
+        );
+
+        // Second press on the same raw target: one non-force deletion, the
+        // arm spent, and the refreshed pane without the row.
+        let gen = app.generation;
+        app.press(Key::char('d'));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > gen
+            }),
+            "the confirmed delete never queued"
+        );
+        assert_eq!(
+            state.lock().unwrap().branch_writes,
+            ["delete branch f\u{fffd}ature"]
+        );
+        assert_eq!(state.lock().unwrap().branch_bytes, [b"f\xe9ature".to_vec()]);
+        assert_eq!(
+            branches_of(&app).armed_row(),
+            None,
+            "the arm outlived its spend"
+        );
+        assert_eq!(
+            branches_of(&app).status(),
+            "2/3 · origin/feat/ure",
+            "the deleted branch did not leave the pane"
+        );
+
+        // A prompt disarms too — a question nobody can answer while the
+        // field holds the keyboard is a trap, not a question.
+        app.dispatch("view.top");
+        app.press(Key::char('d'));
+        assert!(branches_of(&app).armed_row().is_some());
+        app.press(Key::char('n'));
+        assert_eq!(
+            branches_of(&app).armed_row(),
+            None,
+            "the arm survived a prompt"
+        );
+        app.press(Key::plain(Code::Esc));
+
+        // So does a config reload.
+        app.press(Key::char('d'));
+        assert!(branches_of(&app).armed_row().is_some());
+        let path =
+            std::env::temp_dir().join(format!("gitten-tui-branch-{}.toml", std::process::id()));
+        std::fs::write(&path, "[view]\nscrolloff = 1\n").expect("a config file");
+        app.reload(&path);
+        assert_eq!(
+            branches_of(&app).armed_row(),
+            None,
+            "the arm survived a reload"
+        );
+        std::fs::remove_file(&path).ok();
+
+        // The mouse moves the question only by moving the keyboard: a press
+        // on the armed row leaves it standing — that row is still what the
+        // second press would confirm — and a press on another row clears it.
+        app.dispatch("view.top");
+        app.press(Key::char('d'));
+        app.mouse(click(MouseKind::Down, 2, 9));
+        app.mouse(click(MouseKind::Up, 2, 9));
+        assert!(
+            branches_of(&app).armed_row().is_some(),
+            "the arm died on its own row"
+        );
+        app.mouse(click(MouseKind::Down, 2, 11));
+        app.mouse(click(MouseKind::Up, 2, 11));
+        assert_eq!(
+            branches_of(&app).armed_row(),
+            None,
+            "the arm survived a mouse move to another row"
+        );
+
+        // A remote row refuses outright: a tracking ref is the remote's
+        // shadow, and this key is not fetch's prune.
+        app.press(Key::char('d'));
+        assert_eq!(
+            app.message,
+            "a remote branch is its remote's to delete — fetch prunes it here"
+        );
+        assert_eq!(
+            state.lock().unwrap().branch_writes.len(),
+            1,
+            "a remote deletion queued"
+        );
+
+        // Focus round-trips keep the question: the window's own contract,
+        // and the files pane's — arming is about the row, and the keyboard
+        // leaving does not answer it. Both focus paths round-trip, the
+        // digits and the ctrl-j ring, and the arm is on the same target
+        // after each.
+        app.dispatch("view.top");
+        app.press(Key::char('d'));
+        assert_eq!(
+            app.message, "delete branch main? press again to confirm",
+            "{:?}",
+            app.message
+        );
+        assert_eq!(
+            branches_of(&app).armed_row(),
+            Some(Target::Local(RefName::from("main")))
+        );
+        app.press(Key::plain(Code::Char('4')));
+        assert_eq!(app.panes.focused_name(), "commits");
+        app.press(Key::plain(Code::Char('3')));
+        assert_eq!(
+            branches_of(&app).armed_row(),
+            Some(Target::Local(RefName::from("main"))),
+            "the arm died on a digit round-trip"
+        );
+        app.dispatch("pane.next");
+        assert_eq!(app.panes.focused_name(), "commits");
+        app.dispatch("pane.prev");
+        assert_eq!(app.panes.focused_name(), "branches");
+        assert_eq!(
+            branches_of(&app).armed_row(),
+            Some(Target::Local(RefName::from("main"))),
+            "the arm died on a ring round-trip"
+        );
+
+        // The following identical press — the same raw target the question
+        // named, however far the keyboard wandered in between — submits.
+        let gen = app.generation;
+        app.press(Key::char('d'));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > gen
+            }),
+            "the round-tripped arm never submitted"
+        );
+        assert_eq!(
+            state.lock().unwrap().branch_writes,
+            ["delete branch f\u{fffd}ature", "delete branch main"]
+        );
+        assert_eq!(
+            branches_of(&app).armed_row(),
+            None,
+            "the arm outlived its spend"
+        );
+
+        // So does the detached row, in a world that opens detached.
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        {
+            let mut s = state.lock().unwrap();
+            s.head = Some(HeadState::Detached {
+                commit: "f00d".into(),
+            });
+            s.locals[0].head = false;
+        }
+        let mut app = commits_app(&handle);
+        app.press(Key::plain(Code::Char('3')));
+        app.press(Key::char('d'));
+        assert_eq!(app.message, "a detached HEAD is not a branch");
+
+        // And git's own "not fully merged" comes back verbatim: the force
+        // decision's proper home is git's, and nothing here upgrades the
+        // key behind the reader's back.
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        state.lock().unwrap().refuse_branch =
+            Some("error: the branch 'main' is not fully merged".into());
+        let mut app = commits_app(&handle);
+        app.press(Key::plain(Code::Char('3')));
+        app.press(Key::char('d'));
+        app.press(Key::char('d'));
+        let gen = app.generation;
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > gen
+            }),
+            "the refused delete never finished"
+        );
+        assert_eq!(app.message, "error: the branch 'main' is not fully merged");
+        assert!(state.lock().unwrap().branch_writes.is_empty());
+    }
+
+    #[test]
+    fn every_branch_write_refreshes_every_registered_repository_pane() {
+        for verb in ["checkout", "create", "rename", "delete", "tag"] {
+            let (handle, state) = fake(&[]);
+            branch_world(&state);
+            let mut app = commits_app(&handle);
+            // An acquired diff, so every tenant has something the finish can
+            // stale — the empty pane has nothing to re-read by design.
+            app.dispatch("commits.open-diff");
+            app.press(Key::plain(Code::Char('3')));
+            let (branches_before, remotes_before, head_before) = {
+                let s = state.lock().unwrap();
+                (s.branch_reads, s.remote_reads, s.head_reads)
+            };
+            let (log_before, pairs_before) = {
+                let s = state.lock().unwrap();
+                (s.log_reads, s.pairs_reads)
+            };
+
+            // The verb, as the keys send it.
+            match verb {
+                "checkout" => {
+                    app.dispatch("view.down");
+                    app.press(Key::plain(Code::Char(' ')));
+                }
+                "create" => {
+                    app.press(Key::char('n'));
+                    type_(&mut app, "made");
+                    app.press(Key::plain(Code::Enter));
+                }
+                "rename" => {
+                    app.dispatch("view.down");
+                    app.press(Key::char('R'));
+                    type_(&mut app, "renamed");
+                    app.press(Key::plain(Code::Enter));
+                }
+                "delete" => {
+                    app.dispatch("view.down");
+                    app.press(Key::char('d'));
+                    app.press(Key::char('d'));
+                }
+                _ => {
+                    app.dispatch("view.down");
+                    app.press(Key::char('T'));
+                    type_(&mut app, "v1");
+                    app.press(Key::plain(Code::Enter));
+                }
+            }
+            let gen = app.generation;
+            assert!(
+                until(Duration::from_secs(2), || {
+                    app.drain_jobs();
+                    app.generation > gen
+                }),
+                "{verb}: the write never finished"
+            );
+
+            // The ref reads repeat — all three, the snapshot re-taken — and
+            // the panes nobody is looking at re-read too: the hidden commit
+            // list and the acquired diff behind the focused branches pane.
+            let s = state.lock().unwrap();
+            assert!(
+                s.branch_reads > branches_before
+                    && s.remote_reads > remotes_before
+                    && s.head_reads > head_before,
+                "{verb}: the ref reads did not repeat"
+            );
+            assert!(
+                s.log_reads > log_before,
+                "{verb}: the list was not refreshed"
+            );
+            assert!(
+                s.pairs_reads > pairs_before,
+                "{verb}: the diff was not refreshed"
+            );
+            assert!(!s.branch_writes.is_empty(), "{verb}: no write was recorded");
+            drop(s);
+            for name in app.panes.names().collect::<Vec<_>>() {
+                assert_eq!(
+                    app.panes.get(name).unwrap().generation(),
+                    app.generation,
+                    "{verb}: {name} was not refreshed to the generation"
+                );
+            }
+
+            // And the change itself landed in the refreshed pane, where the
+            // verb's semantics say it should.
+            let status = branches_of(&app).status();
+            match verb {
+                "checkout" => {
+                    assert_eq!(status, "2/4 · f\u{fffd}ature", "{verb}");
+                    app.draw();
+                    let rect = app.pane_rect("branches").expect("placed");
+                    let rows: Vec<String> = ((rect.y + 1)..(rect.y + rect.height))
+                        .map(|y| app.screen.row_text(y))
+                        .collect();
+                    assert!(
+                        rows.iter().any(|r| r.starts_with("● f")),
+                        "{verb}: the checked-out branch is not marked current: {rows:?}"
+                    );
+                    assert!(
+                        rows.iter().any(|r| r.starts_with("• m")),
+                        "{verb}: the branch HEAD left is still marked current: {rows:?}"
+                    );
+                }
+                "create" => assert_eq!(status, "1/5 · main", "{verb}"),
+                "rename" => assert_eq!(status, "2/4 · renamed", "{verb}"),
+                "delete" => assert_eq!(status, "2/3 · origin/feat/ure", "{verb}"),
+                _ => assert_eq!(status, "2/4 · f\u{fffd}ature", "{verb}"),
+            }
+        }
+
+        // Hidden tenants: narrow mode, the branches pane unplaced — and a
+        // branch write still re-reads it, with every other tenant, to the
+        // same generation. The diff is opened first so it, too, has
+        // something a finish can stale.
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        let mut app = commits_app(&handle);
+        app.dispatch("commits.open-diff");
+        app.screen.resize(60, 24);
+        app.press(Key::plain(Code::Char('4')));
+        app.draw();
+        assert!(
+            app.pane_content("branches").is_none(),
+            "narrow mode showed the hidden pane"
+        );
+        let job = Write::create_branch(&handle, b"made-hidden".to_vec(), None);
+        assert!(app.submitter.submit(Box::new(job)).is_ok(), "queued");
+        let gen = app.generation;
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > gen
+            }),
+            "the hidden tenant was not refreshed"
+        );
+        for name in ["commits", "stashes", "diff", "files", "branches"] {
+            assert_eq!(
+                app.panes.get(name).unwrap().generation(),
+                app.generation,
+                "{name} was not refreshed while hidden"
+            );
+        }
+
+        // One refresh failure does not skip the tenants after it: the files
+        // read fails mid-wave, and the branches pane — later in the
+        // registration order — still reaches the generation while the first
+        // error is the one the status line keeps.
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        let mut app = commits_app(&handle);
+        state.lock().unwrap().fail_status = Some("fatal: unable to read the working tree".into());
+        app.press(Key::plain(Code::Char('3')));
+        app.press(Key::char('d'));
+        app.press(Key::char('d'));
+        let gen = app.generation;
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > gen
+            }),
+            "the wave with a failing tenant never finished"
+        );
+        assert_eq!(
+            app.message, "fatal: unable to read the working tree",
+            "the first refresh error did not stand: {:?}",
+            app.message
+        );
+        assert!(
+            app.panes.get("files").unwrap().generation() < app.generation,
+            "a failed tenant claimed the generation"
+        );
+        assert_eq!(
+            app.panes.get("branches").unwrap().generation(),
+            app.generation,
+            "a later tenant was skipped by an earlier one's failure"
+        );
+
+        // A refused write is the same contract: the finish advances the
+        // generation and the refs are re-read, refusal or not.
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        state.lock().unwrap().refuse_branch =
+            Some("error: the branch 'main' is not fully merged".into());
+        let mut app = commits_app(&handle);
+        app.press(Key::plain(Code::Char('3')));
+        let reads = state.lock().unwrap().branch_reads;
+        app.press(Key::plain(Code::Char(' ')));
+        let gen = app.generation;
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > gen && state.lock().unwrap().branch_reads > reads
+            }),
+            "the refused write did not trigger the refresh"
+        );
+        assert_eq!(
+            app.panes.get("branches").unwrap().generation(),
+            app.generation,
+            "the refused write's finish did not refresh the pane"
+        );
+    }
+
+    #[test]
+    fn branch_header_status_copy_and_help_use_live_registry_data() {
+        let (handle, _state) = fake(&[]);
+        branch_world(&_state);
+        let mut app = commits_app(&handle);
+        app.press(Key::plain(Code::Char('3')));
+        app.draw();
+
+        // The header says the pane's name, the focus key out of the *live*
+        // keymap — the shipped `3`, here without any local table — and the
+        // label counting the groups the read brought back.
+        let rect = app.pane_rect("branches").expect("placed");
+        let header = app
+            .screen
+            .row_text(rect.y)
+            .chars()
+            .take(40)
+            .collect::<String>();
+        assert!(header.contains("branches"), "{header:?}");
+        assert!(header.contains('3'), "{header:?}");
+        assert!(header.contains("fake (main) · 2 local"), "{header:?}");
+
+        // The title and the status line follow the keyboard.
+        assert!(
+            app.screen.row_text(0).contains("branches"),
+            "the title did not follow: {:?}",
+            app.screen.row_text(0)
+        );
+        assert!(
+            app.screen.row_text(23).contains("branches · 1/4 · main"),
+            "the status did not follow: {:?}",
+            app.screen.row_text(23)
+        );
+
+        // `y` copies exactly the selected refname, as git spells it — the
+        // bare name here, the joined remote/branch there, and nothing at all
+        // for a row no verb can act on.
+        app.dispatch("copy.selection");
+        assert_eq!(app.copy.as_deref(), Some("main"));
+        app.dispatch("view.down");
+        app.dispatch("view.down");
+        app.dispatch("copy.selection");
+        assert_eq!(app.copy.as_deref(), Some("origin/feat/ure"));
+
+        // The help panel lists the five included verbs straight out of the
+        // shared registry — and the rebase row core binds in this mode,
+        // which this pass deliberately leaves unhandled: the gap is visible
+        // in the one place that exists for it, not hidden. Tall enough that
+        // the panel shows past the global section into the focused mode's
+        // own bindings.
+        app.screen = Screen::new(120, 50);
+        app.press(Key::char('?'));
+        app.draw();
+        let help = (0..50)
+            .map(|y| app.screen.row_text(y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for doc in [
+            "focus the branches pane",
+            "check out the selected branch",
+            "create a branch",
+            "rename the selected branch",
+            // The panel's column is finite and the longest descriptions
+            // truncate; each marker below survives its own truncation.
+            "delete the selected branch",
+            "name the selected branch's",
+            "move the current branch onto",
+        ] {
+            assert!(help.contains(doc), "help is missing {doc:?}: {help:?}");
+        }
+    }
+
+    #[test]
+    fn rebase_commands_remain_explicitly_deferred() {
+        // The scope fence for the named lifecycle follow-up — rebase-onto,
+        // conflict state, abort and continue — not the desired final
+        // product: the keys keep saying they do nothing here, and no job is
+        // ever submitted.
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        let mut app = commits_app(&handle);
+        app.press(Key::plain(Code::Char('3')));
+
+        // The key resolves through core's branches mode — lowercase `r` —
+        // and lands on the same unimplemented name.
+        app.press(Key::char('r'));
+        assert_eq!(app.message, "commits.rebase-onto does nothing here");
+        app.dispatch("commits.rebase-onto");
+        assert_eq!(app.message, "commits.rebase-onto does nothing here");
+
+        // From the commits pane, the two exits say the same thing.
+        app.press(Key::plain(Code::Char('4')));
+        app.dispatch("rebase.abort");
+        assert_eq!(app.message, "rebase.abort does nothing here");
+        app.dispatch("rebase.continue");
+        assert_eq!(app.message, "rebase.continue does nothing here");
+
+        app.drain_jobs();
+        let s = state.lock().unwrap();
+        assert!(
+            s.branch_writes.is_empty() && s.writes.is_empty(),
+            "a rebase job was submitted: {:?}",
+            s.branch_writes
+        );
+    }
+
+    #[test]
+    fn wave_one_and_plan_016_features_survive_a_third_tenant() {
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        let mut app = commits_app(&handle);
+        app.draw();
+        app.dispatch("commits.open-diff");
+        app.draw();
+
+        // Focus: the digits and the cycle still walk the ring, and the
+        // title, header and status all follow the keyboard.
+        app.press(Key::plain(Code::Char('3')));
+        assert_eq!(app.panes.focused_name(), "branches");
+        app.draw();
+        assert!(
+            app.screen.row_text(0).contains("branches"),
+            "the title did not follow: {:?}",
+            app.screen.row_text(0)
+        );
+        assert!(
+            app.screen.row_text(7).contains('3') && app.screen.row_text(7).contains("branches"),
+            "the header did not advertise the pane: {:?}",
+            app.screen.row_text(7)
+        );
+        assert!(
+            app.screen.row_text(23).contains("branches · 1/4 · main"),
+            "the status did not follow: {:?}",
+            app.screen.row_text(23)
+        );
+
+        // Enter still replaces and focuses the persistent diff, and Back
+        // returns to the last list — the branches pane included in `last_list`.
+        app.dispatch("commits.open-diff");
+        assert_eq!(app.panes.focused_name(), "diff");
+        app.dispatch("back");
+        assert_eq!(app.panes.focused_name(), "branches", "back lost the list");
+        app.dispatch("commits.open-diff");
+        app.press(Key::plain(Code::Char('4')));
+        app.dispatch("back");
+        assert_eq!(app.panes.focused_name(), "commits");
+
+        // Search still targets the commit list — by the pane's own name,
+        // not by whoever holds the keyboard.
+        app.press(Key::char('/'));
+        assert!(matches!(app.prompt, Some(Prompt::Search { .. })));
+        type_(&mut app, "commit 9");
+        app.press(Key::plain(Code::Enter));
+        let mut direct = Commits::new(hundred_commits());
+        direct.apply_query("commit 9");
+        assert_eq!(
+            commits_of(&app).filter_note(),
+            direct.filter_note(),
+            "search did not reach the list"
+        );
+
+        // Hunk verbs still route to the diff pane and its own gate — not to
+        // the pane that holds the keyboard, and not to the branches.
+        app.press(Key::plain(Code::Char('0')));
+        app.dispatch("diff.stage-hunk");
+        assert_eq!(
+            app.message,
+            "only the working-tree diff can act on hunks — this one is between commits"
+        );
+        assert!(
+            state.lock().unwrap().branch_writes.is_empty(),
+            "the hunk verb reached the branches"
+        );
+
+        // Mouse capture: a drag in the commit list selects its rows and its
+        // release reads that pane; a press in the branches slice moves the
+        // keyboard there, and a drag inside it builds no selection — a ref
+        // list is acted on one row at a time.
+        app.dispatch("commits.focus");
+        app.mouse(click(MouseKind::Down, 5, 15));
+        app.mouse(click(MouseKind::Drag, 5, 17));
+        app.mouse(click(MouseKind::Up, 5, 17));
+        assert!(
+            !commits_of(&app).selection().is_empty(),
+            "the drag in the list selected nothing"
+        );
+        app.mouse(click(MouseKind::Down, 5, 9));
+        assert_eq!(
+            app.panes.focused_name(),
+            "branches",
+            "the press did not move the keyboard to the branches"
+        );
+        app.mouse(click(MouseKind::Up, 5, 9));
+        app.mouse(click(MouseKind::Down, 5, 9));
+        app.mouse(click(MouseKind::Drag, 5, 11));
+        app.mouse(click(MouseKind::Up, 5, 11));
+        assert_eq!(
+            app.panes.get("branches").map(|pane| pane.selection()),
+            Some(String::new()),
+            "a drag built a branch selection"
+        );
+
+        // Copy on the list still copies the row the keyboard is on.
+        app.press(Key::plain(Code::Char('4')));
+        app.dispatch("copy.selection");
+        assert!(app.copy.is_some(), "the list copied nothing");
+
+        // A reload rebuilds the host and re-applies geometry to every placed
+        // pane — the branches pane included — and keeps the focus where it
+        // was.
+        let path = std::env::temp_dir().join(format!(
+            "gitten-tui-branch-wave-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, "[view]\nscrolloff = 1\n").expect("a config file");
+        app.press(Key::plain(Code::Char('3')));
+        app.reload(&path);
+        assert_eq!(
+            app.panes.focused_name(),
+            "branches",
+            "the reload moved the focus"
+        );
+        assert!(app.pane_content("branches").is_some());
+        std::fs::remove_file(&path).ok();
+
+        // Narrow mode, branches focused: the *other* lists are unplaced —
+        // and stale all the same when a branch write finishes.
+        app.screen.resize(60, 24);
+        app.draw();
+        assert!(
+            app.pane_content("commits").is_none(),
+            "narrow mode showed the hidden pane"
+        );
+        let job = Write::create_branch(&handle, b"made-hidden".to_vec(), None);
+        assert!(app.submitter.submit(Box::new(job)).is_ok(), "queued");
+        let gen = app.generation;
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > gen
+            }),
+            "the hidden tenants were not refreshed"
+        );
+        for name in ["commits", "stashes", "diff", "files", "branches"] {
+            assert_eq!(
+                app.panes.get(name).unwrap().generation(),
+                app.generation,
+                "{name} was not refreshed to the generation"
+            );
         }
     }
 }
