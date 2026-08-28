@@ -403,7 +403,7 @@ impl Branches {
     /// A refresh is the repository saying things moved; an armed delete was a
     /// a promise about how they were, so it dies here first — and so does the
     /// mouse's hold on a thumb that may no longer mean anything.
-    pub fn replace(&mut self, prepared: Prepared) {
+    pub fn replace(&mut self, rows: Vec<Row>) {
         self.armed = None;
         self.grabbed = None;
         let old = self.view;
@@ -411,7 +411,7 @@ impl Branches {
             Some(r) => row_target(r),
             None => None,
         };
-        self.rows = prepared.rows;
+        self.rows = rows;
         self.total = self.rows.iter().filter(|r| selectable(Some(r))).count();
         // The old scroll position first, then the anchor: `go_to` drags the
         // viewport after the cursor, and the surviving branch's row must be
@@ -1139,12 +1139,7 @@ mod tests {
         let mut remotes = remotes.clone();
         remotes.reverse();
         let detached = HeadState::Detached { commit: sha() };
-        b.replace(prepare(
-            &reordered,
-            &remotes,
-            Some(&detached),
-            "fake (main)",
-        ));
+        b.replace(prepare(&reordered, &remotes, Some(&detached), "fake (main)").rows);
         assert_eq!(
             b.current(),
             Some(Target::Local(RefName::from_bytes(b"f\xe9ature"))),
@@ -1156,7 +1151,7 @@ mod tests {
         // The branch itself is gone: clamp onto what survives, then settle
         // onto a row a verb can act on.
         let survivor = vec![local("main", true)];
-        b.replace(prepare(&survivor, &[], None, ""));
+        b.replace(prepare(&survivor, &[], None, "").rows);
         assert_eq!(
             b.current(),
             Some(Target::Local(RefName::from("main"))),
@@ -1166,7 +1161,7 @@ mod tests {
         // Emptied wholesale: the cursor and viewport both come home, and the
         // dimensions and the bar the pane was sized with are untouched.
         let (cols, height, bar) = (b.cols, b.view.height(), b.bar);
-        b.replace(prepare(&[], &[], None, ""));
+        b.replace(prepare(&[], &[], None, "").rows);
         assert_eq!((b.view.cursor(), b.view.top()), (0, 0));
         assert_eq!((b.cols, b.view.height(), b.bar), (cols, height, bar));
         assert_eq!(b.current(), None);
