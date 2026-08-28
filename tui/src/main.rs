@@ -1115,7 +1115,7 @@ impl App {
         // stderr, which sits behind the alternate screen. A branch read
         // failure outranks a stash one only because there is one line and
         // both panes refresh either way.
-        app.message = stash_error.or(branch_error).unwrap_or_default();
+        app.message = branch_error.or(stash_error).unwrap_or_default();
         app.sync_header_keys();
         app.sync_modes();
         app
@@ -1737,9 +1737,11 @@ impl App {
     }
 
     /// Drops the branches pane's destructive arm, if one stands and the pane
-    /// exists. The one place focus loss, a prompt and a reload all reach —
-    /// the arm's own clearing on moves, wheels and refreshes lives on the
-    /// view, where the keyboard is.
+    /// exists. The one place a prompt and a reload both reach — the arm's own
+    /// clearing on moves, wheels, mouse rows and refreshes lives on the view,
+    /// where the keyboard is. Focus is deliberately missing: a round-trip
+    /// across the ring leaves the question standing on its row, the window's
+    /// contract and the files pane's.
     fn disarm_branches(&mut self) {
         if let Some(Screens::Branches { view, .. }) = self.panes.get_mut("branches") {
             view.disarm();
@@ -2176,14 +2178,13 @@ impl App {
                 ) {
                     self.last_list = Some(name.to_string());
                 }
-                // A branch elsewhere in the ring still holds a destructive
-                // arm it cannot see answered: the question was asked about
-                // the row the keyboard used to be on, and the keyboard just
-                // moved. The view's own move handling covers attention moves
-                // inside the pane; losing the pane is this one's.
-                if name != "branches" {
-                    self.disarm_branches();
-                }
+                // No disarm here, deliberately. A focus round-trip does not
+                // answer a destructive question: the window keeps the arm
+                // across focus, the files pane ships the same contract, and
+                // the branches pane matches them both. What disarms is the
+                // view's own list — cursor moves, wheels, mouse rows,
+                // refreshes — and a prompt or a reload, through
+                // [`App::disarm_branches`].
                 self.sync_modes();
             }
             None => self.message = format!("no {name} pane"),
@@ -8059,22 +8060,9 @@ diff --git a/tracked.txt b/tracked.txt
             "the deleted branch did not leave the pane"
         );
 
-        // Focus loss disarms: arm, leave the pane, return — no question
-        // standing. The cursor rests on the row the settle chose after the
-        // delete; back to a local row first, so `d` arms.
-        app.dispatch("view.top");
-        app.press(Key::char('d'));
-        assert!(branches_of(&app).armed_row().is_some());
-        app.press(Key::plain(Code::Char('4')));
-        assert_eq!(
-            branches_of(&app).armed_row(),
-            None,
-            "the arm survived losing the keyboard"
-        );
-        app.press(Key::plain(Code::Char('3')));
-
         // A prompt disarms too — a question nobody can answer while the
         // field holds the keyboard is a trap, not a question.
+        app.dispatch("view.top");
         app.press(Key::char('d'));
         assert!(branches_of(&app).armed_row().is_some());
         app.press(Key::char('n'));
@@ -8129,6 +8117,61 @@ diff --git a/tracked.txt b/tracked.txt
             state.lock().unwrap().branch_writes.len(),
             1,
             "a remote deletion queued"
+        );
+
+        // Focus round-trips keep the question: the window's own contract,
+        // and the files pane's — arming is about the row, and the keyboard
+        // leaving does not answer it. Both focus paths round-trip, the
+        // digits and the ctrl-j ring, and the arm is on the same target
+        // after each.
+        app.dispatch("view.top");
+        app.press(Key::char('d'));
+        assert_eq!(
+            app.message, "delete branch main? press again to confirm",
+            "{:?}",
+            app.message
+        );
+        assert_eq!(
+            branches_of(&app).armed_row(),
+            Some(Target::Local(RefName::from("main")))
+        );
+        app.press(Key::plain(Code::Char('4')));
+        assert_eq!(app.panes.focused_name(), "commits");
+        app.press(Key::plain(Code::Char('3')));
+        assert_eq!(
+            branches_of(&app).armed_row(),
+            Some(Target::Local(RefName::from("main"))),
+            "the arm died on a digit round-trip"
+        );
+        app.dispatch("pane.next");
+        assert_eq!(app.panes.focused_name(), "commits");
+        app.dispatch("pane.prev");
+        assert_eq!(app.panes.focused_name(), "branches");
+        assert_eq!(
+            branches_of(&app).armed_row(),
+            Some(Target::Local(RefName::from("main"))),
+            "the arm died on a ring round-trip"
+        );
+
+        // The following identical press — the same raw target the question
+        // named, however far the keyboard wandered in between — submits.
+        let gen = app.generation;
+        app.press(Key::char('d'));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > gen
+            }),
+            "the round-tripped arm never submitted"
+        );
+        assert_eq!(
+            state.lock().unwrap().branch_writes,
+            ["delete branch f\u{fffd}ature", "delete branch main"]
+        );
+        assert_eq!(
+            branches_of(&app).armed_row(),
+            None,
+            "the arm outlived its spend"
         );
 
         // So does the detached row, in a world that opens detached.

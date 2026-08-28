@@ -277,6 +277,22 @@ pub fn delete_question(shown: &str) -> String {
     format!("delete branch {shown}? press again to confirm")
 }
 
+/// Whether a row's verb target is an arm's, matched by borrow — field
+/// against field, the way [`crate::files`] matches its armed discard. The
+/// per-frame half of the arm's search, so it allocates nothing: the clone a
+/// `row_target` round-trip would spend on every row belongs to nothing on
+/// the render path.
+fn row_targets(row: &Row, target: &Target) -> bool {
+    match (row, target) {
+        (Row::Detached { .. }, Target::Detached) => true,
+        (Row::Local(l), Target::Local(name)) => l.name == *name,
+        (Row::Remote(r), Target::Remote { remote, branch }) => {
+            r.remote == *remote && r.branch == *branch
+        }
+        _ => false,
+    }
+}
+
 /// A row's verb target, when it has one — headings do not.
 fn row_target(row: &Row) -> Option<Target> {
     match row {
@@ -317,10 +333,12 @@ pub struct Branches {
     /// The delete awaiting its second press: the exact bytes of the row that
     /// asked. One slot — arming a different row moves the question, it does
     /// not queue two. Outliving a switch to another pane and back is
-    /// deliberate — the question still sits on the row it was asked about —
-    /// and every *attention* change kills it: a cursor move, a wheel, a mouse
-    /// row change, a prompt, a reload, a refresh. The app disarms it when the
-    /// pane loses the keyboard, through [`Branches::disarm`].
+    /// deliberate — the question still sits on the row it was asked about,
+    /// the window's own contract, and the files pane's too. What kills it is
+    /// every *attention* change and every change of the data under it: a
+    /// cursor move, a wheel, a mouse move to another row, a prompt opening,
+    /// a config reload, a refresh. Losing the keyboard alone does none of
+    /// those things.
     armed: Option<Target>,
     /// Where in the scrollbar's thumb it was taken hold of, while it is held.
     grabbed: Option<usize>,
@@ -420,11 +438,7 @@ impl Branches {
         view.set_len(self.rows.len());
         view.scroll_to(old.top());
         let cursor = anchored
-            .and_then(|target| {
-                self.rows
-                    .iter()
-                    .position(|r| row_target(r).as_ref() == Some(&target))
-            })
+            .and_then(|target| self.rows.iter().position(|r| row_targets(r, &target)))
             .unwrap_or_else(|| old.cursor().min(self.rows.len().saturating_sub(1)));
         view.go_to(cursor);
         self.view = view;
@@ -460,8 +474,10 @@ impl Branches {
     }
 
     /// Drops the question, whatever it was about — what the app calls when
-    /// the pane loses the keyboard, because a destructive verb armed to a row
-    /// nobody is looking at is an accident waiting for its second press.
+    /// a prompt stands up over the pane or the config reloads under it, the
+    /// two disarms that are not the view's own. Focus is deliberately not
+    /// one: a round-trip across the ring leaves the question standing on the
+    /// row it was asked about, the window's contract.
     pub fn disarm(&mut self) {
         self.armed = None;
     }
@@ -473,13 +489,12 @@ impl Branches {
     }
 
     /// The row an armed delete sits on, found per frame — the tint is a
-    /// property of the question, not of the draw.
+    /// property of the question, not of the draw. By borrow: a search that
+    /// runs per frame allocates nothing.
     fn armed_index(&self) -> Option<usize> {
-        self.armed.as_ref().and_then(|target| {
-            self.rows
-                .iter()
-                .position(|r| row_target(r).as_ref() == Some(target))
-        })
+        self.armed
+            .as_ref()
+            .and_then(|target| self.rows.iter().position(|r| row_targets(r, target)))
     }
 
     // -------------------------------------------------------------- commands
