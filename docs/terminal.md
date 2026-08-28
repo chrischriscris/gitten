@@ -185,9 +185,10 @@ the same enum `j` is, so the wheel resolves through the keymap, appears on the
 `core::command` exists to stop three clients each owning. What it runs is
 `view.scroll-down` / `view.scroll-up`, also on `ctrl-e` / `ctrl-y`, because
 moving the *view* is a different verb from moving the cursor and deserved a
-command rather than a flag on `view.down`. Where the pointer was is dropped:
-there is one scrollable thing on screen, and a coordinate nothing can route is
-one that gets routed wrong the day there are panes.
+command rather than a flag on `view.down`. The terminal input keeps the notch's
+cell beside that key: `main.rs` resolves it in the mode of the pane below the
+pointer and sends the resulting view command there. Focus does not move, so the
+keyboard stays on its pane while the pointer scrolls either neighbour.
 
 **A button is not a key**, for the same reason and pointing the other way: a
 position cannot be a line in `gitten.toml`, because a config file cannot hold a
@@ -211,11 +212,11 @@ on purpose.
 
 ## The mouse
 
-A notch is a key and a button is a place, and that split is the whole design —
-see [decisions/0022](decisions/0022-the-mouse-in-a-terminal.md).
+A notch is a configurable key *at a place*, while a button is only a place — see
+[decisions/0022](decisions/0022-the-mouse-in-a-terminal.md).
 
 ```text
-  wheel   ──► Code::WheelUp/Down ──► Keymap ──► "view.scroll-up"   rebindable
+  wheel   ──► key + cell ──► hovered pane's mode ──► Keymap ──► view command
   button  ──► Input::Mouse ──► main: which row of the body ──► a view's method
 ```
 

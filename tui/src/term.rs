@@ -59,18 +59,19 @@ use std::time::Duration;
 /// on a second platform writes this function and nothing else.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Input {
-    /// A keypress — and a wheel notch, which [`Code`] holds a variant for and
-    /// which therefore needs nothing here. That is the point of it arriving as a
-    /// key: what a notch does is a line in `gitten.toml` like everything else,
-    /// and this enum stays a list of things that happened rather than a list of
-    /// things to do.
+    /// A keypress.
     Key(Key),
+    /// A wheel notch, as both its configurable key and its position.
+    ///
+    /// Keeping the [`Key`] is what leaves the action in `gitten.toml`; keeping
+    /// the cell is what lets an assembly with panes send that action to the
+    /// view below the pointer rather than the one holding the keyboard.
+    Wheel { key: Key, col: usize, row: usize },
     /// A button, a drag or a release, and where it happened.
     ///
-    /// Not a [`Key`], and that is the line `core::command` draws: a wheel notch
-    /// is a control with no coordinate and resolves through the keymap, and a
-    /// click is a *position* and belongs to whatever was under it. Routing one is
-    /// a hit test, which is the assembly's job and then a view's.
+    /// Not a [`Key`], and that is the line `core::command` draws: a click is a
+    /// *position* and belongs to whatever was under it. Routing one is a hit
+    /// test, which is the assembly's job and then a view's.
     Mouse(Mouse),
     /// The terminal changed size. Carries the new one, so nothing has to ask.
     Resize(usize, usize),
@@ -342,12 +343,11 @@ fn translate_event(event: Event) -> Option<Input> {
     }
 }
 
-/// A mouse event as the two different things it can be.
+/// A mouse event as the configurable wheel or the positional button it can be.
 ///
-/// **A wheel notch is a key.** It has no coordinate anything needs — there is one
-/// scrollable thing under the pointer and the view already knows which — so it
-/// resolves through the keymap like `j`, appears on the `?` panel and is
-/// rebindable in `gitten.toml`. See [`Code::WheelUp`].
+/// **A wheel notch carries a key and a position.** The key resolves through the
+/// keymap like `j`, appears on the `?` panel and is rebindable in
+/// `gitten.toml`; the position lets a pane assembly route the resolved command.
 ///
 /// **A button is a position**, and a position cannot be a key: `gitten.toml`
 /// cannot hold a hit test. So it leaves here as an [`Input::Mouse`] and whoever
@@ -364,10 +364,18 @@ fn mouse(m: MouseEvent) -> Option<Input> {
     );
     let kind = match m.kind {
         MouseEventKind::ScrollUp => {
-            return Some(Input::Key(Key::new(Code::WheelUp, ctrl, alt, shift)))
+            return Some(Input::Wheel {
+                key: Key::new(Code::WheelUp, ctrl, alt, shift),
+                col: m.column as usize,
+                row: m.row as usize,
+            })
         }
         MouseEventKind::ScrollDown => {
-            return Some(Input::Key(Key::new(Code::WheelDown, ctrl, alt, shift)))
+            return Some(Input::Wheel {
+                key: Key::new(Code::WheelDown, ctrl, alt, shift),
+                col: m.column as usize,
+                row: m.row as usize,
+            })
         }
         MouseEventKind::Down(MouseButton::Left) => MouseKind::Down,
         MouseEventKind::Drag(MouseButton::Left) => MouseKind::Drag,
@@ -456,13 +464,21 @@ mod tests {
     }
 
     #[test]
-    fn a_wheel_notch_becomes_a_key_and_keeps_no_coordinate() {
+    fn a_wheel_notch_keeps_its_configurable_key_and_coordinate() {
         let notch = |kind| at(kind, KeyModifiers::NONE);
-        let down = Some(Input::Key(Key::plain(Code::WheelDown)));
+        let down = Some(Input::Wheel {
+            key: Key::plain(Code::WheelDown),
+            col: 4,
+            row: 9,
+        });
         assert_eq!(notch(MouseEventKind::ScrollDown), down);
         assert_eq!(
             notch(MouseEventKind::ScrollUp),
-            Some(Input::Key(Key::plain(Code::WheelUp)))
+            Some(Input::Wheel {
+                key: Key::plain(Code::WheelUp),
+                col: 4,
+                row: 9,
+            })
         );
         // A horizontal wheel is unmapped, exactly as an unmapped key is.
         assert_eq!(notch(MouseEventKind::ScrollLeft), None);

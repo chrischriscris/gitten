@@ -19,10 +19,12 @@ nothing on screen said where in a 714k-row diff you were.
 
 **Two different things, routed two different ways.**
 
-A **wheel notch is a key**: `Code::WheelUp` / `Code::WheelDown` resolve through
-the keymap to `view.scroll-up` / `view.scroll-down`, appear on the `?` panel and
-are rebindable in `gitten.toml`. Unchanged from 0012's rule — it is data, so it is
-config.
+A **wheel notch is a key at a position**: `Code::WheelUp` / `Code::WheelDown`
+resolve through the keymap to `view.scroll-up` / `view.scroll-down`, appear on
+the `?` panel and are rebindable in `gitten.toml`. Its terminal cell stays beside
+the key so `main.rs` resolves in and routes to the pane below the pointer without
+moving keyboard focus. Unchanged from 0012's rule — the action is data, so it is
+config; the client-local coordinate only decides its recipient.
 
 A **button is a position**, and a position cannot be a key, because a config file
 cannot hold a hit test. It leaves `term.rs` as `Input::Mouse { kind, col, row }`,
@@ -121,7 +123,6 @@ The double-click interval is ours to keep: the protocol carries a press and no
 count, so `main.rs` holds a 400 ms clock and a cell. That is the only clock in
 the client, and it is why `core::command` still has none.
 
-What would make us revisit it: **panes**. `main.rs` currently routes to the top
-of the screen stack because there is exactly one thing under the pointer. When
-there are two, that function grows a hit test over the layout — and nothing else
-has to change, which is the point of the coordinate stopping there.
+Panes caused the promised revisit: `main.rs` now hit-tests both button and wheel
+coordinates against the layout. A button focuses its pane; a wheel deliberately
+does not, so pointer and keyboard can operate neighbouring panes independently.

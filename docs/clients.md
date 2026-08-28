@@ -130,8 +130,10 @@ are variants of the enum `j` is, so a notch resolves to `view.scroll-down` the
 way a keypress resolves to `view.down` — rebindable, on the help screen, and the
 same name in all three clients. Kept out of `Code`, it would have been a `match`
 in each client deciding that the wheel scrolls: three keymaps nobody could
-configure, which is the exact thing this module exists to prevent. A mouse
-*position* is not a key and is not here; it belongs to whatever was clicked, and
+configure, which is the exact thing this module exists to prevent. A wheel's
+platform position can travel beside that key so a client with panes chooses the
+recipient after resolving the binding. A mouse *position* is not itself a key
+and is not here; it belongs to whatever was pointed at, and
 `gitten-tui/src/main.rs` is what a client routing one looks like.
 
 ### What `Keymap` will not do

@@ -1333,6 +1333,7 @@ impl App {
     fn input(&mut self, input: Input) {
         match input {
             Input::Key(key) => self.press(key),
+            Input::Wheel { key, col, row } => self.wheel(key, col, row),
             Input::Mouse(m) => self.mouse(m),
             // A paste is text, and only while a prompt stands is there anywhere
             // for it to go. It is never a key: pasted `q`, `?` and Enter are
@@ -1430,6 +1431,47 @@ impl App {
         self.pending.clear();
         if let Some(command) = resolved {
             self.dispatch(&command);
+        }
+    }
+
+    /// One wheel notch, resolved in and routed to the pane below the pointer.
+    ///
+    /// The key remains data — its binding still comes from the shared keymap —
+    /// but focus remains where the keyboard left it. A pane header counts as
+    /// that pane; a divider, chrome, help panel or prompt has nothing below it
+    /// to scroll and consumes nothing.
+    fn wheel(&mut self, key: Key, col: usize, row: usize) {
+        let (_, h) = self.screen.size();
+        if h < 3 || self.help || self.prompt.is_some() {
+            return;
+        }
+        let Some((name, _)) = self.hit(col, row) else {
+            return;
+        };
+        let Some(mode) = self.panes.get(&name).map(Screens::mode) else {
+            return;
+        };
+
+        self.message.clear();
+        self.pending.push(key);
+        let mut modes = Modes::new();
+        if self.panes.list_order().len() > 1 {
+            modes.push(panes::MODE);
+        }
+        modes.push(mode);
+        let resolved = match self.host.keys.resolve(&modes, &self.pending) {
+            Resolve::Run(command) => Some(command.to_string()),
+            Resolve::Pending => return,
+            Resolve::None => {
+                let unknown = gitten_core::command::chord_string(&self.pending);
+                self.pending.clear();
+                self.message = format!("{unknown} is not bound — ? for the keys");
+                return;
+            }
+        };
+        self.pending.clear();
+        if let Some(command) = resolved {
+            self.dispatch_to(&command, Some(&name));
         }
     }
 
@@ -2100,6 +2142,15 @@ impl App {
     /// them from a view would make them stop working the day a view stops
     /// being focused. Then the client's own commands, then the focused pane's.
     fn dispatch(&mut self, command: &str) {
+        self.dispatch_to(command, None);
+    }
+
+    /// A command into an effect, optionally giving the pane that originated it.
+    ///
+    /// Keyboard commands omit the target and fall through to the focused pane.
+    /// A wheel supplies its hit-tested pane, while app-wide commands keep their
+    /// ordinary meaning regardless of where their binding originated.
+    fn dispatch_to(&mut self, command: &str, target: Option<&str>) {
         match command {
             // The ten names the shared registry ships, answered from the pane
             // registry and not from any view: h/l and the arrows walk the
@@ -2208,9 +2259,15 @@ impl App {
             // whole resolved contrast table, and doing that per keypress is a
             // thing that would never have shown up in a timing.
             _ => {
-                let known = match self.panes.focused_mut() {
-                    Some(pane) => pane.run(command, &self.host),
-                    None => false,
+                let known = match target {
+                    Some(name) => self
+                        .panes
+                        .get_mut(name)
+                        .is_some_and(|pane| pane.run(command, &self.host)),
+                    None => self
+                        .panes
+                        .focused_mut()
+                        .is_some_and(|pane| pane.run(command, &self.host)),
                 };
                 if !known {
                     self.message = format!("{command} does nothing here");
@@ -5310,7 +5367,12 @@ diff --git a/tracked.txt b/tracked.txt
         app.dispatch("view.down"); // the move itself
         onto_work(&mut app);
         disarm_check(&mut app, &state, "after a cursor move");
-        app.input(Input::Key(Key::plain(Code::WheelDown)));
+        let files = app.pane_rect("files").expect("files placed");
+        app.input(Input::Wheel {
+            key: Key::plain(Code::WheelDown),
+            col: files.x + 1,
+            row: files.y + 1,
+        });
         onto_work(&mut app);
         disarm_check(&mut app, &state, "after the wheel");
 
@@ -5962,7 +6024,7 @@ diff --git a/tracked.txt b/tracked.txt
     }
 
     #[test]
-    fn view_commands_and_wheel_reach_only_the_focused_viewport() {
+    fn keyboard_uses_focus_and_wheel_uses_the_pane_below_the_pointer() {
         let (handle, _state) = fake_tall(&[]);
         let mut app = commits_app(&handle);
         app.draw();
@@ -5971,34 +6033,56 @@ diff --git a/tracked.txt b/tracked.txt
         app.dispatch("commits.focus");
         app.draw();
 
-        // Under the commits focus, `view.down` and the wheel move the commits
-        // viewport and touch nothing else.
+        // The keyboard follows commits focus; a wheel over the diff moves the
+        // diff instead, without stealing that focus.
         let (dc, dt) = (diff_of(&app).cursor(), diff_of(&app).top());
         app.dispatch("view.down");
         assert_eq!(commits_of(&app).cursor(), 1);
         assert_eq!((diff_of(&app).cursor(), diff_of(&app).top()), (dc, dt));
-        app.input(Input::Key(Key::plain(Code::WheelDown)));
+        let diff = app.pane_rect("diff").expect("diff placed");
+        app.input(Input::Wheel {
+            key: Key::plain(Code::WheelDown),
+            col: diff.x + 1,
+            row: diff.y + 1,
+        });
         assert!(
-            commits_of(&app).top() > 0,
-            "the wheel did not scroll the list"
+            diff_of(&app).top() > dt,
+            "the wheel did not scroll the diff below it"
         );
-        assert_eq!(diff_of(&app).top(), dt);
+        assert_eq!(commits_of(&app).top(), 0);
+        assert_eq!(app.panes.focused_name(), "commits");
 
-        // Under the diff focus, the same commands move the diff alone.
+        // Reverse both: the keyboard follows diff focus, while a wheel over
+        // the commits header moves that list and leaves focus on the diff.
         app.dispatch("diff.focus");
         let (cc, ct) = (commits_of(&app).cursor(), commits_of(&app).top());
+        let dc = diff_of(&app).cursor();
         app.dispatch("view.down");
         assert_eq!(diff_of(&app).cursor(), dc + 1);
         assert_eq!(
             (commits_of(&app).cursor(), commits_of(&app).top()),
             (cc, ct)
         );
-        app.input(Input::Key(Key::plain(Code::WheelDown)));
+        let commits = app.pane_rect("commits").expect("commits placed");
+        app.input(Input::Wheel {
+            key: Key::plain(Code::WheelDown),
+            col: commits.x + 1,
+            row: commits.y,
+        });
         assert!(
-            diff_of(&app).top() > dt,
-            "the wheel did not scroll the diff"
+            commits_of(&app).top() > ct,
+            "the wheel did not scroll the list below it"
         );
-        assert_eq!(commits_of(&app).top(), ct);
+        assert_eq!(app.panes.focused_name(), "diff");
+
+        // The divider belongs to no pane and moves neither side.
+        let (ct, dt) = (commits_of(&app).top(), diff_of(&app).top());
+        app.input(Input::Wheel {
+            key: Key::plain(Code::WheelDown),
+            col: commits.right(),
+            row: commits.y + 1,
+        });
+        assert_eq!((commits_of(&app).top(), diff_of(&app).top()), (ct, dt));
 
         // And the frame agrees: the unfocused pane draws no cursor bar, the
         // focused one exactly one.
