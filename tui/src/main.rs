@@ -1042,10 +1042,10 @@ impl App {
             // all — and the tenant registers whether or not they all came
             // back. A read that lost the branch lists registers honest
             // emptiness and keeps the error for the status line; a HEAD-only
-            // failure keeps the rows it did read and marks nothing current,
-            // because a marking that could not be checked would be a lie.
-            // Either way the launch goes on: a failed side read must not
-            // abort the view the person actually asked for.
+            // failure keeps the rows it did read — the current bit rode in on
+            // the list, not on the head read — and merely loses the detached
+            // row. Either way the launch goes on: a failed side read must
+            // not abort the view the person actually asked for.
             let reads = load_branches(handle.as_ref());
             let (rows, branches_label) = match reads.error.as_ref() {
                 // The lists themselves were lost: the pane's data is not
@@ -2921,8 +2921,9 @@ struct BranchReads {
     /// Whose repository these are — the describe the label is spelled with.
     described: String,
     /// The first read that failed, in the sentence the status line says.
-    /// `None` is a clean read; the branch lists and HEAD are read as one
-    /// snapshot, so any failed leg leaves the whole of it untrusted.
+    /// `None` is a clean read. The caller — not this helper — decides what a
+    /// failed leg costs: the lists are honest while they stand, and a lost
+    /// HEAD read costs the detached row alone.
     error: Option<String>,
 }
 
@@ -2957,9 +2958,11 @@ fn load_branches(repo: &dyn gitten_git::Repo) -> BranchReads {
             (Vec::new(), Vec::new())
         }
     };
-    // A HEAD-only failure still leaves rows to draw — it only costs the
-    // current marking, which a branch that cannot be read must not pretend
-    // to have either.
+    // A HEAD-only failure still leaves rows to draw. What it costs is the
+    // detached row: the current bit is not this read's to lose — it travels
+    // on each `Branch` from the same `for-each-ref` that named it, exactly
+    // the bit the window marks from — so an attached repository keeps its
+    // marking and a detached one simply has no detached row to show.
     let head = match head {
         Ok(head) => Some(head),
         Err(e) => {
@@ -4559,6 +4562,21 @@ diff --git a/tracked.txt b/tracked.txt
         match app.panes.get("files") {
             Some(Screens::Files { label, .. }) => label,
             _ => panic!("the files pane is not registered"),
+        }
+    }
+
+    /// The branches view, and the label its tenant was registered under.
+    fn branches_of(app: &App) -> &Branches {
+        match app.panes.get("branches") {
+            Some(Screens::Branches { view, .. }) => view,
+            _ => panic!("the branches pane is not registered"),
+        }
+    }
+
+    fn branches_label(app: &App) -> &str {
+        match app.panes.get("branches") {
+            Some(Screens::Branches { label, .. }) => label,
+            _ => panic!("the branches pane is not registered"),
         }
     }
 
@@ -7088,5 +7106,296 @@ diff --git a/tracked.txt b/tracked.txt
             assert_eq!(stash.current(), Some(0));
             assert_eq!(stash.status(), "1/2 · stash@{0}");
         }
+    }
+
+    #[test]
+    fn repository_launch_registers_branches_in_the_existing_ring() {
+        // The shipped map already binds the digit and the mode's letters: the
+        // terminal adds no name, no alias and no key table anywhere in the
+        // chain — the focus key and every verb resolve through
+        // `Host::new().keys`, the same map `gitten.toml` writes.
+        let keys = Host::new().keys;
+        let mut commits = Modes::new();
+        commits.push("commits");
+        assert_eq!(
+            keys.resolve(&commits, &[Key::plain(Code::Char('3'))]),
+            Resolve::Run("branches.focus")
+        );
+        let mut branches_mode = Modes::new();
+        branches_mode.push("panes");
+        branches_mode.push("branches");
+        assert_eq!(
+            keys.resolve(&branches_mode, &[Key::plain(Code::Char(' '))]),
+            Resolve::Run("branches.checkout")
+        );
+        assert_eq!(
+            keys.resolve(&branches_mode, &[Key::char('R')]),
+            Resolve::Run("branches.rename"),
+            "the mode override is the shared map's, not a terminal table"
+        );
+
+        // A repository-backed commits launch: five tenants, branches in its
+        // canonical sidebar rank — between files and commits — and the
+        // requested startup focus restored over whatever the registrations
+        // focused last.
+        let (handle, _state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        let names: Vec<&str> = app.panes.names().collect();
+        assert_eq!(
+            app.panes.names().collect::<Vec<_>>(),
+            ["commits", "stashes", "diff", "files", "branches"],
+            "{names:?}"
+        );
+        assert_eq!(app.panes.focused_name(), "commits");
+        assert_eq!(
+            app.panes.list_order(),
+            ["files", "branches", "commits", "stashes"]
+        );
+        assert_eq!(
+            app.panes.reading_order(),
+            ["files", "branches", "commits", "stashes", "diff"]
+        );
+
+        // `3` reaches it — through the keymap — and the keyboard's modes
+        // follow, because the mode stack is built from the focused screen.
+        app.press(Key::plain(Code::Char('3')));
+        assert_eq!(app.panes.focused_name(), "branches");
+        assert_eq!(
+            app.panes.focused().map(|pane| pane.mode()),
+            Some("branches")
+        );
+        assert_eq!(
+            app.panes.focused_placement(),
+            Some(panes::Placement::Sidebar { rank: 2 }),
+            "canonical rank 2, from the registry and not a layout edit"
+        );
+
+        // Ctrl-J cycles the now-real sidebar ring from it: branches' next
+        // list is commits', and the walk h/l reaches it too.
+        app.dispatch("pane.next");
+        assert_eq!(app.panes.focused_name(), "commits");
+        app.press(Key::plain(Code::Char('3')));
+        app.dispatch("pane.left");
+        assert_eq!(app.panes.focused_name(), "files", "the walk skipped a list");
+
+        // A repository-backed diff launch registers the tenant the same way —
+        // `App::new` never assumed commits exists — and the diff keeps the
+        // focus the launch asked for.
+        let source = Source::Repo {
+            path: std::path::PathBuf::from("/fake"),
+            arg: String::new(),
+        };
+        let diff_app = app_on_fake(&source, &handle);
+        assert!(diff_app.panes.get("branches").is_some());
+        assert_eq!(diff_app.panes.focused_name(), "diff");
+    }
+
+    #[test]
+    fn direct_diff_gets_branches_while_fixtures_do_not() {
+        let (handle, _state) = fake(&[]);
+        let source = Source::Repo {
+            path: std::path::PathBuf::from("/fake"),
+            arg: String::new(),
+        };
+
+        // A repository diff launch: branches beside the diff it asked for.
+        let mut app = app_on_fake(&source, &handle);
+        assert_eq!(
+            app.panes.names().collect::<Vec<_>>(),
+            ["stashes", "diff", "files", "branches"]
+        );
+        assert_eq!(app.panes.focused_name(), "diff");
+
+        // Narrow — below the wide breakpoint — only the focused pane is
+        // placed, and `3` swaps that full-width visibility to branches. The
+        // diff keeps no rectangle while it is hidden.
+        app.screen.resize(95, 24);
+        app.draw();
+        app.press(Key::plain(Code::Char('3')));
+        app.draw();
+        assert_eq!(app.panes.focused_name(), "branches");
+        assert_eq!(
+            app.pane_rect("branches"),
+            Some(crate::panes::Rect {
+                x: 0,
+                y: 1,
+                width: 95,
+                height: 22
+            }),
+            "narrow mode gives the focused pane the whole body"
+        );
+        assert!(
+            app.pane_rect("diff").is_none(),
+            "the hidden diff kept a rectangle"
+        );
+
+        // Wide: branches and diff occupy the foundation's disjoint
+        // rectangles — the sidebar's foot slice and the main region. No
+        // layout branch learned the name; this is the registry's own answer
+        // to a third sidebar list.
+        app.screen.resize(96, 24);
+        app.draw();
+        let branches = app.pane_rect("branches").expect("branches is placed wide");
+        let diff = app.pane_rect("diff").expect("the diff is placed wide");
+        assert_eq!(
+            branches,
+            crate::panes::Rect {
+                x: 0,
+                y: 9,
+                width: 40,
+                height: 7
+            }
+        );
+        assert_eq!(
+            diff,
+            crate::panes::Rect {
+                x: 41,
+                y: 1,
+                width: 55,
+                height: 22
+            }
+        );
+        assert!(
+            branches.x + branches.width <= diff.x,
+            "the sidebar drew into the main region"
+        );
+
+        // No repository, no tenant: a fixture and a patch launch keep their
+        // previous tenant counts and answer the focus command with the same
+        // sentence an absent pane always got.
+        for mut app in [
+            app_on_diff(Source::Fixtures, None),
+            app_on_diff(Source::Patch { file: None }, None),
+        ] {
+            assert!(
+                app.panes.get("branches").is_none(),
+                "a repository-free launch invented a branches pane"
+            );
+            app.dispatch("branches.focus");
+            assert_eq!(app.message, "no branches pane");
+        }
+    }
+
+    #[test]
+    fn branch_reads_fail_softly_at_start_and_retry_on_generation() {
+        // A lost branch list: the launch keeps its requested view and focus,
+        // the tenant registers honest *unread* — never a clean zero — and
+        // the exact error rides to the status line.
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().fail_locals = Some("fatal: bad object refs/heads".into());
+        let mut app = commits_app(&handle);
+        assert_eq!(
+            app.panes.names().collect::<Vec<_>>(),
+            ["commits", "stashes", "diff", "files", "branches"]
+        );
+        assert_eq!(
+            app.panes.focused_name(),
+            "commits",
+            "a failed side read stole the launch"
+        );
+        assert_eq!(
+            app.message,
+            "branch reads failed: fatal: bad object refs/heads"
+        );
+        assert_eq!(branches_label(&app), "fake (main) · branches unavailable");
+        assert_eq!(
+            branches_of(&app).status(),
+            "no branches",
+            "a failed read drew as an empty pane"
+        );
+        // Nothing falsely advanced: every tenant sits at the launch
+        // generation, the failed one included.
+        for name in app.panes.names().collect::<Vec<_>>() {
+            assert_eq!(
+                app.panes.get(name).unwrap().generation(),
+                app.generation,
+                "{name} was born stale"
+            );
+        }
+
+        // The next successful wave fills what failed — the same generation
+        // rail any write finish rides — and the error leaves the status line.
+        state.lock().unwrap().fail_locals = None;
+        let reads = state.lock().unwrap().branch_reads;
+        let job = Write::stash_apply(&handle, 0);
+        assert!(app.submitter.submit(Box::new(job)).is_ok(), "queued");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                state.lock().unwrap().branch_reads > reads
+            }),
+            "the recovery never re-read the refs"
+        );
+        assert_eq!(branches_label(&app), "fake (main) · 1 local · 0 remote");
+        assert_eq!(branches_of(&app).status(), "1/1 · main");
+        assert_eq!(
+            app.panes.get("branches").unwrap().generation(),
+            app.generation,
+            "the recovered tenant did not reach the generation"
+        );
+
+        // A refresh that fails keeps the last good rows at their own
+        // generation — no fabricated emptiness, no false advance — and says
+        // so; a later wave retries.
+        state.lock().unwrap().fail_locals = Some("fatal: bad object refs/heads".into());
+        let before = app.panes.get("branches").unwrap().generation();
+        let reads = state.lock().unwrap().branch_reads;
+        let job = Write::stash_apply(&handle, 0);
+        assert!(app.submitter.submit(Box::new(job)).is_ok(), "queued");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                state.lock().unwrap().branch_reads > reads
+            }),
+            "the failed wave never finished"
+        );
+        assert_eq!(
+            app.message,
+            "branch reads failed: fatal: bad object refs/heads"
+        );
+        assert!(
+            app.generation > Generation::default(),
+            "the finish did not advance"
+        );
+        assert_eq!(
+            app.panes.get("branches").unwrap().generation(),
+            before,
+            "a failed refresh advanced the tenant"
+        );
+        assert_eq!(
+            branches_of(&app).status(),
+            "1/1 · main",
+            "a failed refresh replaced the rows"
+        );
+
+        // A HEAD-only failure is the other story: the rows survive — the
+        // current bit rode in on the list read, the same bit the window
+        // marks from — and the leg that failed is the one the status line
+        // names.
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().fail_head = Some("fatal: bad object HEAD".into());
+        let mut app = commits_app(&handle);
+        assert_eq!(app.message, "branch reads failed: fatal: bad object HEAD");
+        assert_eq!(branches_label(&app), "fake (main) · 1 local · 0 remote");
+        assert_eq!(branches_of(&app).status(), "1/1 · main");
+
+        // And the recovery is the same rail: the head read repeats on the
+        // next wave and the error leaves.
+        state.lock().unwrap().fail_head = None;
+        let reads = state.lock().unwrap().head_reads;
+        let job = Write::stash_apply(&handle, 0);
+        assert!(app.submitter.submit(Box::new(job)).is_ok(), "queued");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                state.lock().unwrap().head_reads > reads
+            }),
+            "the head re-read never happened"
+        );
+        assert!(
+            !app.message.contains("branch reads failed"),
+            "the stale error outlived its recovery: {:?}",
+            app.message
+        );
     }
 }
