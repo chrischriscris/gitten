@@ -46,6 +46,7 @@ use gitten_core::runs::Run;
 use gitten_core::Hunk;
 use gitten_tui::commits::{Commits, Glyphs};
 use gitten_tui::diff::Diff;
+use gitten_tui::files::{self, Files};
 use gitten_tui::help;
 use gitten_tui::screen::{Ink, Pen, Screen};
 use gitten_tui::scrollbar::Bar;
@@ -170,6 +171,12 @@ fn main() {
 /// Pretending it was acquired from the working tree would let staging and
 /// refreshing reach a pane that holds nothing; "not loaded yet" is a state
 /// the type can say.
+///
+/// The files tenant carries no source at all, and that is the third shape: it
+/// is only ever registered when startup opened a repository, so everything it
+/// refreshes from is the one handle the app retained. A fixture has no
+/// working tree and so no files pane — the name is absent, and `files.focus`
+/// says so — rather than a pane pretending to hold something.
 enum Screens {
     Commits {
         view: Commits,
@@ -180,6 +187,11 @@ enum Screens {
     Diff {
         view: Diff,
         source: Option<Source>,
+        label: String,
+        generation: Generation,
+    },
+    Files {
+        view: Files,
         label: String,
         generation: Generation,
     },
@@ -200,18 +212,23 @@ impl Screens {
         match self {
             Screens::Commits { .. } => "commits",
             Screens::Diff { .. } => "diff",
+            Screens::Files { .. } => "files",
         }
     }
 
     fn label(&self) -> &str {
         match self {
-            Screens::Commits { label, .. } | Screens::Diff { label, .. } => label,
+            Screens::Commits { label, .. }
+            | Screens::Diff { label, .. }
+            | Screens::Files { label, .. } => label,
         }
     }
 
     fn generation(&self) -> Generation {
         match self {
-            Screens::Commits { generation, .. } | Screens::Diff { generation, .. } => *generation,
+            Screens::Commits { generation, .. }
+            | Screens::Diff { generation, .. }
+            | Screens::Files { generation, .. } => *generation,
         }
     }
 
@@ -297,6 +314,31 @@ impl Screens {
                 // acquired from anywhere and has nothing to re-read.
                 Some(Source::Fixtures) | Some(Source::Patch { .. }) | None => None,
             },
+            Screens::Files {
+                view,
+                label,
+                generation,
+            } => {
+                if *generation >= target {
+                    return None;
+                }
+                // The whole of the blocking half: one `git status`, plus the
+                // describe the label names the repository with — the same two
+                // reads the window's files refresh makes, and the same
+                // registration the pane was built from. Nothing here touches
+                // the view until the read has come back, so a failed refresh
+                // leaves the last good rows standing.
+                let status = match repo.status() {
+                    Ok(status) => status,
+                    Err(e) => return Some(Err(e)),
+                };
+                let described = repo.describe();
+                let files::Prepared { rows, label: next } = files::prepare(&status, &described);
+                view.replace(rows);
+                *label = next;
+                *generation = target;
+                Some(Ok(()))
+            }
         }
     }
 
@@ -319,6 +361,10 @@ impl Screens {
                 d.set_scrolloff(host.view.scrolloff);
                 d.resize(rect.width, rect.height, host);
             }
+            Screens::Files { view: f, .. } => {
+                f.set_scrolloff(host.view.scrolloff);
+                f.resize(rect.width, rect.height);
+            }
         }
     }
 
@@ -336,6 +382,9 @@ impl Screens {
         match self {
             Screens::Commits { view: c, .. } => c.paint(screen, x, y, focused, host),
             Screens::Diff { view: d, .. } => d.paint(screen, x, y, focused, host, out),
+            // The files pane needs no run-list buffer: its rows are cells,
+            // not shaped spans.
+            Screens::Files { view: f, .. } => f.paint(screen, x, y, focused, host),
         }
     }
 
@@ -343,6 +392,7 @@ impl Screens {
         match self {
             Screens::Commits { view: c, .. } => c.status(),
             Screens::Diff { view: d, .. } => d.status(host),
+            Screens::Files { view: f, .. } => f.status(),
         }
     }
 
@@ -356,6 +406,7 @@ impl Screens {
         match self {
             Screens::Commits { view: c, .. } => c.press(col, row, extend, host),
             Screens::Diff { view: d, .. } => d.press(col, row, clicks, extend, host),
+            Screens::Files { view: f, .. } => f.press(col, row, clicks, extend, host),
         }
     }
 
@@ -365,6 +416,7 @@ impl Screens {
         match self {
             Screens::Commits { view: c, .. } => c.drag(row, host),
             Screens::Diff { view: d, .. } => d.drag(col, row, host),
+            Screens::Files { view: f, .. } => f.drag(col, row, host),
         }
     }
 
@@ -372,6 +424,7 @@ impl Screens {
         match self {
             Screens::Commits { view: c, .. } => c.release(),
             Screens::Diff { view: d, .. } => d.release(),
+            Screens::Files { view: f, .. } => f.release(),
         }
     }
 
@@ -381,6 +434,7 @@ impl Screens {
         match self {
             Screens::Commits { view: c, .. } => c.copy_text(),
             Screens::Diff { view: d, .. } => d.copy_text(),
+            Screens::Files { view: f, .. } => f.copy_text(),
         }
     }
 
@@ -391,6 +445,9 @@ impl Screens {
         match self {
             Screens::Commits { view: c, .. } => c.selection(),
             Screens::Diff { view: d, .. } => d.selection(),
+            // A file list has no drag selection, so copy-on-select has
+            // nothing to fire on here — the empty answer is the mechanism.
+            Screens::Files { view: f, .. } => f.selection(),
         }
     }
 
@@ -398,6 +455,7 @@ impl Screens {
         match self {
             Screens::Commits { view: c, .. } => c.select_all(),
             Screens::Diff { view: d, .. } => d.select_all(),
+            Screens::Files { view: f, .. } => f.select_all(),
         }
     }
 
@@ -405,6 +463,7 @@ impl Screens {
         match self {
             Screens::Commits { view: c, .. } => c.select_none(),
             Screens::Diff { view: d, .. } => d.select_none(),
+            Screens::Files { view: f, .. } => f.select_none(),
         }
     }
 
@@ -414,6 +473,7 @@ impl Screens {
         match self {
             Screens::Commits { view: c, .. } => c.filter_note(),
             Screens::Diff { .. } => None,
+            Screens::Files { .. } => None,
         }
     }
 
@@ -456,6 +516,20 @@ impl Screens {
                 "diff.prev-file" => d.jump_file(-1),
                 "diff.cycle-layout" => d.cycle_layout(host),
                 "diff.cycle-wrap" => d.cycle_wrap(host),
+                _ => return false,
+            },
+            Screens::Files { view: f, .. } => match command {
+                "view.down" => f.down(),
+                "view.up" => f.up(),
+                "view.page-down" => f.page(1),
+                "view.page-up" => f.page(-1),
+                "view.scroll-down" => f.scroll_y(host.view.rows as isize),
+                "view.scroll-up" => f.scroll_y(-(host.view.rows as isize)),
+                "view.top" => f.to_top(),
+                "view.bottom" => f.to_bottom(),
+                // Nothing off the left edge to reach: paths clip rather
+                // than pan.
+                "view.left" | "view.right" => {}
                 _ => return false,
             },
         }
@@ -635,6 +709,46 @@ impl App {
                     },
                 );
             }
+        }
+        // The working tree gets its pane whenever startup opened a repository
+        // — eagerly, one blocking `git status` beside the rest of startup
+        // acquisition, the same product choice the window makes. Registration
+        // is the whole of what a second sidebar list costs: the number keys,
+        // the cycle and the walk derive from it, and no geometry or dispatch
+        // branch learns the name. A fixture or a patch has no repository and
+        // so no pane at all; the name stays absent and `files.focus` says so.
+        //
+        // A failed initial read still registers — retryable, refreshed by the
+        // first successful read — and says `status unavailable` rather than
+        // drawing a clean tree it cannot prove. The error is logged here,
+        // before raw mode, where stderr still goes somewhere readable.
+        let launch_focus = panes.focused_name().to_string();
+        if let Some((_, handle)) = &repo {
+            let described = handle.describe();
+            let (view, files_label) = match handle.status() {
+                Ok(status) => {
+                    let files::Prepared { rows, label } = files::prepare(&status, &described);
+                    let mut view = Files::new(rows);
+                    view.set_bar(bar);
+                    (view, label)
+                }
+                Err(e) => {
+                    eprintln!("gitten-tui: status failed, showing an empty files pane: {e}");
+                    (Files::unavailable(), files::unavailable_label(&described))
+                }
+            };
+            panes.register(
+                "files",
+                panes::Placement::sidebar("files"),
+                Screens::Files {
+                    view,
+                    label: files_label,
+                    generation: Generation::default(),
+                },
+            );
+            // `register` focuses what it adds; the keyboard goes back to
+            // whatever the launch opened on — the commit list or the diff.
+            panes.focus_named(&launch_focus);
         }
         let jobs = Runner::new();
         let submitter = jobs.submitter();
@@ -2623,7 +2737,15 @@ diff --git a/tracked.txt b/tracked.txt
         writes: Vec<String>,
         pairs_reads: usize,
         log_reads: usize,
-        untracked: Vec<Vec<u8>>,
+        /// The whole working tree `status` answers with. Tests set it
+        /// directly — staging a file, breaking a read — and the next read
+        /// sees the world they built.
+        status: Status,
+        status_reads: usize,
+        /// When set, the next status read fails with exactly this message —
+        /// the initial-read failure and the refresh failure are different
+        /// panes' stories and each is told on demand.
+        fail_status: Option<String>,
         /// When set, the next log (or pairs) read fails with exactly this
         /// message — so two panes can fail *simultaneously*, each in its own
         /// words, and a test can name which of the two errors stood.
@@ -2674,17 +2796,12 @@ diff --git a/tracked.txt b/tracked.txt
         }
 
         fn status(&self) -> gitten_git::Result<Status> {
-            let s = self.0.lock().unwrap();
-            Ok(Status {
-                untracked: s
-                    .untracked
-                    .iter()
-                    .map(|p| gitten_core::status::UntrackedEntry {
-                        path: gitten_core::status::PathBytes::from_bytes(p),
-                    })
-                    .collect(),
-                ..Status::default()
-            })
+            let mut s = self.0.lock().unwrap();
+            s.status_reads += 1;
+            if let Some(message) = s.fail_status.clone() {
+                return Err(message);
+            }
+            Ok(s.status.clone())
         }
 
         fn describe(&self) -> String {
@@ -2715,11 +2832,20 @@ diff --git a/tracked.txt b/tracked.txt
     /// as given. OIDs are `None` — a worktree pair never caches, so no test
     /// ever reads a neighbour's answer.
     fn fake(untracked: &[&str]) -> (Handle, Arc<Mutex<FakeState>>) {
+        let status = Status {
+            untracked: untracked
+                .iter()
+                .map(|u| gitten_core::status::UntrackedEntry {
+                    path: gitten_core::status::PathBytes::from_bytes(u.as_bytes()),
+                })
+                .collect(),
+            ..Default::default()
+        };
         let state = Arc::new(Mutex::new(FakeState {
             before: vec![pair("f.txt", side(0), side(3))],
             after: vec![pair("f.txt", side(0), side(2))],
             refuses: vec![b"refuse".to_vec()],
-            untracked: untracked.iter().map(|u| u.as_bytes().to_vec()).collect(),
+            status,
             ..Default::default()
         }));
         (Arc::new(FakeRepo(Arc::clone(&state))), state)
@@ -2745,7 +2871,15 @@ diff --git a/tracked.txt b/tracked.txt
             before: vec![pair("f.txt", side(false), side(true))],
             after: vec![pair("f.txt", side(false), side(false))],
             refuses: vec![b"refuse".to_vec()],
-            untracked: untracked.iter().map(|u| u.as_bytes().to_vec()).collect(),
+            status: Status {
+                untracked: untracked
+                    .iter()
+                    .map(|u| gitten_core::status::UntrackedEntry {
+                        path: gitten_core::status::PathBytes::from_bytes(u.as_bytes()),
+                    })
+                    .collect(),
+                ..Default::default()
+            },
             ..Default::default()
         }));
         (Arc::new(FakeRepo(Arc::clone(&state))), state)
@@ -2839,7 +2973,8 @@ diff --git a/tracked.txt b/tracked.txt
     }
 
     /// A wide application on a repository: the commits pane focused, the
-    /// empty diff beside it, both visible at 120 columns.
+    /// files pane above it in the sidebar, the empty diff beside both — the
+    /// three tenants every repository launch registers.
     fn commits_app(handle: &Handle) -> App {
         let started = gitten_app::Started {
             view: View::Commits,
@@ -2874,6 +3009,21 @@ diff --git a/tracked.txt b/tracked.txt
         }
     }
 
+    /// The files view, and the label its tenant was registered under.
+    fn files_of(app: &App) -> &Files {
+        match app.panes.get("files") {
+            Some(Screens::Files { view, .. }) => view,
+            _ => panic!("the files pane is not registered"),
+        }
+    }
+
+    fn files_label(app: &App) -> &str {
+        match app.panes.get("files") {
+            Some(Screens::Files { label, .. }) => label,
+            _ => panic!("the files pane is not registered"),
+        }
+    }
+
     /// A mouse event at a cell of the screen, button unmodified.
     fn click(kind: MouseKind, col: usize, row: usize) -> Mouse {
         Mouse {
@@ -2887,6 +3037,193 @@ diff --git a/tracked.txt b/tracked.txt
     }
 
     #[test]
+    fn files_empty_states_and_narrow_frames_are_honest() {
+        // A clean read draws `working tree clean` and a zero in the label —
+        // and is available, which a failed read never is.
+        let (handle, _state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        app.draw();
+        assert!(files_of(&app).is_clean());
+        assert!(files_of(&app).is_available());
+        assert_eq!(files_label(&app), "fake (main) · 0 changed");
+        let body = app.screen.row_text(2);
+        assert!(body.contains("working tree clean"), "{body:?}");
+
+        // A failed initial read still registers — retryable — and is honest
+        // in both places: the pane says the read did not come back, the
+        // header does not say 0 changed, and neither calls the tree clean.
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().fail_status = Some("the status read failed".into());
+        let mut app = commits_app(&handle);
+        app.draw();
+        assert!(!files_of(&app).is_clean());
+        assert!(!files_of(&app).is_available());
+        assert_eq!(files_label(&app), "fake (main) · status unavailable");
+        let body = app.screen.row_text(2);
+        assert!(body.contains("status unavailable"), "{body:?}");
+        // The first successful read stands it up — the same generation wave
+        // any write finishes into.
+        state.lock().unwrap().fail_status = None;
+        state.lock().unwrap().status = Status {
+            untracked: vec![gitten_core::status::UntrackedEntry {
+                path: gitten_core::status::PathBytes::from("new.txt"),
+            }],
+            ..Default::default()
+        };
+        assert!(app.submitter.submit(Box::new(Dead)).is_ok(), "queued");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                files_of(&app).is_available()
+            }),
+            "the failed pane was never stood up"
+        );
+        assert_eq!(files_label(&app), "fake (main) · 1 changed");
+        app.draw();
+        assert!(
+            app.screen.row_text(3).contains("new.txt"),
+            "{:?}",
+            app.screen.row_text(3)
+        );
+
+        // Wide: files and commits split the sidebar into canonical equal
+        // slices beside the diff, and no row crosses the divider column.
+        app.screen.resize(120, 24);
+        app.draw();
+        let files_rect = app.pane_rect("files").expect("files placed");
+        let commits_rect = app.pane_rect("commits").expect("commits placed");
+        let diff_rect = app.pane_rect("diff").expect("diff placed");
+        assert_eq!((files_rect.x, files_rect.width), (0, 40));
+        assert_eq!((commits_rect.x, commits_rect.width), (0, 40));
+        assert_eq!(files_rect.y, 1);
+        assert_eq!(commits_rect.y, files_rect.y + files_rect.height);
+        assert_eq!(files_rect.height, commits_rect.height, "unequal slices");
+        assert_eq!((diff_rect.x, diff_rect.width), (41, 79));
+        for y in 1..24 {
+            assert_eq!(
+                app.screen.char_at(40, y),
+                Some(' '),
+                "row {y} crossed the divider"
+            );
+        }
+        // The header names the pane, its live focus key, and the label; the
+        // title and the status line name it too.
+        app.dispatch("files.focus");
+        app.draw();
+        let header = app.screen.row_text(1);
+        assert!(header.contains('2'), "{header:?}");
+        assert!(header.contains("files"), "{header:?}");
+        assert!(header.contains("· 1 changed"), "{header:?}");
+        assert!(app.screen.row_text(0).contains("files"));
+        assert!(
+            app.screen.row_text(23).contains("files ·"),
+            "{:?}",
+            app.screen.row_text(23)
+        );
+
+        // Narrow: only the focused pane draws, at the whole body.
+        for width in [95, 80] {
+            app.screen.resize(width, 24);
+            app.draw();
+            assert_eq!(
+                app.pane_rect("files"),
+                Some(crate::panes::Rect {
+                    x: 0,
+                    y: 1,
+                    width,
+                    height: 22,
+                })
+            );
+            assert!(app.pane_rect("commits").is_none(), "{width} kept commits");
+            assert!(app.pane_rect("diff").is_none(), "{width} kept the diff");
+        }
+
+        // Zero- and one-row bodies survive: the layout drops the slice that
+        // does not fit and the panes draw nothing into what is not there.
+        app.screen.resize(120, 3);
+        app.draw();
+        app.screen.resize(120, 2);
+        app.draw();
+    }
+
+    #[test]
+    fn repository_startup_registers_files_into_the_sidebar_ring() {
+        // A commits launch: three tenants — the files pane every repository
+        // start registers, commits, the empty diff — with the launch focus
+        // restored over the registration that focused its own addition.
+        let (handle, _state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        assert_eq!(
+            app.panes.focused_name(),
+            "commits",
+            "the launch focus was not restored"
+        );
+        assert!(app.panes.get("files").is_some(), "no files tenant");
+        assert_eq!(app.panes.names().count(), 3);
+        // The sidebar's canonical order: files (rank 1) above commits
+        // (rank 3), with nothing in panes.rs the wiser.
+        assert_eq!(app.panes.list_order(), ["files", "commits"]);
+
+        // `2` is the shared files.focus binding, and it now lands.
+        app.press(Key::plain(Code::Char('2')));
+        assert_eq!(app.panes.focused_name(), "files");
+        assert_eq!(app.message, "", "focusing a registered pane said nothing");
+        // Ctrl-J/Ctrl-K cycle both directions through the two lists.
+        app.press(Key::ctrl(Code::Char('j')));
+        assert_eq!(app.panes.focused_name(), "commits");
+        app.press(Key::ctrl(Code::Char('k')));
+        assert_eq!(app.panes.focused_name(), "files");
+        // Headers derive live keys: files advertises `2` like any other pane.
+        app.draw();
+        let header = app.screen.row_text(1);
+        assert!(header.contains("files"), "{header:?}");
+        assert!(header.contains('2'), "{header:?}");
+
+        // A direct working-tree-diff launch registers it too, and keeps the
+        // diff focused.
+        let (handle, _state) = fake(&[]);
+        let source = Source::Repo {
+            path: std::path::PathBuf::from("/fake"),
+            arg: String::new(),
+        };
+        let mut direct = app_on_fake(&source, &handle);
+        assert!(
+            direct.panes.get("files").is_some(),
+            "a diff launch got no files pane"
+        );
+        assert_eq!(direct.panes.focused_name(), "diff");
+        // ...and the diff launch's keyboard stays put under a key that is
+        // text everywhere else.
+        direct.press(Key::plain(Code::Char('2')));
+        assert_eq!(direct.panes.focused_name(), "files");
+        direct.press(Key::plain(Code::Char('0')));
+        assert_eq!(direct.panes.focused_name(), "diff");
+
+        // A fixture and a patch have no repository and so no pane: the name
+        // stays absent, and the focus command says the exact sentence.
+        let mut fixture = app_on_diff(Source::Fixtures, None);
+        assert!(fixture.panes.get("files").is_none());
+        fixture.press(Key::plain(Code::Char('2')));
+        assert_eq!(fixture.message, "no files pane");
+        let started = gitten_app::Started {
+            view: View::Diff,
+            source: Source::Patch { file: None },
+            host: Host::new(),
+            loaded: acquire::Loaded {
+                label: "patch".into(),
+                data: Data::Diff(parse_unified_diff(HUNK_DIFF)),
+            },
+            config: std::path::PathBuf::new(),
+            repo: None,
+        };
+        let mut patch = App::new(started, Glyphs::default());
+        patch.screen = Screen::new(60, 24);
+        assert!(patch.panes.get("files").is_none());
+        patch.press(Key::plain(Code::Char('2')));
+        assert_eq!(patch.message, "no files pane");
+    }
+
+    #[test]
     fn enter_replaces_and_focuses_a_persistent_diff_and_back_returns() {
         let (handle, state) = fake(&[]);
         let mut app = commits_app(&handle);
@@ -2895,10 +3232,11 @@ diff --git a/tracked.txt b/tracked.txt
         let open_reads = state.lock().unwrap().pairs_reads;
 
         // Enter acquires the selected commit's diff exactly once, replaces
-        // the empty tenant — never appends — and focuses it.
+        // the empty tenant — never appends — and focuses it. (Three tenants:
+        // the files pane every repository launch registers, commits, diff.)
         app.press(Key::plain(Code::Enter));
         assert_eq!(app.panes.focused_name(), "diff");
-        assert_eq!(app.panes.names().count(), 2, "enter appended a pane");
+        assert_eq!(app.panes.names().count(), 3, "enter appended a pane");
         assert_eq!(state.lock().unwrap().pairs_reads, open_reads + 1);
         assert!(
             matches!(
@@ -2942,7 +3280,7 @@ diff --git a/tracked.txt b/tracked.txt
         app.press(Key::plain(Code::Enter));
         assert_eq!(
             app.panes.names().count(),
-            2,
+            3,
             "a second enter appended a pane"
         );
         assert_eq!(app.panes.focused_name(), "diff");
@@ -3075,7 +3413,9 @@ diff --git a/tracked.txt b/tracked.txt
         app.draw();
 
         // Down in the commits rectangle presses it, in its own coordinates.
-        app.mouse(click(MouseKind::Down, 5, 4));
+        // The sidebar splits between files and commits now, so the commits
+        // slice is the lower half of the sidebar column.
+        app.mouse(click(MouseKind::Down, 5, 15));
         assert_eq!(app.panes.focused_name(), "commits");
         assert_eq!(
             commits_of(&app).cursor(),
@@ -3119,11 +3459,12 @@ diff --git a/tracked.txt b/tracked.txt
 
         // Two quick clicks in the commits pane open the diff — the clock
         // counts, and the pane it counted in is part of what it counted.
+        // (The commits slice is the lower half of the sidebar now.)
         app.dispatch("commits.focus");
         let reads = state.lock().unwrap().pairs_reads;
-        app.mouse(click(MouseKind::Down, 10, 4));
-        app.mouse(click(MouseKind::Up, 10, 4));
-        app.mouse(click(MouseKind::Down, 10, 4));
+        app.mouse(click(MouseKind::Down, 10, 15));
+        app.mouse(click(MouseKind::Up, 10, 15));
+        app.mouse(click(MouseKind::Down, 10, 15));
         assert_eq!(
             app.panes.focused_name(),
             "diff",
@@ -3164,10 +3505,11 @@ diff --git a/tracked.txt b/tracked.txt
         app.draw();
 
         // A drag in the commits pane: the Up queues exactly its selection,
-        // once, and the feedback counts lines.
-        app.mouse(click(MouseKind::Down, 5, 4));
-        app.mouse(click(MouseKind::Drag, 5, 7));
-        app.mouse(click(MouseKind::Up, 5, 7));
+        // once, and the feedback counts lines. The commits slice is the
+        // lower half of the sidebar now.
+        app.mouse(click(MouseKind::Down, 5, 15));
+        app.mouse(click(MouseKind::Drag, 5, 18));
+        app.mouse(click(MouseKind::Up, 5, 18));
         let commits_text = commits_of(&app).selection();
         assert!(
             !commits_text.is_empty(),
@@ -3380,7 +3722,7 @@ diff --git a/tracked.txt b/tracked.txt
         // list is the focused pane and the diff is the registered one the
         // refresh must not forget — hidden by the narrow layout or not.
         app.dispatch("commits.open-diff");
-        assert_eq!(app.panes.names().count(), 2, "open-diff appended a pane");
+        assert_eq!(app.panes.names().count(), 3, "open-diff appended a pane");
         assert!(matches!(app.panes.get("diff"), Some(Screens::Diff { .. })));
         app.dispatch("commits.focus");
         assert_eq!(app.panes.focused_name(), "commits");
@@ -3414,7 +3756,7 @@ diff --git a/tracked.txt b/tracked.txt
         // was refreshed against — a refusal's as much as a success's, the
         // focused pane's as much as the hidden one's.
         assert!(app.generation > Generation::default());
-        for name in ["commits", "diff"] {
+        for name in ["commits", "diff", "files"] {
             let pane = app
                 .panes
                 .get(name)
