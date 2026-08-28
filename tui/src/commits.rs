@@ -190,13 +190,12 @@ pub struct Commits {
     glyphs: Glyphs,
     /// The honest lane count, uncapped, for the status line.
     lanes: usize,
-    /// Widest gutter of any row, so the subject column starts in the same place
-    /// down the whole list.
-    ///
-    /// Per-row widths are what the window does, because it can scroll a
-    /// container wider than itself; a terminal cannot, and a subject that starts
-    /// in a different column on every row is a list the eye cannot scan. So the
-    /// gutter is one width and it is this one.
+    /// Widest gutter of any row — the lane cap's yardstick, and nothing
+    /// more: the subject hugs each row's own graph, the window's layout,
+    /// so a row's text starts right after the lanes that row actually
+    /// drew. The cost — a subject column that wanders row to row — is the
+    /// owner's accepted trade for never shipping a run of dead cells
+    /// between a narrow graph and its name.
     gutter: usize,
     cols: usize,
     /// The cursor, the top row and the height. [`gitten_core::view::Viewport`]
@@ -659,11 +658,10 @@ impl Commits {
             .put(&d.initials, Ink::new(theme.author(&c.author), bg));
         pen.put(" ", dim);
 
-        let after = pen.col() + self.gutter;
+        // The subject hugs the row's own graph — the window's per-row
+        // layout. One space after the lanes this row drew, however wide
+        // the busiest row in the history is.
         self.gutter(pen, d, bg, theme);
-        // One width for the whole list, so the subject starts in the same column
-        // on every row even though each row's graph is only as wide as its own.
-        pen.seek(after);
         pen.put(" ", Ink::new(theme.chrome.fg, bg));
         pen.put(&c.subject, Ink::new(theme.chrome.fg, bg));
         pen.wash(Ink::new(theme.chrome.fg, bg));
@@ -1026,9 +1024,10 @@ r\x1frrrrrrr\x1f\x1fAda Lovelace\x1f1700000100\x1fRoot\x1e";
     }
 
     #[test]
-    fn the_subject_starts_in_the_same_column_on_every_row() {
-        // A terminal cannot scroll a container wider than itself, so a per-row
-        // gutter would put the subject in a different column on every line.
+    fn the_subject_hugs_the_rows_own_graph() {
+        // The window's layout: one space after the lanes this row drew,
+        // so a trunk row's subject sits left of a merge row's — and no
+        // row ships dead cells between its graph and its name.
         let (c, host) = view(LOG, 60, 4);
         let rows = painted(&c, &host);
         // Display columns, not bytes: box drawing is three bytes a glyph, so a
@@ -1036,11 +1035,24 @@ r\x1frrrrrrr\x1f\x1fAda Lovelace\x1f1700000100\x1fRoot\x1e";
         // shape rather than by its width.
         let at =
             |row: &String, word: &str| crate::screen::width(&row[..row.find(word).expect(word)]);
-        let first = at(&rows[0], "Merge branch");
-        assert_eq!(first, 16, "{:?}", rows[0]);
-        assert_eq!(at(&rows[1], "On the trunk"), first);
-        assert_eq!(at(&rows[2], "On a branch"), first);
-        assert_eq!(at(&rows[3], "Root"), first);
+        // SHA_W + WHO_W of furniture, then the row's own lanes × 2, then
+        // the separating space — whatever each row's graph needs, with no
+        // fixed column and no dead cells between graph and name.
+        for (i, row) in rows.iter().enumerate() {
+            let word = match i {
+                0 => "Merge branch",
+                1 => "On the trunk",
+                2 => "On a branch",
+                _ => "Root",
+            };
+            assert_eq!(
+                at(row, word),
+                11 + c.draws[i].lanes * LANE_W + 1,
+                "row {i} ({:?}): {:?}",
+                c.draws[i].lanes,
+                row
+            );
+        }
     }
 
     #[test]
