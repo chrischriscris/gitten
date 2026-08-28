@@ -16,6 +16,7 @@
 use crate::cli::{Source, View};
 use gitten_core::differ::Overrides;
 use gitten_core::host::Host;
+use gitten_core::refs::Stash;
 use gitten_core::{Commit, FileDiff};
 use gitten_git::Repo;
 use std::path::Path;
@@ -224,6 +225,41 @@ fn acquire_with(
     }
 }
 
+/// What the ancillary stash read loaded: the repository's own description
+/// and its stack, kept as separate fields — the label names the repository
+/// the way every other read's does, the stack is the data a stash pane draws.
+#[derive(Debug)]
+pub struct LoadedStashes {
+    pub label: String,
+    pub stashes: Vec<Stash>,
+}
+
+/// Reads one repository's stash stack beside its description.
+///
+/// The ancillary read of a repository-backed launch: commits and diffs are
+/// views someone asked for, the stash stack is the pane every repository
+/// gets, and it is acquired through the same door as everything else — a
+/// [`Repo`] handle in, already-loaded data out. Description and stack run
+/// beside each other, one spawn floor for the two of them, the same overlap
+/// the startup views run their title read with.
+///
+/// **An empty stack is a successful read.** Before the first push and after
+/// the last pop or drop, nothing parked is the state of the world and not a
+/// failure — the opposite of a startup view, where an empty answer usually
+/// means the arguments were wrong. The repository's own error comes back
+/// verbatim: a read that failed says so, and is never flattened into an
+/// empty list that would draw as success.
+pub fn stashes(repo: &dyn Repo) -> Result<LoadedStashes, String> {
+    std::thread::scope(|s| {
+        let title = s.spawn(|| repo.describe());
+        let stashes = repo.stashes()?;
+        Ok(LoadedStashes {
+            label: joined(title),
+            stashes,
+        })
+    })
+}
+
 /// Joins the thread fetching the title.
 ///
 /// `describe` returns a `String` and cannot fail, so the only thing left in
@@ -255,7 +291,7 @@ mod tests {
     use gitten_git::{Handle, Pair};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     /// A repository that exists only as this struct. Every assertion these
     /// tests make lands on data it produced, which is what proves acquisition
@@ -347,6 +383,51 @@ mod tests {
 
         fn describe(&self) -> String {
             "empty".into()
+        }
+    }
+
+    /// A repository whose stash read is the test's to script: a queue of
+    /// answers, drained one per call — two stashes, then an empty stack — or
+    /// a refusal that stands. Nothing else about it is reachable, so every
+    /// byte a test asserts on arrived through the helper under test.
+    struct StashFake {
+        label: &'static str,
+        answers: Mutex<Vec<Vec<Stash>>>,
+        refuse: Option<&'static str>,
+    }
+
+    impl Default for StashFake {
+        fn default() -> Self {
+            Self {
+                label: "scratch (main)",
+                answers: Mutex::new(Vec::new()),
+                refuse: None,
+            }
+        }
+    }
+
+    impl Repo for StashFake {
+        fn log(&self, _limit: usize) -> gitten_git::Result<Vec<Commit>> {
+            Ok(Vec::new())
+        }
+
+        fn pairs(&self, _revspec: &str) -> gitten_git::Result<Vec<Pair>> {
+            Ok(Vec::new())
+        }
+
+        fn status(&self) -> gitten_git::Result<Status> {
+            Ok(Status::default())
+        }
+
+        fn describe(&self) -> String {
+            self.label.into()
+        }
+
+        fn stashes(&self) -> gitten_git::Result<Vec<Stash>> {
+            match self.refuse {
+                Some(e) => Err(e.to_string()),
+                None => Ok(self.answers.lock().unwrap().pop().unwrap_or_default()),
+            }
         }
     }
 
@@ -683,6 +764,65 @@ mod tests {
             .expect("an empty refresh is valid");
             assert!(loaded.data.is_empty());
         }
+    }
+
+    /// **Absence is data.** The newest-first stack the read gives arrives
+    /// through the helper unchanged — description, indices, messages and
+    /// full commits alike — and the read after it, an emptied stack, is
+    /// `Ok` and not an error: before the first push and after the last pop,
+    /// nothing parked is the state of the world.
+    #[test]
+    fn stash_acquisition_preserves_stack_data_and_accepts_absence() {
+        let two = vec![
+            Stash {
+                index: 0,
+                message: "On main: wip things".into(),
+                commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            },
+            Stash {
+                index: 1,
+                message: "On dev: other work".into(),
+                commit: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            },
+        ];
+        let repo = StashFake {
+            // Popped from the tail: the first read answers two stashes, the
+            // second the emptied stack.
+            answers: Mutex::new(vec![Vec::new(), two]),
+            ..Default::default()
+        };
+
+        let loaded = stashes(&repo).expect("two parked");
+        assert_eq!(loaded.label, "scratch (main)", "the description ran beside");
+        let parked = &loaded.stashes;
+        assert_eq!(parked.len(), 2, "{parked:?}");
+        // Newest first as the read gave them, every field the read carried.
+        assert_eq!(parked[0].index, 0);
+        assert_eq!(parked[0].message, "On main: wip things");
+        assert_eq!(
+            parked[0].commit, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "the full identity is what a refresh anchors by"
+        );
+        assert_eq!(parked[1].index, 1);
+        assert_eq!(parked[1].message, "On dev: other work");
+        assert_eq!(parked[1].commit, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+        // The stack drained between reads: an empty answer is success.
+        let drained = stashes(&repo).expect("an empty stack is not an error");
+        assert!(drained.stashes.is_empty());
+        assert_eq!(drained.label, "scratch (main)");
+    }
+
+    /// A read that failed says so in the repository's own words, and is
+    /// never translated into the empty list that would draw as success.
+    #[test]
+    fn stash_acquisition_preserves_the_repository_refusal() {
+        let repo = StashFake {
+            refuse: Some("fatal: bad object refs/stash"),
+            ..Default::default()
+        };
+        let err = stashes(&repo).unwrap_err();
+        assert_eq!(err, "fatal: bad object refs/stash");
     }
 
     #[test]
