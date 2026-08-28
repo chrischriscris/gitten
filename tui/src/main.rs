@@ -1536,6 +1536,16 @@ impl App {
             // Routed here, ahead of the pane, for the same reason the
             // window routes them in its `run_command`.
             "diff.stage-hunk" | "diff.unstage-hunk" => self.hunk_verb(command),
+            // The file verbs, the same story one pane over: the row the
+            // keyboard is on, the side of the index it sits on, and the
+            // shared `Write` that means it — routed here ahead of the pane,
+            // because their work belongs to the job queue, not to a view.
+            // Stash is repository-scoped and asks no pane at all.
+            "files.stage" => self.files_stage(),
+            "files.stage-all" => self.files_stage_all(),
+            "files.discard" => self.files_discard(),
+            "files.ignore" => self.files_ignore(),
+            "files.stash" => self.files_stash(),
             // The clipboard is the terminal's, not this process's — see
             // `Term::copy`. Held until the loop, which is the one place that has
             // a terminal to write to.
@@ -1761,6 +1771,199 @@ impl App {
                 }
             }
             Err(e) => self.message = e,
+        }
+    }
+
+    /// `files.stage`: act on the row the keyboard is on, by the side of the
+    /// index it sits on. Staged means unstage; everything else — unstaged,
+    /// untracked, a conflict whose resolution is being recorded — means
+    /// stage. That is lazygit's rule and git's own asymmetry: `add` is the
+    /// one word for "the index should hold this". The window's rule,
+    /// verbatim, over the terminal's own rows.
+    fn files_stage(&mut self) {
+        let under = match self.panes.focused() {
+            Some(Screens::Files { view, .. }) => {
+                view.current_file().map(|r| (r.section, r.path.clone()))
+            }
+            _ => {
+                self.message = "files.stage is not supported here".into();
+                return;
+            }
+        };
+        let Some((section, path)) = under else {
+            self.message = "nothing selected to stage".into();
+            return;
+        };
+        let Some((_, repo)) = self.repo.as_ref() else {
+            self.message = "a fixture has no working tree to stage in".into();
+            return;
+        };
+        let bytes = path.as_bytes().to_vec();
+        let job = match section {
+            files::Section::Staged => Write::unstage(repo, bytes),
+            _ => Write::stage(repo, bytes),
+        };
+        if self.submitter.submit(Box::new(job)).is_err() {
+            self.message = "the job queue is shutting down".into();
+        }
+    }
+
+    /// `files.stage-all`: every row, on the side of the index the keyboard
+    /// sits in — the one rule `space` keeps for a single row, at scale.
+    /// Staged row or staged heading: unstage everything staged. Anything
+    /// else — unstaged, untracked, their headings, an empty tree: stage
+    /// everything unstaged and untracked. Conflicts belong to neither
+    /// direction — staging one records a resolution, which is its own
+    /// decision. One job either way, so one generation bump and one
+    /// re-acquire wave per keypress.
+    fn files_stage_all(&mut self) {
+        let (staging, targets) = match self.panes.focused() {
+            Some(Screens::Files { view, .. }) => {
+                let staging = view.cursor_section() != Some(files::Section::Staged);
+                let targets = match staging {
+                    // Stage unstaged and untracked; conflicts belong to
+                    // neither direction — staging one records a resolution,
+                    // which is its own decision.
+                    true => {
+                        let mut targets = view.paths_in(files::Section::Unstaged);
+                        targets.extend(view.paths_in(files::Section::Untracked));
+                        targets
+                    }
+                    false => view.paths_in(files::Section::Staged),
+                };
+                (staging, targets)
+            }
+            _ => {
+                self.message = "files.stage-all is not supported here".into();
+                return;
+            }
+        };
+        if targets.is_empty() {
+            self.message = match staging {
+                true => "nothing unstaged or untracked to stage",
+                false => "nothing staged to unstage",
+            }
+            .into();
+            return;
+        }
+        let Some((_, repo)) = self.repo.as_ref() else {
+            self.message = "a fixture has no working tree to act on".into();
+            return;
+        };
+        let bytes: Vec<Vec<u8>> = targets.iter().map(|p| p.as_bytes().to_vec()).collect();
+        let job = match staging {
+            true => Write::stage_many(repo, bytes),
+            false => Write::unstage_many(repo, bytes),
+        };
+        if self.submitter.submit(Box::new(job)).is_err() {
+            self.message = "the job queue is shutting down".into();
+        }
+    }
+
+    /// `files.discard`: the one destructive verb, and it confirms on the
+    /// keyboard because no dialog exists to confirm anywhere else — the
+    /// window's exact pattern. First press arms the row and asks once in
+    /// the band; second press on the same row builds the job; any cursor
+    /// move, wheel, mouse press on another row, or refresh disarms before
+    /// it can lie. Two refusals are said up front rather than answered
+    /// badly: a staged row, whose undo is unstage; and a conflict, whose
+    /// working-tree side is the merge's open question.
+    fn files_discard(&mut self) {
+        let under = match self.panes.focused() {
+            Some(Screens::Files { view, .. }) => view
+                .current_file()
+                .map(|r| (r.section, r.path.clone(), r.text.clone())),
+            _ => {
+                self.message = "files.discard is not supported here".into();
+                return;
+            }
+        };
+        let Some((section, path, shown)) = under else {
+            self.message = "nothing selected to discard".into();
+            return;
+        };
+        match section {
+            files::Section::Staged => {
+                self.message = "that change is staged — unstage it before discarding".into();
+                return;
+            }
+            files::Section::Conflicts => {
+                self.message = "a conflicted file needs its merge resolved, not discarded".into();
+                return;
+            }
+            files::Section::Untracked | files::Section::Unstaged => {}
+        }
+        let Some((_, repo)) = self.repo.as_ref() else {
+            self.message = "a fixture has no working tree to discard from".into();
+            return;
+        };
+        // Arm, or spend the arm. False means the question was just asked.
+        let confirmed = match self.panes.focused_mut() {
+            Some(Screens::Files { view, .. }) => view.confirm_or_arm_discard(section, &path),
+            _ => return,
+        };
+        if !confirmed {
+            self.message = files::discard_question(section, &shown);
+            return;
+        }
+        // The question is spent; the running band speaks next. Untracked
+        // means *delete* — the one mechanics where nothing is recoverable —
+        // and everything else is a checkout of the path's tracked state.
+        let bytes = path.as_bytes().to_vec();
+        let job = match section {
+            files::Section::Untracked => Write::remove_untracked(repo, bytes),
+            _ => Write::discard(repo, bytes),
+        };
+        if self.submitter.submit(Box::new(job)).is_err() {
+            self.message = "the job queue is shutting down".into();
+        }
+    }
+
+    /// `files.ignore`: append the untracked file to the root `.gitignore`
+    /// and let the refresh do the rest — git stops listing ignored files on
+    /// its own. Only an untracked row answers: `.gitignore` governs files
+    /// git does not yet track, so answering over a tracked change would be
+    /// a no-op wearing a success badge.
+    fn files_ignore(&mut self) {
+        let under = match self.panes.focused() {
+            Some(Screens::Files { view, .. }) => {
+                view.current_file().map(|r| (r.section, r.path.clone()))
+            }
+            _ => {
+                self.message = "files.ignore is not supported here".into();
+                return;
+            }
+        };
+        let Some((files::Section::Untracked, path)) = under else {
+            self.message = "only an untracked file can be ignored".into();
+            return;
+        };
+        let Some((_, repo)) = self.repo.as_ref() else {
+            self.message = "a fixture has no repository to ignore in".into();
+            return;
+        };
+        let job = Write::ignore(repo, path.as_bytes().to_vec());
+        if self.submitter.submit(Box::new(job)).is_err() {
+            self.message = "the job queue is shutting down".into();
+        }
+    }
+
+    /// `files.stash`: park what the tracked working tree holds on the stash
+    /// stack and start again from HEAD. Repository-scoped and
+    /// selection-free — parking addresses the repository, whatever pane the
+    /// key was pressed over. No message tonight, git's own `WIP on …`, the
+    /// same word the window uses.
+    fn files_stash(&mut self) {
+        let Some((_, repo)) = self.repo.as_ref() else {
+            self.message = "a fixture has no working tree to park".into();
+            return;
+        };
+        if self
+            .submitter
+            .submit(Box::new(Write::stash_push(repo, None)))
+            .is_err()
+        {
+            self.message = "the job queue is shutting down".into();
         }
     }
 
@@ -2895,7 +3098,10 @@ mod staging {
     use super::*;
     use gitten_core::command::Code;
     use gitten_core::parse_unified_diff;
-    use gitten_core::status::Status;
+    use gitten_core::status::{
+        Change, ConflictEntry, ConflictKind, Kind, PathBytes, StagedEntry, Status, Submodule,
+        UnstagedEntry, UntrackedEntry,
+    };
     use gitten_core::Commit;
     use gitten_git::{Handle, Pair, Repo};
     use std::sync::{Arc, Mutex};
@@ -2954,8 +3160,12 @@ diff --git a/tracked.txt b/tracked.txt
         /// Patches beginning with one of these are refused: a job that
         /// fails, without failing the queue.
         refuses: Vec<Vec<u8>>,
-        /// Every write that reached the repository, recorded.
+        /// Every write that reached the repository, recorded — as the
+        /// person-readable line a test asserts against.
         writes: Vec<String>,
+        /// Every path a *file* verb was aimed at, raw: the byte-for-byte
+        /// record the lossy `writes` strings cannot make.
+        paths_written: Vec<Vec<u8>>,
         pairs_reads: usize,
         log_reads: usize,
         /// The whole working tree `status` answers with. Tests set it
@@ -3064,6 +3274,84 @@ diff --git a/tracked.txt b/tracked.txt
                 .writes
                 .push(format!("amend {message}"));
             Ok("f00d".into())
+        }
+
+        fn stage(&self, path: &[u8]) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            s.writes
+                .push(format!("stage {}", String::from_utf8_lossy(path)));
+            s.paths_written.push(path.to_vec());
+            s.applied += 1;
+            Ok(())
+        }
+
+        fn unstage(&self, path: &[u8]) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            s.writes
+                .push(format!("unstage {}", String::from_utf8_lossy(path)));
+            s.paths_written.push(path.to_vec());
+            s.applied += 1;
+            Ok(())
+        }
+
+        fn discard(&self, path: &[u8]) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            s.writes
+                .push(format!("discard {}", String::from_utf8_lossy(path)));
+            s.paths_written.push(path.to_vec());
+            s.applied += 1;
+            Ok(())
+        }
+
+        fn remove_untracked(&self, path: &[u8]) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            s.writes
+                .push(format!("delete {}", String::from_utf8_lossy(path)));
+            s.paths_written.push(path.to_vec());
+            s.applied += 1;
+            Ok(())
+        }
+
+        fn ignore(&self, path: &[u8]) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            s.writes
+                .push(format!("ignore {}", String::from_utf8_lossy(path)));
+            s.paths_written.push(path.to_vec());
+            s.applied += 1;
+            Ok(())
+        }
+
+        fn stage_many(&self, paths: &[&[u8]]) -> gitten_git::Result<()> {
+            let shown = paths
+                .iter()
+                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut s = self.0.lock().unwrap();
+            s.writes.push(format!("stage-many {shown}"));
+            s.paths_written.extend(paths.iter().map(|p| p.to_vec()));
+            s.applied += 1;
+            Ok(())
+        }
+
+        fn unstage_many(&self, paths: &[&[u8]]) -> gitten_git::Result<()> {
+            let shown = paths
+                .iter()
+                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut s = self.0.lock().unwrap();
+            s.writes.push(format!("unstage-many {shown}"));
+            s.paths_written.extend(paths.iter().map(|p| p.to_vec()));
+            s.applied += 1;
+            Ok(())
+        }
+
+        fn stash_push(&self, message: Option<&str>) -> gitten_git::Result<usize> {
+            let mut s = self.0.lock().unwrap();
+            s.writes.push(format!("stash push {message:?}"));
+            s.applied += 1;
+            Ok(0)
         }
     }
 
@@ -3474,6 +3762,656 @@ diff --git a/tracked.txt b/tracked.txt
         assert_eq!(patch.message, "no files pane");
     }
 
+    /// A tree with one file in each section, the untracked one carrying a
+    /// path no encoding claims — what the per-section verb rules need under
+    /// the cursor, and the byte-exactness check in one fixture.
+    fn four_section_status() -> Status {
+        Status {
+            staged: vec![StagedEntry {
+                path: PathBytes::from("kept.rs"),
+                change: Change::Modified,
+                old_path: None,
+                kind: Kind::File,
+                submodule: Submodule::default(),
+            }],
+            unstaged: vec![UnstagedEntry {
+                path: PathBytes::from("work.rs"),
+                change: Change::Modified,
+                kind: Kind::File,
+                submodule: Submodule::default(),
+            }],
+            untracked: vec![UntrackedEntry {
+                path: PathBytes::from_bytes(b"caf\xe9.txt"),
+            }],
+            conflicts: vec![ConflictEntry {
+                path: PathBytes::from("merge.rs"),
+                state: ConflictKind::BothModified,
+                kind: Kind::File,
+                submodule: Submodule::default(),
+            }],
+            ignored: vec![],
+        }
+    }
+
+    #[test]
+    fn files_stage_submits_stage_or_unstage_and_says_refusals() {
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().status = four_section_status();
+        let mut app = commits_app(&handle);
+        app.dispatch("files.focus");
+        assert_eq!(app.panes.focused_name(), "files");
+        let statuses = |state: &Arc<Mutex<FakeState>>| state.lock().unwrap().writes.len();
+
+        // Staged unstages; unstaged, untracked and conflicted stage — each
+        // with the row's own bytes, walking the sections the way the keys
+        // would.
+        let mut expected: Vec<&str> = Vec::new();
+        for (written, path) in [
+            ("unstage kept.rs", b"kept.rs".as_slice()),
+            ("stage work.rs", b"work.rs".as_slice()),
+            ("stage caf\u{FFFD}.txt", b"caf\xe9.txt".as_slice()),
+            ("stage merge.rs", b"merge.rs".as_slice()),
+        ] {
+            app.dispatch("files.stage");
+            assert!(
+                until(Duration::from_secs(2), || {
+                    app.drain_jobs();
+                    state.lock().unwrap().writes.len() > expected.len()
+                }),
+                "{written} never reached the repository"
+            );
+            expected.push(written);
+            assert_eq!(state.lock().unwrap().writes, expected, "{written}");
+            assert_eq!(
+                state
+                    .lock()
+                    .unwrap()
+                    .paths_written
+                    .last()
+                    .map(Vec::as_slice),
+                Some(path),
+                "{written}: the aim was not the raw bytes"
+            );
+            app.dispatch("view.down");
+        }
+        // The Latin-1 path rode through undecoded, whatever the band said.
+        assert!(state
+            .lock()
+            .unwrap()
+            .paths_written
+            .iter()
+            .any(|p| p.as_slice() == b"caf\xe9.txt"));
+
+        // Wrong focus says the command's name and queues nothing.
+        let written = statuses(&state);
+        app.dispatch("commits.focus");
+        app.dispatch("files.stage");
+        assert_eq!(app.message, "files.stage is not supported here");
+        assert_eq!(statuses(&state), written);
+
+        // No row: a clean tree has nothing under the cursor.
+        let (handle, state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        app.dispatch("files.focus");
+        app.dispatch("files.stage");
+        assert_eq!(app.message, "nothing selected to stage");
+        assert!(state.lock().unwrap().writes.is_empty());
+
+        // No repository: a fixture with a files pane cannot aim a write.
+        let mut fixture = app_on_diff(Source::Fixtures, None);
+        with_hand_registered_files(&mut fixture);
+        fixture.dispatch("files.stage");
+        assert_eq!(fixture.message, "a fixture has no working tree to stage in");
+
+        // A closed queue refuses in its own words, before anything runs.
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().status = four_section_status();
+        let mut app = commits_app(&handle);
+        app.dispatch("files.focus");
+        drop(std::mem::replace(&mut app.jobs, Runner::new()));
+        app.dispatch("files.stage");
+        assert_eq!(app.message, "the job queue is shutting down");
+        assert!(state.lock().unwrap().writes.is_empty());
+    }
+
+    #[test]
+    fn files_stage_all_uses_the_cursor_side_as_one_job() {
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().status = Status {
+            staged: vec![
+                StagedEntry {
+                    path: PathBytes::from("one.rs"),
+                    change: Change::Added,
+                    old_path: None,
+                    kind: Kind::File,
+                    submodule: Submodule::default(),
+                },
+                StagedEntry {
+                    path: PathBytes::from("two.rs"),
+                    change: Change::Modified,
+                    old_path: None,
+                    kind: Kind::File,
+                    submodule: Submodule::default(),
+                },
+            ],
+            unstaged: vec![UnstagedEntry {
+                path: PathBytes::from("work.rs"),
+                change: Change::Modified,
+                kind: Kind::File,
+                submodule: Submodule::default(),
+            }],
+            untracked: vec![UntrackedEntry {
+                path: PathBytes::from_bytes(b"caf\xe9.txt"),
+            }],
+            conflicts: vec![ConflictEntry {
+                path: PathBytes::from("merge.rs"),
+                state: ConflictKind::BothModified,
+                kind: Kind::File,
+                submodule: Submodule::default(),
+            }],
+            ignored: vec![],
+        };
+        let mut app = commits_app(&handle);
+        app.dispatch("files.focus");
+
+        // Cursor in staged: one unstage-many over exactly the staged paths.
+        app.dispatch("files.stage-all");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                !state.lock().unwrap().writes.is_empty()
+            }),
+            "the bulk unstage never reached the repository"
+        );
+        assert_eq!(
+            state.lock().unwrap().writes,
+            vec!["unstage-many one.rs, two.rs"],
+            "one job, not one per path"
+        );
+        assert_eq!(
+            state.lock().unwrap().paths_written,
+            [b"one.rs".to_vec(), b"two.rs".to_vec()],
+            "the raw bytes did not survive the bulk"
+        );
+
+        // Cursor anywhere else — including the conflicts heading's section —
+        // stages unstaged and untracked and leaves the conflict alone.
+        app.dispatch("view.down");
+        app.dispatch("view.down");
+        let writes = state.lock().unwrap().writes.len();
+        app.dispatch("files.stage-all");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                state.lock().unwrap().writes.len() > writes
+            }),
+            "the bulk stage never reached the repository"
+        );
+        assert_eq!(
+            state.lock().unwrap().writes,
+            vec![
+                "unstage-many one.rs, two.rs",
+                "stage-many work.rs, caf\u{FFFD}.txt"
+            ],
+            "the conflict was bulk-staged"
+        );
+        assert_eq!(
+            state
+                .lock()
+                .unwrap()
+                .paths_written
+                .last()
+                .map(Vec::as_slice),
+            Some(b"caf\xe9.txt".as_slice())
+        );
+
+        // Nothing on the cursor's side is the one reachable empty-target
+        // refusal: an empty tree's cursor names no section, so the staging
+        // direction has nothing to gather. ("Nothing staged to unstage" is
+        // the window's own defensive sentence for a state its cursor cannot
+        // reach either — a staged section is only ever drawn non-empty.)
+        let (handle, state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        app.dispatch("files.focus");
+        app.dispatch("files.stage-all");
+        assert_eq!(app.message, "nothing unstaged or untracked to stage");
+        assert!(state.lock().unwrap().writes.is_empty());
+
+        // No repository, wrong focus: the usual two sentences.
+        let mut fixture = app_on_diff(Source::Fixtures, None);
+        with_hand_registered_files(&mut fixture);
+        fixture.dispatch("files.stage-all");
+        assert_eq!(fixture.message, "a fixture has no working tree to act on");
+        let (handle, _state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        app.dispatch("files.stage-all");
+        assert_eq!(app.message, "files.stage-all is not supported here");
+    }
+
+    #[test]
+    fn files_discard_arms_then_submits_the_exact_destructive_job() {
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().status = four_section_status();
+        let mut app = commits_app(&handle);
+        app.dispatch("files.focus");
+        let statuses = |state: &Arc<Mutex<FakeState>>| state.lock().unwrap().writes.len();
+
+        // Staged and conflicted rows refuse before anything is armed —
+        // neither is the terminal's to destroy.
+        for _ in 0..2 {
+            app.dispatch("files.discard");
+        }
+        assert_eq!(
+            app.message,
+            "that change is staged — unstage it before discarding"
+        );
+        assert!(state.lock().unwrap().writes.is_empty());
+        app.dispatch("view.down"); // the unstaged twin's heading, skipped
+        app.dispatch("view.down"); // work.rs
+        app.dispatch("view.down"); // ...on to the conflict
+        app.dispatch("view.down");
+        app.dispatch("view.down");
+        app.dispatch("view.down");
+        app.dispatch("files.discard");
+        assert_eq!(
+            app.message,
+            "a conflicted file needs its merge resolved, not discarded"
+        );
+        assert!(state.lock().unwrap().writes.is_empty());
+
+        // Onto the unstaged work.rs: the first press asks and submits
+        // nothing; the identical second press submits the exact job. One
+        // step down from the first staged file crosses the unstaged heading.
+        app.dispatch("view.top");
+        app.dispatch("view.down");
+        app.dispatch("files.discard");
+        assert_eq!(app.message, "discard work.rs? press again to confirm");
+        assert!(state.lock().unwrap().writes.is_empty());
+        app.dispatch("files.discard");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                !state.lock().unwrap().writes.is_empty()
+            }),
+            "the confirmed discard never reached the repository"
+        );
+        assert_eq!(state.lock().unwrap().writes, vec!["discard work.rs"]);
+        assert_eq!(state.lock().unwrap().paths_written, [b"work.rs".to_vec()]);
+
+        // The untracked file says *delete* and runs the delete mechanics —
+        // a fresh two presses, because a move disarmed the first question.
+        let written = statuses(&state);
+        app.dispatch("view.down"); // one step: past the untracked heading
+        app.dispatch("files.discard");
+        assert_eq!(
+            app.message,
+            "delete caf\u{FFFD}.txt? press again to confirm"
+        );
+        assert_eq!(statuses(&state), written, "the first press queued a job");
+        app.dispatch("files.discard");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                state.lock().unwrap().writes.len() > written
+            }),
+            "the confirmed delete never reached the repository"
+        );
+        assert_eq!(
+            state.lock().unwrap().writes.last(),
+            Some(&"delete caf\u{FFFD}.txt".to_string())
+        );
+
+        // No row, no repository: the usual refusals.
+        let (handle, state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        app.dispatch("files.focus");
+        app.dispatch("files.discard");
+        assert_eq!(app.message, "nothing selected to discard");
+        assert!(state.lock().unwrap().writes.is_empty());
+        let mut fixture = app_on_diff(Source::Fixtures, None);
+        with_hand_registered_files(&mut fixture);
+        fixture.dispatch("files.discard");
+        assert_eq!(
+            fixture.message,
+            "a fixture has no working tree to discard from"
+        );
+
+        // A cursor move, the wheel, a mouse press on another row and a
+        // refresh each disarm the standing question: what is armed to what
+        // the keyboard used to be on can never fire after the keyboard
+        // moved. The keyboard returns to work.rs before each check, so the
+        // question being *asked again* is the whole evidence — an arm that
+        // had survived would have fired instead.
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().status = four_section_status();
+        let mut app = commits_app(&handle);
+        app.draw();
+        app.dispatch("files.focus");
+        let onto_work = |app: &mut App| {
+            // One step down from the first staged file crosses the unstaged
+            // heading onto work.rs.
+            app.dispatch("view.top");
+            app.dispatch("view.down");
+        };
+        let disarm_check = |app: &mut App, state: &Arc<Mutex<FakeState>>, label: &str| {
+            let written = state.lock().unwrap().writes.len();
+            app.dispatch("files.discard");
+            assert_eq!(
+                app.message, "discard work.rs? press again to confirm",
+                "{label}: the press was not a fresh question"
+            );
+            assert_eq!(
+                state.lock().unwrap().writes.len(),
+                written,
+                "{label}: a stale arm fired"
+            );
+        };
+        onto_work(&mut app);
+        disarm_check(&mut app, &state, "fresh");
+        app.dispatch("view.down"); // the move itself
+        onto_work(&mut app);
+        disarm_check(&mut app, &state, "after a cursor move");
+        app.input(Input::Key(Key::plain(Code::WheelDown)));
+        onto_work(&mut app);
+        disarm_check(&mut app, &state, "after the wheel");
+
+        // A mouse press on another row disarms too. The files slice is the
+        // upper half of the sidebar at 120 columns; its content starts on
+        // screen row 2.
+        onto_work(&mut app);
+        app.dispatch("files.discard");
+        let armed_row = files_of(&app).cursor();
+        app.mouse(click(MouseKind::Down, 5, 2 + armed_row + 1));
+        app.mouse(click(MouseKind::Up, 5, 2 + armed_row + 1));
+        onto_work(&mut app);
+        disarm_check(&mut app, &state, "after a mouse press elsewhere");
+
+        // ...while a press on the armed row itself keeps the question, so
+        // the keyboard's second press still confirms it.
+        onto_work(&mut app);
+        let armed_row = files_of(&app).cursor();
+        app.dispatch("files.discard");
+        app.mouse(click(MouseKind::Down, 5, 2 + armed_row));
+        app.mouse(click(MouseKind::Up, 5, 2 + armed_row));
+        let written = state.lock().unwrap().writes.len();
+        app.dispatch("files.discard");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                state.lock().unwrap().writes.len() > written
+            }),
+            "the same-row press did not keep the arm confirmable"
+        );
+
+        // A refresh disarms — and focus away and back alone does not.
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().status = four_section_status();
+        let mut app = commits_app(&handle);
+        app.dispatch("files.focus");
+        onto_work(&mut app);
+        app.dispatch("files.discard");
+        assert_eq!(app.message, "discard work.rs? press again to confirm");
+        assert!(app.submitter.submit(Box::new(Dead)).is_ok(), "queued");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > Generation::default()
+            }),
+            "the finish was never drained"
+        );
+        disarm_check(&mut app, &state, "after a refresh");
+        // The check's press armed work.rs again; a focus round trip is the
+        // one thing that must not touch it, so the next press *confirms* —
+        // the discard lands, which no disarming action could have allowed.
+        app.dispatch("commits.focus");
+        app.dispatch("files.focus");
+        let written = state.lock().unwrap().writes.len();
+        app.dispatch("files.discard");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                state.lock().unwrap().writes.len() > written
+            }),
+            "focus away and back dropped the arm"
+        );
+    }
+
+    #[test]
+    fn files_ignore_only_submits_for_untracked_rows() {
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().status = four_section_status();
+        let mut app = commits_app(&handle);
+        app.dispatch("files.focus");
+
+        // Onto the untracked row, then ignore it: the exact verb, the raw
+        // path, one job.
+        app.dispatch("view.top");
+        for _ in 0..2 {
+            app.dispatch("view.down");
+        }
+        app.dispatch("files.ignore");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                !state.lock().unwrap().writes.is_empty()
+            }),
+            "the ignore never reached the repository"
+        );
+        assert_eq!(state.lock().unwrap().writes, vec!["ignore caf\u{FFFD}.txt"]);
+        assert_eq!(
+            state.lock().unwrap().paths_written,
+            [b"caf\xe9.txt".to_vec()]
+        );
+
+        // Every other section refuses with the one sentence — tracked rows
+        // are not `.gitignore`'s business.
+        let writes = state.lock().unwrap().writes.len();
+        for _ in 0..2 {
+            app.dispatch("view.top");
+            app.dispatch("files.ignore");
+            assert_eq!(app.message, "only an untracked file can be ignored");
+        }
+        assert_eq!(state.lock().unwrap().writes.len(), writes);
+
+        // Wrong focus, no repository, closed queue: said, and silent.
+        app.dispatch("commits.focus");
+        app.dispatch("files.ignore");
+        assert_eq!(app.message, "files.ignore is not supported here");
+        let mut fixture = app_on_diff(Source::Fixtures, None);
+        with_hand_registered_status(&mut fixture, one_untracked_status());
+        fixture.dispatch("files.ignore");
+        assert_eq!(fixture.message, "a fixture has no repository to ignore in");
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().status = four_section_status();
+        let mut app = commits_app(&handle);
+        app.dispatch("files.focus");
+        app.dispatch("view.top");
+        for _ in 0..2 {
+            app.dispatch("view.down");
+        }
+        drop(std::mem::replace(&mut app.jobs, Runner::new()));
+        app.dispatch("files.ignore");
+        assert_eq!(app.message, "the job queue is shutting down");
+        assert!(state.lock().unwrap().writes.is_empty());
+    }
+
+    #[test]
+    fn files_stash_pushes_without_a_selection_or_message() {
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().status = four_section_status();
+        let mut app = commits_app(&handle);
+
+        // Dispatched from the commit list — stash is repository-scoped and
+        // reads no row. No prompt opens for it either.
+        app.dispatch("commits.focus");
+        app.dispatch("files.stash");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                !state.lock().unwrap().writes.is_empty()
+            }),
+            "the stash never reached the repository"
+        );
+        assert_eq!(state.lock().unwrap().writes, vec!["stash push None"]);
+        assert!(app.prompt.is_none(), "stash opened a prompt");
+
+        // From the files pane, same story.
+        app.dispatch("files.focus");
+        app.dispatch("files.stash");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                state.lock().unwrap().writes.len() == 2
+            }),
+            "the second stash never reached the repository"
+        );
+        assert_eq!(
+            state.lock().unwrap().writes,
+            vec!["stash push None", "stash push None"]
+        );
+
+        // A clean tree parks nothing and says nothing failed — the push is
+        // git's to answer.
+        let (handle, state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        app.dispatch("files.stash");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                !state.lock().unwrap().writes.is_empty()
+            }),
+            "the clean-tree stash never ran"
+        );
+        assert_eq!(state.lock().unwrap().writes, vec!["stash push None"]);
+
+        // No repository and a closed queue refuse.
+        let mut fixture = app_on_diff(Source::Fixtures, None);
+        fixture.dispatch("files.stash");
+        assert_eq!(fixture.message, "a fixture has no working tree to park");
+        let (handle, state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        drop(std::mem::replace(&mut app.jobs, Runner::new()));
+        app.dispatch("files.stash");
+        assert_eq!(app.message, "the job queue is shutting down");
+        assert!(state.lock().unwrap().writes.is_empty());
+    }
+
+    /// The files tenant's generation, read off the variant — what a refresh
+    /// sets only after it applied.
+    fn files_generation(app: &App) -> Generation {
+        match app.panes.get("files") {
+            Some(Screens::Files { generation, .. }) => *generation,
+            _ => panic!("the files pane is not registered"),
+        }
+    }
+
+    #[test]
+    fn a_files_write_refreshes_every_generation_tenant() {
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().status = four_section_status();
+        let mut app = commits_app(&handle);
+        app.dispatch("commits.open-diff");
+        app.dispatch("files.focus");
+        // The cursor on the unstaged row, so its anchor can be checked after
+        // the wave: one step down from the first staged file crosses the
+        // unstaged heading onto work.rs.
+        app.dispatch("view.top");
+        app.dispatch("view.down");
+        let started = state.lock().unwrap().status_reads;
+        let opens = state.lock().unwrap().pairs_reads;
+        let generation = app.generation;
+
+        // One write that lands and one that is refused: both finishes are
+        // generation bumps, and both waves must reach every repository pane.
+        let first = Write::stage(&handle, b"work.rs".to_vec());
+        assert!(app.submitter.submit(Box::new(first)).is_ok(), "queued");
+        let second = Write::stage_patch(&handle, b"refuse-me".to_vec()).expect("a non-empty patch");
+        assert!(app.submitter.submit(Box::new(second)).is_ok(), "queued");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                state.lock().unwrap().status_reads >= started + 2
+                    && state.lock().unwrap().pairs_reads >= opens + 2
+                    && state.lock().unwrap().log_reads >= 2
+            }),
+            "the waves never finished"
+        );
+
+        // The generation is the one every pane was refreshed against — the
+        // files pane included, though the keyboard never left it and the
+        // diff was never focused again.
+        assert!(app.generation > generation);
+        for name in ["files", "commits", "diff"] {
+            let pane = app
+                .panes
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} is registered"));
+            assert_eq!(pane.generation(), app.generation, "{name}");
+        }
+        // The label moved with the world: the staged write moved work.rs
+        // out of the unstaged count.
+        assert_eq!(files_label(&app), "fake (main) · 4 changed");
+        // The anchor held: the keyboard is still on (unstaged, work.rs) —
+        // the section it sits in is its own.
+        let current = files_of(&app)
+            .current_file()
+            .expect("a file under the cursor");
+        assert_eq!(
+            (current.section, current.path.as_bytes()),
+            (files::Section::Unstaged, &b"work.rs"[..])
+        );
+
+        // The first refresh error stands and the rest are still attempted:
+        // a failing files read does not stop the commit list's, and the
+        // first pane's error is the one said.
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().status = four_section_status();
+        let mut app = commits_app(&handle);
+        app.dispatch("commits.open-diff");
+        state.lock().unwrap().fail_status = Some("the status read failed".into());
+        state.lock().unwrap().fail_log = Some("the log read failed".into());
+        let reads = state.lock().unwrap().status_reads;
+        assert!(app.submitter.submit(Box::new(Dead)).is_ok(), "queued");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > Generation::default()
+            }),
+            "the finish was never drained"
+        );
+        assert_eq!(app.message, "the log read failed", "the last error stood");
+        assert_ne!(app.message, "the status read failed");
+        assert!(
+            state.lock().unwrap().status_reads > reads,
+            "files was never attempted after the first error"
+        );
+
+        // And the files pane's *own* refresh error leaves its last good data
+        // standing — never a false clean tree, never a current generation.
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().status = four_section_status();
+        let mut app = commits_app(&handle);
+        let stale_label = files_label(&app).to_string();
+        state.lock().unwrap().fail_status = Some("the status read failed".into());
+        assert!(app.submitter.submit(Box::new(Dead)).is_ok(), "queued");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > Generation::default()
+            }),
+            "the finish was never drained"
+        );
+        assert_eq!(app.message, "the status read failed");
+        assert_eq!(files_label(&app), stale_label, "the label was replaced");
+        assert!(files_of(&app).is_available(), "a failed read faked a state");
+        assert_eq!(
+            files_generation(&app),
+            Generation::default(),
+            "a failed refresh marked the pane current"
+        );
+        assert_ne!(files_generation(&app), app.generation);
+    }
+
     #[test]
     fn enter_replaces_and_focuses_a_persistent_diff_and_back_returns() {
         let (handle, state) = fake(&[]);
@@ -3611,11 +4549,21 @@ diff --git a/tracked.txt b/tracked.txt
         }
     }
 
+    /// A one-untracked-file tree — the one section `files.ignore` answers.
+    fn one_untracked_status() -> Status {
+        Status {
+            untracked: vec![UntrackedEntry {
+                path: PathBytes::from("notes.md"),
+            }],
+            ..Default::default()
+        }
+    }
+
     /// Registers a files pane into an app that could not have grown one on
     /// its own — a fixture's, with no repository behind it — so a test can
     /// reach the refusals that live behind a focused files pane.
-    fn with_hand_registered_files(app: &mut App) {
-        let files::Prepared { rows, label } = files::prepare(&one_file_status(), "fake");
+    fn with_hand_registered_status(app: &mut App, status: Status) {
+        let files::Prepared { rows, label } = files::prepare(&status, "fake");
         app.panes.register(
             "files",
             panes::Placement::sidebar("files"),
@@ -3628,6 +4576,10 @@ diff --git a/tracked.txt b/tracked.txt
         app.sync_modes();
         app.dispatch("files.focus");
         assert_eq!(app.panes.focused_name(), "files");
+    }
+
+    fn with_hand_registered_files(app: &mut App) {
+        with_hand_registered_status(app, one_file_status());
     }
 
     #[test]

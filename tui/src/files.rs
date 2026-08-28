@@ -357,6 +357,15 @@ impl Files {
     pub fn new(rows: Vec<Entry>) -> Self {
         let mut view = Viewport::new();
         view.set_len(rows.len());
+        // A non-empty flatten always puts a heading at row 0 and its first
+        // file at row 1, so opening on the first file is a `go_to`, not a
+        // search — and it happens here, not at the first resize, because a
+        // verb dispatched before the pane has ever been drawn still needs a
+        // cursor that names a row it can act on. A heading is a label over
+        // rows, and a verb aimed at one has nowhere to go.
+        if !rows.is_empty() {
+            view.go_to(1);
+        }
         let total = rows.iter().filter(|r| matches!(r, Entry::File(_))).count();
         Self {
             rows,
@@ -401,14 +410,21 @@ impl Files {
     }
 
     /// How many columns the pane draws into, and how many rows it shows.
-    /// The first size with rows under it is also when the pane opens on its
-    /// first file — see [`Files::opened`].
+    /// The first size with rows under it also opens the pane: the cursor is
+    /// already on its first file (it was settled at construction), so the
+    /// opening is a matter of putting the heading above it back on screen —
+    /// which a viewport sized later cannot do on its own when the height is
+    /// too small to keep a scroll margin. A one-row pane has room for the
+    /// cursor and nothing else.
     pub fn resize(&mut self, cols: usize, height: usize) {
         self.cols = cols;
         self.view.set_height(height);
         if !self.opened && height > 0 {
             self.opened = true;
             self.settle(0);
+            if height > 1 {
+                self.view.scroll_to(0);
+            }
         }
     }
 
