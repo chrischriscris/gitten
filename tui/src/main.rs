@@ -49,7 +49,7 @@ use gitten_tui::diff::Diff;
 use gitten_tui::help;
 use gitten_tui::screen::{Ink, Pen, Screen};
 use gitten_tui::scrollbar::Bar;
-use gitten_tui::stashes::Stashes;
+use gitten_tui::stashes::{drop_question, Stashes};
 use gitten_tui::term::{Input, Mouse, MouseKind, Term};
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1369,6 +1369,14 @@ impl App {
             // Routed here, ahead of the pane, for the same reason the
             // window routes them in its `run_command`.
             "diff.stage-hunk" | "diff.unstage-hunk" => self.hunk_verb(command),
+            // The stash verbs act on the *repository*, not the pane: the
+            // pane answers "which row", the queue takes it from there.
+            // Routed ahead of the focused pane for the same reason the hunk
+            // verbs are — and `files.stash` needs no pane at all, only the
+            // repository, so a files tenant gains its already-configured
+            // `s` binding simply by registering.
+            "stashes.apply" | "stashes.pop" | "stashes.drop" => self.stash_selected(command),
+            "files.stash" => self.stash_working_tree(),
             // The clipboard is the terminal's, not this process's — see
             // `Term::copy`. Held until the loop, which is the one place that has
             // a terminal to write to.
@@ -1594,6 +1602,83 @@ impl App {
                 }
             }
             Err(e) => self.message = e,
+        }
+    }
+
+    /// `stashes.apply` / `stashes.pop` / `stashes.drop`: send the stack
+    /// entry the keyboard is on to the queue. The terminal's share of the
+    /// window's stash verbs — the gates, the arm, the job — and not one
+    /// line more, because every one of those is shared with an extension
+    /// calling the same command through the same name.
+    ///
+    /// The verbs reach only a focused stash pane, and only a row: an empty
+    /// or unavailable stack has nothing to address, and is refused before
+    /// the queue rather than sent to git to be told so. Drop alone asks
+    /// twice, on the pane's own arm, *before* any job exists; apply and pop
+    /// act on the first press, exactly as the window does and the command
+    /// descriptions say. Every accepted press builds the exact existing
+    /// [`Write`] and submits it — the repository's own refusal, on a stale
+    /// index or a conflicted restore, comes back from the queue and is the
+    /// status line, never a UI-invented word like `conflict`.
+    fn stash_selected(&mut self, command: &str) {
+        let Some((_, handle)) = self.repo.as_ref() else {
+            // A stash pane is registered only behind a repository, so the
+            // keyboard is somewhere else; said the same way that refusal is
+            // always said.
+            self.message = format!("{command} is not supported here");
+            return;
+        };
+        let selected = match self.panes.focused() {
+            Some(Screens::Stashes { view, .. }) => view.current(),
+            _ => {
+                self.message = format!("{command} is not supported here");
+                return;
+            }
+        };
+        let Some(index) = selected else {
+            self.message = "nothing selected on the stash stack".into();
+            return;
+        };
+        // The arm is spent here, on the pane, before anything is built: a
+        // first press asks and queues nothing, a second press on the same
+        // row acts.
+        if command == "stashes.drop" {
+            let confirmed = match self.panes.focused_mut() {
+                Some(Screens::Stashes { view, .. }) => view.confirm_or_arm_drop(index),
+                _ => return,
+            };
+            if !confirmed {
+                self.message = drop_question(index);
+                return;
+            }
+        }
+        let job = match command {
+            "stashes.apply" => Write::stash_apply(handle, index),
+            "stashes.pop" => Write::stash_pop(handle, index),
+            "stashes.drop" => Write::stash_drop(handle, index),
+            _ => return,
+        };
+        if self.submitter.submit(Box::new(job)).is_err() {
+            self.message = "the job queue is shutting down".into();
+        }
+    }
+
+    /// `files.stash`: park the working tree on the stack — `git stash push`
+    /// with no message, exactly as the window sends it, so git supplies its
+    /// normal `WIP on …` text. Naming a stash is prompt work this command
+    /// deliberately has none of.
+    ///
+    /// It inspects neither the files pane nor the stash pane: the verb aims
+    /// at the repository the app is holding, which is also why it answers
+    /// on a launch that registered no files tenant at all.
+    fn stash_working_tree(&mut self) {
+        let Some((_, handle)) = self.repo.as_ref() else {
+            self.message = "a fixture has no working tree to park".into();
+            return;
+        };
+        let job = Write::stash_push(handle, None);
+        if self.submitter.submit(Box::new(job)).is_err() {
+            self.message = "the job queue is shutting down".into();
         }
     }
 
@@ -4086,5 +4171,357 @@ diff --git a/tracked.txt b/tracked.txt
                 "{name} was not refreshed to the generation"
             );
         }
+    }
+
+    #[test]
+    fn stash_apply_job_uses_the_selected_index_and_keeps_the_entry() {
+        let (handle, state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        // A loaded diff — so all three tenants have something a finish can
+        // stale — then the stack focused and the keyboard moved to the
+        // second entry, the row the verbs must address.
+        app.dispatch("commits.open-diff");
+        app.press(Key::plain(Code::Char('5')));
+        assert_eq!(app.panes.focused_name(), "stashes");
+        app.dispatch("view.down");
+        app.dispatch("stashes.apply");
+        // The gate is the finish itself — the generation a drain advances —
+        // and not the write landing on the worker: the refresh rides the
+        // same drain pass the assertions below read.
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > Generation::default()
+            }),
+            "the apply never reached the repository"
+        );
+        // The job went to the *selected* index — the cursor row's stack
+        // index, and nothing else.
+        assert_eq!(
+            state.lock().unwrap().stash_writes,
+            ["apply stash@{1}"],
+            "{:?}",
+            state.lock().unwrap().stash_writes
+        );
+        // Every repository pane refreshed to the finish's generation, and
+        // the selected stash is still selected: an apply keeps the entry.
+        for name in ["commits", "stashes", "diff"] {
+            assert_eq!(
+                app.panes.get(name).unwrap().generation(),
+                app.generation,
+                "{name}"
+            );
+        }
+        {
+            let stash = match app.panes.get("stashes") {
+                Some(Screens::Stashes { view, .. }) => view,
+                _ => panic!("the stack is registered"),
+            };
+            assert_eq!(
+                stash.current(),
+                Some(1),
+                "the apply moved the keyboard off its entry"
+            );
+        }
+
+        // A refusal is the repository's exact words — no UI-invented
+        // conflict copy — and it still staled every pane, and moved nothing.
+        // The refused verb records no write: like git, the fake changed
+        // nothing; the finish event is what carries the error in.
+        state.lock().unwrap().refuse_stash = Some("the apply refused".into());
+        app.dispatch("stashes.apply");
+        let gen = app.generation;
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > gen
+            }),
+            "the refused apply never finished"
+        );
+        assert_eq!(app.message, "the apply refused", "{:?}", app.message);
+        assert_eq!(
+            state.lock().unwrap().stashes.len(),
+            2,
+            "a refused apply moved the stack"
+        );
+    }
+
+    #[test]
+    fn stash_pop_is_one_press_and_only_clean_success_removes() {
+        // A clean pop: one press queues it — no question, no second press —
+        // and the refreshed read is what renumbers the stack.
+        let (handle, state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        app.press(Key::plain(Code::Char('5')));
+        app.dispatch("stashes.pop");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > Generation::default()
+            }),
+            "the pop never queued"
+        );
+        assert_eq!(state.lock().unwrap().stash_writes, ["pop stash@{0}"]);
+        assert_eq!(
+            state.lock().unwrap().stashes.len(),
+            1,
+            "a clean pop kept the entry"
+        );
+        {
+            let stash = match app.panes.get("stashes") {
+                Some(Screens::Stashes { view, .. }) => view,
+                _ => panic!("the stack is registered"),
+            };
+            assert_eq!(
+                stash.status(),
+                "1/1 · stash@{0}",
+                "the stack did not renumber"
+            );
+            assert_eq!(stash.current(), Some(0));
+        }
+
+        // A conflicted pop — git restored and declined to drop — is the
+        // repository's exact refusal, and the entry is still on the stack
+        // the refresh re-read.
+        let (handle, state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        app.press(Key::plain(Code::Char('5')));
+        state.lock().unwrap().refuse_stash = Some("cannot restore: conflict".into());
+        app.dispatch("stashes.pop");
+        let reads = state.lock().unwrap().stash_reads;
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                state.lock().unwrap().stash_reads > reads
+            }),
+            "the refused pop never finished"
+        );
+        assert_eq!(app.message, "cannot restore: conflict", "{:?}", app.message);
+        assert_eq!(
+            state.lock().unwrap().stashes.len(),
+            2,
+            "a refused pop moved the stack"
+        );
+    }
+
+    #[test]
+    fn stash_drop_requires_two_presses_and_refusals_never_spend_an_arm_twice() {
+        let (handle, state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        app.press(Key::plain(Code::Char('5')));
+
+        // First press: the exact question, and nothing queued.
+        app.press(Key::char('d'));
+        assert_eq!(
+            app.message, "drop stash@{0}? press again to confirm",
+            "{:?}",
+            app.message
+        );
+        assert!(
+            state.lock().unwrap().stash_writes.is_empty(),
+            "an armed drop queued a write"
+        );
+        // Second press on the same row: queues, and the arm is spent. The
+        // gate is again the finish, so the refreshed, renumbered stack is
+        // what the next probes read.
+        app.press(Key::char('d'));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > Generation::default()
+            }),
+            "the confirmed drop never queued"
+        );
+        assert_eq!(state.lock().unwrap().stash_writes, ["drop stash@{0}"]);
+
+        // A moved cursor asks anew: the arm died with the move, so the next
+        // `d` is a question and not a drop. The stack renumbered under the
+        // completed drop — the survivor is now `stash@{0}` — and an arm
+        // that had wrongly survived by index would be a *confirmed* drop
+        // against exactly that renumbering.
+        app.dispatch("view.down");
+        app.press(Key::char('d'));
+        assert_eq!(
+            app.message, "drop stash@{0}? press again to confirm",
+            "{:?}",
+            app.message
+        );
+        assert_eq!(
+            state.lock().unwrap().stash_writes.len(),
+            1,
+            "an unconfirmed drop queued a write"
+        );
+
+        // An empty stack refuses before the queue: there is no row for the
+        // question to be about.
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().stashes.clear();
+        let mut app = commits_app(&handle);
+        app.press(Key::plain(Code::Char('5')));
+        app.press(Key::char('d'));
+        assert_eq!(
+            app.message, "nothing selected on the stash stack",
+            "{:?}",
+            app.message
+        );
+        assert!(state.lock().unwrap().stash_writes.is_empty());
+
+        // A backend refusal — the index the confirm aimed at naming nothing
+        // by the time git ran — is surfaced exactly, after the confirmed
+        // job and its refresh; the refreshed stack, not the UI, decides
+        // what is gone.
+        let (handle, state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        app.press(Key::plain(Code::Char('5')));
+        app.dispatch("view.down");
+        state.lock().unwrap().refuse_stash = Some("stash@{1}: no such stash".into());
+        app.press(Key::char('d'));
+        assert_eq!(app.message, "drop stash@{1}? press again to confirm");
+        app.press(Key::char('d'));
+        let reads = state.lock().unwrap().stash_reads;
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                state.lock().unwrap().stash_reads > reads
+            }),
+            "the refused drop never finished"
+        );
+        assert_eq!(app.message, "stash@{1}: no such stash", "{:?}", app.message);
+        assert_eq!(
+            state.lock().unwrap().stashes.len(),
+            2,
+            "a refused drop moved the stack"
+        );
+    }
+
+    #[test]
+    fn files_stash_queues_a_message_less_push_and_surfaces_clean_tree_refusal() {
+        // No files pane is registered; the command is answered from the
+        // repository the app holds, which is the point.
+        let (handle, state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        app.dispatch("files.stash");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                app.generation > Generation::default()
+            }),
+            "the push never queued"
+        );
+        {
+            let s = state.lock().unwrap();
+            // One job, message-less — git supplies its own `WIP on …`.
+            assert_eq!(s.stash_writes, ["push "], "{:?}", s.stash_writes);
+            // The refreshed stack holds the new top entry above the old two.
+            assert_eq!(s.stashes.len(), 3);
+            assert_eq!(s.stashes[0].index, 0);
+            assert_eq!(s.stashes[0].message, "WIP on fake (main)");
+            assert_eq!(s.stashes[1].index, 1, "the old top did not renumber");
+        }
+        // No prompt and no input mode: a message-less push opens nothing.
+        assert!(app.search.is_none());
+        assert_eq!(app.panes.focused_name(), "commits");
+
+        // A clean tree refuses in git's own words, and the refreshed stack
+        // is the unchanged one the read came back with.
+        let (handle, state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        state.lock().unwrap().refuse_stash = Some("No local changes to save".into());
+        app.dispatch("files.stash");
+        let reads = state.lock().unwrap().stash_reads;
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                state.lock().unwrap().stash_reads > reads
+            }),
+            "the refused push never finished"
+        );
+        assert_eq!(app.message, "No local changes to save", "{:?}", app.message);
+        assert_eq!(state.lock().unwrap().stashes.len(), 2);
+
+        // No repository: said, not queued.
+        let mut app = app_on_diff(Source::Fixtures, None);
+        app.dispatch("files.stash");
+        assert_eq!(app.message, "a fixture has no working tree to park");
+    }
+
+    #[test]
+    fn stash_finishes_refresh_every_registered_repository_pane() {
+        let (handle, state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        // Narrow, so the layout hides whatever does not hold the keyboard:
+        // a loaded diff, then the stack focused — the other two tenants are
+        // hidden and stale all the same.
+        app.screen = Screen::new(60, 24);
+        app.dispatch("commits.open-diff");
+        app.dispatch("stashes.focus");
+        app.draw();
+        assert_eq!(app.panes.focused_name(), "stashes");
+        assert!(app.pane_content("commits").is_none());
+        assert!(app.pane_content("diff").is_none());
+        let open = {
+            let s = state.lock().unwrap();
+            (s.log_reads, s.pairs_reads, s.stash_reads)
+        };
+
+        // One clean apply: every registered repository pane re-reads, once,
+        // regardless of focus or visibility.
+        app.dispatch("stashes.apply");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                let s = state.lock().unwrap();
+                s.log_reads > open.0 && s.pairs_reads > open.1 && s.stash_reads > open.2
+            }),
+            "the finish never refreshed every tenant"
+        );
+        for name in ["commits", "stashes", "diff"] {
+            assert_eq!(
+                app.panes.get(name).unwrap().generation(),
+                app.generation,
+                "{name} was not refreshed to the generation"
+            );
+        }
+
+        // One refused pop: the write's error owns the status, the refresh
+        // still runs, every tenant is still tried — and a refresh failure in
+        // the first-registered pane is appended after the write error, in
+        // the existing `write · refresh` order.
+        {
+            let mut s = state.lock().unwrap();
+            s.refuse_stash = Some("the stash pop refused".into());
+            s.fail_log = Some("the log read failed".into());
+        }
+        app.dispatch("stashes.pop");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                state.lock().unwrap().stash_reads > open.2 + 1
+            }),
+            "the refused finish never refreshed every tenant"
+        );
+        let s = state.lock().unwrap();
+        assert_eq!(
+            s.log_reads,
+            open.0 + 2,
+            "a failed pane skipped the later tenants"
+        );
+        assert_eq!(
+            s.pairs_reads,
+            open.1 + 2,
+            "a failed pane skipped the later tenants"
+        );
+        assert_eq!(s.stash_reads, open.2 + 2);
+        // The refused pop recorded no write — the fake, like git, changed
+        // nothing. Its error reached the status line through the finish
+        // event, asserted below.
+        assert_eq!(s.stash_writes, ["apply stash@{0}"], "{:?}", s.stash_writes);
+        assert_eq!(
+            app.message, "the stash pop refused · the log read failed",
+            "{:?}",
+            app.message
+        );
+        // The refusal removed nothing: the refreshed stack still holds both.
+        assert_eq!(s.stashes.len(), 2);
     }
 }
