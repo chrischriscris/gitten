@@ -10,13 +10,19 @@
 //! can press while reading a diff, and listing it would be a lie in the one
 //! place that exists to stop you guessing.
 
-use crate::screen::{Ink, Screen};
+use crate::{
+    screen::{Ink, Screen},
+    scrollbar::{self, Bar},
+};
 use gitten_core::command::{Commands, HelpRow, Keymap, Modes};
 use gitten_core::theme::Theme;
+use gitten_core::view::Viewport;
 
 /// Widest the panel gets, in columns. Past this the descriptions are further
 /// from their keys than the eye will carry them.
-const MAX_W: usize = 64;
+const MAX_W: usize = 96;
+/// Tall enough to scan, short enough to remain a modal rather than a screen.
+const MAX_H: usize = 30;
 /// Columns between the key column and the description.
 const GAP: usize = 2;
 
@@ -25,6 +31,22 @@ enum Row {
     Mode(String),
     Key { keys: String, doc: String },
     Blank,
+}
+
+fn panel_height(row_count: usize, available: usize) -> usize {
+    let preferred = available.saturating_mul(3).saturating_div(4).max(3);
+    (row_count + 2).min(preferred).min(MAX_H).min(available)
+}
+
+/// Visible rows and the furthest first row for the current terminal.
+pub fn scroll_bounds(
+    height: usize,
+    host: &gitten_core::host::Host,
+    modes: &Modes,
+) -> (usize, usize) {
+    let len = rows(&host.keys, &host.commands, modes).len();
+    let visible = panel_height(len, height).saturating_sub(2);
+    (visible, len.saturating_sub(visible))
 }
 
 /// The rows, straight out of [`Keymap::help`] — `core`'s projection of what the
@@ -43,15 +65,14 @@ fn rows(keys: &Keymap, commands: &Commands, modes: &Modes) -> Vec<Row> {
 
 /// Draws the panel, centred in the rows `top..top + height`.
 ///
-/// Clipped rather than scrolled: a help panel that does not fit is a terminal
-/// too small to be using, and a scrollable one is a second viewport to get
-/// right. It shrinks to what there is and stops.
 pub fn paint(
     screen: &mut Screen,
     top: usize,
     height: usize,
     host: &gitten_core::host::Host,
     modes: &Modes,
+    offset: usize,
+    bar: Bar,
 ) {
     let theme: &Theme = &host.theme;
     let rows = rows(&host.keys, &host.commands, modes);
@@ -63,15 +84,25 @@ pub fn paint(
         })
         .max()
         .unwrap_or(0);
+    let doc_w = rows
+        .iter()
+        .filter_map(|r| match r {
+            Row::Key { doc, .. } => Some(crate::screen::width(doc)),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
 
     // Two columns and a border either side, never wider than the screen.
-    let inner = (key_w + GAP + 28)
+    let inner = (key_w + GAP + doc_w.max(28))
         .min(MAX_W)
         .min(screen.width().saturating_sub(4));
-    let w = inner + 4;
-    let h = (rows.len() + 2).min(height);
+    let w = (inner + 4).min(screen.width());
+    let h = panel_height(rows.len(), height);
     let x = screen.width().saturating_sub(w) / 2;
     let y = top + height.saturating_sub(h) / 2;
+    let visible = h.saturating_sub(2);
+    let offset = offset.min(rows.len().saturating_sub(visible));
 
     let border = Ink::new(theme.chrome.faint, theme.chrome.title_bg);
     let title = Ink::new(theme.chrome.accent, theme.chrome.title_bg);
@@ -98,29 +129,47 @@ pub fn paint(
             }
             r => {
                 pen.put("│ ", border);
-                match rows.get(r - 1) {
+                // Keep the right edge outside the content pen. A description
+                // that fills its column must clip before the border; otherwise
+                // the pane underneath reads as the rest of the sentence.
+                let content_w = pen.room().saturating_sub(1);
+                let mut content = pen.take(content_w);
+                match rows.get(offset + r - 1) {
                     Some(Row::Mode(name)) => {
-                        pen.put(name, mode);
+                        content.put(name, mode);
                     }
                     Some(Row::Key { keys, doc: text }) => {
-                        pen.put(keys, key);
-                        pen.fill(
+                        content.put(keys, key);
+                        content.fill(
                             key_w + GAP - crate::screen::width(keys).min(key_w + GAP),
                             ' ',
                             doc,
                         );
-                        pen.put(text, doc);
+                        content.put(text, doc);
                     }
                     _ => {}
                 }
-                // The right edge last, so a long description is clipped by the
-                // border rather than pushing it off the panel.
-                let rest = pen.room().saturating_sub(1);
-                pen.fill(rest, ' ', border);
+                content.wash(border);
                 pen.put("│", border);
             }
         }
     }
+
+    // The thumb replaces the right border only where it has information to
+    // add; above and below it the modal's own edge remains the track.
+    let mut view = Viewport::new();
+    view.set_len(rows.len());
+    view.set_height(visible);
+    view.pan_by(offset as isize);
+    scrollbar::paint(
+        screen,
+        bar,
+        x + w.saturating_sub(1),
+        None,
+        y + 1,
+        &view,
+        host,
+    );
 }
 
 #[cfg(test)]
@@ -129,9 +178,13 @@ mod tests {
     use gitten_core::host::Host;
 
     fn shown(host: &Host, modes: &Modes) -> Vec<String> {
+        shown_at(host, modes, 0)
+    }
+
+    fn shown_at(host: &Host, modes: &Modes, offset: usize) -> Vec<String> {
         let mut screen = Screen::new(90, 40);
         screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
-        paint(&mut screen, 0, 40, host, modes);
+        paint(&mut screen, 0, 40, host, modes, offset, Bar::block());
         (0..40).map(|y| screen.row_text(y)).collect()
     }
 
@@ -181,7 +234,7 @@ mod tests {
 
         let mut modes = Modes::new();
         modes.push("diff");
-        let in_diff = shown(&host, &modes);
+        let in_diff = shown_at(&host, &modes, usize::MAX);
         assert!(contains(&in_diff, "the next presentation"));
         assert!(contains(&in_diff, "diff"), "the mode is not named");
         assert!(
@@ -197,7 +250,7 @@ mod tests {
         host.commands
             .register("blame.toggle", "show blame beside the diff");
         host.keys.bind("global", "b", "blame.toggle").unwrap();
-        let rows = shown(&host, &Modes::new());
+        let rows = shown_at(&host, &Modes::new(), usize::MAX);
         assert!(contains(&rows, "show blame beside the diff"));
     }
 
@@ -212,11 +265,12 @@ mod tests {
 
     #[test]
     fn it_is_bordered_on_every_side_and_centred() {
-        let host = Host::new();
-        let mut screen = Screen::new(90, 40);
+        let mut host = Host::new();
+        host.view.scrollbar = false;
+        let mut screen = Screen::new(140, 50);
         screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
-        paint(&mut screen, 0, 40, &host, &Modes::new());
-        let rows: Vec<String> = (0..40).map(|y| screen.row_text(y)).collect();
+        paint(&mut screen, 0, 50, &host, &Modes::new(), 0, Bar::block());
+        let rows: Vec<String> = (0..50).map(|y| screen.row_text(y)).collect();
         let first = rows
             .iter()
             .position(|r| r.contains('╭'))
@@ -227,10 +281,34 @@ mod tests {
             .expect("a bottom border");
         assert!(last > first + 2);
         let left = rows[first].find('╭').unwrap();
+        let right = rows[first].chars().position(|c| c == '╮').unwrap();
         assert!(left > 0, "not centred: {}", rows[first]);
+        assert!(right - left + 1 > 68, "the modal did not grow wider");
+        assert!(last - first < MAX_H, "the modal grew too tall");
+        assert!(last < 49, "the modal is not vertically centred");
         for row in &rows[first + 1..last] {
-            assert!(row.contains('│'), "an unbordered row: {row:?}");
+            assert_eq!(row.chars().nth(left), Some('│'), "no left border: {row:?}");
+            assert_eq!(
+                row.chars().nth(right),
+                Some('│'),
+                "no right border: {row:?}"
+            );
         }
+    }
+
+    #[test]
+    fn an_overflowing_panel_moves_through_the_registered_rows() {
+        let host = Host::new();
+        let mut modes = Modes::new();
+        modes.push("commits");
+        let (_, max) = scroll_bounds(40, &host, &modes);
+        assert!(max > 0, "the fixture unexpectedly fits in one page");
+
+        let first = shown_at(&host, &modes, 0).join("\n");
+        let last = shown_at(&host, &modes, max).join("\n");
+        assert!(first.contains("global"), "first page lost the global keys");
+        assert!(!first.contains("check out this commit"));
+        assert!(last.contains("check out this commit"), "{last}");
     }
 
     #[test]
@@ -239,7 +317,7 @@ mod tests {
         for (w, h) in [(1, 1), (10, 3), (20, 8), (200, 2)] {
             let mut screen = Screen::new(w, h);
             screen.clear(Ink::new(0, 0));
-            paint(&mut screen, 0, h, &host, &Modes::new());
+            paint(&mut screen, 0, h, &host, &Modes::new(), 0, Bar::block());
         }
     }
 }

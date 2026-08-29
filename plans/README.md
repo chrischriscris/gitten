@@ -1,6 +1,6 @@
 # Implementation Plans
 
-Two passes so far:
+Passes so far, and pass 5 open (020–022, the 2026-08-28 audit wave):
 
 - **Pass 1** (2026-08-24, audited at `3a8b347`): plans 001–007. All landed on
   main and merged — verified 2026-08-26 against `2dfcb82`
@@ -8,10 +8,57 @@ Two passes so far:
 - **Pass 2** (2026-08-26, audited at `2dfcb82`): plans 008–012. Executed by
   subagents in isolated worktrees, adversarially reviewed, and **all merged
   into main** on 2026-08-26 — see the status table and the follow-ups section.
+- **Pass 3** (2026-08-27, planned at `67fee3d`): plans 013–015 — the terminal
+  client catches up with the window. Plans drafted by Codex from live source,
+  baseline facts independently verified by the integrator, executed by OpenCode
+  subagents in isolated worktrees off `full/tui`, adversarially reviewed
+  (GREEN / CONCERNS-dispositioned / CONCERNS-dispositioned), folds applied,
+  merged into `full/tui` in this tree. Integrated gate: fmt, workspace clippy
+  `-D warnings`, and `cargo test --workspace` all green (1,086 tests).
+  **`full/tui` is complete and awaiting its owner's merge decision**; this tree
+  is the integration line and nothing has touched `full/full`.
+- **Pass 4** (2026-08-27/28, planned at `15bff4a`): interface parity — COMPLETE.
+  016 (the pane focus ring), 017 (files), 019 (stashes) and 018 (branches) are
+  implemented, adversarially reviewed, folded where the findings earned it, and
+  merged into `full/tui` in this tree. The terminal is lazygit-shaped: five
+  tenants (files, branches, commits, stashes + the diff main), every verb the
+  window ships reachable through the same command names, the same
+  `gitten.toml`, the same keymap. Rebase-onto/abort/continue are deliberately
+  deferred as one named follow-up ("TUI rebase lifecycle") with a scope-fence
+  test pinning the gap. **`full/tui` awaits its owner's merge decision**;
+  nothing has touched `full/full`.
 
-Execute pass 2 in the order below unless dependencies say otherwise. Each
-executor: read the plan fully before starting, honor its STOP conditions, and
-update your row when done.
+- **Pass 5** (2026-08-28, audited at `eb888e1`): plans 020–022 from the
+  terminal-vs-window audit. **The maintainer's working tree moved during
+  execution** — the scrollbar-indicator refactor (decision 0027) grew the
+  uncommitted state from three to eight tui files — so each advisor branch's
+  `carry:` commit is a snapshot of all eight files taken 2026-08-28 late
+  (`target/gitten-wip3.patch`), rebuilt after two bootstrap defects the
+  executors correctly STOPPED on (a patch-file carry, then a partial carry).
+  docs/decisions 0027 + its README edit remain live-tree only (docs, not
+  build-relevant). 020 (transactional terminal entry) verdict **APPROVE**;
+  021 (`diff.discard-hunk` + command-parity guard) re-dispatched on the
+  repaired carry; 022 (async loads/refreshes) branches from 021. Direction
+  items surfaced but not planned this wave: TUI status pane, live algorithm /
+  whitespace pickers, cursor-follow diff preview, a grapheme-aware prompt
+  editor, and the armed-hunk render tint (deferred in 021 — a `Frame` field
+  ripples through every presentation). **Merging is the owner's; the advisor
+  never merges.** Merge order: commit or stash the working-tree WIP first,
+  then merge `advisor/020` and `advisor/022` (`advisor/022` contains 021);
+  the branches' carries and your local WIP are the same content at the same
+  snapshot, so the merge is a fast-forward-shaped no-op for the carried files.
+
+## Pass 4 follow-ups — surfaced by reviewers, recorded not folded
+
+- A Down-Down-without-Up (mouse protocol violation by the terminal) leaves a
+  stale one-row selection on the abandoned pane; self-heals on the next press,
+  no cross-pane splice. Only worth fixing with evidence a real emulator does it.
+- Pass-3's recorded follow-ups (gpgsign in `Scratch`, `coords` doc at context 0,
+  CJK-in-squeezed-cells, SGR 58 eyeball) remain open.
+
+Execute pass 3 in the order below unless dependencies say otherwise. Each
+executor: read the plan fully before starting, honor its STOP conditions; the
+integrator owns this table and updates it as waves land.
 
 ## Execution order & status
 
@@ -29,6 +76,31 @@ update your row when done.
 | 010 | Pick the commit list's widest row in characters, not bytes | P2 | S | — | MERGED (`d485bcb`, via `54f9272`) |
 | 011 | Author colours read the live theme | P2 | S | 010 softly | MERGED (`b7b0d75`, same merge commit) |
 | 012 | A font edit in gitten.toml rebuilds the diff presentation | P2 | M | — | MERGED (`dc14543` + followup `9a860a0`, via `d0b1ca5`) |
+| 013 | Incremental commit search in the terminal (`/`, shared `core::search`) | P1 | M | — | DONE (pass 3, `369503a`+2) — adversarially reviewed **GREEN**; 5 non-blocking notes accepted |
+| 014 | Stage/unstage the selected hunk from the terminal diff | P1 | M | — | DONE (pass 3, `b234f62`+5, fold `196704f`) — reviewed CONCERNS (all non-blocking); 3 folds in |
+| 015 | Render the shared Markdown presentation in the terminal | P2 | L | — | DONE (pass 3, `efe00bb`+3, folds `23e7672`) — reviewed CONCERNS (all non-blocking); core markdown.rs is a pure addition; 2 folds in |
+| 016 | The terminal pane focus ring (foundation for lazygit-shaped TUI) | P1 | L | 013–015 | DONE (pass 4, `0cfbb41`+4, fold `a1c5b2d`) — reviewed CONCERNS (all non-blocking); 2 folds in; executor's "2-file scope" claim was false (7 files, all inside plan authorization — test/harness fallout), recorded |
+| 019 | The terminal stashes pane (apply/pop/drop/push) | P1 | S–M | 016 | DONE (pass 4, `ba49f9c`+3, fold `754c032`) — reviewed CONCERNS (all non-blocking); 2 folds in (unavailable-state regression test + unfocused armed-ink assert); drop-arm renumbering probed and unbroken |
+| 017 | The terminal files pane (sections, all file verbs, commit/amend prompts) | P1 | L | 016 | DONE (pass 4, `c99cc1f`+3, fold `20b1415`) — reviewed CONCERNS (all non-blocking); 3 folds in; merged with the stashes tenant at `e58cd1d` |
+| 018 | The terminal branches pane (checkout/new/rename/delete/tag; rebase deferred as a named lifecycle follow-up) | P1 | L | 016, 017 | DONE (pass 4, `91e3876`+5, fold `4b65866`) — reviewed CONCERNS (all non-blocking); integrator ruling: the destructive arm outlives focus round-trips on every pane, matching the window (the ctrl-j bypass finding became the consistency fix); zero-alloc armed matching |
+| 020 | Transactional terminal entry — a failed start cannot leave raw mode on | P1 | S | — | DONE (advisor/020-transactional-terminal-entry, 3 commits on the 8-file carry) — verdict APPROVE: all gates re-run by reviewer (tests 175 lib, clippy, fmt clean), scope clean, diff read; one report inaccuracy (test count "174→178"; actual 171→175), work unaffected; branch carry repaired by orchestrator |
+| 021 | `diff.discard-hunk` in the terminal + the client command-parity guard | P1 | M | — | DONE (advisor/021-tui-discard-hunk-parity-guard, 6 commits on the 8-file carry) — verdict APPROVE: gates re-run by reviewer (182 lib + 60 bin tests, clippy, fmt), scope clean (diff.rs + main.rs), diff read, sabotage re-verified by reviewer (guard fails "copy.selection lost its arm" under a renamed arm, recovers on revert). Judgment calls accepted, documented: `view.*` is ten names not twelve (derived from real arms); four diff-pane names sweep after `diff.focus`; fake `Repo` gained a test-only `discard_patch`; job built before the arm is spent (a tightening of the window's order) |
+| 022 | Repository loads and refreshes off the terminal loop (loader thread, supersede guards) | P1 | L | 021 | DONE (advisor/022-tui-async-loads, 6 commits on 021's tip) — verdict APPROVE: gates re-run by reviewer on a cold isolated target dir (182 lib + 63 bin, clippy, fmt), scope read hunk-by-hunk (apply-time guards: batch id, target generation, request id; first-error stands; FIFO composition order documented), migrated assertions verified verbatim, both new guard tests assert real state. Accepted deviations, documented: `Screens` not `Send` → `Tenant` extraction + associated `acquire_snapshot` on the loader thread (the window's own model); snapshot variants carry labels (behavior-preserving); `catch_unwind` in the loader mirroring the write Runner; one scope extension — `Panes::iter_mut` deleted (4 lines, dead after step 3, caught by the plan's own clippy gate) |
+
+## Pass 3 follow-ups — surfaced by reviewers, pre-existing, not pass regressions
+
+- `app/src/acquire.rs` `Scratch::git` pins identity via `-c` but not `commit.gpgsign`; a machine with global
+  signing fails fixture setup. Named by plan 014's own stop conditions; one-line fix whenever next touched.
+- `core/src/patch.rs` `coords` doc claims only whole-file selections can empty a side — false at
+  `[diff] context = 0`, where an all-addition hunk in a tracked file emits `--- /dev/null` + `@@ -0,0`
+  and real `git apply --cached` refuses. Shared window+terminal behavior by design (git's own refusal
+  surfaces); the *doc* is the bug. Verified against the real backend by the 014 reviewer.
+- CJK text inside a *squeezed* table cell shears the grid in display columns — `flow_row` pads by
+  `chars().count()` (core markdown flow, unchanged, both clients affected), and the terminal module
+  doc records the inherited caveat. Same root as the known characters-versus-columns wrap seam.
+- The SGR 58 table hairline: the byte sequence and the SGR-4 fallback are pinned by tests, but its
+  rendering in a terminal without underline-colour support deserves one live eyeball (`./dev dump`)
+  before pass 3's merge is forgotten.
 
 ## Adversarial-review follow-ups — RESOLVED
 
@@ -56,6 +128,9 @@ GREEN (009), CONCERNS-all-nonblocking (010/011), GREEN (012). Disposition:
 
 ## Dependency notes
 
+- 022 branches from 021's advisor branch (both rework `tui/src/main.rs`'s
+  job/refresh paths, and 022's tests must cover the discard verb's refresh
+  path). 020 is independent and may land in either order.
 - No hard ordering among 008–012; they touch disjoint files except 010→011
   (`shell/src/views/commits.rs`), which is why 010 is listed first.
 - Do 008 before any future golden-corpus work: the merge-record case it fixes

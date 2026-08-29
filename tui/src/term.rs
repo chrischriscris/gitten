@@ -57,23 +57,32 @@ use std::time::Duration;
 /// `core`'s idea of a keypress at the edge, and everything inland — the keymap,
 /// the modes, `gitten.toml` — is shared with every other client. A second client
 /// on a second platform writes this function and nothing else.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Input {
-    /// A keypress — and a wheel notch, which [`Code`] holds a variant for and
-    /// which therefore needs nothing here. That is the point of it arriving as a
-    /// key: what a notch does is a line in `gitten.toml` like everything else,
-    /// and this enum stays a list of things that happened rather than a list of
-    /// things to do.
+    /// A keypress.
     Key(Key),
+    /// A wheel notch, as both its configurable key and its position.
+    ///
+    /// Keeping the [`Key`] is what leaves the action in `gitten.toml`; keeping
+    /// the cell is what lets an assembly with panes send that action to the
+    /// view below the pointer rather than the one holding the keyboard.
+    Wheel { key: Key, col: usize, row: usize },
     /// A button, a drag or a release, and where it happened.
     ///
-    /// Not a [`Key`], and that is the line `core::command` draws: a wheel notch
-    /// is a control with no coordinate and resolves through the keymap, and a
-    /// click is a *position* and belongs to whatever was under it. Routing one is
-    /// a hit test, which is the assembly's job and then a view's.
+    /// Not a [`Key`], and that is the line `core::command` draws: a click is a
+    /// *position* and belongs to whatever was under it. Routing one is a hit
+    /// test, which is the assembly's job and then a view's.
     Mouse(Mouse),
     /// The terminal changed size. Carries the new one, so nothing has to ask.
     Resize(usize, usize),
+    /// A bracketed paste, whole and unedited.
+    ///
+    /// Text, and deliberately not a sequence of [`Key`]s: the negotiation in
+    /// [`Term::enter`] means the emulator hands the whole paste over as one
+    /// event, so a pasted `q` is a character in a string and never a keypress
+    /// the keymap could resolve. Whether the text has anywhere to go is the
+    /// caller's decision — see `App::input` — and it is never made here.
+    Paste(String),
 }
 
 /// What the pointer did, in cells of the terminal.
@@ -247,20 +256,29 @@ impl Term {
     /// The next input, or `None` if nothing arrived within `timeout`.
     ///
     /// Because bracketed paste is negotiated in [`Term::enter`], an emulator
-    /// delivers a paste as one [`Event`] variant that [`translate_event`]
-    /// drops — `q` inside a pasted paragraph cannot quit anything, where
+    /// delivers a paste as one [`Event::Paste`], which leaves here as one
+    /// [`Input::Paste`] — the text whole, and never a sequence of keys. A pasted
+    /// `q` inside a paragraph is a character for the caller to place, where
     /// without the negotiation it would be typed into the keymap character by
-    /// character. Anything else that is not a keypress, a wheel notch, a left
-    /// button or a resize — a focus change, the right button — is skipped
-    /// rather than surfaced, so a caller gets `None` on a timeout and nothing
-    /// else. Key *release* events are skipped too: terminals with the kitty
-    /// protocol on report both, and acting on each is every binding firing
-    /// twice.
+    /// character and could quit something. Anything else that is not a keypress,
+    /// a wheel notch, a left button or a resize — a focus change, the right
+    /// button — is skipped rather than surfaced, and the skip happens *inside*
+    /// the wait: a dropped event does not end the call, so `None` means there
+    /// was nothing to act on and never that noise interrupted the read. That is
+    /// what makes a zero timeout a drain — `None` then says the queue is empty,
+    /// the property the input batch in `run` leans on to draw one frame for a
+    /// whole burst of wheel notches instead of one a notch. Key *release*
+    /// events are skipped too: terminals with the kitty protocol on report
+    /// both, and acting on each is every binding firing twice.
     pub fn poll(timeout: Duration) -> io::Result<Option<Input>> {
-        if !event::poll(timeout)? {
-            return Ok(None);
+        loop {
+            if !event::poll(timeout)? {
+                return Ok(None);
+            }
+            if let Some(input) = translate_event(event::read()?) {
+                return Ok(Some(input));
+            }
         }
-        Ok(translate_event(event::read()?))
     }
 }
 
@@ -302,32 +320,34 @@ fn base64(bytes: &[u8]) -> String {
 
 /// Which events are inputs at all.
 ///
-/// Anything that is not a keypress, a wheel notch, a left button or a resize — a
-/// focus change, a bracketed paste, a horizontal wheel — is dropped, so a caller
-/// sees `None` for a timeout and for noise alike. Key *release* events are
-/// dropped too: terminals with the kitty protocol on report both, and acting on
-/// each is every binding firing twice.
+/// Anything that is not a keypress, a wheel notch, a left button, a resize or a
+/// paste — a focus change, a horizontal wheel — is dropped, so a caller sees
+/// `None` for a timeout and for noise alike. Key *release* events are dropped
+/// too: terminals with the kitty protocol on report both, and acting on each is
+/// every binding firing twice.
 ///
-/// Separate from [`Term::poll`] so it can be tested without a terminal, which is
-/// the same reason every other module in this crate can be.
+/// A paste leaves as one [`Input::Paste`]: text the caller owns, and never a
+/// sequence of keys the keymap could resolve. Separate from [`Term::poll`] so it
+/// can be tested without a terminal, which is the same reason every other module
+/// in this crate can be.
 fn translate_event(event: Event) -> Option<Input> {
     match event {
         Event::Resize(w, h) => Some(Input::Resize(w as usize, h as usize)),
         Event::Key(k) if k.kind != KeyEventKind::Release => translate(k),
         Event::Mouse(m) => mouse(m),
-        // A bracketed paste lands here as `Event::Paste` and is dropped on
-        // purpose: the app takes no text input anywhere, so the correct thing
-        // to do with a paste is nothing.
+        // A bracketed paste lands here whole. It goes out as text and as
+        // nothing else: turning it into keypresses is what would let a pasted
+        // `q` quit, and this is the line that makes that impossible to write.
+        Event::Paste(text) => Some(Input::Paste(text)),
         _ => None,
     }
 }
 
-/// A mouse event as the two different things it can be.
+/// A mouse event as the configurable wheel or the positional button it can be.
 ///
-/// **A wheel notch is a key.** It has no coordinate anything needs — there is one
-/// scrollable thing under the pointer and the view already knows which — so it
-/// resolves through the keymap like `j`, appears on the `?` panel and is
-/// rebindable in `gitten.toml`. See [`Code::WheelUp`].
+/// **A wheel notch carries a key and a position.** The key resolves through the
+/// keymap like `j`, appears on the `?` panel and is rebindable in
+/// `gitten.toml`; the position lets a pane assembly route the resolved command.
 ///
 /// **A button is a position**, and a position cannot be a key: `gitten.toml`
 /// cannot hold a hit test. So it leaves here as an [`Input::Mouse`] and whoever
@@ -344,10 +364,18 @@ fn mouse(m: MouseEvent) -> Option<Input> {
     );
     let kind = match m.kind {
         MouseEventKind::ScrollUp => {
-            return Some(Input::Key(Key::new(Code::WheelUp, ctrl, alt, shift)))
+            return Some(Input::Wheel {
+                key: Key::new(Code::WheelUp, ctrl, alt, shift),
+                col: m.column as usize,
+                row: m.row as usize,
+            })
         }
         MouseEventKind::ScrollDown => {
-            return Some(Input::Key(Key::new(Code::WheelDown, ctrl, alt, shift)))
+            return Some(Input::Wheel {
+                key: Key::new(Code::WheelDown, ctrl, alt, shift),
+                col: m.column as usize,
+                row: m.row as usize,
+            })
         }
         MouseEventKind::Down(MouseButton::Left) => MouseKind::Down,
         MouseEventKind::Drag(MouseButton::Left) => MouseKind::Drag,
@@ -369,18 +397,24 @@ fn mouse(m: MouseEvent) -> Option<Input> {
 /// A key with no [`Code`] is dropped rather than guessed at: a binding that
 /// fires on the wrong key is worse than one that does not fire, and `Code` is
 /// deliberately only what a keyboard-first app binds.
+///
+/// **Ctrl-J is Ctrl-J.** It was folded into `Enter` here for years, because
+/// some layers in between — `script`, a few ssh setups, a pty opened by a test
+/// harness — report the return key as LF, which is the same byte, and "the
+/// return key does nothing" is the worst failure a keyboard-first app has.
+/// That fold now costs the shared keymap's `panes` bindings: core binds
+/// Ctrl-J to `pane.next` and Ctrl-K to `pane.prev`, and a translator that
+/// folds one of them into Enter makes those keys unreachable in this client
+/// no matter what any config file says. The fallback is gone deliberately —
+/// see `a_ctrl_j_is_its_own_key_and_the_pane_bindings_reach_the_keymap` — and
+/// ordinary crossterm `KeyCode::Enter`, which every terminal actually sends
+/// for the return key, still arrives as Enter. A pty layer that reports
+/// Return *only* as LF loses the key; that is a trade the shared keymap now
+/// owns, and hiding it by inspecting the active modes here would put a
+/// keymap's worth of opinion inside a byte-stream parser.
 fn translate(k: KeyEvent) -> Option<Input> {
     let m = k.modifiers;
-    // A terminal in raw mode sends CR for the return key and crossterm reports
-    // that as `Enter`. Some layers in between — `script`, a few ssh setups, a
-    // pty opened by a test harness — send LF instead, which arrives as
-    // `Ctrl-J`. Folded into `Enter` here, **modifier and all**: leaving the
-    // control bit set produces `ctrl-enter`, which is not a key anything binds
-    // either. Nothing wants `ctrl-j` for itself, and "the return key does
-    // nothing" is the worst failure a keyboard-first app has.
-    let feed = matches!(k.code, KeyCode::Char('j')) && m.contains(KeyModifiers::CONTROL);
     let code = match k.code {
-        _ if feed => Code::Enter,
         KeyCode::Char(c) => Code::Char(c),
         KeyCode::Up => Code::Up,
         KeyCode::Down => Code::Down,
@@ -402,7 +436,7 @@ fn translate(k: KeyEvent) -> Option<Input> {
     // `Shift-a` arriving as both `A` and `shift-a`.
     Some(Input::Key(Key::new(
         code,
-        m.contains(KeyModifiers::CONTROL) && !feed,
+        m.contains(KeyModifiers::CONTROL),
         m.contains(KeyModifiers::ALT),
         m.contains(KeyModifiers::SHIFT),
     )))
@@ -430,13 +464,21 @@ mod tests {
     }
 
     #[test]
-    fn a_wheel_notch_becomes_a_key_and_keeps_no_coordinate() {
+    fn a_wheel_notch_keeps_its_configurable_key_and_coordinate() {
         let notch = |kind| at(kind, KeyModifiers::NONE);
-        let down = Some(Input::Key(Key::plain(Code::WheelDown)));
+        let down = Some(Input::Wheel {
+            key: Key::plain(Code::WheelDown),
+            col: 4,
+            row: 9,
+        });
         assert_eq!(notch(MouseEventKind::ScrollDown), down);
         assert_eq!(
             notch(MouseEventKind::ScrollUp),
-            Some(Input::Key(Key::plain(Code::WheelUp)))
+            Some(Input::Wheel {
+                key: Key::plain(Code::WheelUp),
+                col: 4,
+                row: 9,
+            })
         );
         // A horizontal wheel is unmapped, exactly as an unmapped key is.
         assert_eq!(notch(MouseEventKind::ScrollLeft), None);
@@ -536,21 +578,52 @@ mod tests {
     }
 
     #[test]
-    fn a_line_feed_is_the_return_key() {
-        // What `script`, and a few ssh setups, send instead of a carriage
-        // return. Both have to be Enter or the key that opens things is dead.
+    fn a_ctrl_j_is_its_own_key_and_the_pane_bindings_reach_the_keymap() {
+        // The compatibility trade, written down where the fold used to be:
+        // Ctrl-J keeps its control bit, so the shared keymap's `panes` mode
+        // bindings are reachable in this client — and a pty layer that
+        // reports Return only as LF has lost the Enter fallback. Normal
+        // `KeyCode::Enter`, which every terminal sends for the return key,
+        // still arrives as Enter.
         assert_eq!(
             key(KeyCode::Enter, KeyModifiers::NONE),
             Some(Key::plain(Code::Enter))
         );
         assert_eq!(
             key(KeyCode::Char('j'), KeyModifiers::CONTROL),
-            Some(Key::plain(Code::Enter))
+            Some(Key::ctrl(Code::Char('j'))),
+            "ctrl-j was folded into enter and core's pane.next is unreachable"
+        );
+        assert_eq!(
+            key(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            Some(Key::ctrl(Code::Char('k')))
         );
         // ...and an unmodified `j` is still `j`.
         assert_eq!(
             key(KeyCode::Char('j'), KeyModifiers::NONE),
             Some(Key::char('j'))
+        );
+
+        // What those keys mean once translated: the shipped keymap's answers,
+        // through the mode the app builds when a second sidebar list exists.
+        let map = Keymap::builtin();
+        let mut modes = Modes::new();
+        modes.push("panes");
+        modes.push("commits");
+        assert_eq!(
+            map.resolve(&modes, &[Key::ctrl(Code::Char('j'))]),
+            Resolve::Run("pane.next")
+        );
+        assert_eq!(
+            map.resolve(&modes, &[Key::ctrl(Code::Char('k'))]),
+            Resolve::Run("pane.prev")
+        );
+        // Enter, resolved where the return key is actually used.
+        let mut commits = Modes::new();
+        commits.push("commits");
+        assert_eq!(
+            map.resolve(&commits, &[Key::plain(Code::Enter)]),
+            Resolve::Run("commits.open-diff")
         );
     }
 
@@ -579,11 +652,35 @@ mod tests {
     }
 
     #[test]
-    fn a_paste_is_not_an_input() {
-        // Pinned because the app takes no text input, so a paste handler here
-        // would be a pasted `q` quitting — removing the negotiation or adding
-        // one on purpose should fail loudly, not silently.
-        assert_eq!(translate_event(Event::Paste("q".into())), None);
+    fn a_paste_is_one_text_input_and_never_a_key_sequence() {
+        // Bracketed paste is negotiated on purpose, and this is the pin: the
+        // emulator hands the whole paste over as one event, and it leaves here
+        // as one inert piece of text — the original string, unedited. A pasted
+        // `q` is a character in it, and the keymap never sees a thing.
+        let got = match translate_event(Event::Paste("q?\nengine".into())) {
+            Some(Input::Paste(text)) => text,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(got, "q?\nengine", "the paste did not arrive whole");
+    }
+
+    #[test]
+    fn slash_arrives_as_cores_plain_character_key() {
+        // `/` is a character like `j` — no special case anywhere in this file.
+        // What it means is the keymap's business, which is why the search can
+        // open through it without this module knowing search exists.
+        assert_eq!(
+            translate_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('/'),
+                KeyModifiers::NONE
+            ))),
+            Some(Input::Key(Key::char('/')))
+        );
+        let map = Keymap::builtin();
+        let mut modes = Modes::new();
+        modes.push("commits");
+        let press = [Key::char('/')];
+        assert_eq!(map.resolve(&modes, &press), Resolve::Run("commits.search"));
     }
 
     #[test]
@@ -597,5 +694,24 @@ mod tests {
             map.resolve(&Modes::new(), &[press]),
             Resolve::Run("view.page-down")
         );
+    }
+
+    #[test]
+    fn the_hunk_verbs_resolve_in_diff_mode_from_the_keys_this_module_produces() {
+        // `space` and `u` are the shipped staging keys, bound in the shared
+        // keymap's `diff` mode — so the terminal must arrive at them through
+        // translation and resolution alone, and a release must not fire one
+        // twice (guarded above; named here, because these are the keys that
+        // write).
+        let map = Keymap::builtin();
+        let mut modes = Modes::new();
+        modes.push("diff");
+        for (code, name) in [
+            (KeyCode::Char(' '), "diff.stage-hunk"),
+            (KeyCode::Char('u'), "diff.unstage-hunk"),
+        ] {
+            let press = key(code, KeyModifiers::NONE).expect("a key the terminal reports");
+            assert_eq!(map.resolve(&modes, &[press]), Resolve::Run(name));
+        }
     }
 }

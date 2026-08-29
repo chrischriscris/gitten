@@ -1,23 +1,49 @@
-//! A column of cells that says where you are in a list, and can be dragged.
+//! A column of cells that says where you are in a list.
 //!
 //! Two halves, and the split is the same one everything else in this app has:
 //! **where the thumb goes is [`gitten_core::view::Viewport::thumb`]** — arithmetic
 //! about a list, shared with every other door — and what it is *made of* is here,
 //! because a glyph is a UI.
 //!
-//! # It is drawn over the rows, not beside them
+//! # It rides the container's edge
 //!
-//! [`Screen::over`] and not a [`Pen`](crate::screen::Pen), so the row underneath
-//! keeps its background: a removal's red still runs to the right edge, with the
-//! bar on top of it. Reserving a column instead is the obvious alternative and it
-//! costs a reflow — one column fewer is a different wrap, which is a different
-//! row count, which is a different scrollbar. The window's overlays its list for
-//! the same reason.
+//! The caller hands [`paint`] the cells around the pane's edge. At a divider
+//! the thumb is `▐▌`: the right half of the last inside cell and the left half
+//! of the divider cell, one cell wide with its right edge exactly on the rule.
+//! At the screen edge it is one full cell. That is lazygit's geometry.
 //!
-//! The cost, stated plainly: the last column of text is covered on a list long
-//! enough to scroll. With wrapping on nothing reaches it — the budget is the
-//! window less the gutters — and with wrapping off the line is being scrolled
-//! sideways anyway.
+//! It overlays those cells rather than reserving one: reserving a column is a
+//! different wrap, a different row count, and therefore a different scrollbar.
+//! With wrapping on nothing reaches the edge; with wrapping off the line is
+//! being scrolled sideways underneath it.
+//!
+//! [`Screen::over`] and not a [`Pen`](crate::screen::Pen), still: whatever the
+//! edge cell holds, the cell's background stays — a removal's red runs to
+//! the edge underneath the main pane's bar.
+//!
+//! # It is an indicator, and the mouse cannot have it
+//!
+//! The bar was draggable once, and the drag is why it stopped. A thumb's travel
+//! is one viewport's worth of cells and the list's is everything else — a
+//! seven-thousand-commit log in a forty-row pane moves a hundred and eighty rows
+//! for every cell of drag, and a 714k-line diff moves thousands. The window
+//! carries the same ratio and wins on pointer resolution alone: twenty-five
+//! positions to the cell means its thumb can be aimed. A terminal's cannot, and
+//! a control that cannot be aimed is not a control. So the bar says where you
+//! are and takes nothing: precision is the keyboard's (`j`, `ctrl-d`, `/`),
+//! scrolling is the wheel's, and the bar's column is no pane's business — a
+//! press there is a press in no pane at all. The window keeps its
+//! draggable bar — a difference between the doors, not a gap in this one.
+//!
+//! # Half rows
+//!
+//! A terminal moves a thumb in whole cells, but a cell is not the finest block
+//! the grid can draw: `▀` and `▄` each paint half of a cell, so the
+//! thumb is computed by the same [`Viewport::thumb`] arithmetic over a track
+//! twice as tall and lands between two rows where that is where it belongs.
+//! The bar is a coordinate, and twice the resolution is twice the reading.
+//! And the floor holds: a thumb never travels less than a cell, so the finer
+//! position never becomes a smaller thumb.
 //!
 //! # Nothing when there is nothing to say
 //!
@@ -36,9 +62,31 @@ use gitten_core::view::Viewport;
 /// extension that would rather have a Nerd Font's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Bar {
-    /// The part of the track the thumb is not on.
-    pub track: char,
+    /// Optional furniture outside the thumb. The built-ins leave the container
+    /// untouched; an extension can deliberately supply a visible track.
+    pub track: Option<char>,
     pub thumb: char,
+    /// The thumb's upper and lower half, when the alphabet can draw them.
+    ///
+    /// `Some(('▀', '▄'))` lets the thumb land between two rows, which is
+    /// where it usually is — see *Half rows* above. `None` rounds back to
+    /// whole rows: [`Bar::ascii`], or an alphabet without the glyphs, draws
+    /// exactly the bar this module always drew.
+    pub halves: Option<(char, char)>,
+    /// Horizontal halves for a boundary between two terminal cells.
+    ///
+    /// Each pair is `(inside, divider)` for a whole, upper-half and
+    /// lower-half thumb cell. `None` falls back to drawing `thumb` in the
+    /// pane's last cell, as ASCII must.
+    pub boundary: Option<Boundary>,
+}
+
+/// Glyphs that make one-cell-wide ink straddle a two-cell pane boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Boundary {
+    pub whole: (char, char),
+    pub upper: (char, char),
+    pub lower: (char, char),
 }
 
 impl Default for Bar {
@@ -48,92 +96,122 @@ impl Default for Bar {
 }
 
 impl Bar {
-    /// The shipped set: a hairline for the track and a full block for the thumb.
+    /// The shipped set: a solid thumb and no track, at the container's edge.
     ///
-    /// A block and not `▐` or `┃`, because the thumb is the one thing here the
-    /// eye has to find while the list moves under it, and a half-width glyph in a
-    /// quiet palette reads as another line of the graph.
+    /// This is lazygit's shape: the thumb is the only mark. On a divider the
+    /// pane's existing rule remains visible above and below it; at the screen's
+    /// edge nothing invents a second line through otherwise empty space.
     pub fn block() -> Self {
         Self {
-            track: '│',
+            track: None,
             thumb: '█',
+            halves: Some(('▀', '▄')),
+            boundary: Some(Boundary {
+                whole: ('▐', '▌'),
+                upper: ('▝', '▘'),
+                lower: ('▗', '▖'),
+            }),
+        }
+    }
+
+    /// A tracked alternative for an extension that wants the old line shape.
+    pub fn line() -> Self {
+        Self {
+            track: Some('│'),
+            thumb: '┃',
+            halves: Some(('╻', '╹')),
+            boundary: None,
         }
     }
 
     /// Nothing outside ASCII, for a terminal or a font that cannot draw the rest.
     pub fn ascii() -> Self {
         Self {
-            track: '|',
+            track: None,
             thumb: '#',
+            halves: None,
+            boundary: None,
         }
+    }
+
+    /// The thumb at this bar's resolution, or `None` when no bar is drawn —
+    /// the config flag says no, or the list fits its viewport.
+    ///
+    /// Whole rows for an alphabet without half glyphs; twice the track — the
+    /// same [`Viewport::thumb`] arithmetic, twice the resolution — for one
+    /// with them.
+    fn range(&self, view: &Viewport, host: &Host) -> Option<std::ops::Range<usize>> {
+        if !host.view.scrollbar {
+            return None;
+        }
+        let track = match self.halves {
+            Some(_) => view.height() * 2,
+            None => view.height(),
+        };
+        let mut thumb = view.thumb(track)?;
+        // A thumb the share rounds below one cell of ink — any list more than
+        // twice its viewport — would draw as half a block, where the row bar
+        // never drew less than a whole one. Widen to a cell: the end first,
+        // then the start where the end ran out of track, which is what keeps
+        // the bottom case touching the bottom. The halves change where the
+        // thumb *moves*, never how much of it there is.
+        if self.halves.is_some() && thumb.len() < 2 {
+            let grow_end = (2 - thumb.len()).min(track - thumb.end);
+            thumb = thumb.start.saturating_sub(2 - thumb.len() - grow_end)..thumb.end + grow_end;
+        }
+        Some(thumb)
     }
 }
 
 /// Draws the bar for `view` down column `x`, over the rows `y..y + height`.
 ///
-/// A no-op when the config file says no, when the list fits, or when the view has
-/// not been given a height yet. Costs one `over` per visible row and allocates
-/// nothing.
-pub fn paint(screen: &mut Screen, bar: Bar, x: usize, y: usize, view: &Viewport, host: &Host) {
-    let Some(thumb) = thumb(view, host) else {
+/// `x` is the last cell inside the pane. `divider` is the next cell when there
+/// is one; together their facing halves make the edge-aligned thumb. See *It
+/// rides the container's edge* above. A
+/// no-op when the config file says no, when the list fits, or when the view
+/// has not been given a height yet. Costs one `over` per visible row and
+/// allocates nothing.
+pub fn paint(
+    screen: &mut Screen,
+    bar: Bar,
+    x: usize,
+    divider: Option<usize>,
+    y: usize,
+    view: &Viewport,
+    host: &Host,
+) {
+    let Some(thumb) = bar.range(view, host) else {
         return;
     };
     let c = &host.theme.chrome;
-    for i in 0..view.height() {
-        let on = thumb.contains(&i);
-        let (ch, fg) = match on {
-            true => (bar.thumb, c.dim),
-            false => (bar.track, c.faint),
+    // The half glyphs, when the alphabet has them. Substituting the thumb for
+    // them when it does not is dead code by construction: without halves the
+    // two reads per cell below are the same call, so a cell arrives all-thumb
+    // or all-track and never half of each.
+    let (upper, lower) = bar.halves.unwrap_or((bar.thumb, bar.thumb));
+    for cell in 0..view.height() {
+        // Which halves of this cell the thumb covers: off the doubled track
+        // when there are half glyphs, off the row itself when there are not.
+        let (top, bottom) = match bar.halves {
+            Some(_) => (thumb.contains(&(cell * 2)), thumb.contains(&(cell * 2 + 1))),
+            None => (thumb.contains(&cell), thumb.contains(&cell)),
         };
-        screen.over(x, y + i, ch, fg);
+        let painted = match (top, bottom) {
+            (false, false) => bar.track.map(|ch| (ch, c.faint, None)),
+            (true, true) => Some((bar.thumb, c.dim, bar.boundary.map(|b| b.whole))),
+            (true, false) => Some((upper, c.dim, bar.boundary.map(|b| b.upper))),
+            (false, true) => Some((lower, c.dim, bar.boundary.map(|b| b.lower))),
+        };
+        if let Some((ch, fg, across)) = painted {
+            match (divider, across) {
+                (Some(divider), Some((inside, outside))) => {
+                    screen.over(x, y + cell, inside, fg);
+                    screen.over(divider, y + cell, outside, fg);
+                }
+                _ => screen.over(x, y + cell, ch, fg),
+            }
+        }
     }
-}
-
-/// Which rows of the viewport the thumb covers, or `None` when no bar is drawn.
-///
-/// The one place the config flag is read, so "is there a bar here" is the same
-/// question for the paint path and for the hit test — a bar that is invisible and
-/// still takes the clicks is worse than either.
-pub fn thumb(view: &Viewport, host: &Host) -> Option<std::ops::Range<usize>> {
-    if !host.view.scrollbar {
-        return None;
-    }
-    view.thumb(view.height())
-}
-
-/// Whether a click at `col` of a view `cols` wide landed on the bar.
-pub fn hit(col: usize, cols: usize, view: &Viewport, host: &Host) -> bool {
-    thumb(view, host).is_some() && cols > 0 && col + 1 == cols
-}
-
-/// What a press on the bar at row `row` grabs, and where it puts the list.
-///
-/// Two behaviours in one function because they are the same gesture: a press on
-/// the thumb *grabs* it where it was taken hold of, and a press anywhere else on
-/// the track jumps the thumb to the pointer first and then grabs it in the
-/// middle. Returns the grab offset, which the drag then subtracts — without it a
-/// thumb snaps its top to the pointer on the first pixel of every drag, which is
-/// a scrollbar that jumps whenever it is used.
-pub fn grab(view: &mut Viewport, host: &Host, row: usize) -> usize {
-    let Some(thumb) = thumb(view, host) else {
-        return 0;
-    };
-    if thumb.contains(&row) {
-        return row - thumb.start;
-    }
-    let offset = thumb.len() / 2;
-    drag(view, host, row, offset);
-    offset
-}
-
-/// Moves the list so the grabbed point of the thumb follows `row`.
-pub fn drag(view: &mut Viewport, host: &Host, row: usize, grabbed: usize) {
-    if thumb(view, host).is_none() {
-        return;
-    }
-    let track = view.height();
-    let top = view.top_at(row.saturating_sub(grabbed), track);
-    view.scroll_to(top);
 }
 
 #[cfg(test)]
@@ -157,9 +235,13 @@ mod tests {
             screen.row(y + 1).wash(Ink::new(0xffffff, 0x330000));
         }
         let v = view(100, 10);
-        paint(&mut screen, Bar::block(), 19, 1, &v, &host);
+        paint(&mut screen, Bar::block(), 19, None, 1, &v, &host);
         assert_eq!(screen.char_at(19, 1), Some('█'), "the thumb is at the top");
-        assert_eq!(screen.char_at(19, 9), Some('│'));
+        assert_eq!(
+            screen.char_at(19, 9),
+            Some(' '),
+            "the built-in drew a track"
+        );
         assert_eq!(
             screen.ink(19, 9).unwrap().bg,
             0x330000,
@@ -168,51 +250,96 @@ mod tests {
     }
 
     #[test]
-    fn a_list_that_fits_draws_nothing_and_takes_no_clicks() {
+    fn a_list_that_fits_draws_nothing() {
         let host = Host::new();
         let mut screen = Screen::new(20, 12);
         screen.clear(Ink::new(0xffffff, 0x000000));
         let v = view(5, 10);
-        paint(&mut screen, Bar::block(), 19, 1, &v, &host);
+        paint(&mut screen, Bar::block(), 19, None, 1, &v, &host);
         assert_eq!(screen.char_at(19, 1), Some(' '));
-        assert!(!hit(19, 20, &v, &host));
     }
 
     #[test]
-    fn turning_it_off_turns_off_the_hit_test_too() {
+    fn turning_it_off_turns_off_the_paint() {
         let mut host = Host::new();
         host.view.scrollbar = false;
-        let v = view(100, 10);
-        assert_eq!(thumb(&v, &host), None);
-        assert!(!hit(19, 20, &v, &host));
-    }
-
-    #[test]
-    fn grabbing_the_thumb_where_it_is_does_not_move_the_list() {
-        let host = Host::new();
-        let mut v = view(100, 20);
-        v.scroll_to(40);
-        let thumb = thumb(&v, &host).unwrap();
-        assert!(
-            thumb.len() > 1,
-            "a one-cell thumb has nowhere to be grabbed"
+        let mut screen = Screen::new(20, 12);
+        screen.clear(Ink::new(0xffffff, 0x000000));
+        paint(
+            &mut screen,
+            Bar::block(),
+            19,
+            None,
+            1,
+            &view(100, 10),
+            &host,
         );
-        let grabbed = grab(&mut v, &host, thumb.start + 1);
-        assert_eq!(grabbed, 1);
-        assert_eq!(v.top(), 40, "a press on the thumb scrolled the list");
-        // ...and dragging it one cell down moves the list down, not by a screen.
-        drag(&mut v, &host, thumb.start + 2, grabbed);
-        assert!(v.top() > 40 && v.top() < 60, "{}", v.top());
+        assert_eq!(screen.char_at(19, 1), Some(' '));
     }
 
     #[test]
-    fn a_press_on_the_track_jumps_the_thumb_under_the_pointer() {
+    fn a_thumb_that_falls_between_two_rows_is_drawn_as_halves_of_each() {
         let host = Host::new();
-        let mut v = view(1000, 20);
-        let grabbed = grab(&mut v, &host, 19);
-        assert_eq!(v.top(), 980, "the end of the track is the end of the list");
-        assert_eq!(grabbed, 0, "a one-cell thumb is grabbed at its only cell");
-        drag(&mut v, &host, 0, grabbed);
-        assert_eq!(v.top(), 0);
+        // A hundred rows in ten: the half-resolution thumb over `top` 45 lands
+        // on half units 9..11 — the bottom half of cell 4 and the top half of
+        // cell 5 — where the row-resolution thumb rounds to cell 5 whole.
+        let mut v = view(100, 10);
+        v.scroll_to(45);
+        let mut screen = Screen::new(20, 12);
+        screen.clear(Ink::new(0xffffff, 0x000000));
+        paint(&mut screen, Bar::block(), 19, None, 1, &v, &host);
+        assert_eq!(
+            screen.char_at(19, 3),
+            Some(' '),
+            "the screen edge above the thumb stays empty"
+        );
+        assert_eq!(
+            screen.char_at(19, 5),
+            Some('▄'),
+            "the thumb's first half row is the bottom of cell 4"
+        );
+        assert_eq!(
+            screen.char_at(19, 6),
+            Some('▀'),
+            "the thumb's last half row is the top of cell 5"
+        );
+        assert_eq!(
+            screen.char_at(19, 7),
+            Some(' '),
+            "the screen edge below the thumb stays empty"
+        );
+    }
+
+    #[test]
+    fn an_alphabet_without_halves_draws_whole_rows() {
+        let host = Host::new();
+        let mut v = view(100, 10);
+        v.scroll_to(45);
+        let mut screen = Screen::new(20, 12);
+        screen.clear(Ink::new(0xffffff, 0x000000));
+        paint(&mut screen, Bar::ascii(), 19, None, 1, &v, &host);
+        assert_eq!(screen.char_at(19, 6), Some('#'), "cell 5 whole, as always");
+        for y in 1..11 {
+            let ch = screen.char_at(19, y).unwrap();
+            assert!(
+                ch == '#' || ch == ' ',
+                "no half of a cell is ever drawn: {ch}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_half_thumb_touches_the_bottom_exactly_when_the_list_does() {
+        // The load-bearing property, at the doubled track too: scrolled to the
+        // end, the thumb sits on the last row whole — not a half row short of
+        // it, which would read as "there is more" when there is not.
+        let host = Host::new();
+        let mut v = view(100, 10);
+        v.scroll_to(90);
+        let mut screen = Screen::new(20, 12);
+        screen.clear(Ink::new(0xffffff, 0x000000));
+        paint(&mut screen, Bar::block(), 19, None, 1, &v, &host);
+        assert_eq!(screen.char_at(19, 10), Some('█'), "the last row whole");
+        assert_eq!(screen.char_at(19, 9), Some(' '), "no track above it");
     }
 }

@@ -16,6 +16,7 @@
 use crate::cli::{Source, View};
 use gitten_core::differ::Overrides;
 use gitten_core::host::Host;
+use gitten_core::refs::Stash;
 use gitten_core::{Commit, FileDiff};
 use gitten_git::Repo;
 use std::path::Path;
@@ -224,6 +225,41 @@ fn acquire_with(
     }
 }
 
+/// What the ancillary stash read loaded: the repository's own description
+/// and its stack, kept as separate fields — the label names the repository
+/// the way every other read's does, the stack is the data a stash pane draws.
+#[derive(Debug)]
+pub struct LoadedStashes {
+    pub label: String,
+    pub stashes: Vec<Stash>,
+}
+
+/// Reads one repository's stash stack beside its description.
+///
+/// The ancillary read of a repository-backed launch: commits and diffs are
+/// views someone asked for, the stash stack is the pane every repository
+/// gets, and it is acquired through the same door as everything else — a
+/// [`Repo`] handle in, already-loaded data out. Description and stack run
+/// beside each other, one spawn floor for the two of them, the same overlap
+/// the startup views run their title read with.
+///
+/// **An empty stack is a successful read.** Before the first push and after
+/// the last pop or drop, nothing parked is the state of the world and not a
+/// failure — the opposite of a startup view, where an empty answer usually
+/// means the arguments were wrong. The repository's own error comes back
+/// verbatim: a read that failed says so, and is never flattened into an
+/// empty list that would draw as success.
+pub fn stashes(repo: &dyn Repo) -> Result<LoadedStashes, String> {
+    std::thread::scope(|s| {
+        let title = s.spawn(|| repo.describe());
+        let stashes = repo.stashes()?;
+        Ok(LoadedStashes {
+            label: joined(title),
+            stashes,
+        })
+    })
+}
+
 /// Joins the thread fetching the title.
 ///
 /// `describe` returns a `String` and cannot fail, so the only thing left in
@@ -255,7 +291,7 @@ mod tests {
     use gitten_git::{Handle, Pair};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     /// A repository that exists only as this struct. Every assertion these
     /// tests make lands on data it produced, which is what proves acquisition
@@ -347,6 +383,51 @@ mod tests {
 
         fn describe(&self) -> String {
             "empty".into()
+        }
+    }
+
+    /// A repository whose stash read is the test's to script: a queue of
+    /// answers, drained one per call — two stashes, then an empty stack — or
+    /// a refusal that stands. Nothing else about it is reachable, so every
+    /// byte a test asserts on arrived through the helper under test.
+    struct StashFake {
+        label: &'static str,
+        answers: Mutex<Vec<Vec<Stash>>>,
+        refuse: Option<&'static str>,
+    }
+
+    impl Default for StashFake {
+        fn default() -> Self {
+            Self {
+                label: "scratch (main)",
+                answers: Mutex::new(Vec::new()),
+                refuse: None,
+            }
+        }
+    }
+
+    impl Repo for StashFake {
+        fn log(&self, _limit: usize) -> gitten_git::Result<Vec<Commit>> {
+            Ok(Vec::new())
+        }
+
+        fn pairs(&self, _revspec: &str) -> gitten_git::Result<Vec<Pair>> {
+            Ok(Vec::new())
+        }
+
+        fn status(&self) -> gitten_git::Result<Status> {
+            Ok(Status::default())
+        }
+
+        fn describe(&self) -> String {
+            self.label.into()
+        }
+
+        fn stashes(&self) -> gitten_git::Result<Vec<Stash>> {
+            match self.refuse {
+                Some(e) => Err(e.to_string()),
+                None => Ok(self.answers.lock().unwrap().pop().unwrap_or_default()),
+            }
         }
     }
 
@@ -685,6 +766,65 @@ mod tests {
         }
     }
 
+    /// **Absence is data.** The newest-first stack the read gives arrives
+    /// through the helper unchanged — description, indices, messages and
+    /// full commits alike — and the read after it, an emptied stack, is
+    /// `Ok` and not an error: before the first push and after the last pop,
+    /// nothing parked is the state of the world.
+    #[test]
+    fn stash_acquisition_preserves_stack_data_and_accepts_absence() {
+        let two = vec![
+            Stash {
+                index: 0,
+                message: "On main: wip things".into(),
+                commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            },
+            Stash {
+                index: 1,
+                message: "On dev: other work".into(),
+                commit: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            },
+        ];
+        let repo = StashFake {
+            // Popped from the tail: the first read answers two stashes, the
+            // second the emptied stack.
+            answers: Mutex::new(vec![Vec::new(), two]),
+            ..Default::default()
+        };
+
+        let loaded = stashes(&repo).expect("two parked");
+        assert_eq!(loaded.label, "scratch (main)", "the description ran beside");
+        let parked = &loaded.stashes;
+        assert_eq!(parked.len(), 2, "{parked:?}");
+        // Newest first as the read gave them, every field the read carried.
+        assert_eq!(parked[0].index, 0);
+        assert_eq!(parked[0].message, "On main: wip things");
+        assert_eq!(
+            parked[0].commit, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "the full identity is what a refresh anchors by"
+        );
+        assert_eq!(parked[1].index, 1);
+        assert_eq!(parked[1].message, "On dev: other work");
+        assert_eq!(parked[1].commit, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+        // The stack drained between reads: an empty answer is success.
+        let drained = stashes(&repo).expect("an empty stack is not an error");
+        assert!(drained.stashes.is_empty());
+        assert_eq!(drained.label, "scratch (main)");
+    }
+
+    /// A read that failed says so in the repository's own words, and is
+    /// never translated into the empty list that would draw as success.
+    #[test]
+    fn stash_acquisition_preserves_the_repository_refusal() {
+        let repo = StashFake {
+            refuse: Some("fatal: bad object refs/stash"),
+            ..Default::default()
+        };
+        let err = stashes(&repo).unwrap_err();
+        assert_eq!(err, "fatal: bad object refs/stash");
+    }
+
     #[test]
     fn a_diff_of_this_repository_arrives_as_parsed_files() {
         let host = Host::new();
@@ -818,5 +958,184 @@ index 3e7a1b2..9c4d0f1 100644
         };
         let err = acquire(View::Commits, &source, &host, None).unwrap_err();
         assert!(err.contains("diff"), "{err}");
+    }
+
+    /// The **staging round trip**, over a real repository: one committed file
+    /// with two distant edits, one emitted hunk staged through the write seam
+    /// and the shared runner, and the mirror verb putting the index back. The
+    /// distant second edit is the point — a patch that could not tell its
+    /// chosen hunk from its neighbour would stage both and look like it
+    /// worked, so the staged side is checked against git's own answer, which
+    /// neither door gets to argue with.
+    ///
+    /// `Scratch::git` is repository setup and read-only oracle only; the
+    /// stage and unstage under test travel through
+    /// [`Write::stage_patch`](crate::verbs::Write::stage_patch) and its
+    /// sibling, behind the same [`Handle`] acquisition uses and the same
+    /// [`Runner`](crate::jobs::Runner) every client submits to. No tty, no
+    /// window, no terminal.
+    #[test]
+    fn a_hunk_stages_and_unstages_round_trip_in_a_throwaway_repository() {
+        use crate::jobs::{Event, Runner};
+        use crate::verbs::Write;
+        use gitten_core::{parse_unified_diff, DiffLine, LineKind};
+        use std::time::Duration;
+
+        fn wait(runner: &Runner, count: usize) -> Vec<Event> {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut events = Vec::new();
+            while events.len() < count && std::time::Instant::now() < deadline {
+                if let Some(event) = runner.try_next() {
+                    events.push(event);
+                } else {
+                    std::thread::yield_now();
+                }
+            }
+            assert_eq!(events.len(), count, "the worker did not report in time");
+            events
+        }
+
+        /// The changed lines of a stretch of hunks, as `(kind, text)` — the
+        /// part of a hunk that says what an edit *was*, without the context
+        /// that moves with the configured width.
+        fn changed<'a>(lines: impl IntoIterator<Item = &'a DiffLine>) -> Vec<(LineKind, String)> {
+            lines
+                .into_iter()
+                .filter(|l| l.kind != LineKind::Context)
+                .map(|l| (l.kind, l.text.to_string()))
+                .collect()
+        }
+
+        let host = Host::new();
+        let repo = Scratch::new("hunks");
+        let committed: String = (0..40).map(|i| format!("line {i}\n")).collect();
+        repo.commit(committed.as_bytes());
+        let edited: String = (0..40)
+            .map(|i| match i {
+                4 => "EDIT ONE".to_string(),
+                34 => "EDIT TWO".to_string(),
+                _ => format!("line {i}"),
+            })
+            .fold(String::new(), |mut all, line| {
+                all.push_str(&line);
+                all.push('\n');
+                all
+            });
+        std::fs::write(repo.0.join("f.txt"), &edited).expect("wrote the worktree");
+
+        let handle = gitten_git::open(&repo.0);
+        let source = Source::Repo {
+            path: repo.0.clone(),
+            arg: String::new(),
+        };
+        let loaded = acquire(View::Diff, &source, &host, Some(handle.as_ref()))
+            .expect("the worktree has two edits");
+        let Data::Diff(files) = loaded.data else {
+            panic!("a diff view loads files");
+        };
+        assert_eq!(files.len(), 1, "{:?}", files.iter().map(|f| &f.path));
+        assert_eq!(files[0].path, "f.txt");
+        assert_eq!(files[0].hunks.len(), 2, "distant edits stay two hunks");
+
+        // Stage exactly the first hunk, through the write seam and the
+        // shared queue — the only path a client is allowed to reach.
+        let patch = gitten_core::patch::emit(&files[0].path, &[&files[0].hunks[0]]);
+        let runner = Runner::new();
+        let submit = runner.submitter();
+        let job = Write::stage_patch(&handle, patch.clone()).expect("a non-empty patch");
+        assert!(submit.submit(Box::new(job)).is_ok(), "queued");
+        let events = wait(&runner, 2);
+        let Event::Finished {
+            generation,
+            outcome: Ok(()),
+            ..
+        } = &events[1]
+        else {
+            panic!("a clean stage: {:?}", events[1]);
+        };
+        assert_eq!(
+            generation.get(),
+            1,
+            "the first finish is the first generation"
+        );
+
+        // The index holds exactly the chosen hunk: git's own staged diff —
+        // the read-only oracle — is the emitted patch and nothing else, and
+        // the working tree never moved, because `--cached` cannot.
+        let staged = parse_unified_diff(&repo.git(&["diff", "--cached"]));
+        assert_eq!(
+            staged.len(),
+            1,
+            "{}",
+            repo.git(&["diff", "--cached", "--stat"])
+        );
+        let chosen = changed(files[0].hunks[0].lines.iter());
+        assert_eq!(
+            changed(staged[0].hunks.iter().flat_map(|h| &h.lines)),
+            chosen
+        );
+        assert!(
+            chosen.contains(&(LineKind::Added, "EDIT ONE".into())),
+            "the chosen hunk's own edit travelled: {chosen:?}"
+        );
+        assert!(
+            !chosen.contains(&(LineKind::Added, "EDIT TWO".into())),
+            "the emitted selection includes the distant neighbour: {chosen:?} — the staged side is pinned by the oracle comparison above"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.0.join("f.txt")).expect("the worktree reads"),
+            edited,
+            "staging rewrote the working tree"
+        );
+
+        // Re-acquire the working-tree diff, and emit the staged hunk from
+        // what it now answers: the same edit, which the mirror verb
+        // reverses through the same seam.
+        let again = reacquire(
+            View::Diff,
+            &source,
+            &host,
+            Some(handle.as_ref()),
+            &Overrides::default(),
+        )
+        .expect("the worktree still differs from HEAD");
+        let Data::Diff(files) = again.data else {
+            panic!("a diff view loads files");
+        };
+        let chosen = files[0]
+            .hunks
+            .iter()
+            .find(|h| h.lines.iter().any(|l| *l.text == *"EDIT ONE"))
+            .expect("the staged edit still reads against HEAD");
+        let reverse = gitten_core::patch::emit(&files[0].path, &[chosen]);
+        let job = Write::unstage_patch(&handle, reverse).expect("a non-empty patch");
+        assert!(submit.submit(Box::new(job)).is_ok(), "queued");
+        let events = wait(&runner, 2);
+        let Event::Finished {
+            generation,
+            outcome: Ok(()),
+            ..
+        } = &events[1]
+        else {
+            panic!("a clean unstage: {:?}", events[1]);
+        };
+        assert_eq!(
+            generation.get(),
+            2,
+            "the second finish is the second generation"
+        );
+
+        // The index is back where HEAD is; the working tree keeps both
+        // edits, exactly as they were before either verb ran.
+        assert!(
+            repo.git(&["diff", "--cached"]).trim().is_empty(),
+            "an unstaged index is an empty staged diff: {:?}",
+            repo.git(&["diff", "--cached"])
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.0.join("f.txt")).expect("the worktree reads"),
+            edited,
+            "unstaging touched the working tree"
+        );
     }
 }

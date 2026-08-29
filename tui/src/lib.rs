@@ -39,20 +39,28 @@
 //! |---|---|
 //! | [`screen`] | cells, ink, the pen, and the diff that becomes escape codes |
 //! | [`rows`] | the `Rows` seam, `Layouts`, and `TextRows` |
+//! | [`markdown`] | `MarkdownRows`: the rendered document, in cells |
 //! | [`split`] | `SplitRows`: the two-column presentation |
 //! | [`diff`] | the diff view: viewport, reflow, horizontal scroll |
 //! | [`commits`] | the commit list, and the graph gutter in box drawing |
+//! | [`branches`] | the repository's branches: sections, marks, and the armed delete |
+//! | [`stashes`] | the stash stack, one flat address-and-message list |
+//! | [`files`] | the working tree: sections, files, and the armed discard |
 //! | [`scrollbar`] | where you are in a list, drawn over its right-hand column |
 //! | [`help`] | what the keys do, as a function of the keymap |
 //! | [`term`] | the only module that touches `crossterm` |
 
+pub mod branches;
 pub mod commits;
 pub mod diff;
+pub mod files;
 pub mod help;
+pub mod markdown;
 pub mod rows;
 pub mod screen;
 pub mod scrollbar;
 pub mod split;
+pub mod stashes;
 pub mod term;
 
 /// The two rendering budgets, from `gitten_app` — where they are shared rather
