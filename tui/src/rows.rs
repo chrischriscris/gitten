@@ -329,7 +329,7 @@ pub fn col_at(text: &str, col: usize) -> usize {
 /// line of a diff goes through [`text_run`] instead, which has tokens and changed
 /// words to keep as well.
 pub fn selected_text(text: &str, ink: Ink, sel: Option<Selected>, theme: &Theme, pen: &mut Pen) {
-    let Some(range) = selection(sel, text.len()) else {
+    let Some(range) = selection(sel, text) else {
         pen.put(text, ink);
         return;
     };
@@ -339,12 +339,12 @@ pub fn selected_text(text: &str, ink: Ink, sel: Option<Selected>, theme: &Theme,
     pen.put(&text[range.end..], ink);
 }
 
-/// The bytes of a text `len` long that are selected, or `None` when none are.
+/// The bytes of `text` that are selected, or `None` when none are.
 ///
 /// Empty is `None` and not `0..0`: a zero-length highlight is a colour change
 /// nobody asked for, and every caller would otherwise have to check.
-fn selection(sel: Option<Selected>, len: usize) -> Option<Range<usize>> {
-    sel.map(|s| s.range(len)).filter(|r| !r.is_empty())
+fn selection(sel: Option<Selected>, text: &str) -> Option<Range<usize>> {
+    sel.map(|s| s.range(text)).filter(|r| !r.is_empty())
 }
 
 /// The background a row actually draws on: its own, or the selection bar.
@@ -470,7 +470,7 @@ pub fn draw_runs(
     pen.scroll(shift);
     // Bytes of the *text*, which is what the runs address too — a wrapped row
     // draws its own slice of both.
-    let sel = selection(sel, t.text.len());
+    let sel = selection(sel, t.text);
     for run in out.iter() {
         // A run is cut into at most three pieces by the selection, and nearly
         // always into one: the loop below runs on every visible row of every

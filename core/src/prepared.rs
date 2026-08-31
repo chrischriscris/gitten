@@ -54,6 +54,10 @@ pub struct File {
     pub adds: usize,
     pub dels: usize,
     pub hunks: Vec<Hunk>,
+    /// Spans or tokens [`sanitize`] threw away because they pointed mid-character,
+    /// past the end of their line, or out of order. Zero for every built-in pass;
+    /// see [`Prepared::rejected`] for why this exists at all.
+    pub rejected: usize,
 }
 
 /// The prepared diff, plus what the two expensive passes cost. The timings are
@@ -88,6 +92,50 @@ impl Prepared {
             .map(|h| h.lines.len())
             .sum()
     }
+
+    /// How many spans or tokens [`sanitize`] threw away. Zero for everything
+    /// shipped; a frontend reports it so a `Differ` or `Highlighter` extension
+    /// that is quietly handing back bad ranges says so, the same way
+    /// [`crate::wrap::Wrapped::rejected`] does for a bad `Wrap`.
+    pub fn rejected(&self) -> usize {
+        self.files.iter().map(|f| f.rejected).sum()
+    }
+}
+
+/// Keeps the spans or tokens that describe a range of `text` and drops the
+/// rest, counting what it drops.
+///
+/// Not defensiveness for its own sake: a range that points past its line, or
+/// into the middle of a character, is a slice panic on the render path —
+/// `runs_selected` folds these edges in with `.min` only, and it never sees
+/// the text to check them against. `Highlighter` is an extension seam and
+/// `intraline` is not exempt either, so this runs on both. The rules mirror
+/// [`crate::wrap::Wrapped::take`]: in range, on character boundaries, and
+/// ascending — `runs` relies on ordered input to terminate.
+///
+/// `retain` rather than a rebuilt `Vec`: nearly every span and token a real
+/// pass produces is valid, so this costs a scan and not an allocation.
+fn sanitize<T>(
+    text: &str,
+    items: &mut Vec<T>,
+    range: impl Fn(&T) -> (u32, u32),
+    rejected: &mut usize,
+) {
+    let mut prev_end = 0u32;
+    items.retain(|item| {
+        let (start, end) = range(item);
+        let ok = start >= prev_end
+            && end >= start
+            && (end as usize) <= text.len()
+            && text.is_char_boundary(start as usize)
+            && text.is_char_boundary(end as usize);
+        if ok {
+            prev_end = end;
+        } else {
+            *rejected += 1;
+        }
+        ok
+    });
 }
 
 /// Real repos contain minified bundles and base64 blobs; a single line of 9.6
@@ -147,6 +195,7 @@ fn one_file(
 ) -> (File, Duration, Duration) {
     let mut intraline_time = Duration::ZERO;
     let mut syntax_time = Duration::ZERO;
+    let mut rejected = 0usize;
 
     let all = || f.hunks.iter().flat_map(|h| &h.lines);
     let adds = all().filter(|l| l.kind == LineKind::Added).count();
@@ -177,6 +226,21 @@ fn one_file(
         let mut tokens = highlight_hunk(hl, &f.path, &refs, &kinds);
         syntax_time += t.elapsed();
 
+        for i in 0..h.lines.len() {
+            sanitize(
+                &texts[i],
+                &mut spans[i],
+                |s| (s.start, s.end),
+                &mut rejected,
+            );
+            sanitize(
+                &texts[i],
+                &mut tokens[i],
+                |t| (t.start, t.end),
+                &mut rejected,
+            );
+        }
+
         let lines = h
             .lines
             .iter()
@@ -201,6 +265,7 @@ fn one_file(
         adds,
         dels,
         hunks,
+        rejected,
     };
     (file, intraline_time, syntax_time)
 }
@@ -507,5 +572,95 @@ index 1111111..2222222 100644
         );
         assert_eq!(clip(&arc(""), 10).as_ref(), "");
         assert_eq!(clip(&arc("éé"), 0).as_ref(), "  … 2 more chars");
+    }
+
+    /// The `Highlighter` trait is an extension seam, so `prepare` must survive
+    /// one that hands back bad ranges — the whole point of [`sanitize`]. Two of
+    /// three tokens are wrong on purpose: one ends inside the two-byte `é`, one
+    /// overruns the line, and the third is what a real highlighter would have
+    /// produced. Multi-byte text on purpose, because a boundary bug is invisible
+    /// on ASCII.
+    #[test]
+    fn a_bad_highlighter_loses_only_the_bad_tokens() {
+        struct BadHighlighter;
+        impl Highlighter for BadHighlighter {
+            fn highlight(&self, _path: &str, lines: &[&str]) -> Vec<Vec<Token>> {
+                lines
+                    .iter()
+                    .map(|line| {
+                        if line.contains("héllo") {
+                            vec![
+                                // Ends at byte 2, inside `é` (bytes 1..3).
+                                Token {
+                                    start: 0,
+                                    end: 2,
+                                    kind: Kind::Keyword,
+                                },
+                                // Past the end of the (clipped) line.
+                                Token {
+                                    start: 0,
+                                    end: 99,
+                                    kind: Kind::Keyword,
+                                },
+                                // "world" — the one a real highlighter would emit.
+                                Token {
+                                    start: 7,
+                                    end: 12,
+                                    kind: Kind::Keyword,
+                                },
+                            ]
+                        } else {
+                            Vec::new()
+                        }
+                    })
+                    .collect()
+            }
+        }
+
+        const MULTIBYTE: &str = "\
+diff --git a/a.txt b/a.txt
+index 1111111..2222222 100644
+--- a/a.txt
++++ b/a.txt
+@@ -1 +1,2 @@
+ hello
++héllo world
+";
+        let files = parse_unified_diff(MULTIBYTE);
+        let p = prepare(&files, &BadHighlighter, 2000);
+        assert_eq!(
+            p.rejected(),
+            2,
+            "the mid-character end and the overrun should both be dropped"
+        );
+
+        let line = &p.files[0].hunks[0].lines[1];
+        assert_eq!(line.text.as_ref(), "héllo world");
+        assert_eq!(line.tokens.len(), 1, "only the valid token survives");
+        assert_eq!(&line.text[line.tokens[0].range()], "world");
+    }
+
+    #[test]
+    fn sanitize_drops_mid_character_overrun_and_out_of_order() {
+        // "héllo": h=0, é=1..3 (two bytes), l=3, l=4, o=5, len=6. Byte 2 is
+        // inside `é` and is not a boundary.
+        let text = "héllo";
+        let mut items: Vec<Span> = vec![
+            Span { start: 0, end: 2 },  // mid-character end
+            Span { start: 0, end: 99 }, // past the end of the text
+            Span { start: 3, end: 4 },  // valid: "l"
+            Span { start: 1, end: 3 },  // out of order: starts before the last kept end
+            Span { start: 4, end: 6 },  // valid: "lo"
+        ];
+        let mut rejected = 0;
+        sanitize(text, &mut items, |s| (s.start, s.end), &mut rejected);
+        assert_eq!(
+            rejected, 3,
+            "mid-character, overrun and out-of-order are each one rejection"
+        );
+        assert_eq!(
+            items,
+            vec![Span { start: 3, end: 4 }, Span { start: 4, end: 6 }]
+        );
     }
 }

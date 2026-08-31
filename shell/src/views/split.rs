@@ -619,7 +619,7 @@ impl SplitRows {
                             theme,
                             line.kind,
                             line.moved,
-                            selected(sel, column.part(), line.text.len()),
+                            selected(sel, column.part(), &line.text),
                         )
                         .iter()
                         .cloned(),

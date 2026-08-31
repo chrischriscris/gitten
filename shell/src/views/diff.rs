@@ -1607,6 +1607,12 @@ fn arrange(prepared: &Prepared, host: &Host, layouts: &Layouts, current: usize) 
         "intraline {:.0?} · syntax {:.0?}{cpu}",
         prepared.intraline, prepared.syntax
     )];
+    // Distinct from a renderer's own "invalid breaks" report below: this counts
+    // spans and tokens `prepare` threw away at the `Line` boundary — a bad
+    // `Differ` or `Highlighter`, not a bad `Wrap`.
+    if prepared.rejected() > 0 {
+        reports.push(format!("{} spans/tokens rejected", prepared.rejected()));
+    }
     reports.extend(
         renderers
             .iter()
@@ -2412,7 +2418,7 @@ impl Rows for TextRows {
                                     theme,
                                     *kind,
                                     *moved,
-                                    selected(sel, 0, text.len()),
+                                    selected(sel, 0, text),
                                 )
                                 .iter()
                                 .cloned(),
@@ -2506,12 +2512,12 @@ pub(crate) fn scrolled(shift: f32, text: Div) -> Div {
         .child(text.flex_none().ml(px(-shift)))
 }
 
-/// The bytes of a `len`-long text that a selection covers, or nothing at all
-/// when the selection is in another of the row's parts — or is not there, which
-/// is the case on nearly every row of nearly every frame.
-pub(crate) fn selected(sel: Option<Selected>, part: u16, len: usize) -> Range<usize> {
+/// The bytes of `text` that a selection covers, or nothing at all when the
+/// selection is in another of the row's parts — or is not there, which is the
+/// case on nearly every row of nearly every frame.
+pub(crate) fn selected(sel: Option<Selected>, part: u16, text: &str) -> Range<usize> {
     match sel.filter(|s| s.part() == part) {
-        Some(s) => s.range(len),
+        Some(s) => s.range(text),
         None => 0..0,
     }
 }
@@ -2601,7 +2607,7 @@ pub(crate) fn file_header(
     let p = &theme.diff;
     let (dir, name) = split_path(path);
     // One range over the whole path, split between the two elements below.
-    let sel = selected(sel, 0, path.len());
+    let sel = selected(sel, 0, path);
     let cut = dir.as_ref().map_or(0, |d| d.len());
     row_frame()
         // A column, so the rule is part of the row's own 22 pixels rather than
@@ -2731,9 +2737,8 @@ pub(crate) fn hunk_header(
             shift,
             div().child(
                 // The row's own handle, adopted rather than copied.
-                StyledText::new(SharedString::from(std::sync::Arc::clone(header))).with_highlights(
-                    hunk_runs(marker.len(), selected(sel, 0, header.len()), theme),
-                ),
+                StyledText::new(SharedString::from(std::sync::Arc::clone(header)))
+                    .with_highlights(hunk_runs(marker.len(), selected(sel, 0, header), theme)),
             ),
         ))
         .into_any_element()

@@ -463,7 +463,6 @@ impl MarkdownRows {
         // one — and the bytes of it this visual row draws.
         let full = self.doc.text(index).unwrap_or_default();
         let at = self.doc.range(index, seg);
-        let full_len = full.len();
         // One borrow per row: the numbers format into it and the run list sweeps
         // through it, both copied out as the elements take them.
         let mut sc = self.scratch.borrow_mut();
@@ -500,7 +499,7 @@ impl MarkdownRows {
                         theme,
                         line.kind,
                         line.moved,
-                        selected(sel, 0, full_len),
+                        selected(sel, 0, full),
                     )
                     .iter()
                     .cloned(),
@@ -633,7 +632,7 @@ impl MarkdownRows {
                     theme,
                     line.kind,
                     line.moved,
-                    selected(sel, 0, full_len),
+                    selected(sel, 0, full),
                 )
                 .iter()
                 .cloned(),

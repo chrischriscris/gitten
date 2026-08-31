@@ -163,9 +163,21 @@ impl Selected {
         self.part
     }
 
-    /// The bytes of a text `len` long that are selected, clamped into it.
-    pub fn range(self, len: usize) -> Range<usize> {
-        self.from.min(len)..self.to.min(len)
+    /// The bytes of `text` that are selected, clamped into it and onto character
+    /// boundaries — a frontend derives offsets from columns so a mid-character
+    /// end should be impossible, but this is the one exit for a range that will
+    /// be sliced, and "should" is not a contract (see `word_at`, which already
+    /// walks back for the same reason).
+    pub fn range(self, text: &str) -> Range<usize> {
+        let snap = |mut off: usize| {
+            off = off.min(text.len());
+            while off > 0 && !text.is_char_boundary(off) {
+                off -= 1;
+            }
+            off
+        };
+        let (from, to) = (snap(self.from), snap(self.to));
+        from..to.max(from)
     }
 }
 
@@ -344,7 +356,7 @@ impl Selection {
             if !out.is_empty() {
                 out.push('\n');
             }
-            out.push_str(&text[sel.range(text.len())]);
+            out.push_str(&text[sel.range(text)]);
         }
         out
     }
@@ -472,7 +484,7 @@ mod tests {
     fn one_row_selects_the_bytes_between_the_two_offsets() {
         let s = sel((1, 2), (1, 6));
         let got = s.at(1, (0, 1)).expect("the row the carets are on");
-        assert_eq!(got.range(100), 2..6);
+        assert_eq!(got.range(&"x".repeat(100)), 2..6);
         assert_eq!(s.at(0, (0, 0)), None, "the row above");
         assert_eq!(s.at(2, (0, 2)), None, "the row below");
     }
@@ -483,8 +495,12 @@ mod tests {
         let forwards = sel((1, 4), (3, 2));
         let backwards = sel((3, 2), (1, 4));
         for v in 0..5u32 {
-            let a = forwards.at(v as usize, (0, v)).map(|s| s.range(20));
-            let b = backwards.at(v as usize, (0, v)).map(|s| s.range(20));
+            let a = forwards
+                .at(v as usize, (0, v))
+                .map(|s| s.range(&"x".repeat(20)));
+            let b = backwards
+                .at(v as usize, (0, v))
+                .map(|s| s.range(&"x".repeat(20)));
             assert_eq!(a, b, "row {v}");
         }
         assert_eq!(forwards.rows(), 1..4);
@@ -494,12 +510,20 @@ mod tests {
     fn a_row_in_the_middle_is_selected_whole_and_the_ends_are_not() {
         let s = sel((1, 4), (3, 2));
         assert_eq!(
-            s.at(1, (0, 1)).unwrap().range(10),
+            s.at(1, (0, 1)).unwrap().range(&"x".repeat(10)),
             4..10,
             "from the anchor to the end"
         );
-        assert_eq!(s.at(2, (0, 2)).unwrap().range(10), 0..10, "all of it");
-        assert_eq!(s.at(3, (0, 3)).unwrap().range(10), 0..2, "up to the head");
+        assert_eq!(
+            s.at(2, (0, 2)).unwrap().range(&"x".repeat(10)),
+            0..10,
+            "all of it"
+        );
+        assert_eq!(
+            s.at(3, (0, 3)).unwrap().range(&"x".repeat(10)),
+            0..2,
+            "up to the head"
+        );
     }
 
     #[test]
@@ -508,7 +532,7 @@ mod tests {
         // second line contributes nothing, and a zero-length highlight on it
         // would be a stray one-pixel block.
         let s = sel((1, 4), (2, 0));
-        assert_eq!(s.at(1, (0, 1)).unwrap().range(10), 4..10);
+        assert_eq!(s.at(1, (0, 1)).unwrap().range(&"x".repeat(10)), 4..10);
         assert_eq!(s.at(2, (0, 2)), None);
     }
 
@@ -525,7 +549,7 @@ mod tests {
         assert_eq!(s.rows(), 1..4);
         for v in 1..4 {
             assert_eq!(
-                s.at(v, (0, 1)).unwrap().range(60),
+                s.at(v, (0, 1)).unwrap().range(&"x".repeat(60)),
                 3..40,
                 "row {v} of the line"
             );
@@ -558,7 +582,7 @@ mod tests {
         ]);
         assert!(s.resolve(&after));
         assert_eq!(s.rows(), 5..6);
-        assert_eq!(s.at(5, (0, 2)).unwrap().range(9), 0..4);
+        assert_eq!(s.at(5, (0, 2)).unwrap().range(&"x".repeat(9)), 0..4);
     }
 
     #[test]
@@ -599,7 +623,7 @@ mod tests {
         let s = Selection::all(&table).expect("a non-empty diff");
         assert_eq!(s.rows(), 0..3);
         assert_eq!(
-            s.at(2, (0, 2)).unwrap().range(4),
+            s.at(2, (0, 2)).unwrap().range(&"x".repeat(4)),
             0..4,
             "to the end of the last line"
         );
@@ -638,5 +662,21 @@ mod tests {
         // Offset 2 is inside the two-byte `é`.
         assert_eq!(&text[word_at(text, 2)], "héllo");
         assert_eq!(&text[word_at(text, 8)], "wörld");
+    }
+
+    #[test]
+    fn a_selection_range_snaps_onto_character_boundaries_and_slices_cleanly() {
+        // "héllo": h=0, é=1..3 (two bytes), l=3, l=4, o=5, len=6. Byte 2 is
+        // inside `é` and is not a boundary — exactly the kind of offset a
+        // length-only clamp would hand back unchanged.
+        let text = "héllo";
+        let s = sel((0, 0), (0, 2));
+        let got = s.at(0, (0, 0)).unwrap();
+        let range = got.range(text);
+        assert_eq!(range, 0..1, "the end snapped back off the middle of `é`");
+        // The point of the guard: slicing with the result must not panic.
+        assert_eq!(&text[range], "h");
+
+        assert_eq!(got.range(""), 0..0);
     }
 }
