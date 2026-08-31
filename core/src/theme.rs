@@ -170,6 +170,10 @@ pub struct MarkdownPalette {
     pub quote_bar: Rgb,
     /// Bullet glyphs, table pipes, a fence's language label: the punctuation the
     /// renderer draws itself, which should read as structure and not as text.
+    ///
+    /// The base for a furniture colour resolved against a row background, exactly
+    /// like [`DiffPalette::gutter_fg`] — see [`Theme::marker_on`], which is what
+    /// is actually drawn.
     pub marker: Rgb,
     /// A thematic break, and a table's separator row.
     pub rule: Rgb,
@@ -254,6 +258,12 @@ pub struct Theme {
     /// `diff.gutter_fg` resolved against every [`Surface`], for the same reason
     /// and by the same code. Indexed by [`Surface::index`].
     gutter: [Rgb; Surface::COUNT],
+    /// `markdown.marker` resolved against every [`Surface`], for the same reason
+    /// again: a bullet is furniture drawn on whichever row the prose landed on,
+    /// and the raw value measured **2.27:1** on a changed word in the shipped
+    /// dark theme — a glyph standing in for a marker that is no longer there,
+    /// and now not there either. Indexed by [`Surface::index`].
+    marker: [Rgb; Surface::COUNT],
 }
 
 impl Default for Theme {
@@ -338,6 +348,7 @@ impl Theme {
             authors: vec![0x9c8a6b, 0x6f8296, 0x8b7a96, 0x6b8f88, 0x9c7f75, 0x7d8a6b],
             resolved: Vec::new(),
             gutter: [0; Surface::COUNT],
+            marker: [0; Surface::COUNT],
         }
         .rebuilt()
     }
@@ -431,6 +442,7 @@ impl Theme {
             authors: vec![0x8a7040, 0x577891, 0x816b99, 0x447e73, 0x95695b, 0x6a7a40],
             resolved: Vec::new(),
             gutter: [0; Surface::COUNT],
+            marker: [0; Surface::COUNT],
         }
         .rebuilt()
     }
@@ -510,6 +522,7 @@ impl Theme {
             authors: vec![0x6d94b1, 0x658b84, 0x887f9f, 0x619494, 0xa28087, 0x798f6c],
             resolved: Vec::new(),
             gutter: [0; Surface::COUNT],
+            marker: [0; Surface::COUNT],
         }
         .rebuilt()
     }
@@ -531,6 +544,7 @@ impl Theme {
         for surface in Surface::ALL {
             let bg = self.background(surface);
             self.gutter[surface.index()] = readable(self.diff.gutter_fg, bg, self.min_furniture);
+            self.marker[surface.index()] = readable(self.markdown.marker, bg, self.min_furniture);
         }
     }
 
@@ -569,6 +583,43 @@ impl Theme {
     #[inline]
     pub fn gutter_on(&self, surface: Surface) -> Rgb {
         self.gutter[surface.index()]
+    }
+
+    /// The colour to draw a Markdown marker in on `surface` — a bullet glyph, a
+    /// fence's language label. One index; the contrast work happened in
+    /// [`Theme::rebuild`].
+    ///
+    /// The gutter's argument, for the same class of thing: a marker stands in for
+    /// punctuation the row no longer carries, and a rendered prose row lands on
+    /// every diff background there is. Raw, `markdown.marker` measured 2.27:1 on
+    /// a changed word in the shipped dark theme and 2.07:1 on a text selection —
+    /// a bullet that is furniture on a context row and absent everywhere else.
+    /// The *furniture* floor and not the text one, because a bullet is glanced at
+    /// exactly once, like a line number.
+    #[inline]
+    pub fn marker_on(&self, surface: Surface) -> Rgb {
+        self.marker[surface.index()]
+    }
+
+    /// `chrome.faint` made legible against the chrome background it is drawn on.
+    ///
+    /// The split this exists to make: `faint` **as a border** has no legibility
+    /// floor and keeps none — a hairline in a near-black palette cannot be held
+    /// to a text ratio without becoming a bright line, which is the whole
+    /// argument of `docs/decisions/0020-furniture-has-its-own-floor.md`. But
+    /// `faint` **as text** — a section label, a pane's count, a rename's old
+    /// path, the empty state — is read, and raw it measures 2.05:1 on
+    /// `chrome.bg` and 1.95:1 on the title strip: below the furniture floor, so
+    /// "dim and inert" was in practice removed. Text goes through here; a border
+    /// keeps reading `chrome.faint` directly.
+    ///
+    /// Takes a background rather than a [`Surface`], because chrome backgrounds
+    /// are not diff rows and there is no enum of them: the caller knows which of
+    /// `bg`, `title_bg`, `status_bg` or `selection_bg` it painted. Not a table
+    /// because there is nothing to index — a handful of labels per frame, not a
+    /// run per token per row.
+    pub fn quiet_on(&self, bg: Rgb) -> Rgb {
+        readable(self.chrome.faint, bg, self.min_furniture)
     }
 
     #[inline]
