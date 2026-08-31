@@ -59,6 +59,7 @@
 //! vertical axis, which is the one that has to virtualize.
 
 use super::{accept_deferred_scroll, DeferredScrollbar, PendingScroll};
+pub(crate) use crate::chrome::ROW_BAR;
 use gitten_core::font::Font;
 use gitten_core::host::Host;
 use gitten_core::prepared::{prepare, Prepared};
@@ -168,6 +169,30 @@ pub(crate) fn column_at(text: &str, x: f32, size: f32, host: &Host) -> usize {
 
 // ------------------------------------------------------------------ the seam
 
+/// Everything a presentation needs to know about one row's relationship to
+/// the keyboard, beyond what the row itself holds.
+///
+/// One argument and not three bools because this trait is a documented seam —
+/// `docs/extending.md` — and a presentation after the next must not change the
+/// signature twice.
+#[derive(Clone, Copy, Default)]
+pub struct RowState {
+    /// The keyboard's row.
+    pub current: bool,
+    /// Whether this pane holds the keyboard at all.
+    ///
+    /// `dead_code` because no drawing reads it yet: the bar that turns it into
+    /// ink is the seam's next change, and the sidebar's are drawn from the flag
+    /// their pane already holds.
+    #[allow(dead_code)]
+    pub focused: bool,
+    /// An armed destructive question stands over this row's hunk.
+    ///
+    /// Same as `focused`: computed here, read by the tint the next change adds.
+    #[allow(dead_code)]
+    pub armed: bool,
+}
+
 /// Turns one file's diff into rows, and draws them.
 ///
 /// Row height is fixed for the whole list because `uniform_list` is what makes a
@@ -185,11 +210,6 @@ pub(crate) fn column_at(text: &str, x: f32, size: f32, host: &Host) -> usize {
 /// **visual** row of that logical one they are drawing. `seg` is 0 for
 /// everything that fits, which is nearly everything.
 ///
-/// [`Rows::rows`] and [`Rows::reflow`] both default, so a presentation that does
-/// not wrap is exactly as long as it was and an extension's compiles unchanged.
-/// A presentation that does wrap gets the hard part —
-/// [`gitten_core::wrap::Wrapped`] — from `core`; see `TextRows::reflow` for what
-/// is left, which is six lines and a column budget.
 pub trait Rows {
     /// Whether this implementation wants the file. The built-in claims
     /// everything; the last registered claimant wins, so a specialist can take
@@ -238,9 +258,11 @@ pub trait Rows {
 
     /// Draws one visual row. `sel` is the part of it the mouse has selected, in
     /// the row's own byte coordinates — `None` for the overwhelming majority of
-    /// rows on the overwhelming majority of frames. `current` is whether this is
-    /// the row the keyboard is on, drawn as a background bar so navigation has a
-    /// visible cursor — see [`gitten_core::view::Viewport`].
+    /// rows on the overwhelming majority of frames. `state` is the row's
+    /// relationship to the keyboard: whether it is the row the keyboard is on,
+    /// drawn as a background bar so navigation has a visible cursor — see
+    /// [`gitten_core::view::Viewport`] — whether the pane holding it holds the
+    /// keyboard, and whether an armed question stands over it.
     ///
     /// `shift` is how many pixels of text a horizontal scroll has pulled off the
     /// left edge. A row is as wide as the viewport whatever it holds, so an
@@ -254,7 +276,7 @@ pub trait Rows {
         seg: usize,
         host: &Host,
         sel: Option<Selected>,
-        current: bool,
+        state: RowState,
         shift: f32,
     ) -> AnyElement;
 
@@ -696,6 +718,11 @@ pub struct Diff {
     /// clears it — see [`Diff::confirm_or_arm_discard_hunk`] — so a press
     /// can never spend an arm on a hunk it was not asked about.
     armed_hunk: Option<(u16, u32)>,
+    /// Whether this pane holds the keyboard, as the shell last told it. A
+    /// row's cursor bar is accent only when its pane is focused, and the view
+    /// cannot ask the shell during render — so the shell writes it here when
+    /// focus moves, and render reads a flag.
+    focused: bool,
     /// Where every file header is, in visual rows — what `]` and `[` jump
     /// between. Collected by [`expand`] while it builds the order table, so it
     /// costs one branch per row at rebuild and nothing per frame.
@@ -1059,6 +1086,9 @@ impl Diff {
                 if self.layouts.len() >= 2 {
                     self.apply_layout((self.current + 1) % self.layouts.len(), host);
                 }
+                // The rows are about to be re-arranged; whatever the question
+                // was armed against may land somewhere else in them.
+                self.armed_hunk = None;
                 return true;
             }
             "diff.cycle-wrap" => {
@@ -1249,6 +1279,17 @@ impl Diff {
                 false
             }
         }
+    }
+
+    /// Told by the shell whenever the keyboard moves — never decided here.
+    pub(crate) fn set_focused(&mut self, focused: bool) {
+        self.focused = focused;
+    }
+
+    /// Whether this pane holds the keyboard. The rows read it for the bar.
+    #[allow(dead_code)]
+    pub(crate) fn focused(&self) -> bool {
+        self.focused
     }
 
     /// The text of the row the keyboard is on, or nothing past either end. The
@@ -1497,6 +1538,7 @@ impl Diff {
             dragging: false,
             widest: built.widest,
             armed_hunk: None,
+            focused: false,
             headers: Rc::new(built.headers),
             scroll: UniformListScrollHandle::new(),
             pan: Pan::default(),
@@ -1997,6 +2039,12 @@ impl Render for Diff {
         let scroll = self.scroll.clone();
         let synced = self.synced.clone();
         let pending_scroll = self.pending_scroll.clone();
+        // The same flag the shell last wrote, copied into the rows with the rest
+        // of the frame's reads — a view cannot ask the shell during render.
+        let focused = self.focused;
+        // The question the shell is holding, if any, copied so the rows of one
+        // frame all answer it at the same state of the arm.
+        let armed = self.armed_hunk;
         // Where the scrollbar draws itself and how long its thumb is. Last
         // frame's box, like everything else measured here — a view is handed
         // one and cannot ask before.
@@ -2040,7 +2088,15 @@ impl Render for Diff {
                         r.seg as usize,
                         &host,
                         at,
-                        i == cursor,
+                        RowState {
+                            current: i == cursor,
+                            focused,
+                            // Once per row, not once per frame: the arm keys
+                            // the row the keyboard was on — see
+                            // [`Diff::confirm_or_arm_discard_hunk`] — and no
+                            // cursor move has moved it.
+                            armed: armed_at(i, r.owner, armed),
+                        },
                         shift,
                     )
                 })
@@ -2374,17 +2430,17 @@ impl Rows for TextRows {
         seg: usize,
         host: &Host,
         sel: Option<Selected>,
-        current: bool,
+        state: RowState,
         shift: f32,
     ) -> AnyElement {
         let theme = &host.theme;
         let p = &theme.diff;
         match &self.rows[index] {
             Row::File { path, adds, dels } => {
-                file_header(path, *adds, *dels, theme, sel, current, shift)
+                file_header(path, *adds, *dels, theme, sel, state.current, shift)
             }
 
-            Row::Hunk(header) => hunk_header(header, theme, sel, current, shift),
+            Row::Hunk(header) => hunk_header(header, theme, sel, state.current, shift),
 
             Row::Line {
                 kind,
@@ -2399,10 +2455,26 @@ impl Rows for TextRows {
                 // The keyboard's row is a bar across the whole line, whatever
                 // kind of line it is — the same background the terminal draws,
                 // so the cursor reads as one thing in both.
-                let bg = row_background(current, bg, theme);
+                let bg = row_background(state.current, bg, theme);
                 // Which background this row's furniture lands on, so the line
-                // numbers are resolved against it — see `Theme::gutter_on`.
-                let gutter = theme.gutter_on(surfaces(*kind, *moved).0);
+                // numbers are resolved against it — see `Theme::gutter_on`. On
+                // the keyboard's row that is the wash, and not the line kind's:
+                // the row paints `selection_bg` over both, so a number resolved
+                // for the line it is sits on a background it never lands on.
+                let (plain, _) = surfaces(*kind, *moved);
+                let gutter = theme.gutter_on(match state.current {
+                    true => Surface::Cursor,
+                    false => plain,
+                });
+                // The question stands over the hunk the second press will
+                // spend, and the column that says which hunk that is — the
+                // line numbers and the sign — name it in the colour a conflict
+                // does: the palette's own "this row ends work" foreground,
+                // which a conflict's letters already draw.
+                let gutter = match state.armed {
+                    true => theme.chrome.error,
+                    false => gutter,
+                };
                 let at = self.wrapped.range(index, seg, text);
                 let piece = slice(text, &at);
                 // A continuation carries no number and no sign. The background
@@ -2417,6 +2489,14 @@ impl Rows for TextRows {
                 row_frame()
                     .items_center()
                     .px(px(PAD))
+                    // The bar on every row, in the row's own background when
+                    // the cursor is elsewhere: the padding gives back what the
+                    // border takes, so the text starts where it started and a
+                    // move of the cursor shifts no line a pixel — the same
+                    // frame the sidebar's rows sit in.
+                    .border_l(px(ROW_BAR))
+                    .border_color(rgb(row_bar(state, bg, theme)))
+                    .pl(px(PAD - ROW_BAR))
                     .bg(rgb(bg))
                     .child(num(sc.number(*old, blank), gutter))
                     .child(num(sc.number(*new, blank), gutter))
@@ -2424,7 +2504,10 @@ impl Rows for TextRows {
                         div()
                             .flex_none()
                             .w(px(SIGN_W))
-                            .text_color(rgb(fg))
+                            .text_color(rgb(match state.armed {
+                                true => theme.chrome.error,
+                                false => fg,
+                            }))
                             .child(if blank { " " } else { sign }),
                     )
                     .child(scrolled(
@@ -2438,6 +2521,7 @@ impl Rows for TextRows {
                                     theme,
                                     *kind,
                                     *moved,
+                                    state.current,
                                     selected(sel, 0, text),
                                 )
                                 .iter()
@@ -2842,6 +2926,29 @@ pub(crate) fn row_background(current: bool, base: Rgb, theme: &Theme) -> Rgb {
     }
 }
 
+/// The ink on the bar down a row's left edge, on every row: accent while the
+/// row's pane holds the keyboard, faint when the selection is remembered and
+/// the keyboard is elsewhere, and the row's own background when the row is not
+/// the cursor's — which is what keeps the text from shifting a pixel when the
+/// cursor moves. The same rule [`chrome::list_row`] runs; a cursor that some
+/// rows honour and others ignore is a cursor that lies about where it is.
+pub(crate) fn row_bar(state: RowState, base: Rgb, theme: &Theme) -> Rgb {
+    match (state.current, state.focused) {
+        (true, true) => theme.chrome.accent,
+        (true, false) => theme.chrome.faint,
+        (false, _) => base,
+    }
+}
+
+/// Whether an armed question stands over a row: the arm keys the row the
+/// keyboard was on — see [`Diff::confirm_or_arm_discard_hunk`] — and a row
+/// outside it answers no, because a question is spent from where it was asked
+/// and no cursor move has moved it. One comparison per row, which is every row
+/// of every frame until somebody arms.
+pub(crate) fn armed_at(index: usize, owner: u16, armed: Option<(u16, u32)>) -> bool {
+    armed.is_some_and(|id| id == (owner, index as u32))
+}
+
 /// One line-number column.
 ///
 /// **Right-aligned**, which is the whole reason this is a flex row and not a
@@ -2925,6 +3032,7 @@ impl Scratch {
         theme: &Theme,
         kind: LineKind,
         moved: bool,
+        current: bool,
         sel: Range<usize>,
     ) -> &[(Range<usize>, HighlightStyle)] {
         runs::runs_selected(at.clone(), tokens, spans, kind, moved, sel, &mut self.runs);
@@ -2937,7 +3045,16 @@ impl Scratch {
             }
             // A token resolves against the surface it lands on, so a selected
             // or changed byte gets a foreground that reads on that background.
-            let style = r.kind.map(|k| theme.syntax_on(k, r.surface));
+            // On the keyboard's row the plain one is the wash — the row paints
+            // `selection_bg` over whatever the line was, so a token resolved
+            // for it was resolved against a background it never lands on. A
+            // changed word keeps its own: the wash is a bar *under* the row and
+            // the word is the thing being read on it.
+            let surface = match (current, r.word) {
+                (true, false) => Surface::Cursor,
+                _ => r.surface,
+            };
+            let style = r.kind.map(|k| theme.syntax_on(k, surface));
             Some((
                 r.at.start - at.start..r.at.end - at.start,
                 HighlightStyle {
@@ -2962,8 +3079,8 @@ mod tests {
     // By name, not a glob: `use gpui::*` in the parent shadows `#[test]` with
     // GPUI's own attribute macro and every test in here fails to expand.
     use super::{
-        line_colors, locked, row_background, Diff, FileSummary, Layouts, Pan, Row, Rows, TextRows,
-        PAD, ROW_H, TEXT_CHROME,
+        armed_at, line_colors, locked, row_background, row_bar, Diff, FileSummary, Layouts, Pan,
+        Row, RowState, Rows, TextRows, PAD, ROW_H, TEXT_CHROME,
     };
     use gitten_core::font::Font;
     use gitten_core::host::Host;
@@ -3013,7 +3130,7 @@ mod tests {
         sel: std::ops::Range<usize>,
     ) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
         let mut sc = super::Scratch::default();
-        super::Scratch::merged(&mut sc, at, tokens, spans, theme, kind, moved, sel).to_vec()
+        super::Scratch::merged(&mut sc, at, tokens, spans, theme, kind, moved, false, sel).to_vec()
     }
 
     fn well_formed(text: &str, runs: &[(std::ops::Range<usize>, HighlightStyle)]) {
@@ -3212,6 +3329,73 @@ mod tests {
             theme.chrome.selection_bg
         );
         assert_eq!(row_background(false, p.file_bg, &theme), p.file_bg);
+        // The bar, and nothing else: accent while the row's pane holds the
+        // keyboard, faint when the selection is remembered and the keyboard is
+        // elsewhere, and the row's own background when the row is not the
+        // cursor's — which is what keeps the text from shifting a pixel.
+        let state = |current: bool, focused: bool| RowState {
+            current,
+            focused,
+            armed: false,
+        };
+        assert_eq!(
+            row_bar(state(true, true), p.context_bg, &theme),
+            theme.chrome.accent
+        );
+        assert_eq!(
+            row_bar(state(true, false), p.context_bg, &theme),
+            theme.chrome.faint
+        );
+        assert_eq!(
+            row_bar(state(false, true), p.context_bg, &theme),
+            row_background(false, p.context_bg, &theme)
+        );
+    }
+
+    #[test]
+    fn an_armed_hunk_names_the_row_a_second_press_will_spend() {
+        // The keyboard on a hunk's first line, armed: the row the question
+        // stands over says so, and the rows beside it — the rest of the hunk
+        // the second press spends — do not. The arm keys the row the keyboard
+        // was on and not the hunk, which is what `confirm_or_arm_discard_hunk`
+        // records: a second press from the same spot spends it, and a move of
+        // the cursor spends nothing (see the test that holds below).
+        let host = Rc::new(Host::new());
+        let mut d = Diff::with_layouts(parse_unified_diff(THREE_HUNKS), &host, Layouts::builtin());
+        let id = d.cursor_row_id();
+        assert!(!d.confirm_or_arm_discard_hunk(id), "first press asks");
+        let armed = d.armed_hunk;
+        let flagged: Vec<bool> = (0..d.order.len())
+            .map(|i| {
+                let r = d.order[i];
+                // The same comparison the render path walks — see
+                // `Diff::render`'s `uniform_list`.
+                armed_at(i, r.owner, armed)
+            })
+            .collect();
+        let rows: Vec<usize> = flagged
+            .iter()
+            .enumerate()
+            .filter_map(|(i, a)| a.then_some(i))
+            .collect();
+        assert_eq!(rows, vec![id.1 as usize], "the armed row, and only it");
+    }
+
+    #[test]
+    fn a_layout_cycle_disarms_before_the_rows_mean_something_else() {
+        // The rows are about to be re-arranged; whatever the question was
+        // armed against may land somewhere else — the same reason a selection
+        // goes, and the same clear every cursor move already does.
+        let host = Rc::new(Host::new());
+        let mut d = Diff::with_layouts(parse_unified_diff(THREE_HUNKS), &host, Layouts::builtin());
+        let id = d.cursor_row_id();
+        assert!(!d.confirm_or_arm_discard_hunk(id), "first press asks");
+        assert!(d.armed_hunk.is_some(), "armed, and waiting");
+        d.apply_layout(1, &host);
+        assert!(
+            d.armed_hunk.is_none(),
+            "the cycle spent nothing: it cleared"
+        );
     }
 
     #[test]
@@ -3301,6 +3485,7 @@ mod tests {
             &theme,
             LineKind::Added,
             false,
+            false,
             6..20,
         );
         well_formed(text, out);
@@ -3313,6 +3498,7 @@ mod tests {
                 &spans,
                 &theme,
                 LineKind::Added,
+                false,
                 false,
                 6..20,
             );
@@ -4215,7 +4401,7 @@ diff --git a/a.rs b/a.rs
             _seg: usize,
             _host: &Host,
             _sel: Option<Selected>,
-            _current: bool,
+            _state: RowState,
             _shift: f32,
         ) -> AnyElement {
             div().child(self.rows[index].clone()).into_any_element()
@@ -4571,7 +4757,7 @@ diff --git a/b.md b/b.md
             _seg: usize,
             _host: &Host,
             _sel: Option<Selected>,
-            _current: bool,
+            _state: RowState,
             _shift: f32,
         ) -> AnyElement {
             div().child(self.rows[index].clone()).into_any_element()

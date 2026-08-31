@@ -38,10 +38,19 @@ pub enum Surface {
     /// actually lands on. Without it, `comment` on the selection background is
     /// the one run in the diff nobody can read.
     Selected,
+    /// The row the keyboard is on.
+    ///
+    /// Its background is `chrome.selection_bg`, which a frontend substitutes for
+    /// the line kind's own — and that substitution is exactly why this has to be
+    /// a surface: a token resolved for the near-black context row and then
+    /// painted onto the cursor's wash was resolved against a background it never
+    /// landed on. Measured that way, the dark theme's context gutter lands at
+    /// 2.78:1 — under the furniture floor, on the one row being read.
+    Cursor,
 }
 
 impl Surface {
-    pub const ALL: [Surface; 8] = [
+    pub const ALL: [Surface; 9] = [
         Surface::Context,
         Surface::Added,
         Surface::Removed,
@@ -50,6 +59,7 @@ impl Surface {
         Surface::MovedRemoved,
         Surface::MovedAdded,
         Surface::Selected,
+        Surface::Cursor,
     ];
     pub const COUNT: usize = Self::ALL.len();
 
@@ -539,6 +549,7 @@ impl Theme {
             Surface::MovedRemoved => self.diff.moved_removed_bg,
             Surface::MovedAdded => self.diff.moved_added_bg,
             Surface::Selected => self.chrome.selected_bg,
+            Surface::Cursor => self.chrome.selection_bg,
         }
     }
 

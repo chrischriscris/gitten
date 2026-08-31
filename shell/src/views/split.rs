@@ -50,14 +50,15 @@
 
 use super::diff::{
     column_at, columns, file_header, header_hit, hunk_header, hunk_hit, into_text, line_colors,
-    row_frame, scrolled, selected, slice, Hit, Rows, Scratch, PAD, ROW_H,
+    row_background, row_bar, row_frame, scrolled, selected, slice, Hit, RowState, Rows, Scratch,
+    PAD, ROW_BAR, ROW_H,
 };
 use gitten_core::align::align;
 use gitten_core::host::Host;
 use gitten_core::runs::surfaces;
 use gitten_core::select::Selected;
 use gitten_core::syntax::Token;
-use gitten_core::theme::Theme;
+use gitten_core::theme::{Surface, Theme};
 use gitten_core::wrap::{Wrap, Wrapped};
 use gitten_core::{LineKind, Span};
 use gpui::*;
@@ -437,15 +438,15 @@ impl Rows for SplitRows {
         seg: usize,
         host: &Host,
         sel: Option<Selected>,
-        current: bool,
+        state: RowState,
         shift: f32,
     ) -> AnyElement {
         let theme = &host.theme;
         match &self.rows[index] {
             Row::File { path, adds, dels } => {
-                file_header(path, *adds, *dels, theme, sel, current, shift)
+                file_header(path, *adds, *dels, theme, sel, state.current, shift)
             }
-            Row::Hunk(header) => hunk_header(header, theme, sel, current, shift),
+            Row::Hunk(header) => hunk_header(header, theme, sel, state.current, shift),
             Row::Pair { old, new } => {
                 // Page padding, then two columns of *measured* width and a
                 // fixed rule. The width is `cell_px` — the number the hit test
@@ -456,20 +457,24 @@ impl Rows for SplitRows {
                 // see `list_layout_tests`). Fixed pixels cannot drift, and they
                 // make drawing and hit test the same number by construction.
                 let cell = px(self.cell_px(self.width));
+                // The row's own background, and the bar on it: one frame, the
+                // same rule every presentation runs, so the bar and the wash
+                // cannot be decided twice.
+                let bg = row_background(state.current, theme.chrome.bg, theme);
                 row_frame()
                     .items_center()
                     .px(px(PAD))
-                    .bg(rgb(match current {
-                        true => theme.chrome.selection_bg,
-                        false => theme.chrome.bg,
-                    }))
+                    .border_l(px(ROW_BAR))
+                    .border_color(rgb(row_bar(state, bg, theme)))
+                    .pl(px(PAD - ROW_BAR))
+                    .bg(rgb(bg))
                     .child(self.cell(
                         *old,
                         seg,
                         Column::Old,
                         theme,
                         sel,
-                        current,
+                        state,
                         shift,
                         index,
                         cell,
@@ -491,7 +496,7 @@ impl Rows for SplitRows {
                         Column::New,
                         theme,
                         sel,
-                        current,
+                        state,
                         shift,
                         index,
                         cell,
@@ -550,7 +555,7 @@ impl SplitRows {
         column: Column,
         theme: &Theme,
         sel: Option<Selected>,
-        current: bool,
+        state: RowState,
         shift: f32,
         row: usize,
         width: gpui::Pixels,
@@ -564,7 +569,7 @@ impl SplitRows {
             // Nothing opposite: a flat, darker block, so a run of them reads as
             // a hole in the column rather than as unchanged content. The
             // keyboard's bar runs across it too, so the cursor reads as one bar.
-            let bg = super::diff::row_background(current, p.absent_bg, theme);
+            let bg = super::diff::row_background(state.current, p.absent_bg, theme);
             return cell_frame(width)
                 .debug_selector(move || format!("cell-{}-{row}", column.name()))
                 .bg(rgb(bg))
@@ -573,8 +578,23 @@ impl SplitRows {
         let line = &self.lines[index as usize];
         let (bg, fg, sign) = line_colors(line.kind, line.moved, p);
         // The keyboard's row, on this side and on the other: one bar, not two.
-        let bg = super::diff::row_background(current, bg, theme);
-        let gutter = theme.gutter_on(surfaces(line.kind, line.moved).0);
+        let bg = super::diff::row_background(state.current, bg, theme);
+        // The same substitution the unified view makes: the row paints the
+        // wash over whatever the line was, so a number resolved for the line
+        // kind was resolved against a background it never lands on.
+        let (plain, _) = surfaces(line.kind, line.moved);
+        let gutter = theme.gutter_on(match state.current {
+            true => Surface::Cursor,
+            false => plain,
+        });
+        // The question stands over the hunk the second press will spend, and
+        // the column that says which hunk that is — the numbers and the sign —
+        // name it in the colour a conflict does: the palette's own "this row
+        // ends work" foreground, which a conflict's letters already draw.
+        let gutter = match state.armed {
+            true => theme.chrome.error,
+            false => gutter,
+        };
         let no = match column {
             Column::Old => line.old_no,
             Column::New => line.new_no,
@@ -605,7 +625,10 @@ impl SplitRows {
                 div()
                     .flex_none()
                     .w(px(SIGN_W))
-                    .text_color(rgb(fg))
+                    .text_color(rgb(match state.armed {
+                        true => theme.chrome.error,
+                        false => fg,
+                    }))
                     .child(if blank { " " } else { sign }),
             )
             .child(scrolled(
@@ -619,6 +642,7 @@ impl SplitRows {
                             theme,
                             line.kind,
                             line.moved,
+                            state.current,
                             selected(sel, column.part(), &line.text),
                         )
                         .iter()
@@ -979,7 +1003,7 @@ diff --git a/a.rs b/a.rs
 mod list_layout_tests {
     use std::rc::Rc;
 
-    use super::{Rows, SplitRows, PAD, RULE_W};
+    use super::{RowState, Rows, SplitRows, PAD, RULE_W};
     use gitten_core::host::Host;
     use gitten_core::parse_unified_diff;
     use gitten_core::prepared::prepare;
@@ -1029,7 +1053,7 @@ diff --git a/.github/workflows/check.yml b/.github/workflows/check.yml
                 range
                     .map(|k| {
                         let (i, seg) = flat[k];
-                        rows.render(i, seg as usize, &host, None, false, 0.0)
+                        rows.render(i, seg as usize, &host, None, RowState::default(), 0.0)
                     })
                     .collect::<Vec<_>>()
             })

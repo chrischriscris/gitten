@@ -52,6 +52,7 @@ fn surface_name(s: Surface) -> &'static str {
         Surface::MovedRemoved => "movedRemoved",
         Surface::MovedAdded => "movedAdded",
         Surface::Selected => "selected",
+        Surface::Cursor => "cursor",
     }
 }
 

@@ -1032,6 +1032,36 @@ impl Screen {
 /// `gitten.toml`.
 const RESET_MODE: &str = "reset";
 
+/// What the band says, and why it is saying it. Two, because the two sentences
+/// are not the same sentence: an info describes what was tried, and a question
+/// is the one the keyboard is about to spend — the loudest thing on screen,
+/// because quiet is what hid the arm.
+#[derive(Clone, Debug)]
+enum Notice {
+    Info(String),
+    Question(String),
+}
+
+impl Notice {
+    /// The band's sentence, whichever of the two it is.
+    fn text(&self) -> &str {
+        match self {
+            Notice::Info(text) | Notice::Question(text) => text,
+        }
+    }
+}
+
+/// A notice is its text — what `as_deref` hands back out of the band, the same
+/// `&str` a `String` notice did, so a reader cannot tell the two apart and a
+/// test does not have to.
+impl std::ops::Deref for Notice {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.text()
+    }
+}
+
 struct DevShell {
     /// The app half of the title, drawn bright: which program this is. Which
     /// *view* it is showing is the focused region's to say, because a commit
@@ -1118,8 +1148,10 @@ struct DevShell {
     /// that resolved to nothing this screen can do, or a write that named
     /// its own finish (the sync verbs: pushed, pulled, fetched). Cleared by
     /// the next key, so it cannot go stale. Same band as
-    /// [`DevShell::error`], which wins.
-    notice: Option<String>,
+    /// [`DevShell::error`], which wins — and an armed question in it is the
+    /// error's ink and not this, because the one sentence a second press
+    /// spends is the one being read: see [`DevShell::set_question`].
+    notice: Option<Notice>,
     /// Where `gitten.toml` is. Held because picking a theme goes through the same
     /// reload a save does — see [`config::reload`] for why there is only one
     /// path.
@@ -1242,7 +1274,10 @@ impl DevShell {
                 Screen::Branches { view, .. } => view.update(cx, |v, _| v.set_focused(focused)),
                 Screen::Stashes { view, .. } => view.update(cx, |v, _| v.set_focused(focused)),
                 Screen::Commits { view, .. } => view.update(cx, |v, _| v.set_focused(focused)),
-                Screen::Diff { .. } | Screen::Status { .. } | Screen::Custom(_) => {}
+                // The diff draws the cursor for its own rows: it takes focus
+                // through the same seam the sidebar panes do, and no further.
+                Screen::Diff { view, .. } => view.update(cx, |v, _| v.set_focused(focused)),
+                Screen::Status { .. } | Screen::Custom(_) => {}
             }
         }
     }
@@ -1308,7 +1343,13 @@ impl DevShell {
     }
 
     fn set_notice(&mut self, message: impl Into<String>) {
-        self.notice = Some(message.into());
+        self.notice = Some(Notice::Info(message.into()));
+    }
+
+    /// An armed question — the sentence a second press spends, asked once in
+    /// the band and answered by the next press or a move of the cursor.
+    fn set_question(&mut self, message: impl Into<String>) {
+        self.notice = Some(Notice::Question(message.into()));
     }
 
     fn open_input(&mut self, input: Entity<input::Input>, cx: &mut Context<Self>) {
@@ -1536,7 +1577,7 @@ impl DevShell {
         };
         // Arm, or spend the arm. False means the question was just asked.
         if !view.update(cx, |f, _| f.confirm_or_arm_discard(section, &path)) {
-            self.set_notice(views::files::discard_question(section, &shown));
+            self.set_question(views::files::discard_question(section, &shown));
             return;
         }
         self.notice = None; // the question is spent; the running band speaks next
@@ -1729,7 +1770,7 @@ impl DevShell {
         if command == "diff.discard-hunk"
             && !view.update(cx, |d, _| d.confirm_or_arm_discard_hunk(row))
         {
-            self.set_notice(format!(
+            self.set_question(format!(
                 "discard this hunk of {path}? press again to confirm"
             ));
             return;
@@ -1810,7 +1851,7 @@ impl DevShell {
             self.set_notice("reset cancelled");
             return;
         }
-        self.set_notice(Self::reset_question(&commit));
+        self.set_question(Self::reset_question(&commit));
         // The arm just opened; the question's letters are live this frame.
         self.sync_modes(cx);
     }
@@ -1863,7 +1904,7 @@ impl DevShell {
             // Armed on a different commit — the cursor moved since `g`
             // without a command running to drop the arm. The row moved; the
             // question asks again rather than landing on the wrong sha.
-            self.set_notice(Self::reset_question(&commit));
+            self.set_question(Self::reset_question(&commit));
             return;
         }
         self.notice = None; // the question is spent; the running band speaks next
@@ -1998,7 +2039,7 @@ impl DevShell {
                 ),
                 Rewrite::Drop => format!("drop {}? press again to confirm", commit.short),
             };
-            self.set_notice(asked);
+            self.set_question(asked);
             return;
         }
         self.notice = None; // the question is spent; the running band speaks next
@@ -2135,7 +2176,7 @@ impl DevShell {
             return;
         };
         if !view.update(cx, |b, _| b.confirm_or_arm_rebase(&target)) {
-            self.set_notice(format!(
+            self.set_question(format!(
                 "rebase this branch onto {shown}? press again to confirm"
             ));
             return;
@@ -2266,7 +2307,7 @@ impl DevShell {
         };
         if command == "stashes.drop" && !view.update(cx, |s, _| s.confirm_or_arm_drop(index)) {
             // First press on this row: asked, not acted.
-            self.set_notice(views::stashes::drop_question(&shown));
+            self.set_question(views::stashes::drop_question(&shown));
             return;
         }
         if command == "stashes.drop" {
@@ -2592,7 +2633,7 @@ impl DevShell {
         };
         // Arm, or spend the arm. False means the question was just asked.
         if !view.update(cx, |b, _| b.confirm_or_arm_delete(&target)) {
-            self.set_notice(format!("delete branch {shown}? press again to confirm"));
+            self.set_question(format!("delete branch {shown}? press again to confirm"));
             return;
         }
         self.notice = None; // the question is spent; the running band speaks next
@@ -2751,7 +2792,10 @@ impl DevShell {
                     // once, beside the facts the refresh above puts back on
                     // screen; the next key clears it like any other notice.
                     if let Some(done) = done {
-                        self.notice = Some(done);
+                        // A write's finish is the band's own sentence: said
+                        // once, beside the facts the refresh puts back on
+                        // screen, and cleared by the next key like any other.
+                        self.notice = Some(Notice::Info(done));
                     }
                 }
             }
@@ -4467,7 +4511,15 @@ impl Render for DevShell {
             .child({
                 let message = error
                     .map(|e| (e, c.error))
-                    .or_else(|| notice.clone().map(|n| (n.into(), c.dim)))
+                    // A question takes the error's ink and not this: quiet is
+                    // what hid the arm, and the one sentence a second press
+                    // spends is the one being read.
+                    .or_else(|| {
+                        notice.as_ref().map(|n| match n {
+                            Notice::Info(text) => (text.as_str().into(), c.dim),
+                            Notice::Question(text) => (text.as_str().into(), c.error),
+                        })
+                    })
                     .or_else(|| running.map(|n| (n.into(), c.dim)));
                 let badge: SharedString = match self.input.is_some() {
                     true => "PROMPT".into(),
@@ -5136,7 +5188,7 @@ fn window_options(title: SharedString) -> WindowOptions {
 
 #[cfg(test)]
 mod tests {
-    use super::{config, input, panes, DevShell, Open, Pane, Refresh, Screen, Writes};
+    use super::{config, input, panes, DevShell, Notice, Open, Pane, Refresh, Screen, Writes};
     use crate::views::commits::Commits;
     use gitten_app::cli::Source;
     use gitten_app::jobs::{Event as JobEvent, Generation, Job, Runner, Submitter};
@@ -6177,7 +6229,8 @@ mod tests {
             assert!(
                 shell
                     .notice
-                    .as_deref()
+                    .as_ref()
+                    .map(Notice::text)
                     .unwrap_or_default()
                     .contains("not supported here"),
                 "{:?}",
@@ -7257,7 +7310,8 @@ diff --git a/fresh.txt b/fresh.txt
             assert!(
                 shell
                     .notice
-                    .as_deref()
+                    .as_ref()
+                    .map(Notice::text)
                     .unwrap_or_default()
                     .contains("drop stash@{0}? press again"),
                 "{:?}",
@@ -7289,7 +7343,8 @@ diff --git a/fresh.txt b/fresh.txt
             assert!(
                 shell
                     .notice
-                    .as_deref()
+                    .as_ref()
+                    .map(Notice::text)
                     .unwrap_or_default()
                     .contains("drop stash@{1}?"),
                 "{:?}",
@@ -7314,7 +7369,8 @@ diff --git a/fresh.txt b/fresh.txt
             assert!(
                 shell
                     .notice
-                    .as_deref()
+                    .as_ref()
+                    .map(Notice::text)
                     .unwrap_or_default()
                     .contains("drop stash@{0}?"),
                 "the question followed the keyboard: {:?}",
@@ -7332,7 +7388,8 @@ diff --git a/fresh.txt b/fresh.txt
             assert!(
                 shell
                     .notice
-                    .as_deref()
+                    .as_ref()
+                    .map(Notice::text)
                     .unwrap_or_default()
                     .contains("not supported here"),
                 "{:?}",
@@ -7661,7 +7718,7 @@ diff --git a/fresh.txt b/fresh.txt
         shell.update(cx, |shell, cx| shell.run_command("files.discard", cx));
         shell.read_with(cx, |shell, _| {
             assert_eq!(
-                shell.notice.as_deref(),
+                shell.notice.as_ref().map(Notice::text),
                 Some("discard notes.md? press again to confirm"),
                 "{:?}",
                 shell.notice
@@ -7696,7 +7753,7 @@ diff --git a/fresh.txt b/fresh.txt
         shell.update(cx, |shell, cx| shell.run_command("files.discard", cx));
         shell.read_with(cx, |shell, _| {
             assert_eq!(
-                shell.notice.as_deref(),
+                shell.notice.as_ref().map(Notice::text),
                 Some("delete loose.txt? press again to confirm"),
                 "{:?}",
                 shell.notice
@@ -7730,7 +7787,7 @@ diff --git a/fresh.txt b/fresh.txt
         });
         shell.update(cx, |shell, cx| shell.run_command("files.discard", cx));
         shell.read_with(cx, |shell, _| {
-            let notice = shell.notice.as_deref().unwrap_or_default();
+            let notice = shell.notice.as_ref().map(Notice::text).unwrap_or_default();
             assert!(
                 notice.contains("staged") && notice.contains("unstage"),
                 "the staged row said why it refused: {notice:?}"
@@ -7839,7 +7896,7 @@ diff --git a/fresh.txt b/fresh.txt
         for command in ["diff.stage-hunk", "diff.unstage-hunk", "diff.discard-hunk"] {
             shell.update(cx, |shell, cx| shell.run_command(command, cx));
             shell.read_with(cx, |shell, _| {
-                let notice = shell.notice.as_deref().unwrap_or_default();
+                let notice = shell.notice.as_ref().map(Notice::text).unwrap_or_default();
                 assert!(notice.contains("between commits"), "{command}: {notice:?}");
             });
         }
@@ -7853,7 +7910,7 @@ diff --git a/fresh.txt b/fresh.txt
 
         shell.update(cx, |shell, cx| shell.run_command("diff.discard-hunk", cx));
         shell.read_with(cx, |shell, _| {
-            let notice = shell.notice.as_deref().unwrap_or_default();
+            let notice = shell.notice.as_ref().map(Notice::text).unwrap_or_default();
             assert!(
                 notice.contains("press again") && notice.contains("hunk"),
                 "{notice:?}"
@@ -7882,7 +7939,7 @@ diff --git a/fresh.txt b/fresh.txt
         for command in ["diff.stage-hunk", "diff.unstage-hunk", "diff.discard-hunk"] {
             shell.update(cx, |shell, cx| shell.run_command(command, cx));
             shell.read_with(cx, |shell, _| {
-                let notice = shell.notice.as_deref().unwrap_or_default();
+                let notice = shell.notice.as_ref().map(Notice::text).unwrap_or_default();
                 assert!(notice.contains("files pane"), "{command}: {notice:?}");
             });
         }
@@ -7908,7 +7965,9 @@ diff --git a/added.txt b/added.txt
         wire_runner(&shell, cx);
 
         shell.update(cx, |shell, cx| shell.run_command("diff.stage-hunk", cx));
-        let notice = shell.read_with(cx, |shell, _| shell.notice.clone());
+        let notice = shell.read_with(cx, |shell, _| {
+            shell.notice.as_ref().map(|n| n.text().to_string())
+        });
         assert_ne!(
             notice.as_deref(),
             Some("that hunk adds a new file — stage or unstage it whole from the files pane"),
@@ -7933,7 +7992,7 @@ diff --git a/added.txt b/added.txt
         shell.update(cx, |shell, cx| shell.run_command("diff.stage-hunk", cx));
         shell.read_with(cx, |shell, _| {
             assert_eq!(
-                shell.notice.as_deref(),
+                shell.notice.as_ref().map(Notice::text),
                 Some("diff.stage-hunk is not supported here")
             );
         });
@@ -8494,7 +8553,12 @@ diff --git a/added.txt b/added.txt
         shell.read_with(cx, |shell, _| {
             assert!(shell.input.is_none());
             assert!(
-                shell.notice.as_deref().unwrap_or_default().contains("name"),
+                shell
+                    .notice
+                    .as_ref()
+                    .map(Notice::text)
+                    .unwrap_or_default()
+                    .contains("name"),
                 "the refusal went unsaid: {:?}",
                 shell.notice
             );
@@ -8898,7 +8962,7 @@ diff --git a/added.txt b/added.txt
         assert_eq!(repo.counts(), (0, 1));
         // ...the finish names itself in the band...
         shell.read_with(cx, |shell, _| {
-            assert_eq!(shell.notice.as_deref(), Some("fetched"));
+            assert_eq!(shell.notice.as_ref().map(Notice::text), Some("fetched"));
         });
         // ...and the branches panel re-acquired through the production
         // drain_jobs rails: one behind, drawn where the counts live.
@@ -8911,7 +8975,7 @@ diff --git a/added.txt b/added.txt
         assert_eq!(repo.wrote(), vec!["fetch --all", "pull"]);
         assert_eq!(repo.counts(), (0, 0));
         shell.read_with(cx, |shell, _| {
-            assert_eq!(shell.notice.as_deref(), Some("pulled"));
+            assert_eq!(shell.notice.as_ref().map(Notice::text), Some("pulled"));
         });
         let line = main_upstream_line(&shell, cx);
         assert!(!line.contains('↓'), "in sync reads as a bare name: {line}");
@@ -8927,7 +8991,10 @@ diff --git a/added.txt b/added.txt
         );
         assert_eq!(repo.counts(), (0, 0));
         shell.read_with(cx, |shell, _| {
-            assert_eq!(shell.notice.as_deref(), Some("pushed origin main"));
+            assert_eq!(
+                shell.notice.as_ref().map(Notice::text),
+                Some("pushed origin main")
+            );
         });
         let line = main_upstream_line(&shell, cx);
         assert!(!line.contains('↑'), "{line}");
@@ -9103,7 +9170,12 @@ diff --git a/added.txt b/added.txt
         pump_until(&shell, cx, |_| true);
         assert!(repo.wrote().is_empty(), "an unnamed branch was submitted");
         shell.read_with(cx, |shell, _| {
-            assert!(shell.notice.as_deref().unwrap_or_default().contains("name"));
+            assert!(shell
+                .notice
+                .as_ref()
+                .map(Notice::text)
+                .unwrap_or_default()
+                .contains("name"));
         });
     }
 
@@ -9168,7 +9240,7 @@ diff --git a/added.txt b/added.txt
         shell.update(cx, |shell, cx| shell.run_command("branches.delete", cx));
         shell.read_with(cx, |shell, _| {
             assert_eq!(
-                shell.notice.as_deref(),
+                shell.notice.as_ref().map(Notice::text),
                 Some("delete branch feature? press again to confirm"),
                 "{:?}",
                 shell.notice
@@ -9204,7 +9276,12 @@ diff --git a/added.txt b/added.txt
         shell.update(cx, |shell, cx| shell.run_command("branches.delete", cx));
         shell.read_with(cx, |shell, _| {
             assert!(
-                shell.notice.as_deref().unwrap_or_default().contains("main"),
+                shell
+                    .notice
+                    .as_ref()
+                    .map(Notice::text)
+                    .unwrap_or_default()
+                    .contains("main"),
                 "the question moved to the new row: {:?}",
                 shell.notice
             );
