@@ -1086,6 +1086,9 @@ impl Diff {
                 if self.layouts.len() >= 2 {
                     self.apply_layout((self.current + 1) % self.layouts.len(), host);
                 }
+                // The rows are about to be re-arranged; whatever the question
+                // was armed against may land somewhere else in them.
+                self.armed_hunk = None;
                 return true;
             }
             "diff.cycle-wrap" => {
