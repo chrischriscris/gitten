@@ -4582,16 +4582,16 @@ impl Render for DevShell {
                     true => "PROMPT".into(),
                     false => which.to_uppercase().into(),
                 };
-                let hints = match (&message, self.input.is_some()) {
-                    (Some(_), _) | (None, true) => Vec::new(),
+                let (hints, truncated) = match (&message, self.input.is_some()) {
+                    (Some(_), _) | (None, true) => (Vec::new(), false),
                     (None, false) => {
-                        let budget = window.viewport_size().width
-                            - px(host.font.char_width()
-                                * (badge.chars().count() as f32
-                                    + 6.0
-                                    + chrome::version().len() as f32
-                                    + 4.0));
-                        chrome::hints(&host, &self.modes, which, f32::from(budget).max(0.0))
+                        let width = f32::from(window.viewport_size().width);
+                        chrome::hints(
+                            &host,
+                            &self.modes,
+                            which,
+                            chrome::hints_budget(&host, width, &badge),
+                        )
                     }
                 };
                 match message {
@@ -4608,7 +4608,7 @@ impl Render for DevShell {
                         .text_color(rgb(c.dim))
                         .child(div().min_w_0().truncate().text_color(rgb(ink)).child(text))
                         .into_any_element(),
-                    None => chrome::status_bar(&host, badge, &hints, chrome::version())
+                    None => chrome::status_bar(&host, badge, &hints, truncated, chrome::version())
                         .into_any_element(),
                 }
             })
