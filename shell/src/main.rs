@@ -3630,6 +3630,7 @@ impl DevShell {
         if let Some(input) = self.input.as_ref() {
             if let Some(text) = input.read(cx).selected_text() {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
+                self.set_notice("copied");
             }
             return;
         }
@@ -3648,6 +3649,7 @@ impl DevShell {
                 let text = view.read(cx).cursor_text();
                 if !text.is_empty() {
                     cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    self.set_notice("copied");
                 }
             }
             Some(Screen::Files { view, .. }) => {
@@ -3658,6 +3660,7 @@ impl DevShell {
                     // Letters first, then the path — the spelling git itself
                     // prints, so it pastes into a shell usefully.
                     cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    self.set_notice("copied");
                 }
             }
             Some(Screen::Stashes { view, .. }) => {
@@ -3667,6 +3670,7 @@ impl DevShell {
                 if !text.is_empty() {
                     // The address first, then the message — same rule.
                     cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    self.set_notice("copied");
                 }
             }
             Some(Screen::Branches { view, .. }) => {
@@ -3676,6 +3680,7 @@ impl DevShell {
                 let text = view.read(cx).cursor_text();
                 if !text.is_empty() {
                     cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    self.set_notice("copied");
                 }
             }
             Some(Screen::Custom(pane)) => {
