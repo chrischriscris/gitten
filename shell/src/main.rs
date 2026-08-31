@@ -1367,6 +1367,26 @@ impl DevShell {
             previous.update(cx, |input, cx| input.cancel(cx));
         }
         self.sync_modes(cx);
+        // The field speaks its own exits, because the status hints are blanked
+        // while it stands and a prompt that hides how to leave it is a modal
+        // with no door. Resolved here and once: `sync_modes` has just pushed
+        // the input mode, so `live_keys_for` answers what a press means right
+        // now — a key an inner mode took over is never named — and the field
+        // does not re-walk the keymap per frame for a keyboard it holds.
+        let host = config::host(cx);
+        let accept = host
+            .keys
+            .live_keys_for("input.accept", &self.modes)
+            .into_iter()
+            .next();
+        let cancel = host
+            .keys
+            .live_keys_for("input.cancel", &self.modes)
+            .into_iter()
+            .next();
+        if let Some(field) = self.input.as_ref() {
+            field.update(cx, |field, _| field.set_exits(accept, cancel));
+        }
         cx.notify();
     }
 

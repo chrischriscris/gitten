@@ -7,6 +7,7 @@
 //! local cursor and clipboard actions are ordinary text-field mechanics.
 
 use crate::config;
+use gitten_core::theme::ChromePalette;
 use gpui::prelude::*;
 use gpui::*;
 use std::ops::Range;
@@ -79,6 +80,11 @@ pub enum Event {
 
 pub struct Input {
     focus: FocusHandle,
+    /// The prompt's name, stored already uppercased: every other chrome label
+    /// — the section headings, the `PROMPT` badge this field sits above — is
+    /// uppercase, and a label that renders lowercase reads as a third kind of
+    /// text. Uppercased once, here, so the call sites stay lowercase data and
+    /// the frame never pays for the conversion.
     label: SharedString,
     placeholder: SharedString,
     content: String,
@@ -88,6 +94,12 @@ pub struct Input {
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
     selecting: bool,
+    /// The two ways out, resolved once when the shell opened the prompt: the
+    /// live key for `input.accept` and for `input.cancel`, `None` until then.
+    /// An empty string means that exit has no live key and draws nothing —
+    /// naming a key that would not fire is the one lie a prompt of keys must
+    /// not tell, and this is the highest-stakes text entry in the app.
+    exits: Option<(SharedString, SharedString)>,
 }
 
 impl Input {
@@ -101,7 +113,7 @@ impl Input {
         let end = content.len();
         Self {
             focus: cx.focus_handle(),
-            label: label.into(),
+            label: label.into().to_uppercase().into(),
             placeholder: placeholder.into(),
             content,
             selected: end..end,
@@ -110,6 +122,7 @@ impl Input {
             last_layout: None,
             last_bounds: None,
             selecting: false,
+            exits: None,
         }
     }
 
@@ -147,6 +160,21 @@ impl Input {
     pub fn cancel(&mut self, cx: &mut Context<Self>) {
         self.marked = None;
         cx.emit(Event::Cancelled);
+    }
+
+    /// Names the two exits, resolved by the shell at open time — the mode
+    /// stack the prompt will run under exists only there, and a key resolved
+    /// per frame would re-walk the keymap for a field whose keyboard does not
+    /// change while it holds it. `None` leaves the field hintless, which is
+    /// the honest state for a test-built field: no shell, no live keys.
+    pub fn set_exits(&mut self, accept: Option<String>, cancel: Option<String>) {
+        self.exits = match (accept, cancel) {
+            (None, None) => None,
+            (accept, cancel) => Some((
+                accept.map(SharedString::from).unwrap_or_default(),
+                cancel.map(SharedString::from).unwrap_or_default(),
+            )),
+        };
     }
 
     fn cursor(&self) -> usize {
@@ -704,7 +732,10 @@ impl Render for Input {
             .items_center()
             .gap_2()
             .h(px(34.0))
-            .px_4()
+            // The status strip's inset, not the row pad: the `PROMPT` badge
+            // sits directly below this field and the two are one column — a
+            // prompt at a third inset stepped 8px off the bar that names it.
+            .px_2()
             .bg(rgb(chrome.status_bg))
             .border_t_1()
             .border_color(rgb(chrome.border))
@@ -746,7 +777,45 @@ impl Render for Input {
                         selection: rgb(chrome.selection_bg),
                     }),
             )
+            .child(exit_hints(chrome, &self.exits))
     }
+}
+
+/// The prompt's exits, at the field's right edge: `enter accept · esc cancel`.
+///
+/// While a prompt stands, the status hints are blanked on the reasoning that
+/// the field owns the keyboard and speaks for itself — but the field said
+/// nothing, and the two keys that matter most in the app were drawn nowhere.
+/// So the field speaks: the key bright and the verb dim, the same pairing the
+/// status bar draws its hints in, because that bar is where the eye already
+/// reads keys. The keys arrive resolved against the live mode stack (see
+/// [`Input::set_exits`]); an exit with no live key draws nothing — the
+/// panel-of-keys rule — and a `·` between the two, the separator the help
+/// heading uses, so the row reads as two exits and not one sentence.
+fn exit_hints(c: ChromePalette, exits: &Option<(SharedString, SharedString)>) -> Div {
+    let Some((accept, cancel)) = exits else {
+        return div();
+    };
+    let pair = |key: &SharedString, label: &'static str| {
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(div().flex_none().text_color(rgb(c.fg)).child(key.clone()))
+            .child(div().flex_none().text_color(rgb(c.dim)).child(label))
+    };
+    let mut row = div().flex_none().flex().items_center().gap_2();
+    if !accept.is_empty() {
+        row = row.child(pair(accept, "accept"));
+    }
+    if !accept.is_empty() && !cancel.is_empty() {
+        row = row.child(div().flex_none().text_color(rgb(c.faint)).child("·"));
+    }
+    if !cancel.is_empty() {
+        row = row.child(pair(cancel, "cancel"));
+    }
+    row
 }
 
 fn floor_boundary(text: &str, offset: usize) -> usize {
