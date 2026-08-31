@@ -793,7 +793,27 @@ impl Diff {
             // Reset first: arrange() has already been given today's host, and the
             // width half of `applied` must re-fire on the rebuilt renderers.
             self.applied = (0.0, "");
+            // Same presentation before and after — only the glyph metrics moved — so
+            // unlike a layout *change* the selection and the exact cursor row both
+            // still mean something. `apply_layout` is written for the change and
+            // drops both (a fraction of the old row count, no selection); stash them
+            // and hand them back. Sound only because `apply_layout` leaves fresh
+            // renderers with `applied` reset, so the `changed` branch below always
+            // runs in this same call and re-resolves both against the rebuilt order
+            // table — this is not restoring stale state.
+            //
+            // `armed_hunk` is not carried the same way: it is a pending
+            // *destructive* action, and making someone re-arm a discard after a
+            // config reload is the safe direction to be wrong in, unlike a
+            // selection.
+            let keep = self.sel.take();
+            let cursor = self.view.get().cursor();
             self.apply_layout(self.current, host);
+            let mut v = self.view.get();
+            v.go_to(cursor.min(self.order.len().saturating_sub(1)));
+            self.view.set(v);
+            self.defer_show(v);
+            self.sel = keep;
         }
         let wrap = host.wrap.at(self.wrap);
         if (width, wrap.name()) == self.applied || width <= 0.0 {
@@ -4389,6 +4409,54 @@ diff --git a/b.md b/b.md
             builds.get(),
             rebuilt,
             "the rebuild fired again on an unchanged frame"
+        );
+    }
+
+    #[test]
+    fn a_font_edit_keeps_the_selection_and_the_row() {
+        // A font edit is not a presentation change: same rows, same row count,
+        // only the glyph metrics moved. Unlike `apply_layout`'s other callers,
+        // the selection and the cursor's logical row both still mean something
+        // afterwards, and both should survive.
+        let host = Host::new();
+        let mut diff = Diff::with_layouts(parse_unified_diff(TWO_FILES), &host, Layouts::builtin());
+        diff.reflow(width_for(40, &host), &host);
+
+        diff.sel = Some(select(&diff, (1, 0), (3, 9)));
+        let text = diff.selection();
+        assert!(!text.is_empty());
+
+        // A known row, past the start, so a fall-back to 0 would not
+        // accidentally pass.
+        let mut v = diff.view.get();
+        v.go_to(3);
+        diff.view.set(v);
+        let logical_before = diff.order[diff.view.get().cursor()].logical();
+
+        let mut bigger = Host::new();
+        bigger.font.size = 18.0;
+        diff.reflow(width_for(40, &host), &bigger);
+
+        assert!(diff.sel.is_some(), "a font edit threw the selection away");
+        assert_eq!(
+            diff.selection(),
+            text,
+            "the same bytes, at the same width, under a new font"
+        );
+        // The visual index may legitimately have moved if the new font
+        // changed the column budget; the row it names must not have.
+        let logical_after = diff.order[diff.view.get().cursor()].logical();
+        assert_eq!(
+            logical_after, logical_before,
+            "the cursor landed on a different logical row"
+        );
+
+        // The other half of the rule still holds: an actual presentation
+        // change still drops the selection.
+        diff.apply_layout(1, &host);
+        assert!(
+            diff.sel.is_none(),
+            "a layout change kept a selection anchored to somebody else's rows"
         );
     }
 
