@@ -1033,6 +1033,12 @@ impl Screen {
 /// `gitten.toml`.
 const RESET_MODE: &str = "reset";
 
+/// The keymap mode the message overlay pushes while it stands — see
+/// [`DevShell::sync_modes`]. It binds nothing itself: the overlay is a reading
+/// pane, and its exits (`esc`, the copy) answer to whatever the keymap already
+/// says, so a config file can rebind them and the panel follows.
+const MESSAGE_MODE: &str = "message";
+
 /// What the band says, and why it is saying it. Two, because the two sentences
 /// are not the same sentence: an info describes what was tried, and a question
 /// is the one the keyboard is about to spend — the loudest thing on screen,
@@ -1060,6 +1066,54 @@ impl std::ops::Deref for Notice {
 
     fn deref(&self) -> &str {
         self.text()
+    }
+}
+
+/// A refusal, kept whole. The band shows [`GitError::summary`]; the message
+/// overlay shows [`GitError::full`] — the argv prefix is part of the answer
+/// when the text is being read rather than glanced at, and the summary is the
+/// glance.
+#[derive(Clone, Debug, PartialEq)]
+struct GitError {
+    /// The first line of git's own words, argv prefix stripped.
+    summary: SharedString,
+    /// Everything git said, verbatim — the argv prefix included, because
+    /// "which command" is part of the answer when the text is being read
+    /// rather than glanced at.
+    full: SharedString,
+}
+
+impl GitError {
+    fn new(full: impl Into<SharedString>) -> Self {
+        let full = full.into();
+        // The acquisition layer's shape is `git {args}: {stderr}` — strip that
+        // prefix and the summary is git's first line, not the argv's. An
+        // error that arrived by another road is already its own summary.
+        let body = match full.strip_prefix("git ") {
+            Some(rest) => match rest.find(": ") {
+                Some(at) => &rest[at + ": ".len()..],
+                None => rest,
+            },
+            None => full.as_ref(),
+        };
+        let summary = body
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or(body);
+        Self {
+            summary: summary.into(),
+            full,
+        }
+    }
+}
+
+/// An error reads as its headline: the same `&str` the band shows, so a test
+/// (or a reader) asks the error for words and gets the glance, not the record.
+impl std::ops::Deref for GitError {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.summary
     }
 }
 
@@ -1144,7 +1198,10 @@ struct DevShell {
     /// A failed re-diff. Shown, not swallowed: the usual cause is a repository
     /// that moved under the window, and silently keeping the old rows would be a
     /// diff labelled with an algorithm that did not produce it.
-    error: Option<SharedString>,
+    error: Option<GitError>,
+    /// Whether the error's full text is on screen — `message.show` opened it,
+    /// `esc` or anything that clears the error closes it.
+    show_message: bool,
     /// One sentence about what a key just did — an unbound chord, a command
     /// that resolved to nothing this screen can do, or a write that named
     /// its own finish (the sync verbs: pushed, pulled, fetched). Cleared by
@@ -1330,6 +1387,9 @@ impl DevShell {
         }
         if self.help {
             self.modes.push(help::MODE);
+        }
+        if self.show_message && self.error.is_some() {
+            self.modes.push(MESSAGE_MODE);
         }
         self.pending.clear();
         self.open = None;
@@ -2791,7 +2851,7 @@ impl DevShell {
                     ..
                 } => {
                     self.running = None;
-                    self.error = Some(error.into());
+                    self.error = Some(GitError::new(error));
                     // A refusal is not proof the repository stood still: git
                     // can answer nonzero with work already left behind, and
                     // the conflicted revert is the case that proves it — its
@@ -2897,7 +2957,7 @@ impl DevShell {
         self.refresh_pending = self.refresh_pending.saturating_sub(1);
         if self.refresh_pending == 0 {
             if self.error.is_none() {
-                self.error = self.refresh_error.take().map(Into::into);
+                self.error = self.refresh_error.take().map(GitError::new);
             } else {
                 self.refresh_error = None;
             }
@@ -2969,7 +3029,7 @@ impl DevShell {
             }
             // The old rows stay on screen, which is the right failure: they are
             // still a true diff, just not the one that was asked for.
-            Err(e) => self.error = Some(e.into()),
+            Err(e) => self.error = Some(GitError::new(e)),
         }
         cx.notify();
     }
@@ -3038,6 +3098,13 @@ impl DevShell {
     /// lets a screen override `back` one day without this file having to know.
     fn run_command(&mut self, command: &str, cx: &mut Context<Self>) {
         match command {
+            "message.show" => {
+                // Only meaningful while an error stands: the overlay is the
+                // error's full text, and there is nothing else to show.
+                if self.error.is_some() {
+                    self.show_message = !self.show_message;
+                }
+            }
             "quit" => cx.quit(),
             "help" => {
                 self.help = !self.help;
@@ -3219,9 +3286,23 @@ impl DevShell {
     /// lighter. A selection is inside a list, so it goes after the region
     /// switch; the diff's own selection stays until its rows are replaced.
     fn back(&mut self, cx: &mut Context<Self>) {
+        if self.show_message {
+            self.show_message = false;
+            self.sync_modes(cx);
+            cx.notify();
+            return;
+        }
         if self.help {
             self.help = false;
             self.sync_modes(cx);
+            return;
+        }
+        // An error is a message, not a context: it stands until dismissed, and
+        // `esc` dismisses it before `back` moves anything else.
+        if self.error.is_some() {
+            self.error = None;
+            self.sync_modes(cx);
+            cx.notify();
             return;
         }
         if self.open.take().is_some() {
@@ -3514,7 +3595,7 @@ impl DevShell {
                         }
                     }
                     Ok(_) => {}
-                    Err(e) => shell.error = Some(e.into()),
+                    Err(e) => shell.error = Some(GitError::new(e)),
                 }
                 cx.notify();
             });
@@ -4381,7 +4462,7 @@ impl Render for DevShell {
 
         let which = self.active_view_name();
         let strip = self.strip(&host, cx);
-        let error = self.error.clone();
+        let error = self.error.as_ref().map(|e| e.summary.clone());
         let notice = self.notice.clone();
         let running = self
             .running
@@ -4628,6 +4709,20 @@ impl Render for DevShell {
                         )
                     }
                 };
+                // An error says how to leave, where it stands: `esc` dismisses,
+                // the message key opens the full text. Live keys only — a hint
+                // naming a dead key is the one lie a panel of keys must never
+                // tell.
+                let exits = self
+                    .error
+                    .as_ref()
+                    .and_then(|_| {
+                        host.keys
+                            .live_keys_for("message.show", &self.modes)
+                            .into_iter()
+                            .next()
+                    })
+                    .map(|key| SharedString::from(format!("· esc dismiss · {key} full text")));
                 match message {
                     Some((text, ink)) => div()
                         .flex_none()
@@ -4641,6 +4736,13 @@ impl Render for DevShell {
                         .border_color(rgb(c.border))
                         .text_color(rgb(host.theme.dim_on(theme::Surface::Status)))
                         .child(div().min_w_0().truncate().text_color(rgb(ink)).child(text))
+                        // An error says how to leave, in the faint ink of
+                        // furniture: the summary is the sentence, this is the
+                        // small print. No live key, no piece — the help
+                        // overlay's rule.
+                        .children(
+                            exits.map(|e| div().flex_none().text_color(rgb(c.faint)).child(e)),
+                        )
                         .into_any_element(),
                     None => chrome::status_bar(&host, badge, &hints, truncated, chrome::version())
                         .into_any_element(),
@@ -4680,9 +4782,54 @@ impl Render for DevShell {
             .children(
                 self.help
                     .then(|| help::overlay(&config::host(cx), &self.modes, &self.help_scroll)),
+            )
+            // The message overlay, over even the help: it exists because the
+            // band's one truncated line was not the whole of git's answer, so
+            // the whole of the answer is the one thing it must show.
+            .children(
+                self.show_message
+                    .then_some(self.error.as_ref())
+                    .flatten()
+                    .map(|error| message_overlay(error, &host)),
             );
         root
     }
+}
+
+/// The error's whole answer, word-wrapped, over everything. The heading is
+/// git's own first line in the error's ink; the body is everything git said,
+/// argv prefix included — the band's one truncated line is the glance, this is
+/// the reading. No `whitespace_nowrap`: a long answer wraps, because a panel
+/// that clips its tail is the band with more room.
+fn message_overlay(error: &GitError, host: &Host) -> AnyElement {
+    let c = &host.theme.chrome;
+    div()
+        .occlude()
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            div()
+                .max_w(px(720.0))
+                .max_h_full()
+                .overflow_hidden()
+                .bg(rgb(c.title_bg))
+                .border_1()
+                .border_color(rgb(c.faint))
+                .rounded(px(4.))
+                .p(px(16.0))
+                .text_size(px(host.font.size))
+                .font_family(host.font.family.clone())
+                .text_color(rgb(c.dim))
+                // The glance, then the record. No `whitespace_nowrap`: a long
+                // answer wraps, because a panel that clips its tail is the
+                // band with more room.
+                .child(div().text_color(rgb(c.error)).child(error.summary.clone()))
+                .child(error.full.clone()),
+        )
+        .into_any_element()
 }
 
 fn main() {
@@ -5132,6 +5279,7 @@ fn main() {
                     refresh_pending: 0,
                     refresh_error: None,
                     running: None,
+                    show_message: false,
                     input: None,
                     prompt: None,
                     search_live: None,
@@ -5473,6 +5621,7 @@ mod tests {
                 refresh_pending: 0,
                 refresh_error: None,
                 running: None,
+                show_message: false,
                 input: None,
                 prompt: None,
                 search_live: None,
@@ -7628,7 +7777,9 @@ diff --git a/fresh.txt b/fresh.txt
         shell.read_with(cx, |shell, _| {
             assert_eq!(
                 shell.error.as_deref(),
-                Some("git commit: hook declined"),
+                // The summary, not the record: git's argv is stripped, git's
+                // words are not.
+                Some("hook declined"),
                 "the repository's own words reached the band"
             );
             assert!(shell.running.is_none(), "the job still reads as running");

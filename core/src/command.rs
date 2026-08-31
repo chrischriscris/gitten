@@ -326,6 +326,10 @@ impl Keymap {
         // commit graph is drawn out of the same one. Shifted, because cycling a
         // theme is a thing done twice a month and `t` is worth more than that.
         bind(GLOBAL, "T", "theme.cycle");
+        // ` is unclaimed by every mode and untyped by lazygit's defaults, and
+        // the message it opens is read once and dismissed — a key at the edge
+        // of the keyboard for a panel at the edge of the app's life.
+        bind(GLOBAL, "`", "message.show");
         bind(GLOBAL, "esc", "back");
 
         bind(GLOBAL, "j", "view.down");
@@ -1110,6 +1114,11 @@ impl Commands {
             (
                 "copy.selection",
                 "copy the selection, or the row the cursor is on",
+                None,
+            ),
+            (
+                "message.show",
+                "show the full text of the last message",
                 None,
             ),
         ] {
