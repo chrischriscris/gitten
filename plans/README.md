@@ -128,12 +128,26 @@ integrator owns this table and updates it as waves land.
 | 028 | Make the docs say what the code does | P2 | M | — | TODO — **partly obsolete**: 023 already fixed `check.yml`'s stale job list, and the Linux/keyboard claims may have been overtaken on `full/full`. Re-audit rather than execute |
 | 029 | Author initials clear a contrast floor, because they are text | P3 | S | replaces 027 | TODO — the surviving half of 027: initials are glyphs on a background they do not choose, and 0020 does not cover them. A guard for hand-written palettes, not a fix |
 | 030 | Surface budget exhaustion, so the checker can hold myers exact again | P3 | M | 023 | TODO — restores the exactness 023 had to drop. Referenced by name in `git/examples/diffcheck.rs` |
-| 031 | The diff pane shows where the keyboard is and what is armed | P1 | L | — | TODO |
-| 032 | Git's own words survive: errors readable/dismissable/copyable; jobs show elapsed time | P1 | M | 031 softly (same band lines) | TODO |
-| 033 | The help overlay is modal, scrollable, and aligned | P1 | M | — | TODO |
-| 034 | The contrast report measures everything drawn; quiet text gets a floor | P2 | M | 031 softly (covers the new surface) | TODO |
-| 035 | One chip language in the chrome; the prompt says its exits | P2 | S–M | 033 softly (both touch help.rs) | TODO |
-| 036 | The views keep their own rules: truncation, empty states, the split's edges | P2 | M | 031 softly (same render arms) | TODO |
+| 031 | The diff pane shows where the keyboard is and what is armed | P1 | L | — | **MERGED** (pass 7, PR #28, merge `9a63a90`) — `Surface::Cursor` + `RowState` on the `Rows` seam; cursor bar, armed tint, `Notice::Question`; 390 core / 332 shell; contrast report clean |
+| 032 | Git's own words survive: errors readable/dismissable/copyable; jobs show elapsed time | P1 | M | 031 softly (same band lines) | **MERGED** (pass 7, PR #32, merge `871061e`) — `GitError` panel + `message.show` (backtick); job elapsed time; copy notices. Its CI lint failed on `useless_conversion` the integrator had already fixed downstream in #33 — see the follow-up note |
+| 033 | The help overlay is modal, scrollable, and aligned | P1 | M | — | **MERGED** (pass 7, PR #29, merge `a86b0b8`) — `help::MODE` owns the keyboard; scrollable rows; measured key column; rebased onto 031's `main.rs` and re-verified |
+| 034 | The contrast report measures everything drawn; quiet text gets a floor | P2 | M | 031 softly (covers the new surface) | **MERGED** (pass 7, PR #31, merge `7bc6530`) — marker/quiet/dim resolve; `Surface::Title`/`Status` (11 surfaces); the owner chose the structural dim fix over hex retuning at the plan's STOP; matrix pinned as `chrome_text_inks_clear_the_text_floor_where_they_are_drawn`, mutation-validated |
+| 035 | One chip language in the chrome; the prompt says its exits | P2 | S–M | 033 softly (both touch help.rs) | **MERGED** (pass 7, PR #30, merge `35dcccf`) — `chrome::RADIUS`, live prompt exit hints, one hints budget with an honest `…`. Step 2 SKIP-AND-REPORTed: `chrome.raised`/`keycap` live only in the owner's uncommitted design pass |
+| 036 | The views keep their own rules: truncation, empty states, the split's edges | P2 | M | 031 softly (same render arms) | **MERGED** (pass 7, PR #33, merge `545faeb`) — paths give up the directory's head, `chrome::empty_line` (resolving through `quiet_on`, not the raw `faint` it was drafted with), split pads in pixels; also restored the keycap numeral's resolution lost in a 034 rebase resolution |
+
+## Pass 7 follow-ups — surfaced by execution, recorded not folded
+
+- #32's CI lint failed on a `useless_conversion` after merge (the integrator
+  merged on UNSTABLE — a mistake not to repeat); the fix had already landed
+  via #33's rebase, so the tip is clean, but the lesson stands: never merge
+  before the checks are green, and re-run clippy after every conflict
+  resolution, not just tests.
+- 035's Step 2 (raised surfaces) is SKIP-AND-REPORTed until the owner's
+  `chrome.raised`/`chrome.keycap` design pass lands; 035's matrix rows for the
+  two hover fills go with it (see 034's example).
+- A rebase resolution during 034 briefly took the keycap's border ink for its
+  numeral; caught and restored in #33. Resolution conflicts in overlapping
+  passes need the plan's own test suite re-read, not just re-run.
 
 ## Pass 3 follow-ups — surfaced by reviewers, pre-existing, not pass regressions
 
