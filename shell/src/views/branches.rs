@@ -58,10 +58,11 @@ pub(crate) enum Row {
 /// never consults the theme, cycles nothing and allocates nothing for it.
 ///
 /// The design's grammar: a filled ● is a ref living locally, tinted by what
-/// the row *is* — HEAD alone wears the accent, other locals borrow graph-lane
-/// inks so each branch keeps one colour across the app — while a hollow ○
-/// marks a remote-tracking copy, faint because it names what a fetch already
-/// fetched, not anything checked out here.
+/// the row *is* — HEAD alone wears the accent, every other local an ink keyed
+/// by a stable hash of its **name** (the fold [`Theme::author`] uses), so a
+/// branch keeps one colour across refreshes, re-orders and other panes'
+/// opinions — while a hollow ○ marks a remote-tracking copy, faint because it
+/// names what a fetch already fetched, not anything checked out here.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Dot {
     /// `●` locally, `○` for the remote copies.
@@ -113,8 +114,13 @@ pub(crate) struct LocalRow {
     /// True when a pair exists but cannot be compared — the state the word
     /// *gone* names, drawn faint so it never reads as "in sync".
     pub gone: bool,
-    /// The row's dot, decided once — HEAD accent, otherwise lane ink.
+    /// The row's dot, decided once — HEAD accent, otherwise an ink keyed by
+    /// the branch's name, never its place in the list.
     pub dot: Dot,
+    /// True when git has this branch checked out in **another** worktree —
+    /// a checkout here would be refused, and the right-edge word `worktree`
+    /// says so. Never HEAD's own branch, which is this worktree's checkout.
+    pub worktree: bool,
 }
 
 /// One remote-tracking branch, as the last fetch left it.
@@ -187,10 +193,13 @@ fn upstream_counts(u: &Upstream) -> (Option<SharedString>, bool) {
 /// then the local branches, then the remote group. Pure — the unit-tested
 /// half of a refresh. The theme rides along because each dot's ink is a
 /// flatten-time decision: it lands on the row, not on the render path.
+/// `taken` names the branches git has checked out in another worktree —
+/// a display garnish, never a state the pane acts on.
 pub(crate) fn flatten(
     local: &[Branch],
     remotes: &[RemoteBranch],
     head: Option<&HeadState>,
+    taken: &[String],
     theme: &Theme,
 ) -> Vec<Row> {
     let mut rows = Vec::new();
@@ -210,12 +219,14 @@ pub(crate) fn flatten(
             count: SharedString::from(local.len().to_string()),
             section: Section::Local,
         });
-        rows.extend(local.iter().enumerate().map(|(i, b)| {
+        let taken: std::collections::HashSet<&str> = taken.iter().map(|s| s.as_str()).collect();
+        rows.extend(local.iter().map(|b| {
             let (counts, gone) = b.upstream.as_ref().map_or((None, false), upstream_counts);
-            // HEAD's branch alone wears the accent; every other local keeps
-            // one lane ink for its whole life in this pane. The index is the
-            // row's place among locals whether or not HEAD marks it, so a
-            // checkout that moves paints only the one dot it moved.
+            // HEAD's branch alone wears the accent; every other local's ink is
+            // a stable hash of its **name** into the lane palette, so it keeps
+            // one colour across refreshes, re-orders and whatever place the
+            // list gives it — the name is the only thing a refresh never
+            // moves.
             let dot = match b.head {
                 true => Dot {
                     glyph: "●",
@@ -223,15 +234,21 @@ pub(crate) fn flatten(
                 },
                 false => Dot {
                     glyph: "●",
-                    color: theme.lane(i),
+                    color: theme.name_lane(b.name.as_bytes()),
                 },
             };
+            // A branch checked out elsewhere cannot be checked out here, and
+            // the row says so at its right edge. HEAD's own branch is *this*
+            // worktree's checkout — git never has a branch in two — so it is
+            // excluded by rule, not by the read's courtesy.
+            let worktree = !b.head && taken.contains(b.name.to_string_lossy().as_ref());
             Row::Local(LocalRow {
                 name: b.name.clone(),
                 name_text: b.display().into_owned().into(),
                 counts,
                 gone,
                 dot,
+                worktree,
             })
         }));
     }
@@ -325,6 +342,7 @@ pub(crate) fn prepare(
     local: Vec<Branch>,
     remotes: Vec<RemoteBranch>,
     head: Option<HeadState>,
+    taken: Vec<String>,
     theme: &Theme,
     describe: &str,
 ) -> Prepared {
@@ -334,7 +352,7 @@ pub(crate) fn prepare(
         local.len(),
         remotes.len()
     );
-    let rows = flatten(&local, &remotes, head.as_ref(), theme);
+    let rows = flatten(&local, &remotes, head.as_ref(), &taken, theme);
     let head = head_info(head.as_ref(), &local);
     eprintln!("branches: {label} · flatten {:.0?}", t.elapsed());
     Prepared { rows, label, head }
@@ -845,6 +863,20 @@ fn row(e: &Row, host: &Host, current: bool, focused: bool, armed: bool) -> AnyEl
         Row::Local(l) => chrome::list_row(host, current, focused, ROW_H)
             .child(dot(&l.dot))
             .child(name(l.name_text.clone(), None))
+            // The worktree mark: a word, not a glyph — the app ships no
+            // icons, and at the right edge, where `(gone)` already lives, a
+            // word costs nothing. Quiet through `quiet_on` like every other
+            // state word here, never raw `faint`, and it rides **before** the
+            // distance cell. When that cell is absent the mark takes the
+            // auto margin itself, so the word still lands at the far end.
+            .children(l.worktree.then(|| {
+                div()
+                    .flex_none()
+                    .when(l.counts.is_none(), |d| d.ml_auto())
+                    .when(l.counts.is_some(), |d| d.pl(px(ch)))
+                    .text_color(rgb(host.theme.quiet_on(c.bg)))
+                    .child("worktree")
+            }))
             .children(l.counts.clone().map(|text| {
                 div()
                     .flex_none()
@@ -953,6 +985,7 @@ mod tests {
             &[local("feature", false), local("main", true)],
             &[remote("main"), remote("wip")],
             None,
+            &[],
             &t,
         );
         assert_eq!(
@@ -995,7 +1028,7 @@ mod tests {
         }
         // An empty group draws no heading at all.
         assert_eq!(
-            outline(&flatten(&[local("main", true)], &[], None, &t)),
+            outline(&flatten(&[local("main", true)], &[], None, &[], &t)),
             vec!["[local·1]", "●main"]
         );
     }
@@ -1007,6 +1040,7 @@ mod tests {
             &[local("main", false)],
             &[],
             Some(&HeadState::Detached { commit: sha() }),
+            &[],
             &t,
         );
         assert_eq!(
@@ -1028,6 +1062,7 @@ mod tests {
                 name: RefName::from("main"),
                 commit: None,
             }),
+            &[],
             &t,
         );
         assert!(!outline(&attached).iter().any(|r| r.contains("detached")));
@@ -1045,6 +1080,7 @@ mod tests {
             ],
             &[],
             None,
+            &[],
             &t,
         );
         assert_eq!(
@@ -1071,7 +1107,7 @@ mod tests {
         // branch tracks no longer exists locally. A `0` here would invite a
         // push that fixes nothing.
         let t = Theme::dark();
-        let rows = flatten(&[tracked("old", false, None, None)], &[], None, &t);
+        let rows = flatten(&[tracked("old", false, None, None)], &[], None, &[], &t);
         assert_eq!(outline(&rows), vec!["[local·1]", "●old (gone)"]);
         // The row remembers why, for the faint ink the draw gives it.
         match &rows[1] {
@@ -1098,6 +1134,7 @@ mod tests {
                 commit: sha(),
             }],
             None,
+            &[],
             &t,
         );
         match &rows[1] {
@@ -1126,6 +1163,7 @@ mod tests {
             &[local("main", true)],
             &[remote("main")],
             Some(&HeadState::Detached { commit: sha() }),
+            &[],
             &t,
         );
         assert_eq!(
@@ -1155,6 +1193,7 @@ mod tests {
             vec![local("feature", false), local("main", true)],
             Vec::new(),
             None,
+            Vec::new(),
             &host.theme,
             "",
         ));
@@ -1197,6 +1236,7 @@ mod tests {
             vec![local("feature", false), local("main", true)],
             Vec::new(),
             None,
+            Vec::new(),
             &host.theme,
             "",
         ));
@@ -1217,6 +1257,7 @@ mod tests {
                 vec![local("feature", false), local("main", true)],
                 Vec::new(),
                 None,
+                vec![],
                 &host.theme,
                 "",
             ),
@@ -1230,7 +1271,14 @@ mod tests {
         // The same when the branch itself is gone under the arm.
         assert!(b.confirm_or_arm_delete(&target));
         b.replace_prepared(
-            prepare(vec![local("main", true)], Vec::new(), None, &host.theme, ""),
+            prepare(
+                vec![local("main", true)],
+                Vec::new(),
+                None,
+                vec![],
+                &host.theme,
+                "",
+            ),
             &host,
         );
         assert_eq!(b.armed_row(), None);
@@ -1250,12 +1298,13 @@ mod tests {
             vec![local("main", true)],
             vec![remote("main")],
             None,
+            Vec::new(),
             &host.theme,
             "gitten (main)",
         );
         assert_eq!(p.label, "gitten (main) · 1 local · 1 remote");
 
-        let empty = prepare(Vec::new(), Vec::new(), None, &host.theme, "gitten");
+        let empty = prepare(Vec::new(), Vec::new(), None, vec![], &host.theme, "gitten");
         assert_eq!(empty.label, "gitten · 0 local · 0 remote");
         assert_eq!(empty.rows.len(), 0);
         assert_eq!(empty.head, None, "no branch, nothing to name");
@@ -1276,6 +1325,7 @@ mod tests {
             vec![tracked("main", true, Some(1), Some(2))],
             Vec::new(),
             Some(attached.clone()),
+            Vec::new(),
             &host.theme,
             "",
         );
@@ -1325,6 +1375,7 @@ mod tests {
             vec![local("main", false)],
             Vec::new(),
             Some(HeadState::Detached { commit: sha() }),
+            Vec::new(),
             &host.theme,
             "",
         );
@@ -1339,6 +1390,7 @@ mod tests {
                 name: RefName::from("ghost"),
                 commit: None,
             }),
+            Vec::new(),
             &host.theme,
             "",
         );
@@ -1349,36 +1401,71 @@ mod tests {
     }
 
     #[test]
-    fn lane_inks_follow_a_locals_place_among_locals_head_excluded() {
-        // The colour a branch carries through the pane belongs to the *row*,
-        // not to HEAD: inserting a branch above shifts the ink down with it,
-        // and HEAD never borrows the cycle whatever its place.
+    fn a_branchs_colour_survives_the_list_reordering() {
+        // The colour a branch carries is a hash of its **name**, not of its
+        // row: inserting a branch above it repaints nobody, so a commit or a
+        // checkout that re-orders the list never reshuffles the rainbow. HEAD
+        // still sits out of the palette in its accent.
         let t = Theme::dark();
-        let rows = flatten(
+        let ink = |rows: &[Row], name: &[u8]| {
+            rows.iter()
+                .find_map(|r| match r {
+                    Row::Local(l) if l.name.as_bytes() == name => Some(l.dot.color),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no local row named {}", String::from_utf8_lossy(name)))
+        };
+        let before = flatten(
+            &[local("held", true), local("third", false)],
+            &[],
+            None,
+            &[],
+            &t,
+        );
+        let after = flatten(
             &[
-                tracked("held", true, Some(3), Some(0)),
-                local("second", false),
+                local("held", true),
+                local("second", true),
                 local("third", false),
             ],
             &[],
             None,
+            &[],
             &t,
         );
-        match (&rows[1], &rows[2], &rows[3]) {
-            (Row::Local(head), Row::Local(second), Row::Local(third)) => {
-                assert_eq!(second.name.as_bytes(), b"second");
+        assert_eq!(
+            ink(&before, b"third"),
+            ink(&after, b"third"),
+            "a branch inserted above moved nobody's ink"
+        );
+        assert_eq!(ink(&after, b"third"), t.name_lane(b"third"));
+        match &after[1] {
+            Row::Local(head) => {
                 assert_eq!(
                     head.dot.color, t.chrome.accent,
-                    "HEAD sits out of the cycle"
+                    "HEAD sits out of the palette"
                 );
-                assert_eq!(
-                    second.dot.color,
-                    t.lane(1),
-                    "its index counts from the first local, marked or not"
-                );
-                assert_eq!(third.dot.color, t.lane(2));
             }
-            other => panic!("three local rows expected, got {other:?}"),
+            other => panic!("HEAD's row expected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_branch_taken_by_another_worktree_is_marked_and_heads_own_is_not() {
+        let t = Theme::dark();
+        let rows = flatten(
+            &[local("main", true), local("wip", false)],
+            &[],
+            None,
+            &["wip".to_string()],
+            &t,
+        );
+        match (&rows[1], &rows[2]) {
+            (Row::Local(head), Row::Local(wip)) => {
+                assert!(!head.worktree, "HEAD's branch is this worktree's checkout");
+                assert!(wip.worktree, "a branch checked out elsewhere is named");
+            }
+            other => panic!("two local rows expected, got {other:?}"),
         }
     }
 
@@ -1389,6 +1476,7 @@ mod tests {
             vec![local("a", true), local("b", false)],
             vec![remote("a")],
             None,
+            Vec::new(),
             &host.theme,
             "",
         ));
@@ -1447,6 +1535,7 @@ mod tests {
                 vec![local("a", true)],
                 vec![remote("a"), remote("b")],
                 None,
+                vec![],
                 &host.theme,
                 "",
             ),
@@ -1462,7 +1551,7 @@ mod tests {
     #[test]
     fn settle_is_the_identity_off_a_heading_and_survives_a_heading_only_list() {
         let t = Theme::dark();
-        let rows = flatten(&[local("a", true)], &[remote("a")], None, &t);
+        let rows = flatten(&[local("a", true)], &[remote("a")], None, &[], &t);
         for i in [1, 3] {
             assert_eq!(super::settle(&rows, i, 1), i);
             assert_eq!(super::settle(&rows, i, -1), i);

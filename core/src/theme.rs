@@ -716,17 +716,32 @@ impl Theme {
         self.lanes[i % self.lanes.len()]
     }
 
+    /// Stable per name, over the lane palette: the fold every name-keyed ink
+    /// shares with [`Theme::author`], so a branch's dot survives refreshes,
+    /// re-orders and whatever order another pane lists it in.
+    pub fn name_lane(&self, name: &[u8]) -> Rgb {
+        if self.lanes.is_empty() {
+            return self.chrome.fg;
+        }
+        self.lanes[name_hash(name) as usize % self.lanes.len()]
+    }
+
     /// Stable per author name, so one person's commits clump visibly in a long
     /// list without anyone assigning colours by hand.
     pub fn author(&self, author: &str) -> Rgb {
         if self.authors.is_empty() {
             return self.chrome.dim;
         }
-        let hash = author
-            .bytes()
-            .fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
-        self.authors[hash as usize % self.authors.len()]
+        self.authors[name_hash(author.as_bytes()) as usize % self.authors.len()]
     }
+}
+
+/// The fold behind every name-keyed colour — [`Theme::author`]'s original, made
+/// shared when the branches pane needed its branch dots to follow names too.
+/// Byte-wise, because a ref may carry bytes no UTF-8 string can hold.
+fn name_hash(name: &[u8]) -> u32 {
+    name.iter()
+        .fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(*b as u32))
 }
 
 /// Every theme that exists, and what a picker lists.
@@ -1173,11 +1188,19 @@ mod tests {
     }
 
     #[test]
+    fn a_name_lane_is_stable_and_in_range() {
+        let t = Theme::dark();
+        assert_eq!(t.name_lane(b"main"), t.name_lane(b"main"));
+        assert!(t.lanes.contains(&t.name_lane(b"feature/one")));
+    }
+
+    #[test]
     fn an_empty_palette_falls_back_instead_of_panicking() {
         let mut t = Theme::dark();
         t.lanes.clear();
         t.authors.clear();
         assert_eq!(t.lane(3), t.chrome.fg);
         assert_eq!(t.author("x"), t.chrome.dim);
+        assert_eq!(t.name_lane(b"x"), t.chrome.fg);
     }
 }
