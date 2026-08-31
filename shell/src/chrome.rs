@@ -47,6 +47,10 @@ pub const ROW_PAD: f32 = 12.0;
 /// stripe and starts to look like a column of its own.
 pub const ROW_BAR: f32 = 2.0;
 
+/// Corner radius for every chip, pill, keycap and floating panel. One value:
+/// three radii in one 32px strip read as three design languages.
+pub const RADIUS: f32 = 4.0;
+
 /// The frame every list row sits in: a fixed height for `uniform_list`, the
 /// selection tint when `current`, and the bar on the left edge — accent when
 /// the row's pane holds the keyboard, `faint` when the selection is remembered
@@ -133,7 +137,7 @@ fn keycap(host: &Host, number: &str, focused: bool) -> Div {
         .h(px(ch * 1.6))
         .border_1()
         .border_color(rgb(ink))
-        .rounded(px(3.0))
+        .rounded(px(RADIUS))
         .text_color(rgb(ink))
         .child(SharedString::from(number.to_string()))
 }
@@ -258,7 +262,7 @@ pub fn status_bar(
                 .justify_center()
                 .px_2()
                 .h(px(host.font.char_width() * 1.7))
-                .rounded(px(2.0))
+                .rounded(px(RADIUS))
                 .bg(rgb(c.accent))
                 .text_color(rgb(chip_ink))
                 .child(badge),

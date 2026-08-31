@@ -4492,7 +4492,7 @@ impl Render for DevShell {
                                 .px_2()
                                 .border_1()
                                 .border_color(rgb(c.border))
-                                .rounded(px(3.0))
+                                .rounded(px(chrome::RADIUS))
                                 .whitespace_nowrap()
                                 // Both halves were spelled at prepare; a
                                 // frame clones two refcounts.
