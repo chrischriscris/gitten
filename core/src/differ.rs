@@ -2208,6 +2208,67 @@ mod tests {
     }
 
     #[test]
+    fn histogram_scores_a_run_by_its_rarest_line() {
+        // `fn anchor`'s doc says it plainly: a run is scored by its *rarest*
+        // line, not its most common one. Get that backwards and a long run of
+        // unique code loses to a short one the moment a common line like `}`
+        // falls inside it — the same class of bug that cost 582 spurious
+        // changed-line pairs on this repository's own history.
+        //
+        // Driven through `Ctx::anchor` directly, as `an_exhausted_budget_...`
+        // above does: asserting on the final `Differ::diff` script does not
+        // pin this, because the recursion can absorb a wrong top-level anchor
+        // back into the same edit script on inputs this small.
+        //
+        // Five-line run at the front, identical on both sides, with a `}` as
+        // its third line. `}` is padded to five occurrences total, but only in
+        // `old` — enough to inflate its global count without giving the scan
+        // anything else to trip over. A two-line run further along, also
+        // identical on both sides and made entirely of lines that appear
+        // nowhere else, is the only other candidate.
+        let old: Vec<Arc<str>> = [
+            "run_u0", "run_u1", "}", "run_u2", "run_u3", // the long run: 0..5
+            "a_only_1", "}", "a_only_2", "}", "a_only_3", "}", "a_only_4",
+            "}", // padding, 5..13
+            "mid_a_1", "mid_a_2", // 13..15
+            "run_s0", "run_s1", // the short run: 15..17
+            "a_tail_1", "a_tail_2", // 17..19
+        ]
+        .into_iter()
+        .map(Arc::from)
+        .collect();
+        let new: Vec<Arc<str>> = [
+            "run_u0", "run_u1", "}", "run_u2", "run_u3", // the long run: 0..5
+            "b_only_1", "b_only_2", "b_only_3", "b_only_4", // 5..9
+            "b_only_5", "b_only_6", "b_only_7", "b_only_8", // 9..13
+            "mid_b_1", "mid_b_2", // 13..15
+            "run_s0", "run_s1", // the short run: 15..17
+            "b_tail_1", "b_tail_2", // 17..19
+        ]
+        .into_iter()
+        .map(Arc::from)
+        .collect();
+        let (a, b) = intern(&old, &new);
+
+        let mut ctx = Ctx::default();
+        ctx.begin_file();
+        match ctx.anchor(&a, &b, Region::whole(&a, &b), MAX_ANCHOR_OCCURRENCES) {
+            Anchor::At { a_at, b_at, len } => {
+                assert_eq!(
+                    (a_at, b_at, len),
+                    (0, 0, 5),
+                    "scored by its rarest line, the five-line run must win over \
+                     the two-line one, `}}` inside it or not"
+                );
+            }
+            Anchor::TooCommon => {
+                panic!("expected an anchor, budget or threshold ruled everything out")
+            }
+            Anchor::Disjoint => panic!("expected an anchor, the two runs are common to both sides"),
+        }
+    }
+
+    #[test]
     fn an_anchor_that_peels_one_line_at_a_time_still_finishes() {
         // The shape that makes recursion depth equal to file length: a unique
         // line between every pair of identical ones, so every anchor is one line

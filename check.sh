@@ -78,13 +78,30 @@ echo "── differs vs git ─────────────────�
 # also true of `git diff` in the same repository.
 # The second is the whole history in one diff: every file this repo has ever
 # had, which is the widest single input the differs get here.
+#
+# diffcheck itself exits non-zero on a disagreement, so this used to be run
+# for its printout alone, piped through `sed` with stderr discarded — a build
+# error or a real mismatch was invisible, same bug `report` above exists to
+# fix. `diffgate` is that fix for a command whose *output* also has to stay
+# on screen, which is why it cannot just reuse `report`.
+diffgate() {
+  local label=$1; shift
+  local out status
+  out=$("$@" 2>&1); status=$?
+  printf '%s\n' "$out" | sed 's/^/  /'
+  if [ "$status" -ne 0 ]; then
+    FAILED="$FAILED $label"
+    printf '  ✗ %s disagreed with git\n' "$label"
+  fi
+}
 for spec in HEAD~4..HEAD "$(git rev-list --max-parents=0 HEAD | tail -1)..HEAD"; do
-  cargo run -q -p gitten-git --example diffcheck --release . "$spec" 2>/dev/null | sed 's/^/  /'
+  diffgate "diffcheck(., $spec)" \
+    cargo run -q -p gitten-git --example diffcheck --release . "$spec"
 done
 for repo in "$HOME/Projects/cmux" "$HOME/Projects/git"; do
   [ -d "$repo/.git" ] || continue
-  cargo run -q -p gitten-git --example diffcheck --release "$repo" HEAD~5..HEAD 2>/dev/null \
-    | sed 's/^/  /'
+  diffgate "diffcheck($(basename "$repo"))" \
+    cargo run -q -p gitten-git --example diffcheck --release "$repo" HEAD~5..HEAD
 done
 
 echo
