@@ -849,11 +849,11 @@ fn row(e: &Row, host: &Host, current: bool, focused: bool, armed: bool) -> AnyEl
                 div()
                     .flex_none()
                     // The auto margin carries the distance to the row's far
-                    // end however wide its name ran; the padding is the floor
-                    // under that — the air a squeezed name still leaves.
+                    // end however wide its name ran; the right reserve is the
+                    // scrollbar's track, which overlays this edge.
                     .ml_auto()
                     .pl(px(ch))
-                    .pr_2()
+                    .pr(px(super::SCROLLBAR_TRACK_W))
                     .text_color(rgb(match l.gone {
                         // "gone" is read — it is why the upstream is not shown
                         // — so quiet through `quiet_on`, not invisible.

@@ -103,7 +103,17 @@ pub fn section_label(host: &Host, text: SharedString, count: Option<SharedString
         // the rows and never as one of them.
         .text_color(rgb(host.theme.quiet_on(c.bg)))
         .child(div().flex_none().child(text))
-        .children(count.map(|count| div().flex_none().ml_auto().pr_2().child(count)))
+        // The auto margin carries the distance to the far end; the right
+        // reserve is the scrollbar's track, which overlays this edge — the
+        // same constant the bar is configured with, so the two cannot
+        // disagree.
+        .children(count.map(|count| {
+            div()
+                .flex_none()
+                .ml_auto()
+                .pr(px(crate::views::SCROLLBAR_TRACK_W))
+                .child(count)
+        }))
 }
 
 /// A path drawn as the design draws one: directory dim, filename in
