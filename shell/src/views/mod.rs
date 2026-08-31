@@ -13,10 +13,19 @@ use std::rc::Rc;
 /// Keep this beside the shared handle adapter so every built-in pane gets the
 /// same furniture. The library still owns painting, hit testing and dragging;
 /// this only supplies the presentation it deliberately exposes as data.
+///
+/// The scrollbar's track — and thumb, the two are one square bar — in px.
+///
+/// The one number right-edge furniture in a scrollable pane must agree with:
+/// the track overlays the panes' right edge, so every section count, drift
+/// count and clock that ends a row reserves exactly this much, by taking
+/// this constant rather than spelling its own pixels beside it.
+pub(crate) const SCROLLBAR_TRACK_W: f32 = 8.0;
+
 fn scrollbar<H: ScrollbarHandle + Clone>(handle: &H, axis: ScrollbarAxis) -> Scrollbar {
     Scrollbar::new(handle).axis(axis).styles(|s| {
-        s.track(|s| s.width(px(8.)))
-            .thumb(|s| s.width(px(8.)).inset(px(0.)).radius(px(0.)))
+        s.track(|s| s.width(px(SCROLLBAR_TRACK_W)))
+            .thumb(|s| s.width(px(SCROLLBAR_TRACK_W)).inset(px(0.)).radius(px(0.)))
     })
 }
 

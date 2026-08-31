@@ -831,9 +831,11 @@ fn row(
                 .flex_none()
                 .ml_auto()
                 // A character of air before the cell is the floor under the
-                // auto margin — what a squeezed subject still leaves.
+                // auto margin — what a squeezed subject still leaves. The
+                // right reserve is the scrollbar's track, which overlays
+                // this edge.
                 .pl(px(ch))
-                .pr_2()
+                .pr(px(super::SCROLLBAR_TRACK_W))
                 .w(px((TIME_CHARS + 1.0) * ch))
                 .flex()
                 .justify_end()

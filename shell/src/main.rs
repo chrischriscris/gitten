@@ -122,6 +122,18 @@ fn section_floor(rows: usize) -> f32 {
     SECTION_MIN_H.min(section_height(rows))
 }
 
+/// The FILES header's count: the working tree's distinct changed paths, as
+/// the header's only right-edge furniture. `None` on a clean tree — a zero
+/// count is the empty state said twice, the rows below it already saying so,
+/// and no other pane prints one.
+fn files_header_count(
+    view: &gpui::Entity<crate::views::files::Files>,
+    cx: &App,
+) -> Option<SharedString> {
+    let changed = view.read(cx).changed();
+    (changed > 0).then(|| SharedString::from(changed.to_string()))
+}
+
 /// The diff header's text, spelled once per change of what it says — see
 /// [`DevShell::header_memo`]. The path is already cut where
 /// [`chrome::path_spans`] wants it.
@@ -4249,13 +4261,8 @@ impl Render for DevShell {
                     continue;
                 };
                 let focused = self.spot == Spot::List && focused_name == name;
-                // The count is the header's only right-edge furniture: the
-                // working tree's distinct changed paths, spelled once per
-                // refresh and read here for free.
                 let count = match screen {
-                    Screen::Files { view, .. } => {
-                        Some(SharedString::from(view.read(cx).changed().to_string()))
-                    }
+                    Screen::Files { view, .. } => files_header_count(view, cx),
                     _ => None,
                 };
                 let rows = match screen {
@@ -5464,7 +5471,8 @@ fn window_options(title: SharedString) -> WindowOptions {
 #[cfg(test)]
 mod tests {
     use super::{
-        config, input, panes, DevShell, GitError, Notice, Open, Pane, Refresh, Screen, Writes,
+        config, files_header_count, input, panes, DevShell, GitError, Notice, Open, Pane, Refresh,
+        Screen, Writes,
     };
     use crate::views::commits::Commits;
     use gitten_app::cli::Source;
@@ -8092,6 +8100,41 @@ diff --git a/fresh.txt b/fresh.txt
             vec!["delete loose.txt"],
             "the untracked mechanics ran, not a checkout"
         );
+    }
+
+    #[gpui::test]
+    fn the_files_header_prints_a_count_only_when_there_is_one(cx: &mut TestAppContext) {
+        // A clean tree is already described by its empty rows; a `0` in the
+        // header would be the empty state said twice, and no other pane
+        // prints one.
+        let (shell, _repo, _handle) = tree_shell(cx, Status::default());
+        shell.read_with(cx, |shell, cx| {
+            let Some(Screen::Files { view, .. }) = shell.active() else {
+                panic!("files pane lost");
+            };
+            assert_eq!(view.read(cx).changed(), 0);
+            assert_eq!(files_header_count(view, cx), None);
+        });
+
+        // One changed path, and the count is there for the header to read.
+        let mut tree = Status::default();
+        tree.staged.push(gitten_core::status::StagedEntry {
+            path: "gone.txt".into(),
+            change: gitten_core::status::Change::Deleted,
+            old_path: None,
+            kind: gitten_core::status::Kind::File,
+            submodule: Default::default(),
+        });
+        let (shell, _repo, _handle) = tree_shell(cx, tree);
+        shell.read_with(cx, |shell, cx| {
+            let Some(Screen::Files { view, .. }) = shell.active() else {
+                panic!("files pane lost");
+            };
+            assert_eq!(
+                files_header_count(view, cx).map(|c| c.to_string()),
+                Some("1".to_string())
+            );
+        });
     }
 
     #[gpui::test]

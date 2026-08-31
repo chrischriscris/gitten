@@ -82,7 +82,11 @@ pub fn overlay(
         .absolute()
         .inset_0()
         // The whole overlay, not only its panel: a wheel in the dim space
-        // around it must not find the list underneath.
+        // around it must not find the list underneath. And the space really
+        // is dim — a scrim of the window colour at half alpha, so the diff
+        // behind recedes and the panel's border clears ~1.7:1 against every
+        // row background where it cleared as little as 1.35:1 bare.
+        .bg(rgb(c.bg).alpha(0.5))
         .occlude()
         .flex()
         .items_center()

@@ -2,10 +2,10 @@
 //!
 //! The design being followed draws every region with the same furniture: a
 //! short header strip that names the pane with **the number of the key that
-//! focuses it** — `1 FILES`, `4 COMMITS`, `5 <file>` — and one status bar
-//! across the bottom that says where the keyboard is and what the nearest
-//! keys do. Both are drawn here, once, so the two regions cannot drift
-//! into two different ideas of a header.
+//! focuses it** — numbered in stack order, so no literal here can go stale —
+//! and one status bar across the bottom that says where the keyboard is and
+//! what the nearest keys do. Both are drawn here, once, so the two regions
+//! cannot drift into two different ideas of a header.
 //!
 //! Nothing here holds state or makes a decision: a header is a number, a
 //! name and a count; the status bar is a badge, a list of `(key, label)`
@@ -22,7 +22,8 @@ use gitten_core::theme::Surface;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 
-/// Height of a pane's header strip — `1 FILES`, `4 COMMITS`, `5 <path>`.
+/// Height of a pane's header strip — the same strip the module doc
+/// describes, so the numbers live in the pane stack and nowhere else.
 /// A shade taller than a list row: a header is a label, not a row, and one
 /// pixel of extra air is what keeps it from reading as data.
 pub const HEADER_H: f32 = 26.0;
@@ -102,7 +103,17 @@ pub fn section_label(host: &Host, text: SharedString, count: Option<SharedString
         // the rows and never as one of them.
         .text_color(rgb(host.theme.quiet_on(c.bg)))
         .child(div().flex_none().child(text))
-        .children(count.map(|count| div().flex_none().ml_auto().pr_2().child(count)))
+        // The auto margin carries the distance to the far end; the right
+        // reserve is the scrollbar's track, which overlays this edge — the
+        // same constant the bar is configured with, so the two cannot
+        // disagree.
+        .children(count.map(|count| {
+            div()
+                .flex_none()
+                .ml_auto()
+                .pr(px(crate::views::SCROLLBAR_TRACK_W))
+                .child(count)
+        }))
 }
 
 /// A path drawn as the design draws one: directory dim, filename in

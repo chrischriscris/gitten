@@ -774,7 +774,7 @@ impl Render for Input {
                     .child(TextElement {
                         input: cx.entity(),
                         cursor: rgb(chrome.accent),
-                        selection: rgb(chrome.selection_bg),
+                        selection: rgb(chrome.selected_bg),
                     }),
             )
             .child(exit_hints(chrome, &self.exits))
