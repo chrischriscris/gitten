@@ -1506,11 +1506,13 @@ impl Diff {
         let current = match layouts.position(&host.layout) {
             Some(i) => i,
             None => {
-                eprintln!(
-                    "gitten: unknown diff.layout {:?}; registered: {}",
-                    host.layout,
-                    layouts.names().join(", ")
-                );
+                if crate::stats::enabled() {
+                    eprintln!(
+                        "gitten: unknown diff.layout {:?}; registered: {}",
+                        host.layout,
+                        layouts.names().join(", ")
+                    );
+                }
                 0
             }
         };
@@ -1691,7 +1693,9 @@ fn arrange(prepared: &Prepared, host: &Host, layouts: &Layouts, current: usize) 
         t.elapsed(),
         reports.join(" · "),
     );
-    eprintln!("{load}");
+    if crate::stats::enabled() {
+        eprintln!("{load}");
+    }
     Built {
         renderers,
         order,

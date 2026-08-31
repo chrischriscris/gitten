@@ -354,7 +354,9 @@ pub(crate) fn prepare(
     );
     let rows = flatten(&local, &remotes, head.as_ref(), &taken, theme);
     let head = head_info(head.as_ref(), &local);
-    eprintln!("branches: {label} · flatten {:.0?}", t.elapsed());
+    if crate::stats::enabled() {
+        eprintln!("branches: {label} · flatten {:.0?}", t.elapsed());
+    }
     Prepared { rows, label, head }
 }
 

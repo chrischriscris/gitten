@@ -604,7 +604,9 @@ pub(crate) fn prepare(commits: Vec<Commit>, _host: &Host) -> Prepared {
         t_lanes,
         t_draws
     );
-    eprintln!("{load}");
+    if crate::stats::enabled() {
+        eprintln!("{load}");
+    }
 
     // The sha column hugs what this history produces — see [`Data::sha_chars`]
     // — and characters, never bytes: the width is paid in cells of `char_width`.
