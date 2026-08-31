@@ -524,6 +524,25 @@ impl Keymap {
         bind("input", "enter", "input.accept");
         bind("input", "esc", "input.cancel");
 
+        // The help overlay owns the keyboard for as long as it stands: a client
+        // resolves against this mode *alone* while it is up, so a chord that is
+        // not here runs nothing underneath — a panel of keys that arms a file
+        // discard behind itself is a trap, and it had one. Which is also why
+        // the way out and the way down are spelled again here: the same command
+        // names the lists use, bound in this mode so they stay reachable when
+        // inheriting the globals no longer happens. `?` toggles the panel shut
+        // and `esc` takes `back`'s own spelling, which closes help first.
+        bind("help", "?", "help");
+        bind("help", "esc", "back");
+        bind("help", "j", "view.scroll-down");
+        bind("help", "down", "view.scroll-down");
+        bind("help", "k", "view.scroll-up");
+        bind("help", "up", "view.scroll-up");
+        bind("help", "g", "view.top");
+        bind("help", "home", "view.top");
+        bind("help", "G", "view.bottom");
+        bind("help", "end", "view.bottom");
+
         bind("panes", "ctrl-j", "pane.next");
         bind("panes", "ctrl-k", "pane.prev");
         k
@@ -1234,6 +1253,39 @@ mod tests {
     }
 
     #[test]
+    fn the_help_mode_swallows_the_pane_verbs_it_is_only_describing() {
+        let k = Keymap::builtin();
+        // What a client does while the panel stands: resolve against `help`
+        // alone, exactly as it does against `input` for a focused field. The
+        // full walk still finds the files pane's `D` underneath — a discard
+        // armed behind a panel that is only *describing* it, which is the one
+        // thing a screen full of key names must not do.
+        let mut modes = Modes::new();
+        modes.push("files");
+        modes.push("help");
+        let d = keys("D");
+        assert_eq!(k.resolve_any(&modes, &[&d]), Resolve::Run("files.discard"));
+        assert_eq!(k.resolve_mode_any("help", &[&d]), Resolve::None);
+        // And what it does answer: the way out, and its own scroll.
+        assert_eq!(
+            k.resolve_mode_any("help", &[&keys("?")]),
+            Resolve::Run("help")
+        );
+        assert_eq!(
+            k.resolve_mode_any("help", &[&keys("esc")]),
+            Resolve::Run("back")
+        );
+        assert_eq!(
+            k.resolve_mode_any("help", &[&keys("j")]),
+            Resolve::Run("view.scroll-down")
+        );
+        assert_eq!(
+            k.resolve_mode_any("help", &[&keys("end")]),
+            Resolve::Run("view.bottom")
+        );
+    }
+
+    #[test]
     fn the_wheel_is_a_key_like_any_other() {
         let k = Keymap::builtin();
         let modes = Modes::new();
@@ -1699,8 +1751,13 @@ mod tests {
             k.resolve(&Modes::new(), &keys("j")),
             Resolve::Run("view.up")
         );
+        // In *this* mode: `j` is spelled again in `[help]`, where it means the
+        // panel's own scroll, and a replacement here must not touch that one.
         assert_eq!(
-            k.bindings().iter().filter(|b| b.chord == keys("j")).count(),
+            k.bindings()
+                .iter()
+                .filter(|b| b.mode == GLOBAL && b.chord == keys("j"))
+                .count(),
             1
         );
         // A built-in has to be removable, not only movable.
@@ -2119,11 +2176,15 @@ mod tests {
         assert_eq!(
             k.live_keys_for("help", &open),
             vec!["?"],
-            "help itself binds nothing"
+            "the help mode's own `?` is the one that fires"
         );
 
-        // A mode that takes `?` over leaves the hint nothing to say.
+        // A mode that takes `?` over leaves the hint nothing to say — with the
+        // help mode's own `?` unbound, as a config file may do it, because
+        // otherwise the innermost mode is the one holding the key and no outer
+        // mode can shadow it.
         let mut k = Keymap::builtin();
+        assert!(k.unbind("help", "?"));
         k.bind("diff", "?", "diff.cycle-layout").unwrap();
         let mut in_diff = Modes::new();
         in_diff.push("diff");

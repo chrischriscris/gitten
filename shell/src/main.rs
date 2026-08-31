@@ -1183,6 +1183,13 @@ struct DevShell {
     /// change of any of it.
     pending: Vec<Vec<Key>>,
     help: bool,
+    /// The help panel's row scroll. The handle is the shell's and not the
+    /// panel's because the panel is a pure element — see [`help::overlay`] —
+    /// and the keyboard has to reach its tail, which is the one piece of
+    /// state a pure element cannot hold. Reset when help opens: the rows are
+    /// a different projection every time — the active modes' — and an offset
+    /// the last reading left is a promise about rows that no longer exist.
+    help_scroll: ScrollHandle,
     /// The window's one focusable element: this shell itself. Key events reach a
     /// listener through the focus path, so something has to hold focus, and one
     /// handle owned here means the views never have to know input exists.
@@ -1321,7 +1328,7 @@ impl DevShell {
             self.modes.push(input::MODE);
         }
         if self.help {
-            self.modes.push("help");
+            self.modes.push(help::MODE);
         }
         self.pending.clear();
         self.open = None;
@@ -3013,7 +3020,31 @@ impl DevShell {
             "quit" => cx.quit(),
             "help" => {
                 self.help = !self.help;
+                // Reopening starts at the top: the rows are a different
+                // projection every time — the active modes' — and an offset
+                // the last reading left is a promise about rows that no
+                // longer exist.
+                if self.help {
+                    help::scroll_to_end(&self.help_scroll, false);
+                }
                 self.sync_modes(cx);
+            }
+            // While the panel stands, the movement verbs are the panel's: the
+            // rows under it are occluded, and one of these keys moving the list
+            // underneath instead would scroll something the reader cannot see.
+            // The names are the map's — bound in the help mode in `core` — so
+            // the routing here is the only client-side half of it.
+            "view.scroll-down" | "view.scroll-up" if self.help => {
+                help::scroll_by(
+                    &self.help_scroll,
+                    match command {
+                        "view.scroll-up" => -1.0,
+                        _ => 1.0,
+                    },
+                );
+            }
+            "view.top" | "view.bottom" if self.help => {
+                help::scroll_to_end(&self.help_scroll, command == "view.bottom");
             }
             "back" => self.back(cx),
             "theme.cycle" => self.cycle_theme(cx),
@@ -3561,6 +3592,12 @@ impl DevShell {
         let typed: Vec<&[Key]> = self.pending.iter().map(Vec::as_slice).collect();
         let resolved = match self.input.is_some() {
             true => host.keys.resolve_mode_any(input::MODE, &typed),
+            // While the help panel stands it owns the keyboard the same way a
+            // native field does: resolved against its mode *alone*, so a chord
+            // the map does not give it runs nothing underneath — a pane's `D`
+            // reads as "not bound" instead of arming a discard behind a screen
+            // that is only describing it. `Resolve::None` below says so.
+            false if self.help => host.keys.resolve_mode_any(help::MODE, &typed),
             false => host.keys.resolve_any(&self.modes, &typed),
         };
         match resolved {
@@ -4583,7 +4620,7 @@ impl Render for DevShell {
             // can drift from the other.
             .children(
                 self.help
-                    .then(|| help::overlay(&config::host(cx), &self.modes)),
+                    .then(|| help::overlay(&config::host(cx), &self.modes, &self.help_scroll)),
             );
         root
     }
@@ -5050,6 +5087,7 @@ fn main() {
                     modes: Modes::new(),
                     pending: Vec::new(),
                     help: false,
+                    help_scroll: ScrollHandle::default(),
                     focus,
                     focused: None,
                     seen_host: None,
@@ -5197,6 +5235,7 @@ mod tests {
     use gitten_core::status::Status;
     use gitten_core::Commit;
     use gitten_git::{Pair, Repo};
+    use gpui::ScrollHandle;
     use gpui::{AppContext as _, TestAppContext};
     use std::cell::{Cell, RefCell};
     use std::path::PathBuf;
@@ -5389,6 +5428,7 @@ mod tests {
                 modes: Modes::new(),
                 pending: vec![vec![Key::char('g')]],
                 help: false,
+                help_scroll: ScrollHandle::default(),
                 focus: cx.focus_handle(),
                 focused: None,
                 seen_host: None,
