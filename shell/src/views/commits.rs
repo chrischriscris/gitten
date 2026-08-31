@@ -22,13 +22,12 @@ struct Who {
 struct Data {
     commits: Vec<Commit>,
     draws: Vec<graph::Draw>,
-    /// The age column, one string per commit and solved once per load:
-    /// `3h`, `2d`, `6mo`. Clock work belongs to load work twice over — a
-    /// frame would reformat all 82k answers for pixels that did not ask,
-    /// and a clock read per frame disagrees with itself row to row where a
-    /// load-time answer reads as one timestamp. See [`rel_time`] for the
-    /// bands.
-    times: Vec<SharedString>,
+    /// Each row's commit timestamp, stored at flatten. The age *strings* are
+    /// derived from these on demand — at load, and again whenever the
+    /// re-band timer sees a band move — so an hour after load `5m` is not
+    /// still on screen. Formatting is load work, never frame work; see
+    /// [`rel_time`] for the bands.
+    stamps: Vec<i64>,
     /// The sha column's width, in *characters*: the longest `%h` this
     /// repository actually produced plus one of air. Twelve was the constant —
     /// `%h` is seven in a young repository and eleven in git/git — but the
@@ -86,6 +85,18 @@ pub struct Commits {
     /// First visible row, for the session — see the note in the diff view.
     pub top: Rc<Cell<usize>>,
     pub load: String,
+    /// The age column, one string per commit, re-derived from
+    /// [`Data::stamps`] at load and whenever the re-band timer sees a band
+    /// move — see [`REBAND`]. Behind the same kind of `Rc` as `data`, so a
+    /// re-band swaps one refcount instead of mutating what a frame reads.
+    ages: Rc<Vec<SharedString>>,
+    /// The clock the ages in [`Commits::ages`] were banded against, in Unix
+    /// seconds. The timer compares each visible stamp's band against this
+    /// one — the coarsest boundary, integer arithmetic, no strings.
+    banded_at: i64,
+    /// Whether the re-band timer is already running. Spawned once, from the
+    /// first render; it dies with the view.
+    clock_armed: bool,
     /// The hard reset awaiting its second press: the sha of the commit that
     /// asked. One slot — arming a different row moves the question. Any
     /// cursor move, wheel or refresh drops it, because a stale yes waiting
@@ -462,10 +473,20 @@ impl Commits {
 impl Commits {
     pub fn new(commits: Vec<Commit>, host: Rc<Host>) -> Self {
         let Prepared { data, load } = prepare(commits, &host);
+        let banded_at = unix_now();
+        let ages = Rc::new(
+            data.stamps
+                .iter()
+                .map(|&ts| rel_time(ts, banded_at).into())
+                .collect(),
+        );
         Self {
             visible: Rc::new(Vec::from_iter(0..data.commits.len())),
             query: None,
             data: Rc::new(data),
+            ages,
+            banded_at,
+            clock_armed: false,
             scroll: UniformListScrollHandle::new(),
             view: Rc::new(Cell::new(Viewport::new())),
             synced: Rc::new(Cell::new(0.0)),
@@ -523,7 +544,16 @@ impl Commits {
         self.data = Rc::new(data);
         self.visible = visible;
         self.load = load;
-
+        // A refresh is a fresh load: the ages re-band against the clock it
+        // read, the same rule the first load followed.
+        self.banded_at = unix_now();
+        self.ages = Rc::new(
+            self.data
+                .stamps
+                .iter()
+                .map(|&ts| rel_time(ts, self.banded_at).into())
+                .collect(),
+        );
         let mut view = old;
         view.set_len(self.visible.len());
         view.scroll_to(top);
@@ -563,18 +593,10 @@ pub(crate) fn prepare(commits: Vec<Commit>, _host: &Host) -> Prepared {
     let lanes = graph::lane_count(&rows);
     let t_draws = t.elapsed();
 
-    // One clock read per load and one [`rel_time`] per commit. The answer is
-    // as stale as any snapshot of the log is — the next refresh recomputes it
-    // here, the same pass that recomputes everything else — and never on a
-    // frame.
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64);
-    let times: Vec<SharedString> = commits
-        .iter()
-        .map(|c| rel_time(c.timestamp, now).into())
-        .collect();
-
+    // Each row's timestamp is stored at flatten — [`Data::stamps`] — and the
+    // age strings are derived where they are drawn from: at load, and again
+    // on the re-band timer, never per frame.
+    let stamps: Vec<i64> = commits.iter().map(|c| c.timestamp).collect();
     let load = format!(
         "{} commits · {} lanes · lanes {:.0?} draws {:.0?}",
         commits.len(),
@@ -609,7 +631,7 @@ pub(crate) fn prepare(commits: Vec<Commit>, _host: &Host) -> Prepared {
             sha_chars,
             commits,
             draws,
-            times,
+            stamps,
         },
         load,
     }
@@ -629,7 +651,11 @@ impl Render for Commits {
             };
             return chrome::empty_line(&crate::config::host(cx), text);
         }
+        // The re-band timer is armed on the first render, when the view is an
+        // entity with a context to spawn from — never at construction.
+        self.arm_clock(cx);
         let data = self.data.clone();
+        let ages = self.ages.clone();
         let rendered = self.rendered.clone();
         let top = self.top.clone();
         let view = self.view.clone();
@@ -672,7 +698,15 @@ impl Render for Commits {
                     // `visible` is ascending into the full vec, so the arrays
                     // derived at load index directly by it.
                     let c = visible[i];
-                    row(c, &data, &host, i == cursor, focused, Some(i) == armed)
+                    row(
+                        c,
+                        &data,
+                        &ages,
+                        &host,
+                        i == cursor,
+                        focused,
+                        Some(i) == armed,
+                    )
                 })
                 .collect()
         })
@@ -708,38 +742,114 @@ impl Render for Commits {
 /// `2d`, `4w`, `6mo`, `1y`.
 ///
 /// Pure on purpose: the caller owns what "now" is, and here that caller is
-/// [`prepare`], which reads the clock once per load — a read per row would
-/// disagree with itself down the list. A timestamp in the future still reads
-/// as `now`: a committer's clock running ahead of ours must not print a minus
-/// sign into a column meant to be glanced at. The bands are what the eye
-/// already groups — minutes until they stop mattering, hours until a day
-/// starts it, days until a week does, then thirty to the month and three
-/// hundred sixty-five to the year, each folded with integer division because
-/// rough is the point: the alternative is a calendar.
+/// the load path and the re-band timer, each of which reads the clock once
+/// per pass — a read per row would disagree with itself down the list. A
+/// timestamp in the future still reads as `now`: a committer's clock running
+/// ahead of ours must not print a minus sign into a column meant to be
+/// glanced at. The bands are what the eye already groups — minutes until
+/// they stop mattering, hours until a day starts it, days until a week
+/// does, then thirty to the month and three hundred sixty-five to the
+/// year, each folded with integer division because rough is the point:
+/// the alternative is a calendar.
 fn rel_time(timestamp: i64, now: i64) -> String {
-    let secs = now - timestamp;
-    if secs < 60 {
+    let (n, unit) = band(now - timestamp);
+    if unit == "now" {
         return "now".to_string();
     }
-    let mins = secs / 60;
+    format!("{n}{unit}")
+}
+
+/// Which band an age falls in — the number the eye reads plus its unit, one
+/// pair per band of [`rel_time`]'s vocabulary. The one home for the
+/// boundaries, so the strings the rows draw and the comparison the re-band
+/// timer makes cannot drift into two different ideas of "the same band":
+/// the timer compares this, integer against integer, and never the strings
+/// themselves.
+///
+/// Pure like [`rel_time`], and future timestamps read as `now` here too —
+/// a negative age is still under the minute band.
+fn band(age_secs: i64) -> (i64, &'static str) {
+    if age_secs < 60 {
+        return (0, "now");
+    }
+    let mins = age_secs / 60;
     if mins < 60 {
-        return format!("{mins}m");
+        return (mins, "m");
     }
     let hours = mins / 60;
     if hours < 24 {
-        return format!("{hours}h");
+        return (hours, "h");
     }
     let days = hours / 24;
     if days < 7 {
-        return format!("{days}d");
+        return (days, "d");
     }
     if days < 30 {
-        return format!("{}w", days / 7);
+        return (days / 7, "w");
     }
     if days < 365 {
-        return format!("{}mo", days / 30);
+        return (days / 30, "mo");
     }
-    format!("{}y", days / 365)
+    (days / 365, "y")
+}
+
+/// How often the commits view re-bands its age column: thirty seconds,
+/// because a column that reads `5m` and `3h` cannot mean anything a
+/// half-minute sharper, and a timer that woke per row of vocabulary would
+/// spend frames on pixels that did not ask.
+const REBAND: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The clock the ages are banded against right now, in Unix seconds.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+impl Commits {
+    /// Starts [`REBAND`]'s interval, once per view, from the first render —
+    /// the view is only an entity with a context to spawn from there. The
+    /// loop dies with the view: `update` fails and the future ends.
+    fn arm_clock(&mut self, cx: &mut Context<Self>) {
+        if self.clock_armed {
+            return;
+        }
+        self.clock_armed = true;
+        cx.spawn(async move |view, cx| loop {
+            cx.background_executor().timer(REBAND).await;
+            let live = view.update(cx, |view, cx| view.reband(cx));
+            if live.is_err() {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    /// Re-bands the age column when time has actually moved a row across a
+    /// band boundary, and not otherwise. The check is [`band`] — the
+    /// coarsest boundary, integer arithmetic over the *visible* rows —
+    /// never per-row strings, and never any frame work: the clock is read
+    /// once per wake, and only a moved band reformats the column and
+    /// notifies.
+    fn reband(&mut self, cx: &mut Context<Self>) {
+        let now = unix_now();
+        let data = self.data.clone();
+        let moved = self.visible.iter().any(|&i| {
+            let ts = data.stamps[i];
+            band(now - ts) != band(self.banded_at - ts)
+        });
+        if !moved {
+            return;
+        }
+        self.ages = Rc::new(
+            data.stamps
+                .iter()
+                .map(|&ts| rel_time(ts, now).into())
+                .collect(),
+        );
+        self.banded_at = now;
+        cx.notify();
+    }
 }
 
 /// Two letters of initials beside the sha — see [`Who`].
@@ -771,6 +881,7 @@ const TIME_CHARS: f32 = 4.0;
 fn row(
     i: usize,
     data: &Data,
+    ages: &[SharedString],
     host: &Rc<Host>,
     current: bool,
     focused: bool,
@@ -779,7 +890,7 @@ fn row(
     // Every per-commit answer indexes straight into what load derived — see
     // `visible`'s comment: no lookup, no hashing, one array read each.
     let c = &data.commits[i];
-    let time = &data.times[i];
+    let time = &ages[i];
     let who = &data.who[i];
     let d = &data.draws[i];
     let ch = host.font.char_width();
@@ -859,8 +970,8 @@ mod tests {
     // By name, not a glob: `use gpui::*` in the parent shadows `#[test]` with
     // GPUI's own attribute macro and every test in here fails to expand.
     use super::graph;
-    use super::rel_time;
     use super::Commits;
+    use super::{band, rel_time};
     use gitten_core::host::Host;
     use gitten_core::Commit;
     use std::rc::Rc;
@@ -1403,6 +1514,21 @@ mod tests {
             "2y",
             "past three hundred sixty-five days the calendar stops being consulted"
         );
+    }
+
+    #[test]
+    fn an_age_crosses_a_band_when_time_passes() {
+        // The re-band timer's whole decision, driven by hand: the same
+        // commit seen at two instants — the pure functions, [`band`] for
+        // the compare and [`rel_time`] for what the row then draws.
+        let ts = NOW - 59 * 60;
+        assert_eq!(rel_time(ts, NOW), "59m", "one minute short of an hour");
+        assert_ne!(
+            band(NOW - ts),
+            band(NOW + 120 - ts),
+            "two minutes later the boundary has moved"
+        );
+        assert_eq!(rel_time(ts, NOW + 120), "1h", "and the column re-bands");
     }
 
     // ------------------------------------------------------------ arming
