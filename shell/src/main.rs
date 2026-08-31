@@ -28,6 +28,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 /// Startup-stage timestamps on stderr, behind `GITTEN_START_LOG=1`.
 ///
@@ -1178,7 +1179,7 @@ struct DevShell {
     refresh_id: u64,
     refresh_pending: usize,
     refresh_error: Option<String>,
-    running: Option<String>,
+    running: Option<(String, std::time::Instant)>,
     /// The one native text field over the active screen, if a command is
     /// gathering input. Consumers subscribe to its accepted/cancelled event.
     input: Option<Entity<input::Input>>,
@@ -2842,8 +2843,27 @@ impl DevShell {
             changed = true;
             match event {
                 JobEvent::Started { name } => {
-                    self.running = Some(format!("running {name}"));
+                    self.running = Some((format!("running {name}"), Instant::now()));
                     self.error = None;
+                    // The seconds will not tick by themselves — GPUI draws
+                    // nothing at rest — so a job that runs longer than a
+                    // heartbeat needs a notifier of its own. It dies with the
+                    // job: one tick past `running` going `None` at most.
+                    cx.spawn(async move |shell, cx| loop {
+                        cx.background_executor().timer(Duration::from_secs(1)).await;
+                        let live = shell.update(cx, |shell, cx| {
+                            if shell.running.is_some() {
+                                cx.notify();
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                        if !live.unwrap_or(false) {
+                            break;
+                        }
+                    })
+                    .detach();
                 }
                 JobEvent::Finished {
                     outcome: Err(error),
@@ -4338,7 +4358,8 @@ impl Render for DevShell {
             unreachable!("the main view is always a diff");
         };
         let head = self.head.borrow().clone();
-        let loading = self.loading.get();
+        // The band's "loading diff" is the one home for the word: an accent
+        // here competed with it and said the same thing twice at once.
         // The header names the file the keyboard is in, with that file's
         // change counts and the hunk's place among its siblings — the same
         // three facts the design's fifth pane carries. The commit's subject
@@ -4418,11 +4439,7 @@ impl Render for DevShell {
                             // `faint` is under the floor on this strip.
                             .text_color(rgb(host.theme.quiet_on(c.title_bg)))
                             .child(h)
-                    }))
-                    .children(
-                        loading
-                            .then(|| div().flex_none().text_color(rgb(c.accent)).child("loading")),
-                    );
+                    }));
                 // The name is a path, so it is drawn as one: directory dim,
                 // filename in the header's own ink — the same cut the files
                 // rows make, so the eye lands on the same word in both.
@@ -4464,14 +4481,20 @@ impl Render for DevShell {
         let strip = self.strip(&host, cx);
         let error = self.error.as_ref().map(|e| e.summary.clone());
         let notice = self.notice.clone();
-        let running = self
-            .running
-            .clone()
-            .or_else(|| (self.refresh_pending > 0).then(|| "refreshing repository".to_string()))
+        let running = self.running.as_ref().map(|(label, at)| {
+            // Whole seconds, and only once there is one to say: a job that
+            // answers inside its first second reads as if it never ran.
+            match at.elapsed().as_secs() {
+                0 => SharedString::from(label.as_str()),
+                s => SharedString::from(format!("{label} · {s}s")),
+            }
+        });
+        let running = running
+            .or_else(|| (self.refresh_pending > 0).then(|| "refreshing repository".into()))
             // The main view's own load, which does not ride the job queue:
             // said here rather than invented for it, because the band is the
             // one place a background something is spoken of.
-            .or_else(|| self.loading.get().then(|| "loading diff".to_string()));
+            .or_else(|| self.loading.get().then(|| "loading diff".into()));
         let input = self.input.clone();
 
         // The title is the repository and where HEAD is, and nothing else.
@@ -5433,7 +5456,9 @@ fn window_options(title: SharedString) -> WindowOptions {
 
 #[cfg(test)]
 mod tests {
-    use super::{config, input, panes, DevShell, Notice, Open, Pane, Refresh, Screen, Writes};
+    use super::{
+        config, input, panes, DevShell, GitError, Notice, Open, Pane, Refresh, Screen, Writes,
+    };
     use crate::views::commits::Commits;
     use gitten_app::cli::Source;
     use gitten_app::jobs::{Event as JobEvent, Generation, Job, Runner, Submitter};
@@ -5957,7 +5982,7 @@ mod tests {
                 }),
             ));
             shell.generation = generation;
-            shell.running = Some("running next write".into());
+            shell.running = Some(("running next write".into(), Instant::now()));
             cx.set_global(config::Active(Rc::new(Host::new())));
             shell.refresh_stale(cx);
         });
@@ -5983,7 +6008,10 @@ mod tests {
             }
             assert!(shell.error.is_none());
             assert_eq!(shell.refresh_pending, 0);
-            assert_eq!(shell.running.as_deref(), Some("running next write"));
+            assert_eq!(
+                shell.running.as_ref().map(|(label, _)| label.as_str()),
+                Some("running next write")
+            );
         });
         assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
@@ -7789,6 +7817,46 @@ diff --git a/fresh.txt b/fresh.txt
             );
             assert_eq!(shell.refresh_pending, 0, "the wave never came home");
         });
+    }
+
+    /// An error keeps its record whole and reads as its first line: git's
+    /// argv is the prefix the band strips, and git's words are what survives.
+    #[test]
+    fn an_error_arrives_whole_and_reads_as_its_first_line() {
+        let e = GitError::new("git push origin main: error: failed to push some refs\nhint: …");
+        assert_eq!(
+            e.full, "git push origin main: error: failed to push some refs\nhint: …",
+            "the record is kept verbatim"
+        );
+        assert_eq!(
+            e.summary, "error: failed to push some refs",
+            "the first non-empty line of git's own words"
+        );
+
+        let bare = GitError::new("fatal: not a git repository");
+        assert_eq!(bare.summary, "fatal: not a git repository");
+    }
+
+    /// `esc` peels the message overlay first, the error second, and only then
+    /// falls through to the ladder the key was already on.
+    #[gpui::test]
+    async fn esc_peels_the_overlay_then_the_error_then_the_ladder(cx: &mut TestAppContext) {
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, _| {
+            shell.error = Some(GitError::new("git commit: hook declined"));
+            shell.show_message = true;
+        });
+
+        // First `esc`: the overlay closes, the error stands.
+        shell.update(cx, |shell, cx| shell.back(cx));
+        shell.read_with(cx, |shell, _| {
+            assert!(!shell.show_message, "the overlay closed");
+            assert!(shell.error.is_some(), "the error outlives its overlay");
+        });
+
+        // Second: the error itself is gone.
+        shell.update(cx, |shell, cx| shell.back(cx));
+        shell.read_with(cx, |shell, _| assert!(shell.error.is_none()));
     }
 
     #[gpui::test]

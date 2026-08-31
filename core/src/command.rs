@@ -2204,6 +2204,15 @@ mod tests {
     }
 
     #[test]
+    fn message_show_is_global_and_spoken_on_the_backtick() {
+        // The one key lazygit's defaults never took and the shell's own maps
+        // left alone: the message overlay must answer to it from anywhere.
+        let k = Keymap::builtin();
+        assert_eq!(k.live_keys_for("message.show", &Modes::new()), vec!["`"]);
+        assert!(Commands::builtin().known("message.show"));
+    }
+
+    #[test]
     fn an_unbound_key_leaves_the_projection_and_an_unknown_mode_is_silent() {
         let mut k = Keymap::builtin();
         let c = Commands::builtin();
