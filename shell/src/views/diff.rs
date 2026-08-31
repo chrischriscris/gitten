@@ -2789,7 +2789,7 @@ pub(crate) fn file_header(
                         div()
                             .flex_none()
                             .text_color(rgb(p.dels_fg))
-                            .child(format!("-{dels}")),
+                            .child(format!("−{dels}")),
                     ),
             )),
         )
