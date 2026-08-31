@@ -11,7 +11,7 @@
 //! modal anywhere in the window yet.
 
 use super::{accept_deferred_scroll, DeferredScrollbar, PendingScroll};
-use crate::chrome::{list_row, ROW_PAD};
+use crate::chrome::{empty_line, list_row};
 use crate::graph::ROW_H;
 use gitten_core::host::Host;
 use gitten_core::refs::Stash;
@@ -372,23 +372,11 @@ const GAP_CHARS: f32 = 1.5;
 
 impl Render for Stashes {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let host = crate::config::host(cx);
-        let c = host.theme.chrome;
-        // An empty stack is a quiet line, not an empty box — the compact twin
-        // of the files pane's clean-tree line, sitting top-left because this
-        // pane is a short section of the sidebar, not a whole column.
-        if let Some(empty) = self.is_empty().then(|| {
-            div()
-                .size_full()
-                .pl(px(ROW_PAD))
-                .pt_2()
-                .flex()
-                .items_start()
-                .text_color(rgb(host.theme.quiet_on(c.bg)))
-                .child("nothing stashed")
-                .into_any_element()
-        }) {
-            return empty;
+        // An empty stack is a quiet line, not an empty box —
+        // [`chrome::empty_line`], the compact twin of the files pane's
+        // clean-tree sentence.
+        if self.is_empty() {
+            return empty_line(&crate::config::host(cx), "nothing stashed".into());
         }
 
         let data = self.data.clone();

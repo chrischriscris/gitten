@@ -12,7 +12,7 @@
 //! strings so the render path allocates nothing per frame.
 
 use super::{accept_deferred_scroll, DeferredScrollbar, PendingScroll};
-use crate::chrome::{list_row, path_spans, section_label, ROW_PAD};
+use crate::chrome::{empty_line, list_row, path_spans, section_label};
 use crate::graph::ROW_H;
 use gitten_core::host::Host;
 use gitten_core::status::{Change, ConflictKind, PathBytes, Status};
@@ -717,25 +717,11 @@ const GAP_CHARS: f32 = 1.5;
 
 impl Render for Files {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let host = crate::config::host(cx);
-        let c = host.theme.chrome;
-        // A clean tree is a quiet line, not an empty box: this pane is a short
-        // section of the sidebar now, not a whole column, so the answer sits
-        // top-left where a reader scans and not centred where nobody looks.
-        // A sentence someone looks for — through `quiet_on`, because raw
-        // `faint` is 2.05:1 here and "quiet" was reading as "absent".
-        if let Some(empty) = self.is_clean().then(|| {
-            div()
-                .size_full()
-                .pl(px(ROW_PAD))
-                .pt_2()
-                .flex()
-                .items_start()
-                .text_color(rgb(host.theme.quiet_on(c.bg)))
-                .child("working tree clean")
-                .into_any_element()
-        }) {
-            return empty;
+        // A clean tree is a quiet line, not an empty box: [`chrome::empty_line`]
+        // sits top-left where a reader scans, and the sentence is shared with
+        // the stashes and branches panes so one blank pane means one thing.
+        if self.is_clean() {
+            return empty_line(&crate::config::host(cx), "working tree clean".into());
         }
 
         let data = self.data.clone();

@@ -2020,6 +2020,18 @@ impl Diff {
 
 impl Render for Diff {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Zero rows is a sentence, not a bare rectangle: nothing selected, a
+        // clean tree and an empty projection are indistinguishable from out
+        // here, and [`chrome::empty_line`] says so the same way every quiet
+        // pane does. The pane header above already names what was selected.
+        // A one-file diff with no hunks still keeps its header row — only an
+        // empty *order* lands here.
+        if self.order.is_empty() {
+            return crate::chrome::empty_line(
+                &crate::config::host(cx),
+                "no changes to show".into(),
+            );
+        }
         // Whatever the last frame measured this view to be. Reflowing here and
         // not in the probe itself keeps every mutation of the row tables on the
         // one path, and costs one frame of unwrapped rows at startup.
@@ -2153,7 +2165,7 @@ impl Render for Diff {
                 )))
                 .child(Scrollbar::horizontal(&self.pan))
             });
-        root
+        root.into_any_element()
     }
 }
 

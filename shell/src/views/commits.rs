@@ -617,6 +617,18 @@ pub(crate) fn prepare(commits: Vec<Commit>, _host: &Host) -> Prepared {
 
 impl Render for Commits {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // No visible rows is a sentence, not a blank: with a standing query
+        // the query itself is what makes the state legible — the header's
+        // `0/4173` says how many survived, this says why nothing is drawn —
+        // and without one it is simply a repository with no commits. Either
+        // way [`chrome::empty_line`], like every other quiet pane.
+        if self.visible.is_empty() {
+            let text = match self.query.as_deref() {
+                Some(q) => SharedString::from(format!("no commits match \"{q}\"")),
+                None => SharedString::from("no commits"),
+            };
+            return chrome::empty_line(&crate::config::host(cx), text);
+        }
         let data = self.data.clone();
         let rendered = self.rendered.clone();
         let top = self.top.clone();
@@ -678,12 +690,17 @@ impl Render for Commits {
         // terminal draws its own bar from the same flag, and a knob that means
         // two things in two clients is a knob nobody trusts.
         let bars = crate::config::host(cx).view.scrollbar;
-        div().relative().size_full().child(list).when(bars, |d| {
-            d.child(Scrollbar::vertical(&DeferredScrollbar::new(
-                &self.scroll,
-                &self.pending_scroll,
-            )))
-        })
+        div()
+            .relative()
+            .size_full()
+            .child(list)
+            .when(bars, |d| {
+                d.child(Scrollbar::vertical(&DeferredScrollbar::new(
+                    &self.scroll,
+                    &self.pending_scroll,
+                )))
+            })
+            .into_any_element()
     }
 }
 
@@ -1251,6 +1268,22 @@ mod tests {
             Some(before.as_str()),
             "empty restores instantly, cursor included"
         );
+    }
+
+    #[test]
+    fn an_empty_list_is_a_state_the_render_reads_with_the_query_standing() {
+        let host = Rc::new(Host::new());
+        let mut c = Commits::new(commits(20), host.clone());
+        assert!(!c.visible.is_empty());
+        // The empty pane renders from this state — no visible rows — and the
+        // sentence it draws echoes the query, so the state must still hold it.
+        c.apply_query("only staged files");
+        assert!(c.visible.is_empty());
+        assert_eq!(c.query(), Some("only staged files"));
+        // And the other honest blank: a repository with no commits at all.
+        let none = Commits::new(Vec::new(), host);
+        assert!(none.visible.is_empty());
+        assert!(none.query().is_none());
     }
 
     #[test]

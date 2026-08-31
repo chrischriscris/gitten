@@ -145,6 +145,26 @@ pub fn path_spans(
         .child(div().flex_none().text_color(rgb(bright)).child(name))
 }
 
+/// An empty pane's answer: one quiet faint line, top-left, where a reader
+/// scans — a quiet line, not an empty box, and never a sentence centred in a
+/// pane where no row ever sits. Shared here because three sidebar panes had
+/// drifted into near-identical copies of the same twelve lines, and one blank
+/// pane must not mean three different things.
+pub fn empty_line(host: &Host, text: SharedString) -> AnyElement {
+    let c = host.theme.chrome;
+    div()
+        .size_full()
+        .pl(px(ROW_PAD))
+        .pt_2()
+        .flex()
+        .items_start()
+        // A sentence someone looks for: through `quiet_on`, because raw
+        // `faint` is 2.05:1 here and that is not a sentence, it is a gap.
+        .text_color(rgb(host.theme.quiet_on(c.bg)))
+        .child(text)
+        .into_any_element()
+}
+
 /// The keycap a pane header starts with: the number of the key that focuses
 /// the pane, in a small outlined square. The square is the whole point — a
 /// bare numeral reads as a count, a keycap reads as *press me* — and it is

@@ -735,27 +735,13 @@ fn row_target(row: &Row) -> Option<Target> {
 
 impl Render for Branches {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let host = crate::config::host(cx);
-        let c = host.theme.chrome;
         // No refs at all is a sentence, not an empty box — an unborn
-        // repository's honest answer. Top-left at `ROW_PAD`, like the files
-        // and stash panes' lines: this is a short section of the sidebar, and
-        // a sentence centred in it would sit where no row ever does.
-        if let Some(empty) = self.is_empty().then(|| {
-            div()
-                .size_full()
-                .pl(px(chrome::ROW_PAD))
-                .pt_2()
-                .flex()
-                .items_start()
-                // A sentence someone looks for: through `quiet_on`, because
-                // raw `faint` is 2.05:1 here and that is not a sentence, it
-                // is a gap.
-                .text_color(rgb(host.theme.quiet_on(c.bg)))
-                .child("no branches yet")
-                .into_any_element()
-        }) {
-            return empty;
+        // repository's honest answer, drawn by [`chrome::empty_line`] like
+        // the files and stash panes' sentences: this pane is a short section
+        // of the sidebar, and a sentence centred in it would sit where no
+        // row ever does.
+        if self.is_empty() {
+            return chrome::empty_line(&crate::config::host(cx), "no branches yet".into());
         }
 
         let data = self.data.clone();
