@@ -1,6 +1,8 @@
 # Implementation Plans
 
-Passes so far, and pass 7 open (031–036, the 2026-08-31 UI/UX audit wave):
+Passes so far, and pass 8 open (037–044, the 2026-08-31 UI re-audit wave,
+planned against `origin/full/full` `635aba8`); pass 9 (045–059, the GUI
+design review) lives in `plans/high-priority/` with its own index:
 
 - **Pass 1** (2026-08-24, audited at `3a8b347`): plans 001–007. All landed on
   main and merged — verified 2026-08-26 against `2dfcb82`
@@ -80,7 +82,22 @@ Passes so far, and pass 7 open (031–036, the 2026-08-31 UI/UX audit wave):
   gated SKIP-AND-REPORT rather than publishing the owner's in-flight work.
   Numbered 031+ because pass 6's plans landed first (PR #26) — the two audits
   ran concurrently and both initially claimed 023–028; these were renumbered
-  and their cross-references rewritten on discovering the collision.
+  and their cross-references rewritten on discovering the collision. The wave
+  was executed and merged upstream as PRs #28–#33 (`9a63a90`, `a86b0b8`,
+  `35dcccf`, `7bc6530`, `871061e`, `545faeb`), closed by `635aba8` ("pass 7
+  executed, all six merged").
+- **Pass 8** (2026-08-31, planned at `635aba8` = `origin/full/full`; planned
+  while the `chrome.raised`/`chrome.keycap` design pass was still uncommitted
+  — it lands with this commit): eight plans from a four-scout re-audit
+  (lost-findings resurrection + new surfaces + interaction model +
+  theme/parity). Every excerpt re-opened and verified by the advisor; contrast
+  figures are the repo's own or recomputed with its methodology. Maintainer
+  selected findings 1–8 + 10 of the presented table; 042 bundles three
+  one-site fixes; reflog/undo declined as a direction option this wave.
+- **Pass 9** (2026-08-31, the GUI design review): plans 045–059 in
+  `plans/high-priority/`, written by two advisor sessions in parallel and
+  reconciled; that folder's README is their index, base convention and
+  dispatch order. Excludes everything passes 7–8 already own.
 
 ## Pass 4 follow-ups — surfaced by reviewers, recorded not folded
 
@@ -148,6 +165,27 @@ integrator owns this table and updates it as waves land.
 - A rebase resolution during 034 briefly took the keycap's border ink for its
   numeral; caught and restored in #33. Resolution conflicts in overlapping
   passes need the plan's own test suite re-read, not just re-run.
+
+### Pass 8 — execution order & status
+
+| Plan | Title | Priority | Effort | Depends on | Status |
+|------|-------|----------|--------|------------|--------|
+| 037 | The message overlay owns the keyboard, the way help does | P1 | M | — | TODO |
+| 038 | An armed verb's question lives exactly as long as the arm | P1 | S | 037 softly (same Resolve::Run block) | TODO |
+| 039 | The title-bar pickers own the keyboard | P1 | S–M | — | TODO |
+| 040 | Every text resolves against the surface it is drawn on | P2 | S | — | TODO |
+| 041 | The status bar never advertises a dead key | P1 | S | — | TODO |
+| 042 | Three small modal-guard fixes (wheel under prompt, live esc hint, stale overlay flag) | P1 | S | 037 softly, 043 | TODO |
+| 043 | The error band's summary survives an argv that contains `": "` | P2 | S–M | 042 (GitError construction) | TODO |
+| 044 | The terminal's quiet text resolves like the window's | P2 | S | — | TODO |
+
+Pass 8 dependency notes:
+
+- 037 first (the resolution-arm shape 038's context shares); 038 next; 042
+  after 037, 043 after 042. 039, 040, 041, 044 are independent.
+- All eight branch from `origin/full/full` (`635aba8`); none touch the
+  owner's uncommitted design pass. If `chrome.raised`/`chrome.keycap` land
+  first, 040's out-of-scope fence still holds (leave the new fields alone).
 
 ## Pass 3 follow-ups — surfaced by reviewers, pre-existing, not pass regressions
 
@@ -247,6 +285,108 @@ Both passes vetted these; left out for leverage. Still open unless noted.
   untracked but unignored (git-status noise / accidental `add -A` risk).
   Effort S each, M bundled.
 
+## Pass 6 dependency notes and merge order
+
+All six branch from `origin/full/full` (`038d0ad`) and are independent PRs, so
+they can be reviewed in any order. **Merge** order matters, because they share
+files:
+
+1. **031 first** — it changes `Rows::render` (a documented extension seam) from
+   `current: bool` to a `RowState` struct. 036 edits the same render arms and
+   034 measures the `Surface` it adds; both rebase cleanly after it.
+2. **033 before 035** — 033 restructures `help.rs` (scroll container); 035
+   recolours one line of it.
+3. **032 after 031** — both touch the status-band precedence block in
+   `shell/src/main.rs`; 031 introduces the question/notice ink split that 032's
+   `GitError` sits beside.
+4. 034 and 036 last; they are the widest and the least entangled with each
+   other.
+
+Note for whoever merges: `full/full` in the `gitten.wt/full` worktree was 66
+commits behind `origin/full/full` at audit time and carries 2 local commits
+plus the uncommitted design pass. Pull before merging, and expect 035's Step 2
+to still be open (it is gated on the design pass landing).
+
+## Pass 6 findings surfaced but NOT turned into plans
+
+All vetted against `038d0ad`; open unless a maintainer decides otherwise.
+
+- **Mouse story (product decision needed)**: the only hover/`cursor_pointer` in
+  the app is `controls.rs`; no list pane handles a row click — clicking a commit
+  focuses the pane but shows the *previous* row's diff, while the diff pane
+  itself hit-tests richly and the tui already routes clicks through
+  `core::select` per decision 0022. Either add click-to-select (each pane has
+  `go_to`; disarm any armed verb on click) or commit to keyboard-only and stop
+  drawing a pressable-looking keycap. Effort M.
+- **Font-derived metrics**: `[font] size` accepts 4–96 and hot-reloads, but
+  `ROW_H` (22), `HEADER_H`/`STATUS_H` (26), `TITLE_H` (32), `CHIP_H`, keycap
+  `ch*1.6`, markdown `indent: 14.0` and the heading ceiling `ROW_H/1.2` are
+  constants — at `size = 16` h1 and h2 render identically, at ≥ 18 all six
+  heading levels collapse, and rows clip. Fix is deriving the family from
+  `host.font` and re-checking every `uniform_list`/wheel `/ROW_H` conversion.
+  Effort M, risk MED. Deserves its own plan.
+- **`g` collision (maintainer taste)**: global `g` = `view.top`, but
+  `[stashes] g` = pop (mutating, unconfirmed) and `[commits] g` = reset menu
+  shadow it. Deliberate per the comments — but a keymap test asserting "no
+  mutating command shadows a global movement key" would keep the decision
+  conscious. Effort S once decided.
+- **Search readout**: a standing `/` filter shows no query and no match count in
+  the pane body, no highlight of the matched substring (`core::search` returns
+  indices only), and no search exists in the diff view at all. Effort M / L.
+- **In-progress rebase/cherry-pick invisible**: nothing reads
+  `rebase-merge`/`MERGE_HEAD`/`CHERRY_PICK_HEAD`; `rebase.abort` (`A` in
+  commits — lazygit's *amend* key) fires with no confirmation and discards
+  conflict resolution; `Z`/`X` cherry-pick verbs are unhinted. Effort M.
+- **Hunk-header furniture resolved against the wrong surface**: coordinates take
+  `gutter_on(Surface::Context)` but draw on `hunk_bg` (~3.03:1, clears 3.0 by
+  luck), and `diff.rs` solves the same problem ad hoc with an inline `readable`
+  at the file header. Promoting `file_bg`/`hunk_bg` to `Surface`s is the fix —
+  a natural rider on 031's enum change.
+- **Binary/rename/mode-change rows**: the parser skips them, so a changed PNG
+  renders as a `+0 -0` header that says "nothing changed". Needs a notice-row
+  variant in `core` seen by all three presentations. Effort M. (036 ships an
+  honest empty sentence meanwhile.)
+- **`chrome.error` means three things** (failure, conflict, armed question) with
+  no `warning` field, against the palette's own one-colour-one-meaning rule.
+  Needs three themes' worth of taste. Effort M.
+- **The armed-hunk render tint** was already deferred once, in pass 5's 021, on
+  the grounds that a `Frame` field ripples through every tui presentation. 031
+  does the **window** half (`RowState`); the terminal half remains open and is
+  now cheaper, since the window will have settled the field's shape.
+
+### 2026-08-31 re-audit verdicts (pass 8, advisor-verified at `635aba8`)
+
+| Item | Verdict |
+|---|---|
+| Mouse story | STILL LIVE — `cursor_pointer`/`on_click` still only in `controls.rs` (174-179, 232-243); no list view handles a click. Plan declined this wave; product decision stands open. |
+| Font-derived metrics | STILL LIVE — ROW_H 22, HEADER_H/STATUS_H 26, TITLE_H 32, CHIP_H 22 all survive; heading scale now font-relative but capped at ROW_H/1.2, so ≥6 levels still collapse. Not selected this wave. |
+| `g` collision | By design; the per-mode keymap tests naming the trade already exist → moved to "considered and rejected". |
+| Search readout | PARTIAL — filter count + query-echo empty state landed; no substring highlight (`core/src/search.rs:56` returns bare indices), no diff search. Open, not selected. |
+| Rebase/cherry-pick invisible | PARTIAL — verbs + Z/X hints landed (`git/src/lib.rs:1667-1705`); in-progress state still renders nowhere; `rebase.abort` on `A` unconfirmed is a recorded decision. Open, not selected. |
+| Hunk-header furniture | PARTIAL — band receded and is tested; @@ markers still `gutter_on(Surface::Context)` on `hunk_bg` (`diff.rs:2880`). Lower stakes; Surface promotion still the recorded fix. |
+| Binary/rename/mode rows | PARTIAL — header kept with honest counts (`git/src/lib.rs:2030+`); still no words saying "binary". Open, not selected. |
+| `chrome.error` three meanings | STILL LIVE structurally improved — `Notice::Question` split landed; ink still one colour, no `warning` field. Open, not selected. |
+| Armed-hunk tint, terminal half | RESOLVED — per-pane armed fields + per-frame `armed_index` in every arming pane; no Frame field ripple. |
+
+## Pass 6 direction options (maintainer's call, evidence-backed)
+
+- **Command palette**: `Commands` already holds name+doc+hint with `all()`;
+  `live_keys_for` answers "which key runs this now"; `controls.rs`' picker and
+  the help overlay prove the overlay pattern; extension commands are currently
+  reachable only by editing `gitten.toml`. A fuzzy filter over the registry
+  dispatching into the one `run_command` path is the cheapest large
+  discoverability win in the tree. Effort M (coarse).
+- **Command log pane**: the job runner already emits `Started`/`Finished` with
+  human-readable names for every write and the shell discards them — lazygit's
+  standing trust feature ("what did this app just do to my repo") is a bounded
+  ring buffer plus a drawer away. Absorbs 032's error retention. Effort M–L.
+- **Conflict verbs before the merge editor (roadmap #19)**: `core::status`
+  already models `ConflictKind` per path and the files pane draws a CONFLICTS
+  section, but the app offers no way *through* a conflict — take-ours /
+  take-theirs / mark-resolved are two-line `Write::named` verbs on existing
+  rails, and they de-risk #19's design. Trap to name in any plan: ours/theirs
+  invert between rebase and merge. Effort S–M for the verbs.
+
 ## Direction options (pass 2)
 
 Maintainer's call, evidence-backed: repo-access trait + porcelain-v2 status
@@ -278,3 +418,16 @@ Pass 2:
 - Web: memoizing `(cols, wrap)` reflow across tabs — proof client, single user,
   localhost; the clamp on request params already bounds worst case. Not worth
   the code today.
+
+Pass 8:
+- The `g` collision (global `g` = `view.top` shadowed by `[stashes] g` = pop
+  and `[commits] g` = reset menu): deliberate per the in-code comments, and
+  the per-mode keymap tests naming the mode-overrides-global trade already
+  exist (`core/src/command.rs:1586-1654`). The finding's literal proposed
+  assertion ("no mutating command shadows a global movement key") would fail
+  against that design. Recorded so nobody re-audits it; a cross-mode guard
+  test is the only residue if the maintainer ever wants one.
+- Upstream-index doc drift: the upstream `plans/README.md` lost the pass-6
+  findings/direction sections during the PR #26/#34 restructure. When merging
+  pass 8 upstream, carry this file's pass-6 verdict table and direction
+  options with it.
