@@ -46,6 +46,18 @@ and a 1px line held to a text floor is a bright seam. The gutter is the one piec
 of furniture that is *text*, on backgrounds it does not choose. See
 [../theming.md](../theming.md#what-a-hairline-is-for).
 
+## Amendment — faint as text resolves through `quiet_on`
+
+The exemption above is about `faint` *as a border*, and it stands: a hairline
+keeps no floor. But the same field was drawn as *text* in a dozen places —
+section labels, pane-header counts, a rename's old path, the empty states — and
+there raw `faint` measures 2.05:1 on `chrome.bg` and 1.95:1 on the title strip:
+below the furniture floor, so "dim and inert" was in practice *removed*. Those
+sites now resolve through `Theme::quiet_on`, which gives `chrome.faint` the
+furniture floor against whatever background it is drawn on and leaves the border
+uses untouched. The split, in one line: a border may be invisible — it is felt,
+not read; a word may not.
+
 ## Evidence
 
 `contrast()` over the shipped palette, before and after, in

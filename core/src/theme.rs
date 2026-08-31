@@ -13,8 +13,12 @@
 
 use crate::syntax::Kind;
 
-/// Which background a token is actually drawn on. A single colour per token
-/// class is not enough: the same grey that reads as a quiet comment on the
+/// Which background ink is drawn on. A single colour per class is not
+/// enough: the same grey that reads as a quiet comment on the
+///
+/// Diff rows for tokens, chrome strips for the text drawn on them — `dim`
+/// as text is below the floor on both strips in every shipped theme, and a
+/// strip's background is as static as a row's is to whoever paints it.
 /// near-black context row is illegible on the lighter background a changed word
 /// carries, which was measured at 1.15:1 before this existed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,10 +51,23 @@ pub enum Surface {
     /// landed on. Measured that way, the dark theme's context gutter lands at
     /// 2.78:1 — under the furniture floor, on the one row being read.
     Cursor,
+    /// The strip a pane starts with — `1 FILES` and its neighbours.
+    ///
+    /// A surface for the same reason Cursor is one: chrome text is read off
+    /// both strips, and raw `dim` is under the text floor there — 3.37 on the
+    /// title strip, 3.40 on the bar, in all three shipped themes — while a
+    /// strip's background is as static as a row's: whoever paints it knows
+    /// which one it is.
+    Title,
+    /// The bar across the bottom, where the keyboard says where it is.
+    ///
+    /// Same reason: raw `dim` measures 3.40:1 on `status_bg`, under the text
+    /// floor in all three themes, and the bar's background is static.
+    Status,
 }
 
 impl Surface {
-    pub const ALL: [Surface; 9] = [
+    pub const ALL: [Surface; 11] = [
         Surface::Context,
         Surface::Added,
         Surface::Removed,
@@ -60,6 +77,8 @@ impl Surface {
         Surface::MovedAdded,
         Surface::Selected,
         Surface::Cursor,
+        Surface::Title,
+        Surface::Status,
     ];
     pub const COUNT: usize = Self::ALL.len();
 
@@ -170,6 +189,10 @@ pub struct MarkdownPalette {
     pub quote_bar: Rgb,
     /// Bullet glyphs, table pipes, a fence's language label: the punctuation the
     /// renderer draws itself, which should read as structure and not as text.
+    ///
+    /// The base for a furniture colour resolved against a row background, exactly
+    /// like [`DiffPalette::gutter_fg`] — see [`Theme::marker_on`], which is what
+    /// is actually drawn.
     pub marker: Rgb,
     /// A thematic break, and a table's separator row.
     pub rule: Rgb,
@@ -254,6 +277,21 @@ pub struct Theme {
     /// `diff.gutter_fg` resolved against every [`Surface`], for the same reason
     /// and by the same code. Indexed by [`Surface::index`].
     gutter: [Rgb; Surface::COUNT],
+    /// `markdown.marker` resolved against every [`Surface`], for the same reason
+    /// again: a bullet is furniture drawn on whichever row the prose landed on,
+    /// and the raw value measured **2.27:1** on a changed word in the shipped
+    /// dark theme — a glyph standing in for a marker that is no longer there,
+    /// and now not there either. Indexed by [`Surface::index`].
+    marker: [Rgb; Surface::COUNT],
+    /// `chrome.dim` resolved against every [`Surface`], for the reason the
+    /// strips are surfaces at all: raw, `dim` is chrome *text* — a picker's
+    /// value, a pane's name, the hints' labels — and it clears the text floor
+    /// on `chrome.bg` alone (3.53 in the shipped dark theme, 3.55 in the
+    /// light, 3.52 in slate). On the title strip it measures 3.37, on the
+    /// status bar 3.40, on a selected row 2.97, and a strip's background is
+    /// as static as a row's: whoever paints it knows which one it is.
+    /// Indexed by [`Surface::index`].
+    dim: [Rgb; Surface::COUNT],
 }
 
 impl Default for Theme {
@@ -338,6 +376,8 @@ impl Theme {
             authors: vec![0x9c8a6b, 0x6f8296, 0x8b7a96, 0x6b8f88, 0x9c7f75, 0x7d8a6b],
             resolved: Vec::new(),
             gutter: [0; Surface::COUNT],
+            marker: [0; Surface::COUNT],
+            dim: [0; Surface::COUNT],
         }
         .rebuilt()
     }
@@ -431,6 +471,8 @@ impl Theme {
             authors: vec![0x8a7040, 0x577891, 0x816b99, 0x447e73, 0x95695b, 0x6a7a40],
             resolved: Vec::new(),
             gutter: [0; Surface::COUNT],
+            marker: [0; Surface::COUNT],
+            dim: [0; Surface::COUNT],
         }
         .rebuilt()
     }
@@ -510,6 +552,8 @@ impl Theme {
             authors: vec![0x6d94b1, 0x658b84, 0x887f9f, 0x619494, 0xa28087, 0x798f6c],
             resolved: Vec::new(),
             gutter: [0; Surface::COUNT],
+            marker: [0; Surface::COUNT],
+            dim: [0; Surface::COUNT],
         }
         .rebuilt()
     }
@@ -531,6 +575,8 @@ impl Theme {
         for surface in Surface::ALL {
             let bg = self.background(surface);
             self.gutter[surface.index()] = readable(self.diff.gutter_fg, bg, self.min_furniture);
+            self.marker[surface.index()] = readable(self.markdown.marker, bg, self.min_furniture);
+            self.dim[surface.index()] = readable(self.chrome.dim, bg, self.min_contrast);
         }
     }
 
@@ -550,6 +596,8 @@ impl Theme {
             Surface::MovedAdded => self.diff.moved_added_bg,
             Surface::Selected => self.chrome.selected_bg,
             Surface::Cursor => self.chrome.selection_bg,
+            Surface::Title => self.chrome.title_bg,
+            Surface::Status => self.chrome.status_bg,
         }
     }
 
@@ -569,6 +617,58 @@ impl Theme {
     #[inline]
     pub fn gutter_on(&self, surface: Surface) -> Rgb {
         self.gutter[surface.index()]
+    }
+
+    /// The colour to draw a Markdown marker in on `surface` — a bullet glyph, a
+    /// fence's language label. One index; the contrast work happened in
+    /// [`Theme::rebuild`].
+    ///
+    /// The gutter's argument, for the same class of thing: a marker stands in for
+    /// punctuation the row no longer carries, and a rendered prose row lands on
+    /// every diff background there is. Raw, `markdown.marker` measured 2.27:1 on
+    /// a changed word in the shipped dark theme and 2.07:1 on a text selection —
+    /// a bullet that is furniture on a context row and absent everywhere else.
+    /// The *furniture* floor and not the text one, because a bullet is glanced at
+    /// exactly once, like a line number.
+    #[inline]
+    pub fn marker_on(&self, surface: Surface) -> Rgb {
+        self.marker[surface.index()]
+    }
+
+    /// The colour to draw chrome text in when it is drawn dim: a picker's
+    /// disabled value, a pane's name, the hints' labels. One index; the
+    /// contrast work happened in [`Theme::rebuild`], against every surface the
+    /// strips sit on and every row a list can paint.
+    ///
+    /// The gutter's argument, and the same floor: raw `dim` clears the text
+    /// floor on `chrome.bg` alone — 3.53:1 in the shipped dark theme, 3.55 in
+    /// the light, 3.52 in slate — and fails it everywhere else it is drawn.
+    /// Resolved, it is still the quietest ink on every surface, and never
+    /// louder than the rows it sits among.
+    #[inline]
+    pub fn dim_on(&self, surface: Surface) -> Rgb {
+        self.dim[surface.index()]
+    }
+
+    /// `chrome.faint` made legible against the chrome background it is drawn on.
+    ///
+    /// The split this exists to make: `faint` **as a border** has no legibility
+    /// floor and keeps none — a hairline in a near-black palette cannot be held
+    /// to a text ratio without becoming a bright line, which is the whole
+    /// argument of `docs/decisions/0020-furniture-has-its-own-floor.md`. But
+    /// `faint` **as text** — a section label, a pane's count, a rename's old
+    /// path, the empty state — is read, and raw it measures 2.05:1 on
+    /// `chrome.bg` and 1.95:1 on the title strip: below the furniture floor, so
+    /// "dim and inert" was in practice removed. Text goes through here; a border
+    /// keeps reading `chrome.faint` directly.
+    ///
+    /// Takes a background rather than a [`Surface`]: quiet has one floor — the
+    /// furniture one, everywhere it is drawn, and a handful of labels per frame
+    /// to resolve. `dim` fails the *text* floor on the strips, and it is text
+    /// there: the strips took the enum and the table instead, and
+    /// [`Theme::dim_on`] resolves against whichever one it lands on.
+    pub fn quiet_on(&self, bg: Rgb) -> Rgb {
+        readable(self.chrome.faint, bg, self.min_furniture)
     }
 
     #[inline]
@@ -768,6 +868,53 @@ mod tests {
                         t.min_contrast
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn chrome_text_inks_clear_the_text_floor_where_they_are_drawn() {
+        // The strips are surfaces now, and `dim` is resolved like the gutter:
+        // what a theme ships is the one grey, and the table is what `rebuild`
+        // made of it. Raw, `dim` failed the text floor on the title strip
+        // (3.37), the status bar (3.40) and a selected row (2.97) in every
+        // shipped theme — tuned against `bg` alone. This pins the table, so a
+        // fourth palette cannot ship a dim label at 2.97:1 on the row the
+        // keyboard is reading.
+        for t in Themes::builtin().0 {
+            let c = t.chrome;
+            for (ink_name, ink) in [("fg", c.fg), ("accent", c.accent), ("error", c.error)] {
+                for (bg_name, bg) in [
+                    ("bg", c.bg),
+                    ("title_bg", c.title_bg),
+                    ("status_bg", c.status_bg),
+                    ("selection_bg", c.selection_bg),
+                ] {
+                    let got = contrast(ink, bg);
+                    assert!(
+                        got >= t.min_contrast - 0.01,
+                        "{}: {ink_name} on {bg_name} is {got:.2}:1, floor is {:.2}",
+                        t.name,
+                        t.min_contrast
+                    );
+                }
+            }
+            for surface in Surface::ALL {
+                let bg = t.background(surface);
+                let dim = contrast(t.dim_on(surface), bg);
+                assert!(
+                    dim >= t.min_contrast - 0.01,
+                    "{}: dim on {surface:?} is {dim:.2}:1, floor is {:.2}",
+                    t.name,
+                    t.min_contrast
+                );
+                let marker = contrast(t.marker_on(surface), bg);
+                assert!(
+                    marker >= t.min_furniture - 0.01,
+                    "{}: marker on {surface:?} is {marker:.2}:1, floor is {:.2}",
+                    t.name,
+                    t.min_furniture
+                );
             }
         }
     }

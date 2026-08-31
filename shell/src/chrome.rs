@@ -18,6 +18,7 @@
 
 use gitten_core::command::{HelpRow, Modes};
 use gitten_core::host::Host;
+use gitten_core::theme::Surface;
 use gpui::*;
 
 /// Height of a pane's header strip — `1 FILES`, `4 COMMITS`, `5 <path>`.
@@ -94,7 +95,11 @@ pub fn section_label(host: &Host, text: SharedString, count: Option<SharedString
         .min_w_full()
         .h(px(h))
         .pl(px(ROW_PAD))
-        .text_color(rgb(c.faint))
+        // Text, not a border: raw `faint` is 2.05:1 here — half the furniture
+        // floor — so "quiet" was in practice invisible. `quiet_on` lifts it to
+        // the floor and no further, so the label still reads as a heading over
+        // the rows and never as one of them.
+        .text_color(rgb(host.theme.quiet_on(c.bg)))
         .child(div().flex_none().child(text))
         .children(count.map(|count| div().flex_none().ml_auto().pr_2().child(count)))
 }
@@ -106,13 +111,26 @@ pub fn section_label(host: &Host, text: SharedString, count: Option<SharedString
 /// filename starts and the render path clones two refcounts instead of
 /// cutting and copying a string per visible row per frame. Two `flex_none`
 /// spans in one row and no wrapping, because a path is one word to the eye.
-pub fn path_spans(host: &Host, dir: SharedString, name: SharedString, bright: u32) -> Div {
-    let c = host.theme.chrome;
+pub fn path_spans(
+    host: &Host,
+    dir: SharedString,
+    name: SharedString,
+    bright: u32,
+    surface: Surface,
+) -> Div {
     div()
         .flex()
         .items_center()
         .whitespace_nowrap()
-        .child(div().flex_none().text_color(rgb(c.dim)).child(dir))
+        // The directory is read as a path — raw dim is under the text floor on
+        // the title strips it lands on and on a selected row, so it resolves
+        // against the surface the caller paints.
+        .child(
+            div()
+                .flex_none()
+                .text_color(rgb(host.theme.dim_on(surface)))
+                .child(dir),
+        )
         .child(div().flex_none().text_color(rgb(bright)).child(name))
 }
 
@@ -127,6 +145,14 @@ fn keycap(host: &Host, number: &str, focused: bool) -> Div {
     let ink = match focused {
         true => c.accent,
         false => c.faint,
+    };
+    // The numeral is text and the box around it is a border, so they part
+    // ways here: the box keeps `faint` raw — a hairline has no floor — and
+    // the digit goes through `quiet_on`, because raw it is 1.95:1 on the
+    // strip and a keycap nobody can read teaches nothing.
+    let digit = match focused {
+        true => c.accent,
+        false => host.theme.quiet_on(c.title_bg),
     };
     div()
         .flex_none()
@@ -170,7 +196,10 @@ pub fn pane_header(
     let name = div()
         .text_color(rgb(match focused {
             true => c.fg,
-            false => c.dim,
+            // The header strip is where the pane says what it is; dim raw
+            // measures 3.37:1 on `title_bg`, under the text floor, so the
+            // name resolves against the strip it lands on.
+            false => host.theme.dim_on(Surface::Title),
         }))
         .child(name)
         .into_any_element();
@@ -222,7 +251,14 @@ pub fn pane_header_with(
         .child(div().flex_none().child(name))
         // Everything after the name is right-edge furniture.
         .child(div().min_w_0().flex_grow(1.0))
-        .children(count.map(|count| div().flex_none().text_color(rgb(c.faint)).child(count)))
+        .children(count.map(|count| {
+            div()
+                .flex_none()
+                // A count is read, so it goes through `quiet_on` — raw `faint`
+                // is 1.95:1 on the strip it sits on.
+                .text_color(rgb(host.theme.quiet_on(c.title_bg)))
+                .child(count)
+        }))
         .children(right)
 }
 
@@ -258,7 +294,9 @@ pub fn status_bar(
         .bg(rgb(c.status_bg))
         .border_t_1()
         .border_color(rgb(c.border))
-        .text_color(rgb(c.dim))
+        // The bar is read for where the keyboard is; raw dim is under the
+        // text floor on it (3.40), so the bar's text resolves against it.
+        .text_color(rgb(host.theme.dim_on(Surface::Status)))
         .child(
             div()
                 .flex_none()
@@ -282,7 +320,9 @@ pub fn status_bar(
                 .child(
                     div()
                         .flex_none()
-                        .text_color(rgb(c.dim))
+                        // Read when wanted, glanced past otherwise — raw dim is
+                        // under the floor on the bar, so it resolves against it.
+                        .text_color(rgb(host.theme.dim_on(Surface::Status)))
                         .child(label.clone()),
                 )
         }))
@@ -291,7 +331,9 @@ pub fn status_bar(
         .child(
             div()
                 .flex_none()
-                .text_color(rgb(c.faint))
+                // Read, not glanced at — a version nobody can parse might as
+                // well be absent — so it clears the furniture floor.
+                .text_color(rgb(host.theme.quiet_on(c.status_bg)))
                 .child(SharedString::from(version.to_string())),
         )
 }

@@ -3,6 +3,7 @@ use crate::chrome;
 use crate::graph;
 use gitten_core::host::Host;
 use gitten_core::search;
+use gitten_core::theme;
 use gitten_core::view::Viewport;
 use gitten_core::{assign_lanes, initials, Commit};
 use gpui::prelude::FluentBuilder as _;
@@ -776,7 +777,13 @@ fn row(
                 // with it — so the tint spends nothing new.
                 .text_color(rgb(match armed {
                     true => host.theme.chrome.error,
-                    false => host.theme.chrome.dim,
+                    // The sha is read on the row it ends; raw dim fails on a
+                    // selected row, so it resolves against the row's bg.
+                    false => host.theme.dim_on(if current {
+                        theme::Surface::Cursor
+                    } else {
+                        theme::Surface::Context
+                    }),
                 }))
                 .child(c.short.clone()),
         )
@@ -816,11 +823,12 @@ fn row(
                 // Faint rather than dim, and below it in the palette on
                 // purpose: furniture looked up once per glance and not text
                 // to be read — the same floor reasoning that lets the diff's
-                // gutter recede. Armed reaches here too, so the whole row
-                // asks together.
+                // gutter recede. The furniture *floor* still applies, though,
+                // so it resolves through `quiet_on` rather than reading raw.
+                // Armed reaches here too, so the whole row asks together.
                 .text_color(rgb(match armed {
                     true => host.theme.chrome.error,
-                    false => host.theme.chrome.faint,
+                    false => host.theme.quiet_on(host.theme.chrome.bg),
                 }))
                 .child(time.clone()),
         )

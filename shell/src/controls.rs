@@ -45,7 +45,7 @@
 
 use crate::chrome::RADIUS;
 use gitten_core::font::Font;
-use gitten_core::theme::Theme;
+use gitten_core::theme::{Surface, Theme};
 use gpui::*;
 use std::rc::Rc;
 
@@ -108,12 +108,31 @@ pub fn picker(
     on_pick: impl Fn(usize, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
     let c = &theme.chrome;
-    // Disabled draws the *label* faint and the *value* at what an enabled label
-    // gets, rather than putting both on `faint`: that measures 1.95:1 on the
-    // title bar, so "dim and inert rather than removed" was in practice removed —
-    // and a control still has to say what it is on to be worth leaving there.
-    let dim = if p.enabled { c.dim } else { c.faint };
-    let fg = if p.enabled { c.fg } else { c.dim };
+    // Disabled draws the *label* quiet and the *value* at what an enabled label
+    // gets, rather than putting both on `faint`: raw, that measures 1.95:1 on
+    // the title bar, so "dim and inert rather than removed" was in practice
+    // removed. The label now goes through `quiet_on` — still the quietest ink
+    // on the strip, but at the furniture floor instead of under it — and a
+    // control still has to say what it is on to be worth leaving there.
+    let dim = if p.enabled {
+        // The trigger's background is its own to know: closed it sits on the
+        // title strip, open on the status tint — raw dim is under the text
+        // floor on both (3.37, 3.40), so it resolves against the one painted.
+        theme.dim_on(if open {
+            Surface::Status
+        } else {
+            Surface::Title
+        })
+    } else {
+        theme.quiet_on(c.title_bg)
+    };
+    let fg = if p.enabled {
+        c.fg
+    } else {
+        // The value is read when it is there; raw dim is under the text floor
+        // on the title bar, so it resolves against the strip it floats over.
+        theme.dim_on(Surface::Title)
+    };
 
     // Shared with the list, which dismisses on an outside click.
     let toggle = Rc::new(on_toggle);

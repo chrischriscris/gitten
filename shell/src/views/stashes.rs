@@ -15,6 +15,7 @@ use crate::chrome::{list_row, ROW_PAD};
 use crate::graph::ROW_H;
 use gitten_core::host::Host;
 use gitten_core::refs::Stash;
+use gitten_core::theme;
 use gitten_core::view::Viewport;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
@@ -369,7 +370,8 @@ const GAP_CHARS: f32 = 1.5;
 
 impl Render for Stashes {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let c = crate::config::host(cx).theme.chrome;
+        let host = crate::config::host(cx);
+        let c = host.theme.chrome;
         // An empty stack is a quiet line, not an empty box — the compact twin
         // of the files pane's clean-tree line, sitting top-left because this
         // pane is a short section of the sidebar, not a whole column.
@@ -380,7 +382,7 @@ impl Render for Stashes {
                 .pt_2()
                 .flex()
                 .items_start()
-                .text_color(rgb(c.faint))
+                .text_color(rgb(host.theme.quiet_on(c.bg)))
                 .child("nothing stashed")
                 .into_any_element()
         }) {
@@ -444,7 +446,11 @@ fn row(e: &Row, host: &Host, current: bool, focused: bool, armed: bool) -> AnyEl
                 .flex_none()
                 .text_color(rgb(match armed {
                     true => c.error,
-                    false => c.dim,
+                    false => host.theme.dim_on(if current {
+                        theme::Surface::Cursor
+                    } else {
+                        theme::Surface::Context
+                    }),
                 }))
                 .child(e.title.clone()),
         )
