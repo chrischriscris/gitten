@@ -205,7 +205,9 @@ impl Stashes {
         self.scroll.0.borrow().base_handle.bounds()
     }
 
-    /// Nothing off the left edge to reach — messages truncate rather than pan.
+    /// Nothing off the left edge to reach — a squeezed message ends in an
+    /// ellipsis rather than pan. Present so the wheel routing can offer the
+    /// axis to every screen alike.
     pub fn pan_pixels(&self, _dx: f32) -> bool {
         false
     }
@@ -456,10 +458,13 @@ fn row(e: &Row, host: &Host, current: bool, focused: bool, armed: bool) -> AnyEl
         )
         .child(
             div()
-                .flex_none()
                 .ml(px(GAP_CHARS * ch))
+                // The one thing that gives: `min_w_0` and `truncate` let a long
+                // message end in an ellipsis rather than shove itself out of
+                // the pane — the rule the branches pane's names already run.
+                // The address beside it is `flex_none` and never moves.
                 .min_w_0()
-                .whitespace_nowrap()
+                .truncate()
                 .text_color(rgb(match armed {
                     true => c.error,
                     false => c.fg,

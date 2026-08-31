@@ -495,8 +495,10 @@ impl Files {
         self.scroll.0.borrow().base_handle.bounds()
     }
 
-    /// Nothing off the left edge to reach — paths truncate rather than pan.
-    /// Present so the wheel routing can offer the axis to every screen alike.
+    /// Nothing off the left edge to reach — a squeezed path ends in an
+    /// ellipsis (the directory's head gives; [`crate::chrome::path_spans`]
+    /// keeps the filename) rather than pan. Present so the wheel routing can
+    /// offer the axis to every screen alike.
     pub fn pan_pixels(&self, _dx: f32) -> bool {
         false
     }
@@ -818,7 +820,11 @@ fn row(e: &Entry, host: &Host, current: bool, focused: bool, armed: bool) -> Any
                     .child(SharedString::from(f.letters)),
             )
             .child(
-                div().flex_none().min_w_0().child(match armed {
+                // No `flex_none` here: the path is the one thing that gives —
+                // [`path_spans`] shrinks the directory's head under a squeezed
+                // row — and a `flex_none` wrapper would refuse to shrink and
+                // pin the whole row wide.
+                div().min_w_0().child(match armed {
                     // The question repaints the whole path; unarmed, the
                     // directory is dim and the name keeps the row's ink.
                     true => div()

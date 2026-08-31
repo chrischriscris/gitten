@@ -109,8 +109,15 @@ pub fn section_label(host: &Host, text: SharedString, count: Option<SharedString
 /// cut, by [`gitten_core::path::split_dir_name`] at flatten or prepare, so
 /// the files pane, the title strip and the diff header agree on where the
 /// filename starts and the render path clones two refcounts instead of
-/// cutting and copying a string per visible row per frame. Two `flex_none`
-/// spans in one row and no wrapping, because a path is one word to the eye.
+/// cutting and copying a string per visible row per frame. No wrapping,
+/// because a path is one word to the eye.
+///
+/// When the row is too narrow for the whole path the **directory's head
+/// gives and the filename never does** — `min_w_0` and `flex_shrink` let the
+/// dim half shrink under a squeezed row, `text_ellipsis_start` leaves
+/// `…views/diff.rs` and not `src/views/d…`. A forty-file list is scanned by
+/// name; a path that clipped at its right edge would throw away the one
+/// part being scanned.
 pub fn path_spans(
     host: &Host,
     dir: SharedString,
@@ -121,13 +128,17 @@ pub fn path_spans(
     div()
         .flex()
         .items_center()
+        .min_w_0()
         .whitespace_nowrap()
         // The directory is read as a path — raw dim is under the text floor on
         // the title strips it lands on and on a selected row, so it resolves
         // against the surface the caller paints.
         .child(
             div()
-                .flex_none()
+                .min_w_0()
+                .flex_shrink(1.0)
+                .overflow_hidden()
+                .text_ellipsis_start()
                 .text_color(rgb(host.theme.dim_on(surface)))
                 .child(dir),
         )
@@ -248,7 +259,14 @@ pub fn pane_header_with(
                 })),
         )
         .child(keycap(host, number, focused))
-        .child(div().flex_none().child(name))
+        // `min_w_0` and not `flex_none`: the one header whose name is a path
+        // — the diff pane's, through [`path_spans`] — has to be able to give
+        // its directory's head up when the right-edge furniture crowds it. A
+        // `flex_none` wrapper would pin the path at full width and let the
+        // overflow clip at the strip instead, which is the loss this pane
+        // exists not to make. Plain word names never overflow and never
+        // notice the difference.
+        .child(div().min_w_0().child(name))
         // Everything after the name is right-edge furniture.
         .child(div().min_w_0().flex_grow(1.0))
         .children(count.map(|count| {
