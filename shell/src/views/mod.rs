@@ -3,9 +3,30 @@
 //! assembling the final multi-pane layout an assembly job rather than a rewrite.
 
 use gpui::{point, px, Bounds, Pixels, Point, Size, UniformListScrollHandle};
-use gpui_component::scroll::ScrollbarHandle;
+use gpui_component::scroll::{Scrollbar, ScrollbarAxis, ScrollbarHandle};
 use std::cell::Cell;
 use std::rc::Rc;
+
+/// Gitten's scrollbar geometry: one quiet, square bar against the container's
+/// edge, rather than gpui-component's narrow thumb inset inside a wider track.
+///
+/// Keep this beside the shared handle adapter so every built-in pane gets the
+/// same furniture. The library still owns painting, hit testing and dragging;
+/// this only supplies the presentation it deliberately exposes as data.
+fn scrollbar<H: ScrollbarHandle + Clone>(handle: &H, axis: ScrollbarAxis) -> Scrollbar {
+    Scrollbar::new(handle).axis(axis).styles(|s| {
+        s.track(|s| s.width(px(8.)))
+            .thumb(|s| s.width(px(8.)).inset(px(0.)).radius(px(0.)))
+    })
+}
+
+fn vertical_scrollbar<H: ScrollbarHandle + Clone>(handle: &H) -> Scrollbar {
+    scrollbar(handle, ScrollbarAxis::Vertical)
+}
+
+fn horizontal_scrollbar<H: ScrollbarHandle + Clone>(handle: &H) -> Scrollbar {
+    scrollbar(handle, ScrollbarAxis::Horizontal)
+}
 
 /// State spanning a strict list request and the prepaint that consumes it.
 ///

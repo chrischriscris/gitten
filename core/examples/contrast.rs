@@ -160,6 +160,8 @@ fn report(t: &Theme) {
         ("title_bg", c.title_bg),
         ("status_bg", c.status_bg),
         ("border", c.border),
+        ("raised", c.raised),
+        ("keycap", c.keycap),
         ("selection_bg", c.selection_bg),
     ] {
         row(&format!("{name} vs bg"), contrast(bg, c.bg), 0.0);

@@ -176,6 +176,11 @@ edge in a dark theme: `chrome.bg`, `title_bg` and `status_bg` are within **1.05:
 of each other, which is invisible as a boundary, and pulling them apart far enough
 to see would make the window three competing panels. One pixel reads at any tint.
 
+The deliberate exception is `chrome.raised` (and `keycap`, one step above it):
+a chip, a pill or the focused pane's header band is furniture *on* a surface,
+not a region of the window, so it alone takes a visible step — ~1.3:1, enough
+to see and not enough to read as a panel.
+
 `diff.rule` is separate from `gutter_fg` for the reason every split field in here
 is separate: that colour has to clear a *text* floor against five row backgrounds,
 and a full-height line held to a text floor is a bright seam down the middle of
@@ -230,7 +235,7 @@ shell files before this existed.
 |---|---|
 | `diff` | `file_bg` `file_fg` `adds_fg` `dels_fg` `hunk_bg` `hunk_fg` `gutter_fg` `rule` `context_bg` `context_fg` `added_bg` `added_fg` `added_word_bg` `removed_bg` `removed_fg` `removed_word_bg` `moved_removed_bg` `moved_added_bg` `absent_bg` |
 | `markdown` | `code_bar` `quote_bar` `marker` (resolved per surface) `rule` (also the table grid) |
-| `chrome` | `bg` `fg` `dim` `faint` `accent` `title_bg` `status_bg` `border` `selection_bg` (the row the keyboard is on) `selected_bg` (the text the mouse is holding) `error` |
+| `chrome` | `bg` `fg` `dim` `faint` `accent` `title_bg` `status_bg` `border` `raised` (chip fills, the focused header band) `keycap` (the key face on it) `selection_bg` (the row the keyboard is on) `selected_bg` (the text the mouse is holding) `error` |
 | graph | `lanes` `lane_overflow` |
 | commits | `authors` |
 | syntax | 12 `Style`s, resolved across 11 surfaces |

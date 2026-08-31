@@ -19,6 +19,7 @@
 use gitten_core::command::{HelpRow, Modes};
 use gitten_core::host::Host;
 use gitten_core::theme::Surface;
+use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 
 /// Height of a pane's header strip — `1 FILES`, `4 COMMITS`, `5 <path>`.
@@ -166,16 +167,19 @@ pub fn empty_line(host: &Host, text: SharedString) -> AnyElement {
 }
 
 /// The keycap a pane header starts with: the number of the key that focuses
-/// the pane, in a small outlined square. The square is the whole point — a
-/// bare numeral reads as a count, a keycap reads as *press me* — and it is
+/// the pane, on a small filled key face. The face is the whole point — a
+/// bare numeral reads as a count, a key face reads as *press me* — and it is
 /// the one place the header may spend ink, because it is the one thing the
-/// header teaches.
+/// header teaches. Filled rather than outlined: a one-pixel box at this size
+/// is all corners, and the raised face is what makes it a key rather than a
+/// badge. Which pane holds the keyboard is the numeral's ink — accent or dim
+/// — never the face's, so the caps sit still while focus moves.
 fn keycap(host: &Host, number: &str, focused: bool) -> Div {
     let c = host.theme.chrome;
     let ch = host.font.char_width();
     let ink = match focused {
         true => c.accent,
-        false => c.faint,
+        false => c.dim,
     };
     // The numeral is text and the box around it is a border, so they part
     // ways here: the box keeps `faint` raw — a hairline has no floor — and
@@ -192,6 +196,7 @@ fn keycap(host: &Host, number: &str, focused: bool) -> Div {
         .justify_center()
         .w(px(ch * 1.6))
         .h(px(ch * 1.6))
+        .bg(rgb(c.keycap))
         .border_1()
         .border_color(rgb(ink))
         .rounded(px(RADIUS))
@@ -268,6 +273,11 @@ pub fn pane_header_with(
         // anything gets this far.
         .overflow_hidden()
         .px_2()
+        // The focused pane's band is lifted one step; the rest stay flat.
+        // With the accent bar and the bright name this is the third voice
+        // saying "the keyboard is here", and it is the one that works in
+        // peripheral vision, where neither ink nor a 2px bar registers.
+        .when(focused, |d| d.bg(rgb(c.raised)))
         .border_b_1()
         .border_color(rgb(c.border))
         .child(

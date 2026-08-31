@@ -98,6 +98,7 @@ rgb_fields! {
         "faint" = chrome.faint, "accent" = chrome.accent,
         "title_bg" = chrome.title_bg, "status_bg" = chrome.status_bg,
         "border" = chrome.border,
+        "raised" = chrome.raised, "keycap" = chrome.keycap,
         "selection_bg" = chrome.selection_bg,
         "selected_bg" = chrome.selected_bg, "error" = chrome.error;
     "diff":

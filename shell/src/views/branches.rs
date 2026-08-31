@@ -14,7 +14,7 @@
 //! scroll-handle dance, rows flattened **once per refresh** into owned display
 //! strings so the render path allocates nothing per frame.
 
-use super::{accept_deferred_scroll, DeferredScrollbar, PendingScroll};
+use super::{accept_deferred_scroll, vertical_scrollbar, DeferredScrollbar, PendingScroll};
 use crate::chrome;
 use crate::graph::ROW_H;
 use gitten_core::host::Host;
@@ -24,7 +24,6 @@ use gitten_core::theme::{Rgb, Surface, Theme};
 use gitten_core::view::Viewport;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
-use gpui_component::scroll::Scrollbar;
 use std::cell::Cell;
 use std::rc::Rc;
 
@@ -786,7 +785,7 @@ impl Render for Branches {
             .size_full()
             .child(list)
             .when(crate::config::host(cx).view.scrollbar, |d| {
-                d.child(Scrollbar::vertical(&DeferredScrollbar::new(
+                d.child(vertical_scrollbar(&DeferredScrollbar::new(
                     &self.scroll,
                     &self.pending_scroll,
                 )))

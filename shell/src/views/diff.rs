@@ -58,7 +58,10 @@
 //! nothing outside it can hold one of them still. What the list keeps is the
 //! vertical axis, which is the one that has to virtualize.
 
-use super::{accept_deferred_scroll, DeferredScrollbar, PendingScroll};
+use super::{
+    accept_deferred_scroll, horizontal_scrollbar, vertical_scrollbar, DeferredScrollbar,
+    PendingScroll,
+};
 pub(crate) use crate::chrome::ROW_BAR;
 use gitten_core::font::Font;
 use gitten_core::host::Host;
@@ -73,7 +76,7 @@ use gitten_core::wrap::{Wrap, Wrapped};
 use gitten_core::{FileDiff, LineKind, Span};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
-use gpui_component::scroll::{Scrollbar, ScrollbarHandle};
+use gpui_component::scroll::ScrollbarHandle;
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::rc::Rc;
@@ -2159,11 +2162,11 @@ impl Render for Diff {
             .when(crate::config::host(cx).view.scrollbar, |d| {
                 // Two handles, because there are two axes and they belong to
                 // different things now: the rows to the list, the text to `Pan`.
-                d.child(Scrollbar::vertical(&DeferredScrollbar::new(
+                d.child(vertical_scrollbar(&DeferredScrollbar::new(
                     &self.scroll,
                     &self.pending_scroll,
                 )))
-                .child(Scrollbar::horizontal(&self.pan))
+                .child(horizontal_scrollbar(&self.pan))
             });
         root.into_any_element()
     }

@@ -11,7 +11,7 @@
 //! scroll-handle dance, rows flattened **once per refresh** into owned display
 //! strings so the render path allocates nothing per frame.
 
-use super::{accept_deferred_scroll, DeferredScrollbar, PendingScroll};
+use super::{accept_deferred_scroll, vertical_scrollbar, DeferredScrollbar, PendingScroll};
 use crate::chrome::{empty_line, list_row, path_spans, section_label};
 use crate::graph::ROW_H;
 use gitten_core::host::Host;
@@ -20,7 +20,6 @@ use gitten_core::theme::{Rgb, Surface};
 use gitten_core::view::Viewport;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
-use gpui_component::scroll::Scrollbar;
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -58,7 +57,10 @@ pub(crate) struct FileEntry {
     pub name: SharedString,
     /// What a rename moved it from, decoded once; `None` otherwise.
     pub renamed_from: Option<SharedString>,
-    /// What happened to it — the letter's meaning and its colour in one.
+    /// What happened to it — the letter's meaning; the colour is the section's.
+    /// (The mark itself is spent at construction, on [`Mark::letter`]; what the
+    /// row keeps is git's own spelling.)
+    #[allow(dead_code)]
     pub mark: Mark,
     /// The letter(s) themselves, git's own spelling: `A`, `M`, `UU`, `?`.
     pub letters: &'static str,
@@ -105,10 +107,29 @@ impl Section {
             Section::Conflicts,
         ]
     }
+
+    /// The ink a section's status letters draw in — git's own porcelain
+    /// convention, which every reader's fingers already know: staged is
+    /// green, unstaged is red, untracked recedes, a conflict is the error
+    /// ink because it is the one state that ends work. The *letter* still
+    /// says what kind of change it is; the colour answers the only question
+    /// the panel exists for, which is "what will commit". The greens and
+    /// reds are the diff palette's, where a theme has already tuned those
+    /// two words.
+    fn ink(self, host: &Host) -> Rgb {
+        let t = &host.theme;
+        match self {
+            Section::Staged => t.diff.adds_fg,
+            Section::Unstaged => t.diff.dels_fg,
+            Section::Untracked => t.chrome.faint,
+            Section::Conflicts => t.chrome.error,
+        }
+    }
 }
 
-/// What a status letter means, once you get past which side of the index it is
-/// about — which is what decides its colour, and nothing else.
+/// What a status letter means. The mark owns the letter and nothing else —
+/// which side of the index the file sits on is the section's, and so is the
+/// colour: see [`Section::ink`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mark {
     Add,
@@ -145,38 +166,6 @@ impl Mark {
             // glyph beats two.
             Mark::Untracked => "?",
             Mark::Conflict => "",
-        }
-    }
-
-    /// The ink each state draws in. Adds and deletes borrow the diff palette,
-    /// where those two words already have colours a theme has tuned; modify
-    /// takes the chrome accent, which is what the design points at it — it is
-    /// the every-minute state and earns the one loud furniture colour — so a
-    /// rename steps aside onto the graph's first lane ink instead. When one
-    /// working tree shows both, the two never share a colour and renames
-    /// cannot read as edits.
-    fn color(self, host: &Host, current: bool) -> Rgb {
-        let t = &host.theme;
-        match self {
-            Mark::Add => t.diff.adds_fg,
-            Mark::Delete => t.diff.dels_fg,
-            Mark::Conflict => t.chrome.error,
-            Mark::Modify => t.chrome.accent,
-            Mark::Rename => t.lanes.first().copied().unwrap_or(t.chrome.accent),
-            // Rare enough not to earn a hue of its own; quieter than any of
-            // the above is the right amount of loud for a typechange. Raw dim
-            // fails the text floor on a selected row, so it resolves against
-            // the row it lands on, the way text on a row does.
-            Mark::TypeChange => {
-                if current {
-                    host.theme.dim_on(Surface::Cursor)
-                } else {
-                    t.chrome.dim
-                }
-            }
-            // Quietest of all, but still read — `faint` raw is 2.05:1 on the
-            // row, under the floor, so it resolves like the quiet text it is.
-            Mark::Untracked => t.quiet_on(t.chrome.bg),
         }
     }
 }
@@ -767,7 +756,7 @@ impl Render for Files {
             .size_full()
             .child(list)
             .when(crate::config::host(cx).view.scrollbar, |d| {
-                d.child(Scrollbar::vertical(&DeferredScrollbar::new(
+                d.child(vertical_scrollbar(&DeferredScrollbar::new(
                     &self.scroll,
                     &self.pending_scroll,
                 )))
@@ -807,7 +796,7 @@ fn row(e: &Entry, host: &Host, current: bool, focused: bool, armed: bool) -> Any
                     // with it — so the armed tint spends nothing new.
                     .text_color(rgb(match armed {
                         true => c.error,
-                        false => f.mark.color(host, current),
+                        false => f.section.ink(host),
                     }))
                     .child(SharedString::from(f.letters)),
             )

@@ -216,6 +216,20 @@ pub struct ChromePalette {
     /// be seen would be three competing panels instead of one dark window. A rule
     /// is one pixel and reads at any tint.
     pub border: Rgb,
+    /// A surface lifted one visible step above the strip it sits on: the fill
+    /// of a chip or pill, and the focused pane's header band.
+    ///
+    /// The one deliberate exception to the quiet-surfaces rule `border`
+    /// describes. A chip is furniture *on* a strip, not a region of the
+    /// window, and the focused header is the one band that has to be findable
+    /// without reading — so both take a step the regions themselves are
+    /// denied. One step, not a colour: loud enough to see against `title_bg`,
+    /// quiet enough never to read as a panel of its own.
+    pub raised: Rgb,
+    /// The face of a keycap — the `1` in `1 FILES`. One step above
+    /// [`ChromePalette::raised`], because the focused pane's header band *is*
+    /// `raised` and the key sitting on it still has to read as a key.
+    pub keycap: Rgb,
     /// The row the keyboard is on.
     ///
     /// A background bar and not a foreground change, because the row underneath
@@ -331,7 +345,7 @@ impl Theme {
                 file_fg: 0xe8e3dc,
                 adds_fg: 0x6fbf73,
                 dels_fg: 0xd4736b,
-                hunk_bg: 0x111417,
+                hunk_bg: 0x15181d,
                 hunk_fg: 0x7d8fa8,
                 gutter_fg: 0x4a4540,
                 rule: 0x332c28,
@@ -339,10 +353,15 @@ impl Theme {
                 context_fg: 0xa39c93,
                 added_bg: 0x16241a,
                 added_fg: 0x9dc79b,
-                added_word_bg: 0x1e3a23,
+                // The word-level emphasis is roughly double the line tint's
+                // step, on purpose: the line says "changed", the word says
+                // "here", and when the two whisper at the same volume the
+                // intraline pass may as well not have run. The resolver
+                // re-lightens any token that lands on these.
+                added_word_bg: 0x385b37,
                 removed_bg: 0x2a1917,
                 removed_fg: 0xd4a09a,
-                removed_word_bg: 0x43201a,
+                removed_word_bg: 0x63322c,
                 moved_removed_bg: 0x191d28,
                 moved_added_bg: 0x1d2636,
                 absent_bg: 0x070605,
@@ -365,6 +384,8 @@ impl Theme {
                 title_bg: 0x151312,
                 status_bg: 0x131211,
                 border: 0x282320,
+                raised: 0x1c1a18,
+                keycap: 0x2c2925,
                 selection_bg: 0x241f1a,
                 selected_bg: 0x2f3b4a,
                 error: 0xd4736b,
@@ -462,6 +483,10 @@ impl Theme {
                 title_bg: 0xf5f1eb,
                 status_bg: 0xf6f3ec,
                 border: 0xe4ded5,
+                // Raised goes *darker* on paper — elevation on a light ground
+                // is a shadow, not a shine.
+                raised: 0xece7dd,
+                keycap: 0xe0dacd,
                 selection_bg: 0xede4d0,
                 selected_bg: 0xaac2e4,
                 error: 0xab3623,
@@ -543,6 +568,8 @@ impl Theme {
                 title_bg: 0x14181f,
                 status_bg: 0x13171e,
                 border: 0x212730,
+                raised: 0x1c232e,
+                keycap: 0x29323f,
                 selection_bg: 0x18252e,
                 selected_bg: 0x20405b,
                 error: 0xef6470,

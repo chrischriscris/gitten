@@ -4629,10 +4629,11 @@ impl Render for DevShell {
                     // The branch chip, the design's `⎇ main · ↑2 ↓0`: where
                     // HEAD sits and how far it has drifted, read from the
                     // branches pane's own prepared head — one small struct
-                    // per frame, no second git call anywhere. Outlined and
-                    // not filled: the one filled chip is the status badge,
-                    // and two would compete. A detached HEAD or a fixture
-                    // draws nothing: absence is the honest state.
+                    // per frame, no second git call anywhere. Filled with
+                    // `raised`, the quiet chip surface — the status badge
+                    // keeps the accent fill to itself, so the two never
+                    // compete. A detached HEAD or a fixture draws nothing:
+                    // absence is the honest state.
                     .children(self.panes.get("branches").and_then(|screen| {
                         let Screen::Branches { view, .. } = screen else {
                             return None;
@@ -4645,6 +4646,7 @@ impl Render for DevShell {
                                 .items_center()
                                 .h(px(CHIP_H))
                                 .px_2()
+                                .bg(rgb(c.raised))
                                 .border_1()
                                 .border_color(rgb(c.border))
                                 .rounded(px(chrome::RADIUS))
@@ -4669,9 +4671,8 @@ impl Render for DevShell {
                         // characters of a strip that has four controls in it, and
                         // the sentence belongs beside the numbers it is about,
                         // which is the stats overlay. No chip behind it either:
-                        // every surface in this palette is within 1.05:1 of every
-                        // other, so a filled chip is a rectangle nobody sees, and
-                        // the accent alone is unmistakable.
+                        // chips are for controls and states, this is a caveat,
+                        // and the accent alone is unmistakable.
                         div().flex_none().text_color(rgb(c.accent)).child("debug")
                     }))
                     // Pushes the controls to the right edge and takes the clicks
