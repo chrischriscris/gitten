@@ -326,6 +326,10 @@ impl Keymap {
         // commit graph is drawn out of the same one. Shifted, because cycling a
         // theme is a thing done twice a month and `t` is worth more than that.
         bind(GLOBAL, "T", "theme.cycle");
+        // ` is unclaimed by every mode and untyped by lazygit's defaults, and
+        // the message it opens is read once and dismissed — a key at the edge
+        // of the keyboard for a panel at the edge of the app's life.
+        bind(GLOBAL, "`", "message.show");
         bind(GLOBAL, "esc", "back");
 
         bind(GLOBAL, "j", "view.down");
@@ -1110,6 +1114,11 @@ impl Commands {
             (
                 "copy.selection",
                 "copy the selection, or the row the cursor is on",
+                None,
+            ),
+            (
+                "message.show",
+                "show the full text of the last message",
                 None,
             ),
         ] {
@@ -2192,6 +2201,15 @@ mod tests {
         assert!(k.live_keys_for("help", &in_diff).is_empty());
         // And the same map outside the mode still names it.
         assert_eq!(k.live_keys_for("help", &Modes::new()), vec!["?"]);
+    }
+
+    #[test]
+    fn message_show_is_global_and_spoken_on_the_backtick() {
+        // The one key lazygit's defaults never took and the shell's own maps
+        // left alone: the message overlay must answer to it from anywhere.
+        let k = Keymap::builtin();
+        assert_eq!(k.live_keys_for("message.show", &Modes::new()), vec!["`"]);
+        assert!(Commands::builtin().known("message.show"));
     }
 
     #[test]
