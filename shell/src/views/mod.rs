@@ -128,6 +128,139 @@ impl ScrollbarHandle for DeferredScrollbar {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::ScrollStrategy;
+
+    /// A handle with a strict request parked on it, as `scroll_to` leaves one.
+    fn parked(row: usize) -> (UniformListScrollHandle, PendingScroll, Cell<f32>) {
+        let scroll = UniformListScrollHandle::new();
+        let pending = PendingScroll::default();
+        pending.begin();
+        scroll.scroll_to_item_strict(row, ScrollStrategy::Top);
+        (scroll, pending, Cell::new(0.0))
+    }
+
+    /// What prepaint does when it consumes the request: clears it and writes
+    /// the offset it settled on.
+    fn prepaint(scroll: &UniformListScrollHandle, y: f32) {
+        let mut state = scroll.0.borrow_mut();
+        state.deferred_scroll_to_item = None;
+        state.base_handle.set_offset(point(px(0.), px(y)));
+    }
+
+    #[test]
+    fn an_offset_is_accepted_only_once_the_request_is_gone() {
+        // The row callback runs for measurement *before* prepaint takes the
+        // request, and the offset it would read then is the one from before the
+        // restore. Accepting it is how a restored position silently becomes
+        // row zero.
+        let (scroll, pending, synced) = parked(40);
+        assert!(accept_deferred_scroll(&scroll, &pending, &synced).is_none());
+        assert!(pending.is_awaiting(), "still waiting on prepaint");
+        assert_eq!(synced.get(), 0.0);
+
+        prepaint(&scroll, -880.0);
+        let accepted =
+            accept_deferred_scroll(&scroll, &pending, &synced).expect("prepaint's offset");
+        assert!(!accepted.wheeled);
+        assert_eq!(accepted.y, -880.0);
+        assert_eq!(synced.get(), -880.0);
+        assert!(!pending.is_awaiting(), "and it stops waiting");
+
+        // Once, and not again: a second call has nothing left to accept.
+        assert!(accept_deferred_scroll(&scroll, &pending, &synced).is_none());
+    }
+
+    #[test]
+    fn nothing_awaiting_accepts_nothing() {
+        let scroll = UniformListScrollHandle::new();
+        let pending = PendingScroll::default();
+        let synced = Cell::new(0.0);
+        prepaint(&scroll, -100.0);
+        assert!(accept_deferred_scroll(&scroll, &pending, &synced).is_none());
+        assert_eq!(synced.get(), 0.0, "an unasked-for offset was adopted");
+    }
+
+    #[test]
+    fn wheel_pixels_that_arrived_while_waiting_are_applied_on_top() {
+        // A trackpad delivers fifty small deltas a second and a reflow parks a
+        // row between two of them. Converting each to a row would round every
+        // one of them to nothing, so they accumulate as pixels and land against
+        // the bound that exists once the restore has settled.
+        let (scroll, pending, synced) = parked(40);
+        assert_eq!(pending.wheel(-6.0), -6.0);
+        assert_eq!(
+            pending.wheel(-4.0),
+            -10.0,
+            "they add up rather than replace"
+        );
+
+        prepaint(&scroll, -880.0);
+        let accepted = accept_deferred_scroll(&scroll, &pending, &synced).expect("accepted");
+        assert!(
+            accepted.wheeled,
+            "the caller has to know to move its cursor"
+        );
+        // Clamped against the handle's bound, which is zero on a headless one —
+        // so the whole gesture lands at the top rather than off the end.
+        assert_eq!(accepted.y, 0.0);
+        assert_eq!(synced.get(), 0.0);
+        assert_eq!(
+            pending.0.wheel.get(),
+            0.0,
+            "spent, not re-applied next frame"
+        );
+    }
+
+    #[test]
+    fn a_consumed_offset_with_no_wheel_is_left_exactly_as_prepaint_wrote_it() {
+        // The clamp is only for wheel pixels. GPUI has already bounded the
+        // strict offset, and re-clamping it against a headless handle — whose
+        // bound is zero — erases the very position being accepted.
+        let (scroll, pending, synced) = parked(40);
+        prepaint(&scroll, -880.0);
+        let accepted = accept_deferred_scroll(&scroll, &pending, &synced).expect("accepted");
+        assert_eq!(accepted.y, -880.0);
+        assert_eq!(f32::from(scroll.0.borrow().base_handle.offset().y), -880.0);
+    }
+
+    #[test]
+    fn a_thumb_write_cancels_the_request_it_would_otherwise_fight() {
+        // The user's newer position wins. Without this the parked request is
+        // consumed a frame later and drags the list back out from under the
+        // thumb that was just released.
+        let (scroll, pending, synced) = parked(40);
+        let bar = DeferredScrollbar::new(&scroll, &pending);
+        bar.set_offset(point(px(0.), px(-220.)));
+
+        assert!(scroll.0.borrow().deferred_scroll_to_item.is_none());
+        assert!(!pending.is_awaiting());
+        assert_eq!(f32::from(bar.offset().y), -220.0);
+        // And nothing is left to accept, so the next callback reads the drag
+        // rather than a restore that no longer applies.
+        assert!(accept_deferred_scroll(&scroll, &pending, &synced).is_none());
+    }
+
+    #[test]
+    fn cancelling_forgets_the_pixels_as_well_as_the_wait() {
+        // Both halves: a wheel delta surviving a cancel is applied against the
+        // *next* restore, which is a scroll nobody asked for.
+        let pending = PendingScroll::default();
+        pending.begin();
+        pending.wheel(-12.0);
+        pending.cancel();
+        assert!(!pending.is_awaiting());
+        assert_eq!(pending.wheel(0.0), 0.0);
+
+        // And `begin` clears them too, so a second restore starts clean.
+        pending.wheel(-12.0);
+        pending.begin();
+        assert_eq!(pending.wheel(0.0), 0.0);
+    }
+}
+
 pub mod branches;
 pub mod commits;
 pub mod diff;

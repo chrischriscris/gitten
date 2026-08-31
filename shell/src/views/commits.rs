@@ -1074,21 +1074,16 @@ mod tests {
     }
 
     #[test]
-    fn consuming_a_deferred_restore_is_not_reconciled_as_a_drag() {
+    fn a_restore_this_view_accepted_is_not_reconciled_as_a_drag() {
+        // `accept_deferred_scroll` and what it means are `views::tests`'; what
+        // is this view's is that its own `synced` is the one the acceptance
+        // writes, so the next `reconcile` sees the list where the restore left
+        // it. Missing that, the key below lands on the scrolloff margin instead
+        // of one row down, because row 40 reads as a thumb drag.
         let host = Rc::new(Host::new());
         let mut c = Commits::new(commits(100), host.clone());
         c.scroll_to(40, &host);
         c.go_to(40, &host);
-
-        // Measurement calls the row callback before prepaint takes the request;
-        // that must not accept the old offset.
-        assert!(
-            crate::views::accept_deferred_scroll(&c.scroll, &c.pending_scroll, &c.synced).is_none()
-        );
-        assert!(c.pending_scroll.0.awaiting.get());
-        assert_eq!(c.synced.get(), 0.0);
-
-        // What strict prepaint does: consume the request and write its offset.
         {
             let mut state = c.scroll.0.borrow_mut();
             state.deferred_scroll_to_item = None;
@@ -1096,15 +1091,10 @@ mod tests {
                 .base_handle
                 .set_offset(gpui::point(gpui::px(0.0), gpui::px(-40.0 * 22.0)));
         }
-        let accepted =
-            crate::views::accept_deferred_scroll(&c.scroll, &c.pending_scroll, &c.synced)
-                .expect("prepaint's offset was not accepted");
-        assert!(!accepted.wheeled);
-        assert!(!c.pending_scroll.0.awaiting.get());
-        assert_eq!(c.synced.get(), -40.0 * 22.0);
+        crate::views::accept_deferred_scroll(&c.scroll, &c.pending_scroll, &c.synced)
+            .expect("prepaint's offset was not accepted");
+        assert_eq!(c.synced.get(), -40.0 * 22.0, "this view's own sync marker");
 
-        // Without accepting the offset, reconcile treats row 40 as a thumb drag
-        // and moves the cursor to the scrolloff margin before applying this key.
         c.rendered.set(20);
         assert!(c.run_view("view.down", &host));
         assert_eq!(c.view.get().cursor(), 41);

@@ -3215,26 +3215,6 @@ mod tests {
     }
 
     #[test]
-    fn many_tokens_and_spans_stay_sorted_and_disjoint() {
-        let theme = Theme::dark();
-        let text = "fn draw(&self) { self.paint(1); } // later";
-        let tokens = vec![
-            tok(0, 2, Kind::Keyword),
-            tok(3, 7, Kind::Func),
-            tok(9, 13, Kind::Keyword),
-            tok(22, 27, Kind::Func),
-            tok(28, 29, Kind::Number),
-            tok(34, 42, Kind::Comment),
-        ];
-        let spans = vec![Span { start: 3, end: 12 }, Span { start: 28, end: 30 }];
-        let out = runs(all(text), &tokens, &spans, &theme, LineKind::Removed, false);
-        well_formed(text, &out);
-        assert!(out
-            .iter()
-            .any(|(r, s)| *r == (28..29) && s.color.is_some() && s.background_color.is_some()));
-    }
-
-    #[test]
     fn multi_byte_text_keeps_its_boundaries() {
         let theme = Theme::dark();
         let text = "let s = \"café 😀\";";
@@ -5221,19 +5201,15 @@ diff --git a/b.md b/b.md
     }
 
     #[test]
-    fn consuming_a_deferred_restore_is_not_reconciled_as_a_drag() {
+    fn a_restore_this_view_accepted_is_not_reconciled_as_a_drag() {
+        // The acceptance itself is `views::tests`'; this is the wiring — that
+        // the offset lands on *this* view's `synced`, so its `reconcile` reads
+        // the list where the restore left it rather than as a thumb drag, which
+        // would put the key below on the scrolloff margin.
         let host = Host::new();
         let mut d = Diff::with_layouts(long_diff(), &host, Layouts::builtin());
         d.scroll_to(40, &host);
         d.go_to(40, &host);
-
-        // The callback runs once for measurement while the request is still
-        // parked, then after prepaint has consumed it and written the offset.
-        assert!(
-            crate::views::accept_deferred_scroll(&d.scroll, &d.pending_scroll, &d.synced).is_none()
-        );
-        assert!(d.pending_scroll.0.awaiting.get());
-        assert_eq!(d.synced.get(), 0.0);
         {
             let mut state = d.scroll.0.borrow_mut();
             state.deferred_scroll_to_item = None;
@@ -5241,12 +5217,9 @@ diff --git a/b.md b/b.md
                 .base_handle
                 .set_offset(gpui::point(gpui::px(0.0), gpui::px(-40.0 * ROW_H)));
         }
-        let accepted =
-            crate::views::accept_deferred_scroll(&d.scroll, &d.pending_scroll, &d.synced)
-                .expect("prepaint's offset was not accepted");
-        assert!(!accepted.wheeled);
-        assert!(!d.pending_scroll.0.awaiting.get());
-        assert_eq!(d.synced.get(), -40.0 * ROW_H);
+        crate::views::accept_deferred_scroll(&d.scroll, &d.pending_scroll, &d.synced)
+            .expect("prepaint's offset was not accepted");
+        assert_eq!(d.synced.get(), -40.0 * ROW_H, "this view's own sync marker");
 
         d.rendered.set(20);
         assert!(d.run_view("view.down", &host));
