@@ -250,8 +250,15 @@ pub trait Rows {
     fn claims(&self, path: &str) -> bool;
     fn len(&self) -> usize;
     fn build(&mut self, file: prepared::File);
-    fn render(&self, index: usize, seg: usize, host: &Host, sel: Option<Selected>, shift: f32)
-        -> AnyElement;
+    fn render(
+        &self,
+        index: usize,
+        seg: usize,
+        host: &Host,
+        sel: Option<Selected>,
+        state: RowState,
+        shift: f32,
+    ) -> AnyElement;
     fn width(&self, index: usize, seg: usize) -> usize;
 
     // Wrapping. Both default, so an implementation that ignores them is exactly
@@ -285,6 +292,12 @@ that wraps. `overflow` is the other half: how far past the right edge your wides
 row reaches, which is what the view bounds the offset by. The same two numbers the
 terminal passes to `Pen::scroll`, for the same reason — see
 [decisions/0023](decisions/0023-the-gutter-does-not-scroll.md).
+
+**`state` is what the keyboard already knows about the row.** Whether it is the
+row the cursor is on, whether the pane holding it holds the keyboard, and whether
+an armed question stands over its hunk. One argument and not three bools, because
+this trait is an extension's seam and a signature is not something a presentation
+after the next should have to change twice.
 
 ```rust
 Diff::with_renderers(files, host, vec![

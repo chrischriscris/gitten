@@ -168,6 +168,30 @@ pub(crate) fn column_at(text: &str, x: f32, size: f32, host: &Host) -> usize {
 
 // ------------------------------------------------------------------ the seam
 
+/// Everything a presentation needs to know about one row's relationship to
+/// the keyboard, beyond what the row itself holds.
+///
+/// One argument and not three bools because this trait is a documented seam —
+/// `docs/extending.md` — and a presentation after the next must not change the
+/// signature twice.
+#[derive(Clone, Copy, Default)]
+pub struct RowState {
+    /// The keyboard's row.
+    pub current: bool,
+    /// Whether this pane holds the keyboard at all.
+    ///
+    /// `dead_code` because no drawing reads it yet: the bar that turns it into
+    /// ink is the seam's next change, and the sidebar's are drawn from the flag
+    /// their pane already holds.
+    #[allow(dead_code)]
+    pub focused: bool,
+    /// An armed destructive question stands over this row's hunk.
+    ///
+    /// Same as `focused`: computed here, read by the tint the next change adds.
+    #[allow(dead_code)]
+    pub armed: bool,
+}
+
 /// Turns one file's diff into rows, and draws them.
 ///
 /// Row height is fixed for the whole list because `uniform_list` is what makes a
@@ -185,11 +209,6 @@ pub(crate) fn column_at(text: &str, x: f32, size: f32, host: &Host) -> usize {
 /// **visual** row of that logical one they are drawing. `seg` is 0 for
 /// everything that fits, which is nearly everything.
 ///
-/// [`Rows::rows`] and [`Rows::reflow`] both default, so a presentation that does
-/// not wrap is exactly as long as it was and an extension's compiles unchanged.
-/// A presentation that does wrap gets the hard part —
-/// [`gitten_core::wrap::Wrapped`] — from `core`; see `TextRows::reflow` for what
-/// is left, which is six lines and a column budget.
 pub trait Rows {
     /// Whether this implementation wants the file. The built-in claims
     /// everything; the last registered claimant wins, so a specialist can take
@@ -238,9 +257,11 @@ pub trait Rows {
 
     /// Draws one visual row. `sel` is the part of it the mouse has selected, in
     /// the row's own byte coordinates — `None` for the overwhelming majority of
-    /// rows on the overwhelming majority of frames. `current` is whether this is
-    /// the row the keyboard is on, drawn as a background bar so navigation has a
-    /// visible cursor — see [`gitten_core::view::Viewport`].
+    /// rows on the overwhelming majority of frames. `state` is the row's
+    /// relationship to the keyboard: whether it is the row the keyboard is on,
+    /// drawn as a background bar so navigation has a visible cursor — see
+    /// [`gitten_core::view::Viewport`] — whether the pane holding it holds the
+    /// keyboard, and whether an armed question stands over it.
     ///
     /// `shift` is how many pixels of text a horizontal scroll has pulled off the
     /// left edge. A row is as wide as the viewport whatever it holds, so an
@@ -254,7 +275,7 @@ pub trait Rows {
         seg: usize,
         host: &Host,
         sel: Option<Selected>,
-        current: bool,
+        state: RowState,
         shift: f32,
     ) -> AnyElement;
 
@@ -696,6 +717,11 @@ pub struct Diff {
     /// clears it — see [`Diff::confirm_or_arm_discard_hunk`] — so a press
     /// can never spend an arm on a hunk it was not asked about.
     armed_hunk: Option<(u16, u32)>,
+    /// Whether this pane holds the keyboard, as the shell last told it. A
+    /// row's cursor bar is accent only when its pane is focused, and the view
+    /// cannot ask the shell during render — so the shell writes it here when
+    /// focus moves, and render reads a flag.
+    focused: bool,
     /// Where every file header is, in visual rows — what `]` and `[` jump
     /// between. Collected by [`expand`] while it builds the order table, so it
     /// costs one branch per row at rebuild and nothing per frame.
@@ -1251,6 +1277,17 @@ impl Diff {
         }
     }
 
+    /// Told by the shell whenever the keyboard moves — never decided here.
+    pub(crate) fn set_focused(&mut self, focused: bool) {
+        self.focused = focused;
+    }
+
+    /// Whether this pane holds the keyboard. The rows read it for the bar.
+    #[allow(dead_code)]
+    pub(crate) fn focused(&self) -> bool {
+        self.focused
+    }
+
     /// The text of the row the keyboard is on, or nothing past either end. The
     /// fallback half of `copy.selection`.
     pub fn cursor_text(&self) -> String {
@@ -1497,6 +1534,7 @@ impl Diff {
             dragging: false,
             widest: built.widest,
             armed_hunk: None,
+            focused: false,
             headers: Rc::new(built.headers),
             scroll: UniformListScrollHandle::new(),
             pan: Pan::default(),
@@ -1997,6 +2035,13 @@ impl Render for Diff {
         let scroll = self.scroll.clone();
         let synced = self.synced.clone();
         let pending_scroll = self.pending_scroll.clone();
+        // The same flag the shell last wrote, copied into the rows with the rest
+        // of the frame's reads — a view cannot ask the shell during render.
+        let focused = self.focused;
+        // The question the shell is holding, if any, copied so the rows of one
+        // frame all answer it at the same state of the arm.
+        let armed = self.armed_hunk;
+        let prepared = self.prepared.clone();
         // Where the scrollbar draws itself and how long its thumb is. Last
         // frame's box, like everything else measured here — a view is handed
         // one and cannot ask before.
@@ -2040,7 +2085,30 @@ impl Render for Diff {
                         r.seg as usize,
                         &host,
                         at,
-                        i == cursor,
+                        RowState {
+                            current: i == cursor,
+                            focused,
+                            // Once per row, not once per frame: `hunk_at` is a
+                            // binary search over spans the load recorded, and
+                            // the question keys a hunk the row claims — found
+                            // the way `file_summary` finds the file under it.
+                            armed: armed.is_some_and(|(f, h)| {
+                                renderers[r.owner as usize]
+                                    .hunk_at(r.index as usize)
+                                    // The arm keys a file the prepared diff
+                                    // numbers, and `hunk_at` answers the file's
+                                    // own path — found the way `file_summary`
+                                    // finds it, once per row.
+                                    .and_then(|(path, row_h)| {
+                                        prepared
+                                            .files
+                                            .iter()
+                                            .position(|file| file.path == path)
+                                            .map(|file| file == f as usize && row_h == h as usize)
+                                    })
+                                    .unwrap_or(false)
+                            }),
+                        },
                         shift,
                     )
                 })
@@ -2374,17 +2442,17 @@ impl Rows for TextRows {
         seg: usize,
         host: &Host,
         sel: Option<Selected>,
-        current: bool,
+        state: RowState,
         shift: f32,
     ) -> AnyElement {
         let theme = &host.theme;
         let p = &theme.diff;
         match &self.rows[index] {
             Row::File { path, adds, dels } => {
-                file_header(path, *adds, *dels, theme, sel, current, shift)
+                file_header(path, *adds, *dels, theme, sel, state.current, shift)
             }
 
-            Row::Hunk(header) => hunk_header(header, theme, sel, current, shift),
+            Row::Hunk(header) => hunk_header(header, theme, sel, state.current, shift),
 
             Row::Line {
                 kind,
@@ -2399,14 +2467,14 @@ impl Rows for TextRows {
                 // The keyboard's row is a bar across the whole line, whatever
                 // kind of line it is — the same background the terminal draws,
                 // so the cursor reads as one thing in both.
-                let bg = row_background(current, bg, theme);
+                let bg = row_background(state.current, bg, theme);
                 // Which background this row's furniture lands on, so the line
                 // numbers are resolved against it — see `Theme::gutter_on`. On
                 // the keyboard's row that is the wash, and not the line kind's:
                 // the row paints `selection_bg` over both, so a number resolved
                 // for the line it is sits on a background it never lands on.
                 let (plain, _) = surfaces(*kind, *moved);
-                let gutter = theme.gutter_on(match current {
+                let gutter = theme.gutter_on(match state.current {
                     true => Surface::Cursor,
                     false => plain,
                 });
@@ -2445,7 +2513,7 @@ impl Rows for TextRows {
                                     theme,
                                     *kind,
                                     *moved,
-                                    current,
+                                    state.current,
                                     selected(sel, 0, text),
                                 )
                                 .iter()
@@ -2980,8 +3048,8 @@ mod tests {
     // By name, not a glob: `use gpui::*` in the parent shadows `#[test]` with
     // GPUI's own attribute macro and every test in here fails to expand.
     use super::{
-        line_colors, locked, row_background, Diff, FileSummary, Layouts, Pan, Row, Rows, TextRows,
-        PAD, ROW_H, TEXT_CHROME,
+        line_colors, locked, row_background, Diff, FileSummary, Layouts, Pan, Row, RowState, Rows,
+        TextRows, PAD, ROW_H, TEXT_CHROME,
     };
     use gitten_core::font::Font;
     use gitten_core::host::Host;
@@ -4235,7 +4303,7 @@ diff --git a/a.rs b/a.rs
             _seg: usize,
             _host: &Host,
             _sel: Option<Selected>,
-            _current: bool,
+            _state: RowState,
             _shift: f32,
         ) -> AnyElement {
             div().child(self.rows[index].clone()).into_any_element()
@@ -4591,7 +4659,7 @@ diff --git a/b.md b/b.md
             _seg: usize,
             _host: &Host,
             _sel: Option<Selected>,
-            _current: bool,
+            _state: RowState,
             _shift: f32,
         ) -> AnyElement {
             div().child(self.rows[index].clone()).into_any_element()

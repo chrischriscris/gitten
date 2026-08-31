@@ -50,7 +50,7 @@
 
 use super::diff::{
     column_at, columns, file_header, header_hit, hunk_header, hunk_hit, into_text, line_colors,
-    row_frame, scrolled, selected, slice, Hit, Rows, Scratch, PAD, ROW_H,
+    row_frame, scrolled, selected, slice, Hit, RowState, Rows, Scratch, PAD, ROW_H,
 };
 use gitten_core::align::align;
 use gitten_core::host::Host;
@@ -437,15 +437,15 @@ impl Rows for SplitRows {
         seg: usize,
         host: &Host,
         sel: Option<Selected>,
-        current: bool,
+        state: RowState,
         shift: f32,
     ) -> AnyElement {
         let theme = &host.theme;
         match &self.rows[index] {
             Row::File { path, adds, dels } => {
-                file_header(path, *adds, *dels, theme, sel, current, shift)
+                file_header(path, *adds, *dels, theme, sel, state.current, shift)
             }
-            Row::Hunk(header) => hunk_header(header, theme, sel, current, shift),
+            Row::Hunk(header) => hunk_header(header, theme, sel, state.current, shift),
             Row::Pair { old, new } => {
                 // Page padding, then two columns of *measured* width and a
                 // fixed rule. The width is `cell_px` — the number the hit test
@@ -459,7 +459,7 @@ impl Rows for SplitRows {
                 row_frame()
                     .items_center()
                     .px(px(PAD))
-                    .bg(rgb(match current {
+                    .bg(rgb(match state.current {
                         true => theme.chrome.selection_bg,
                         false => theme.chrome.bg,
                     }))
@@ -469,7 +469,7 @@ impl Rows for SplitRows {
                         Column::Old,
                         theme,
                         sel,
-                        current,
+                        state,
                         shift,
                         index,
                         cell,
@@ -491,7 +491,7 @@ impl Rows for SplitRows {
                         Column::New,
                         theme,
                         sel,
-                        current,
+                        state,
                         shift,
                         index,
                         cell,
@@ -550,7 +550,7 @@ impl SplitRows {
         column: Column,
         theme: &Theme,
         sel: Option<Selected>,
-        current: bool,
+        state: RowState,
         shift: f32,
         row: usize,
         width: gpui::Pixels,
@@ -564,7 +564,7 @@ impl SplitRows {
             // Nothing opposite: a flat, darker block, so a run of them reads as
             // a hole in the column rather than as unchanged content. The
             // keyboard's bar runs across it too, so the cursor reads as one bar.
-            let bg = super::diff::row_background(current, p.absent_bg, theme);
+            let bg = super::diff::row_background(state.current, p.absent_bg, theme);
             return cell_frame(width)
                 .debug_selector(move || format!("cell-{}-{row}", column.name()))
                 .bg(rgb(bg))
@@ -573,12 +573,12 @@ impl SplitRows {
         let line = &self.lines[index as usize];
         let (bg, fg, sign) = line_colors(line.kind, line.moved, p);
         // The keyboard's row, on this side and on the other: one bar, not two.
-        let bg = super::diff::row_background(current, bg, theme);
+        let bg = super::diff::row_background(state.current, bg, theme);
         // The same substitution the unified view makes: the row paints the
         // wash over whatever the line was, so a number resolved for the line
         // kind was resolved against a background it never lands on.
         let (plain, _) = surfaces(line.kind, line.moved);
-        let gutter = theme.gutter_on(match current {
+        let gutter = theme.gutter_on(match state.current {
             true => Surface::Cursor,
             false => plain,
         });
@@ -626,7 +626,7 @@ impl SplitRows {
                             theme,
                             line.kind,
                             line.moved,
-                            current,
+                            state.current,
                             selected(sel, column.part(), &line.text),
                         )
                         .iter()
@@ -987,7 +987,7 @@ diff --git a/a.rs b/a.rs
 mod list_layout_tests {
     use std::rc::Rc;
 
-    use super::{Rows, SplitRows, PAD, RULE_W};
+    use super::{RowState, Rows, SplitRows, PAD, RULE_W};
     use gitten_core::host::Host;
     use gitten_core::parse_unified_diff;
     use gitten_core::prepared::prepare;
@@ -1037,7 +1037,7 @@ diff --git a/.github/workflows/check.yml b/.github/workflows/check.yml
                 range
                     .map(|k| {
                         let (i, seg) = flat[k];
-                        rows.render(i, seg as usize, &host, None, false, 0.0)
+                        rows.render(i, seg as usize, &host, None, RowState::default(), 0.0)
                     })
                     .collect::<Vec<_>>()
             })

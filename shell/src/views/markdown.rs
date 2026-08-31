@@ -64,7 +64,8 @@
 
 use super::diff::{
     column_at, columns, file_header, header_hit, hunk_header, hunk_hit, into_text, line_colors,
-    num, row_frame, scrolled, selected, slice, Hit, Rows, Scratch, PAD, ROW_H, SIGN_W, TEXT_CHROME,
+    num, row_frame, scrolled, selected, slice, Hit, RowState, Rows, Scratch, PAD, ROW_H, SIGN_W,
+    TEXT_CHROME,
 };
 use gitten_core::host::Host;
 use gitten_core::markdown::{Bar, Block, DocRow, Document};
@@ -404,17 +405,17 @@ impl Rows for MarkdownRows {
         seg: usize,
         host: &Host,
         sel: Option<Selected>,
-        current: bool,
+        state: RowState,
         shift: f32,
     ) -> AnyElement {
         let theme = &host.theme;
         match self.doc.row(index) {
             Some(DocRow::File { path, adds, dels }) => {
-                file_header(path, *adds, *dels, theme, sel, current, shift)
+                file_header(path, *adds, *dels, theme, sel, state.current, shift)
             }
-            Some(DocRow::Hunk(header)) => hunk_header(header, theme, sel, current, shift),
+            Some(DocRow::Hunk(header)) => hunk_header(header, theme, sel, state.current, shift),
             Some(DocRow::Line { block, line }) => {
-                self.line(index, seg, *block, line, current, host, sel, shift)
+                self.line(index, seg, *block, line, state, host, sel, shift)
             }
             // The order table only names rows this presentation built, so this
             // arm is unreachable; a blank row beats a panic if an index ever
@@ -432,9 +433,8 @@ impl MarkdownRows {
         seg: usize,
         block: Block,
         line: &Line,
-        // Whether the keyboard is on this row: the one bar every presentation
-        // paints, prose or not — see `row_background`.
-        current: bool,
+        // Everything the row needs about the keyboard: see [`RowState`].
+        state: RowState,
         host: &Host,
         sel: Option<Selected>,
         // Pixels of text scrolled off the left. Everything this row draws in
@@ -453,13 +453,13 @@ impl MarkdownRows {
         // The keyboard's row, on prose exactly as on source: the same helper
         // every presentation goes through, so a paragraph cannot be the one row
         // that hides the cursor.
-        let bg = super::diff::row_background(current, bg, theme);
+        let bg = super::diff::row_background(state.current, bg, theme);
         // The marker is furniture, and furniture is what a bar already is: it
         // lands on the row's wash and not on the line's, so it is resolved
         // here against the cursor's own — the way a file header resolves its
         // directory ink against the background it actually paints. Twice a row
         // at most: a bullet on the first, a label on a fence.
-        let marker = match current {
+        let marker = match state.current {
             true => readable(
                 md.marker,
                 theme.background(Surface::Cursor),
@@ -472,7 +472,7 @@ impl MarkdownRows {
         // paints `selection_bg` over both, so a grey that recedes on a context
         // line is a smear on the one row being read.
         let (plain, _) = surfaces(line.kind, line.moved);
-        let surface = match current {
+        let surface = match state.current {
             true => Surface::Cursor,
             false => plain,
         };
@@ -520,7 +520,7 @@ impl MarkdownRows {
                         theme,
                         line.kind,
                         line.moved,
-                        current,
+                        state.current,
                         selected(sel, 0, full),
                     )
                     .iter()
@@ -654,7 +654,7 @@ impl MarkdownRows {
                     theme,
                     line.kind,
                     line.moved,
-                    current,
+                    state.current,
                     selected(sel, 0, full),
                 )
                 .iter()
@@ -679,7 +679,7 @@ impl MarkdownRows {
 #[cfg(test)]
 mod tests {
     // By name, not a glob: `use gpui::*` in the parent shadows `#[test]`.
-    use super::{MarkdownRows, Metrics};
+    use super::{MarkdownRows, Metrics, RowState};
     use crate::views::diff::{Diff, Rows, TextRows, PAD, TEXT_CHROME};
     use gitten_core::host::Host;
     use gitten_core::markdown::{Block, Document};
@@ -951,8 +951,8 @@ diff --git a/README.md b/README.md
         assert!((0..r.len()).any(|i| r.rows(i) > 0));
         for i in 0..r.len() {
             for seg in 0..r.rows(i) {
-                let _ = r.render(i, seg, &host, None, true, 0.0);
-                let _ = r.render(i, seg, &host, None, false, 0.0);
+                let _ = r.render(i, seg, &host, None, RowState::default(), 0.0);
+                let _ = r.render(i, seg, &host, None, RowState::default(), 0.0);
             }
         }
     }

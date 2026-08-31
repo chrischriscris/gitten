@@ -1242,7 +1242,10 @@ impl DevShell {
                 Screen::Branches { view, .. } => view.update(cx, |v, _| v.set_focused(focused)),
                 Screen::Stashes { view, .. } => view.update(cx, |v, _| v.set_focused(focused)),
                 Screen::Commits { view, .. } => view.update(cx, |v, _| v.set_focused(focused)),
-                Screen::Diff { .. } | Screen::Status { .. } | Screen::Custom(_) => {}
+                // The diff draws the cursor for its own rows: it takes focus
+                // through the same seam the sidebar panes do, and no further.
+                Screen::Diff { view, .. } => view.update(cx, |v, _| v.set_focused(focused)),
+                Screen::Status { .. } | Screen::Custom(_) => {}
             }
         }
     }
