@@ -64,8 +64,8 @@
 
 use super::diff::{
     column_at, columns, file_header, header_hit, hunk_header, hunk_hit, into_text, line_colors,
-    num, row_frame, scrolled, selected, slice, Hit, RowState, Rows, Scratch, PAD, ROW_H, SIGN_W,
-    TEXT_CHROME,
+    num, row_bar, row_frame, scrolled, selected, slice, Hit, RowState, Rows, Scratch, PAD, ROW_BAR,
+    ROW_H, SIGN_W, TEXT_CHROME,
 };
 use gitten_core::host::Host;
 use gitten_core::markdown::{Bar, Block, DocRow, Document};
@@ -480,6 +480,14 @@ impl MarkdownRows {
         // bullet stays indented under its own text and a wrapped quote keeps its
         // bar, and no number and no sign, as everywhere else.
         let blank = seg > 0;
+        // The question stands over the hunk the second press will spend, and
+        // the column that says which hunk that is — the numbers and the sign —
+        // name it in the colour a conflict does: the palette's own "this row
+        // ends work" foreground, which a conflict's letters already draw.
+        let gutter = match state.armed {
+            true => theme.chrome.error,
+            false => theme.gutter_on(surface),
+        };
         // The whole logical row's text — the flowed grid when this width needed
         // one — and the bytes of it this visual row draws.
         let full = self.doc.text(index).unwrap_or_default();
@@ -494,14 +502,23 @@ impl MarkdownRows {
         let row = row_frame()
             .items_center()
             .px_4()
+            // The bar on every row, in the row's own background when the cursor
+            // is elsewhere — the same frame every presentation sits in, prose
+            // or not, so a move of the cursor shifts no line a pixel.
+            .border_l(px(ROW_BAR))
+            .border_color(rgb(row_bar(state, bg, theme)))
+            .pl(px(PAD - ROW_BAR))
             .bg(rgb(bg))
-            .child(num(sc.number(line.old_no, blank), theme.gutter_on(surface)))
-            .child(num(sc.number(line.new_no, blank), theme.gutter_on(surface)))
+            .child(num(sc.number(line.old_no, blank), gutter))
+            .child(num(sc.number(line.new_no, blank), gutter))
             .child(
                 div()
                     .flex_none()
                     .w(px(SIGN_W))
-                    .text_color(rgb(fg))
+                    .text_color(rgb(match state.armed {
+                        true => theme.chrome.error,
+                        false => fg,
+                    }))
                     .child(if blank { " " } else { sign }),
             );
 

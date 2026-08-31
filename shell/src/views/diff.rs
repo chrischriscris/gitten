@@ -59,6 +59,7 @@
 //! vertical axis, which is the one that has to virtualize.
 
 use super::{accept_deferred_scroll, DeferredScrollbar, PendingScroll};
+pub(crate) use crate::chrome::ROW_BAR;
 use gitten_core::font::Font;
 use gitten_core::host::Host;
 use gitten_core::prepared::{prepare, Prepared};
@@ -2041,7 +2042,6 @@ impl Render for Diff {
         // The question the shell is holding, if any, copied so the rows of one
         // frame all answer it at the same state of the arm.
         let armed = self.armed_hunk;
-        let prepared = self.prepared.clone();
         // Where the scrollbar draws itself and how long its thumb is. Last
         // frame's box, like everything else measured here — a view is handed
         // one and cannot ask before.
@@ -2088,26 +2088,11 @@ impl Render for Diff {
                         RowState {
                             current: i == cursor,
                             focused,
-                            // Once per row, not once per frame: `hunk_at` is a
-                            // binary search over spans the load recorded, and
-                            // the question keys a hunk the row claims — found
-                            // the way `file_summary` finds the file under it.
-                            armed: armed.is_some_and(|(f, h)| {
-                                renderers[r.owner as usize]
-                                    .hunk_at(r.index as usize)
-                                    // The arm keys a file the prepared diff
-                                    // numbers, and `hunk_at` answers the file's
-                                    // own path — found the way `file_summary`
-                                    // finds it, once per row.
-                                    .and_then(|(path, row_h)| {
-                                        prepared
-                                            .files
-                                            .iter()
-                                            .position(|file| file.path == path)
-                                            .map(|file| file == f as usize && row_h == h as usize)
-                                    })
-                                    .unwrap_or(false)
-                            }),
+                            // Once per row, not once per frame: the arm keys
+                            // the row the keyboard was on — see
+                            // [`Diff::confirm_or_arm_discard_hunk`] — and no
+                            // cursor move has moved it.
+                            armed: armed_at(i, r.owner, armed),
                         },
                         shift,
                     )
@@ -2478,6 +2463,15 @@ impl Rows for TextRows {
                     true => Surface::Cursor,
                     false => plain,
                 });
+                // The question stands over the hunk the second press will
+                // spend, and the column that says which hunk that is — the
+                // line numbers and the sign — name it in the colour a conflict
+                // does: the palette's own "this row ends work" foreground,
+                // which a conflict's letters already draw.
+                let gutter = match state.armed {
+                    true => theme.chrome.error,
+                    false => gutter,
+                };
                 let at = self.wrapped.range(index, seg, text);
                 let piece = slice(text, &at);
                 // A continuation carries no number and no sign. The background
@@ -2492,6 +2486,14 @@ impl Rows for TextRows {
                 row_frame()
                     .items_center()
                     .px(px(PAD))
+                    // The bar on every row, in the row's own background when
+                    // the cursor is elsewhere: the padding gives back what the
+                    // border takes, so the text starts where it started and a
+                    // move of the cursor shifts no line a pixel — the same
+                    // frame the sidebar's rows sit in.
+                    .border_l(px(ROW_BAR))
+                    .border_color(rgb(row_bar(state, bg, theme)))
+                    .pl(px(PAD - ROW_BAR))
                     .bg(rgb(bg))
                     .child(num(sc.number(*old, blank), gutter))
                     .child(num(sc.number(*new, blank), gutter))
@@ -2499,7 +2501,10 @@ impl Rows for TextRows {
                         div()
                             .flex_none()
                             .w(px(SIGN_W))
-                            .text_color(rgb(fg))
+                            .text_color(rgb(match state.armed {
+                                true => theme.chrome.error,
+                                false => fg,
+                            }))
                             .child(if blank { " " } else { sign }),
                     )
                     .child(scrolled(
@@ -2918,6 +2923,29 @@ pub(crate) fn row_background(current: bool, base: Rgb, theme: &Theme) -> Rgb {
     }
 }
 
+/// The ink on the bar down a row's left edge, on every row: accent while the
+/// row's pane holds the keyboard, faint when the selection is remembered and
+/// the keyboard is elsewhere, and the row's own background when the row is not
+/// the cursor's — which is what keeps the text from shifting a pixel when the
+/// cursor moves. The same rule [`chrome::list_row`] runs; a cursor that some
+/// rows honour and others ignore is a cursor that lies about where it is.
+pub(crate) fn row_bar(state: RowState, base: Rgb, theme: &Theme) -> Rgb {
+    match (state.current, state.focused) {
+        (true, true) => theme.chrome.accent,
+        (true, false) => theme.chrome.faint,
+        (false, _) => base,
+    }
+}
+
+/// Whether an armed question stands over a row: the arm keys the row the
+/// keyboard was on — see [`Diff::confirm_or_arm_discard_hunk`] — and a row
+/// outside it answers no, because a question is spent from where it was asked
+/// and no cursor move has moved it. One comparison per row, which is every row
+/// of every frame until somebody arms.
+pub(crate) fn armed_at(index: usize, owner: u16, armed: Option<(u16, u32)>) -> bool {
+    armed.is_some_and(|id| id == (owner, index as u32))
+}
+
 /// One line-number column.
 ///
 /// **Right-aligned**, which is the whole reason this is a flex row and not a
@@ -3048,8 +3076,8 @@ mod tests {
     // By name, not a glob: `use gpui::*` in the parent shadows `#[test]` with
     // GPUI's own attribute macro and every test in here fails to expand.
     use super::{
-        line_colors, locked, row_background, Diff, FileSummary, Layouts, Pan, Row, RowState, Rows,
-        TextRows, PAD, ROW_H, TEXT_CHROME,
+        armed_at, line_colors, locked, row_background, row_bar, Diff, FileSummary, Layouts, Pan,
+        Row, RowState, Rows, TextRows, PAD, ROW_H, TEXT_CHROME,
     };
     use gitten_core::font::Font;
     use gitten_core::host::Host;
@@ -3298,6 +3326,73 @@ mod tests {
             theme.chrome.selection_bg
         );
         assert_eq!(row_background(false, p.file_bg, &theme), p.file_bg);
+        // The bar, and nothing else: accent while the row's pane holds the
+        // keyboard, faint when the selection is remembered and the keyboard is
+        // elsewhere, and the row's own background when the row is not the
+        // cursor's — which is what keeps the text from shifting a pixel.
+        let state = |current: bool, focused: bool| RowState {
+            current,
+            focused,
+            armed: false,
+        };
+        assert_eq!(
+            row_bar(state(true, true), p.context_bg, &theme),
+            theme.chrome.accent
+        );
+        assert_eq!(
+            row_bar(state(true, false), p.context_bg, &theme),
+            theme.chrome.faint
+        );
+        assert_eq!(
+            row_bar(state(false, true), p.context_bg, &theme),
+            row_background(false, p.context_bg, &theme)
+        );
+    }
+
+    #[test]
+    fn an_armed_hunk_names_the_row_a_second_press_will_spend() {
+        // The keyboard on a hunk's first line, armed: the row the question
+        // stands over says so, and the rows beside it — the rest of the hunk
+        // the second press spends — do not. The arm keys the row the keyboard
+        // was on and not the hunk, which is what `confirm_or_arm_discard_hunk`
+        // records: a second press from the same spot spends it, and a move of
+        // the cursor spends nothing (see the test that holds below).
+        let host = Rc::new(Host::new());
+        let mut d = Diff::with_layouts(parse_unified_diff(THREE_HUNKS), &host, Layouts::builtin());
+        let id = d.cursor_row_id();
+        assert!(!d.confirm_or_arm_discard_hunk(id), "first press asks");
+        let armed = d.armed_hunk;
+        let flagged: Vec<bool> = (0..d.order.len())
+            .map(|i| {
+                let r = d.order[i];
+                // The same comparison the render path walks — see
+                // `Diff::render`'s `uniform_list`.
+                armed_at(i, r.owner, armed)
+            })
+            .collect();
+        let rows: Vec<usize> = flagged
+            .iter()
+            .enumerate()
+            .filter_map(|(i, a)| a.then_some(i))
+            .collect();
+        assert_eq!(rows, vec![id.1 as usize], "the armed row, and only it");
+    }
+
+    #[test]
+    fn a_layout_cycle_disarms_before_the_rows_mean_something_else() {
+        // The rows are about to be re-arranged; whatever the question was
+        // armed against may land somewhere else — the same reason a selection
+        // goes, and the same clear every cursor move already does.
+        let host = Rc::new(Host::new());
+        let mut d = Diff::with_layouts(parse_unified_diff(THREE_HUNKS), &host, Layouts::builtin());
+        let id = d.cursor_row_id();
+        assert!(!d.confirm_or_arm_discard_hunk(id), "first press asks");
+        assert!(d.armed_hunk.is_some(), "armed, and waiting");
+        d.apply_layout(1, &host);
+        assert!(
+            d.armed_hunk.is_none(),
+            "the cycle spent nothing: it cleared"
+        );
     }
 
     #[test]

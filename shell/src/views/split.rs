@@ -50,7 +50,8 @@
 
 use super::diff::{
     column_at, columns, file_header, header_hit, hunk_header, hunk_hit, into_text, line_colors,
-    row_frame, scrolled, selected, slice, Hit, RowState, Rows, Scratch, PAD, ROW_H,
+    row_background, row_bar, row_frame, scrolled, selected, slice, Hit, RowState, Rows, Scratch,
+    PAD, ROW_BAR, ROW_H,
 };
 use gitten_core::align::align;
 use gitten_core::host::Host;
@@ -456,13 +457,17 @@ impl Rows for SplitRows {
                 // see `list_layout_tests`). Fixed pixels cannot drift, and they
                 // make drawing and hit test the same number by construction.
                 let cell = px(self.cell_px(self.width));
+                // The row's own background, and the bar on it: one frame, the
+                // same rule every presentation runs, so the bar and the wash
+                // cannot be decided twice.
+                let bg = row_background(state.current, theme.chrome.bg, theme);
                 row_frame()
                     .items_center()
                     .px(px(PAD))
-                    .bg(rgb(match state.current {
-                        true => theme.chrome.selection_bg,
-                        false => theme.chrome.bg,
-                    }))
+                    .border_l(px(ROW_BAR))
+                    .border_color(rgb(row_bar(state, bg, theme)))
+                    .pl(px(PAD - ROW_BAR))
+                    .bg(rgb(bg))
                     .child(self.cell(
                         *old,
                         seg,
@@ -582,6 +587,14 @@ impl SplitRows {
             true => Surface::Cursor,
             false => plain,
         });
+        // The question stands over the hunk the second press will spend, and
+        // the column that says which hunk that is — the numbers and the sign —
+        // name it in the colour a conflict does: the palette's own "this row
+        // ends work" foreground, which a conflict's letters already draw.
+        let gutter = match state.armed {
+            true => theme.chrome.error,
+            false => gutter,
+        };
         let no = match column {
             Column::Old => line.old_no,
             Column::New => line.new_no,
@@ -612,7 +625,10 @@ impl SplitRows {
                 div()
                     .flex_none()
                     .w(px(SIGN_W))
-                    .text_color(rgb(fg))
+                    .text_color(rgb(match state.armed {
+                        true => theme.chrome.error,
+                        false => fg,
+                    }))
                     .child(if blank { " " } else { sign }),
             )
             .child(scrolled(
