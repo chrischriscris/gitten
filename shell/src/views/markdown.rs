@@ -488,7 +488,7 @@ impl MarkdownRows {
         // every other row of the diff or the eye loses the column.
         let row = row_frame()
             .items_center()
-            .px_4()
+            .px(px(PAD))
             // The bar on every row, in the row's own background when the cursor
             // is elsewhere — the same frame every presentation sits in, prose
             // or not, so a move of the cursor shifts no line a pixel.

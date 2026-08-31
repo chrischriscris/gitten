@@ -2736,7 +2736,7 @@ pub(crate) fn file_header(
         // the row's text, and the only thing in front of it is the page padding —
         // which is why the padding is out here and the scroll is inside it.
         .child(
-            div().flex().flex_grow(1.0).px_4().child(scrolled(
+            div().flex().flex_grow(1.0).px(px(PAD)).child(scrolled(
                 shift,
                 div()
                     .flex()

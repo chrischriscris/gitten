@@ -259,6 +259,14 @@ pub fn pane_header_with(
         .gap_2()
         .h(px(HEADER_H))
         .relative()
+        // Nothing paints outside the strip, ever. The right-edge furniture is
+        // `flex_none` after a name that only lately learned to shrink; a deep
+        // path used to be able to push `hunk 2/7` — the answer to "which hunk
+        // will space stage" — clean out of the window, where no amount of
+        // looking would find it. Clipping keeps the loss at the edge, where a
+        // squeezed [`path_spans`] gives the directory's head up long before
+        // anything gets this far.
+        .overflow_hidden()
         .px_2()
         .border_b_1()
         .border_color(rgb(c.border))
