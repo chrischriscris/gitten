@@ -355,7 +355,8 @@ pub trait Repo: Send + Sync {
     /// [`gitten_core::status`] for the model and why the four are separate.
     fn status(&self) -> Result<Status>;
 
-    /// The local branches, with HEAD's position and each branch's upstream
+    /// The local branches, most recently committed first; the checked-out
+    /// branch first of all — plus HEAD's position and each branch's upstream
     /// counts. See [`gitten_core::refs`] for the model.
     fn branches(&self) -> Result<Vec<Branch>> {
         Err(unserved("branches"))
@@ -1207,11 +1208,22 @@ impl Repo for Binary {
             &[
                 "for-each-ref",
                 &format!("--format={BRANCH_FORMAT}"),
+                // Most recently committed first: the pane's whole question is
+                // "which branch do I want next", and the two best answers are
+                // the branch just left and the branch on now. Git owns the
+                // sort — ties (two branches on one commit) fall back to its
+                // secondary refname order, which is deterministic.
+                "--sort=-committerdate",
                 "refs/heads",
             ],
         )?;
         let mut out = Vec::new();
-        for b in parse_branches(&raw) {
+        // Pin the checked-out branch to index 0, stable: the recency order
+        // git handed back for everything else is untouched. Detached HEAD
+        // marks no branch, so nothing pins.
+        let mut raw_branches = parse_branches(&raw);
+        raw_branches.sort_by_key(|b| !b.head);
+        for b in raw_branches {
             let upstream = b.upstream.map(|u| {
                 let (ahead, behind) = match u.track {
                     Track::Synced => (Some(0), Some(0)),
@@ -4658,6 +4670,83 @@ mod tests {
             })
         );
         assert!(feature.upstream.is_none(), "no configuration, no claim");
+    }
+
+    /// A commit with its committer date pinned: `--sort=-committerdate` reads
+    /// second-granularity timestamps, and commits made in one test second tie
+    /// into git's refname fallback, which would unprove the order.
+    fn commit_at(r: &Scratch, file: &str, body: &[u8], msg: &str, date: &str) {
+        use std::process::Command;
+        r.write(file, body);
+        r.git(&["add", "-A"]);
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&r.0)
+            .args(SCRATCH_CONFIG)
+            .env("GIT_COMMITTER_DATE", date)
+            .args(["commit", "-qm", msg])
+            .output()
+            .expect("git commit runs");
+        assert!(
+            out.status.success(),
+            "commit at {date}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn branches_read_recency_first_with_the_checked_out_one_pinned() {
+        // Three branches where the checked-out one is neither the newest nor
+        // the first alphabetically: the contract is "checked-out branch first
+        // of all, then most recently committed first" — the pin must not
+        // disturb the recency order of the rest, and alphabetical order (the
+        // order git hands back unsorted) must not survive.
+        let r = Scratch::new("branch-order");
+        commit_at(&r, "f.txt", b"one\n", "first", "2026-01-01T00:00:01");
+        // Alphabetically first and the oldest: exactly the branch alphabetical
+        // order used to reward.
+        r.git(&["branch", "aaa", "main"]);
+        commit_at(&r, "f.txt", b"two\n", "second", "2026-01-01T00:00:02");
+        // The newest commit lives on a branch named last.
+        r.git(&["checkout", "-qb", "zebra"]);
+        commit_at(&r, "f.txt", b"three\n", "third", "2026-01-01T00:00:03");
+        r.git(&["checkout", "-q", "main"]);
+
+        let names: Vec<Vec<u8>> = r
+            .open()
+            .branches()
+            .unwrap()
+            .iter()
+            .map(|b| b.name.as_bytes().to_vec())
+            .collect();
+        assert_eq!(
+            names,
+            vec![b"main".to_vec(), b"zebra".to_vec(), b"aaa".to_vec()],
+            "checked-out first, then most recently committed first",
+        );
+    }
+
+    #[test]
+    fn a_detached_head_pins_no_branch_first() {
+        // The pin exists to answer "the branch I'm on"; detached HEAD is on
+        // none, so nothing moves and the recency order stands alone.
+        let r = Scratch::new("branch-order-detached");
+        commit_at(&r, "f.txt", b"one\n", "first", "2026-01-01T00:00:01");
+        r.git(&["branch", "aaa", "main"]);
+        commit_at(&r, "f.txt", b"two\n", "second", "2026-01-01T00:00:02");
+        r.git(&["checkout", "-q", "--detach", "main"]);
+
+        let got = r.open().branches().unwrap();
+        assert!(
+            got.iter().all(|b| !b.head),
+            "detached means attached to none of them"
+        );
+        let names: Vec<Vec<u8>> = got.iter().map(|b| b.name.as_bytes().to_vec()).collect();
+        assert_eq!(
+            names,
+            vec![b"main".to_vec(), b"aaa".to_vec()],
+            "no pin under a detached HEAD: recency order alone"
+        );
     }
 
     #[test]
