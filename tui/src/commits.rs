@@ -1193,6 +1193,12 @@ r\x1fr\x1f\x1fA\x1f1\x1froot\x1e";
         assert_ne!(screen.ink(0, 0).unwrap().bg, bar);
     }
 
+    /// The clamp, the page and the margin are
+    /// [`gitten_core::view::Viewport`]'s and are tested there, over a viewport
+    /// and no commits at all. What is this list's is the row the rules land on
+    /// meaning a *commit* — everything that opens a diff, copies a sha or names
+    /// a rebase target reads `current`, and a cursor that is right while
+    /// `current` is off by one is the bug none of those would survive.
     #[test]
     fn each_pane_clips_to_its_span_and_owns_its_scrollbar() {
         // The pane is a guest in the row: it draws from column 20 for 30
@@ -1310,13 +1316,18 @@ r\x1fr\x1f\x1fA\x1f1\x1froot\x1e";
             .map(|i| format!("{i:040}\x1f{i:07}\x1f\x1fA\x1f1\x1fc{i}\x1e"))
             .collect();
         let (mut c, _) = view(&log, 60, 10);
-        c.up();
-        assert_eq!(c.cursor(), 0);
+        assert_eq!(c.current().map(|x| x.subject.as_str()), Some("c0"));
+
         c.page(1);
-        assert_eq!(c.cursor(), 9);
+        assert_eq!(
+            c.current().map(|x| x.subject.as_str()),
+            Some(format!("c{}", c.cursor()).as_str())
+        );
         c.to_bottom();
-        assert_eq!(c.cursor(), 99);
-        assert_eq!(c.top(), 90);
+        assert_eq!(c.cursor(), 99, "the viewport is sized to the log");
+        assert_eq!(c.current().map(|x| x.subject.as_str()), Some("c99"));
+        // Past the end is the end, and `current` follows it rather than
+        // answering about a commit that is not there.
         c.go_to(9999);
         assert_eq!(c.cursor(), 99);
         assert_eq!(c.current().map(|x| x.subject.as_str()), Some("c99"));

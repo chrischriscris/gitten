@@ -875,56 +875,41 @@ mod tests {
         (d, host)
     }
 
+    /// The cursor, the margin, the page and the clamp are
+    /// [`gitten_core::view::Viewport`]'s, and every method here that touches
+    /// them is one line of delegation — so what is left to test in this crate is
+    /// that the delegation is real and that it is aimed at the *visual* row
+    /// count. Both were wrong once: the rules re-asserted here passed while the
+    /// list was sized to logical rows and a wrapped diff ran off the end.
+    ///
+    /// The rules themselves are in `core/src/view.rs`, against a `Viewport` and
+    /// no diff at all. Restating them here says nothing new and goes stale in
+    /// the wrong file.
     #[test]
-    fn the_cursor_clamps_rather_than_wrapping_at_both_ends() {
-        let (mut d, _) = view(diff(10), 60, 6);
-        d.up();
-        assert_eq!(d.cursor(), 0);
-        d.move_by(9999);
-        assert_eq!(d.cursor(), d.rows() - 1);
-    }
-
-    #[test]
-    fn the_viewport_follows_the_cursor_and_keeps_a_margin() {
+    fn the_viewport_is_cores_and_it_is_sized_in_visual_rows() {
         let (mut d, _) = view(diff(40), 60, 12);
-        assert_eq!(d.top(), 0);
-        // Down to just inside the margin: nothing has scrolled yet.
-        d.move_by(8);
-        assert_eq!(d.top(), 0);
-        d.down();
-        assert_eq!(d.top(), 1, "the margin did not push the viewport");
-        d.to_bottom();
-        assert_eq!(d.top(), d.rows() - 12, "scrolled past the end");
-    }
+        assert_eq!(d.rows(), d.view.len(), "the model is sized to the order");
 
-    #[test]
-    fn a_screen_too_short_for_a_margin_drops_it_rather_than_pinning_the_cursor() {
-        let (mut d, _) = view(diff(40), 60, 4);
-        d.down();
-        assert_eq!(d.top(), 0);
-        d.move_by(2);
-        assert_eq!(d.cursor(), 3);
-        assert_eq!(
-            d.top(),
-            0,
-            "a four-row screen scrolled on the first keypress"
+        d.move_by(9999);
+        assert_eq!(d.cursor(), d.rows() - 1, "clamped at the last visual row");
+        assert_eq!(d.cursor(), d.view.cursor(), "and the model agrees");
+        assert_eq!(d.top(), d.view.top());
+
+        // Wrapping makes more visual rows than there are lines, which is the
+        // number the viewport has to be holding.
+        let long = format!(
+            "diff --git a/a.rs b/a.rs\n@@ -1,1 +1,1 @@\n{}",
+            (0..12)
+                .map(|i| format!(" line {i} {}\n", "padding ".repeat(6)))
+                .collect::<String>()
         );
-    }
-
-    #[test]
-    fn a_diff_shorter_than_the_screen_never_scrolls() {
-        let (mut d, _) = view(diff(3), 60, 40);
+        let (mut d, host) = view(parse_unified_diff(&long), 100, 12);
+        let before = d.rows();
+        d.resize(30, 12, &host);
+        assert!(d.rows() > before, "nothing wrapped at thirty columns");
+        assert_eq!(d.view.len(), d.rows(), "the model kept the logical count");
         d.to_bottom();
-        assert_eq!(d.top(), 0);
-    }
-
-    #[test]
-    fn a_page_keeps_one_row_of_overlap() {
-        let (mut d, _) = view(diff(100), 60, 20);
-        d.page(1);
-        assert_eq!(d.cursor(), 19);
-        d.page(-1);
-        assert_eq!(d.cursor(), 0);
+        assert_eq!(d.cursor(), d.rows() - 1);
     }
 
     #[test]

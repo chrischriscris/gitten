@@ -3,11 +3,16 @@
 //! [`prepared`](crate::prepared) stops one step short of a frontend: it hands
 //! back files, hunks and lines, and every frontend then flattens the three into
 //! one uniform list so that a 714k-line diff scrolls through a virtualized list
-//! however large it is. That flattening, the wrap index over it and the order
-//! table that maps a row on screen back to a line were written three times —
-//! once in `gitten-shell`, once in `gitten-web`, once about to be — which is what
-//! *don't put logic in `shell/` that `cli/` would have to duplicate* is warning
-//! about. So it is here, and a frontend is left with drawing.
+//! however large it is. That flattening, the wrap index over it and the map from
+//! a row on screen back to a line were written three times — once in
+//! `gitten-shell`, once in `gitten-web`, once about to be — which is what *don't
+//! put logic in `shell/` that `cli/` would have to duplicate* is warning about.
+//! So it is here, and a frontend is left with drawing.
+//!
+//! The map comes in two shapes, because the two ways of reading it want
+//! different ones: [`Ordered`] for a list that iterates and [`Visual`] for a
+//! server that seeks. They are indices over the same break table and never a
+//! second answer — the test that says so is the one that matters here.
 //!
 //! # The two row counts
 //!
@@ -93,7 +98,8 @@ pub struct Entry {
     pub dels: usize,
     /// Which **logical** row is this file's header. Logical rather than visual
     /// because reflow moves the visual one and this would then need
-    /// invalidating on every resize; [`Ordered::visual`] converts on demand.
+    /// invalidating on every resize; [`Ordered::visual`] and [`Visual::first`]
+    /// convert on demand.
     pub row: usize,
 }
 
@@ -531,6 +537,73 @@ pub fn expand<P: Present>(logical: &[RowRef], owners: &[P], anchor: Option<RowRe
         order,
         widest: widest_at,
         anchor: found,
+    }
+}
+
+/// The same mapping [`Ordered`] holds, as a prefix sum instead of a table.
+///
+/// One `u32` per **logical** row rather than 8 bytes per **visual** one, and
+/// `at` is a binary search rather than an index. Which of the two a frontend
+/// wants follows from how it reads them:
+///
+/// - A **list** iterates. It scrolls by visual rows, holds the index it is on,
+///   and asks for a run of neighbours — so it wants [`Ordered`], where that is a
+///   slice, and it needs the `owner` field to reach across several presentations
+///   at once.
+/// - A **server** seeks. Every request names a window out of nowhere and pays a
+///   lookup to find its start, then walks; and it answers "how many rows are
+///   there" constantly, which is the last entry here and a `len()` there.
+///
+/// Both are rebuilt by the same reflow and neither is authoritative: the break
+/// table in [`Flat`] is. This is an index over one [`Flat`], so it has no
+/// `owner` — a frontend with several presentations open at once wants
+/// [`expand`].
+#[derive(Debug, Default)]
+pub struct Visual {
+    /// `starts[i]` is the first visual row of logical row `i`, and one longer
+    /// than the rows themselves so the last row needs no special case.
+    starts: Vec<u32>,
+}
+
+impl Visual {
+    pub fn build(flat: &Flat) -> Self {
+        let mut starts = Vec::with_capacity(flat.len() + 1);
+        let mut at = 0u32;
+        for i in 0..flat.len() {
+            starts.push(at);
+            at += flat.visual_rows(i) as u32;
+        }
+        starts.push(at);
+        Self { starts }
+    }
+
+    /// Total visual rows — what a client sizes its scrollbar to.
+    pub fn total(&self) -> usize {
+        self.starts.last().copied().unwrap_or(0) as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.total() == 0
+    }
+
+    /// The first visual row of a logical one. `O(1)`, unlike
+    /// [`Ordered::visual`], which is what makes a jump list cheap to answer.
+    pub fn first(&self, logical: usize) -> usize {
+        self.starts.get(logical).copied().unwrap_or(0) as usize
+    }
+
+    /// Which logical row a visual row belongs to, and which of its rows it is.
+    ///
+    /// `None` past the end rather than a panic: a client can ask for a window
+    /// past the end while a reflow is in flight, and an empty answer is the
+    /// honest reply to it.
+    pub fn at(&self, visual: usize) -> Option<(usize, usize)> {
+        if visual >= self.total() {
+            return None;
+        }
+        let v = visual as u32;
+        let i = self.starts.partition_point(|&s| s <= v) - 1;
+        Some((i, (v - self.starts[i]) as usize))
     }
 }
 
@@ -1067,5 +1140,77 @@ diff --git a/a.rs b/a.rs
         assert_eq!(hunks.at(5), Some((1, 1)));
         assert_eq!(hunks.at(6), Some((1, 1)));
         assert_eq!(hunks.at(7), None);
+    }
+
+    // ------------------------------------------------------- the visual index
+
+    fn wrapped_flat(cols: usize) -> Flat {
+        let mut flat = Flat::default();
+        let host = Host::new();
+        for f in prepare(&parse_unified_diff(DIFF), &host.syntax, 2000).files {
+            flat.push(f);
+        }
+        flat.reflow(cols, &Word);
+        flat
+    }
+
+    #[test]
+    fn the_prefix_sum_and_the_order_table_are_the_same_mapping() {
+        // The whole claim of having two: a seek and an iterate over one answer.
+        // Anything else here is a browser and a window disagreeing about which
+        // row of the diff a saved position names.
+        let host = Host::new();
+        let mut owners = vec![Text::default()];
+        let a = assemble(&parse_unified_diff(DIFF), &host.syntax, 2000, &mut owners);
+        owners[0].flat.reflow(8, &Word);
+        let order = expand(&a.ordered.order, &owners, None).order;
+        let index = Visual::build(&owners[0].flat);
+
+        assert_eq!(index.total(), order.len());
+        for (v, r) in order.iter().enumerate() {
+            assert_eq!(
+                index.at(v),
+                Some((r.index as usize, r.seg as usize)),
+                "visual row {v}"
+            );
+        }
+        for i in 0..owners[0].len() {
+            assert_eq!(
+                index.first(i),
+                order.iter().position(|r| r.index as usize == i).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn a_row_past_the_end_is_none_rather_than_a_panic() {
+        // A client asks for a window while a reflow is in flight, so the end of
+        // the diff is a boundary that gets crossed rather than an error.
+        let index = Visual::build(&wrapped_flat(8));
+        assert_eq!(index.at(index.total()), None);
+        assert_eq!(index.at(usize::MAX), None);
+        assert_eq!(index.first(9999), 0, "a logical row nobody has");
+
+        let empty = Visual::build(&Flat::default());
+        assert_eq!(empty.total(), 0);
+        assert!(empty.is_empty());
+        assert_eq!(empty.at(0), None);
+    }
+
+    #[test]
+    fn unwrapped_the_index_is_the_identity() {
+        // Before any reflow every row is one row, which is the state a client
+        // gets its first window in.
+        let mut flat = Flat::default();
+        let host = Host::new();
+        for f in prepare(&parse_unified_diff(DIFF), &host.syntax, 2000).files {
+            flat.push(f);
+        }
+        let index = Visual::build(&flat);
+        assert_eq!(index.total(), flat.len());
+        for i in 0..flat.len() {
+            assert_eq!(index.first(i), i);
+            assert_eq!(index.at(i), Some((i, 0)));
+        }
     }
 }

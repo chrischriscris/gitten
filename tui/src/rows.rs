@@ -1140,7 +1140,31 @@ diff --git a/a.rs b/a.rs
 
     #[test]
     fn the_report_is_the_flat_rows_report_and_not_a_second_one() {
-        let h = Harness::new(DIFF, 40, "unified");
-        assert_eq!(h.owners[0].report(), "");
+        // Asserting the quiet case only is no test at all: a presentation that
+        // returns `String::new()` unconditionally — which is what the trait's
+        // own default does — passes it. So this asks for the one thing only
+        // `Flat` knows, in `Flat`'s own words.
+        let mut h = Harness::new(DIFF, 40, "unified");
+        assert_eq!(
+            h.owners[0].report(),
+            "",
+            "nothing moved and nothing rejected"
+        );
+
+        struct Bad;
+        impl Wrap for Bad {
+            fn name(&self) -> &'static str {
+                "bad"
+            }
+            fn breaks(&self, text: &str, _cols: usize, out: &mut Vec<gitten_core::wrap::Break>) {
+                out.push(gitten_core::wrap::Break::hard(text.len() + 1000));
+            }
+        }
+        h.reflow(40, &Bad);
+        assert!(
+            h.owners[0].report().contains("invalid breaks from bad"),
+            "{:?}",
+            h.owners[0].report()
+        );
     }
 }
