@@ -47,6 +47,10 @@ pub const ROW_PAD: f32 = 12.0;
 /// stripe and starts to look like a column of its own.
 pub const ROW_BAR: f32 = 2.0;
 
+/// Corner radius for every chip, pill, keycap and floating panel. One value:
+/// three radii in one 32px strip read as three design languages.
+pub const RADIUS: f32 = 4.0;
+
 /// The frame every list row sits in: a fixed height for `uniform_list`, the
 /// selection tint when `current`, and the bar on the left edge — accent when
 /// the row's pane holds the keyboard, `faint` when the selection is remembered
@@ -133,7 +137,7 @@ fn keycap(host: &Host, number: &str, focused: bool) -> Div {
         .h(px(ch * 1.6))
         .border_1()
         .border_color(rgb(ink))
-        .rounded(px(3.0))
+        .rounded(px(RADIUS))
         .text_color(rgb(ink))
         .child(SharedString::from(number.to_string()))
 }
@@ -230,11 +234,16 @@ pub fn pane_header_with(
 /// work and the one thing worth finding without scanning. `hints` is
 /// `(key, label)` pairs already resolved and capped by the caller; the key
 /// draws bright and the label dim, so the eye picks the keys out of the bar
-/// and reads labels only when it wants one.
+/// and reads labels only when it wants one. `truncated` is [`hints`]'s word
+/// for "there were more pairs than the width allowed": one faint `…` after
+/// the last pair, because a bar that quietly drops its tail advertises keys
+/// that were never there — and an omission the reader cannot see is the one
+/// kind of lie a hint bar must not tell.
 pub fn status_bar(
     host: &Host,
     badge: SharedString,
     hints: &[(SharedString, SharedString)],
+    truncated: bool,
     version: &str,
 ) -> Div {
     let c = host.theme.chrome;
@@ -258,7 +267,7 @@ pub fn status_bar(
                 .justify_center()
                 .px_2()
                 .h(px(host.font.char_width() * 1.7))
-                .rounded(px(2.0))
+                .rounded(px(RADIUS))
                 .bg(rgb(c.accent))
                 .text_color(rgb(chip_ink))
                 .child(badge),
@@ -277,6 +286,7 @@ pub fn status_bar(
                         .child(label.clone()),
                 )
         }))
+        .children(truncated.then(|| div().flex_none().text_color(rgb(c.faint)).child("…")))
         .child(div().min_w_0().flex_grow(1.0))
         .child(
             div()
@@ -293,7 +303,10 @@ pub fn status_bar(
 /// status-bar label — and prefer the focused pane's own mode before the
 /// globals, because `stage` means more to a files pane than `push` does.
 /// Stops when `max_px` is spent, so the bar fills whatever width the window
-/// has and never wraps.
+/// has and never wraps — and says so: the second return is whether it
+/// stopped with hints left over. A bar that silently drops its tail is a
+/// lie by omission; the bar draws a faint `…` in that case and the reader
+/// knows there are keys it is not being shown.
 ///
 /// `active` is the focused screen's mode name — the same string `[keys]`
 /// groups bindings under, and the same one [`Modes`] carries innermost, so
@@ -304,7 +317,7 @@ pub fn hints(
     modes: &Modes,
     active: &str,
     max_px: f32,
-) -> Vec<(SharedString, SharedString)> {
+) -> (Vec<(SharedString, SharedString)>, bool) {
     let rows = host.keys.help(&host.commands, modes);
     let ch = host.font.char_width();
     // One pass collects each mode's hinted rows in registry order, so the
@@ -342,13 +355,13 @@ pub fn hints(
             // Key, two spaces of air, label, four to the next pair.
             let w = (key.chars().count() + label.chars().count() + 6) as f32 * ch;
             if spent + w > max_px {
-                return out;
+                return (out, true);
             }
             spent += w;
             out.push((key.clone(), label.clone()));
         }
     }
-    out
+    (out, false)
 }
 
 /// The version the bar signs itself with. The workspace's own version —
@@ -357,14 +370,16 @@ pub fn version() -> &'static str {
     concat!("gitten ", env!("CARGO_PKG_VERSION"))
 }
 
-/// How wide the hints may draw: the bar's width, less the badge, the
-/// version and their air. Computed here so a caller without a window in
-/// hand — a test, a second client — can ask instead of duplicating the
-/// arithmetic the status bar does.
-#[allow(dead_code)]
-pub fn hints_budget(host: &Host, bar_px: f32) -> f32 {
+/// How wide the hints may draw: the bar's width, less the badge as it will
+/// actually render — its characters plus the air around it — the version
+/// and their air. The badge is a parameter because its length is the one
+/// part that varies (`PROMPT` against a mode name) and a helper that
+/// guessed it was a second copy of the arithmetic waiting to drift. One
+/// home for the sum, so a caller without a window in hand — a test, a
+/// second client — asks instead of duplicating it.
+pub fn hints_budget(host: &Host, bar_px: f32, badge: &str) -> f32 {
     let ch = host.font.char_width();
-    (bar_px - ch * (8.0 + version().len() as f32 + 4.0)).max(0.0)
+    (bar_px - ch * (badge.chars().count() as f32 + 6.0 + version().len() as f32 + 4.0)).max(0.0)
 }
 
 #[cfg(test)]
@@ -377,7 +392,7 @@ mod tests {
         let host = gitten_core::host::Host::new();
         let mut modes = Modes::new();
         modes.push("files");
-        let out = hints(&host, &modes, "files", 4000.0);
+        let (out, truncated) = hints(&host, &modes, "files", 4000.0);
         assert!(
             out.iter()
                 .any(|(k, l)| l.as_ref() == "stage" && !k.is_empty()),
@@ -385,6 +400,7 @@ mod tests {
         );
         // Globals ride along after the pane's own.
         assert!(out.iter().any(|(_, l)| l.as_ref() == "push"));
+        assert!(!truncated, "a bar wide enough for everything claimed a cut");
     }
 
     #[test]
@@ -392,14 +408,37 @@ mod tests {
         let host = gitten_core::host::Host::new();
         let mut modes = Modes::new();
         modes.push("files");
-        let out = hints(&host, &modes, "files", 1.0);
+        let (out, truncated) = hints(&host, &modes, "files", 1.0);
         assert!(out.len() <= 1, "a one-pixel bar held {} hints", out.len());
+        assert!(truncated, "a bar that stopped at one pixel said nothing");
+    }
+
+    #[test]
+    fn a_bar_that_stopped_with_hints_left_says_so() {
+        // Exactly wide enough for the first pair: the second does not fit,
+        // the walk stops, and the flag has to say the bar was cut — this is
+        // the difference between "these are your keys" and "these are all
+        // your keys", and only one of them is true.
+        let host = gitten_core::host::Host::new();
+        let mut modes = Modes::new();
+        modes.push("files");
+        let (all, _) = hints(&host, &modes, "files", 4000.0);
+        assert!(
+            all.len() > 1,
+            "the files map had more than one hint to give"
+        );
+        let (key, label) = &all[0];
+        let ch = host.font.char_width();
+        let one_pair = (key.chars().count() + label.chars().count() + 6) as f32 * ch;
+        let (some, truncated) = hints(&host, &modes, "files", one_pair);
+        assert_eq!(some.len(), 1, "the budget held exactly one pair");
+        assert!(truncated, "a bar that stopped with hints left said nothing");
     }
 
     #[test]
     fn an_unknown_mode_still_gets_the_globals() {
         let host = gitten_core::host::Host::new();
-        let out = hints(&host, &Modes::new(), "nowhere", 4000.0);
+        let (out, _) = hints(&host, &Modes::new(), "nowhere", 4000.0);
         assert!(out.iter().any(|(_, l)| l.as_ref() == "push"));
     }
 

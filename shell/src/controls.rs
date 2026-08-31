@@ -43,6 +43,7 @@
 //! `cx.listener` closures from that same entity. So this file has no lifecycle
 //! to get wrong, and it is a pure function of a `Picker` plus a bool.
 
+use crate::chrome::RADIUS;
 use gitten_core::font::Font;
 use gitten_core::theme::Theme;
 use gpui::*;
@@ -132,7 +133,7 @@ pub fn picker(
         .gap_2()
         .h(px(H))
         .px_2()
-        .rounded(px(3.))
+        .rounded(px(RADIUS))
         // A border, because the fill cannot do this job: closed, the trigger was
         // `title_bg` on `title_bg`, so four controls were sixty characters of
         // dim text that only became controls when the mouse was already on one.
@@ -189,7 +190,7 @@ pub fn picker(
             .bg(rgb(c.title_bg))
             .border_1()
             .border_color(rgb(c.faint))
-            .rounded(px(4.))
+            .rounded(px(RADIUS))
             // Without this the list is drawn but the rows beneath it get the
             // clicks: GPUI hit-tests by paint order, and an absolutely
             // positioned child does not claim the space it covers.

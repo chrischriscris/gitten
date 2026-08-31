@@ -19,6 +19,7 @@
 //! out and the panel's own scroll are bound in that mode in `core` — a key is
 //! data, and the panel is not allowed a `match` of its own.
 
+use crate::chrome::RADIUS;
 use gitten_core::command::HelpRow;
 use gitten_core::host::Host;
 use gpui::prelude::FluentBuilder as _;
@@ -99,7 +100,7 @@ pub fn overlay(
                     .bg(rgb(c.title_bg))
                     .border_1()
                     .border_color(rgb(c.faint))
-                    .rounded(px(4.))
+                    .rounded(px(RADIUS))
                     .p(px(PAD))
                     .text_size(px(host.font.size))
                     .font_family(font)

@@ -1367,6 +1367,26 @@ impl DevShell {
             previous.update(cx, |input, cx| input.cancel(cx));
         }
         self.sync_modes(cx);
+        // The field speaks its own exits, because the status hints are blanked
+        // while it stands and a prompt that hides how to leave it is a modal
+        // with no door. Resolved here and once: `sync_modes` has just pushed
+        // the input mode, so `live_keys_for` answers what a press means right
+        // now — a key an inner mode took over is never named — and the field
+        // does not re-walk the keymap per frame for a keyboard it holds.
+        let host = config::host(cx);
+        let accept = host
+            .keys
+            .live_keys_for("input.accept", &self.modes)
+            .into_iter()
+            .next();
+        let cancel = host
+            .keys
+            .live_keys_for("input.cancel", &self.modes)
+            .into_iter()
+            .next();
+        if let Some(field) = self.input.as_ref() {
+            field.update(cx, |field, _| field.set_exits(accept, cancel));
+        }
         cx.notify();
     }
 
@@ -4492,7 +4512,7 @@ impl Render for DevShell {
                                 .px_2()
                                 .border_1()
                                 .border_color(rgb(c.border))
-                                .rounded(px(3.0))
+                                .rounded(px(chrome::RADIUS))
                                 .whitespace_nowrap()
                                 // Both halves were spelled at prepare; a
                                 // frame clones two refcounts.
@@ -4562,16 +4582,16 @@ impl Render for DevShell {
                     true => "PROMPT".into(),
                     false => which.to_uppercase().into(),
                 };
-                let hints = match (&message, self.input.is_some()) {
-                    (Some(_), _) | (None, true) => Vec::new(),
+                let (hints, truncated) = match (&message, self.input.is_some()) {
+                    (Some(_), _) | (None, true) => (Vec::new(), false),
                     (None, false) => {
-                        let budget = window.viewport_size().width
-                            - px(host.font.char_width()
-                                * (badge.chars().count() as f32
-                                    + 6.0
-                                    + chrome::version().len() as f32
-                                    + 4.0));
-                        chrome::hints(&host, &self.modes, which, f32::from(budget).max(0.0))
+                        let width = f32::from(window.viewport_size().width);
+                        chrome::hints(
+                            &host,
+                            &self.modes,
+                            which,
+                            chrome::hints_budget(&host, width, &badge),
+                        )
                     }
                 };
                 match message {
@@ -4588,7 +4608,7 @@ impl Render for DevShell {
                         .text_color(rgb(c.dim))
                         .child(div().min_w_0().truncate().text_color(rgb(ink)).child(text))
                         .into_any_element(),
-                    None => chrome::status_bar(&host, badge, &hints, chrome::version())
+                    None => chrome::status_bar(&host, badge, &hints, truncated, chrome::version())
                         .into_any_element(),
                 }
             })
