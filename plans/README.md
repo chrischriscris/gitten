@@ -1,6 +1,6 @@
 # Implementation Plans
 
-Passes so far, and pass 5 open (020–022, the 2026-08-28 audit wave):
+Passes so far, and pass 7 open (031–036, the 2026-08-31 UI/UX audit wave):
 
 - **Pass 1** (2026-08-24, audited at `3a8b347`): plans 001–007. All landed on
   main and merged — verified 2026-08-26 against `2dfcb82`
@@ -65,6 +65,23 @@ Passes so far, and pass 5 open (020–022, the 2026-08-28 audit wave):
   independently re-verified by the reviewer on the final base, including
   re-running every new test's mutation check.
 
+- **Pass 7** (2026-08-31, audited at `038d0ad` = `origin/full/full` before pass
+  6 landed): plans 031–036, scoped to **aesthetics / UI / UX** at the owner's
+  request. Four parallel read-only audits (window chrome, pane views,
+  interaction model, theme system); every finding re-opened and vetted against
+  the code by the advisor before planning; contrast figures computed with the
+  repo's own `contrast()`/`readable()`. Two bootstrap facts shaped the wave:
+  the audit first ran in the `gitten.wt/full` worktree, whose `full/full` was
+  **66 commits behind `origin/full/full`**, so all six plans were rebased onto
+  `038d0ad` and their excerpts refreshed (findings re-verified as still live on
+  that tip); and the owner's `chrome.raised`/`chrome.keycap` design pass is
+  **uncommitted working-tree-only**, so — unlike pass 5's `carry:` convention —
+  nothing was snapshotted and the one step needing those fields (035 Step 2) is
+  gated SKIP-AND-REPORT rather than publishing the owner's in-flight work.
+  Numbered 031+ because pass 6's plans landed first (PR #26) — the two audits
+  ran concurrently and both initially claimed 023–028; these were renumbered
+  and their cross-references rewritten on discovering the collision.
+
 ## Pass 4 follow-ups — surfaced by reviewers, recorded not folded
 
 - A Down-Down-without-Up (mouse protocol violation by the terminal) leaves a
@@ -111,6 +128,12 @@ integrator owns this table and updates it as waves land.
 | 028 | Make the docs say what the code does | P2 | M | — | TODO — **partly obsolete**: 023 already fixed `check.yml`'s stale job list, and the Linux/keyboard claims may have been overtaken on `full/full`. Re-audit rather than execute |
 | 029 | Author initials clear a contrast floor, because they are text | P3 | S | replaces 027 | TODO — the surviving half of 027: initials are glyphs on a background they do not choose, and 0020 does not cover them. A guard for hand-written palettes, not a fix |
 | 030 | Surface budget exhaustion, so the checker can hold myers exact again | P3 | M | 023 | TODO — restores the exactness 023 had to drop. Referenced by name in `git/examples/diffcheck.rs` |
+| 031 | The diff pane shows where the keyboard is and what is armed | P1 | L | — | TODO |
+| 032 | Git's own words survive: errors readable/dismissable/copyable; jobs show elapsed time | P1 | M | 031 softly (same band lines) | TODO |
+| 033 | The help overlay is modal, scrollable, and aligned | P1 | M | — | TODO |
+| 034 | The contrast report measures everything drawn; quiet text gets a floor | P2 | M | 031 softly (covers the new surface) | TODO |
+| 035 | One chip language in the chrome; the prompt says its exits | P2 | S–M | 033 softly (both touch help.rs) | TODO |
+| 036 | The views keep their own rules: truncation, empty states, the split's edges | P2 | M | 031 softly (same render arms) | TODO |
 
 ## Pass 3 follow-ups — surfaced by reviewers, pre-existing, not pass regressions
 
