@@ -65,7 +65,10 @@ impl Render for Status {
                     div()
                         .flex_none()
                         .px(px(ch * 0.5))
-                        .text_color(rgb(c.faint))
+                        // Every quiet ink in this row is read — a direction, a
+                        // state, a distance — so all four go through
+                        // `quiet_on`: raw `faint` is 2.05:1 on the pane.
+                        .text_color(rgb(host.theme.quiet_on(c.bg)))
                         .child("→"),
                 )
                 .child(
@@ -79,14 +82,14 @@ impl Render for Status {
                         div()
                             .flex_none()
                             .pl(px(ch))
-                            .text_color(rgb(c.faint))
+                            .text_color(rgb(host.theme.quiet_on(c.bg)))
                             .child("✓"),
                     ),
                     (ahead, behind) => super::branches::drift(ahead, behind).map(|drift| {
                         div()
                             .flex_none()
                             .pl(px(ch))
-                            .text_color(rgb(c.faint))
+                            .text_color(rgb(host.theme.quiet_on(c.bg)))
                             .child(SharedString::from(drift))
                     }),
                 }),
@@ -94,7 +97,7 @@ impl Render for Status {
                 div()
                     .flex_none()
                     .pl(px(ch))
-                    .text_color(rgb(c.faint))
+                    .text_color(rgb(host.theme.quiet_on(c.bg)))
                     .child("no branch"),
             ),
         }

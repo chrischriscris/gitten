@@ -369,7 +369,8 @@ const GAP_CHARS: f32 = 1.5;
 
 impl Render for Stashes {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let c = crate::config::host(cx).theme.chrome;
+        let host = crate::config::host(cx);
+        let c = host.theme.chrome;
         // An empty stack is a quiet line, not an empty box — the compact twin
         // of the files pane's clean-tree line, sitting top-left because this
         // pane is a short section of the sidebar, not a whole column.
@@ -380,7 +381,7 @@ impl Render for Stashes {
                 .pt_2()
                 .flex()
                 .items_start()
-                .text_color(rgb(c.faint))
+                .text_color(rgb(host.theme.quiet_on(c.bg)))
                 .child("nothing stashed")
                 .into_any_element()
         }) {

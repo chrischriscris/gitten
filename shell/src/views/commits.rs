@@ -816,11 +816,12 @@ fn row(
                 // Faint rather than dim, and below it in the palette on
                 // purpose: furniture looked up once per glance and not text
                 // to be read — the same floor reasoning that lets the diff's
-                // gutter recede. Armed reaches here too, so the whole row
-                // asks together.
+                // gutter recede. The furniture *floor* still applies, though,
+                // so it resolves through `quiet_on` rather than reading raw.
+                // Armed reaches here too, so the whole row asks together.
                 .text_color(rgb(match armed {
                     true => host.theme.chrome.error,
-                    false => host.theme.chrome.faint,
+                    false => host.theme.quiet_on(host.theme.chrome.bg),
                 }))
                 .child(time.clone()),
         )

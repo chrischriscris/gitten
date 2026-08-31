@@ -4014,7 +4014,10 @@ impl DevShell {
                 note.map(|note| {
                     div()
                         .flex_none()
-                        .text_color(rgb(c.faint))
+                        // The filter is the thing that changed most recently
+                        // and the thing the count is about — read, not glanced
+                        // at, so it clears the furniture floor.
+                        .text_color(rgb(host.theme.quiet_on(c.title_bg)))
                         .child(SharedString::from(note))
                         .into_any_element()
                 })
@@ -4308,7 +4311,9 @@ impl Render for DevShell {
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .text_ellipsis_start()
-                            .text_color(rgb(c.faint))
+                            // Read when it is there — the commit the list is
+                            // sitting on — so it clears the furniture floor.
+                            .text_color(rgb(host.theme.quiet_on(c.title_bg)))
                             .child(commit.subject.clone())
                     }))
                     .children(adds.map(|adds| {
@@ -4323,7 +4328,14 @@ impl Render for DevShell {
                             .text_color(rgb(host.theme.diff.dels_fg))
                             .child(dels)
                     }))
-                    .children(hunk.map(|h| div().flex_none().text_color(rgb(c.faint)).child(h)))
+                    .children(hunk.map(|h| {
+                        div()
+                            .flex_none()
+                            // A count is read, so through `quiet_on` — raw
+                            // `faint` is under the floor on this strip.
+                            .text_color(rgb(host.theme.quiet_on(c.title_bg)))
+                            .child(h)
+                    }))
                     .children(
                         loading
                             .then(|| div().flex_none().text_color(rgb(c.accent)).child("loading")),
@@ -4631,7 +4643,12 @@ impl Render for DevShell {
                             .child(rows)
                             .child(heap),
                     )
-                    .child(div().text_color(rgb(c.faint)).child(load))
+                    // Read — it is the load number — so through `quiet_on`.
+                    .child(
+                        div()
+                            .text_color(rgb(host.theme.quiet_on(c.status_bg)))
+                            .child(load),
+                    )
             }))
             // The help overlay, last so it paints over everything: deferred, so
             // it escapes the regions' paint order; occluding, so the rows under

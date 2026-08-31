@@ -166,7 +166,9 @@ impl Mark {
             // Rare enough not to earn a hue of its own; quieter than any of
             // the above is the right amount of loud for a typechange.
             Mark::TypeChange => t.chrome.dim,
-            Mark::Untracked => t.chrome.faint,
+            // Quietest of all, but still read — `faint` raw is 2.05:1 on the
+            // row, under the floor, so it resolves like the quiet text it is.
+            Mark::Untracked => t.quiet_on(t.chrome.bg),
         }
     }
 }
@@ -705,10 +707,13 @@ const GAP_CHARS: f32 = 1.5;
 
 impl Render for Files {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let c = crate::config::host(cx).theme.chrome;
+        let host = crate::config::host(cx);
+        let c = host.theme.chrome;
         // A clean tree is a quiet line, not an empty box: this pane is a short
         // section of the sidebar now, not a whole column, so the answer sits
         // top-left where a reader scans and not centred where nobody looks.
+        // A sentence someone looks for — through `quiet_on`, because raw
+        // `faint` is 2.05:1 here and "quiet" was reading as "absent".
         if let Some(empty) = self.is_clean().then(|| {
             div()
                 .size_full()
@@ -716,7 +721,7 @@ impl Render for Files {
                 .pt_2()
                 .flex()
                 .items_start()
-                .text_color(rgb(c.faint))
+                .text_color(rgb(host.theme.quiet_on(c.bg)))
                 .child("working tree clean")
                 .into_any_element()
         }) {
@@ -819,7 +824,9 @@ fn row(e: &Entry, host: &Host, current: bool, focused: bool, armed: bool) -> Any
                 div()
                     .flex_none()
                     .ml(px(GAP_CHARS * ch))
-                    .text_color(rgb(c.faint))
+                    // The old path is read — it is where the file came from —
+                    // so quiet, not invisible: through `quiet_on`.
+                    .text_color(rgb(host.theme.quiet_on(c.bg)))
                     .child(old.clone())
             }))
             .into_any_element(),

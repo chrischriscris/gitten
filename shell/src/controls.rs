@@ -108,11 +108,17 @@ pub fn picker(
     on_pick: impl Fn(usize, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
     let c = &theme.chrome;
-    // Disabled draws the *label* faint and the *value* at what an enabled label
-    // gets, rather than putting both on `faint`: that measures 1.95:1 on the
-    // title bar, so "dim and inert rather than removed" was in practice removed —
-    // and a control still has to say what it is on to be worth leaving there.
-    let dim = if p.enabled { c.dim } else { c.faint };
+    // Disabled draws the *label* quiet and the *value* at what an enabled label
+    // gets, rather than putting both on `faint`: raw, that measures 1.95:1 on
+    // the title bar, so "dim and inert rather than removed" was in practice
+    // removed. The label now goes through `quiet_on` — still the quietest ink
+    // on the strip, but at the furniture floor instead of under it — and a
+    // control still has to say what it is on to be worth leaving there.
+    let dim = if p.enabled {
+        c.dim
+    } else {
+        theme.quiet_on(c.title_bg)
+    };
     let fg = if p.enabled { c.fg } else { c.dim };
 
     // Shared with the list, which dismisses on an outside click.

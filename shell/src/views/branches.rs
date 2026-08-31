@@ -252,10 +252,12 @@ pub(crate) fn flatten(
                 branch: r.branch.clone(),
                 label: label.into(),
                 // Hollow and faint: a fetched copy of elsewhere, never a
-                // state of this checkout.
+                // state of this checkout. Faint through `quiet_on` rather
+                // than raw — the dot is read as a state, and raw `faint` is
+                // under the furniture floor on the row it lands on.
                 dot: Dot {
                     glyph: "○",
-                    color: theme.chrome.faint,
+                    color: theme.quiet_on(theme.chrome.bg),
                 },
             })
         }));
@@ -733,7 +735,8 @@ fn row_target(row: &Row) -> Option<Target> {
 
 impl Render for Branches {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let c = crate::config::host(cx).theme.chrome;
+        let host = crate::config::host(cx);
+        let c = host.theme.chrome;
         // No refs at all is a sentence, not an empty box — an unborn
         // repository's honest answer. Top-left at `ROW_PAD`, like the files
         // and stash panes' lines: this is a short section of the sidebar, and
@@ -745,7 +748,10 @@ impl Render for Branches {
                 .pt_2()
                 .flex()
                 .items_start()
-                .text_color(rgb(c.faint))
+                // A sentence someone looks for: through `quiet_on`, because
+                // raw `faint` is 2.05:1 here and that is not a sentence, it
+                // is a gap.
+                .text_color(rgb(host.theme.quiet_on(c.bg)))
                 .child("no branches yet")
                 .into_any_element()
         }) {
@@ -857,7 +863,9 @@ fn row(e: &Row, host: &Host, current: bool, focused: bool, armed: bool) -> AnyEl
                     .pl(px(ch))
                     .pr_2()
                     .text_color(rgb(match l.gone {
-                        true => c.faint,
+                        // "gone" is read — it is why the upstream is not shown
+                        // — so quiet through `quiet_on`, not invisible.
+                        true => host.theme.quiet_on(c.bg),
                         false => c.dim,
                     }))
                     .child(text)
@@ -973,8 +981,8 @@ mod tests {
             match row {
                 Row::Remote(r) => assert_eq!(
                     (r.dot.glyph, r.dot.color),
-                    ("○", t.chrome.faint),
-                    "a remote copy is hollow and quiet"
+                    ("○", t.quiet_on(t.chrome.bg)),
+                    "a remote copy is hollow and quiet — quiet, not invisible"
                 ),
                 other => panic!("a remote row expected, got {other:?}"),
             }

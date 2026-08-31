@@ -94,7 +94,11 @@ pub fn section_label(host: &Host, text: SharedString, count: Option<SharedString
         .min_w_full()
         .h(px(h))
         .pl(px(ROW_PAD))
-        .text_color(rgb(c.faint))
+        // Text, not a border: raw `faint` is 2.05:1 here — half the furniture
+        // floor — so "quiet" was in practice invisible. `quiet_on` lifts it to
+        // the floor and no further, so the label still reads as a heading over
+        // the rows and never as one of them.
+        .text_color(rgb(host.theme.quiet_on(c.bg)))
         .child(div().flex_none().child(text))
         .children(count.map(|count| div().flex_none().ml_auto().pr_2().child(count)))
 }
@@ -127,6 +131,14 @@ fn keycap(host: &Host, number: &str, focused: bool) -> Div {
     let ink = match focused {
         true => c.accent,
         false => c.faint,
+    };
+    // The numeral is text and the box around it is a border, so they part
+    // ways here: the box keeps `faint` raw — a hairline has no floor — and
+    // the digit goes through `quiet_on`, because raw it is 1.95:1 on the
+    // strip and a keycap nobody can read teaches nothing.
+    let digit = match focused {
+        true => c.accent,
+        false => host.theme.quiet_on(c.title_bg),
     };
     div()
         .flex_none()
@@ -222,7 +234,14 @@ pub fn pane_header_with(
         .child(div().flex_none().child(name))
         // Everything after the name is right-edge furniture.
         .child(div().min_w_0().flex_grow(1.0))
-        .children(count.map(|count| div().flex_none().text_color(rgb(c.faint)).child(count)))
+        .children(count.map(|count| {
+            div()
+                .flex_none()
+                // A count is read, so it goes through `quiet_on` — raw `faint`
+                // is 1.95:1 on the strip it sits on.
+                .text_color(rgb(host.theme.quiet_on(c.title_bg)))
+                .child(count)
+        }))
         .children(right)
 }
 
@@ -291,7 +310,9 @@ pub fn status_bar(
         .child(
             div()
                 .flex_none()
-                .text_color(rgb(c.faint))
+                // Read, not glanced at — a version nobody can parse might as
+                // well be absent — so it clears the furniture floor.
+                .text_color(rgb(host.theme.quiet_on(c.status_bg)))
                 .child(SharedString::from(version.to_string())),
         )
 }
