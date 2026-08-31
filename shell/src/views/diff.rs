@@ -2401,8 +2401,15 @@ impl Rows for TextRows {
                 // so the cursor reads as one thing in both.
                 let bg = row_background(current, bg, theme);
                 // Which background this row's furniture lands on, so the line
-                // numbers are resolved against it — see `Theme::gutter_on`.
-                let gutter = theme.gutter_on(surfaces(*kind, *moved).0);
+                // numbers are resolved against it — see `Theme::gutter_on`. On
+                // the keyboard's row that is the wash, and not the line kind's:
+                // the row paints `selection_bg` over both, so a number resolved
+                // for the line it is sits on a background it never lands on.
+                let (plain, _) = surfaces(*kind, *moved);
+                let gutter = theme.gutter_on(match current {
+                    true => Surface::Cursor,
+                    false => plain,
+                });
                 let at = self.wrapped.range(index, seg, text);
                 let piece = slice(text, &at);
                 // A continuation carries no number and no sign. The background
@@ -2438,6 +2445,7 @@ impl Rows for TextRows {
                                     theme,
                                     *kind,
                                     *moved,
+                                    current,
                                     selected(sel, 0, text),
                                 )
                                 .iter()
@@ -2925,6 +2933,7 @@ impl Scratch {
         theme: &Theme,
         kind: LineKind,
         moved: bool,
+        current: bool,
         sel: Range<usize>,
     ) -> &[(Range<usize>, HighlightStyle)] {
         runs::runs_selected(at.clone(), tokens, spans, kind, moved, sel, &mut self.runs);
@@ -2937,7 +2946,16 @@ impl Scratch {
             }
             // A token resolves against the surface it lands on, so a selected
             // or changed byte gets a foreground that reads on that background.
-            let style = r.kind.map(|k| theme.syntax_on(k, r.surface));
+            // On the keyboard's row the plain one is the wash — the row paints
+            // `selection_bg` over whatever the line was, so a token resolved
+            // for it was resolved against a background it never lands on. A
+            // changed word keeps its own: the wash is a bar *under* the row and
+            // the word is the thing being read on it.
+            let surface = match (current, r.word) {
+                (true, false) => Surface::Cursor,
+                _ => r.surface,
+            };
+            let style = r.kind.map(|k| theme.syntax_on(k, surface));
             Some((
                 r.at.start - at.start..r.at.end - at.start,
                 HighlightStyle {
@@ -3013,7 +3031,7 @@ mod tests {
         sel: std::ops::Range<usize>,
     ) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
         let mut sc = super::Scratch::default();
-        super::Scratch::merged(&mut sc, at, tokens, spans, theme, kind, moved, sel).to_vec()
+        super::Scratch::merged(&mut sc, at, tokens, spans, theme, kind, moved, false, sel).to_vec()
     }
 
     fn well_formed(text: &str, runs: &[(std::ops::Range<usize>, HighlightStyle)]) {
@@ -3301,6 +3319,7 @@ mod tests {
             &theme,
             LineKind::Added,
             false,
+            false,
             6..20,
         );
         well_formed(text, out);
@@ -3313,6 +3332,7 @@ mod tests {
                 &spans,
                 &theme,
                 LineKind::Added,
+                false,
                 false,
                 6..20,
             );

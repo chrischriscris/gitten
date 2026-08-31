@@ -71,7 +71,7 @@ use gitten_core::markdown::{Bar, Block, DocRow, Document};
 use gitten_core::prepared::Line;
 use gitten_core::runs::surfaces;
 use gitten_core::select::Selected;
-use gitten_core::theme::Rgb;
+use gitten_core::theme::{readable, Rgb, Surface};
 use gitten_core::wrap::Wrap;
 use gpui::*;
 
@@ -454,7 +454,28 @@ impl MarkdownRows {
         // every presentation goes through, so a paragraph cannot be the one row
         // that hides the cursor.
         let bg = super::diff::row_background(current, bg, theme);
-        let surface = surfaces(line.kind, line.moved).0;
+        // The marker is furniture, and furniture is what a bar already is: it
+        // lands on the row's wash and not on the line's, so it is resolved
+        // here against the cursor's own — the way a file header resolves its
+        // directory ink against the background it actually paints. Twice a row
+        // at most: a bullet on the first, a label on a fence.
+        let marker = match current {
+            true => readable(
+                md.marker,
+                theme.background(Surface::Cursor),
+                theme.min_furniture,
+            ),
+            false => md.marker,
+        };
+        // The numbers are resolved against the row they are drawn on — and on
+        // the keyboard's row that is the wash, not the line kind's: the row
+        // paints `selection_bg` over both, so a grey that recedes on a context
+        // line is a smear on the one row being read.
+        let (plain, _) = surfaces(line.kind, line.moved);
+        let surface = match current {
+            true => Surface::Cursor,
+            false => plain,
+        };
         // A continuation of a wrapped line: the same furniture, so a wrapped
         // bullet stays indented under its own text and a wrapped quote keeps its
         // bar, and no number and no sign, as everywhere else.
@@ -499,6 +520,7 @@ impl MarkdownRows {
                         theme,
                         line.kind,
                         line.moved,
+                        current,
                         selected(sel, 0, full),
                     )
                     .iter()
@@ -607,7 +629,7 @@ impl MarkdownRows {
                 div()
                     .flex_none()
                     .w(px(m.indent))
-                    .text_color(rgb(md.marker))
+                    .text_color(rgb(marker))
                     .child(if blank { " " } else { m.bullet(depth) }),
             )
         } else {
@@ -632,6 +654,7 @@ impl MarkdownRows {
                     theme,
                     line.kind,
                     line.moved,
+                    current,
                     selected(sel, 0, full),
                 )
                 .iter()
@@ -645,7 +668,7 @@ impl MarkdownRows {
             // A fence's language label is punctuation the reader should be able
             // to skip. A table's pipes are too, but a table is drawn verbatim —
             // see the note on `Block::Table` in `gitten_core::markdown`.
-            body.text_color(rgb(md.marker))
+            body.text_color(rgb(marker))
         } else {
             body
         };

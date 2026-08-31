@@ -57,7 +57,7 @@ use gitten_core::host::Host;
 use gitten_core::runs::surfaces;
 use gitten_core::select::Selected;
 use gitten_core::syntax::Token;
-use gitten_core::theme::Theme;
+use gitten_core::theme::{Surface, Theme};
 use gitten_core::wrap::{Wrap, Wrapped};
 use gitten_core::{LineKind, Span};
 use gpui::*;
@@ -574,7 +574,14 @@ impl SplitRows {
         let (bg, fg, sign) = line_colors(line.kind, line.moved, p);
         // The keyboard's row, on this side and on the other: one bar, not two.
         let bg = super::diff::row_background(current, bg, theme);
-        let gutter = theme.gutter_on(surfaces(line.kind, line.moved).0);
+        // The same substitution the unified view makes: the row paints the
+        // wash over whatever the line was, so a number resolved for the line
+        // kind was resolved against a background it never lands on.
+        let (plain, _) = surfaces(line.kind, line.moved);
+        let gutter = theme.gutter_on(match current {
+            true => Surface::Cursor,
+            false => plain,
+        });
         let no = match column {
             Column::Old => line.old_no,
             Column::New => line.new_no,
@@ -619,6 +626,7 @@ impl SplitRows {
                             theme,
                             line.kind,
                             line.moved,
+                            current,
                             selected(sel, column.part(), &line.text),
                         )
                         .iter()
