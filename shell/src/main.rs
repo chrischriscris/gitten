@@ -1365,35 +1365,47 @@ impl DevShell {
     /// [`Modes`] can change — and at the tail of [`DevShell::run_command`],
     /// because a cursor move inside a list can end a standing question.
     fn sync_modes(&mut self, cx: &App) {
-        self.modes = Modes::new();
+        self.modes = self.stack_for(self.active(), cx);
+        self.pending.clear();
+        self.open = None;
+    }
+
+    /// The [`Modes`] stack a key would resolve against if `screen` held the
+    /// keyboard — [`DevShell::sync_modes`]' builder without its side effects.
+    /// The keyboard's own stack stays in `self.modes`; the wheel resolves
+    /// against this one so the pane under it answers for the event while
+    /// focus stays where it was. The modal halves — a standing prompt, the
+    /// error band — belong to the window either way, so they ride along
+    /// unchanged; only the screen's own mode is swapped for the target's.
+    fn stack_for(&self, screen: Option<&Screen>, cx: &App) -> Modes {
+        let mut modes = Modes::new();
         // Cycling the lists needs more than one of them to be worth a key.
         if self.list_order().len() > 1 {
-            self.modes.push(panes::MODE);
+            modes.push(panes::MODE);
         }
-        if let Some(screen) = self.active() {
-            self.modes.push(screen.mode());
+        if let Some(screen) = screen {
+            modes.push(screen.mode());
         }
         // The reset question, lazygit's menu: while the commits view has a
         // reset armed, its three letters capture s/m/h for the strengths —
         // `h` included, which outside the question is the pane move. The
         // question is the pane's own state and survives nothing that moves
         // the cursor, so this reads it rather than mirrors it.
-        if let Some(Screen::Commits { view, .. }) = self.active() {
+        if let Some(Screen::Commits { view, .. }) = screen {
             if view.read(cx).armed() {
-                self.modes.push(RESET_MODE);
+                modes.push(RESET_MODE);
             }
         }
         if self.input.is_some() {
-            self.modes.push(input::MODE);
+            modes.push(input::MODE);
         }
         if self.help {
-            self.modes.push(help::MODE);
+            modes.push(help::MODE);
         }
         if self.show_message && self.error.is_some() {
-            self.modes.push(MESSAGE_MODE);
+            modes.push(MESSAGE_MODE);
         }
-        self.pending.clear();
-        self.open = None;
+        modes
     }
 
     /// The live host, and the chord reset that goes with it when the file has
@@ -3111,12 +3123,23 @@ impl DevShell {
     }
 
     /// One named command, run. **This is the one dispatch path**: the keymap
-    /// resolves to a name, and whatever resolved it — a key, a chord, a wheel
-    /// notch rebinding, a menu item — arrives here and nowhere else.
+    /// resolves to a name, and whatever resolved it — a key, a chord, a menu
+    /// item — arrives here and nowhere else.
     ///
     /// The client's own commands first, then the screen's. That order is what
     /// lets a screen override `back` one day without this file having to know.
     fn run_command(&mut self, command: &str, cx: &mut Context<Self>) {
+        self.run_command_from(command, None, cx);
+    }
+
+    /// [`DevShell::run_command`] with the pane the event came *over*. The
+    /// keyboard omits it and falls through to the focused pane, exactly as it
+    /// always has; the wheel supplies the pane under the pointer, so a glance
+    /// scrolls that list without moving the keyboard. App-wide commands keep
+    /// their ordinary meaning regardless of where their binding originated —
+    /// only the screen's own verbs read the target — which is the same rule
+    /// the terminal's `dispatch_to` runs under.
+    fn run_command_from(&mut self, command: &str, over: Option<&Screen>, cx: &mut Context<Self>) {
         match command {
             "message.show" => {
                 // Only meaningful while an error stands: the overlay is the
@@ -3261,7 +3284,7 @@ impl DevShell {
                 }
             }
             _ => {
-                let known = match self.active() {
+                let known = match over.or_else(|| self.active()) {
                     Some(screen) => {
                         let host = config::host(cx);
                         let writes = self.writes();
@@ -3804,10 +3827,16 @@ impl DevShell {
             return;
         }
         // Over one region's rows or the other's, and not over the title bar
-        // or a dropdown above them. Focus that region before resolving the
-        // wheel: otherwise an unfocused pane's native list scroller would
-        // become a second, unconfigured input path when this capture handler
-        // stood aside.
+        // or a dropdown above them. The wheel is a glance, not a commitment:
+        // it scrolls the pane under it and the keyboard stays where it was —
+        // focus is the click's job. So the hit region is the event's target
+        // *only*: resolved against here, dispatched to below, and nothing on
+        // this path reads the focused pane — the badge, the hints and the
+        // accent bar sit still through the gesture. What the old focusing
+        // protected still holds: this capture handler remains the wheel's
+        // only consumer, so it never stands aside to an unfocused pane's
+        // native list scroller becoming a second, unconfigured input path,
+        // and the keymap still owns both halves of the motion.
         let in_stack = self.has_column.then(|| {
             self.panes
                 .iter()
@@ -3817,14 +3846,13 @@ impl DevShell {
         let screen = match (in_stack.flatten(), over_main) {
             // The stack keeps its per-list hit test: whichever list is
             // showing owns its own box.
-            (Some(at), _) => {
-                self.focus_pane(at, cx);
-                self.panes.focused().clone()
-            }
-            (None, true) => {
-                self.set_spot(Spot::Main, cx);
-                self.main.clone()
-            }
+            (Some(at), _) => self
+                .panes
+                .iter()
+                .nth(at)
+                .expect("the position was just found in this registry")
+                .clone(),
+            (None, true) => self.main.clone(),
             (None, false) => return,
         };
         let mut ongoing = self.ongoing.get();
@@ -3841,13 +3869,17 @@ impl DevShell {
         if !delta.x.is_zero() {
             moved |= screen.pan_pixels(-f32::from(delta.x), cx);
         }
-        // The vertical axis belongs to the keymap. What resolved decides *both*
-        // halves of the motion: which way the list moves comes from the command
-        // — `wheelup = "view.scroll-down"` really does scroll down — and how
-        // far is the event's own pixels at `[view] scroll`'s multiplier, which
-        // is what keeps a trackpad smooth. Any other command still dispatches
-        // by name through the one path; an unbound or half-typed chord does
-        // nothing, exactly like a key.
+
+        // The vertical axis belongs to the keymap, resolved against the pane
+        // under the wheel: a binding written under another pane's mode stays
+        // quiet over this one, and one this pane carries answers here. What
+        // resolved decides *both* halves of the motion: which way the list
+        // moves comes from the command — `wheelup = "view.scroll-down"` really
+        // does scroll down — and how far is the event's own pixels at
+        // `[view] scroll`'s multiplier, which is what keeps a trackpad smooth.
+        // Any other command still dispatches by name through the one path,
+        // aimed at the hovered pane for this event; an unbound or half-typed
+        // chord does nothing, exactly like a key.
         if !delta.y.is_zero() {
             let host = self.fresh_host(cx);
             let key = Key::new(
@@ -3861,7 +3893,8 @@ impl DevShell {
             );
             // Unbound or half-typed: the wheel does nothing, which is what an
             // unbound key does too.
-            if let Resolve::Run(name) = host.keys.resolve(&self.modes, &[key]) {
+            let modes = self.stack_for(Some(&screen), cx);
+            if let Resolve::Run(name) = host.keys.resolve(&modes, &[key]) {
                 let name = name.to_string();
                 match Self::smooth_pixels(&name, f32::from(delta.y), host.view.rows) {
                     // The smooth path: the command came from `[keys]`, the
@@ -3869,7 +3902,7 @@ impl DevShell {
                     Some(px) => moved |= screen.scroll_pixels(px, &host, cx),
                     _ => {
                         self.notice = None;
-                        self.run_command(&name, cx);
+                        self.run_command_from(&name, Some(&screen), cx);
                     }
                 }
             }
@@ -5675,6 +5708,233 @@ mod tests {
                 ongoing: Cell::default(),
             }
         })
+    }
+
+    /// A pane tenant that answers the wheel: a fake painted box for the hit
+    /// test — real bounds stay zero until a paint, and these tests do not
+    /// paint the shell — with a real commits view behind it, so a dispatched
+    /// movement verb has somewhere to land and an armed question has a pane
+    /// to belong to. Its mode is its own, so a binding written under it
+    /// resolves only when this pane is the one under the wheel.
+    struct WheelPane {
+        view: gpui::Entity<Commits>,
+        bounds: gpui::Bounds<gpui::Pixels>,
+    }
+
+    impl Pane for WheelPane {
+        fn any(&self) -> gpui::AnyView {
+            self.view.clone().into()
+        }
+
+        fn mode(&self) -> &'static str {
+            "wheeled"
+        }
+
+        fn label(&self, _: &gpui::App) -> String {
+            "wheeled pane".into()
+        }
+
+        fn list_bounds(&self, _: &gpui::App) -> gpui::Bounds<gpui::Pixels> {
+            self.bounds
+        }
+
+        fn run(&self, command: &str, host: &Host, _: Option<&Writes>, cx: &mut gpui::App) -> bool {
+            self.view.update(cx, |v, _| v.run_view(command, host))
+        }
+
+        fn scroll_pixels(&self, dy: f32, host: &Host, cx: &mut gpui::App) -> bool {
+            self.view.update(cx, |v, _| v.scroll_pixels(dy, host))
+        }
+    }
+
+    fn wheel_commits(n: usize) -> Vec<Commit> {
+        (0..n)
+            .map(|i| Commit {
+                sha: format!("c{i}"),
+                short: format!("c{i}"),
+                parents: Box::from(&[][..]),
+                author: "test".into(),
+                timestamp: 0,
+                subject: format!("commit {i}"),
+            })
+            .collect()
+    }
+
+    /// A two-pane shell: the keyboard on `commits`, and a `wheeled` pane
+    /// beside it with its own commits view and its own painted box
+    /// (x 0..200, y 100..300). The host's keymap carries
+    /// `wheeldown = "view.down"` under the `wheeled` mode, so a wheel over
+    /// that pane only resolves if the *hovered* pane's mode was consulted —
+    /// the shipped global `wheeldown` would have resolved either way.
+    fn wheel_shell(cx: &mut TestAppContext) -> (gpui::Entity<DevShell>, gpui::Entity<Commits>) {
+        let mut host = Host::new();
+        host.keys.bind("wheeled", "wheeldown", "view.down").unwrap();
+        let host = Rc::new(host);
+        let commits = cx.new(|_| Commits::new(wheel_commits(4), host.clone()));
+        let wheeled = cx.new(|_| Commits::new(wheel_commits(4), Rc::clone(&host)));
+        let diff = cx.new(|cx| crate::views::diff::Diff::new(Vec::new(), host.clone(), cx));
+        let jobs = Runner::new();
+        let shell = cx.new(|cx| {
+            cx.set_global(config::Active(Rc::clone(&host)));
+            let mut panes = panes::Panes::new(
+                "commits",
+                Screen::commits(commits, Source::Fixtures, Generation::default(), "repo"),
+            );
+            panes.register(
+                "wheeled",
+                Screen::Custom(Rc::new(WheelPane {
+                    view: wheeled.clone(),
+                    bounds: gpui::Bounds::new(
+                        gpui::point(gpui::px(0.), gpui::px(100.)),
+                        gpui::size(gpui::px(200.), gpui::px(200.)),
+                    ),
+                })),
+            );
+            // `register` focuses the new tenant; the keyboard stays put.
+            panes.focus(0);
+            DevShell {
+                which: "commits",
+                panes,
+                main: Screen::diff(diff, None, Generation::default(), ""),
+                has_column: true,
+                spot: super::Spot::List,
+                head: RefCell::new(None),
+                request: Cell::new(0),
+                loading: Cell::new(false),
+                stats: None,
+                rediff: None,
+                repo: None,
+                submitter: jobs.submitter(),
+                jobs,
+                generation: Generation::default(),
+                refresh_id: 0,
+                refresh_pending: 0,
+                refresh_error: None,
+                running: None,
+                show_message: false,
+                input: None,
+                prompt: None,
+                search_live: None,
+                over: Default::default(),
+                open: None,
+                error: None,
+                notice: None,
+                config: std::path::PathBuf::new(),
+                first_render: Cell::new(false),
+                title_memo: RefCell::new(None),
+                header_memo: RefCell::new(None),
+                modes: Modes::new(),
+                pending: Vec::new(),
+                help: false,
+                help_scroll: ScrollHandle::default(),
+                focus: cx.focus_handle(),
+                focused: None,
+                seen_host: None,
+                ongoing: Cell::default(),
+            }
+        });
+        (shell, wheeled)
+    }
+
+    /// The commits view that holds the keyboard in the [`DevShell::wheel_shell`]
+    /// fixture — the pane the wheel must not disturb.
+    fn wheel_focused(shell: &gpui::Entity<DevShell>, cx: &TestAppContext) -> gpui::Entity<Commits> {
+        shell.read_with(cx, |shell, _| match shell.panes.get("commits") {
+            Some(Screen::Commits { view, .. }) => view.clone(),
+            _ => panic!("the fixture has a commits pane"),
+        })
+    }
+
+    /// One wheel notch over the fixture's wheeled pane, shaped the way the
+    /// capture handler sees one.
+    fn wheeled_notch() -> gpui::ScrollWheelEvent {
+        wheeled_notch_at(gpui::point(gpui::px(100.), gpui::px(150.)))
+    }
+
+    fn wheeled_notch_at(at: gpui::Point<gpui::Pixels>) -> gpui::ScrollWheelEvent {
+        gpui::ScrollWheelEvent {
+            position: at,
+            delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-40.))),
+            modifiers: gpui::Modifiers::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        }
+    }
+
+    #[gpui::test]
+    async fn a_wheel_over_an_unfocused_pane_scrolls_it_and_focus_stays_put(
+        cx: &mut TestAppContext,
+    ) {
+        let (shell, wheeled) = wheel_shell(cx);
+        let focused = wheel_focused(&shell, cx);
+
+        // An empty window is only the `&mut Window` the capture handler
+        // needs; nothing paints, which is why the fixture pane carries its
+        // own hit box.
+        let window = cx.add_empty_window();
+        window.update(|window, cx| {
+            shell.update(cx, |shell, cx| shell.on_wheel(&wheeled_notch(), window, cx));
+        });
+        window.update(|_, cx| {
+            // The pane under the wheel scrolled a row; the pane that holds
+            // the keyboard did not move, and the keyboard itself never
+            // moved — no spot change, no focused-tenant change, so the
+            // badge and the accent bar sit still through the gesture.
+            assert_eq!(shell.read(cx).panes.focused_name(), "commits");
+            assert_eq!(
+                wheeled.read(cx).current().map(|c| c.sha.to_string()),
+                Some("c1".into()),
+                "the wheeled pane's list moved"
+            );
+            assert_eq!(
+                focused.read(cx).current().map(|c| c.sha.to_string()),
+                Some("c0".into()),
+                "the keyboard's pane did not"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn a_wheel_over_the_hovered_pane_disarms_only_that_panes_question(
+        cx: &mut TestAppContext,
+    ) {
+        let (shell, wheeled) = wheel_shell(cx);
+        let focused = wheel_focused(&shell, cx);
+        let window = cx.add_empty_window();
+
+        // Arm in the pane under the wheel, then wheel. The disarm rule is
+        // the pane's own — a view's question dies when that view's cursor
+        // moves (`Commits::run_view`), and the wheel here moves only the
+        // hovered pane's cursor.
+        window.update(|_, cx| {
+            wheeled.update(cx, |v, _| assert!(!v.confirm_or_arm_reset("c0")));
+        });
+        window.update(|window, cx| {
+            shell.update(cx, |shell, cx| shell.on_wheel(&wheeled_notch(), window, cx));
+        });
+        window.update(|_, cx| {
+            assert_eq!(
+                wheeled.read(cx).armed_sha(),
+                None,
+                "the wheel disarmed the pane it scrolled"
+            );
+        });
+
+        // Arm in the pane that *holds* the keyboard, wheel over the other
+        // one again: the hovered pane's state moves, this question is not
+        // the wheel's to spend.
+        window.update(|_, cx| {
+            focused.update(cx, |v, _| assert!(!v.confirm_or_arm_reset("c0")));
+        });
+        window.update(|window, cx| {
+            shell.update(cx, |shell, cx| shell.on_wheel(&wheeled_notch(), window, cx));
+        });
+        window.update(|_, cx| {
+            assert_eq!(
+                focused.read(cx).armed_sha().as_deref(),
+                Some("c0"),
+                "a wheel over another pane does not spend the question"
+            );
+        });
     }
 
     #[gpui::test]
