@@ -16,7 +16,7 @@ use crate::chrome::{list_row, path_spans, section_label, ROW_PAD};
 use crate::graph::ROW_H;
 use gitten_core::host::Host;
 use gitten_core::status::{Change, ConflictKind, PathBytes, Status};
-use gitten_core::theme::Rgb;
+use gitten_core::theme::{Rgb, Surface};
 use gitten_core::view::Viewport;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
@@ -155,7 +155,7 @@ impl Mark {
     /// rename steps aside onto the graph's first lane ink instead. When one
     /// working tree shows both, the two never share a colour and renames
     /// cannot read as edits.
-    fn color(self, host: &Host) -> Rgb {
+    fn color(self, host: &Host, current: bool) -> Rgb {
         let t = &host.theme;
         match self {
             Mark::Add => t.diff.adds_fg,
@@ -164,8 +164,16 @@ impl Mark {
             Mark::Modify => t.chrome.accent,
             Mark::Rename => t.lanes.first().copied().unwrap_or(t.chrome.accent),
             // Rare enough not to earn a hue of its own; quieter than any of
-            // the above is the right amount of loud for a typechange.
-            Mark::TypeChange => t.chrome.dim,
+            // the above is the right amount of loud for a typechange. Raw dim
+            // fails the text floor on a selected row, so it resolves against
+            // the row it lands on, the way text on a row does.
+            Mark::TypeChange => {
+                if current {
+                    host.theme.dim_on(Surface::Cursor)
+                } else {
+                    t.chrome.dim
+                }
+            }
             // Quietest of all, but still read — `faint` raw is 2.05:1 on the
             // row, under the floor, so it resolves like the quiet text it is.
             Mark::Untracked => t.quiet_on(t.chrome.bg),
@@ -805,7 +813,7 @@ fn row(e: &Entry, host: &Host, current: bool, focused: bool, armed: bool) -> Any
                     // with it — so the armed tint spends nothing new.
                     .text_color(rgb(match armed {
                         true => c.error,
-                        false => f.mark.color(host),
+                        false => f.mark.color(host, current),
                     }))
                     .child(SharedString::from(f.letters)),
             )
@@ -817,7 +825,17 @@ fn row(e: &Entry, host: &Host, current: bool, focused: bool, armed: bool) -> Any
                         .whitespace_nowrap()
                         .text_color(rgb(c.error))
                         .child(f.path_text.clone()),
-                    false => path_spans(host, f.dir.clone(), f.name.clone(), c.fg),
+                    false => path_spans(
+                        host,
+                        f.dir.clone(),
+                        f.name.clone(),
+                        c.fg,
+                        if current {
+                            Surface::Cursor
+                        } else {
+                            Surface::Context
+                        },
+                    ),
                 }),
             )
             .children(f.renamed_from.as_ref().map(|old| {

@@ -20,7 +20,7 @@ use crate::graph::ROW_H;
 use gitten_core::host::Host;
 use gitten_core::refs::{Branch, HeadState, RemoteBranch, Upstream};
 use gitten_core::status::PathBytes;
-use gitten_core::theme::{Rgb, Theme};
+use gitten_core::theme::{Rgb, Surface, Theme};
 use gitten_core::view::Viewport;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
@@ -848,7 +848,14 @@ fn row(e: &Row, host: &Host, current: bool, focused: bool, armed: bool) -> AnyEl
         }
         Row::Detached { dot: d, text } => chrome::list_row(host, current, focused, ROW_H)
             .child(dot(d))
-            .child(name(text.clone(), Some(c.dim)))
+            .child(name(
+                text.clone(),
+                Some(if current {
+                    host.theme.dim_on(Surface::Cursor)
+                } else {
+                    c.dim
+                }),
+            ))
             .into_any_element(),
         Row::Local(l) => chrome::list_row(host, current, focused, ROW_H)
             .child(dot(&l.dot))
@@ -866,14 +873,28 @@ fn row(e: &Row, host: &Host, current: bool, focused: bool, armed: bool) -> AnyEl
                         // "gone" is read — it is why the upstream is not shown
                         // — so quiet through `quiet_on`, not invisible.
                         true => host.theme.quiet_on(c.bg),
-                        false => c.dim,
+                        // The upstream text is read, and raw dim is under the
+                        // floor when the row is selected — it resolves against
+                        // whichever background the row is wearing.
+                        false => host.theme.dim_on(if current {
+                            Surface::Cursor
+                        } else {
+                            Surface::Context
+                        }),
                     }))
                     .child(text)
             }))
             .into_any_element(),
         Row::Remote(r) => chrome::list_row(host, current, focused, ROW_H)
             .child(dot(&r.dot))
-            .child(name(r.label.clone(), Some(c.dim)))
+            .child(name(
+                r.label.clone(),
+                Some(if current {
+                    host.theme.dim_on(Surface::Cursor)
+                } else {
+                    c.dim
+                }),
+            ))
             .into_any_element(),
     }
 }

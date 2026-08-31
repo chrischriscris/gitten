@@ -18,6 +18,7 @@ use gitten_core::command::{chord_string, Code, Key, Modes, Resolve};
 use gitten_core::differ::{Overrides, Whitespace};
 use gitten_core::host::Host;
 use gitten_core::refs::ResetMode;
+use gitten_core::theme;
 use gitten_core::{Commit, FileDiff};
 use gpui::*;
 use gpui_component::*;
@@ -4022,12 +4023,13 @@ impl DevShell {
                         .into_any_element()
                 })
                 .or_else(|| {
-                    // Dim, not accent: the accent is the keyboard's mark and
-                    // a branch name is a fact about the list.
+                    // Dim, not accent: the accent is the keyboard's mark, and
+                    // a branch name is a fact about the strip it sits on — raw
+                    // dim is under the text floor there, so it resolves.
                     branch.map(|branch| {
                         div()
                             .flex_none()
-                            .text_color(rgb(c.dim))
+                            .text_color(rgb(host.theme.dim_on(theme::Surface::Title)))
                             .child(branch)
                             .into_any_element()
                     })
@@ -4348,7 +4350,13 @@ impl Render for DevShell {
                     false => c.dim,
                 };
                 let name = match &text {
-                    Some(t) => chrome::path_spans(&host, t.dir.clone(), t.name.clone(), name_ink),
+                    Some(t) => chrome::path_spans(
+                        &host,
+                        t.dir.clone(),
+                        t.name.clone(),
+                        name_ink,
+                        theme::Surface::Title,
+                    ),
                     None => div().text_color(rgb(name_ink)).child("DIFF"),
                 };
                 chrome::pane_header_with(
@@ -4405,7 +4413,7 @@ impl Render for DevShell {
                         (dir, name)
                     }
                 };
-                chrome::path_spans(&host, dir, name, c.fg).into_any_element()
+                chrome::path_spans(&host, dir, name, c.fg, theme::Surface::Title).into_any_element()
             }
             None => div()
                 .whitespace_nowrap()
@@ -4490,7 +4498,10 @@ impl Render for DevShell {
                     .bg(rgb(c.title_bg))
                     .border_b_1()
                     .border_color(rgb(c.border))
-                    .text_color(rgb(c.dim))
+                    // The strip names the repository and is read; raw dim is
+                    // under the text floor here (3.37), so it resolves against
+                    // the strip it is drawn on.
+                    .text_color(rgb(host.theme.dim_on(theme::Surface::Title)))
                     // The one thing in the strip that is allowed to shrink, and
                     // everything else is `flex_none`. A repository is the part of
                     // a title a reader can reconstruct; a picker pushed off the
@@ -4530,7 +4541,13 @@ impl Render for DevShell {
                                 // frame clones two refcounts.
                                 .child(div().flex_none().text_color(rgb(c.fg)).child(info.chip))
                                 .children(info.drift.map(|drift| {
-                                    div().flex_none().text_color(rgb(c.dim)).child(drift)
+                                    // A drift figure is read, not glanced at —
+                                    // and raw dim is under the floor on the
+                                    // strip it sits on.
+                                    div()
+                                        .flex_none()
+                                        .text_color(rgb(host.theme.dim_on(theme::Surface::Title)))
+                                        .child(drift)
                                 })),
                         )
                     }))
@@ -4585,11 +4602,16 @@ impl Render for DevShell {
                     // spends is the one being read.
                     .or_else(|| {
                         notice.as_ref().map(|n| match n {
-                            Notice::Info(text) => (text.as_str().into(), c.dim),
+                            Notice::Info(text) => (
+                                text.as_str().into(),
+                                host.theme.dim_on(theme::Surface::Status),
+                            ),
                             Notice::Question(text) => (text.as_str().into(), c.error),
                         })
                     })
-                    .or_else(|| running.map(|n| (n.into(), c.dim)));
+                    .or_else(|| {
+                        running.map(|n| (n.into(), host.theme.dim_on(theme::Surface::Status)))
+                    });
                 let badge: SharedString = match self.input.is_some() {
                     true => "PROMPT".into(),
                     false => which.to_uppercase().into(),
@@ -4617,7 +4639,7 @@ impl Render for DevShell {
                         .bg(rgb(c.status_bg))
                         .border_t_1()
                         .border_color(rgb(c.border))
-                        .text_color(rgb(c.dim))
+                        .text_color(rgb(host.theme.dim_on(theme::Surface::Status)))
                         .child(div().min_w_0().truncate().text_color(rgb(ink)).child(text))
                         .into_any_element(),
                     None => chrome::status_bar(&host, badge, &hints, truncated, chrome::version())
@@ -4634,7 +4656,7 @@ impl Render for DevShell {
                     .bg(rgb(c.status_bg))
                     .border_t_1()
                     .border_color(rgb(c.border))
-                    .text_color(rgb(c.dim))
+                    .text_color(rgb(host.theme.dim_on(theme::Surface::Status)))
                     .child(
                         div()
                             .flex()
