@@ -48,6 +48,23 @@ Passes so far, and pass 5 open (020–022, the 2026-08-28 audit wave):
   the branches' carries and your local WIP are the same content at the same
   snapshot, so the merge is a fast-forward-shaped no-op for the carried files.
 
+- **Pass 6** (2026-08-30/31, audited at `87229df` on `main`): plans 023–030.
+  A full-repo audit — correctness, perf, complexity, UI and docs — run by an
+  advisor with four parallel read-only subagents, every finding vetted against
+  the code before planning. **Two base-branch mistakes shaped this pass and
+  are worth knowing about**: it was first audited and executed against `main`
+  (127 commits stale), then re-targeted onto a *local* `full/full` that was
+  itself 60 commits behind `origin/full/full`. Consequences: plan 026 lost half
+  its scope (the widest-row measurement it fixed had already been deleted with
+  the sideways scroll), plan 024's call sites had to be re-derived rather than
+  replayed against the rewritten markdown/tui code, and these plans were
+  renumbered from 013–020 to **023–030** on discovering the collision with
+  passes 3–5. Anything below still marked TODO was planned against `main` and
+  **must be drift-checked against `origin/full/full` before execution**.
+  023, 024 and 026 are **merged into `full/full`** (PRs #23/#24/#25); each was
+  independently re-verified by the reviewer on the final base, including
+  re-running every new test's mutation check.
+
 ## Pass 4 follow-ups — surfaced by reviewers, recorded not folded
 
 - A Down-Down-without-Up (mouse protocol violation by the terminal) leaves a
@@ -86,6 +103,14 @@ integrator owns this table and updates it as waves land.
 | 020 | Transactional terminal entry — a failed start cannot leave raw mode on | P1 | S | — | DONE (advisor/020-transactional-terminal-entry, 3 commits on the 8-file carry) — verdict APPROVE: all gates re-run by reviewer (tests 175 lib, clippy, fmt clean), scope clean, diff read; one report inaccuracy (test count "174→178"; actual 171→175), work unaffected; branch carry repaired by orchestrator |
 | 021 | `diff.discard-hunk` in the terminal + the client command-parity guard | P1 | M | — | DONE (advisor/021-tui-discard-hunk-parity-guard, 6 commits on the 8-file carry) — verdict APPROVE: gates re-run by reviewer (182 lib + 60 bin tests, clippy, fmt), scope clean (diff.rs + main.rs), diff read, sabotage re-verified by reviewer (guard fails "copy.selection lost its arm" under a renamed arm, recovers on revert). Judgment calls accepted, documented: `view.*` is ten names not twelve (derived from real arms); four diff-pane names sweep after `diff.focus`; fake `Repo` gained a test-only `discard_patch`; job built before the arm is spent (a tightening of the window's order) |
 | 022 | Repository loads and refreshes off the terminal loop (loader thread, supersede guards) | P1 | L | 021 | DONE (advisor/022-tui-async-loads, 6 commits on 021's tip) — verdict APPROVE: gates re-run by reviewer on a cold isolated target dir (182 lib + 63 bin, clippy, fmt), scope read hunk-by-hunk (apply-time guards: batch id, target generation, request id; first-error stands; FIFO composition order documented), migrated assertions verified verbatim, both new guard tests assert real state. Accepted deviations, documented: `Screens` not `Send` → `Tenant` extraction + associated `acquire_snapshot` on the loader thread (the window's own model); snapshot variants carry labels (behavior-preserving); `catch_unwind` in the loader mirroring the write Runner; one scope extension — `Panes::iter_mut` deleted (4 lines, dead after step 3, caught by the plan's own clippy gate) |
+| 023 | Make the differ-vs-git check a gate instead of a printout | P1 | M | — | **MERGED** (pass 6, PR #23, `128f061`, merge `356342a`) — all 5 CI jobs green incl. the new `diffcheck` job. Fixed two contradictions in the checker on the way: hunk positions are now compared only between same-size scripts, and myers' exact-count check stands down past its step budget (see 030) |
+| 024 | Guard the runs seam against mid-character offsets | P1 | S | — | **MERGED** (pass 6, PR #24, `69217a4`, merge `038d0ad`) — 388 core tests, 13 workspace binaries; guard mutation-validated by the reviewer on the final base. Closes three latent render-path panics (BUG-05/BUG-11/BUG-14) |
+| 025 | A startup failure opens the window and says so | P1 | M | — | TODO — **planned against `main`; drift-check before executing** |
+| 026 | A font edit keeps your selection and your place in the diff | P2 | S | — | **MERGED** (pass 6, PR #25, `5748465`, merge `cb6ceda`) — 330 shell tests, mutation-validated. Its commit-list half was dropped: `full/full` had already deleted the widest-row measurement |
+| 027 | The overflow lane clears the furniture contrast floor | P2 | S | — | **REJECTED** — premise contradicts decision 0020, which exempts `lane_overflow` by name as a stroke with no legibility floor. The 1.87:1 measurement is real; the conclusion was not. Caught by the executor at its STOP condition before committing. Replaced by 029 |
+| 028 | Make the docs say what the code does | P2 | M | — | TODO — **partly obsolete**: 023 already fixed `check.yml`'s stale job list, and the Linux/keyboard claims may have been overtaken on `full/full`. Re-audit rather than execute |
+| 029 | Author initials clear a contrast floor, because they are text | P3 | S | replaces 027 | TODO — the surviving half of 027: initials are glyphs on a background they do not choose, and 0020 does not cover them. A guard for hand-written palettes, not a fix |
+| 030 | Surface budget exhaustion, so the checker can hold myers exact again | P3 | M | 023 | TODO — restores the exactness 023 had to drop. Referenced by name in `git/examples/diffcheck.rs` |
 
 ## Pass 3 follow-ups — surfaced by reviewers, pre-existing, not pass regressions
 

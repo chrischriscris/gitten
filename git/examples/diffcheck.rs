@@ -158,7 +158,7 @@ fn main() {
         // sides, exact agreement), which is the evidence this is the
         // budget and not a bug. So an exact-length assertion on myers only
         // holds below the budget; past it the drift is worth seeing and not
-        // worth failing the gate on. Plan 020 restores the exact check by
+        // worth failing the gate on. Plan 030 restores the exact check by
         // surfacing budget exhaustion from the differ, so the checker can
         // hold myers exact whenever it actually finished.
         // The anchored algorithms have no step budget in play here, so a
