@@ -4302,6 +4302,15 @@ impl Render for DevShell {
                 let focused = self.spot == Spot::List && focused_name == name;
                 let count = match screen {
                     Screen::Files { view, .. } => files_header_count(view, cx),
+                    Screen::Branches { view, .. } => {
+                        // The pane's total — its rows minus the group
+                        // headings, the same rows the in-list LOCAL and
+                        // REMOTE labels count — and zero dropped, the rule
+                        // the empty state lives by: the pane below already
+                        // says there is nothing here.
+                        let n = view.read(cx).count();
+                        (n > 0).then(|| SharedString::from(n.to_string()))
+                    }
                     _ => None,
                 };
                 let rows = match screen {
@@ -4353,7 +4362,17 @@ impl Render for DevShell {
                     continue;
                 };
                 let focused = self.spot == Spot::List && focused_name == name;
-                let count: Option<SharedString> = None;
+                let count: Option<SharedString> = match screen {
+                    Screen::Stashes { view, .. } => {
+                        // The stash list has no headings, so its row count is
+                        // the total — the same number the pane's height reads
+                        // — and zero is dropped, the same rule the other
+                        // headers follow.
+                        let n = view.read(cx).rows();
+                        (n > 0).then(|| SharedString::from(n.to_string()))
+                    }
+                    _ => None,
+                };
                 let rows = match screen {
                     Screen::Stashes { view, .. } => view.read(cx).rows(),
                     _ => 0,

@@ -482,6 +482,18 @@ impl Branches {
         self.data.len()
     }
 
+    /// What the BRANCHES header counts: the pane's rows minus the group
+    /// headings — locals plus remotes, and detached HEAD's own row, which is
+    /// a ref the pane holds however it is named. Derived from the same
+    /// flattened rows the in-list labels' counts spell, so the header and the
+    /// groups cannot disagree.
+    pub fn count(&self) -> usize {
+        self.data
+            .iter()
+            .filter(|row| !matches!(row, Row::Heading { .. }))
+            .count()
+    }
+
     /// Who HEAD is, for anything outside this pane: the window's title strip
     /// reads this at most once per frame. Cloned rather than borrowed because
     /// readers sit across an entity boundary; it is one small struct.
