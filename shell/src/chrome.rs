@@ -195,7 +195,7 @@ fn keycap(host: &Host, number: &str, focused: bool) -> Div {
         .border_1()
         .border_color(rgb(ink))
         .rounded(px(RADIUS))
-        .text_color(rgb(ink))
+        .text_color(rgb(digit))
         .child(SharedString::from(number.to_string()))
 }
 

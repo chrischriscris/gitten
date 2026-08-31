@@ -4721,9 +4721,7 @@ impl Render for DevShell {
                             Notice::Question(text) => (text.as_str().into(), c.error),
                         })
                     })
-                    .or_else(|| {
-                        running.map(|n| (n.into(), host.theme.dim_on(theme::Surface::Status)))
-                    });
+                    .or_else(|| running.map(|n| (n, host.theme.dim_on(theme::Surface::Status))));
                 let badge: SharedString = match self.input.is_some() {
                     true => "PROMPT".into(),
                     false => which.to_uppercase().into(),
