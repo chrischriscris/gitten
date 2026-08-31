@@ -11,7 +11,7 @@
 //! modal anywhere in the window yet.
 
 use super::{accept_deferred_scroll, DeferredScrollbar, PendingScroll};
-use crate::chrome::{list_row, ROW_PAD};
+use crate::chrome::{empty_line, list_row};
 use crate::graph::ROW_H;
 use gitten_core::host::Host;
 use gitten_core::refs::Stash;
@@ -205,7 +205,9 @@ impl Stashes {
         self.scroll.0.borrow().base_handle.bounds()
     }
 
-    /// Nothing off the left edge to reach — messages truncate rather than pan.
+    /// Nothing off the left edge to reach — a squeezed message ends in an
+    /// ellipsis rather than pan. Present so the wheel routing can offer the
+    /// axis to every screen alike.
     pub fn pan_pixels(&self, _dx: f32) -> bool {
         false
     }
@@ -370,23 +372,11 @@ const GAP_CHARS: f32 = 1.5;
 
 impl Render for Stashes {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let host = crate::config::host(cx);
-        let c = host.theme.chrome;
-        // An empty stack is a quiet line, not an empty box — the compact twin
-        // of the files pane's clean-tree line, sitting top-left because this
-        // pane is a short section of the sidebar, not a whole column.
-        if let Some(empty) = self.is_empty().then(|| {
-            div()
-                .size_full()
-                .pl(px(ROW_PAD))
-                .pt_2()
-                .flex()
-                .items_start()
-                .text_color(rgb(host.theme.quiet_on(c.bg)))
-                .child("nothing stashed")
-                .into_any_element()
-        }) {
-            return empty;
+        // An empty stack is a quiet line, not an empty box —
+        // [`chrome::empty_line`], the compact twin of the files pane's
+        // clean-tree sentence.
+        if self.is_empty() {
+            return empty_line(&crate::config::host(cx), "nothing stashed".into());
         }
 
         let data = self.data.clone();
@@ -456,10 +446,13 @@ fn row(e: &Row, host: &Host, current: bool, focused: bool, armed: bool) -> AnyEl
         )
         .child(
             div()
-                .flex_none()
                 .ml(px(GAP_CHARS * ch))
+                // The one thing that gives: `min_w_0` and `truncate` let a long
+                // message end in an ellipsis rather than shove itself out of
+                // the pane — the rule the branches pane's names already run.
+                // The address beside it is `flex_none` and never moves.
                 .min_w_0()
-                .whitespace_nowrap()
+                .truncate()
                 .text_color(rgb(match armed {
                     true => c.error,
                     false => c.fg,

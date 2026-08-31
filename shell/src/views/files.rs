@@ -12,7 +12,7 @@
 //! strings so the render path allocates nothing per frame.
 
 use super::{accept_deferred_scroll, DeferredScrollbar, PendingScroll};
-use crate::chrome::{list_row, path_spans, section_label, ROW_PAD};
+use crate::chrome::{empty_line, list_row, path_spans, section_label};
 use crate::graph::ROW_H;
 use gitten_core::host::Host;
 use gitten_core::status::{Change, ConflictKind, PathBytes, Status};
@@ -495,8 +495,10 @@ impl Files {
         self.scroll.0.borrow().base_handle.bounds()
     }
 
-    /// Nothing off the left edge to reach — paths truncate rather than pan.
-    /// Present so the wheel routing can offer the axis to every screen alike.
+    /// Nothing off the left edge to reach — a squeezed path ends in an
+    /// ellipsis (the directory's head gives; [`crate::chrome::path_spans`]
+    /// keeps the filename) rather than pan. Present so the wheel routing can
+    /// offer the axis to every screen alike.
     pub fn pan_pixels(&self, _dx: f32) -> bool {
         false
     }
@@ -715,25 +717,11 @@ const GAP_CHARS: f32 = 1.5;
 
 impl Render for Files {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let host = crate::config::host(cx);
-        let c = host.theme.chrome;
-        // A clean tree is a quiet line, not an empty box: this pane is a short
-        // section of the sidebar now, not a whole column, so the answer sits
-        // top-left where a reader scans and not centred where nobody looks.
-        // A sentence someone looks for — through `quiet_on`, because raw
-        // `faint` is 2.05:1 here and "quiet" was reading as "absent".
-        if let Some(empty) = self.is_clean().then(|| {
-            div()
-                .size_full()
-                .pl(px(ROW_PAD))
-                .pt_2()
-                .flex()
-                .items_start()
-                .text_color(rgb(host.theme.quiet_on(c.bg)))
-                .child("working tree clean")
-                .into_any_element()
-        }) {
-            return empty;
+        // A clean tree is a quiet line, not an empty box: [`chrome::empty_line`]
+        // sits top-left where a reader scans, and the sentence is shared with
+        // the stashes and branches panes so one blank pane means one thing.
+        if self.is_clean() {
+            return empty_line(&crate::config::host(cx), "working tree clean".into());
         }
 
         let data = self.data.clone();
@@ -807,7 +795,13 @@ fn row(e: &Entry, host: &Host, current: bool, focused: bool, armed: bool) -> Any
             .child(
                 div()
                     .flex_none()
-                    .w(px(STATUS_CHARS * ch))
+                    // One character of air *inside* the column — the gap is
+                    // part of it, the way commits.rs sizes WHO_CHARS — so a
+                    // conflict's `UU`, the widest pair git puts here, does
+                    // not weld itself to the path it belongs to. Single
+                    // letters keep the air they had by accident; now every
+                    // state has it by rule.
+                    .w(px((STATUS_CHARS + 1.0) * ch))
                     // The error colour is already this palette's "this row
                     // ends work" foreground — conflicts draw their letters
                     // with it — so the armed tint spends nothing new.
@@ -818,7 +812,11 @@ fn row(e: &Entry, host: &Host, current: bool, focused: bool, armed: bool) -> Any
                     .child(SharedString::from(f.letters)),
             )
             .child(
-                div().flex_none().min_w_0().child(match armed {
+                // No `flex_none` here: the path is the one thing that gives —
+                // [`path_spans`] shrinks the directory's head under a squeezed
+                // row — and a `flex_none` wrapper would refuse to shrink and
+                // pin the whole row wide.
+                div().min_w_0().child(match armed {
                     // The question repaints the whole path; unarmed, the
                     // directory is dim and the name keeps the row's ink.
                     true => div()

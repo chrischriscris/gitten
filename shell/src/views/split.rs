@@ -58,7 +58,7 @@ use gitten_core::host::Host;
 use gitten_core::runs::surfaces;
 use gitten_core::select::Selected;
 use gitten_core::syntax::Token;
-use gitten_core::theme::{Surface, Theme};
+use gitten_core::theme::{Rgb, Surface, Theme};
 use gitten_core::wrap::{Wrap, Wrapped};
 use gitten_core::{LineKind, Span};
 use gpui::*;
@@ -461,13 +461,29 @@ impl Rows for SplitRows {
                 // same rule every presentation runs, so the bar and the wash
                 // cannot be decided twice.
                 let bg = row_background(state.current, theme.chrome.bg, theme);
+                // The page padding is *inside* the row's colour, not beside it:
+                // the two pads carry the halves' own backgrounds (read once, in
+                // [`Self::side_bg`], the same values the cells paint), so a run
+                // of additions reaches both edges like the unified layout and
+                // toggling `s` does not change whether a hunk reads as a block
+                // or as a striped column. The widths are the old geometry to
+                // the pixel — `bar + left pad = PAD`, right pad = `PAD` — so
+                // `cell_px` and the hit test, which both divide clicks assuming
+                // text starts at `PAD`, do not move.
+                let old_bg = self.side_bg(*old, seg, state, theme);
+                let new_bg = self.side_bg(*new, seg, state, theme);
                 row_frame()
                     .items_center()
-                    .px(px(PAD))
                     .border_l(px(ROW_BAR))
                     .border_color(rgb(row_bar(state, bg, theme)))
-                    .pl(px(PAD - ROW_BAR))
                     .bg(rgb(bg))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(PAD - ROW_BAR))
+                            .h(px(ROW_H))
+                            .bg(rgb(old_bg)),
+                    )
                     .child(self.cell(
                         *old,
                         seg,
@@ -501,6 +517,7 @@ impl Rows for SplitRows {
                         index,
                         cell,
                     ))
+                    .child(div().flex_none().w(px(PAD)).h(px(ROW_H)).bg(rgb(new_bg)))
                     .into_any_element()
             }
         }
@@ -547,6 +564,21 @@ impl SplitRows {
         line.filter(|i| seg < self.wrapped.rows(*i as usize))
     }
 
+    /// The background one side of a pair paints: the line kind's, or the
+    /// absent hole's, under the cursor rule every presentation shares. Read
+    /// where the row frame is built as well as in [`Self::cell`] — the pads
+    /// flanking the two cells carry the same colour the cells do, so a run of
+    /// additions reads as a block to both edges and not as a striped column
+    /// between two strips of chrome.
+    fn side_bg(&self, line: Option<u32>, seg: usize, state: RowState, theme: &Theme) -> Rgb {
+        let p = &theme.diff;
+        let base = match self.present(line, seg) {
+            None => p.absent_bg,
+            Some(i) => line_colors(self.lines[i as usize].kind, self.lines[i as usize].moved, p).0,
+        };
+        super::diff::row_background(state.current, base, theme)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn cell(
         &self,
@@ -569,16 +601,18 @@ impl SplitRows {
             // Nothing opposite: a flat, darker block, so a run of them reads as
             // a hole in the column rather than as unchanged content. The
             // keyboard's bar runs across it too, so the cursor reads as one bar.
-            let bg = super::diff::row_background(state.current, p.absent_bg, theme);
+            let bg = self.side_bg(line, seg, state, theme);
             return cell_frame(width)
                 .debug_selector(move || format!("cell-{}-{row}", column.name()))
                 .bg(rgb(bg))
                 .into_any_element();
         };
         let line = &self.lines[index as usize];
-        let (bg, fg, sign) = line_colors(line.kind, line.moved, p);
-        // The keyboard's row, on this side and on the other: one bar, not two.
-        let bg = super::diff::row_background(state.current, bg, theme);
+        // The keyboard's row, on this side and on the other: one bar, not two
+        // — and the same `side_bg` the frame's pads read, so a cell and the
+        // pad beside it can never disagree.
+        let bg = self.side_bg(Some(index), seg, state, theme);
+        let (_, fg, sign) = line_colors(line.kind, line.moved, p);
         // The same substitution the unified view makes: the row paints the
         // wash over whatever the line was, so a number resolved for the line
         // kind was resolved against a background it never lands on.

@@ -109,8 +109,15 @@ pub fn section_label(host: &Host, text: SharedString, count: Option<SharedString
 /// cut, by [`gitten_core::path::split_dir_name`] at flatten or prepare, so
 /// the files pane, the title strip and the diff header agree on where the
 /// filename starts and the render path clones two refcounts instead of
-/// cutting and copying a string per visible row per frame. Two `flex_none`
-/// spans in one row and no wrapping, because a path is one word to the eye.
+/// cutting and copying a string per visible row per frame. No wrapping,
+/// because a path is one word to the eye.
+///
+/// When the row is too narrow for the whole path the **directory's head
+/// gives and the filename never does** — `min_w_0` and `flex_shrink` let the
+/// dim half shrink under a squeezed row, `text_ellipsis_start` leaves
+/// `…views/diff.rs` and not `src/views/d…`. A forty-file list is scanned by
+/// name; a path that clipped at its right edge would throw away the one
+/// part being scanned.
 pub fn path_spans(
     host: &Host,
     dir: SharedString,
@@ -121,17 +128,41 @@ pub fn path_spans(
     div()
         .flex()
         .items_center()
+        .min_w_0()
         .whitespace_nowrap()
         // The directory is read as a path — raw dim is under the text floor on
         // the title strips it lands on and on a selected row, so it resolves
         // against the surface the caller paints.
         .child(
             div()
-                .flex_none()
+                .min_w_0()
+                .flex_shrink(1.0)
+                .overflow_hidden()
+                .text_ellipsis_start()
                 .text_color(rgb(host.theme.dim_on(surface)))
                 .child(dir),
         )
         .child(div().flex_none().text_color(rgb(bright)).child(name))
+}
+
+/// An empty pane's answer: one quiet faint line, top-left, where a reader
+/// scans — a quiet line, not an empty box, and never a sentence centred in a
+/// pane where no row ever sits. Shared here because three sidebar panes had
+/// drifted into near-identical copies of the same twelve lines, and one blank
+/// pane must not mean three different things.
+pub fn empty_line(host: &Host, text: SharedString) -> AnyElement {
+    let c = host.theme.chrome;
+    div()
+        .size_full()
+        .pl(px(ROW_PAD))
+        .pt_2()
+        .flex()
+        .items_start()
+        // A sentence someone looks for: through `quiet_on`, because raw
+        // `faint` is 2.05:1 here and that is not a sentence, it is a gap.
+        .text_color(rgb(host.theme.quiet_on(c.bg)))
+        .child(text)
+        .into_any_element()
 }
 
 /// The keycap a pane header starts with: the number of the key that focuses
@@ -164,7 +195,7 @@ fn keycap(host: &Host, number: &str, focused: bool) -> Div {
         .border_1()
         .border_color(rgb(ink))
         .rounded(px(RADIUS))
-        .text_color(rgb(ink))
+        .text_color(rgb(digit))
         .child(SharedString::from(number.to_string()))
 }
 
@@ -228,6 +259,14 @@ pub fn pane_header_with(
         .gap_2()
         .h(px(HEADER_H))
         .relative()
+        // Nothing paints outside the strip, ever. The right-edge furniture is
+        // `flex_none` after a name that only lately learned to shrink; a deep
+        // path used to be able to push `hunk 2/7` — the answer to "which hunk
+        // will space stage" — clean out of the window, where no amount of
+        // looking would find it. Clipping keeps the loss at the edge, where a
+        // squeezed [`path_spans`] gives the directory's head up long before
+        // anything gets this far.
+        .overflow_hidden()
         .px_2()
         .border_b_1()
         .border_color(rgb(c.border))
@@ -248,7 +287,14 @@ pub fn pane_header_with(
                 })),
         )
         .child(keycap(host, number, focused))
-        .child(div().flex_none().child(name))
+        // `min_w_0` and not `flex_none`: the one header whose name is a path
+        // — the diff pane's, through [`path_spans`] — has to be able to give
+        // its directory's head up when the right-edge furniture crowds it. A
+        // `flex_none` wrapper would pin the path at full width and let the
+        // overflow clip at the strip instead, which is the loss this pane
+        // exists not to make. Plain word names never overflow and never
+        // notice the difference.
+        .child(div().min_w_0().child(name))
         // Everything after the name is right-edge furniture.
         .child(div().min_w_0().flex_grow(1.0))
         .children(count.map(|count| {

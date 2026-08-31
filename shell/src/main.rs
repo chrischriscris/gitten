@@ -4406,8 +4406,11 @@ impl Render for DevShell {
                     None => (None, None, None),
                 };
                 // File path, then the counts, then the subject last and
-                // shrinking: the path is the one thing that must not
-                // truncate, and the eye finds counts at the right edge.
+                // shrinking: the counts are `flex_none` and the eye finds
+                // them at the right edge, the subject gives whole, and the
+                // path — [`chrome::path_spans`] — gives only its directory's
+                // head. The filename is the one part of this strip that
+                // never truncates.
                 let right = div()
                     .min_w_0()
                     .flex()
@@ -4718,9 +4721,7 @@ impl Render for DevShell {
                             Notice::Question(text) => (text.as_str().into(), c.error),
                         })
                     })
-                    .or_else(|| {
-                        running.map(|n| (n.into(), host.theme.dim_on(theme::Surface::Status)))
-                    });
+                    .or_else(|| running.map(|n| (n, host.theme.dim_on(theme::Surface::Status))));
                 let badge: SharedString = match self.input.is_some() {
                     true => "PROMPT".into(),
                     false => which.to_uppercase().into(),
