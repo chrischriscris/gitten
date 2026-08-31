@@ -809,7 +809,13 @@ fn row(e: &Entry, host: &Host, current: bool, focused: bool, armed: bool) -> Any
             .child(
                 div()
                     .flex_none()
-                    .w(px(STATUS_CHARS * ch))
+                    // One character of air *inside* the column — the gap is
+                    // part of it, the way commits.rs sizes WHO_CHARS — so a
+                    // conflict's `UU`, the widest pair git puts here, does
+                    // not weld itself to the path it belongs to. Single
+                    // letters keep the air they had by accident; now every
+                    // state has it by rule.
+                    .w(px((STATUS_CHARS + 1.0) * ch))
                     // The error colour is already this palette's "this row
                     // ends work" foreground — conflicts draw their letters
                     // with it — so the armed tint spends nothing new.
