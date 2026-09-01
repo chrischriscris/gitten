@@ -379,6 +379,16 @@ pub(crate) struct Prepared {
 /// any cursor move, wheel or refresh drops the arm.
 pub struct Branches {
     data: Rc<Vec<Row>>,
+    /// Rows the list draws right now: indices into `data`, ascending.
+    /// Identity until a query filters it, rebuilt only when the query
+    /// changes — never per frame — which is why the full vector is kept
+    /// and this is all the list draws from.
+    visible: Rc<Vec<usize>>,
+    /// The live filter, as the prompt last left it. `None` — or an empty
+    /// string, which [`Branches::apply_query`] folds into `None` — is
+    /// every row; kept so a second `/` edits the query rather than
+    /// starting over, and so clearing restores in one keystroke.
+    filter: Option<String>,
     scroll: UniformListScrollHandle,
     /// The cursor, the top row and the height — [`Viewport`], the same model
     /// every other list holds.
@@ -411,11 +421,21 @@ pub struct Branches {
 /// and `G` from resting on a `REMOTE` heading with an empty group under it.
 /// `dir` is the sign of the move; zero counts as forward.
 fn settle(rows: &[Row], at: usize, dir: isize) -> usize {
-    let heading = |i: usize| matches!(rows.get(i), Some(Row::Heading { .. }));
+    settle_by(
+        rows.len(),
+        |i| matches!(rows.get(i), Some(Row::Heading { .. })),
+        at,
+        dir,
+    )
+}
+
+/// [`settle`] with the heading test lifted out, so the shown-space walk
+/// below can run the same rule in the space the cursor addresses.
+fn settle_by(len: usize, heading: impl Fn(usize) -> bool, at: usize, dir: isize) -> usize {
     if !heading(at) {
         return at;
     }
-    let forward = (at + 1..rows.len()).find(|&i| !heading(i));
+    let forward = (at + 1..len).find(|&i| !heading(i));
     let back = (0..at).rev().find(|&i| !heading(i));
     match dir.is_negative() {
         false => forward.or(back),
@@ -424,11 +444,62 @@ fn settle(rows: &[Row], at: usize, dir: isize) -> usize {
     .unwrap_or(at)
 }
 
+/// [`settle`] over the shown rows: the same walk, in the space the cursor
+/// addresses — a heading survives a filter only when its group under it
+/// does, and the keyboard never rests on one either way.
+fn settle_shown(rows: &[Row], visible: &[usize], at: usize, dir: isize) -> usize {
+    settle_by(
+        visible.len(),
+        |i| {
+            visible
+                .get(i)
+                .is_some_and(|&d| matches!(rows.get(d), Some(Row::Heading { .. })))
+        },
+        at,
+        dir,
+    )
+}
+
+/// The one matcher, where the rows live: a query matches when the row's
+/// text contains it, folded — exactly what the commit list's search does.
+fn matches(haystack: &str, needle: &str) -> bool {
+    haystack.to_lowercase().contains(&needle.to_lowercase())
+}
+
+/// The rows a query keeps, as indices into `rows`: a branch whose name
+/// matches — a local's display name, a remote's `origin/main` — plus the
+/// heading of every group that still has a row under it, exactly the rows
+/// an empty group drops at flatten. A detached HEAD is a place, not a
+/// branch name; it shows unfiltered and a branch query says nothing
+/// about it.
+fn search_rows(rows: &[Row], query: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut pending_heading = None;
+    for (i, row) in rows.iter().enumerate() {
+        let kept = match row {
+            Row::Heading { section, .. } => {
+                pending_heading = Some((i, *section));
+                continue;
+            }
+            Row::Local(l) => matches(l.name_text.as_ref(), query),
+            Row::Remote(r) => matches(r.label.as_ref(), query),
+            Row::Detached { .. } => false,
+        };
+        if kept {
+            if let Some((h, _)) = pending_heading.take() {
+                out.push(h);
+            }
+            out.push(i);
+        }
+    }
+    out
+}
+
 impl Branches {
     /// The viewport model with everything live folded in.
     fn live_view(&self, host: &Host) -> Viewport {
         let mut v = self.view.get();
-        v.set_len(self.data.len());
+        v.set_len(self.visible.len());
         v.set_height(self.rendered.get());
         v.set_scrolloff(host.view.scrolloff);
         v
@@ -447,13 +518,16 @@ impl Branches {
 
     pub(crate) fn from_prepared(prepared: Prepared) -> Self {
         let Prepared { rows, head, .. } = prepared;
+        let visible = Rc::new(Vec::from_iter(0..rows.len()));
         // Row zero is usually the `LOCAL` heading; the keyboard starts on
         // the first branch under it instead.
         let mut view = Viewport::new();
-        view.set_len(rows.len());
+        view.set_len(visible.len());
         view.go_to(settle(&rows, 0, 1));
         Self {
             data: Rc::new(rows),
+            visible,
+            filter: None,
             scroll: UniformListScrollHandle::new(),
             view: Rc::new(Cell::new(view)),
             synced: Rc::new(Cell::new(0.0)),
@@ -476,17 +550,18 @@ impl Branches {
     pub(crate) fn row_slice(&self) -> &[Row] {
         &self.data
     }
-
-    /// How many rows the list draws — what sizes this pane's sidebar section.
+    /// How many rows the list draws — the shown ones, a query having
+    /// narrowed the loaded set without replacing it. What sizes this
+    /// pane's sidebar section.
     pub fn rows(&self) -> usize {
-        self.data.len()
+        self.visible.len()
     }
 
-    /// What the BRANCHES header counts: the pane's rows minus the group
+    /// What the BRANCHES header counts: the loaded rows minus the group
     /// headings — locals plus remotes, and detached HEAD's own row, which is
-    /// a ref the pane holds however it is named. Derived from the same
-    /// flattened rows the in-list labels' counts spell, so the header and the
-    /// groups cannot disagree.
+    /// a ref the pane holds however it is named. A query narrows what is
+    /// *shown*; this stays what the repository holds — see [`filter_note`]
+    /// for the shown count while one stands.
     pub fn count(&self) -> usize {
         self.data
             .iter()
@@ -494,13 +569,10 @@ impl Branches {
             .count()
     }
 
-    /// Who HEAD is, for anything outside this pane: the window's title strip
-    /// reads this at most once per frame. Cloned rather than borrowed because
-    /// readers sit across an entity boundary; it is one small struct.
-    pub fn head_info(&self) -> Option<HeadInfo> {
-        self.head.clone()
+    /// The live query, for pre-filling an edit of it. Empty means none.
+    pub fn query(&self) -> Option<&str> {
+        self.filter.as_deref()
     }
-
     pub(crate) fn replace_prepared(&mut self, prepared: Prepared, host: &Host) {
         // A refresh is the repository saying things moved; an armed delete
         // was a promise about how they were, so it dies here first.
@@ -509,31 +581,44 @@ impl Branches {
         let old = self.view.get();
         // Only a branch anchors, and on what a verb aims at — the bytes. A
         // heading is a fact about the last refresh's grouping, not a thing
-        // the eye was reading.
-        let anchored = self.data.get(old.cursor()).and_then(row_target);
+        // the eye was reading. The cursor addresses the *shown* rows, so the
+        // anchor is read through the visible index.
+        let anchored = self
+            .visible
+            .get(old.cursor())
+            .and_then(|&d| self.data.get(d))
+            .and_then(row_target);
         let Prepared { rows, head, .. } = prepared;
         self.head = head;
         self.data = Rc::new(rows);
+        // The new rows under the *current* query — a refresh must not drop
+        // the filter the user is looking through, and the anchor below is
+        // found in this space, not in the full list's.
+        self.visible = Rc::new(match &self.filter {
+            Some(q) => search_rows(&self.data, q),
+            None => Vec::from_iter(0..self.data.len()),
+        });
 
         let cursor = anchored
             .and_then(|target| {
-                self.data
+                self.visible
                     .iter()
-                    .position(|r| row_target(r).is_some_and(|t| t == target))
+                    .position(|&d| row_target(&self.data[d]).is_some_and(|t| t == target))
             })
             .unwrap_or(old.cursor());
         let mut view = old;
-        view.set_len(self.data.len());
+        view.set_len(self.visible.len());
         // A refresh that lands the cursor on a heading — the branch it was
         // on is gone — steps forward, the way a fresh open does.
-        view.go_to(settle(
+        view.go_to(settle_shown(
             &self.data,
-            cursor.min(self.data.len().saturating_sub(1)),
+            &self.visible,
+            cursor.min(self.visible.len().saturating_sub(1)),
             1,
         ));
         self.view.set(view);
 
-        if self.data.is_empty() {
+        if self.visible.is_empty() {
             self.pending_scroll.cancel();
             let mut state = self.scroll.0.borrow_mut();
             state.deferred_scroll_to_item = None;
@@ -542,6 +627,101 @@ impl Branches {
         } else {
             self.defer_show(view);
         }
+    }
+
+    /// Sets the filter — once per keystroke, and never anywhere else. The
+    /// visible-index vec is rebuilt here and read everywhere else.
+    ///
+    /// The keyboard stays on the same branch it was on: anchored by the row's
+    /// verb target into the next result set wherever that branch survives the
+    /// narrower query, clamped to a neighbouring row when it does not. An
+    /// empty query (a trimmed-empty one too) is no query: identity indices,
+    /// so clearing restores exactly what was on screen before.
+    ///
+    /// A strict deferred scroll parks the viewport the way every other jump
+    /// does — the list's geometry still describes the previous length until
+    /// the next prepaint, and writing an offset against it would clamp in
+    /// the wrong place.
+    pub fn apply_query(&mut self, query: &str) {
+        let next = Some(query.trim()).filter(|q| !q.is_empty());
+        if self.filter.as_deref() == next {
+            return;
+        }
+        // A changed filter can move the cursor by clamping, and a question
+        // aimed at yesterday's row is the thing the arm exists to prevent.
+        self.armed = None;
+        // Anchor first, named by the verb target like every other re-anchor
+        // in this file, because row numbers are about to stop meaning
+        // anything.
+        let anchored = self
+            .visible
+            .get(self.view.get().cursor())
+            .and_then(|&d| self.data.get(d))
+            .and_then(row_target);
+
+        self.filter = next.map(str::to_string);
+        self.visible = Rc::new(match &self.filter {
+            Some(q) => search_rows(&self.data, q),
+            None => Vec::from_iter(0..self.data.len()),
+        });
+
+        let mut view = self.view.get();
+        let cursor = anchored
+            .as_ref()
+            .and_then(|target| {
+                self.visible
+                    .iter()
+                    .position(|&d| row_target(&self.data[d]).as_ref() == Some(target))
+            })
+            .unwrap_or_else(|| view.cursor().min(self.visible.len().saturating_sub(1)));
+        view.set_len(self.visible.len());
+        // A filter that lands the cursor on a heading — the branch it was on
+        // is gone — steps forward, the way a fresh open does.
+        view.go_to(settle_shown(
+            &self.data,
+            &self.visible,
+            cursor.min(self.visible.len().saturating_sub(1)),
+            1,
+        ));
+        self.view.set(view);
+        if self.visible.is_empty() {
+            // Nothing survives the query; park nothing and leave no stale
+            // offset for a later keystroke to reconcile against.
+            self.pending_scroll.cancel();
+            let mut state = self.scroll.0.borrow_mut();
+            state.deferred_scroll_to_item = None;
+            state.base_handle.set_offset(point(px(0.0), px(0.0)));
+            self.synced.set(0.0);
+        } else {
+            self.defer_show(view);
+        }
+    }
+    /// What the pane's label appends while filtered: shown over loaded —
+    /// `"1/3"`, counting the refs and not the group headings, which are
+    /// furniture the query did not ask about. `None` unfiltered — the
+    /// header then stays exactly what acquisition named it.
+    pub fn filter_note(&self) -> Option<String> {
+        let refs = |rows: &[Row]| {
+            rows.iter()
+                .filter(|r| !matches!(r, Row::Heading { .. }))
+                .count()
+        };
+        self.filter.is_some().then(|| {
+            let shown = self
+                .visible
+                .iter()
+                .filter_map(|&d| self.data.get(d))
+                .filter(|r| !matches!(r, Row::Heading { .. }))
+                .count();
+            format!("{shown}/{}", refs(&self.data))
+        })
+    }
+
+    /// Who HEAD is, for anything outside this pane: the window's title strip
+    /// reads this at most once per frame. Cloned rather than borrowed because
+    /// readers sit across an entity boundary; it is one small struct.
+    pub fn head_info(&self) -> Option<HeadInfo> {
+        self.head.clone()
     }
 
     // -------------------------------------------------------------- commands
@@ -662,7 +842,7 @@ impl Branches {
             "view.left" | "view.right" => return true,
             _ => return false,
         };
-        let settled = settle(&self.data, v.cursor(), dir);
+        let settled = settle_shown(&self.data, &self.visible, v.cursor(), dir);
         if settled != v.cursor() {
             v.go_to(settled);
         }
@@ -682,7 +862,7 @@ impl Branches {
         self.reconcile(host);
         let mut v = self.live_view(host);
         v.go_to(index);
-        let settled = settle(&self.data, v.cursor(), 1);
+        let settled = settle_shown(&self.data, &self.visible, v.cursor(), 1);
         if settled != v.cursor() {
             v.go_to(settled);
         }
@@ -715,7 +895,8 @@ impl Branches {
     /// What the keyboard is on, as verbs aim at it. `None` on a heading or
     /// in an empty pane.
     pub(crate) fn current(&self) -> Option<Target> {
-        row_target(self.data.get(self.view.get().cursor())?)
+        let shown = *self.visible.get(self.view.get().cursor())?;
+        row_target(self.data.get(shown)?)
     }
 
     /// Arms — or confirms — a delete of this exact target. First call asks
@@ -793,31 +974,33 @@ impl Render for Branches {
         if self.is_empty() {
             return chrome::empty_line(&crate::config::host(cx), "no branches yet".into());
         }
-
         let data = self.data.clone();
+        let visible = self.visible.clone();
         let rendered = self.rendered.clone();
         let view = self.view.clone();
         let scroll = self.scroll.clone();
         let synced = self.synced.clone();
         let pending_scroll = self.pending_scroll.clone();
-        // The row an armed delete is waiting on, found once per frame — the
-        // tint is a property of the question, not of the draw.
+        // The row an armed delete is waiting on, found once per frame in the
+        // *shown* rows — the cursor's space — the tint a property of the
+        // question, not of the draw.
         let armed = self.armed.as_ref().and_then(|target| {
-            data.iter()
-                .position(|r| row_target(r).as_ref() == Some(target))
+            visible
+                .iter()
+                .position(|&d| row_target(&data[d]).as_ref() == Some(target))
         });
         let focused = self.focused;
         // A click on a row is the keyboard coming back — see [`Self::select_row`].
         // Built as a plain handle, not `cx.listener`: the rows are drawn in the
         // list's closure over `&mut App`, where no listener can be minted.
         let this = cx.entity().downgrade();
-        let list = uniform_list("branches", data.len(), move |range, _, cx| {
+        let list = uniform_list("branches", visible.len(), move |range, _, cx| {
             rendered.set(range.len());
             let host = crate::config::host(cx);
             if let Some(accepted) = accept_deferred_scroll(&scroll, &pending_scroll, &synced) {
                 if accepted.wheeled {
                     let mut v = view.get();
-                    v.set_len(data.len());
+                    v.set_len(visible.len());
                     v.set_height(range.len());
                     v.set_scrolloff(host.view.scrolloff);
                     v.scroll_to((-accepted.y / ROW_H).round().max(0.0) as usize);
@@ -828,8 +1011,14 @@ impl Render for Branches {
             let cursor = view.get().cursor();
             range
                 .map(|i| {
-                    let r = row(&data[i], &host, i == cursor, focused, Some(i) == armed);
-                    if row_target(&data[i]).is_some() {
+                    let r = row(
+                        &data[visible[i]],
+                        &host,
+                        i == cursor,
+                        focused,
+                        Some(i) == armed,
+                    );
+                    if row_target(&data[visible[i]]).is_some() {
                         let this = this.clone();
                         return r
                             .id(("row", i))
@@ -974,6 +1163,7 @@ mod tests {
     use gitten_core::host::Host;
     use gitten_core::refs::{Branch, HeadState, RefName, RemoteBranch, Upstream};
     use gitten_core::theme::Theme;
+    use std::rc::Rc;
 
     /// A full-length OID-looking commit id, for shapes rather than values.
     fn sha() -> String {
@@ -1541,6 +1731,65 @@ mod tests {
 
     fn at(b: &Branches) -> usize {
         b.view.get().cursor()
+    }
+
+    // -------------------------------------------------------------- search
+
+    #[test]
+    fn a_query_filters_live_and_the_keyboard_stays_on_its_branch() {
+        let (mut b, _host) = pane();
+        // The keyboard opens on `a` — a name that survives "A", folded, and
+        let anchored = b.current().expect("a branch under the keyboard");
+
+        b.apply_query("  A  ");
+        let v = b.view.get();
+        assert_eq!(
+            v.len(),
+            4,
+            "the two matches plus the two headings of their groups"
+        );
+        assert_eq!(b.filter_note().as_deref(), Some("2/3"));
+        assert_eq!(b.rows(), 4);
+        assert_eq!(
+            b.count(),
+            3,
+            "the filter narrows what is shown, never what is loaded"
+        );
+        // Through the indirection: `current` is the anchored branch, not
+        // whatever now happens to sit at row 1 of a shorter list.
+        assert_eq!(b.current().as_ref(), Some(&anchored));
+
+        // The same query again is no change at all — and rebuilds nothing.
+        let before = Rc::as_ptr(&b.visible);
+        b.apply_query("A ");
+        assert_eq!(b.query(), Some("A"), "trimmed before comparing");
+        assert_eq!(
+            Rc::as_ptr(&b.visible),
+            before,
+            "a no-op query did not rebuild the index"
+        );
+
+        // A changed filter is a movement of attention: the keyboard clamps
+        // into what survives, and an armed delete dies with the question's
+        // row.
+        assert!(!b.confirm_or_arm_delete(&anchored));
+        b.apply_query("nothing matches this");
+        let v = b.view.get();
+        assert_eq!(v.len(), 0);
+        assert!(b.current().is_none());
+        assert_eq!(b.filter_note().as_deref(), Some("0/3"));
+        assert_eq!(b.armed_row(), None, "a changed query disarmed");
+
+        // Clearing puts every row back under the same branch.
+        b.apply_query("");
+        assert_eq!(b.rows(), 5);
+        assert_eq!(b.query(), None);
+        assert_eq!(b.filter_note(), None);
+        assert_eq!(
+            b.current().as_ref(),
+            Some(&anchored),
+            "empty restores instantly, cursor included"
+        );
     }
 
     #[test]
