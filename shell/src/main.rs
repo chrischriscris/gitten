@@ -106,6 +106,14 @@ const CHIP_H: f32 = 22.0;
 /// is the least a list can show and still be seen to scroll.
 const SECTION_MIN_H: f32 = chrome::HEADER_H + 2.0 * graph::ROW_H;
 
+/// The shortest window that keeps its promise: five stacked sections at
+/// their [`SECTION_MIN_H`] floor — the three content-sized panes, the commit
+/// list and the stash — plus the title strip and the status bar that bracket
+/// them. The arithmetic is the documentation: below this, the declared
+/// minimum would let the layout silently clip sections it still owes their
+/// floors.
+const WINDOW_MIN_H: f32 = 5.0 * SECTION_MIN_H + TITLE_H + chrome::STATUS_H;
+
 /// A sidebar section's natural height: its header plus one row per line it
 /// draws, with a floor of one row for the empty state's line ("working tree
 /// clean", "nothing stashed"). Arithmetic and not measurement, because a view
@@ -5517,7 +5525,9 @@ fn started_title(view: View, label: &str) -> String {
 ///
 /// A minimum size, because there is no useful window narrower than its own
 /// gutters — the diff view's wrap budget bottoms out at eight characters and
-/// says so, and this is the other end of the same argument.
+/// says so — and the height is [`WINDOW_MIN_H`], because five stacked
+/// sections' floors plus the two strips are more than any smaller number
+/// admits, and a minimum that clips a floor is a promise the layout breaks.
 fn window_options(title: SharedString) -> WindowOptions {
     WindowOptions {
         titlebar: Some(TitlebarOptions {
@@ -5525,7 +5535,7 @@ fn window_options(title: SharedString) -> WindowOptions {
             appears_transparent: true,
             traffic_light_position: Some(point(px(LIGHTS_X), px((TITLE_H - 12.0) / 2.0))),
         }),
-        window_min_size: Some(size(px(560.), px(320.))),
+        window_min_size: Some(size(px(560.), px(WINDOW_MIN_H))),
         ..Default::default()
     }
 }
@@ -10112,6 +10122,26 @@ mod title_tests {
             section_floor(40),
             SECTION_MIN_H,
             "a long list still squeezes to two rows"
+        );
+    }
+
+    #[test]
+    fn the_minimum_window_holds_every_sections_floor() {
+        // The same sum [`WINDOW_MIN_H`] spells, recomputed here from the
+        // parts it names — five stacked sections at their floor, plus the
+        // title strip and the status bar — so a floor or a strip that grows
+        // without the minimum following is caught here and not at a window
+        // that quietly clips.
+        let floors = 5.0 * SECTION_MIN_H + super::TITLE_H + crate::chrome::STATUS_H;
+        let options = super::window_options("test".into());
+        let Some(min) = options.window_min_size else {
+            panic!("the window declares no minimum size");
+        };
+        assert!(
+            min.height >= gpui::px(floors),
+            "the declared minimum ({}) clips a section floor ({})",
+            min.height,
+            gpui::px(floors)
         );
     }
 }
