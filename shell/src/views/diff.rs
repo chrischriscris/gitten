@@ -191,6 +191,13 @@ pub struct RowState {
     /// second press would destroy is named by its own colour and not only by
     /// the band above it.
     pub armed: bool,
+    /// The row is inside the hunk the keyboard is on — its header, its lines
+    /// and the rows a wrapped line spilled onto. The extent a hunk verb acts
+    /// on: the gutter's hairline marks it, row by row, so a hunk that starts
+    /// above the viewport is still shown. Computed against the hunk's span
+    /// once per frame; a row reads it as two integer compares — see
+    /// [`HunkExtent`].
+    pub in_hunk: bool,
 }
 
 /// Turns one file's diff into rows, and draws them.
@@ -298,6 +305,17 @@ pub trait Rows {
     /// what makes "the keyboard is not on a hunk" the honest answer from
     /// anything that draws no hunks — a rendered document, a graph.
     fn hunk_at(&self, _index: usize) -> Option<(&str, usize)> {
+        None
+    }
+
+    /// The logical rows the hunk under logical row `index` spans — its header
+    /// row through its last line, the same address [`Rows::hunk_at`] names but
+    /// as a range: what the extent mark and the armed tint are computed
+    /// against, once per frame, so a row reads its membership as integer
+    /// compares against a precomputed key and never a search apiece. The
+    /// default is none, which is what makes "no hunk, no extent" the honest
+    /// answer from anything that draws no hunks — a rendered document, a graph.
+    fn hunk_span(&self, _index: usize) -> Option<(u32, u32)> {
         None
     }
 
@@ -2093,6 +2111,17 @@ impl Render for Diff {
             let cursor = view.get().cursor();
             // Once per batch of rows, not once per row.
             let renderers = renderers.borrow();
+            // The keyboard's hunk and the armed one, as the rows address them:
+            // one presentation lookup each, per frame — a row then reads its
+            // extent and its arm as integer compares against the two ranges,
+            // and never a search apiece. `armed` keys the logical row the
+            // question was asked on — see [`Diff::confirm_or_arm_discard_hunk`]
+            // — and no cursor move has moved it, so the rows are the same ones
+            // the arm was spent on.
+            let extent = order
+                .get(cursor)
+                .and_then(|r| extent_of(&renderers, r.owner, r.index));
+            let armed_extent = armed.and_then(|(o, i)| extent_of(&renderers, o, i));
             range
                 .map(|i| {
                     let r = order[i];
@@ -2107,11 +2136,8 @@ impl Render for Diff {
                         RowState {
                             current: i == cursor,
                             focused,
-                            // Once per row, not once per frame: the arm keys
-                            // the row the keyboard was on — see
-                            // [`Diff::confirm_or_arm_discard_hunk`] — and no
-                            // cursor move has moved it.
-                            armed: armed_at(i, r.owner, armed),
+                            armed: armed_extent.is_some_and(|e| e.contains(r.owner, r.index)),
+                            in_hunk: extent.is_some_and(|e| e.contains(r.owner, r.index)),
                         },
                         shift,
                     )
@@ -2256,6 +2282,17 @@ impl HunkMap {
             None
         }
     }
+
+    /// The logical rows the hunk under `index` spans — first through last,
+    /// header included, [`HunkMap::at`]'s own answer as a range. What the
+    /// extent mark and the armed tint are computed against, once per frame:
+    /// a row then reads its membership as two integer compares against this
+    /// range and never a binary search apiece.
+    pub(crate) fn span(&self, index: usize) -> Option<(u32, u32)> {
+        let i = self.spans.partition_point(|s| s.start as usize <= index);
+        let s = self.spans.get(i.checked_sub(1)?)?;
+        (index < s.start as usize + s.rows as usize).then_some((s.start, s.start + s.rows))
+    }
 }
 
 /// The default presentation: one line of text per row, behind a line-number
@@ -2377,6 +2414,10 @@ impl Rows for TextRows {
         self.hunks.at(index)
     }
 
+    fn hunk_span(&self, index: usize) -> Option<(u32, u32)> {
+        self.hunks.span(index)
+    }
+
     /// Characters, not bytes, and after `trim_end`: a line of box drawing is a
     /// third as many columns as it is bytes, and whitespace at the end of a row
     /// is not ink. Both were wrong here in the direction of a scrollable width
@@ -2453,10 +2494,10 @@ impl Rows for TextRows {
         let p = &theme.diff;
         match &self.rows[index] {
             Row::File { path, adds, dels } => {
-                file_header(path, *adds, *dels, theme, sel, state.current, shift)
+                file_header(path, *adds, *dels, theme, sel, state, shift)
             }
 
-            Row::Hunk(header) => hunk_header(header, theme, sel, state.current, shift),
+            Row::Hunk(header) => hunk_header(header, theme, sel, state, shift),
 
             Row::Line {
                 kind,
@@ -2502,9 +2543,7 @@ impl Rows for TextRows {
                 // numbers are formatted into it and the run list swept into it,
                 // both copied out by the elements as they take them.
                 let mut sc = self.scratch.borrow_mut();
-                row_frame()
-                    .items_center()
-                    .px(px(PAD))
+                extent_line(row_frame().items_center().px(px(PAD)), state, bg, theme)
                     // The bar on every row, in the row's own background when
                     // the cursor is elsewhere: the padding gives back what the
                     // border takes, so the text starts where it started and a
@@ -2721,7 +2760,7 @@ pub(crate) fn file_header(
     dels: usize,
     theme: &Theme,
     sel: Option<Selected>,
-    current: bool,
+    state: RowState,
     shift: f32,
 ) -> AnyElement {
     let p = &theme.diff;
@@ -2729,12 +2768,12 @@ pub(crate) fn file_header(
     // One range over the whole path, split between the two elements below.
     let sel = selected(sel, 0, path);
     let cut = dir.as_ref().map_or(0, |d| d.len());
-    row_frame()
+    header_gutter(row_frame(), state, p.file_bg, theme)
         // A column, so the rule is part of the row's own 22 pixels rather than
         // added to them: every row in this list is exactly `ROW_H` tall and the
         // list is what makes 714k of them scroll.
         .flex_col()
-        .bg(rgb(row_background(current, p.file_bg, theme)))
+        .bg(rgb(row_background(state.current, p.file_bg, theme)))
         .child(div().flex_none().h(px(1.)).bg(rgb(p.rule)))
         // A path longer than the window is reached the same way a line is: it is
         // the row's text, and the only thing in front of it is the page padding —
@@ -2842,16 +2881,16 @@ pub(crate) fn hunk_header(
     header: &std::sync::Arc<str>,
     theme: &Theme,
     sel: Option<Selected>,
-    current: bool,
+    state: RowState,
     shift: f32,
 ) -> AnyElement {
     let p = &theme.diff;
     let (marker, _) = gitten_core::hunk_parts(header);
-    row_frame()
+    header_gutter(row_frame(), state, p.hunk_bg, theme)
         .items_center()
         .pl(px(HUNK_INDENT))
         .pr(px(PAD))
-        .bg(rgb(row_background(current, p.hunk_bg, theme)))
+        .bg(rgb(row_background(state.current, p.hunk_bg, theme)))
         .text_color(rgb(p.hunk_fg))
         .child(scrolled(
             shift,
@@ -2956,13 +2995,91 @@ pub(crate) fn row_bar(state: RowState, base: Rgb, theme: &Theme) -> Rgb {
     }
 }
 
-/// Whether an armed question stands over a row: the arm keys the row the
-/// keyboard was on — see [`Diff::confirm_or_arm_discard_hunk`] — and a row
-/// outside it answers no, because a question is spent from where it was asked
-/// and no cursor move has moved it. One comparison per row, which is every row
-/// of every frame until somebody arms.
-pub(crate) fn armed_at(index: usize, owner: u16, armed: Option<(u16, u32)>) -> bool {
-    armed.is_some_and(|id| id == (owner, index as u32))
+/// The ink the extent hairline takes on a row: `diff.rule` when the row is in
+/// the keyboard's hunk and the keyboard is elsewhere; the row's own background
+/// when it is not — the ink the element always carries when it says nothing,
+/// which is what keeps a cursor moving between hunks from shifting any row a
+/// pixel; and the bar's ink on the keyboard's row, where the 2px bar wins and
+/// the hairline hides inside it.
+fn extent_ink(state: RowState, base: Rgb, theme: &Theme) -> Rgb {
+    match (state.current, state.in_hunk) {
+        (true, _) => row_bar(state, base, theme),
+        (false, true) => theme.diff.rule,
+        (false, false) => base,
+    }
+}
+
+/// The hairline down a row's left edge that says where the keyboard's hunk
+/// starts and ends: one pixel, inside the bar's own 2px column, in
+/// [`extent_ink`]'s ink.
+///
+/// A hairline and not a second tint, because the row backgrounds already
+/// spend their tint saying add and remove — a second tint would compete. And
+/// in `diff.rule`'s ink specifically because that is the ink a 1px line
+/// already proves itself in: the file header's top rule, and the split
+/// layout's divider, draw it against the same backgrounds at the same width.
+pub(crate) fn extent_line(frame: Div, state: RowState, base: Rgb, theme: &Theme) -> Div {
+    frame.relative().child(
+        div()
+            .absolute()
+            .left_0()
+            .top_0()
+            .bottom_0()
+            .w(px(1.))
+            .bg(rgb(extent_ink(state, base, theme))),
+    )
+}
+
+/// A header row's gutter edge: the 2px bar the line rows carry as a border —
+/// same [`row_bar`] ink, so the cursor is one shape on a header and on a line
+/// — with the extent hairline inside it. Both out of the flow, because a
+/// header's geometry was measured to the pixel: the file header's rule across
+/// its top, the indent its text starts at — a border would move them both.
+pub(crate) fn header_gutter(frame: Div, state: RowState, base: Rgb, theme: &Theme) -> Div {
+    extent_line(
+        frame.child(
+            div()
+                .absolute()
+                .left_0()
+                .top_0()
+                .bottom_0()
+                .w(px(ROW_BAR))
+                .bg(rgb(row_bar(state, base, theme))),
+        ),
+        state,
+        base,
+        theme,
+    )
+}
+
+/// A hunk, as the rows address it once per frame: which presentation owns it
+/// and the logical rows it spans there — [`HunkMap::span`]'s shape. The
+/// keyboard's hunk and the armed one are computed like this at the top of a
+/// frame, and every row then reads its membership as two integer compares —
+/// one `u16` for every row of another file, two `u32` for the owner's own —
+/// never a string compare, and never a search per row.
+#[derive(Clone, Copy)]
+pub(crate) struct HunkExtent {
+    owner: u16,
+    /// First logical row of the hunk, its header included, and one past its
+    /// last.
+    span: (u32, u32),
+}
+
+impl HunkExtent {
+    /// Whether a row of the order table is inside this hunk. The owner first:
+    /// it is the compare every row of every other file pays, which is all of
+    /// them but the hunk's own.
+    fn contains(&self, owner: u16, index: u32) -> bool {
+        self.owner == owner && self.span.0 <= index && index < self.span.1
+    }
+}
+
+/// The hunk standing over one row of the order table, as its presentation
+/// holds it. Once per frame, not once per row.
+fn extent_of(renderers: &[Box<dyn Rows>], owner: u16, index: u32) -> Option<HunkExtent> {
+    let span = renderers.get(owner as usize)?.hunk_span(index as usize)?;
+    Some(HunkExtent { owner, span })
 }
 
 /// One line-number column.
@@ -3095,8 +3212,9 @@ mod tests {
     // By name, not a glob: `use gpui::*` in the parent shadows `#[test]` with
     // GPUI's own attribute macro and every test in here fails to expand.
     use super::{
-        armed_at, line_colors, locked, row_background, row_bar, Diff, FileSummary, Layouts, Pan,
-        Row, RowState, Rows, TextRows, PAD, ROW_H, TEXT_CHROME,
+        extent_ink, extent_of, file_header, hunk_header, line_colors, locked, row_background,
+        row_bar, Diff, FileSummary, Layouts, Pan, Row, RowState, Rows, TextRows, PAD, ROW_H,
+        TEXT_CHROME,
     };
     use gitten_core::font::Font;
     use gitten_core::host::Host;
@@ -3333,6 +3451,7 @@ mod tests {
             current,
             focused,
             armed: false,
+            in_hunk: false,
         };
         assert_eq!(
             row_bar(state(true, true), p.context_bg, &theme),
@@ -3347,34 +3466,130 @@ mod tests {
             row_background(false, p.context_bg, &theme)
         );
     }
-
     #[test]
-    fn an_armed_hunk_names_the_row_a_second_press_will_spend() {
-        // The keyboard on a hunk's first line, armed: the row the question
-        // stands over says so, and the rows beside it — the rest of the hunk
-        // the second press spends — do not. The arm keys the row the keyboard
-        // was on and not the hunk, which is what `confirm_or_arm_discard_hunk`
-        // records: a second press from the same spot spends it, and a move of
-        // the cursor spends nothing (see the test that holds below).
+    fn every_row_of_the_cursors_hunk_reports_the_extent() {
+        // The keyboard mid-hunk: every row of the hunk it sits in — its
+        // header row, its lines, nothing else — reads in extent. That range
+        // is what the hairline in the gutter marks row by row, and the
+        // answer to "which lines would `space` stage".
         let host = Rc::new(Host::new());
         let mut d = Diff::with_layouts(parse_unified_diff(THREE_HUNKS), &host, Layouts::builtin());
-        let id = d.cursor_row_id();
-        assert!(!d.confirm_or_arm_discard_hunk(id), "first press asks");
-        let armed = d.armed_hunk;
-        let flagged: Vec<bool> = (0..d.order.len())
-            .map(|i| {
+        with_height(&mut d, 20);
+
+        // Unified layout rows: file header at 0; hunk 0 owns its header row
+        // and its four lines (1..=5); hunk 1 its header and three lines
+        // (6..=9). A file header owns no hunk — the keyboard parked there
+        // reports none.
+        let r = d.order[0];
+        let renderers = d.renderers.borrow();
+        assert!(
+            extent_of(&renderers, r.owner, r.index).is_none(),
+            "row 0 is a file header"
+        );
+        drop(renderers);
+
+        // The keyboard onto hunk 0's header row.
+        d.run_view("view.down", &host);
+        let r = d.order[d.view.get().cursor()];
+        let e = extent_of(&d.renderers.borrow(), r.owner, r.index).expect("on a hunk");
+        let rows: Vec<usize> = (0..d.order.len())
+            .filter(|&i| {
                 let r = d.order[i];
-                // The same comparison the render path walks — see
-                // `Diff::render`'s `uniform_list`.
-                armed_at(i, r.owner, armed)
+                e.contains(r.owner, r.index)
             })
             .collect();
-        let rows: Vec<usize> = flagged
-            .iter()
-            .enumerate()
-            .filter_map(|(i, a)| a.then_some(i))
+        assert_eq!(rows, vec![1, 2, 3, 4, 5], "the hunk's rows, and only them");
+        // The boundaries: the file header above is out, and so is the next
+        // hunk's header — and the second file's first hunk is out twice
+        // over, its own hunk number 0 notwithstanding.
+        assert!(!e.contains(r.owner, 0), "row 0 is above the extent");
+        assert!(!e.contains(r.owner, 6), "row 6 is the next hunk's header");
+        let two = d.order[12];
+        assert!(
+            !e.contains(two.owner, two.index),
+            "the second file maps to no extent here"
+        );
+    }
+
+    #[test]
+    fn the_armed_tint_covers_exactly_the_armed_hunk() {
+        // Armed via the discard verb, the way `D` asks: the tint spans the
+        // hunk the second press would spend — its header row through its
+        // last line — and nothing outside it. A move of the keyboard
+        // disarms, as it always has, so the tint cannot outlive the
+        // question it was asked about.
+        let host = Rc::new(Host::new());
+        let mut d = Diff::with_layouts(parse_unified_diff(THREE_HUNKS), &host, Layouts::builtin());
+        with_height(&mut d, 20);
+        // Walk to hunk 1's first changed line — row 6 is its header, 7 is
+        // `delta` — and arm.
+        for _ in 0..7 {
+            d.run_view("view.down", &host);
+        }
+        let id = d.cursor_row_id();
+        assert!(!d.confirm_or_arm_discard_hunk(id), "first press asks");
+        let armed = d.armed_hunk.expect("armed, and waiting");
+        let e = extent_of(&d.renderers.borrow(), armed.0, armed.1)
+            .expect("the armed row is a hunk row");
+        let rows: Vec<usize> = (0..d.order.len())
+            .filter(|&i| {
+                let r = d.order[i];
+                e.contains(r.owner, r.index)
+            })
             .collect();
-        assert_eq!(rows, vec![id.1 as usize], "the armed row, and only it");
+        assert_eq!(
+            rows,
+            vec![6, 7, 8, 9],
+            "the armed hunk's rows, and only them"
+        );
+        d.run_view("view.down", &host);
+        assert!(d.armed_hunk.is_none(), "a cursor move disarms");
+    }
+
+    #[test]
+    fn a_header_row_carries_the_cursor_bar() {
+        // `file_header` and `hunk_header` take the RowState the line rows do
+        // and ask the same `row_bar` for their bar's ink — so the cursor is
+        // one shape parked on a header and parked on a line — and the extent
+        // hairline inside it takes `extent_ink`'s: `diff.rule` when the row
+        // is in the hunk, the header's own background when it is not, and
+        // the bar's ink on the keyboard's row, where the 2px bar wins.
+        let theme = Theme::dark();
+        let p = &theme.diff;
+        let header: std::sync::Arc<str> = std::sync::Arc::from("@@ -1,3 +1,3 @@");
+        let path: std::sync::Arc<str> = std::sync::Arc::from("one.txt");
+        let state = |current: bool, in_hunk: bool| RowState {
+            current,
+            focused: true,
+            armed: false,
+            in_hunk,
+        };
+        // Both headers draw with the keyboard on them — and, one state down,
+        // with the hairline carrying the extent.
+        let _ = hunk_header(&header, &theme, None, state(true, true), 0.0);
+        let _ = file_header(&path, 1, 2, &theme, None, state(true, true), 0.0);
+        let _ = hunk_header(&header, &theme, None, state(false, true), 0.0);
+        let _ = file_header(&path, 1, 2, &theme, None, state(false, true), 0.0);
+        // The bar's ink is the line rows', whatever the header's own
+        // background: accent on the keyboard's row, and the row's own
+        // background elsewhere.
+        assert_eq!(
+            row_bar(state(true, false), p.hunk_bg, &theme),
+            theme.chrome.accent
+        );
+        assert_eq!(row_bar(state(false, false), p.hunk_bg, &theme), p.hunk_bg);
+        assert_eq!(row_bar(state(false, false), p.file_bg, &theme), p.file_bg);
+        // The hairline's ink: `diff.rule` in the extent, the row's own
+        // background out of it, and the bar's ink on the keyboard's row.
+        assert_eq!(extent_ink(state(false, true), p.hunk_bg, &theme), p.rule);
+        assert_eq!(
+            extent_ink(state(false, false), p.file_bg, &theme),
+            p.file_bg
+        );
+        assert_eq!(
+            extent_ink(state(true, true), p.hunk_bg, &theme),
+            row_bar(state(true, true), p.hunk_bg, &theme)
+        );
     }
 
     #[test]

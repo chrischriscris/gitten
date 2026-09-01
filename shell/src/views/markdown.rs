@@ -411,9 +411,9 @@ impl Rows for MarkdownRows {
         let theme = &host.theme;
         match self.doc.row(index) {
             Some(DocRow::File { path, adds, dels }) => {
-                file_header(path, *adds, *dels, theme, sel, state.current, shift)
+                file_header(path, *adds, *dels, theme, sel, state, shift)
             }
-            Some(DocRow::Hunk(header)) => hunk_header(header, theme, sel, state.current, shift),
+            Some(DocRow::Hunk(header)) => hunk_header(header, theme, sel, state, shift),
             Some(DocRow::Line { block, line }) => {
                 self.line(index, seg, *block, line, state, host, sel, shift)
             }

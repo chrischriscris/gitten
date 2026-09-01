@@ -294,8 +294,10 @@ terminal passes to `Pen::scroll`, for the same reason — see
 [decisions/0023](decisions/0023-the-gutter-does-not-scroll.md).
 
 **`state` is what the keyboard already knows about the row.** Whether it is the
-row the cursor is on, whether the pane holding it holds the keyboard, and whether
-an armed question stands over its hunk. One argument and not three bools, because
+row the cursor is on, whether the pane holding it holds the keyboard, whether
+an armed question stands over its hunk, and whether the row is inside the hunk
+the cursor is on — the extent a hunk verb acts on, which the view marks in the
+gutter. One argument and not four bools, because
 this trait is an extension's seam and a signature is not something a presentation
 after the next should have to change twice.
 

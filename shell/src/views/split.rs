@@ -49,9 +49,9 @@
 //! many rows it takes.
 
 use super::diff::{
-    column_at, columns, file_header, header_hit, hunk_header, hunk_hit, into_text, line_colors,
-    row_background, row_bar, row_frame, scrolled, selected, slice, Hit, RowState, Rows, Scratch,
-    PAD, ROW_BAR, ROW_H,
+    column_at, columns, extent_line, file_header, header_hit, hunk_header, hunk_hit, into_text,
+    line_colors, row_background, row_bar, row_frame, scrolled, selected, slice, Hit, RowState,
+    Rows, Scratch, PAD, ROW_BAR, ROW_H,
 };
 use gitten_core::align::align;
 use gitten_core::host::Host;
@@ -315,6 +315,10 @@ impl Rows for SplitRows {
         self.hunks.at(index)
     }
 
+    fn hunk_span(&self, index: usize) -> Option<(u32, u32)> {
+        self.hunks.span(index)
+    }
+
     /// The longer of a pair row's two sides, because that is the side that
     /// decides how far there is left to scroll — both columns move together and
     /// they are the same width, so the wider text is the bound for the row.
@@ -444,9 +448,9 @@ impl Rows for SplitRows {
         let theme = &host.theme;
         match &self.rows[index] {
             Row::File { path, adds, dels } => {
-                file_header(path, *adds, *dels, theme, sel, state.current, shift)
+                file_header(path, *adds, *dels, theme, sel, state, shift)
             }
-            Row::Hunk(header) => hunk_header(header, theme, sel, state.current, shift),
+            Row::Hunk(header) => hunk_header(header, theme, sel, state, shift),
             Row::Pair { old, new } => {
                 // Page padding, then two columns of *measured* width and a
                 // fixed rule. The width is `cell_px` — the number the hit test
@@ -472,8 +476,7 @@ impl Rows for SplitRows {
                 // text starts at `PAD`, do not move.
                 let old_bg = self.side_bg(*old, seg, state, theme);
                 let new_bg = self.side_bg(*new, seg, state, theme);
-                row_frame()
-                    .items_center()
+                extent_line(row_frame().items_center(), state, bg, theme)
                     .border_l(px(ROW_BAR))
                     .border_color(rgb(row_bar(state, bg, theme)))
                     .bg(rgb(bg))
