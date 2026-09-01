@@ -59,8 +59,8 @@
 //! vertical axis, which is the one that has to virtualize.
 
 use super::{
-    accept_deferred_scroll, horizontal_scrollbar, vertical_scrollbar, DeferredScrollbar,
-    PendingScroll,
+    accept_deferred_scroll, horizontal_scrollbar, track_marks, vertical_scrollbar,
+    DeferredScrollbar, PendingScroll,
 };
 pub(crate) use crate::chrome::ROW_BAR;
 use gitten_core::font::Font;
@@ -717,6 +717,11 @@ pub struct Diff {
     /// does; one borrow per *batch* of rows, not per row.
     renderers: Rc<RefCell<Vec<Box<dyn Rows>>>>,
     order: Rc<Vec<RowRef>>,
+    /// Where each hunk starts, as a fraction of the row order — the diff
+    /// scrollbar's ticks. Computed beside the order table it indexes and
+    /// rebuilt exactly where the order is: load, reflow, a layout swap and a
+    /// reload. See [`hunk_marks`].
+    marks: Rc<Vec<f32>>,
     /// What the mouse has selected, or nothing.
     ///
     /// The model is `gitten_core::select` and this is the only state the window
@@ -888,6 +893,7 @@ impl Diff {
             self.order = Rc::new(built.order);
             self.widest = built.widest;
             self.headers = Rc::new(headers);
+            self.marks = Rc::new(hunk_marks(&self.order, &self.renderers.borrow()));
             self.total.set(self.order.len());
             // The line you were reading is wherever the cursor now is — its row
             // number moved with the wrapping, which is what `built.anchor`
@@ -1414,6 +1420,7 @@ impl Diff {
         *self.renderers.borrow_mut() = built.renderers;
         self.widest = built.widest;
         self.headers = Rc::new(built.headers);
+        self.marks = Rc::new(built.marks);
         self.load = built.load;
         self.total.set(self.order.len());
         self.applied = (0.0, "");
@@ -1554,6 +1561,7 @@ impl Diff {
             measured: Rc::new(Cell::new(0.0)),
             renderers: Rc::new(RefCell::new(built.renderers)),
             order: Rc::new(built.order),
+            marks: Rc::new(built.marks),
             sel: None,
             dragging: false,
             widest: built.widest,
@@ -1591,6 +1599,7 @@ impl Diff {
         self.order = Rc::new(built.order);
         *self.renderers.borrow_mut() = built.renderers;
         self.widest = built.widest;
+        self.marks = Rc::new(built.marks);
 
         self.load = built.load;
         self.total.set(self.order.len());
@@ -1618,6 +1627,10 @@ struct Built {
     /// the widest-row search read. Produced by the same [`expand`] that built
     /// `order`, so it can never disagree with it.
     headers: Vec<usize>,
+    /// Where each hunk starts, as a fraction of the order — [`Diff::marks`]'s
+    /// source. Produced beside the order it indexes, by the same [`expand`]
+    /// pass, so the two can never disagree.
+    marks: Vec<f32>,
     load: String,
 }
 
@@ -1711,11 +1724,13 @@ fn arrange(prepared: &Prepared, host: &Host, layouts: &Layouts, current: usize) 
     if crate::stats::enabled() {
         eprintln!("{load}");
     }
+    let marks = hunk_marks(&order, &renderers);
     Built {
         renderers,
         order,
         widest,
         headers,
+        marks,
         load,
     }
 }
@@ -2059,6 +2074,7 @@ impl Render for Diff {
         // one path, and costs one frame of unwrapped rows at startup.
         self.reflow(self.measured.get(), &crate::config::host(cx));
 
+        let pending_scroll = self.pending_scroll.clone();
         let renderers = self.renderers.clone();
         let order = self.order.clone();
         let rendered = self.rendered.clone();
@@ -2072,13 +2088,18 @@ impl Render for Diff {
         let view = self.view.clone();
         let scroll = self.scroll.clone();
         let synced = self.synced.clone();
-        let pending_scroll = self.pending_scroll.clone();
         // The same flag the shell last wrote, copied into the rows with the rest
         // of the frame's reads — a view cannot ask the shell during render.
         let focused = self.focused;
         // The question the shell is holding, if any, copied so the rows of one
         // frame all answer it at the same state of the arm.
         let armed = self.armed_hunk;
+        // The hunk ticks' two per-frame reads, taken here like every other
+        // setting the frame is drawn from: the offsets, computed at load and
+        // rebuilt where the order was, and the ink they are drawn in. A
+        // refcount bump and a u32 — nothing per frame.
+        let marks = self.marks.clone();
+        let ink = crate::config::host(cx).theme.diff.hunk_fg;
         // Where the scrollbar draws itself and how long its thumb is. Last
         // frame's box, like everything else measured here — a view is handed
         // one and cannot ask before.
@@ -2194,6 +2215,15 @@ impl Render for Diff {
                     &self.pending_scroll,
                 )))
                 .child(horizontal_scrollbar(&self.pan))
+                // The hunk ticks, last so they ride on the track the widget
+                // paints — an opaque channel of the window's background, which
+                // would cover a strip painted before it. Only when there is a
+                // track to mark: a diff that fits the pane is one the widget
+                // draws no bar on.
+                .when(
+                    self.scroll.0.borrow().base_handle.max_offset().y > px(0.),
+                    |d| d.child(track_marks(marks, ink)),
+                )
             });
         root.into_any_element()
     }
@@ -3080,6 +3110,58 @@ impl HunkExtent {
 fn extent_of(renderers: &[Box<dyn Rows>], owner: u16, index: u32) -> Option<HunkExtent> {
     let span = renderers.get(owner as usize)?.hunk_span(index as usize)?;
     Some(HunkExtent { owner, span })
+}
+
+/// Where each hunk starts, as a fraction of the order table — the scrollbar
+/// ticks' whole input.
+///
+/// Computed where the order table is — load, reflow, a layout change — and
+/// never per frame. It walks the flat order once, asking each renderer's
+/// [`Rows::hunk_span`] for the hunk a row belongs to (the input 051's
+/// [`HunkMap`] already serves; nothing here re-derives hunks) and recording
+/// `hunk_start_row / total_rows` for a hunk's own first visual row. That is
+/// the row a `scroll_to_item` to the hunk's start lands the viewport on, and
+/// therefore where the thumb's top sits — a uniform list normalizes a row to
+/// a track offset by plain division, which is exactly what a fraction of the
+/// row count is.
+///
+/// Mark data, not hunk data: a fraction per hunk and nothing else. The
+/// painter takes offsets and an ink — [`crate::views::track_marks`] — so
+/// search marks later are another caller, not another painter.
+fn hunk_marks(order: &[RowRef], renderers: &[Box<dyn Rows>]) -> Vec<f32> {
+    let total = order.len();
+    let mut marks = Vec::new();
+    if total == 0 {
+        return marks;
+    }
+    // The hunk the walk is inside of, per owner: the compare every row pays
+    // before it may ask its renderer, so the walk is linear in the rows and
+    // a search only per hunk.
+    let mut open: Option<(u16, u32, u32)> = None;
+    for (i, r) in order.iter().enumerate() {
+        let span = match open {
+            Some((owner, span, end)) if owner == r.owner && r.index < end => (span, end),
+            _ => match renderers
+                .get(r.owner as usize)
+                .and_then(|rows| rows.hunk_span(r.index as usize))
+            {
+                Some(s) => {
+                    open = Some((r.owner, s.0, s.1));
+                    s
+                }
+                None => {
+                    open = None;
+                    continue;
+                }
+            },
+        };
+        // The hunk's header row is its first, and its first visual row is
+        // that row's first segment: one tick per hunk, not one per segment.
+        if r.seg == 0 && span.0 == r.index {
+            marks.push(i as f32 / total as f32);
+        }
+    }
+    marks
 }
 
 /// One line-number column.
@@ -5597,6 +5679,80 @@ diff --git a/two.txt b/two.txt
             Some("two.txt#0".into()),
             "the second file maps by its own path"
         );
+    }
+
+    #[test]
+    fn every_hunk_leaves_a_tick_at_its_start() {
+        let host = Host::new();
+        let d = Diff::with_layouts(parse_unified_diff(THREE_HUNKS), &host, Layouts::builtin());
+
+        // The same rows `hunk_at_row` names: file header at 0; hunk 0 at 1
+        // (header and four lines); hunk 1 at 6 (header and three lines); the
+        // second file's header 10, its hunk 11 (header and three lines) — 15
+        // rows, and a tick where a `scroll_to_item` to each hunk's header
+        // lands the thumb.
+        assert_eq!(d.order.len(), 15);
+        assert_eq!(d.marks.as_ref(), &[1.0 / 15.0, 6.0 / 15.0, 11.0 / 15.0]);
+    }
+
+    #[test]
+    fn an_empty_diff_holds_no_marks() {
+        let host = Host::new();
+        let d = Diff::with_layouts(Vec::new(), &host, Layouts::builtin());
+        assert!(d.marks.is_empty(), "nothing to divide, nothing to mark");
+    }
+
+    #[test]
+    fn the_smallest_hunk_marks_the_top_of_the_track() {
+        // One line replaced: in unified layout the removal and the addition
+        // are two lines, so the hunk is a header and two lines, the order is
+        // three rows — one file with hunks leaves its band out — and the tick
+        // sits at row 0. The division the one-row guard protects is the empty
+        // order's, tested above; a mark itself can only be a fraction of an
+        // order that holds the hunk it came from, so three is the floor.
+        let src = "\
+diff --git a/one.txt b/one.txt
+--- a/one.txt
++++ b/one.txt
+@@ -1 +1 @@
+-alpha
++beta
+";
+        let host = Host::new();
+        let d = Diff::with_layouts(parse_unified_diff(src), &host, Layouts::builtin());
+        assert_eq!(d.order.len(), 3);
+        assert_eq!(d.marks.as_ref(), &[0.0]);
+    }
+
+    #[test]
+    fn marks_follow_the_order_through_a_reflow_and_a_layout_swap() {
+        // The marks are rebuilt exactly where the order is, so a width that
+        // wraps keeps one tick per hunk at its new start — and a layout
+        // change, which renumbers every row, does not leave the old fractions
+        // behind. The count is read from the loaded diff itself, not from the
+        // marks, so a walk that lost or doubled a hunk would fail here; the
+        // reflow is asserted to have moved the rows at all, so a stale cache
+        // would fail the changed-fractions compare.
+        let host = Host::new();
+        let mut d = Diff::with_layouts(parse_unified_diff(THREE_HUNKS), &host, Layouts::builtin());
+        let hunks: usize = d.files.iter().map(|f| f.hunks.len()).sum();
+        assert_eq!(hunks, 3, "the fixture has hunks to mark");
+        assert_eq!(d.marks.len(), hunks);
+        let before = d.marks.as_ref().to_vec();
+
+        // Five columns wraps `epsilon old` and its friends, so hunk 1's and
+        // hunk 2's starts move down and the fractions move with them.
+        d.reflow(width_for(5, &host), &host);
+        assert!(d.order.len() > 15, "the width wrapped something");
+        assert_eq!(d.marks.len(), hunks, "a wrap renumbers, never re-marks");
+        assert!(d.marks.iter().all(|m| (0.0..=1.0).contains(m)));
+        assert!(d.marks.windows(2).all(|w| w[0] < w[1]), "ascending");
+        assert_ne!(d.marks.as_ref(), before.as_slice());
+
+        d.apply_layout(1, &host);
+        assert_eq!(d.layout(), "split");
+        assert_eq!(d.marks.len(), hunks);
+        assert!(d.marks.iter().all(|m| (0.0..=1.0).contains(m)));
     }
 
     #[test]

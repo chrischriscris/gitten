@@ -2,7 +2,11 @@
 //! None of them assume they own the window or the keymap — that is what makes
 //! assembling the final multi-pane layout an assembly job rather than a rewrite.
 
-use gpui::{point, px, Bounds, Pixels, Point, Size, UniformListScrollHandle};
+use gpui::{
+    canvas, fill, point, px, rgb, AnyElement, Bounds, Hsla, Pixels, Point, Size,
+    UniformListScrollHandle,
+};
+use gpui::{IntoElement as _, Styled as _};
 use gpui_component::scroll::{Scrollbar, ScrollbarAxis, ScrollbarHandle};
 use std::cell::Cell;
 use std::rc::Rc;
@@ -157,6 +161,63 @@ impl ScrollbarHandle for DeferredScrollbar {
         (base.max_offset() + base.bounds().size.into()).into()
     }
 }
+/// How tall one track mark is, in px. Furniture, not a line: 1–2px is what the
+/// plan's tick budget allows, and 2 is what reads at the ink the ticks get.
+const TRACK_MARK_H: f32 = 2.0;
+
+/// The bars [`track_marks`] paints for one strip: one per mark, the full width
+/// of the strip, [`TRACK_MARK_H`] tall, its top at the mark's offset of the
+/// strip's height — clamped inside, so a mark at the very bottom still lands
+/// on it.
+///
+/// Marks, not hunks — this is the painter's geometry and the whole of its
+/// contract: offsets in, bars out. A second caller hands it its own offsets
+/// and is a caller, not a painter; see plan 057's seam check.
+pub(crate) fn mark_bars<'a>(
+    strip: &'a Bounds<Pixels>,
+    marks: &'a [f32],
+) -> impl Iterator<Item = Bounds<Pixels>> + 'a {
+    let h = f32::from(strip.size.height);
+    let room = (h - TRACK_MARK_H).max(0.0);
+    let left = strip.origin.x;
+    let right = strip.origin.x + strip.size.width;
+    marks.iter().map(move |m| {
+        let y = strip.origin.y + px((*m * h).clamp(0.0, room));
+        Bounds::from_corners(point(left, y), point(right, y + px(TRACK_MARK_H)))
+    })
+}
+
+/// Marks on a scrollbar track — the seam diff hunks ride on today, and search
+/// matches will ride on later.
+///
+/// The contract: `marks` are offsets along the track, each a fraction of its
+/// height in `0.0..=1.0`, computed by the caller at load time and never per
+/// frame; `ink` is the furniture colour they are drawn in. The element is the
+/// scrollbar's strip — the right [`SCROLLBAR_TRACK_W`] of its box, its whole
+/// height — laid out by flexbox against the box the pane was handed, so it
+/// sits on the widget's track by construction, with none of the widget's own
+/// pixel constants guessed. It is a child painted *after* the bar, because the
+/// bar's track is an opaque channel of the window's background and a strip
+/// painted before it would never be seen; the thumb is below the ticks, which
+/// is the one order the widget's own paint pass allows. Each mark is one
+/// full-track-width quad, its top at its offset: the place the thumb's own top
+/// lands when the list is scrolled to that row.
+pub(crate) fn track_marks(marks: Rc<Vec<f32>>, ink: gitten_core::theme::Rgb) -> AnyElement {
+    canvas(
+        |_, _, _| {},
+        move |strip, _, window, _| {
+            for bar in mark_bars(&strip, &marks) {
+                window.paint_quad(fill(bar, Hsla::from(rgb(ink))));
+            }
+        },
+    )
+    .absolute()
+    .top_0()
+    .bottom_0()
+    .right_0()
+    .w(px(SCROLLBAR_TRACK_W))
+    .into_any_element()
+}
 
 #[cfg(test)]
 mod tests {
@@ -288,6 +349,41 @@ mod tests {
         pending.wheel(-12.0);
         pending.begin();
         assert_eq!(pending.wheel(0.0), 0.0);
+    }
+
+    /// A strip standing in for the diff pane's right edge.
+    fn strip() -> Bounds<Pixels> {
+        Bounds {
+            origin: point(px(100.), px(50.)),
+            size: Size {
+                width: px(SCROLLBAR_TRACK_W),
+                height: px(200.),
+            },
+        }
+    }
+
+    /// The seam check the painter owes: two mark sets through the one device —
+    /// offsets in, bars out, and not a hunk anywhere in it. Where the bars
+    /// land is the whole contract; the ink is whoever paints them.
+    #[test]
+    fn the_mark_painter_takes_any_offsets_and_an_ink() {
+        let strip = strip();
+        let bars: Vec<_> = mark_bars(&strip, &[0.0, 0.5]).collect();
+        let [low, mid] = bars.as_slice() else {
+            panic!("two marks, two bars: {bars:?}")
+        };
+        for (bar, top) in [(low, 50.0), (mid, 150.0)] {
+            assert_eq!(f32::from(bar.size.width), SCROLLBAR_TRACK_W);
+            assert_eq!(f32::from(bar.size.height), TRACK_MARK_H);
+            assert_eq!(f32::from(bar.origin.x), 100.0, "full strip width");
+            assert_eq!(f32::from(bar.origin.y), top);
+        }
+
+        // A second caller: different offsets through the same painter, the
+        // bottom edge clamped onto the strip rather than off it.
+        let bars: Vec<_> = mark_bars(&strip, &[0.25, 1.0]).collect();
+        let ys: Vec<f32> = bars.iter().map(|b| f32::from(b.origin.y)).collect();
+        assert_eq!(ys, vec![100.0, 50.0 + 200.0 - TRACK_MARK_H]);
     }
 }
 
