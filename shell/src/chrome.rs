@@ -32,14 +32,6 @@ pub const HEADER_H: f32 = 26.0;
 /// the window and should read as a matched pair.
 pub const STATUS_H: f32 = 26.0;
 
-/// The left column's slice of the window's width — one column, lazygit's
-/// proportions: the three short lists and the commit list stacked in it, the
-/// diff taking the rest. It was 0.21 when the column held only short paths
-/// and branch names and the commits had a region of their own; merged, the
-/// stack inherits the commits' width, because a sha, initials, a subject and
-/// an age all live in a row now.
-pub const SIDEBAR_SHARE: f32 = 0.32;
-
 /// Left padding of every list row and section label. One number, because
 /// the eye runs down a column of rows and a row that starts a pixel later
 /// than its neighbours reads as indented on purpose.

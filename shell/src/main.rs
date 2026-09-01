@@ -105,6 +105,11 @@ const CHIP_H: f32 = 22.0;
 /// fit: its header and two rows — the selected one and a neighbour, which
 /// is the least a list can show and still be seen to scroll.
 const SECTION_MIN_H: f32 = chrome::HEADER_H + 2.0 * graph::ROW_H;
+/// The most rows an *unfocused* list section spends its pixels on. Eight:
+/// nobody reads sixteen branches while committing — the focused pane is the
+/// one being read, and it stays uncapped. The slack a cap frees goes to the
+/// commit list, the flexible middle under the stack.
+const SECTION_MAX_ROWS: usize = 8;
 
 /// The shortest window that keeps its promise: five stacked sections at
 /// their [`SECTION_MIN_H`] floor — the three content-sized panes, the commit
@@ -129,6 +134,47 @@ fn section_height(rows: usize) -> f32 {
 fn section_floor(rows: usize) -> f32 {
     SECTION_MIN_H.min(section_height(rows))
 }
+
+/// The height a section *asks* for: its natural height when the keyboard is
+/// in it, else that natural height capped at [`SECTION_MAX_ROWS`] rows — see
+/// the cap for why. The flex squeeze still bounds both, so a focused
+/// sixteen-row list wins the argument only when there is slack to win.
+fn section_basis(rows: usize, focused: bool) -> f32 {
+    section_height(if focused {
+        rows
+    } else {
+        rows.min(SECTION_MAX_ROWS)
+    })
+}
+
+/// The whole-row cut of a squeezed section's content height: rounded down to
+/// a whole multiple of [`graph::ROW_H`]. Flex may squeeze a section to three
+/// and a half rows, and the half is a line of text cut mid-glyph — so what a
+/// section shows is quantized and the remainder is padded below in the
+/// background colour, and the boundary always lands between rows. Arithmetic
+/// on a measurement, one frame late — the house rule; see
+/// [`DevShell::section_content`].
+fn quantized(content_h: f32) -> f32 {
+    (content_h / graph::ROW_H).floor() * graph::ROW_H
+}
+/// The share a session copy of the sidebar's width is written inside: the
+/// band the config parser promises ([`gitten_core::host::SIDEBAR_MIN`]..
+/// [`gitten_core::host::SIDEBAR_MAX`]) and the drag's rails. The parser
+/// clamps what the file says; this clamps what a drag does — a gesture can
+/// ask for anything, and a boundary dragged off the window is a boundary
+/// nobody can find again.
+fn clamped_share(share: f32) -> f32 {
+    share.clamp(
+        gitten_core::host::SIDEBAR_MIN,
+        gitten_core::host::SIDEBAR_MAX,
+    )
+}
+
+/// The divider drag's payload: nothing but a type for GPUI to name, so the
+/// drag-move listener can tell this gesture from any other. The ghost it
+/// renders is gpui's `EmptyView` — a divider says nothing while dragged.
+#[derive(Clone, Copy)]
+struct SidebarDrag;
 
 /// The FILES header's count: the working tree's distinct changed paths, as
 /// the header's only right-edge furniture. `None` on a clean tree — a zero
@@ -1241,6 +1287,14 @@ struct DevShell {
     /// reload a save does — see [`config::reload`] for why there is only one
     /// path.
     config: std::path::PathBuf,
+    /// The sidebar's slice of the window's width, for the session: taken
+    /// from the config knob when the window opens (the same band the parser
+    /// clamps, see [`clamped_share`]) and moved by the divider drag. Never
+    /// written back to `gitten.toml` — the file is read-only by design; the
+    /// knob sets the opening share, the drag adjusts the session. Not a
+    /// watcher of reloads either: a saved file changes the *next* window,
+    /// never the boundary somebody is sitting behind.
+    share: Cell<f32>,
     /// Startup logging, and nothing else: whether [`start::mark`] has already
     /// stamped the first render. One bool read per frame afterwards.
     first_render: Cell<bool>,
@@ -1253,6 +1307,13 @@ struct DevShell {
     /// must not re-split the path and re-format three numbers to say the
     /// same thing again.
     header_memo: RefCell<Option<(views::diff::FileSummary, HeaderText)>>,
+    /// Each sidebar section's content height, as its canvas probe reported it
+    /// during the last paint — keyed by the section's element id, because the
+    /// wrappers are built fresh every frame and the probe has to write into
+    /// something that survives them. Read by the next frame's build, which is
+    /// what makes the whole-row quantization one frame late; see
+    /// [`DevShell::section_content`] and [`quantized`].
+    quant: RefCell<std::collections::HashMap<&'static str, Rc<Cell<f32>>>>,
     /// Which modes' bindings are live, innermost last: the pane container, the
     /// focused tenant, then input or help over it. Rebuilt by
     /// [`DevShell::sync_modes`] whenever any of those changes.
@@ -4135,6 +4196,82 @@ impl DevShell {
             theme_picker,
         ]
     }
+    /// The probe cell a section's content wrapper reports its height into —
+    /// keyed by the section's element id, because the wrappers are built
+    /// fresh every frame and the probe has to write into something that
+    /// survives them. The probe paints after this frame's build has read the
+    /// cell, so what it writes is the *next* frame's input: correct, and one
+    /// frame late, the house rule for measured layout.
+    fn probed(&self, id: &'static str) -> Rc<Cell<f32>> {
+        self.quant
+            .borrow_mut()
+            .entry(id)
+            .or_insert_with(|| Rc::new(Cell::new(0.0)))
+            .clone()
+    }
+
+    /// A section's content wrapper — the pane's rows under its header —
+    /// sized to whole rows. The zero-height canvas pinned across it is the
+    /// probe: paint reports the wrapper's box, [`DevShell::quant`] carries
+    /// it to the next frame, and that frame rounds the height **down** to a
+    /// whole multiple of [`graph::ROW_H`] ([`quantized`]) and pads the
+    /// remainder below the last full row in the background colour, so the
+    /// boundary always lands between rows and never through a line of
+    /// text. Before the first report the rows take the wrapper as they
+    /// find it; every frame after, squeezed or not, is quantized.
+    fn section_content(
+        &self,
+        id: &'static str,
+        view: AnyView,
+        bg: theme::Rgb,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let probed = self.probed(id);
+        let measured = probed.get();
+        let me = cx.entity().downgrade();
+        let wrapper = div()
+            .min_h_0()
+            .flex_grow(1.0)
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .child({
+                let probed = probed.clone();
+                canvas(
+                    move |bounds, _, cx| {
+                        let h = f32::from(bounds.size.height);
+                        if (h - probed.get()).abs() >= 0.5 {
+                            probed.set(h);
+                            _ = me.update(cx, |_, cx| cx.notify());
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .h(px(0.))
+            });
+        if measured > 0.0 {
+            wrapper
+                .child(
+                    div()
+                        .debug_selector(move || format!("{id}-rows"))
+                        .flex_none()
+                        .w_full()
+                        .h(px(quantized(measured)))
+                        .overflow_hidden()
+                        .child(view),
+                )
+                // The remainder the rows do not spend: background, not a
+                // half row. Growing into exactly the difference is what
+                // flex_grow does here.
+                .child(div().flex_grow(1.0).bg(rgb(bg)))
+        } else {
+            wrapper.child(div().min_h_0().flex_grow(1.0).overflow_hidden().child(view))
+        }
+    }
 
     /// The stack's flexible foot: the commit list, or whichever extension
     /// pane took its region over. Focused-and-not-a-sidebar-name is exactly
@@ -4233,13 +4370,7 @@ impl DevShell {
                     this.set_spot(Spot::List, cx);
                 }))
                 .child(chrome::pane_header(host, "4", name, None, focused, right))
-                .child(
-                    div()
-                        .min_h_0()
-                        .flex_grow(1.0)
-                        .overflow_hidden()
-                        .child(screen.any()),
-                )
+                .child(self.section_content("side-commits", screen.any(), c.bg, cx))
                 .into_any_element(),
         );
     }
@@ -4285,10 +4416,15 @@ impl Render for DevShell {
         // content**: five files take five rows and the branches sit directly
         // under them, the way the design stacks them — not a quarter of the
         // column each with air nobody asked for. The height is arithmetic
-        // (header plus rows), because a view cannot measure itself during
-        // `render`; and when they do not fit, each shrinks from that basis
-        // to a floor of two rows and its `uniform_list` scrolls. No
-        // measurement, no second frame.
+        // (header plus rows, capped at [`SECTION_MAX_ROWS`] when the keyboard
+        // is elsewhere — the focused pane is the one being read), because a
+        // view cannot measure itself during `render`; and when they do not
+        // fit, each shrinks from that basis to a floor of two rows and its
+        // `uniform_list` scrolls. The one measurement the stack does make —
+        // a squeezed section's box, reported one frame late by the canvas
+        // probe — is spent on the boundary only: [`quantized`] rounds what a
+        // section shows down to whole rows, so flex can never cut a line of
+        // text mid-glyph.
         //
         // The commit list is the stack's one *flexible* section: it takes
         // whatever the short panes leave, the way lazygit's log does — it is
@@ -4332,7 +4468,7 @@ impl Render for DevShell {
                         .id(id)
                         .debug_selector(move || id.to_string())
                         .flex_shrink(1.0)
-                        .h(px(section_height(rows)))
+                        .h(px(section_basis(rows, focused)))
                         // The floor never exceeds the basis: a minimum
                         // above the natural height wins the layout and an
                         // empty section would be padded to two rows.
@@ -4351,13 +4487,7 @@ impl Render for DevShell {
                             focused,
                             None,
                         ))
-                        .child(
-                            div()
-                                .min_h_0()
-                                .flex_grow(1.0)
-                                .overflow_hidden()
-                                .child(screen.any()),
-                        )
+                        .child(self.section_content(id, screen.any(), c.bg, cx))
                         .into_any_element(),
                 );
             }
@@ -4390,7 +4520,7 @@ impl Render for DevShell {
                         .id(id)
                         .debug_selector(move || id.to_string())
                         .flex_shrink(1.0)
-                        .h(px(section_height(rows)))
+                        .h(px(section_basis(rows, focused)))
                         .min_h(px(section_floor(rows)))
                         .flex()
                         .flex_col()
@@ -4406,13 +4536,7 @@ impl Render for DevShell {
                             focused,
                             None,
                         ))
-                        .child(
-                            div()
-                                .min_h_0()
-                                .flex_grow(1.0)
-                                .overflow_hidden()
-                                .child(screen.any()),
-                        )
+                        .child(self.section_content(id, screen.any(), c.bg, cx))
                         .into_any_element(),
                 );
             }
@@ -4420,7 +4544,9 @@ impl Render for DevShell {
                 div()
                     .id("sidebar")
                     .flex_none()
-                    .w(relative(chrome::SIDEBAR_SHARE))
+                    // The session's share, not the config's: the divider
+                    // drag moves this and nothing writes the file back.
+                    .w(relative(self.share.get()))
                     .min_h_0()
                     .flex()
                     .flex_col()
@@ -4429,6 +4555,9 @@ impl Render for DevShell {
                     .children(sections)
             })
         };
+        // Owned by the divider's gating: a fixture has no stack, so it has no
+        // border for a strip to straddle either.
+        let has_stack = sidebar.is_some();
         let Screen::Diff {
             view: main_view, ..
         } = &self.main
@@ -4763,7 +4892,42 @@ impl Render for DevShell {
                     .flex_grow(1.0)
                     .flex()
                     .children(sidebar)
-                    .child(main_region),
+                    .child(main_region)
+                    // The divider: a 5px hit strip straddling the border the
+                    // sidebar and the diff are parted by — the border itself
+                    // stays the hairline it is, and the strip is invisible
+                    // (no ink of its own) but occludes, so the hand finds it
+                    // and a click on it does not fall through to either
+                    // region. Dragging it moves the session's share, inside
+                    // the band the config parser clamps; the hairline follows
+                    // on the next frame, which is a relative-width write and
+                    .children(has_stack.then(|| {
+                        div()
+                            .id("divider")
+                            .debug_selector(|| "divider".to_string())
+                            .absolute()
+                            .top_0()
+                            .h_full()
+                            .left(relative(self.share.get()))
+                            .ml(px(-2.0))
+                            .w(px(5.0))
+                            .cursor_col_resize()
+                            .occlude()
+                            .on_drag(SidebarDrag, |_, _, _, cx| {
+                                cx.stop_propagation();
+                                cx.new(|_| gpui::EmptyView)
+                            })
+                            .on_drag_move(cx.listener(
+                                |this, e: &DragMoveEvent<SidebarDrag>, window, cx| {
+                                    let width = f32::from(window.viewport_size().width);
+                                    let next = clamped_share(f32::from(e.event.position.x) / width);
+                                    if (next - this.share.get()).abs() > f32::EPSILON {
+                                        this.share.set(next);
+                                        cx.notify();
+                                    }
+                                },
+                            ))
+                    })),
             )
             .children(input)
             // The menu itself is deferred at priority 1. Its transparent
@@ -5398,6 +5562,8 @@ fn main() {
                     first_render: Cell::new(false),
                     title_memo: RefCell::new(None),
                     header_memo: RefCell::new(None),
+                    quant: RefCell::default(),
+                    share: Cell::new(clamped_share(host.sidebar_share)),
                     modes: Modes::new(),
                     pending: Vec::new(),
                     help: false,
@@ -5745,6 +5911,8 @@ mod tests {
                 first_render: Cell::new(false),
                 title_memo: RefCell::new(None),
                 header_memo: RefCell::new(None),
+                quant: RefCell::default(),
+                share: Cell::new(super::clamped_share(host.sidebar_share)),
                 modes: Modes::new(),
                 pending: vec![vec![Key::char('g')]],
                 help: false,
@@ -5870,6 +6038,8 @@ mod tests {
                 first_render: Cell::new(false),
                 title_memo: RefCell::new(None),
                 header_memo: RefCell::new(None),
+                quant: RefCell::default(),
+                share: Cell::new(super::clamped_share(host.sidebar_share)),
                 modes: Modes::new(),
                 pending: Vec::new(),
                 help: false,
@@ -6358,17 +6528,32 @@ mod tests {
             .expect("the main view was not drawn");
 
         // Side by side, both full height, the stack in its slice of the
-        // width — 0.32 against the main view's 0.68.
+        // width — the config's default share against the main view's rest.
         assert!(stack.size.height > gpui::px(0.0));
         assert!(main.size.height > gpui::px(0.0));
         assert_eq!(stack.origin.y, main.origin.y);
         let width = f32::from(stack.size.width) + f32::from(main.size.width);
         let share = f32::from(stack.size.width) / width;
+        // The default, read through the config path — the same door a saved
+        // `gitten.toml` value arrives by.
+        let expected = observed.read_with(&cx, |_, cx| config::host(cx).sidebar_share);
         assert!(
-            (share - super::chrome::SIDEBAR_SHARE).abs() < 0.01,
-            "the stack took {share} of the width"
+            (share - expected).abs() < 0.01,
+            "the stack took {share} of the width, not the config's {expected}"
         );
+        // And the default is the one `gitten_core` spells: the same number
+        // the parser clamps around.
+        assert_eq!(expected, gitten_core::host::SIDEBAR_SHARE);
         assert_eq!(stack.right(), main.origin.x);
+        // The divider straddles the border it owns: an invisible 5px strip,
+        // centred where the stack hands the window to the diff.
+        let divider = cx
+            .debug_bounds("divider")
+            .expect("the divider was not drawn");
+        assert!(
+            (f32::from(divider.center().x) - f32::from(main.origin.x)).abs() < 3.0,
+            "the divider did not straddle the border"
+        );
 
         // A click moves the keyboard between exactly the two regions. The
         // commit section answers for the whole stack: focusing it puts the
@@ -10057,7 +10242,10 @@ diff --git a/added.txt b/added.txt
 
 #[cfg(test)]
 mod title_tests {
-    use super::{repo_title, section_floor, section_height, SECTION_MIN_H};
+    use super::{
+        quantized, repo_title, section_basis, section_floor, section_height, SECTION_MAX_ROWS,
+        SECTION_MIN_H,
+    };
     use std::path::Path;
 
     #[test]
@@ -10123,6 +10311,67 @@ mod title_tests {
             SECTION_MIN_H,
             "a long list still squeezes to two rows"
         );
+    }
+
+    #[test]
+    fn a_squeezed_section_shows_only_whole_rows() {
+        let row = crate::graph::ROW_H;
+        assert_eq!(
+            quantized(3.5 * row),
+            3.0 * row,
+            "the half row is padded away"
+        );
+        assert_eq!(
+            quantized(2.0 * row),
+            2.0 * row,
+            "a whole multiple is kept exactly"
+        );
+        assert_eq!(quantized(0.5 * row), 0.0, "less than a row shows nothing");
+        assert_eq!(quantized(0.0), 0.0);
+        // Whatever the squeeze, the shown height plus nothing is a whole-row
+        // multiple: the boundary lands between rows, never through a glyph.
+        assert_eq!(quantized(972.4) % row, 0.0);
+    }
+
+    #[test]
+    fn a_share_drag_is_railed_to_the_band() {
+        let lo = gitten_core::host::SIDEBAR_MIN;
+        let hi = gitten_core::host::SIDEBAR_MAX;
+        assert_eq!(super::clamped_share(lo), lo);
+        assert_eq!(super::clamped_share(hi), hi);
+        assert_eq!(
+            super::clamped_share(0.02),
+            lo,
+            "a drag past the edge stops at the rail"
+        );
+        assert_eq!(super::clamped_share(0.9), hi);
+        assert_eq!(
+            super::clamped_share(0.4),
+            0.4,
+            "a drag inside the band lands where the hand put it"
+        );
+    }
+
+    #[test]
+    fn an_unfocused_section_never_exceeds_the_cap() {
+        assert_eq!(
+            section_basis(16, false),
+            section_height(SECTION_MAX_ROWS),
+            "a long list asks for the cap, not its rows"
+        );
+        assert_eq!(
+            section_basis(3, false),
+            section_height(3),
+            "a short list keeps its natural height"
+        );
+        assert_eq!(
+            section_basis(16, true),
+            section_height(16),
+            "the focused section is uncapped"
+        );
+        // And the floor survives the cap: a squeezed section still shows two
+        // whole rows, whatever it asked for.
+        assert!(section_basis(16, false) >= SECTION_MIN_H);
     }
 
     #[test]
