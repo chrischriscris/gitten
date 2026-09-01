@@ -1069,12 +1069,16 @@ impl Screen {
                 }
                 known
             }),
-            // The status pane has no verbs: it says where HEAD is and takes
-            // no commands. Every global still resolves over it — cycling,
-            // the number keys, the pane moves — and a pane-specific verb is
-            // answered by the caller's sentence, the same as a command no
-            // screen owns.
-            Screen::Status { .. } => false,
+            // The status pane's rows are verbs: the shared list vocabulary
+            // moves its cursor, and everything else is said, not swallowed —
+            // the same answer a command no screen owns gets.
+            Screen::Status { view, .. } => view.update(cx, |s, c| {
+                let known = s.run_view(command, host);
+                if known {
+                    c.notify();
+                }
+                known
+            }),
             Screen::Custom(pane) => pane.run(command, host, writes, cx),
         }
     }
@@ -1492,10 +1496,11 @@ impl DevShell {
                 Screen::Branches { view, .. } => view.update(cx, |v, _| v.set_focused(focused)),
                 Screen::Stashes { view, .. } => view.update(cx, |v, _| v.set_focused(focused)),
                 Screen::Commits { view, .. } => view.update(cx, |v, _| v.set_focused(focused)),
-                // The diff draws the cursor for its own rows: it takes focus
-                // through the same seam the sidebar panes do, and no further.
+                // The status pane draws a cursor now, like the diff: both
+                // take focus through the same seam the sidebar panes do.
                 Screen::Diff { view, .. } => view.update(cx, |v, _| v.set_focused(focused)),
-                Screen::Status { .. } | Screen::Custom(_) => {}
+                Screen::Status { view, .. } => view.update(cx, |v, _| v.set_focused(focused)),
+                Screen::Custom(_) => {}
             }
         }
     }
@@ -2534,6 +2539,23 @@ impl DevShell {
         }
     }
 
+    /// `status.run`: the status pane's `enter`. The row the cursor is on
+    /// holds a command *name* — the same registry name a keybinding
+    /// resolves to — and it is handed to the one dispatch below, which
+    /// is the whole proof the rows were commands and not buttons: the
+    /// pane adds no path of its own.
+    fn status_verb(&mut self, cx: &mut Context<Self>) {
+        let Some(Screen::Status { view, .. }) = self.active() else {
+            self.set_notice("status.run is not supported here");
+            return;
+        };
+        let Some(command) = view.read(cx).current() else {
+            return;
+        };
+        let command = command.to_string();
+        self.run_command(&command, cx);
+    }
+
     /// `stashes.apply` / `stashes.pop` / `stashes.drop`: act on the row the
     /// keyboard is on, addressed by its index — which is also why only the
     /// drop asks twice. Apply and pop are recoverable in every direction that
@@ -3441,6 +3463,10 @@ impl DevShell {
             // is git's "no rebase in progress".
             "commits.cherry-pick-abort" => self.cherry_pick_abort_command(cx),
             "commits.cherry-pick-continue" => self.cherry_pick_continue_command(cx),
+
+            // The status pane's enter: the row's own name, run through
+            // this one dispatch — the same door the keymap opens.
+            "status.run" => self.status_verb(cx),
             // The repository-level sync verbs: whatever pane the keyboard
             // sits over, they act on the branch HEAD is on — which is why
             // their keys are globals.
@@ -4649,7 +4675,7 @@ impl Render for DevShell {
                 let rows = match screen {
                     Screen::Files { view, .. } => view.read(cx).rows(),
                     Screen::Branches { view, .. } => view.read(cx).rows(),
-                    Screen::Stashes { view, .. } => view.read(cx).rows(),
+                    Screen::Status { view, .. } => view.read(cx).rows(),
                     _ => 0,
                 };
                 sections.push(
@@ -4975,6 +5001,26 @@ impl Render for DevShell {
             // said here rather than invented for it, because the band is the
             // one place a background something is spoken of.
             .or_else(|| self.loading.get().then(|| "loading diff".into()));
+        // The status pane's running row reads the band's own cell: the line
+        // exactly as the band spells it, paired with the command the job's
+        // name names — a verb job's name is its row. Written, not duplicated:
+        // the pane keeps no timer and no second copy of the sentence.
+        let running_row = self.running.as_ref().and_then(|(label, _)| {
+            let word = label.strip_prefix("running ")?.split(' ').next()?;
+            let command = match word {
+                "pull" => "repo.pull",
+                "push" => "repo.push",
+                "fetch" => "repo.fetch",
+                _ => return None,
+            };
+            running
+                .clone()
+                .map(|text| (SharedString::from(command), text))
+        });
+        if let Some(Screen::Status { view, .. }) = self.panes.get("status") {
+            let view = view.clone();
+            view.update(cx, |v, _| v.running = running_row);
+        }
         let input = self.input.clone();
 
         // The one focusable element in the window, and where key dispatch enters
@@ -6931,7 +6977,13 @@ mod tests {
             .expect("no branches section");
         let stashes = cx.debug_bounds("side-stashes").expect("no stashes section");
         let natural = gpui::px(super::section_height(0));
-        assert_eq!(status.size.height, natural, "an empty section is one row");
+        // The status pane is content-sized like the rest, but its content is
+        // the fact row plus its three verbs — four rows, not the empty one.
+        assert_eq!(
+            status.size.height,
+            gpui::px(super::section_height(4)),
+            "the status section is sized for its rows"
+        );
         assert_eq!(files.size.height, natural);
         assert_eq!(branches.size.height, natural);
         assert_eq!(stashes.size.height, natural);
@@ -10006,6 +10058,83 @@ diff --git a/added.txt b/added.txt
                 }
             }
         });
+    }
+
+    // --------------------------------------------------- the status pane
+
+    /// A shell with the status pane registered and holding the keyboard, the
+    /// repository recording behind it. The pane needs no tree: its fact row
+    /// says "no branch" and its verbs do not read one.
+    fn status_shell(cx: &mut TestAppContext) -> (gpui::Entity<DevShell>, Arc<RecordingRepo>) {
+        let calls = Arc::default();
+        let repo = Arc::new(RecordingRepo::new(Arc::clone(&calls)));
+        let handle: gitten_git::Handle = repo.clone();
+        let shell = shell(None, cx);
+        shell.update(cx, |shell, cx| {
+            let host = config::host(cx);
+            let branches = cx.new(|_| {
+                crate::views::branches::Branches::from_prepared(crate::views::branches::prepare(
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                    Vec::new(),
+                    &host.theme,
+                    "recorded",
+                ))
+            });
+            shell.panes.register(
+                "status",
+                Screen::status(
+                    cx.new(|_| crate::views::status::Status::new("recorded", Some(branches))),
+                    "recorded",
+                ),
+            );
+            shell.sync_modes(cx);
+            shell.repo = Some((PathBuf::from("/recorded"), handle));
+            cx.set_global(config::Active(Rc::new(Host::new())));
+        });
+        (shell, repo)
+    }
+
+    #[gpui::test]
+    fn the_status_pane_dispatches_its_rows_through_the_one_door(cx: &mut TestAppContext) {
+        let (shell, repo) = status_shell(cx);
+
+        // The keycap's promise is real: `enter` resolves in the pane's own
+        // mode, to a command, through the same map every other pane's keys do.
+        shell.read_with(cx, |shell, cx| {
+            let mut modes = Modes::new();
+            modes.push(panes::MODE);
+            modes.push(crate::views::status::MODE);
+            assert_eq!(
+                config::host(cx)
+                    .keys
+                    .resolve(&modes, &[Key::plain(Code::Enter)]),
+                Resolve::Run("status.run"),
+                "enter did not resolve in the status mode"
+            );
+            assert_eq!(shell.modes.top(), crate::views::status::MODE);
+        });
+
+        // The cursor starts on pull; enter dispatches the row's *name* —
+        // the same dispatch a keypress resolves to — and the fake repo
+        // records the pull.
+        shell.update(cx, |shell, cx| shell.run_command("status.run", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["pull"]);
+
+        // j moves onto push, and enter runs that too.
+        shell.update(cx, |shell, cx| shell.run_command("view.down", cx));
+        shell.update(cx, |shell, cx| shell.run_command("status.run", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["pull", "push origin main"]);
+
+        // The globals still reach the same commands from anywhere: this pane
+        // is a second door, not a replacement — which is the proof they were
+        // commands all along.
+        shell.update(cx, |shell, cx| shell.run_command("repo.pull", cx));
+        pump_write(&shell, cx);
+        assert_eq!(repo.wrote(), vec!["pull", "push origin main", "pull"]);
     }
 
     // ------------------------------------------------------- the sync verbs
