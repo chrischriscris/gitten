@@ -2,9 +2,8 @@
 
 Passes so far, and pass 8 open (037–044, the 2026-08-31 UI re-audit wave,
 planned against `origin/full/full` `635aba8`); pass 9 (045–059, the GUI
-design review) lives in `plans/high-priority/` with its own index — its
-executed plans (and every plan below marked DONE/MERGED) are archived in
-`plans/done/` as of 2026-08-31:
+design review) ran the same day — its status table is below, its plan files
+are archived in `plans/done/` alongside every plan marked DONE/MERGED here:
 
 - **Pass 1** (2026-08-24, audited at `3a8b347`): plans 001–007. All landed on
   main and merged — verified 2026-08-26 against `2dfcb82`
@@ -96,10 +95,28 @@ executed plans (and every plan below marked DONE/MERGED) are archived in
   figures are the repo's own or recomputed with its methodology. Maintainer
   selected findings 1–8 + 10 of the presented table; 042 bundles three
   one-site fixes; reflog/undo declined as a direction option this wave.
-- **Pass 9** (2026-08-31, the GUI design review): plans 045–059 in
-  `plans/high-priority/`, written by two advisor sessions in parallel and
-  reconciled; that folder's README is their index, base convention and
-  dispatch order. Excludes everything passes 7–8 already own.
+- **Pass 9** (2026-08-31, the GUI design review): plans 045–059, written by two
+  advisor sessions in parallel and reconciled; excludes everything passes 7–8
+  already own. Executed in three waves the same day; the withdrawn 056's file
+  held its STOP rationale. Status (plan files in `plans/done/`):
+
+| Plan | Status |
+|---|---|
+| 045 | MERGED (#40, test fix #41) |
+| 046 | MERGED (#42) |
+| 047 | MERGED (#38) |
+| 048 | MERGED (#43) |
+| 049 | MERGED (#37) |
+| 050 | MERGED (#48) |
+| 051 | MERGED (#47) |
+| 052 | MERGED (#44) |
+| 053 | MERGED (#39 items 2–8, #46 item 1; items 3 and 7's branches.rs bullet no-ops on the merged base) |
+| 054 | MERGED (#35) |
+| 055 | MERGED (#45) |
+| 056 | DROPPED — withdrawn by the owner 2026-08-31. Executor STOP condition: the uniform-gutter fix reverses the trunk-readability decision at commits.rs:755-758 (the subject follows its own row's graph so a trunk commit reads from the left). Per-row width stands. |
+| 057 | MERGED (#49) |
+| 058 | MERGED (#50) |
+| 059 | MERGED (#36) |
 
 ## Pass 4 follow-ups — surfaced by reviewers, recorded not folded
 
