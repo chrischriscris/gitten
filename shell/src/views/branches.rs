@@ -674,6 +674,25 @@ impl Branches {
         true
     }
 
+    /// Where a click lands the keyboard: onto the row the mouse hit, with
+    /// exactly the side effects a key move has — see [`Self::run_view`]. The
+    /// row clamps like [`Viewport::go_to`] does, and a heading snaps forward —
+    /// the nearest selectable row below, the way a key steps off one.
+    pub fn select_row(&mut self, index: usize, host: &Host) {
+        self.reconcile(host);
+        let mut v = self.live_view(host);
+        v.go_to(index);
+        let settled = settle(&self.data, v.cursor(), 1);
+        if settled != v.cursor() {
+            v.go_to(settled);
+        }
+        // The mouse moved — whatever was armed was armed to what the mouse
+        // used to be on.
+        self.armed = None;
+        self.view.set(v);
+        self.show(v);
+    }
+
     fn show(&self, v: Viewport) {
         let target = v.top();
         if self.scroll.0.borrow().deferred_scroll_to_item.is_some() {
@@ -788,6 +807,10 @@ impl Render for Branches {
                 .position(|r| row_target(r).as_ref() == Some(target))
         });
         let focused = self.focused;
+        // A click on a row is the keyboard coming back — see [`Self::select_row`].
+        // Built as a plain handle, not `cx.listener`: the rows are drawn in the
+        // list's closure over `&mut App`, where no listener can be minted.
+        let this = cx.entity().downgrade();
         let list = uniform_list("branches", data.len(), move |range, _, cx| {
             rendered.set(range.len());
             let host = crate::config::host(cx);
@@ -804,7 +827,24 @@ impl Render for Branches {
             }
             let cursor = view.get().cursor();
             range
-                .map(|i| row(&data[i], &host, i == cursor, focused, Some(i) == armed))
+                .map(|i| {
+                    let r = row(&data[i], &host, i == cursor, focused, Some(i) == armed);
+                    if row_target(&data[i]).is_some() {
+                        let this = this.clone();
+                        return r
+                            .id(("row", i))
+                            .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, _, cx| {
+                                let Some(this) = this.upgrade() else { return };
+                                let host = crate::config::host(cx);
+                                this.update(cx, |b, cx| {
+                                    b.select_row(i, &host);
+                                    cx.notify();
+                                });
+                            })
+                            .into_any_element();
+                    }
+                    r.into_any_element()
+                })
                 .collect()
         })
         .track_scroll(&self.scroll)
@@ -837,7 +877,7 @@ impl Render for Branches {
 /// distance out of the pane, because `↑2` is the fact a narrow sidebar is
 /// being glanced at for and a name's tail is not. A heading is
 /// [`chrome::section_label`] and never the cursor's — see [`settle`].
-fn row(e: &Row, host: &Host, current: bool, focused: bool, armed: bool) -> AnyElement {
+fn row(e: &Row, host: &Host, current: bool, focused: bool, armed: bool) -> Div {
     let ch = host.font.char_width();
     let c = host.theme.chrome;
     // The dot was decided beside the text, at flatten; the draw only paints
@@ -861,7 +901,6 @@ fn row(e: &Row, host: &Host, current: bool, focused: bool, armed: bool) -> AnyEl
     match e {
         Row::Heading { count, section } => {
             chrome::section_label(host, section.label().into(), Some(count.clone()), ROW_H)
-                .into_any_element()
         }
         Row::Detached { dot: d, text } => chrome::list_row(host, current, focused, ROW_H)
             .child(dot(d))
@@ -872,8 +911,7 @@ fn row(e: &Row, host: &Host, current: bool, focused: bool, armed: bool) -> AnyEl
                 } else {
                     c.dim
                 }),
-            ))
-            .into_any_element(),
+            )),
         Row::Local(l) => chrome::list_row(host, current, focused, ROW_H)
             .child(dot(&l.dot))
             .child(name(l.name_text.clone(), None))
@@ -914,8 +952,7 @@ fn row(e: &Row, host: &Host, current: bool, focused: bool, armed: bool) -> AnyEl
                         }),
                     }))
                     .child(text)
-            }))
-            .into_any_element(),
+            })),
         Row::Remote(r) => chrome::list_row(host, current, focused, ROW_H)
             .child(dot(&r.dot))
             .child(name(
@@ -925,8 +962,7 @@ fn row(e: &Row, host: &Host, current: bool, focused: bool, armed: bool) -> AnyEl
                 } else {
                     c.dim
                 }),
-            ))
-            .into_any_element(),
+            )),
     }
 }
 
@@ -1579,5 +1615,46 @@ mod tests {
         assert_eq!(super::settle(&only, 0, 1), 0);
         assert_eq!(super::settle(&only, 0, -1), 0);
         assert_eq!(super::settle(&[], 0, 1), 0);
+    }
+
+    #[test]
+    fn a_click_moves_the_cursor_to_the_row_it_hit_and_disarms_a_delete() {
+        let host = Host::new();
+        let mut b = Branches::from_prepared(prepare(
+            vec![local("feature", false), local("main", true)],
+            Vec::new(),
+            None,
+            &host.theme,
+            "",
+        ));
+        b.rendered.set(3);
+        let mut v = b.view.get();
+        v.set_len(b.data.len());
+        v.set_height(3);
+        b.view.set(v);
+
+        // The keyboard opens on `feature`, past the heading. A click on
+        // `main` — row 2 — is a place: the cursor lands there.
+        b.select_row(2, &host);
+        assert_eq!(
+            b.view.get().cursor(),
+            2,
+            "the keyboard is on the clicked row"
+        );
+
+        // And the click is a cursor move like any other: an armed delete dies.
+        let target = b.current().expect("a branch under the keyboard");
+        assert!(!b.confirm_or_arm_delete(&target));
+        assert_eq!(b.armed_row(), Some(target.clone()));
+
+        // A click on the heading — row 0 — selects nothing: the cursor snaps
+        // to the nearest selectable row below, and the question stays gone.
+        b.select_row(0, &host);
+        assert_eq!(b.armed_row(), None, "the click disarms the question");
+        assert_eq!(
+            b.view.get().cursor(),
+            1,
+            "the cursor never rests on a heading"
+        );
     }
 }

@@ -597,6 +597,22 @@ impl Files {
         true
     }
 
+    /// Where a click lands the keyboard: onto the row the mouse hit, with
+    /// exactly the side effects a key move has — see [`Self::run_view`]. The
+    /// row clamps like [`Viewport::go_to`] does, and a heading snaps to the
+    /// nearest selectable row below, the same rule the keyboard runs.
+    pub fn select_row(&mut self, index: usize, host: &Host) {
+        self.reconcile(host);
+        let mut v = self.live_view(host);
+        v.go_to(index);
+        settle(&self.data, &mut v, index);
+        // The mouse moved — whatever was armed was armed to what the mouse
+        // used to be on.
+        self.armed = None;
+        self.view.set(v);
+        self.show(v);
+    }
+
     /// Puts row `v.top()` at the top of the viewport, exactly — see
     /// [`super::commits::Commits::show`].
     fn show(&self, v: Viewport) {
@@ -715,6 +731,10 @@ impl Render for Files {
             return empty_line(&crate::config::host(cx), "working tree clean".into());
         }
 
+        // A click on a row is the keyboard coming back — see [`Self::select_row`].
+        // Built as a plain handle, not `cx.listener`: the rows are drawn in the
+        // list's closure over `&mut App`, where no listener can be minted.
+        let this = cx.entity().downgrade();
         let data = self.data.clone();
         let rendered = self.rendered.clone();
         let view = self.view.clone();
@@ -745,7 +765,24 @@ impl Render for Files {
             }
             let cursor = view.get().cursor();
             range
-                .map(|i| row(&data[i], &host, i == cursor, focused, Some(i) == armed))
+                .map(|i| {
+                    let r = row(&data[i], &host, i == cursor, focused, Some(i) == armed);
+                    if selectable(&data, i) {
+                        let this = this.clone();
+                        return r
+                            .id(("row", i))
+                            .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, _, cx| {
+                                let Some(this) = this.upgrade() else { return };
+                                let host = crate::config::host(cx);
+                                this.update(cx, |f, cx| {
+                                    f.select_row(i, &host);
+                                    cx.notify();
+                                });
+                            })
+                            .into_any_element();
+                    }
+                    r.into_any_element()
+                })
                 .collect()
         })
         .track_scroll(&self.scroll)
@@ -774,13 +811,12 @@ impl Render for Files {
 /// `armed` tints the letters and the path toward `chrome.error`, so the thing
 /// a second press will destroy is named by its own colour and not only by the
 /// band above it.
-fn row(e: &Entry, host: &Host, current: bool, focused: bool, armed: bool) -> AnyElement {
+fn row(e: &Entry, host: &Host, current: bool, focused: bool, armed: bool) -> Div {
     let ch = host.font.char_width();
     let c = host.theme.chrome;
     match e {
         Entry::Heading { count, section } => {
             section_label(host, section.label().into(), Some(count.clone()), ROW_H)
-                .into_any_element()
         }
         Entry::File(f) => list_row(host, current, focused, ROW_H)
             .child(
@@ -835,8 +871,7 @@ fn row(e: &Entry, host: &Host, current: bool, focused: bool, armed: bool) -> Any
                     // so quiet, not invisible: through `quiet_on`.
                     .text_color(rgb(host.theme.quiet_on(c.bg)))
                     .child(old.clone())
-            }))
-            .into_any_element(),
+            })),
     }
 }
 
@@ -1521,6 +1556,53 @@ mod tests {
         assert_eq!(
             discard_question(Section::Unstaged, "src/x.rs"),
             "discard src/x.rs? press again to confirm"
+        );
+    }
+
+    #[test]
+    fn a_click_moves_the_cursor_to_the_row_it_hit() {
+        let host = Host::new();
+        let mut f = files(sample_status());
+        with_height(&mut f, 20);
+
+        // Row 2 is the second staged file, under row 0's heading. The click
+        // is a place: the keyboard lands there, whatever it believed before.
+        f.select_row(2, &host);
+        assert_eq!(
+            f.view.get().cursor(),
+            2,
+            "the keyboard is on the clicked row"
+        );
+        assert_eq!(
+            f.current_file()
+                .map(|f| f.path.to_string_lossy().into_owned()),
+            Some("gone.txt".into()),
+            "the clicked file is the one under the keyboard"
+        );
+    }
+
+    #[test]
+    fn a_click_on_a_section_label_selects_nothing_and_a_click_disarms_a_question() {
+        let host = Host::new();
+        let mut f = files(sample_status());
+        with_height(&mut f, 20);
+
+        // Arm a discard of the first staged file, row 1 (row 0 is the heading).
+        let path = match &f.data[1] {
+            Entry::File(file) => file.path.clone(),
+            _ => unreachable!("row 1 is a file"),
+        };
+        assert!(!f.confirm_or_arm_discard(Section::Staged, &path));
+        assert!(f.armed_row().is_some(), "armed before the click");
+
+        // A click on the heading — row 0 — selects nothing: the cursor snaps
+        // to the nearest selectable row below, and the question is gone.
+        f.select_row(0, &host);
+        assert_eq!(f.armed_row(), None, "the click disarms the question");
+        assert_eq!(
+            f.view.get().cursor(),
+            1,
+            "the cursor snaps to the nearest selectable row below"
         );
     }
 }

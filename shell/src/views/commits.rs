@@ -307,6 +307,20 @@ impl Commits {
         true
     }
 
+    /// Where a click lands the keyboard: onto the row the mouse hit, with
+    /// exactly the side effects a key move has — see [`Self::run_view`]. The
+    /// row clamps like [`Viewport::go_to`] does; this list has no headings.
+    pub fn select_row(&mut self, index: usize, host: &Host) {
+        self.reconcile(host);
+        let mut v = self.live_view(host);
+        v.go_to(index);
+        // The mouse moved — whatever was armed was armed to what the mouse
+        // used to be on.
+        self.armed = None;
+        self.view.set(v);
+        self.show(v);
+    }
+
     /// Puts row `v.top()` at the top of the viewport, exactly. If the list still
     /// has a deferred position, its geometry is not current yet; replace that
     /// target instead of clamping against stale bounds.
@@ -678,6 +692,10 @@ impl Render for Commits {
             .as_ref()
             .and_then(|sha| visible.iter().position(|i| data.commits[*i].sha == *sha));
         let focused = self.focused;
+        // A click on a row is the keyboard coming back — see [`Self::select_row`].
+        // Built as a plain handle, not `cx.listener`: the rows are drawn in the
+        // list's closure over `&mut App`, where no listener can be minted.
+        let this = cx.entity().downgrade();
         let list = uniform_list("commits", visible.len(), move |range, _, cx| {
             rendered.set(range.len());
             top.set(range.start);
@@ -700,6 +718,7 @@ impl Render for Commits {
                     // `visible` is ascending into the full vec, so the arrays
                     // derived at load index directly by it.
                     let c = visible[i];
+                    let this = this.clone();
                     row(
                         c,
                         &data,
@@ -709,6 +728,16 @@ impl Render for Commits {
                         focused,
                         Some(i) == armed,
                     )
+                    .id(("row", i))
+                    .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, _, cx| {
+                        let Some(this) = this.upgrade() else { return };
+                        let host = crate::config::host(cx);
+                        this.update(cx, |v, cx| {
+                            v.select_row(i, &host);
+                            cx.notify();
+                        });
+                    })
+                    .into_any_element()
                 })
                 .collect()
         })
@@ -888,7 +917,7 @@ fn row(
     current: bool,
     focused: bool,
     armed: bool,
-) -> AnyElement {
+) -> Div {
     // Every per-commit answer indexes straight into what load derived — see
     // `visible`'s comment: no lookup, no hashing, one array read each.
     let c = &data.commits[i];
@@ -964,7 +993,6 @@ fn row(
                 }))
                 .child(time.clone()),
         )
-        .into_any_element()
 }
 
 #[cfg(test)]
@@ -1604,5 +1632,29 @@ mod tests {
         assert!(!c.confirm_or_arm_reset(&sha0));
         c.apply_query("engine");
         assert!(!armed(&c), "a changed query disarmed");
+    }
+
+    #[test]
+    fn a_click_moves_the_cursor_to_the_row_it_hit() {
+        let host = Rc::new(Host::new());
+        let mut c = Commits::new(commits(100), host.clone());
+        with_height(&mut c, 20);
+
+        // Deep in the history, not where the keyboard happened to be: the
+        // click is a place, and the list follows the model the way a key
+        // move does.
+        c.select_row(42, &host);
+        assert_eq!(
+            c.view.get().cursor(),
+            42,
+            "the keyboard is on the clicked row"
+        );
+
+        // The list was written back to meet the model, so they agree.
+        let v = c.view.get();
+        assert!(
+            v.top() <= 42 && 42 < v.top() + 20,
+            "the clicked row is visible"
+        );
     }
 }
