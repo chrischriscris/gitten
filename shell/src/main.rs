@@ -4518,7 +4518,7 @@ impl Render for DevShell {
                 div()
                     .id("sidebar")
                     .flex_none()
-                    .w(relative(chrome::SIDEBAR_SHARE))
+                    .w(relative(host.sidebar_share))
                     .min_h_0()
                     .flex()
                     .flex_col()
@@ -6459,16 +6459,22 @@ mod tests {
             .expect("the main view was not drawn");
 
         // Side by side, both full height, the stack in its slice of the
-        // width — 0.32 against the main view's 0.68.
+        // width — the config's default share against the main view's rest.
         assert!(stack.size.height > gpui::px(0.0));
         assert!(main.size.height > gpui::px(0.0));
         assert_eq!(stack.origin.y, main.origin.y);
         let width = f32::from(stack.size.width) + f32::from(main.size.width);
         let share = f32::from(stack.size.width) / width;
+        // The default, read through the config path — the same door a saved
+        // `gitten.toml` value arrives by.
+        let expected = observed.read_with(&cx, |_, cx| config::host(cx).sidebar_share);
         assert!(
-            (share - super::chrome::SIDEBAR_SHARE).abs() < 0.01,
-            "the stack took {share} of the width"
+            (share - expected).abs() < 0.01,
+            "the stack took {share} of the width, not the config's {expected}"
         );
+        // And the default is the one `gitten_core` spells: the same number
+        // the parser clamps around.
+        assert_eq!(expected, gitten_core::host::SIDEBAR_SHARE);
         assert_eq!(stack.right(), main.origin.x);
 
         // A click moves the keyboard between exactly the two regions. The
