@@ -1014,14 +1014,15 @@ mod tests {
             ]
         );
         // The dots say what every row is: HEAD's branch alone wears the
-        // accent, another local keeps the lane ink for its place among the
-        // locals, and a fetched copy draws hollow and faint.
+        // accent, another local keeps the lane ink keyed by its name — the
+        // one thing a refresh never moves — and a fetched copy draws hollow
+        // and faint.
         match (&rows[1], &rows[2]) {
             (Row::Local(feature), Row::Local(main)) => {
                 assert_eq!(
                     feature.dot.color,
-                    t.lane(0),
-                    "the first local takes the first lane ink"
+                    t.name_lane(b"feature"),
+                    "a local's ink follows its name"
                 );
                 assert_eq!(
                     main.dot.color, t.chrome.accent,
