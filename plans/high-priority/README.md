@@ -72,6 +72,10 @@ Status tracking: update the table below, not the top-level
 `plans/README.md` (it is mid-edit by the owner; the owner will fold this
 pass into it).
 
+The fourteen executed plans moved to `plans/done/` on 2026-08-31 (the PR
+numbers below are the record); 056 stays here — it is the DROPPED entry and
+its file holds the STOP rationale.
+
 | Plan | Status |
 |---|---|
 | 045 | MERGED (#40, test fix #41) |

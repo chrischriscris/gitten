@@ -2,7 +2,9 @@
 
 Passes so far, and pass 8 open (037–044, the 2026-08-31 UI re-audit wave,
 planned against `origin/full/full` `635aba8`); pass 9 (045–059, the GUI
-design review) lives in `plans/high-priority/` with its own index:
+design review) lives in `plans/high-priority/` with its own index — its
+executed plans (and every plan below marked DONE/MERGED) are archived in
+`plans/done/` as of 2026-08-31:
 
 - **Pass 1** (2026-08-24, audited at `3a8b347`): plans 001–007. All landed on
   main and merged — verified 2026-08-26 against `2dfcb82`
