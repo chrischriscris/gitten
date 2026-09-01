@@ -111,6 +111,26 @@ pub trait Differ: Send + Sync {
     fn name(&self) -> &'static str;
 
     fn diff(&self, path: &str, old: &[Arc<str>], new: &[Arc<str>]) -> Vec<Edit>;
+
+    /// The same answer as [`Differ::diff`], for a caller that has already
+    /// interned the keys. `ids` are dense from zero and equal exactly when the
+    /// keys are, so an implementation whose inner loops compare lines can skip a
+    /// hash pass the caller has already paid for.
+    ///
+    /// The default ignores them, which is the right answer for an implementation
+    /// that needs the text itself — a semantic differ reads words, not numbers.
+    /// Overriding this is an optimisation and never a change of answer: both
+    /// methods must return the same edit script for the same input.
+    fn diff_interned(
+        &self,
+        path: &str,
+        old: &[Arc<str>],
+        new: &[Arc<str>],
+        ids: (&[u32], &[u32]),
+    ) -> Vec<Edit> {
+        let _ = ids;
+        self.diff(path, old, new)
+    }
 }
 
 /// Every line replaced by a number, so the inner loops compare `u32`s.
@@ -225,6 +245,19 @@ impl Differ for Histogram {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .diffed(old, new, Some(MAX_ANCHOR_OCCURRENCES))
     }
+
+    fn diff_interned(
+        &self,
+        _path: &str,
+        _old: &[Arc<str>],
+        _new: &[Arc<str>],
+        ids: (&[u32], &[u32]),
+    ) -> Vec<Edit> {
+        self.scratch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .diffed_ids(ids.0, ids.1, Some(MAX_ANCHOR_OCCURRENCES))
+    }
 }
 
 impl Differ for Patience {
@@ -238,6 +271,19 @@ impl Differ for Patience {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .diffed(old, new, Some(1))
     }
+
+    fn diff_interned(
+        &self,
+        _path: &str,
+        _old: &[Arc<str>],
+        _new: &[Arc<str>],
+        ids: (&[u32], &[u32]),
+    ) -> Vec<Edit> {
+        self.scratch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .diffed_ids(ids.0, ids.1, Some(1))
+    }
 }
 
 impl Differ for Myers {
@@ -250,6 +296,19 @@ impl Differ for Myers {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .diffed(old, new, None)
+    }
+
+    fn diff_interned(
+        &self,
+        _path: &str,
+        _old: &[Arc<str>],
+        _new: &[Arc<str>],
+        ids: (&[u32], &[u32]),
+    ) -> Vec<Edit> {
+        self.scratch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .diffed_ids(ids.0, ids.1, None)
     }
 }
 
@@ -369,7 +428,6 @@ impl Ctx {
     /// buffers, then run the search on them. `Some(max)` anchors with that
     /// rarity threshold, `None` runs plain Myers.
     fn diffed(&mut self, old: &[Arc<str>], new: &[Arc<str>], max: Option<u32>) -> Vec<Edit> {
-        self.begin_file();
         // One map over both sides; keys borrow the caller's handles and die with
         // this call, which is why the map cannot live in `Ctx`.
         //
@@ -383,15 +441,22 @@ impl Ctx {
         let a = std::mem::take(&mut self.ids_old);
         number(&mut map, new, &mut self.ids_new);
         let b = std::mem::take(&mut self.ids_new);
-
-        let mut out = Vec::new();
-        match max {
-            Some(max) => self.anchored(&a, &b, max, &mut out),
-            None => self.myers(&a, &b, Region::whole(&a, &b), &mut out),
-        }
+        let out = self.diffed_ids(&a, &b, max);
         // Handed back rather than dropped: the next file starts at full size.
         self.ids_old = a;
         self.ids_new = b;
+        out
+    }
+
+    /// The search itself, over ids the caller supplies. `diffed` is this with an
+    /// interning pass in front of it.
+    fn diffed_ids(&mut self, a: &[u32], b: &[u32], max: Option<u32>) -> Vec<Edit> {
+        self.begin_file();
+        let mut out = Vec::new();
+        match max {
+            Some(max) => self.anchored(a, b, max, &mut out),
+            None => self.myers(a, b, Region::whole(a, b), &mut out),
+        }
         out
     }
 
@@ -985,23 +1050,31 @@ impl Whitespace {
         }
     }
 
-    /// Handles to every line's form under this relation, interned through
-    /// `arena`: equal text shares one allocation, so a line costs a refcount
-    /// bump and not a copy. Equal handles if and only if equal under this
-    /// relation, because the arena interns by content.
-    fn keys(self, lines: &[Arc<str>], arena: &mut KeyArena, out: &mut Vec<Arc<str>>) {
+    /// Handles and dense ids for every line's form under this relation,
+    /// interned through `arena`. Equal text shares one allocation and one id.
+    fn keys(
+        self,
+        lines: &[Arc<str>],
+        arena: &mut KeyArena,
+        out: &mut Vec<Arc<str>>,
+        ids: &mut Vec<u32>,
+    ) {
         match self {
             Whitespace::Exact => {}
             _ => {
                 out.clear();
                 out.reserve(lines.len());
+                ids.clear();
+                ids.reserve(lines.len());
                 // Taken out so `intern` can touch the arena while the scratch
                 // is borrowed; handed back afterwards.
                 let mut norm = std::mem::take(&mut arena.norm);
                 for line in lines {
                     norm.clear();
                     self.normalize(line, &mut norm);
-                    out.push(arena.intern(&norm));
+                    let (id, key) = arena.intern(&norm);
+                    ids.push(id);
+                    out.push(key);
                 }
                 arena.norm = norm;
             }
@@ -1034,23 +1107,24 @@ struct KeyArena {
 }
 
 impl KeyArena {
-    /// The handle for `key`'s content, inserting it when new. The bytes are
-    /// copied once, into the handle — every later equal key borrows that one.
-    fn intern(&mut self, key: &str) -> Arc<str> {
+    /// The id and handle for `key`'s content, inserting it when new. Ids are
+    /// dense from zero and equal exactly when the content is, which is what lets
+    /// a differ compare `u32`s without hashing the text a second time.
+    fn intern(&mut self, key: &str) -> (u32, Arc<str>) {
         let mut hasher = crate::FxHasher::default();
         hasher.write(key.as_bytes());
         let hash = hasher.finish();
         if let Some(ids) = self.buckets.get(&hash) {
             for &id in ids {
                 if &*self.keys[id as usize] == key {
-                    return Arc::clone(&self.keys[id as usize]);
+                    return (id, Arc::clone(&self.keys[id as usize]));
                 }
             }
         }
         let id = self.keys.len() as u32;
         self.keys.push(Arc::from(key));
         self.buckets.entry(hash).or_default().push(id);
-        Arc::clone(&self.keys[id as usize])
+        (id, Arc::clone(&self.keys[id as usize]))
     }
 }
 
@@ -1852,18 +1926,19 @@ impl Differs {
         match ws {
             // Byte-for-byte: the lines themselves are the keys, and their
             // handles are already shared.
-            Whitespace::Exact => self.assemble(path, differ, old, new, old, new),
+            Whitespace::Exact => self.assemble(path, differ, old, new, old, new, None),
             _ => {
-                // Normalised once per file into interned handles; what every
-                // stage below compares are those, equal exactly when the
-                // relation says so. See docs/measurements.md on what `-w` used
-                // to cost.
+                // Normalised once per file into interned handles and ids; what
+                // every stage below compares are those, equal exactly when the
+                // relation says so.
                 let mut arena = KeyArena::default();
                 let (mut ko, mut kn) =
                     (Vec::with_capacity(old.len()), Vec::with_capacity(new.len()));
-                ws.keys(old, &mut arena, &mut ko);
-                ws.keys(new, &mut arena, &mut kn);
-                self.assemble(path, differ, old, new, &ko, &kn)
+                let (mut ido, mut idn) =
+                    (Vec::with_capacity(old.len()), Vec::with_capacity(new.len()));
+                ws.keys(old, &mut arena, &mut ko, &mut ido);
+                ws.keys(new, &mut arena, &mut kn, &mut idn);
+                self.assemble(path, differ, old, new, &ko, &kn, Some((&ido, &idn)))
             }
         }
     }
@@ -1892,8 +1967,15 @@ impl Differs {
         new: &[Arc<str>],
         keys_old: &[Arc<str>],
         keys_new: &[Arc<str>],
+        ids: Option<(&[u32], &[u32])>,
     ) -> FileDiff {
-        let mut edits = differ.diff(path, keys_old, keys_new);
+        // Ids when the caller interned them — the whitespace relations do,
+        // because normalising a line is already a pass over it. `Exact` has
+        // nothing interned yet and the differ does its own.
+        let mut edits = match ids {
+            Some(ids) => differ.diff_interned(path, keys_old, keys_new, ids),
+            None => differ.diff(path, keys_old, keys_new),
+        };
         if self.indent_heuristic {
             // Both: readability is scored against the text a reader will see, and
             // whether a slide is possible at all is decided by the relation. Two
@@ -2014,6 +2096,76 @@ mod tests {
             verify(&old, &new, &edits);
             assert!(!edits.is_empty(), "{} found no change", d.name());
         }
+    }
+
+    #[test]
+    fn built_in_interned_and_text_paths_agree() {
+        let old = lines("start\nrepeat\nold\nrepeat\nend\n");
+        let new = lines("start\nrepeat\nnew\ninsert\nrepeat\nend\n");
+        let ids = intern(&old, &new);
+        for differ in all() {
+            assert_eq!(
+                differ.diff("x", &old, &new),
+                differ.diff_interned("x", &old, &new, (&ids.0, &ids.1)),
+                "{}",
+                differ.name()
+            );
+        }
+    }
+
+    #[test]
+    fn a_default_differ_ignores_ids() {
+        struct Text;
+        impl Differ for Text {
+            fn name(&self) -> &'static str {
+                "text"
+            }
+
+            fn diff(&self, _path: &str, _old: &[Arc<str>], _new: &[Arc<str>]) -> Vec<Edit> {
+                vec![Edit {
+                    old_start: 0,
+                    old_end: 1,
+                    new_start: 0,
+                    new_end: 1,
+                }]
+            }
+        }
+
+        let old = lines("old");
+        let new = lines("new");
+        assert_eq!(
+            Text.diff("x", &old, &new),
+            Text.diff_interned("x", &old, &new, (&[0], &[0]))
+        );
+    }
+
+    #[test]
+    fn whitespace_keys_and_ids_agree() {
+        let source = lines("a  b\na b\na\tb\ntrailing \ntrailing\n");
+        for ws in [Whitespace::Trailing, Whitespace::Change, Whitespace::All] {
+            let mut arena = KeyArena::default();
+            let (mut keys, mut ids) = (Vec::new(), Vec::new());
+            ws.keys(&source, &mut arena, &mut keys, &mut ids);
+            assert_eq!(ids.len(), source.len());
+            for i in 0..source.len() {
+                for j in 0..source.len() {
+                    assert_eq!(ids[i] == ids[j], keys[i] == keys[j], "{ws:?}: {i}, {j}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn whitespace_ids_are_shared_across_both_sides() {
+        let old = lines("left\nshared  line\n");
+        let new = lines("shared line\nright\n");
+        let mut arena = KeyArena::default();
+        let (mut old_keys, mut new_keys) = (Vec::new(), Vec::new());
+        let (mut old_ids, mut new_ids) = (Vec::new(), Vec::new());
+        Whitespace::Change.keys(&old, &mut arena, &mut old_keys, &mut old_ids);
+        Whitespace::Change.keys(&new, &mut arena, &mut new_keys, &mut new_ids);
+        assert_eq!(old_keys[1], new_keys[0]);
+        assert_eq!(old_ids[1], new_ids[0]);
     }
 
     #[test]

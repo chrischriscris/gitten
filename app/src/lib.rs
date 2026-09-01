@@ -52,6 +52,7 @@
 //! knowing what a row looks like, it has moved to the wrong crate.
 
 pub mod acquire;
+pub mod act;
 pub mod cli;
 pub mod config;
 pub mod jobs;

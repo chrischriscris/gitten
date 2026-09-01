@@ -47,7 +47,7 @@ use gitten_core::differ::Overrides;
 use gitten_core::host::Host;
 use gitten_core::runs::Run;
 use gitten_core::Hunk;
-use gitten_tui::branches::{self, delete_question, Branches, Marks, Target};
+use gitten_tui::branches::{self, Branches, Marks, Target};
 use gitten_tui::commits::{Commits, Glyphs};
 use gitten_tui::diff::Diff;
 use gitten_tui::files::{self, Files};
@@ -1793,44 +1793,7 @@ impl App {
         if !self.branches_focused("branches.delete") {
             return;
         }
-        let Some(target) = self.branch_target() else {
-            self.message = "nothing selected to delete".into();
-            return;
-        };
-        let shown = match &target {
-            Target::Local(name) => name.to_string_lossy().into_owned(),
-            Target::Remote { remote, branch } => {
-                format!("{}/{}", remote.to_string_lossy(), branch.to_string_lossy())
-            }
-            Target::Detached => {
-                self.message = "a detached HEAD is not a branch".into();
-                return;
-            }
-        };
-        if matches!(target, Target::Remote { .. }) {
-            self.message =
-                "a remote branch is its remote's to delete — fetch prunes it here".into();
-            return;
-        }
-        let Some((_, repo)) = self.repo.as_ref() else {
-            self.message = "a fixture has no repository to delete branches from".into();
-            return;
-        };
-        // Arm, or spend the arm. False means the question was just asked.
-        let confirmed = match self.panes.focused_mut() {
-            Some(Screens::Branches { view, .. }) => view.confirm_or_arm_delete(&target),
-            _ => return,
-        };
-        if !confirmed {
-            self.message = delete_question(&shown);
-            return;
-        }
-        // The question is spent; the running band speaks next.
-        let Target::Local(name) = target else {
-            unreachable!("remotes and detached refuse above");
-        };
-        let job = Write::delete_branch(repo, name.as_bytes().to_vec(), false);
-        self.submit(Box::new(job));
+        gitten_app::act::delete_branch(self);
     }
 
     /// Stands a prompt up and gives it the keyboard — the one path every
@@ -3091,6 +3054,37 @@ impl App {
                 self.bar,
             );
         }
+    }
+}
+
+impl gitten_app::act::Acts for App {
+    fn branch_target(&self) -> Option<Target> {
+        App::branch_target(self)
+    }
+
+    fn say(&mut self, message: String) {
+        self.message = message;
+    }
+
+    fn ask(&mut self, question: String) {
+        self.message = question;
+    }
+
+    fn confirm_or_arm(&mut self, target: &Target) -> bool {
+        match self.panes.focused_mut() {
+            Some(Screens::Branches { view, .. }) => view.confirm_or_arm_delete(target),
+            _ => false,
+        }
+    }
+
+    fn repo(&self) -> Option<gitten_git::Handle> {
+        self.repo
+            .as_ref()
+            .map(|(_, repo)| gitten_git::Handle::clone(repo))
+    }
+
+    fn submit(&mut self, job: Box<dyn Job>) -> bool {
+        self.submitter.submit(job).is_ok()
     }
 }
 

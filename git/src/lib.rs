@@ -929,6 +929,7 @@ pub type Handle = Arc<dyn Repo>;
 pub fn open(root: &Path) -> Handle {
     Arc::new(Binary {
         root: root.to_path_buf(),
+        state_paths: Default::default(),
     })
 }
 
@@ -939,6 +940,18 @@ pub fn open(root: &Path) -> Handle {
 /// crate notices.
 struct Binary {
     root: PathBuf,
+    /// Where each of git's sequencing state files *would* be, resolved once.
+    ///
+    /// `rev-parse --git-path` answers a question about the repository's layout,
+    /// which does not move for the life of a handle — a linked worktree's own
+    /// state directory is still its own an hour later. Whether the file is
+    /// *there* is the question the callers actually ask, and that is a `stat`
+    /// on every call, below. Resolving both together meant a process spawn to
+    /// re-learn something that could not have changed.
+    ///
+    /// A `Mutex<Vec<..>>` and not a map: the whole domain is four static names,
+    /// so a linear scan of at most four entries is cheaper than hashing one.
+    state_paths: std::sync::Mutex<Vec<(String, Option<PathBuf>)>>,
 }
 
 impl Repo for Binary {
@@ -1092,7 +1105,16 @@ impl Repo for Binary {
             let old = RawChange::synthetic(&c.old_mode, &c.old_oid).or(fetched_old);
             let new = RawChange::synthetic(&c.new_mode, &c.new_oid)
                 .or(fetched_new)
-                .or_else(|| new_side(&c.new_oid, &top, c.path.as_bytes()));
+                .or_else(|| {
+                    // Only a working-tree diff can have content outside the
+                    // object database. A historical deletion has the same null
+                    // new OID, but reading a later recreation from disk would
+                    // put bytes into a revision where the file did not exist.
+                    revspec
+                        .is_empty()
+                        .then(|| new_side(&c.new_oid, &top, c.path.as_bytes()))
+                        .flatten()
+                });
             let binary = old.as_ref().is_some_and(|b| is_binary(b))
                 || new.as_ref().is_some_and(|b| is_binary(b));
             // The lossy decode happens here and only here: everything above —
@@ -1884,26 +1906,44 @@ impl Binary {
             .map(|oid| lossy(trimmed(&oid)))
     }
 
+    /// Where git would keep the state file called `name`, resolved once per
+    /// handle and remembered. `None` when this repository cannot answer.
+    fn git_state_path(&self, name: &str) -> Option<PathBuf> {
+        let mut memo = self
+            .state_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_, at)) = memo.iter().find(|(key, _)| key == name) {
+            return at.clone();
+        }
+
+        let at = run(&self.root, &["rev-parse", "--git-path", name])
+            .ok()
+            .and_then(|raw| {
+                let shown = trimmed(&raw);
+                if shown.is_empty() {
+                    return None;
+                }
+                use std::os::unix::ffi::OsStrExt;
+                let at = Path::new(std::ffi::OsStr::from_bytes(shown));
+                Some(match at.is_absolute() {
+                    true => at.to_path_buf(),
+                    // Relative answers are relative to where git was pointed.
+                    false => self.root.join(at),
+                })
+            });
+        memo.push((name.to_string(), at.clone()));
+        at
+    }
+
     /// Whether one of git's sequencing state directories exists —
     /// `rebase-merge` for the modern interactive rebase, `rebase-apply` for
-    /// `am`-shaped ones and older git's fallback. Resolved through
-    /// `--git-path`, which is what makes a linked worktree answer about its
-    /// own state directory instead of the main `.git`.
+    /// `am`-shaped ones and older git's fallback.
     fn git_state_exists(&self, name: &str) -> bool {
-        let Ok(raw) = run(&self.root, &["rev-parse", "--git-path", name]) else {
-            return false;
-        };
-        let shown = trimmed(&raw);
-        if shown.is_empty() {
-            return false;
-        }
-        use std::os::unix::ffi::OsStrExt;
-        let at = Path::new(std::ffi::OsStr::from_bytes(shown));
-        match at.is_absolute() {
-            true => at.exists(),
-            // Relative answers are relative to where git was pointed.
-            false => self.root.join(at).exists(),
-        }
+        // The path cannot move; whether anything is at it is the question, and
+        // that is asked afresh every time — a rebase that started a moment ago
+        // must be visible to the very next call.
+        self.git_state_path(name).is_some_and(|at| at.exists())
     }
 
     /// Ahead and behind between a branch and its upstream: one process, both
@@ -3759,6 +3799,26 @@ mod tests {
         assert!(
             paths(&g.pairs("").unwrap()).contains(&"loose.txt"),
             "the working tree has it"
+        );
+    }
+
+    #[test]
+    fn a_historical_deletion_does_not_read_a_recreated_worktree_file() {
+        let r = Scratch::new("revspec-deletion");
+        r.write("gone.txt", b"committed\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "add"]);
+        r.git(&["rm", "-q", "gone.txt"]);
+        r.git(&["commit", "-qm", "delete"]);
+        r.write("gone.txt", b"untracked replacement\n");
+
+        let got = r.open().pairs("HEAD~1..HEAD").unwrap();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].status, 'D');
+        assert_eq!(strs(&got[0].old), ["committed"]);
+        assert!(
+            got[0].new.is_empty(),
+            "a historical deletion has no new side, regardless of the worktree"
         );
     }
 
@@ -7151,6 +7211,137 @@ mod tests {
             script.push_step(Action::Pick, rev.as_bytes());
         }
         script
+    }
+
+    fn binary_for(root: &Path) -> Binary {
+        Binary {
+            root: root.to_path_buf(),
+            state_paths: Default::default(),
+        }
+    }
+
+    fn rebase_conflict_repo(name: &str) -> Scratch {
+        let r = Scratch::new(name);
+        r.write("line.txt", b"start\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        r.write("line.txt", b"first\n");
+        r.git(&["commit", "-qam", "first"]);
+        r.write("line.txt", b"second\n");
+        r.git(&["commit", "-qam", "second"]);
+        r
+    }
+
+    fn start_conflicted_rebase(r: &Scratch, g: &Binary) {
+        let head = r.rev_parse("HEAD");
+        let base = r.rev_parse("HEAD~2");
+        let err = g
+            .rebase_todo(base.as_bytes(), &picks(&[&head, &r.rev_parse("HEAD~1")]))
+            .unwrap_err();
+        assert!(!err.is_empty(), "git's own words come back");
+    }
+
+    #[test]
+    fn a_started_rebase_is_seen_after_the_path_was_already_resolved() {
+        let r = rebase_conflict_repo("state-path-started");
+        let g = binary_for(&r.0);
+        assert!(!g.rebase_in_progress(), "the memo starts while idle");
+
+        start_conflicted_rebase(&r, &g);
+        assert!(
+            g.rebase_in_progress(),
+            "existence is checked again after resolving the path"
+        );
+        g.rebase_abort().expect("abort");
+    }
+
+    #[test]
+    fn a_finished_rebase_stops_being_seen() {
+        let r = rebase_conflict_repo("state-path-finished");
+        let g = binary_for(&r.0);
+        start_conflicted_rebase(&r, &g);
+        assert!(g.rebase_in_progress());
+
+        g.rebase_abort().expect("abort");
+        assert!(
+            !g.rebase_in_progress(),
+            "existence is checked again after abort"
+        );
+    }
+
+    #[test]
+    fn the_state_path_is_resolved_once() {
+        let r = Scratch::new("state-path-once");
+        let g = binary_for(&r.0);
+        assert!(!g.git_state_exists("rebase-merge"));
+        assert!(!g.git_state_exists("rebase-merge"));
+
+        let memo = g
+            .state_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            memo.iter()
+                .filter(|(name, _)| name == "rebase-merge")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_state_name_is_remembered_as_unresolvable() {
+        let root = std::env::temp_dir().join(format!(
+            "gitten-git-state-path-missing-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("a temp dir");
+        let r = Scratch(root);
+        let g = binary_for(&r.0);
+        assert!(!g.git_state_exists("rebase-merge"));
+        assert!(!g.git_state_exists("rebase-merge"));
+
+        let memo = g
+            .state_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(matches!(
+            memo.as_slice(),
+            [(name, None)] if name == "rebase-merge"
+        ));
+    }
+
+    #[test]
+    fn a_linked_worktree_answers_about_its_own_state() {
+        let r = Scratch::new("state-path-worktree");
+        r.write("base.txt", b"base\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        let linked = std::env::temp_dir().join(format!(
+            "gitten-git-state-path-linked-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&linked);
+        r.git_os(&[
+            "worktree".into(),
+            "add".into(),
+            "-q".into(),
+            "-b".into(),
+            "linked".into(),
+            linked.as_os_str().to_owned(),
+        ]);
+
+        let g = binary_for(&linked);
+        let path = g
+            .git_state_path("rebase-merge")
+            .expect("the linked worktree resolves its state");
+        let root = r.0.canonicalize().expect("the repository path");
+        assert!(
+            path.starts_with(root.join(".git").join("worktrees")),
+            "{path:?}"
+        );
+        assert_ne!(path, root.join(".git").join("rebase-merge"));
+        let _ = std::fs::remove_dir_all(linked);
     }
 
     #[test]

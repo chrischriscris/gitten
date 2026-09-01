@@ -5,6 +5,12 @@ planned against `origin/full/full` `635aba8`); pass 9 (045–059, the GUI
 design review) ran the same day — its status table is below, its plan files
 are archived in `plans/done/` alongside every plan marked DONE/MERGED here:
 
+**Pass 10** (2026-08-31, planned at `da9f8a7`): plans 060–066, scoped to
+**performance and complexity** at the owner's request — four on `core`'s load
+path, one on acquisition, two structural. Plans and their index live in
+`plans/high-priority/`; see that README for dispatch order, what was verified as
+already fixed, what was rejected, and what this wave did **not** audit.
+
 - **Pass 1** (2026-08-24, audited at `3a8b347`): plans 001–007. All landed on
   main and merged — verified 2026-08-26 against `2dfcb82`
   (`aa936f7`, `e25056b`, `db2b4fb`, `c857964`, `a020a3d`, `3d547ae`, `fe6cd74`).
