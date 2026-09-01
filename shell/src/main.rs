@@ -1423,31 +1423,36 @@ struct DevShell {
     ongoing: Cell<OngoingScroll>,
 }
 
+fn action_file_section(section: views::files::Section) -> gitten_app::act::FileSection {
+    match section {
+        views::files::Section::Staged => gitten_app::act::FileSection::Staged,
+        views::files::Section::Unstaged => gitten_app::act::FileSection::Unstaged,
+        views::files::Section::Untracked => gitten_app::act::FileSection::Untracked,
+        views::files::Section::Conflicts => gitten_app::act::FileSection::Conflicts,
+    }
+}
+
+fn view_file_section(section: gitten_app::act::FileSection) -> views::files::Section {
+    match section {
+        gitten_app::act::FileSection::Staged => views::files::Section::Staged,
+        gitten_app::act::FileSection::Unstaged => views::files::Section::Unstaged,
+        gitten_app::act::FileSection::Untracked => views::files::Section::Untracked,
+        gitten_app::act::FileSection::Conflicts => views::files::Section::Conflicts,
+    }
+}
+
 struct WindowActs<'shell, 'context, 'app> {
     shell: &'shell mut DevShell,
     cx: &'context mut Context<'app, DevShell>,
 }
 
-impl gitten_app::act::Acts for WindowActs<'_, '_, '_> {
-    fn branch_target(&self) -> Option<views::branches::Target> {
-        self.shell.branches_target(self.cx)
-    }
-
+impl gitten_app::act::Client for WindowActs<'_, '_, '_> {
     fn say(&mut self, message: String) {
         self.shell.set_notice(message);
     }
 
     fn ask(&mut self, question: String) {
         self.shell.set_question(question);
-    }
-
-    fn confirm_or_arm(&mut self, target: &views::branches::Target) -> bool {
-        match self.shell.active() {
-            Some(Screen::Branches { view, .. }) => view.update(self.cx, |branches, _| {
-                branches.confirm_or_arm_delete(target)
-            }),
-            _ => false,
-        }
     }
 
     fn repo(&self) -> Option<gitten_git::Handle> {
@@ -1457,6 +1462,62 @@ impl gitten_app::act::Acts for WindowActs<'_, '_, '_> {
     fn submit(&mut self, job: Box<dyn Job>) -> bool {
         self.shell.notice = None;
         self.shell.writes().is_some_and(|writes| writes.send(job))
+    }
+}
+
+impl gitten_app::act::BranchClient for WindowActs<'_, '_, '_> {
+    fn branch_target(&self) -> Option<views::branches::Target> {
+        self.shell.branches_target(self.cx)
+    }
+
+    fn confirm_or_arm_branch(&mut self, target: &views::branches::Target) -> bool {
+        match self.shell.active() {
+            Some(Screen::Branches { view, .. }) => view.update(self.cx, |branches, _| {
+                branches.confirm_or_arm_delete(target)
+            }),
+            _ => false,
+        }
+    }
+}
+
+impl gitten_app::act::FileClient for WindowActs<'_, '_, '_> {
+    fn selected_file(&self) -> Option<gitten_app::act::SelectedFile> {
+        let Some(Screen::Files { view, .. }) = self.shell.active() else {
+            return None;
+        };
+        view.read(self.cx)
+            .current_file()
+            .map(|file| gitten_app::act::SelectedFile {
+                section: action_file_section(file.section),
+                path: file.path.clone(),
+                shown: file.path_text.to_string(),
+            })
+    }
+
+    fn cursor_section(&self) -> Option<gitten_app::act::FileSection> {
+        let Some(Screen::Files { view, .. }) = self.shell.active() else {
+            return None;
+        };
+        view.read(self.cx).cursor_section().map(action_file_section)
+    }
+
+    fn paths_in(
+        &self,
+        section: gitten_app::act::FileSection,
+    ) -> Vec<gitten_core::status::PathBytes> {
+        let Some(Screen::Files { view, .. }) = self.shell.active() else {
+            return Vec::new();
+        };
+        view.read(self.cx).paths_in(view_file_section(section))
+    }
+
+    fn confirm_or_arm_file(&mut self, target: &gitten_app::act::SelectedFile) -> bool {
+        match self.shell.active() {
+            Some(Screen::Files { view, .. }) => view.update(self.cx, |files, _| {
+                files.confirm_or_arm_discard(view_file_section(target.section), &target.path)
+            }),
+            _ => false,
+        }
     }
 }
 
@@ -1718,8 +1779,8 @@ impl DevShell {
         });
         self.sync_modes(cx);
         match (accept, self.prompt.take()) {
-            (true, Some(Prompt::CommitMessage)) => self.commit_message(text),
-            (true, Some(Prompt::AmendMessage)) => self.amend_message(text),
+            (true, Some(Prompt::CommitMessage)) => self.commit_message(text, cx),
+            (true, Some(Prompt::AmendMessage)) => self.amend_message(text, cx),
             // A search keeps what was typed on accept and clears on cancel —
             // `esc` means "forget it", not "keep half of it".
             (_, Some(Prompt::Search { target })) => {
@@ -1760,32 +1821,12 @@ impl DevShell {
     /// successful finish bumps the generation so all repository panes
     /// re-acquire at once.
     fn stage_or_unstage(&mut self, cx: &mut Context<Self>) {
-        let Some(Screen::Files { view, .. }) = self.active() else {
+        if !matches!(self.active(), Some(Screen::Files { .. })) {
             self.set_notice("files.stage is not supported here");
             return;
-        };
-        let under = view
-            .read(cx)
-            .current_file()
-            .map(|f| (f.section, f.path.clone()));
-        let Some((section, path)) = under else {
-            self.set_notice("nothing selected to stage");
-            return;
-        };
-        // No rails means no repository behind this window — the same answer
-        // the pane would get if it asked for them itself.
-        let Some(writes) = self.writes() else {
-            self.set_notice("a fixture has no working tree to stage in");
-            return;
-        };
-        let bytes = path.as_bytes().to_vec();
-        let job = match section {
-            views::files::Section::Staged => gitten_app::verbs::Write::unstage(&writes.repo, bytes),
-            _ => gitten_app::verbs::Write::stage(&writes.repo, bytes),
-        };
-        if !writes.send(Box::new(job)) {
-            self.set_notice("the job queue is shutting down");
         }
+        let mut client = WindowActs { shell: self, cx };
+        gitten_app::act::stage_or_unstage(&mut client);
     }
 
     /// `files.commit`: gather a message over the pane, then commit on accept.
@@ -1811,21 +1852,9 @@ impl DevShell {
     /// The accepted commit text, as a job. Empty refused again here — the
     /// trait refuses it too, but saying so beside the field that just closed
     /// beats making the reader find out twice.
-    fn commit_message(&mut self, message: String) {
-        if message.trim().is_empty() {
-            self.set_notice("a commit needs a message");
-            return;
-        }
-        let Some(writes) = self.writes() else {
-            self.set_notice("a fixture has no repository to commit in");
-            return;
-        };
-        if !writes.send(Box::new(gitten_app::verbs::Write::commit(
-            &writes.repo,
-            message,
-        ))) {
-            self.set_notice("the job queue is shutting down");
-        }
+    fn commit_message(&mut self, message: String, cx: &mut Context<Self>) {
+        let mut client = WindowActs { shell: self, cx };
+        gitten_app::act::commit_message(&mut client, message);
     }
 
     /// `files.amend`: the same field commit's key opens, aimed one step back
@@ -1853,21 +1882,9 @@ impl DevShell {
     /// beats making the reader find out twice. Amending a commit some remote
     /// already holds is tonight the reader's own decision: nothing tracks
     /// push state yet, and saying so beats a guard that guesses.
-    fn amend_message(&mut self, message: String) {
-        if message.trim().is_empty() {
-            self.set_notice("a commit needs a message");
-            return;
-        }
-        let Some(writes) = self.writes() else {
-            self.set_notice("a fixture has no repository to amend in");
-            return;
-        };
-        if !writes.send(Box::new(gitten_app::verbs::Write::amend(
-            &writes.repo,
-            message,
-        ))) {
-            self.set_notice("the job queue is shutting down");
-        }
+    fn amend_message(&mut self, message: String, cx: &mut Context<Self>) {
+        let mut client = WindowActs { shell: self, cx };
+        gitten_app::act::amend_message(&mut client, message);
     }
 
     /// `files.discard`: the one destructive verb, and it confirms on the
@@ -1881,51 +1898,12 @@ impl DevShell {
     /// whose unstaged side may be empty and whose undo is unstage; and a
     /// conflict, whose working-tree side is the merge's open question.
     fn discard_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(Screen::Files { view, .. }) = self.active() else {
+        if !matches!(self.active(), Some(Screen::Files { .. })) {
             self.set_notice("files.discard is not supported here");
             return;
-        };
-        let under = view
-            .read(cx)
-            .current_file()
-            .map(|f| (f.section, f.path.clone(), f.path_text.to_string()));
-        let Some((section, path, shown)) = under else {
-            self.set_notice("nothing selected to discard");
-            return;
-        };
-        match section {
-            views::files::Section::Staged => {
-                self.set_notice("that change is staged — unstage it before discarding");
-                return;
-            }
-            views::files::Section::Conflicts => {
-                self.set_notice("a conflicted file needs its merge resolved, not discarded");
-                return;
-            }
-            views::files::Section::Untracked | views::files::Section::Unstaged => {}
         }
-        // The rails, taken once like every sibling takes them: a fixture has
-        // no working tree to discard from, and saying so outranks arming one.
-        let Some(writes) = self.writes() else {
-            self.set_notice("a fixture has no working tree to discard from");
-            return;
-        };
-        // Arm, or spend the arm. False means the question was just asked.
-        if !view.update(cx, |f, _| f.confirm_or_arm_discard(section, &path)) {
-            self.set_question(views::files::discard_question(section, &shown));
-            return;
-        }
-        self.notice = None; // the question is spent; the running band speaks next
-        let bytes = path.as_bytes().to_vec();
-        let job = match section {
-            views::files::Section::Untracked => {
-                gitten_app::verbs::Write::remove_untracked(&writes.repo, bytes)
-            }
-            _ => gitten_app::verbs::Write::discard(&writes.repo, bytes),
-        };
-        if !writes.send(Box::new(job)) {
-            self.set_notice("the job queue is shutting down");
-        }
+        let mut client = WindowActs { shell: self, cx };
+        gitten_app::act::discard_file(&mut client);
     }
 
     /// `files.stage-all`: every row, on the side of the index the keyboard
@@ -1940,41 +1918,12 @@ impl DevShell {
     /// resolution, which is its own decision. One job either way, so one
     /// generation bump and one re-acquire wave per keypress.
     fn stage_all(&mut self, cx: &mut Context<Self>) {
-        let Some(Screen::Files { view, .. }) = self.active() else {
+        if !matches!(self.active(), Some(Screen::Files { .. })) {
             self.set_notice("files.stage-all is not supported here");
             return;
-        };
-        let staging = view.read(cx).cursor_section() != Some(views::files::Section::Staged);
-        let (first, second) = match staging {
-            true => (
-                views::files::Section::Unstaged,
-                Some(views::files::Section::Untracked),
-            ),
-            false => (views::files::Section::Staged, None),
-        };
-        let mut targets = view.read(cx).paths_in(first);
-        if let Some(second) = second {
-            targets.extend(view.read(cx).paths_in(second));
         }
-        if targets.is_empty() {
-            self.set_notice(match staging {
-                true => "nothing unstaged or untracked to stage",
-                false => "nothing staged to unstage",
-            });
-            return;
-        }
-        let Some(writes) = self.writes() else {
-            self.set_notice("a fixture has no working tree to act on");
-            return;
-        };
-        let bytes = targets.iter().map(|p| p.as_bytes().to_vec()).collect();
-        let job = match staging {
-            true => gitten_app::verbs::Write::stage_many(&writes.repo, bytes),
-            false => gitten_app::verbs::Write::unstage_many(&writes.repo, bytes),
-        };
-        if !writes.send(Box::new(job)) {
-            self.set_notice("the job queue is shutting down");
-        }
+        let mut client = WindowActs { shell: self, cx };
+        gitten_app::act::stage_all(&mut client);
     }
 
     /// `files.ignore`: append the untracked file to the root `.gitignore`,
@@ -1986,26 +1935,12 @@ impl DevShell {
     /// not yet track, so answering over a tracked change would be a no-op
     /// wearing a success badge.
     fn ignore_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(Screen::Files { view, .. }) = self.active() else {
+        if !matches!(self.active(), Some(Screen::Files { .. })) {
             self.set_notice("files.ignore is not supported here");
             return;
-        };
-        let under = view
-            .read(cx)
-            .current_file()
-            .map(|f| (f.section, f.path.clone()));
-        let Some((views::files::Section::Untracked, path)) = under else {
-            self.set_notice("only an untracked file can be ignored");
-            return;
-        };
-        let Some(writes) = self.writes() else {
-            self.set_notice("a fixture has no repository to ignore in");
-            return;
-        };
-        let job = gitten_app::verbs::Write::ignore(&writes.repo, path.as_bytes().to_vec());
-        if !writes.send(Box::new(job)) {
-            self.set_notice("the job queue is shutting down");
         }
+        let mut client = WindowActs { shell: self, cx };
+        gitten_app::act::ignore_file(&mut client);
     }
 
     /// `diff.stage-hunk` / `diff.unstage-hunk` / `diff.discard-hunk`: act on
@@ -2134,17 +2069,9 @@ impl DevShell {
     /// git's own `WIP on …`, which is honest about what it was; a prompt for
     /// one is future work. Nothing here reads the pane: parking addresses the
     /// repository, whatever pane the key was pressed over.
-    fn stash_working_tree(&mut self, _cx: &mut Context<Self>) {
-        let Some(writes) = self.writes() else {
-            self.set_notice("a fixture has no working tree to park");
-            return;
-        };
-        if !writes.send(Box::new(gitten_app::verbs::Write::stash_push(
-            &writes.repo,
-            None,
-        ))) {
-            self.set_notice("the job queue is shutting down");
-        }
+    fn stash_working_tree(&mut self, cx: &mut Context<Self>) {
+        let mut client = WindowActs { shell: self, cx };
+        gitten_app::act::stash_working_tree(&mut client);
     }
 
     // ---------------------------------------------------- the branch verbs

@@ -286,17 +286,6 @@ fn file_row(
     }
 }
 
-/// What an armed discard asks, once, on the status line. An untracked file
-/// says *delete* because that is what discarding means when there is no
-/// earlier version to go back to — the honest word for the one mechanics
-/// where nothing is recoverable.
-pub fn discard_question(section: Section, shown: &str) -> String {
-    match section {
-        Section::Untracked => format!("delete {shown}? press again to confirm"),
-        _ => format!("discard {shown}? press again to confirm"),
-    }
-}
-
 /// The header label of a files pane whose first status read failed.
 ///
 /// Deliberately not `· 0 changed`: a read that did not come back must never
