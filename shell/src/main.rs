@@ -157,6 +157,24 @@ fn section_basis(rows: usize, focused: bool) -> f32 {
 fn quantized(content_h: f32) -> f32 {
     (content_h / graph::ROW_H).floor() * graph::ROW_H
 }
+/// The share a session copy of the sidebar's width is written inside: the
+/// band the config parser promises ([`gitten_core::host::SIDEBAR_MIN`]..
+/// [`gitten_core::host::SIDEBAR_MAX`]) and the drag's rails. The parser
+/// clamps what the file says; this clamps what a drag does — a gesture can
+/// ask for anything, and a boundary dragged off the window is a boundary
+/// nobody can find again.
+fn clamped_share(share: f32) -> f32 {
+    share.clamp(
+        gitten_core::host::SIDEBAR_MIN,
+        gitten_core::host::SIDEBAR_MAX,
+    )
+}
+
+/// The divider drag's payload: nothing but a type for GPUI to name, so the
+/// drag-move listener can tell this gesture from any other. The ghost it
+/// renders is gpui's `EmptyView` — a divider says nothing while dragged.
+#[derive(Clone, Copy)]
+struct SidebarDrag;
 
 /// The FILES header's count: the working tree's distinct changed paths, as
 /// the header's only right-edge furniture. `None` on a clean tree — a zero
@@ -1269,6 +1287,14 @@ struct DevShell {
     /// reload a save does — see [`config::reload`] for why there is only one
     /// path.
     config: std::path::PathBuf,
+    /// The sidebar's slice of the window's width, for the session: taken
+    /// from the config knob when the window opens (the same band the parser
+    /// clamps, see [`clamped_share`]) and moved by the divider drag. Never
+    /// written back to `gitten.toml` — the file is read-only by design; the
+    /// knob sets the opening share, the drag adjusts the session. Not a
+    /// watcher of reloads either: a saved file changes the *next* window,
+    /// never the boundary somebody is sitting behind.
+    share: Cell<f32>,
     /// Startup logging, and nothing else: whether [`start::mark`] has already
     /// stamped the first render. One bool read per frame afterwards.
     first_render: Cell<bool>,
@@ -4518,7 +4544,9 @@ impl Render for DevShell {
                 div()
                     .id("sidebar")
                     .flex_none()
-                    .w(relative(host.sidebar_share))
+                    // The session's share, not the config's: the divider
+                    // drag moves this and nothing writes the file back.
+                    .w(relative(self.share.get()))
                     .min_h_0()
                     .flex()
                     .flex_col()
@@ -4527,6 +4555,9 @@ impl Render for DevShell {
                     .children(sections)
             })
         };
+        // Owned by the divider's gating: a fixture has no stack, so it has no
+        // border for a strip to straddle either.
+        let has_stack = sidebar.is_some();
         let Screen::Diff {
             view: main_view, ..
         } = &self.main
@@ -4861,7 +4892,42 @@ impl Render for DevShell {
                     .flex_grow(1.0)
                     .flex()
                     .children(sidebar)
-                    .child(main_region),
+                    .child(main_region)
+                    // The divider: a 5px hit strip straddling the border the
+                    // sidebar and the diff are parted by — the border itself
+                    // stays the hairline it is, and the strip is invisible
+                    // (no ink of its own) but occludes, so the hand finds it
+                    // and a click on it does not fall through to either
+                    // region. Dragging it moves the session's share, inside
+                    // the band the config parser clamps; the hairline follows
+                    // on the next frame, which is a relative-width write and
+                    .children(has_stack.then(|| {
+                        div()
+                            .id("divider")
+                            .debug_selector(|| "divider".to_string())
+                            .absolute()
+                            .top_0()
+                            .h_full()
+                            .left(relative(self.share.get()))
+                            .ml(px(-2.0))
+                            .w(px(5.0))
+                            .cursor_col_resize()
+                            .occlude()
+                            .on_drag(SidebarDrag, |_, _, _, cx| {
+                                cx.stop_propagation();
+                                cx.new(|_| gpui::EmptyView)
+                            })
+                            .on_drag_move(cx.listener(
+                                |this, e: &DragMoveEvent<SidebarDrag>, window, cx| {
+                                    let width = f32::from(window.viewport_size().width);
+                                    let next = clamped_share(f32::from(e.event.position.x) / width);
+                                    if (next - this.share.get()).abs() > f32::EPSILON {
+                                        this.share.set(next);
+                                        cx.notify();
+                                    }
+                                },
+                            ))
+                    })),
             )
             .children(input)
             // The menu itself is deferred at priority 1. Its transparent
@@ -5497,6 +5563,7 @@ fn main() {
                     title_memo: RefCell::new(None),
                     header_memo: RefCell::new(None),
                     quant: RefCell::default(),
+                    share: Cell::new(clamped_share(host.sidebar_share)),
                     modes: Modes::new(),
                     pending: Vec::new(),
                     help: false,
@@ -5845,6 +5912,7 @@ mod tests {
                 title_memo: RefCell::new(None),
                 header_memo: RefCell::new(None),
                 quant: RefCell::default(),
+                share: Cell::new(super::clamped_share(host.sidebar_share)),
                 modes: Modes::new(),
                 pending: vec![vec![Key::char('g')]],
                 help: false,
@@ -5971,6 +6039,7 @@ mod tests {
                 title_memo: RefCell::new(None),
                 header_memo: RefCell::new(None),
                 quant: RefCell::default(),
+                share: Cell::new(super::clamped_share(host.sidebar_share)),
                 modes: Modes::new(),
                 pending: Vec::new(),
                 help: false,
@@ -6476,6 +6545,15 @@ mod tests {
         // the parser clamps around.
         assert_eq!(expected, gitten_core::host::SIDEBAR_SHARE);
         assert_eq!(stack.right(), main.origin.x);
+        // The divider straddles the border it owns: an invisible 5px strip,
+        // centred where the stack hands the window to the diff.
+        let divider = cx
+            .debug_bounds("divider")
+            .expect("the divider was not drawn");
+        assert!(
+            (f32::from(divider.center().x) - f32::from(main.origin.x)).abs() < 3.0,
+            "the divider did not straddle the border"
+        );
 
         // A click moves the keyboard between exactly the two regions. The
         // commit section answers for the whole stack: focusing it puts the
@@ -10253,6 +10331,25 @@ mod title_tests {
         // Whatever the squeeze, the shown height plus nothing is a whole-row
         // multiple: the boundary lands between rows, never through a glyph.
         assert_eq!(quantized(972.4) % row, 0.0);
+    }
+
+    #[test]
+    fn a_share_drag_is_railed_to_the_band() {
+        let lo = gitten_core::host::SIDEBAR_MIN;
+        let hi = gitten_core::host::SIDEBAR_MAX;
+        assert_eq!(super::clamped_share(lo), lo);
+        assert_eq!(super::clamped_share(hi), hi);
+        assert_eq!(
+            super::clamped_share(0.02),
+            lo,
+            "a drag past the edge stops at the rail"
+        );
+        assert_eq!(super::clamped_share(0.9), hi);
+        assert_eq!(
+            super::clamped_share(0.4),
+            0.4,
+            "a drag inside the band lands where the hand put it"
+        );
     }
 
     #[test]
