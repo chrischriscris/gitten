@@ -19,7 +19,7 @@
 //! out and the panel's own scroll are bound in that mode in `core` — a key is
 //! data, and the panel is not allowed a `match` of its own.
 
-use crate::chrome::RADIUS;
+use crate::chrome::{gap_l, gap_m, gap_s, RADIUS};
 use gitten_core::command::HelpRow;
 use gitten_core::host::Host;
 use gpui::prelude::FluentBuilder as _;
@@ -118,15 +118,19 @@ pub fn overlay(
                     // the one lie a panel of keys must never tell. No live key,
                     // no hint. Fixed above the scroll, so the way out is on
                     // screen wherever the rows are.
-                    .child(div().flex_none().pb_2().text_color(rgb(c.accent)).child(
-                        SharedString::from(format!(
-                            "keys{}",
-                            match host.keys.live_keys_for("help", modes).first() {
-                                Some(k) => format!("  ·  {k} closes"),
-                                None => String::new(),
-                            }
-                        )),
-                    ))
+                    .child(
+                        div()
+                            .flex_none()
+                            .pb(gap_m(&host.font))
+                            .text_color(rgb(c.accent))
+                            .child(SharedString::from(format!(
+                                "keys{}",
+                                match host.keys.live_keys_for("help", modes).first() {
+                                    Some(k) => format!("  ·  {k} closes"),
+                                    None => String::new(),
+                                }
+                            ))),
+                    )
                     // The rows, and the only part that scrolls. `id` first —
                     // there is no way into `overflow_y_scroll` without one —
                     // and `min_h_0`, or a flex child is never shorter than its
@@ -148,7 +152,7 @@ pub fn overlay(
                                         .h(px(ROW_H))
                                         .flex()
                                         .items_center()
-                                        .pt_1()
+                                        .pt(gap_s(&host.font))
                                         .text_color(rgb(c.accent))
                                         .child(name.clone()),
                                     HelpRow::Blank => div().h(px(ROW_H / 2.0)),
@@ -156,7 +160,7 @@ pub fn overlay(
                                         .h(px(ROW_H))
                                         .flex()
                                         .items_center()
-                                        .gap_3()
+                                        .gap(gap_l(&host.font))
                                         // A column and not a run of text: the width
                                         // is the widest chord's, measured once, and
                                         // right-aligned against it — which is what

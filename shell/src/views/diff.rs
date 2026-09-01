@@ -62,6 +62,7 @@ use super::{
     accept_deferred_scroll, horizontal_scrollbar, track_marks, vertical_scrollbar,
     DeferredScrollbar, PendingScroll,
 };
+use crate::chrome::gap_l;
 pub(crate) use crate::chrome::ROW_BAR;
 use gitten_core::font::Font;
 use gitten_core::host::Host;
@@ -2524,7 +2525,7 @@ impl Rows for TextRows {
         let p = &theme.diff;
         match &self.rows[index] {
             Row::File { path, adds, dels } => {
-                file_header(path, *adds, *dels, theme, sel, state, shift)
+                file_header(path, *adds, *dels, theme, &host.font, sel, state, shift)
             }
 
             Row::Hunk(header) => hunk_header(header, theme, sel, state, shift),
@@ -2784,11 +2785,13 @@ fn header_text(text: SharedString, sel: Range<usize>, theme: &Theme) -> AnyEleme
 /// directory/name split below is two subslices of one string, and only what a
 /// header actually draws is handed to GPUI — inline for any piece under 23
 /// bytes, which is nearly all of them.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn file_header(
     path: &std::sync::Arc<str>,
     adds: usize,
     dels: usize,
     theme: &Theme,
+    font: &Font,
     sel: Option<Selected>,
     state: RowState,
     shift: f32,
@@ -2814,7 +2817,7 @@ pub(crate) fn file_header(
                 div()
                     .flex()
                     .items_center()
-                    .gap_3()
+                    .gap(gap_l(font))
                     .child(
                         div()
                             .flex()
@@ -3649,9 +3652,27 @@ mod tests {
         // Both headers draw with the keyboard on them — and, one state down,
         // with the hairline carrying the extent.
         let _ = hunk_header(&header, &theme, None, state(true, true), 0.0);
-        let _ = file_header(&path, 1, 2, &theme, None, state(true, true), 0.0);
+        let _ = file_header(
+            &path,
+            1,
+            2,
+            &theme,
+            &Font::default(),
+            None,
+            state(true, true),
+            0.0,
+        );
         let _ = hunk_header(&header, &theme, None, state(false, true), 0.0);
-        let _ = file_header(&path, 1, 2, &theme, None, state(false, true), 0.0);
+        let _ = file_header(
+            &path,
+            1,
+            2,
+            &theme,
+            &Font::default(),
+            None,
+            state(false, true),
+            0.0,
+        );
         // The bar's ink is the line rows', whatever the header's own
         // background: accent on the keyboard's row, and the row's own
         // background elsewhere.

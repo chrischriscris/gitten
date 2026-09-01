@@ -6,7 +6,9 @@
 //! to the operating system. Only accepting and cancelling are named commands;
 //! local cursor and clipboard actions are ordinary text-field mechanics.
 
+use crate::chrome::{gap_m, gap_s};
 use crate::config;
+use gitten_core::host::Host;
 use gitten_core::theme::ChromePalette;
 use gpui::prelude::*;
 use gpui::*;
@@ -737,12 +739,13 @@ impl Render for Input {
             .flex_none()
             .flex()
             .items_center()
-            .gap_2()
+            .gap(gap_m(&host.font))
             .h(px(INPUT_H))
             // The status strip's inset, not the row pad: the `PROMPT` badge
             // sits directly below this field and the two are one column — a
-            // prompt at a third inset stepped 8px off the bar that names it.
-            .px_2()
+            // prompt at a third inset, one [`gap_m`] step off the bar that
+            // names it.
+            .px(gap_m(&host.font))
             .bg(rgb(chrome.status_bg))
             .border_t_1()
             .border_color(rgb(chrome.border))
@@ -784,7 +787,7 @@ impl Render for Input {
                         selection: rgb(chrome.selected_bg),
                     }),
             )
-            .child(exit_hints(chrome, &self.exits))
+            .child(exit_hints(&host, chrome, &self.exits))
     }
 }
 
@@ -799,7 +802,7 @@ impl Render for Input {
 /// [`Input::set_exits`]); an exit with no live key draws nothing — the
 /// panel-of-keys rule — and a `·` between the two, the separator the help
 /// heading uses, so the row reads as two exits and not one sentence.
-fn exit_hints(c: ChromePalette, exits: &Option<(SharedString, SharedString)>) -> Div {
+fn exit_hints(host: &Host, c: ChromePalette, exits: &Option<(SharedString, SharedString)>) -> Div {
     let Some((accept, cancel)) = exits else {
         return div();
     };
@@ -808,11 +811,15 @@ fn exit_hints(c: ChromePalette, exits: &Option<(SharedString, SharedString)>) ->
             .flex_none()
             .flex()
             .items_center()
-            .gap_1()
+            .gap(gap_s(&host.font))
             .child(div().flex_none().text_color(rgb(c.fg)).child(key.clone()))
             .child(div().flex_none().text_color(rgb(c.dim)).child(label))
     };
-    let mut row = div().flex_none().flex().items_center().gap_2();
+    let mut row = div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(gap_m(&host.font));
     if !accept.is_empty() {
         row = row.child(pair(accept, "accept"));
     }

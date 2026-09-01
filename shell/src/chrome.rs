@@ -17,6 +17,7 @@
 //! one lie a keyboard-first app must not tell.
 
 use gitten_core::command::{HelpRow, Modes};
+use gitten_core::font::Font;
 use gitten_core::host::Host;
 use gitten_core::theme::Surface;
 use gpui::prelude::FluentBuilder as _;
@@ -45,6 +46,55 @@ pub const ROW_BAR: f32 = 2.0;
 /// Corner radius for every chip, pill, keycap and floating panel. One value:
 /// three radii in one 32px strip read as three design languages.
 pub const RADIUS: f32 = 4.0;
+
+// The chrome's spacing ladder — the whole vocabulary of distance the strips
+// spend, in one currency: the live font's advance ([`Font::char_width`]), not
+// GPUI's frozen 16px rem. A rem shorthand (`px_2`, `gap_3`) resolves against a
+// rem size nothing in `gitten.toml` reaches, so at `[font] size = 16` the
+// glyphs grew while their padding stayed at 13px-era values. Padding and gap
+// are one currency — both are a distance between furniture — so one ladder
+// serves both, set through `.px()`, `.gap()`, `.pt()` and friends.
+//
+// Each step is the pixel value the rem shorthand it replaced drew at the
+// shipped default face — JetBrains Mono at 14px, advance 0.6, so `ch` is
+// 8.4px — rounded to the whole pixel: at the default font nothing moves a
+// pixel, and at any other size nothing is frozen.
+
+/// Half a character. At the default font this is exactly the old `gap_1` /
+/// `py_1` — 4px.
+pub fn gap_s(font: &Font) -> Pixels {
+    px((font.char_width() * 0.5).round())
+}
+
+/// One character. At the default font this is exactly the old `gap_2` /
+/// `px_2` / `pt_2` — 8px.
+pub fn gap_m(font: &Font) -> Pixels {
+    px(font.char_width().round())
+}
+
+/// One and two fifths. At the default font this is exactly the old `gap_3` /
+/// `pr_3` — 12px.
+pub fn gap_l(font: &Font) -> Pixels {
+    px((font.char_width() * 1.4).round())
+}
+
+/// One and nine tenths. At the default font this is exactly the old `px_4` —
+/// 16px.
+pub fn gap_xl(font: &Font) -> Pixels {
+    px((font.char_width() * 1.9).round())
+}
+
+/// Two and four fifths. At the default font this is exactly the old `gap_6` —
+/// 24px.
+pub fn gap_xxl(font: &Font) -> Pixels {
+    px((font.char_width() * 2.8).round())
+}
+
+/// One hint pair's air, in characters: two between the key and its label,
+/// four to the next pair. [`hints`] spends it per pair and [`hints_budget`]
+/// reserves the same six around the badge — one number, so the walk and the
+/// budget cannot drift into two ideas of how much air a pair costs.
+pub(crate) const HINT_AIR_CHARS: f32 = 6.0;
 
 /// The frame every list row sits in: a fixed height for `uniform_list`, the
 /// selection tint when `current`, and the bar on the left edge — accent when
@@ -159,7 +209,7 @@ pub fn empty_line(host: &Host, text: SharedString) -> AnyElement {
     div()
         .size_full()
         .pl(px(ROW_PAD))
-        .pt_2()
+        .pt(gap_m(&host.font))
         .flex()
         .items_start()
         // A sentence someone looks for: through `quiet_on`, because raw
@@ -264,7 +314,7 @@ pub fn pane_header_with(
         .w_full()
         .flex()
         .items_center()
-        .gap_2()
+        .gap(gap_m(&host.font))
         .h(px(HEADER_H))
         .relative()
         // Nothing paints outside the strip, ever. The right-edge furniture is
@@ -275,7 +325,7 @@ pub fn pane_header_with(
         // squeezed [`path_spans`] gives the directory's head up long before
         // anything gets this far.
         .overflow_hidden()
-        .px_2()
+        .px(gap_m(&host.font))
         // The focused pane's band is lifted one step; the rest stay flat.
         // With the accent bar and the bright name this is the third voice
         // saying "the keyboard is here", and it is the one that works in
@@ -347,9 +397,9 @@ pub fn status_bar(
         .flex_none()
         .flex()
         .items_center()
-        .gap_3()
+        .gap(gap_l(&host.font))
         .h(px(STATUS_H))
-        .px_2()
+        .px(gap_m(&host.font))
         .bg(rgb(c.status_bg))
         .border_t_1()
         .border_color(rgb(c.border))
@@ -362,7 +412,7 @@ pub fn status_bar(
                 .flex()
                 .items_center()
                 .justify_center()
-                .px_2()
+                .px(gap_m(&host.font))
                 .h(px(host.font.char_width() * 1.7))
                 .rounded(px(RADIUS))
                 .bg(rgb(c.accent))
@@ -374,7 +424,7 @@ pub fn status_bar(
                 .flex_none()
                 .flex()
                 .items_center()
-                .gap_1()
+                .gap(gap_s(&host.font))
                 .child(div().flex_none().text_color(rgb(c.fg)).child(key.clone()))
                 .child(
                     div()
@@ -453,8 +503,9 @@ pub fn hints(
             continue;
         };
         for (key, label) in list {
-            // Key, two spaces of air, label, four to the next pair.
-            let w = (key.chars().count() + label.chars().count() + 6) as f32 * ch;
+            // Key, two spaces of air, label, four to the next pair —
+            // [`HINT_AIR_CHARS`].
+            let w = (key.chars().count() + label.chars().count()) as f32 * ch + HINT_AIR_CHARS * ch;
             if spent + w > max_px {
                 return (out, true);
             }
@@ -480,13 +531,16 @@ pub fn version() -> &'static str {
 /// second client — asks instead of duplicating it.
 pub fn hints_budget(host: &Host, bar_px: f32, badge: &str) -> f32 {
     let ch = host.font.char_width();
-    (bar_px - ch * (badge.chars().count() as f32 + 6.0 + version().len() as f32 + 4.0)).max(0.0)
+    (bar_px - ch * (badge.chars().count() as f32 + HINT_AIR_CHARS + version().len() as f32 + 4.0))
+        .max(0.0)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::hints;
+    use super::{gap_l, gap_m, gap_s, gap_xl, gap_xxl, hints, HINT_AIR_CHARS};
     use gitten_core::command::{Commands, Keymap, Modes};
+    use gitten_core::font::Font;
+    use gpui::px;
 
     #[test]
     fn hints_come_from_the_registry_and_prefer_the_active_mode() {
@@ -530,7 +584,8 @@ mod tests {
         );
         let (key, label) = &all[0];
         let ch = host.font.char_width();
-        let one_pair = (key.chars().count() + label.chars().count() + 6) as f32 * ch;
+        let one_pair =
+            (key.chars().count() + label.chars().count()) as f32 * ch + HINT_AIR_CHARS * ch;
         let (some, truncated) = hints(&host, &modes, "files", one_pair);
         assert_eq!(some.len(), 1, "the budget held exactly one pair");
         assert!(truncated, "a bar that stopped with hints left said nothing");
@@ -561,6 +616,44 @@ mod tests {
             assert!(
                 keys.keys_for(name).iter().any(|k| !k.is_empty()),
                 "{name} is hinted but unbound"
+            );
+        }
+    }
+
+    #[test]
+    fn the_ladder_lands_on_the_old_rem_values_at_the_default_font() {
+        // The shipped face: JetBrains Mono at 14px, advance 0.6 — ch 8.4px.
+        // GPUI's rem shorthands resolved against a frozen 16px rem, so these
+        // are the pixels `gap_1`, `gap_2`, `gap_3`, `px_4` and `gap_6` drew
+        // the day the vocabulary replaced them: at the default font nothing
+        // moves a pixel.
+        let f = Font::default();
+        assert_eq!(gap_s(&f), px(4.0));
+        assert_eq!(gap_m(&f), px(8.0));
+        assert_eq!(gap_l(&f), px(12.0));
+        assert_eq!(gap_xl(&f), px(16.0));
+        assert_eq!(gap_xxl(&f), px(24.0));
+    }
+
+    #[test]
+    fn the_ladder_scales_with_the_glyphs_at_size_16() {
+        // The point of the currency: the same `[font] size = 16` that grew
+        // the glyphs grows every step, and the ladder stays a ladder.
+        let d = Font::default();
+        let f = Font {
+            size: 16.0,
+            ..Font::default()
+        };
+        for (small, grown) in [
+            (gap_s(&d), gap_s(&f)),
+            (gap_m(&d), gap_m(&f)),
+            (gap_l(&d), gap_l(&f)),
+            (gap_xl(&d), gap_xl(&f)),
+            (gap_xxl(&d), gap_xxl(&f)),
+        ] {
+            assert!(
+                grown > small,
+                "size 16 drew {grown}px where the default drew {small}px"
             );
         }
     }

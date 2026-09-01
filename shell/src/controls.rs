@@ -48,7 +48,7 @@
 //! `cx.listener` closures from that same entity. So this file has no lifecycle
 //! to get wrong, and it is a pure function of a `Picker` plus a bool.
 
-use crate::chrome::RADIUS;
+use crate::chrome::{gap_m, gap_s, RADIUS};
 use gitten_core::font::Font;
 use gitten_core::theme::{Surface, Theme};
 use gpui::*;
@@ -130,10 +130,13 @@ pub fn tier(
 ) -> Tier {
     let ch = font.char_width();
     // What one trigger costs around its text: its own padding, its border,
-    // and the gap the strip puts before it (`px_2`, `border_1`, `gap_2`).
-    const TRIGGER_PX: f32 = 8.0 + 8.0 + 1.0 + 1.0 + 8.0;
+    // and the gap the strip puts before it — `px_2` twice, `border_1`, and
+    // `gap_2`, through the spacing ladder so the budget moves when the font
+    // does and not only when a label changes. The borders are absolute: a
+    // hairline has no floor to scale from.
+    let trigger_px = f32::from(gap_m(font)) + 2.0 + f32::from(gap_m(font)) + f32::from(gap_m(font));
     // The air between the trigger's own halves — label, value, caret.
-    const GAP_PX: f32 = 8.0;
+    let gap_px = f32::from(gap_m(font));
     let cost = |labelled: bool| -> f32 {
         pickers
             .iter()
@@ -143,7 +146,7 @@ pub fn tier(
                 } else {
                     p.value().chars().count() + 1
                 };
-                text as f32 * ch + GAP_PX * if labelled { 2.0 } else { 1.0 } + TRIGGER_PX
+                text as f32 * ch + gap_px * if labelled { 2.0 } else { 1.0 } + trigger_px
             })
             .sum()
     };
@@ -219,9 +222,9 @@ pub fn picker(
         .flex()
         .flex_none()
         .items_center()
-        .gap_2()
+        .gap(gap_m(font))
         .h(px(H))
-        .px_2()
+        .px(gap_m(font))
         .rounded(px(RADIUS))
         // A border, because the fill cannot do this job: closed, the trigger was
         // `title_bg` on `title_bg`, so four controls were sixty characters of
@@ -270,10 +273,10 @@ pub fn picker(
         let list = div()
             .id("list")
             .absolute()
-            .top(px(H + 4.0))
+            .top(px(H) + gap_s(font))
             .right_0()
             .w(w)
-            .py_1()
+            .py(gap_s(font))
             .bg(rgb(c.title_bg))
             .border_1()
             .border_color(rgb(c.faint))
@@ -296,7 +299,7 @@ pub fn picker(
                     .items_center()
                     .justify_between()
                     .h(px(ROW_H))
-                    .px_2()
+                    .px(gap_m(font))
                     .cursor_pointer()
                     .hover(|s| s.bg(rgb(c.status_bg)))
                     .child(
@@ -378,9 +381,9 @@ pub fn composed_picker(
         .flex()
         .flex_none()
         .items_center()
-        .gap_2()
+        .gap(gap_m(font))
         .h(px(H))
-        .px_2()
+        .px(gap_m(font))
         .rounded(px(RADIUS))
         .border_1()
         .border_color(rgb(if open { c.faint } else { c.border }))
@@ -409,15 +412,15 @@ pub fn composed_picker(
             .flat_map(|s| s.options.iter().map(|o| o.chars().count()))
             .max()
             .unwrap_or(0);
-        let w = px((widest as f32 + 4.0) * font.advance * font.size + 16.0);
+        let w = px((widest as f32 + 4.0) * font.advance * font.size) + gap_m(font) + gap_m(font);
 
         let list = div()
             .id("list")
             .absolute()
-            .top(px(H + 4.0))
+            .top(px(H) + gap_s(font))
             .right_0()
             .w(w)
-            .py_1()
+            .py(gap_s(font))
             .bg(rgb(c.title_bg))
             .border_1()
             .border_color(rgb(c.faint))
@@ -433,7 +436,7 @@ pub fn composed_picker(
                     .flex()
                     .items_center()
                     .h(px(ROW_H))
-                    .px_2()
+                    .px(gap_m(font))
                     .text_color(rgb(theme.dim_on(Surface::Title)))
                     .child(SharedString::from(section.label));
                 div()
@@ -449,7 +452,7 @@ pub fn composed_picker(
                                 .items_center()
                                 .justify_between()
                                 .h(px(ROW_H))
-                                .px_2()
+                                .px(gap_m(font))
                                 .text_color(rgb(if !section.enabled {
                                     theme.dim_on(Surface::Title)
                                 } else if i == section.current {
