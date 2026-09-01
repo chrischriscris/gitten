@@ -71,11 +71,13 @@ pub(crate) fn flatten(stashes: &[Stash]) -> Vec<Row> {
 pub(crate) fn prepare(stashes: &[Stash], describe: &str) -> Prepared {
     let t = std::time::Instant::now();
     let rows = flatten(stashes);
-    eprintln!(
-        "stashes: {} entries · flatten {:.0?}",
-        rows.len(),
-        t.elapsed()
-    );
+    if crate::stats::enabled() {
+        eprintln!(
+            "stashes: {} entries · flatten {:.0?}",
+            rows.len(),
+            t.elapsed()
+        );
+    }
     Prepared {
         label: format!("{describe} · {} parked", rows.len()),
         rows,

@@ -354,7 +354,9 @@ pub(crate) fn prepare(
     );
     let rows = flatten(&local, &remotes, head.as_ref(), &taken, theme);
     let head = head_info(head.as_ref(), &local);
-    eprintln!("branches: {label} · flatten {:.0?}", t.elapsed());
+    if crate::stats::enabled() {
+        eprintln!("branches: {label} · flatten {:.0?}", t.elapsed());
+    }
     Prepared { rows, label, head }
 }
 
@@ -478,6 +480,18 @@ impl Branches {
     /// How many rows the list draws — what sizes this pane's sidebar section.
     pub fn rows(&self) -> usize {
         self.data.len()
+    }
+
+    /// What the BRANCHES header counts: the pane's rows minus the group
+    /// headings — locals plus remotes, and detached HEAD's own row, which is
+    /// a ref the pane holds however it is named. Derived from the same
+    /// flattened rows the in-list labels' counts spell, so the header and the
+    /// groups cannot disagree.
+    pub fn count(&self) -> usize {
+        self.data
+            .iter()
+            .filter(|row| !matches!(row, Row::Heading { .. }))
+            .count()
     }
 
     /// Who HEAD is, for anything outside this pane: the window's title strip
@@ -1000,14 +1014,15 @@ mod tests {
             ]
         );
         // The dots say what every row is: HEAD's branch alone wears the
-        // accent, another local keeps the lane ink for its place among the
-        // locals, and a fetched copy draws hollow and faint.
+        // accent, another local keeps the lane ink keyed by its name — the
+        // one thing a refresh never moves — and a fetched copy draws hollow
+        // and faint.
         match (&rows[1], &rows[2]) {
             (Row::Local(feature), Row::Local(main)) => {
                 assert_eq!(
                     feature.dot.color,
-                    t.lane(0),
-                    "the first local takes the first lane ink"
+                    t.name_lane(b"feature"),
+                    "a local's ink follows its name"
                 );
                 assert_eq!(
                     main.dot.color, t.chrome.accent,

@@ -292,7 +292,9 @@ pub(crate) fn prepare(status: Status, describe: &str) -> Prepared {
         })
         .filter(|f| seen.insert(&f.path))
         .count();
-    eprintln!("files: {changed} entries · flatten {:.0?}", t.elapsed());
+    if crate::stats::enabled() {
+        eprintln!("files: {changed} entries · flatten {:.0?}", t.elapsed());
+    }
     Prepared {
         rows,
         label: format!("{describe} · {changed} changed"),

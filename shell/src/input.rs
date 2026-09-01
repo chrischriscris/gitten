@@ -16,6 +16,13 @@ use unicode_segmentation::UnicodeSegmentation as _;
 pub const MODE: &str = "input";
 const KEY_CONTEXT: &str = "GittenInput";
 
+/// The input band's height: [`crate::chrome::STATUS_H`] plus 8. Taller than
+/// the 26px strips it sits between on purpose — a text field is a *target*,
+/// not a label: it is where typing lands, and a target earns the extra air a
+/// label does not need. Named like the strips, so the band joins the chrome's
+/// rhythm instead of quoting a literal beside it.
+const INPUT_H: f32 = crate::chrome::STATUS_H + 8.0;
+
 actions!(
     gitten_input,
     [
@@ -731,7 +738,7 @@ impl Render for Input {
             .flex()
             .items_center()
             .gap_2()
-            .h(px(34.0))
+            .h(px(INPUT_H))
             // The status strip's inset, not the row pad: the `PROMPT` badge
             // sits directly below this field and the two are one column — a
             // prompt at a third inset stepped 8px off the bar that names it.
