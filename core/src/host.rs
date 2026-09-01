@@ -20,6 +20,18 @@ use crate::theme::{Theme, Themes};
 use crate::view::Scrolling;
 use crate::wrap::Wraps;
 
+/// The window's left column's slice of the window's width — the GUI shell's
+/// opening proportion — and the band it stays inside. `[view] sidebar` in
+/// `gitten.toml` sets the opening share, and the shell's divider drag adjusts
+/// it for the session; the parser clamps to the band and so does the drag.
+/// Spelled here, in the file every client reads, because the parser and the
+/// drag must name the same three numbers; a client with no sidebar ignores
+/// the knob entirely, the way one that cannot `quit` ignores `quit`.
+pub const SIDEBAR_SHARE: f32 = 0.32;
+pub const SIDEBAR_MIN: f32 = 0.20;
+pub const SIDEBAR_MAX: f32 = 0.50;
+
+#[derive(Clone)]
 pub struct Host {
     /// Which highlighter each path gets. Route a language elsewhere, or replace
     /// the fallback for all of them.
@@ -49,6 +61,10 @@ pub struct Host {
     /// — a scroll is arithmetic, and what varies is only how much of it. Read by
     /// whatever runs `view.scroll-down`, so a saved file changes the next notch.
     pub view: Scrolling,
+    /// The window's left column's slice of the width — the GUI shell's
+    /// opening share of it. See [`SIDEBAR_SHARE`]; a client it does not apply
+    /// to ignores it, and the shell's drag adjusts a session copy.
+    pub sidebar_share: f32,
     /// What the mouse does besides select — today, whether a drag copies.
     ///
     /// Its own field and not part of [`Scrolling`]: one is about where a list is
@@ -104,6 +120,7 @@ impl Host {
             layout: "unified".into(),
             wrap: Wraps::builtin(),
             view: Scrolling::default(),
+            sidebar_share: SIDEBAR_SHARE,
             mouse: Mousing::default(),
             keys: Keymap::builtin(),
             commands: Commands::builtin(),

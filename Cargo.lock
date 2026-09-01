@@ -2262,6 +2262,7 @@ dependencies = [
  "gpui-component",
  "gpui-component-assets",
  "gpui_platform",
+ "unicode-segmentation",
 ]
 
 [[package]]

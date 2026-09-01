@@ -13,7 +13,7 @@
 //! budget rather than a fact about diffs.
 
 use crate::syntax::{highlight_hunk, Highlighter, Token};
-use crate::{intraline, replace_pairs, FileDiff, LineKind, Span};
+use crate::{intraline_with, replace_pairs, FileDiff, LineKind, Span};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -54,6 +54,10 @@ pub struct File {
     pub adds: usize,
     pub dels: usize,
     pub hunks: Vec<Hunk>,
+    /// Spans or tokens [`sanitize`] threw away because they pointed mid-character,
+    /// past the end of their line, or out of order. Zero for every built-in pass;
+    /// see [`Prepared::rejected`] for why this exists at all.
+    pub rejected: usize,
 }
 
 /// The prepared diff, plus what the two expensive passes cost. The timings are
@@ -88,6 +92,50 @@ impl Prepared {
             .map(|h| h.lines.len())
             .sum()
     }
+
+    /// How many spans or tokens [`sanitize`] threw away. Zero for everything
+    /// shipped; a frontend reports it so a `Differ` or `Highlighter` extension
+    /// that is quietly handing back bad ranges says so, the same way
+    /// [`crate::wrap::Wrapped::rejected`] does for a bad `Wrap`.
+    pub fn rejected(&self) -> usize {
+        self.files.iter().map(|f| f.rejected).sum()
+    }
+}
+
+/// Keeps the spans or tokens that describe a range of `text` and drops the
+/// rest, counting what it drops.
+///
+/// Not defensiveness for its own sake: a range that points past its line, or
+/// into the middle of a character, is a slice panic on the render path —
+/// `runs_selected` folds these edges in with `.min` only, and it never sees
+/// the text to check them against. `Highlighter` is an extension seam and
+/// `intraline` is not exempt either, so this runs on both. The rules mirror
+/// [`crate::wrap::Wrapped::take`]: in range, on character boundaries, and
+/// ascending — `runs` relies on ordered input to terminate.
+///
+/// `retain` rather than a rebuilt `Vec`: nearly every span and token a real
+/// pass produces is valid, so this costs a scan and not an allocation.
+fn sanitize<T>(
+    text: &str,
+    items: &mut Vec<T>,
+    range: impl Fn(&T) -> (u32, u32),
+    rejected: &mut usize,
+) {
+    let mut prev_end = 0u32;
+    items.retain(|item| {
+        let (start, end) = range(item);
+        let ok = start >= prev_end
+            && end >= start
+            && (end as usize) <= text.len()
+            && text.is_char_boundary(start as usize)
+            && text.is_char_boundary(end as usize);
+        if ok {
+            prev_end = end;
+        } else {
+            *rejected += 1;
+        }
+        ok
+    });
 }
 
 /// Real repos contain minified bundles and base64 blobs; a single line of 9.6
@@ -136,123 +184,150 @@ pub fn clip(s: &Arc<str>, max_chars: usize) -> Arc<str> {
 /// of it.
 const PARALLEL_ABOVE: usize = 2_000;
 
-/// One file: clip, intraline, highlight. The whole of what [`prepare`] does,
-/// factored out because it is also the unit of work handed to a worker — and
-/// because a file is genuinely independent of every other file, which is the
-/// property the parallelism rests on and the reason it needs no locking.
+/// One hunk: clip, intraline, highlight, sanitize. The unit of work a worker
+/// pulls, and independent of every other hunk — nothing in here reads outside
+/// the hunk except the file's path, which only picks a lexer.
+fn one_hunk(
+    h: &crate::Hunk,
+    path: &str,
+    hl: &dyn Highlighter,
+    max_line_chars: usize,
+    lcs: &mut Vec<u32>,
+) -> (Hunk, Duration, Duration, usize) {
+    let mut texts: Vec<Arc<str>> = h
+        .lines
+        .iter()
+        .map(|l| clip(&l.text, max_line_chars))
+        .collect();
+
+    // Second pass: only the removed/added pairs a line diff already matched get
+    // word-level spans. The table allocation survives every pair this worker
+    // handles.
+    let mut spans: Vec<Vec<Span>> = vec![Vec::new(); h.lines.len()];
+    let t = Instant::now();
+    for (d, a) in replace_pairs(h) {
+        let (o, n) = intraline_with(&texts[d], &texts[a], lcs);
+        spans[d] = o;
+        spans[a] = n;
+    }
+    let intraline_time = t.elapsed();
+
+    let t = Instant::now();
+    let refs: Vec<&str> = texts.iter().map(|t| &**t).collect();
+    let kinds: Vec<LineKind> = h.lines.iter().map(|l| l.kind).collect();
+    let mut tokens = highlight_hunk(hl, path, &refs, &kinds);
+    let syntax_time = t.elapsed();
+
+    let mut rejected = 0;
+    for i in 0..h.lines.len() {
+        sanitize(
+            &texts[i],
+            &mut spans[i],
+            |s| (s.start, s.end),
+            &mut rejected,
+        );
+        sanitize(
+            &texts[i],
+            &mut tokens[i],
+            |t| (t.start, t.end),
+            &mut rejected,
+        );
+    }
+
+    let mut lines = Vec::with_capacity(h.lines.len());
+    for (i, l) in h.lines.iter().enumerate() {
+        lines.push(Line {
+            kind: l.kind,
+            moved: l.moved,
+            old_no: l.old_no,
+            new_no: l.new_no,
+            text: std::mem::take(&mut texts[i]),
+            tokens: std::mem::take(&mut tokens[i]).into_boxed_slice(),
+            spans: std::mem::take(&mut spans[i]).into_boxed_slice(),
+        });
+    }
+    (
+        Hunk {
+            header: h.header.clone(),
+            lines,
+        },
+        intraline_time,
+        syntax_time,
+        rejected,
+    )
+}
+
+/// One file through the same hunk-shaped work used by the parallel path.
 fn one_file(
     f: &FileDiff,
     hl: &dyn Highlighter,
     max_line_chars: usize,
 ) -> (File, Duration, Duration) {
-    let mut intraline_time = Duration::ZERO;
-    let mut syntax_time = Duration::ZERO;
-
     let all = || f.hunks.iter().flat_map(|h| &h.lines);
     let adds = all().filter(|l| l.kind == LineKind::Added).count();
     let dels = all().filter(|l| l.kind == LineKind::Removed).count();
     let mut hunks = Vec::with_capacity(f.hunks.len());
-
+    let (mut intraline_time, mut syntax_time) = (Duration::ZERO, Duration::ZERO);
+    let mut rejected = 0;
+    let mut lcs = Vec::new();
     for h in &f.hunks {
-        let mut texts: Vec<Arc<str>> = h
-            .lines
-            .iter()
-            .map(|l| clip(&l.text, max_line_chars))
-            .collect();
-
-        // Second pass: only the removed/added pairs a line diff already
-        // matched get word-level spans.
-        let mut spans: Vec<Vec<Span>> = vec![Vec::new(); h.lines.len()];
-        let t = Instant::now();
-        for (d, a) in replace_pairs(h) {
-            let (o, n) = intraline(&texts[d], &texts[a]);
-            spans[d] = o;
-            spans[a] = n;
-        }
-        intraline_time += t.elapsed();
-
-        let t = Instant::now();
-        let refs: Vec<&str> = texts.iter().map(|t| &**t).collect();
-        let kinds: Vec<LineKind> = h.lines.iter().map(|l| l.kind).collect();
-        let mut tokens = highlight_hunk(hl, &f.path, &refs, &kinds);
-        syntax_time += t.elapsed();
-
-        let lines = h
-            .lines
-            .iter()
-            .enumerate()
-            .map(|(i, l)| Line {
-                kind: l.kind,
-                moved: l.moved,
-                old_no: l.old_no,
-                new_no: l.new_no,
-                text: std::mem::take(&mut texts[i]),
-                spans: std::mem::take(&mut spans[i]).into_boxed_slice(),
-                tokens: std::mem::take(&mut tokens[i]).into_boxed_slice(),
-            })
-            .collect();
-        hunks.push(Hunk {
-            header: h.header.clone(),
-            lines,
-        });
+        let (hunk, intra, syntax, bad) = one_hunk(h, &f.path, hl, max_line_chars, &mut lcs);
+        hunks.push(hunk);
+        intraline_time += intra;
+        syntax_time += syntax;
+        rejected += bad;
     }
-    let file = File {
-        path: f.path.clone(),
-        adds,
-        dels,
-        hunks,
-    };
-    (file, intraline_time, syntax_time)
+    (
+        File {
+            path: f.path.clone(),
+            adds,
+            dels,
+            hunks,
+            rejected,
+        },
+        intraline_time,
+        syntax_time,
+    )
 }
 
-/// A diff into rows, one file at a time — on as many cores as there are.
+/// A diff into rows, one hunk at a time — on as many cores as there are.
 ///
 /// # Why this is where the threads are
 ///
-/// A file is independent of every other file: nothing in [`one_file`] reads
-/// another file's output, and the two expensive passes are pure functions of one
-/// hunk's text. So this was one core doing 179 ms of work that ten cores can do
-/// in 67, and it was the largest single thing between a keystroke and a redrawn
-/// diff.
-///
-/// Threads in `core` are not a boundary violation — the rule is that `core` may
-/// not know a UI exists, and a thread is arithmetic, not I/O. Putting them here
-/// rather than in each client is the same argument as everything else in this
-/// module: three frontends need the identical answer, and one that had to write
-/// its own fan-out is one that would get the ordering wrong.
+/// A hunk is independent of every other hunk: nothing in [`one_hunk`] reads a
+/// neighbour's output, and the two expensive passes are pure functions of its
+/// text. Threads in `core` are arithmetic, not I/O, and keep every frontend on
+/// the same ordering and timing semantics.
 ///
 /// # Work stealing, not chunks
 ///
-/// Workers pull the next file off a shared counter rather than taking a
-/// contiguous slice each. Files are wildly uneven — `md.diff` is 229 files and
-/// one of them is most of the work — so static chunks leave nine cores idle
-/// while one finishes, and measured 2.1× where stealing measures better. It is
-/// four lines of `AtomicUsize` either way.
+/// Workers pull the next hunk off a shared counter rather than taking a
+/// contiguous slice each. Hunks are wildly uneven, so static chunks leave cores
+/// idle. The line floor still decides whether spawning is worthwhile.
 ///
 /// # The output is order-for-order identical to doing it serially
 ///
-/// Rows address files by index and a client caches by it, so a reordered
-/// `files` is not a cosmetic difference — it is every row pointing at the wrong
-/// file. Workers therefore carry each result's index with it and the whole lot
-/// is sorted back before it is returned, which costs one sort of a few thousand
-/// small items and buys a guarantee. `parallel_and_serial_agree_exactly` is the
-/// test, and it compares the `Vec<File>`s whole rather than sampling.
+/// Rows address files and hunks by index. Workers therefore carry both indices,
+/// results are sorted back into input order, and files with no hunks are built
+/// from the input rather than disappearing from a hunk-shaped work list.
 ///
-/// **A single-file diff gets nothing from this.** The unit of work is a file, so
-/// one 700k-line file is still one core. Stealing hunks instead would fix that
-/// and is the next thing here; it needs the per-file timing accumulation to move,
-/// which is why it is not in this pass.
+/// A diff of one hunk is the remaining serial floor. Splitting below it would
+/// split a syntax-highlighting run, which may carry state across its lines.
 pub fn prepare(files: &[FileDiff], hl: &dyn Highlighter, max_line_chars: usize) -> Prepared {
     let lines: usize = files
         .iter()
         .flat_map(|f| &f.hunks)
         .map(|h| h.lines.len())
         .sum();
-    let workers = match lines > PARALLEL_ABOVE && files.len() > 1 {
+    let hunks: usize = files.iter().map(|f| f.hunks.len()).sum();
+    // Hunks, not files: a large diff of one file is the case the file-shaped
+    // gate excluded. Below the line floor, threading is pure loss regardless of
+    // shape.
+    let workers = match lines > PARALLEL_ABOVE && hunks > 1 {
         true => std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
-            .min(files.len()),
+            .min(hunks),
         false => 1,
     };
 
@@ -273,17 +348,35 @@ pub fn prepare(files: &[FileDiff], hl: &dyn Highlighter, max_line_chars: usize) 
         };
     }
 
+    // One flat list of (file, hunk), so a worker's counter is an index and not a
+    // search. Built once, outside the threads.
+    let work: Vec<(u32, u32)> = files
+        .iter()
+        .enumerate()
+        .flat_map(|(fi, f)| (0..f.hunks.len()).map(move |hi| (fi as u32, hi as u32)))
+        .collect();
     let next = AtomicUsize::new(0);
-    let batches: Vec<Vec<(usize, File, Duration, Duration)>> = std::thread::scope(|s| {
+    type Done = (u32, u32, Hunk, Duration, Duration, usize);
+    let batches: Vec<Vec<Done>> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..workers)
             .map(|_| {
                 s.spawn(|| {
                     let mut mine = Vec::new();
+                    let mut lcs = Vec::new();
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(f) = files.get(i) else { break };
-                        let (file, intra, syn) = one_file(f, hl, max_line_chars);
-                        mine.push((i, file, intra, syn));
+                        let Some(&(fi, hi)) = work.get(i) else {
+                            break;
+                        };
+                        let file = &files[fi as usize];
+                        let (hunk, intra, syn, rejected) = one_hunk(
+                            &file.hunks[hi as usize],
+                            &file.path,
+                            hl,
+                            max_line_chars,
+                            &mut lcs,
+                        );
+                        mine.push((fi, hi, hunk, intra, syn, rejected));
                     }
                     mine
                 })
@@ -298,15 +391,30 @@ pub fn prepare(files: &[FileDiff], hl: &dyn Highlighter, max_line_chars: usize) 
             .collect()
     });
 
-    let mut done: Vec<(usize, File, Duration, Duration)> = batches.into_iter().flatten().collect();
-    done.sort_unstable_by_key(|(i, ..)| *i);
+    let mut done: Vec<Done> = batches.into_iter().flatten().collect();
+    done.sort_unstable_by_key(|(fi, hi, ..)| (*fi, *hi));
+    let mut out: Vec<File> = files
+        .iter()
+        .map(|f| {
+            let all = || f.hunks.iter().flat_map(|h| &h.lines);
+            File {
+                path: f.path.clone(),
+                adds: all().filter(|l| l.kind == LineKind::Added).count(),
+                dels: all().filter(|l| l.kind == LineKind::Removed).count(),
+                hunks: Vec::with_capacity(f.hunks.len()),
+                rejected: 0,
+            }
+        })
+        .collect();
     let (mut intra, mut syn) = (Duration::ZERO, Duration::ZERO);
-    let mut out = Vec::with_capacity(done.len());
-    for (_, file, i, s) in done {
-        out.push(file);
+    for (fi, _, hunk, i, s, rejected) in done {
+        let file = &mut out[fi as usize];
+        file.hunks.push(hunk);
+        file.rejected += rejected;
         intra += i;
         syn += s;
     }
+
     Prepared {
         files: out,
         intraline: intra,
@@ -352,6 +460,17 @@ index 1111111..2222222 100644
         raw
     }
 
+    fn one_file_many_hunks() -> String {
+        let mut raw = String::from("diff --git a/one.rs b/one.rs\n");
+        for h in 0..1001 {
+            raw.push_str(&format!("@@ -{},2 +{},2 @@\n", h * 10 + 1, h * 10 + 1));
+            raw.push_str(&format!(" fn keep{h}() {{}}\n"));
+            raw.push_str(&format!("-let old{h} = 1;\n"));
+            raw.push_str(&format!("+let new{h} = 1;\n"));
+        }
+        raw
+    }
+
     #[test]
     fn parallel_and_serial_agree_exactly() {
         // The property the whole fan-out rests on. Rows address files by index
@@ -373,6 +492,77 @@ index 1111111..2222222 100644
             serial.push(one_file(f, &hl, 2000).0);
         }
         assert_eq!(parallel.files, serial);
+    }
+
+    #[test]
+    fn one_file_of_many_hunks_agrees_with_serial() {
+        let hl = Highlighters::builtin();
+        let files = parse_unified_diff(&one_file_many_hunks());
+        let parallel = prepare(&files, &hl, 2000);
+        assert!(parallel.threads > 1);
+        assert_eq!(parallel.files, vec![one_file(&files[0], &hl, 2000).0]);
+    }
+
+    #[test]
+    fn a_file_with_no_hunks_survives() {
+        let hl = Highlighters::builtin();
+        let normal = parse_unified_diff(&one_file_many_hunks()).remove(0);
+        let files = vec![
+            normal.clone(),
+            FileDiff {
+                path: "empty.rs".into(),
+                hunks: Vec::new(),
+            },
+            normal,
+        ];
+        let prepared = prepare(&files, &hl, 2000);
+        assert!(prepared.threads > 1);
+        assert_eq!(prepared.files.len(), 3);
+        assert_eq!(prepared.files[1].path, "empty.rs");
+        assert!(prepared.files[1].hunks.is_empty());
+    }
+
+    #[test]
+    fn hunks_keep_their_order_within_a_file() {
+        let hl = Highlighters::builtin();
+        let files = parse_unified_diff(&one_file_many_hunks());
+        let expected: Vec<_> = files[0].hunks.iter().map(|h| h.header.clone()).collect();
+        let prepared = prepare(&files, &hl, 2000);
+        let actual: Vec<_> = prepared.files[0]
+            .hunks
+            .iter()
+            .map(|h| h.header.clone())
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn rejected_sums_across_hunks() {
+        struct Bad;
+        impl Highlighter for Bad {
+            fn highlight(&self, _path: &str, lines: &[&str]) -> Vec<Vec<Token>> {
+                lines
+                    .iter()
+                    .map(|line| {
+                        line.contains("bad")
+                            .then_some(vec![Token {
+                                start: 0,
+                                end: 99,
+                                kind: Kind::Keyword,
+                            }])
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            }
+        }
+
+        let files = parse_unified_diff(
+            "diff --git a/a.rs b/a.rs\n\
+             @@ -1 +1 @@\n-old\n+bad one\n\
+             @@ -10 +10 @@\n-old\n+bad two\n",
+        );
+        let prepared = prepare(&files, &Bad, 2000);
+        assert_eq!(prepared.files[0].rejected, 2);
     }
 
     #[test]
@@ -507,5 +697,95 @@ index 1111111..2222222 100644
         );
         assert_eq!(clip(&arc(""), 10).as_ref(), "");
         assert_eq!(clip(&arc("éé"), 0).as_ref(), "  … 2 more chars");
+    }
+
+    /// The `Highlighter` trait is an extension seam, so `prepare` must survive
+    /// one that hands back bad ranges — the whole point of [`sanitize`]. Two of
+    /// three tokens are wrong on purpose: one ends inside the two-byte `é`, one
+    /// overruns the line, and the third is what a real highlighter would have
+    /// produced. Multi-byte text on purpose, because a boundary bug is invisible
+    /// on ASCII.
+    #[test]
+    fn a_bad_highlighter_loses_only_the_bad_tokens() {
+        struct BadHighlighter;
+        impl Highlighter for BadHighlighter {
+            fn highlight(&self, _path: &str, lines: &[&str]) -> Vec<Vec<Token>> {
+                lines
+                    .iter()
+                    .map(|line| {
+                        if line.contains("héllo") {
+                            vec![
+                                // Ends at byte 2, inside `é` (bytes 1..3).
+                                Token {
+                                    start: 0,
+                                    end: 2,
+                                    kind: Kind::Keyword,
+                                },
+                                // Past the end of the (clipped) line.
+                                Token {
+                                    start: 0,
+                                    end: 99,
+                                    kind: Kind::Keyword,
+                                },
+                                // "world" — the one a real highlighter would emit.
+                                Token {
+                                    start: 7,
+                                    end: 12,
+                                    kind: Kind::Keyword,
+                                },
+                            ]
+                        } else {
+                            Vec::new()
+                        }
+                    })
+                    .collect()
+            }
+        }
+
+        const MULTIBYTE: &str = "\
+diff --git a/a.txt b/a.txt
+index 1111111..2222222 100644
+--- a/a.txt
++++ b/a.txt
+@@ -1 +1,2 @@
+ hello
++héllo world
+";
+        let files = parse_unified_diff(MULTIBYTE);
+        let p = prepare(&files, &BadHighlighter, 2000);
+        assert_eq!(
+            p.rejected(),
+            2,
+            "the mid-character end and the overrun should both be dropped"
+        );
+
+        let line = &p.files[0].hunks[0].lines[1];
+        assert_eq!(line.text.as_ref(), "héllo world");
+        assert_eq!(line.tokens.len(), 1, "only the valid token survives");
+        assert_eq!(&line.text[line.tokens[0].range()], "world");
+    }
+
+    #[test]
+    fn sanitize_drops_mid_character_overrun_and_out_of_order() {
+        // "héllo": h=0, é=1..3 (two bytes), l=3, l=4, o=5, len=6. Byte 2 is
+        // inside `é` and is not a boundary.
+        let text = "héllo";
+        let mut items: Vec<Span> = vec![
+            Span { start: 0, end: 2 },  // mid-character end
+            Span { start: 0, end: 99 }, // past the end of the text
+            Span { start: 3, end: 4 },  // valid: "l"
+            Span { start: 1, end: 3 },  // out of order: starts before the last kept end
+            Span { start: 4, end: 6 },  // valid: "lo"
+        ];
+        let mut rejected = 0;
+        sanitize(text, &mut items, |s| (s.start, s.end), &mut rejected);
+        assert_eq!(
+            rejected, 3,
+            "mid-character, overrun and out-of-order are each one rejection"
+        );
+        assert_eq!(
+            items,
+            vec![Span { start: 3, end: 4 }, Span { start: 4, end: 6 }]
+        );
     }
 }

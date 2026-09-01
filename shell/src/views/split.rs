@@ -49,15 +49,16 @@
 //! many rows it takes.
 
 use super::diff::{
-    column_at, columns, file_header, header_hit, hunk_header, into_text, line_colors, row_frame,
-    scrolled, selected, slice, Hit, Rows, Scratch, PAD, ROW_H,
+    column_at, columns, extent_line, file_header, header_hit, hunk_header, hunk_hit, into_text,
+    line_colors, row_background, row_bar, row_frame, scrolled, selected, slice, Hit, RowState,
+    Rows, Scratch, PAD, ROW_BAR, ROW_H,
 };
 use gitten_core::align::align;
 use gitten_core::host::Host;
 use gitten_core::runs::surfaces;
 use gitten_core::select::Selected;
 use gitten_core::syntax::Token;
-use gitten_core::theme::Theme;
+use gitten_core::theme::{Rgb, Surface, Theme};
 use gitten_core::wrap::{Wrap, Wrapped};
 use gitten_core::{LineKind, Span};
 use gpui::*;
@@ -171,6 +172,9 @@ enum Row {
 pub struct SplitRows {
     rows: Vec<Row>,
     lines: Vec<Line>,
+    /// Which hunk every row belongs to — see [`super::diff::HunkMap`]. One
+    /// entry per hunk, recorded as the rows are built.
+    hunks: super::diff::HunkMap,
     /// Widest line in the diff, in characters. Not a width any more — a column is
     /// half the window — but it is what says on the overlay how much of the diff
     /// is off the right of it.
@@ -205,6 +209,10 @@ impl Rows for SplitRows {
 
     fn len(&self) -> usize {
         self.rows.len()
+    }
+
+    fn is_file_header(&self, index: usize) -> bool {
+        matches!(self.rows.get(index), Some(Row::File { .. }))
     }
 
     /// A pair row is as tall as its taller side. The shorter one runs out of
@@ -253,12 +261,16 @@ impl Rows for SplitRows {
     }
 
     fn build(&mut self, f: gitten_core::prepared::File) {
+        // Kept beside the rows, which consume the hunks: the hunk map needs
+        // to spell each file the loaded diff spells it.
+        let path = std::sync::Arc::from(f.path.as_str());
         self.rows.push(Row::File {
-            path: f.path.into(),
+            path: std::sync::Arc::clone(&path),
             adds: f.adds,
             dels: f.dels,
         });
-        for h in f.hunks {
+        for (n, h) in f.hunks.into_iter().enumerate() {
+            let at = self.rows.len();
             self.rows.push(Row::Hunk(h.header.into()));
 
             // The alignment is computed from the kinds alone, before the lines
@@ -295,7 +307,16 @@ impl Rows for SplitRows {
                     new: new.map(|i| base + i),
                 });
             }
+            self.hunks.record(at, self.rows.len() - at, &path, n);
         }
+    }
+
+    fn hunk_at(&self, index: usize) -> Option<(&str, usize)> {
+        self.hunks.at(index)
+    }
+
+    fn hunk_span(&self, index: usize) -> Option<(u32, u32)> {
+        self.hunks.span(index)
     }
 
     /// The longer of a pair row's two sides, because that is the side that
@@ -350,7 +371,7 @@ impl Rows for SplitRows {
     fn hit(&self, index: usize, seg: usize, x: f32, host: &Host, shift: f32) -> Option<Hit> {
         match self.rows.get(index)? {
             Row::File { path, .. } => Some(header_hit(path, x, host, shift)),
-            Row::Hunk(h) => Some(header_hit(h, x, host, shift)),
+            Row::Hunk(h) => Some(hunk_hit(h, x, host, shift)),
             Row::Pair { old, new } => {
                 let cell = PAD + self.cell_px(self.width);
                 let (part, from) = match x < cell + RULE_W {
@@ -411,18 +432,25 @@ impl Rows for SplitRows {
         }
     }
 
+    fn is_header(&self, index: usize) -> bool {
+        matches!(self.rows.get(index), Some(Row::File { .. }))
+    }
+
     fn render(
         &self,
         index: usize,
         seg: usize,
         host: &Host,
         sel: Option<Selected>,
+        state: RowState,
         shift: f32,
     ) -> AnyElement {
         let theme = &host.theme;
         match &self.rows[index] {
-            Row::File { path, adds, dels } => file_header(path, *adds, *dels, theme, sel, shift),
-            Row::Hunk(header) => hunk_header(header, theme, sel, shift),
+            Row::File { path, adds, dels } => {
+                file_header(path, *adds, *dels, theme, &host.font, sel, state, shift)
+            }
+            Row::Hunk(header) => hunk_header(header, theme, sel, state, shift),
             Row::Pair { old, new } => {
                 // Page padding, then two columns of *measured* width and a
                 // fixed rule. The width is `cell_px` — the number the hit test
@@ -433,10 +461,43 @@ impl Rows for SplitRows {
                 // see `list_layout_tests`). Fixed pixels cannot drift, and they
                 // make drawing and hit test the same number by construction.
                 let cell = px(self.cell_px(self.width));
-                row_frame()
-                    .items_center()
-                    .px(px(PAD))
-                    .child(self.cell(*old, seg, Column::Old, theme, sel, shift, index, cell))
+                // The row's own background, and the bar on it: one frame, the
+                // same rule every presentation runs, so the bar and the wash
+                // cannot be decided twice.
+                let bg = row_background(state.current, theme.chrome.bg, theme);
+                // The page padding is *inside* the row's colour, not beside it:
+                // the two pads carry the halves' own backgrounds (read once, in
+                // [`Self::side_bg`], the same values the cells paint), so a run
+                // of additions reaches both edges like the unified layout and
+                // toggling `s` does not change whether a hunk reads as a block
+                // or as a striped column. The widths are the old geometry to
+                // the pixel — `bar + left pad = PAD`, right pad = `PAD` — so
+                // `cell_px` and the hit test, which both divide clicks assuming
+                // text starts at `PAD`, do not move.
+                let old_bg = self.side_bg(*old, seg, state, theme);
+                let new_bg = self.side_bg(*new, seg, state, theme);
+                extent_line(row_frame().items_center(), state, bg, theme)
+                    .border_l(px(ROW_BAR))
+                    .border_color(rgb(row_bar(state, bg, theme)))
+                    .bg(rgb(bg))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(PAD - ROW_BAR))
+                            .h(px(ROW_H))
+                            .bg(rgb(old_bg)),
+                    )
+                    .child(self.cell(
+                        *old,
+                        seg,
+                        Column::Old,
+                        theme,
+                        sel,
+                        state,
+                        shift,
+                        index,
+                        cell,
+                    ))
                     .child(
                         div()
                             .flex_none()
@@ -448,7 +509,18 @@ impl Rows for SplitRows {
                             // text floor is a bright seam down the window.
                             .bg(rgb(theme.diff.rule)),
                     )
-                    .child(self.cell(*new, seg, Column::New, theme, sel, shift, index, cell))
+                    .child(self.cell(
+                        *new,
+                        seg,
+                        Column::New,
+                        theme,
+                        sel,
+                        state,
+                        shift,
+                        index,
+                        cell,
+                    ))
+                    .child(div().flex_none().w(px(PAD)).h(px(ROW_H)).bg(rgb(new_bg)))
                     .into_any_element()
             }
         }
@@ -495,6 +567,21 @@ impl SplitRows {
         line.filter(|i| seg < self.wrapped.rows(*i as usize))
     }
 
+    /// The background one side of a pair paints: the line kind's, or the
+    /// absent hole's, under the cursor rule every presentation shares. Read
+    /// where the row frame is built as well as in [`Self::cell`] — the pads
+    /// flanking the two cells carry the same colour the cells do, so a run of
+    /// additions reads as a block to both edges and not as a striped column
+    /// between two strips of chrome.
+    fn side_bg(&self, line: Option<u32>, seg: usize, state: RowState, theme: &Theme) -> Rgb {
+        let p = &theme.diff;
+        let base = match self.present(line, seg) {
+            None => p.absent_bg,
+            Some(i) => line_colors(self.lines[i as usize].kind, self.lines[i as usize].moved, p).0,
+        };
+        super::diff::row_background(state.current, base, theme)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn cell(
         &self,
@@ -503,6 +590,7 @@ impl SplitRows {
         column: Column,
         theme: &Theme,
         sel: Option<Selected>,
+        state: RowState,
         shift: f32,
         row: usize,
         width: gpui::Pixels,
@@ -514,15 +602,36 @@ impl SplitRows {
         // which reads as an unchanged line that is not there.
         let Some(index) = self.present(line, seg) else {
             // Nothing opposite: a flat, darker block, so a run of them reads as
-            // a hole in the column rather than as unchanged content.
+            // a hole in the column rather than as unchanged content. The
+            // keyboard's bar runs across it too, so the cursor reads as one bar.
+            let bg = self.side_bg(line, seg, state, theme);
             return cell_frame(width)
                 .debug_selector(move || format!("cell-{}-{row}", column.name()))
-                .bg(rgb(p.absent_bg))
+                .bg(rgb(bg))
                 .into_any_element();
         };
         let line = &self.lines[index as usize];
-        let (bg, fg, sign) = line_colors(line.kind, line.moved, p);
-        let gutter = theme.gutter_on(surfaces(line.kind, line.moved).0);
+        // The keyboard's row, on this side and on the other: one bar, not two
+        // — and the same `side_bg` the frame's pads read, so a cell and the
+        // pad beside it can never disagree.
+        let bg = self.side_bg(Some(index), seg, state, theme);
+        let (_, fg, sign) = line_colors(line.kind, line.moved, p);
+        // The same substitution the unified view makes: the row paints the
+        // wash over whatever the line was, so a number resolved for the line
+        // kind was resolved against a background it never lands on.
+        let (plain, _) = surfaces(line.kind, line.moved);
+        let gutter = theme.gutter_on(match state.current {
+            true => Surface::Cursor,
+            false => plain,
+        });
+        // The question stands over the hunk the second press will spend, and
+        // the column that says which hunk that is — the numbers and the sign —
+        // name it in the colour a conflict does: the palette's own "this row
+        // ends work" foreground, which a conflict's letters already draw.
+        let gutter = match state.armed {
+            true => theme.chrome.error,
+            false => gutter,
+        };
         let no = match column {
             Column::Old => line.old_no,
             Column::New => line.new_no,
@@ -553,7 +662,10 @@ impl SplitRows {
                 div()
                     .flex_none()
                     .w(px(SIGN_W))
-                    .text_color(rgb(fg))
+                    .text_color(rgb(match state.armed {
+                        true => theme.chrome.error,
+                        false => fg,
+                    }))
                     .child(if blank { " " } else { sign }),
             )
             .child(scrolled(
@@ -567,7 +679,8 @@ impl SplitRows {
                             theme,
                             line.kind,
                             line.moved,
-                            selected(sel, column.part(), line.text.len()),
+                            state.current,
+                            selected(sel, column.part(), &line.text),
                         )
                         .iter()
                         .cloned(),
@@ -927,7 +1040,7 @@ diff --git a/a.rs b/a.rs
 mod list_layout_tests {
     use std::rc::Rc;
 
-    use super::{Rows, SplitRows, PAD, RULE_W};
+    use super::{RowState, Rows, SplitRows, PAD, RULE_W};
     use gitten_core::host::Host;
     use gitten_core::parse_unified_diff;
     use gitten_core::prepared::prepare;
@@ -977,7 +1090,7 @@ diff --git a/.github/workflows/check.yml b/.github/workflows/check.yml
                 range
                     .map(|k| {
                         let (i, seg) = flat[k];
-                        rows.render(i, seg as usize, &host, None, 0.0)
+                        rows.render(i, seg as usize, &host, None, RowState::default(), 0.0)
                     })
                     .collect::<Vec<_>>()
             })

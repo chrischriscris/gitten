@@ -42,11 +42,23 @@
 //! every anchor peels off one line is a 50k-deep recursion, which is a stack
 //! overflow rather than a slow load, and it is not a hypothetical shape — a
 //! generated file with a repeating structure produces exactly it.
+//!
+//! # The cache
+//!
+//! Assembled hunks are remembered against both sides' blob OIDs plus every
+//! setting that reaches the answer — resolved algorithm, whitespace relation,
+//! context, move floor, indent heuristic ([`Cache`]). A blob never changes,
+//! so equal OIDs mean an equal answer, which is why the key can be that small:
+//! the cache changes what a diff costs and never what it says. A side with no
+//! OID — untracked, added or deleted, a gitlink — has no identity to remember
+//! it by and always computes. Nothing here makes a cold diff cheaper: the first
+//! acquisition of anything, every file that actually changed, and every `git`
+//! spawn stay full-price — the cache only stops unchanged files paying twice.
 
 use crate::{DiffLine, FileDiff, Hunk, LineKind};
-use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::hash::Hasher;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 // ------------------------------------------------------------- the edit script
 
@@ -93,10 +105,32 @@ impl Edit {
 ///
 /// The name is what a config file and a keybinding refer to, which is why it is
 /// `&'static str` and part of the trait rather than a wrapper's business.
-pub trait Differ {
+/// Implementations are thread-safe so a configured registry can be cloned into
+/// a pane's background refresh rather than rebuilt from built-ins there.
+pub trait Differ: Send + Sync {
     fn name(&self) -> &'static str;
 
     fn diff(&self, path: &str, old: &[Arc<str>], new: &[Arc<str>]) -> Vec<Edit>;
+
+    /// The same answer as [`Differ::diff`], for a caller that has already
+    /// interned the keys. `ids` are dense from zero and equal exactly when the
+    /// keys are, so an implementation whose inner loops compare lines can skip a
+    /// hash pass the caller has already paid for.
+    ///
+    /// The default ignores them, which is the right answer for an implementation
+    /// that needs the text itself — a semantic differ reads words, not numbers.
+    /// Overriding this is an optimisation and never a change of answer: both
+    /// methods must return the same edit script for the same input.
+    fn diff_interned(
+        &self,
+        path: &str,
+        old: &[Arc<str>],
+        new: &[Arc<str>],
+        ids: (&[u32], &[u32]),
+    ) -> Vec<Edit> {
+        let _ = ids;
+        self.diff(path, old, new)
+    }
 }
 
 /// Every line replaced by a number, so the inner loops compare `u32`s.
@@ -167,7 +201,7 @@ pub const MAX_ANCHOR_OCCURRENCES: u32 = 64;
 /// `docs/decisions/0001-histogram-not-myers.md`.
 #[derive(Debug, Default)]
 pub struct Histogram {
-    scratch: RefCell<Ctx>,
+    scratch: Mutex<Ctx>,
 }
 
 /// Anchors only on lines appearing *exactly* once, and falls back to [`Myers`]
@@ -185,7 +219,7 @@ pub struct Histogram {
 /// Histogram and not by this, and which reads better depends on the file.
 #[derive(Debug, Default)]
 pub struct Patience {
-    scratch: RefCell<Ctx>,
+    scratch: Mutex<Ctx>,
 }
 
 /// The minimal edit script, by Myers' 1986 algorithm with the linear-space
@@ -197,7 +231,7 @@ pub struct Patience {
 /// did not touch anything else.
 #[derive(Debug, Default)]
 pub struct Myers {
-    scratch: RefCell<Ctx>,
+    scratch: Mutex<Ctx>,
 }
 
 impl Differ for Histogram {
@@ -207,8 +241,22 @@ impl Differ for Histogram {
 
     fn diff(&self, _path: &str, old: &[Arc<str>], new: &[Arc<str>]) -> Vec<Edit> {
         self.scratch
-            .borrow_mut()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .diffed(old, new, Some(MAX_ANCHOR_OCCURRENCES))
+    }
+
+    fn diff_interned(
+        &self,
+        _path: &str,
+        _old: &[Arc<str>],
+        _new: &[Arc<str>],
+        ids: (&[u32], &[u32]),
+    ) -> Vec<Edit> {
+        self.scratch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .diffed_ids(ids.0, ids.1, Some(MAX_ANCHOR_OCCURRENCES))
     }
 }
 
@@ -218,7 +266,23 @@ impl Differ for Patience {
     }
 
     fn diff(&self, _path: &str, old: &[Arc<str>], new: &[Arc<str>]) -> Vec<Edit> {
-        self.scratch.borrow_mut().diffed(old, new, Some(1))
+        self.scratch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .diffed(old, new, Some(1))
+    }
+
+    fn diff_interned(
+        &self,
+        _path: &str,
+        _old: &[Arc<str>],
+        _new: &[Arc<str>],
+        ids: (&[u32], &[u32]),
+    ) -> Vec<Edit> {
+        self.scratch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .diffed_ids(ids.0, ids.1, Some(1))
     }
 }
 
@@ -228,7 +292,23 @@ impl Differ for Myers {
     }
 
     fn diff(&self, _path: &str, old: &[Arc<str>], new: &[Arc<str>]) -> Vec<Edit> {
-        self.scratch.borrow_mut().diffed(old, new, None)
+        self.scratch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .diffed(old, new, None)
+    }
+
+    fn diff_interned(
+        &self,
+        _path: &str,
+        _old: &[Arc<str>],
+        _new: &[Arc<str>],
+        ids: (&[u32], &[u32]),
+    ) -> Vec<Edit> {
+        self.scratch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .diffed_ids(ids.0, ids.1, None)
     }
 }
 
@@ -348,7 +428,6 @@ impl Ctx {
     /// buffers, then run the search on them. `Some(max)` anchors with that
     /// rarity threshold, `None` runs plain Myers.
     fn diffed(&mut self, old: &[Arc<str>], new: &[Arc<str>], max: Option<u32>) -> Vec<Edit> {
-        self.begin_file();
         // One map over both sides; keys borrow the caller's handles and die with
         // this call, which is why the map cannot live in `Ctx`.
         //
@@ -362,15 +441,22 @@ impl Ctx {
         let a = std::mem::take(&mut self.ids_old);
         number(&mut map, new, &mut self.ids_new);
         let b = std::mem::take(&mut self.ids_new);
-
-        let mut out = Vec::new();
-        match max {
-            Some(max) => self.anchored(&a, &b, max, &mut out),
-            None => self.myers(&a, &b, Region::whole(&a, &b), &mut out),
-        }
+        let out = self.diffed_ids(&a, &b, max);
         // Handed back rather than dropped: the next file starts at full size.
         self.ids_old = a;
         self.ids_new = b;
+        out
+    }
+
+    /// The search itself, over ids the caller supplies. `diffed` is this with an
+    /// interning pass in front of it.
+    fn diffed_ids(&mut self, a: &[u32], b: &[u32], max: Option<u32>) -> Vec<Edit> {
+        self.begin_file();
+        let mut out = Vec::new();
+        match max {
+            Some(max) => self.anchored(a, b, max, &mut out),
+            None => self.myers(a, b, Region::whole(a, b), &mut out),
+        }
         out
     }
 
@@ -878,7 +964,7 @@ fn enclosing(old: &[Arc<str>], from: usize) -> Option<&str> {
 /// normalised text still addresses the original lines and the hunks show the real
 /// text. That is also what `git -w` does: a line whose only change was whitespace
 /// comes out as context, showing the version from the old file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Whitespace {
     /// Byte for byte. git's default.
     #[default]
@@ -964,23 +1050,31 @@ impl Whitespace {
         }
     }
 
-    /// Handles to every line's form under this relation, interned through
-    /// `arena`: equal text shares one allocation, so a line costs a refcount
-    /// bump and not a copy. Equal handles if and only if equal under this
-    /// relation, because the arena interns by content.
-    fn keys(self, lines: &[Arc<str>], arena: &mut KeyArena, out: &mut Vec<Arc<str>>) {
+    /// Handles and dense ids for every line's form under this relation,
+    /// interned through `arena`. Equal text shares one allocation and one id.
+    fn keys(
+        self,
+        lines: &[Arc<str>],
+        arena: &mut KeyArena,
+        out: &mut Vec<Arc<str>>,
+        ids: &mut Vec<u32>,
+    ) {
         match self {
             Whitespace::Exact => {}
             _ => {
                 out.clear();
                 out.reserve(lines.len());
+                ids.clear();
+                ids.reserve(lines.len());
                 // Taken out so `intern` can touch the arena while the scratch
                 // is borrowed; handed back afterwards.
                 let mut norm = std::mem::take(&mut arena.norm);
                 for line in lines {
                     norm.clear();
                     self.normalize(line, &mut norm);
-                    out.push(arena.intern(&norm));
+                    let (id, key) = arena.intern(&norm);
+                    ids.push(id);
+                    out.push(key);
                 }
                 arena.norm = norm;
             }
@@ -1013,23 +1107,24 @@ struct KeyArena {
 }
 
 impl KeyArena {
-    /// The handle for `key`'s content, inserting it when new. The bytes are
-    /// copied once, into the handle — every later equal key borrows that one.
-    fn intern(&mut self, key: &str) -> Arc<str> {
+    /// The id and handle for `key`'s content, inserting it when new. Ids are
+    /// dense from zero and equal exactly when the content is, which is what lets
+    /// a differ compare `u32`s without hashing the text a second time.
+    fn intern(&mut self, key: &str) -> (u32, Arc<str>) {
         let mut hasher = crate::FxHasher::default();
         hasher.write(key.as_bytes());
         let hash = hasher.finish();
         if let Some(ids) = self.buckets.get(&hash) {
             for &id in ids {
                 if &*self.keys[id as usize] == key {
-                    return Arc::clone(&self.keys[id as usize]);
+                    return (id, Arc::clone(&self.keys[id as usize]));
                 }
             }
         }
         let id = self.keys.len() as u32;
         self.keys.push(Arc::from(key));
         self.buckets.entry(hash).or_default().push(id);
-        Arc::clone(&self.keys[id as usize])
+        (id, Arc::clone(&self.keys[id as usize]))
     }
 }
 
@@ -1500,6 +1595,90 @@ fn score_cmp(a: &Score, b: &Score) -> i64 {
     INDENT_WEIGHT * indents + (a.penalty - b.penalty)
 }
 
+// ----------------------------------------------------------------- the cache
+
+/// How many answers the cache may hold before its oldest entry is forgotten.
+///
+/// An entry count and not a byte count, on purpose: bytes would need a pass
+/// over every hunk to know. 4096 files is far past any one diff — cmux at
+/// `HEAD~120..HEAD` is 482 — and far below anything that could crowd memory,
+/// while a walk of a 500k-commit history commit by commit simply forgets its
+/// beginning instead of growing without bound.
+const CACHE_CAP: usize = 4096;
+
+/// What one cached answer is keyed on: **identity plus every setting that
+/// reaches the answer.**
+///
+/// The OIDs are identity — a blob's content never changes, so the pair names
+/// both sides' text completely, renames included (the hunks of a rename are
+/// computed from content alone; only the *label* carries paths). The rest is
+/// the resolved answer of [`Differs::file_using`] itself: which algorithm ran
+/// *after* routing and overrides, which whitespace relation, and the three
+/// configuration knobs that shape hunks from an edit script.
+///
+/// The key is built in the same function that resolves those values — never
+/// re-derived by a caller — because a second derivation is where drift lives:
+/// a knob added to [`Differs`] tomorrow has to appear here once or every
+/// cached answer after a change of it is a lie. That is also why the path is
+/// *not* in the key: two paths resolving to the same algorithm and relation
+/// with the same blobs genuinely have the same hunks, and `.txt` renamed to
+/// `.rs` changes the routed algorithm, which changes the key on its own.
+///
+/// Forward note: the key is field-by-field today, so its maintenance rule is
+/// memory — a knob added to [`Overrides`] or to this registry that can change
+/// hunk output must join it, or stale answers survive a turn of that knob in
+/// silence. If that list grows, the structural fix is hoisting the settings
+/// into one `Hash` struct embedded wholesale, so a new field lands in the key
+/// by construction instead of by recall.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct Key {
+    old: String,
+    new: String,
+    algorithm: &'static str,
+    whitespace: Whitespace,
+    context: u32,
+    min_moved: u32,
+    indent_heuristic: bool,
+}
+
+/// Bounded, insertion-order-evicting store of assembled answers.
+///
+/// A plain map plus the order keys arrived in. No LRU touching, no per-entry
+/// locks, no reference counting scheme: a hit clones the answer, a miss
+/// computes outside the lock and inserts, and when the cap is crossed the
+/// front of the queue goes. Keys enter the queue exactly once each — only on
+/// the vacant side of an entry — so the queue and the map cannot disagree.
+#[derive(Default)]
+struct Cache {
+    answers: crate::FxHashMap<Key, Vec<Hunk>>,
+    order: VecDeque<Key>,
+}
+
+impl Cache {
+    fn get(&self, key: &Key) -> Option<Vec<Hunk>> {
+        self.answers.get(key).cloned()
+    }
+
+    /// Records an answer, unless another thread recorded it first — two cold
+    /// misses racing compute the same file twice and keep the first result;
+    /// determinism makes them identical, so dropping either is safe and this
+    /// keeps one canonical copy alive for every later clone to come from.
+    fn put(&mut self, key: Key, hunks: Vec<Hunk>) {
+        // One lock guards lookup through insertion, so this check and the
+        // insert below cannot interleave with another thread's.
+        if self.answers.contains_key(&key) {
+            return;
+        }
+        self.order.push_back(key.clone());
+        if self.order.len() > CACHE_CAP {
+            if let Some(oldest) = self.order.pop_front() {
+                self.answers.remove(&oldest);
+            }
+        }
+        self.answers.insert(key, hunks);
+    }
+}
+
 // ---------------------------------------------------------------- the registry
 
 /// Which algorithm each path gets, and how much context its hunks carry.
@@ -1509,8 +1688,9 @@ fn score_cmp(a: &Score, b: &Score) -> i64 {
 /// generalist knowing it exists. Selection is by *name* rather than by value
 /// because a config file has to be able to express it — see
 /// `docs/decisions/0012-config-is-data-behaviour-is-not.md`.
+#[derive(Clone)]
 pub struct Differs {
-    impls: Vec<Box<dyn Differ>>,
+    impls: Vec<Arc<dyn Differ>>,
     routes: Vec<(Vec<String>, usize)>,
     fallback: usize,
     /// Unchanged lines shown around each change. git's default is 3.
@@ -1522,6 +1702,16 @@ pub struct Differs {
     /// Slide each change to the most readable of its equivalent positions. On,
     /// as it is in git.
     pub indent_heuristic: bool,
+    /// Assembled answers, keyed on blob pair and settings — see [`Cache`].
+    ///
+    /// Behind an `Arc` so that a clone of the registry — which panes make to
+    /// diff on their own thread — shares this one cache rather than forking
+    /// it, and behind a lock because two panes may refresh at once. The cache
+    /// dies with the registry, i.e. with the host: a config reload rebuilds
+    /// both, and a reload is exactly when context or algorithm may have moved
+    /// anyway. The key covers those settings regardless; the lifetime is
+    /// hygiene, not correctness.
+    cache: Arc<Mutex<Cache>>,
 }
 
 impl Default for Differs {
@@ -1541,6 +1731,7 @@ impl Differs {
             whitespace: Whitespace::Exact,
             min_moved: MIN_MOVED_LINES,
             indent_heuristic: true,
+            cache: Arc::default(),
         };
         d.register(Histogram::default());
         d.register(Patience::default());
@@ -1554,8 +1745,14 @@ impl Differs {
     /// as a language table can.
     pub fn register(&mut self, differ: impl Differ + 'static) {
         match self.impls.iter().position(|d| d.name() == differ.name()) {
-            Some(i) => self.impls[i] = Box::new(differ),
-            None => self.impls.push(Box::new(differ)),
+            Some(i) => {
+                self.impls[i] = Arc::new(differ);
+                // A replacement keeps its name but not its answers, and the
+                // key cannot tell them apart — drop everything rather than
+                // serve hunks under a name that did not produce them.
+                *self.locked() = Cache::default();
+            }
+            None => self.impls.push(Arc::new(differ)),
         }
     }
 
@@ -1629,7 +1826,7 @@ impl Differs {
     /// This is what an acquisition layer calls. It never learns which algorithm
     /// ran, which is the point.
     pub fn file(&self, path: &str, old: &[Arc<str>], new: &[Arc<str>]) -> FileDiff {
-        self.file_using(&Overrides::default(), path, old, new)
+        self.file_using(&Overrides::default(), path, old, new, None)
     }
 
     /// The same, with a frontend's live overrides applied.
@@ -1639,35 +1836,109 @@ impl Differs {
     /// `.json` on whatever it was routed to would make the control lie about what
     /// is on screen. A name that is not registered falls back to the configured
     /// behaviour rather than failing, because the caller is a click.
+    ///
+    /// `blobs` is the two sides' blob OIDs when both sides are real blobs in
+    /// the object database — what [`gitten_git::Pair`] carries — and `None`
+    /// when either side has none: a working-tree or null side, a gitlink, or
+    /// any caller without identity to offer. `None` is *always compute*, and
+    /// that is the whole safety story of the cache: partial identity invents
+    /// keys for answers nobody proved.
+    ///
+    /// # The cache, and why the key is built here
+    ///
+    /// A repeated acquisition re-diffs every unchanged file from scratch,
+    /// which is most of the cost of a shell refresh after an unrelated write.
+    /// When `blobs` is present the assembled hunks are remembered under
+    /// `(old_oid, new_oid)` **plus everything this function would otherwise
+    /// compute fresh**: the algorithm actually selected (override, else route,
+    /// else fallback), the whitespace relation in force, context, move floor
+    /// and the indent heuristic. A change to any of them misses, so the cache
+    /// can change what an answer costs but never what it says. See [`Cache`]
+    /// for the store; see [`Key`] for why the path is not in it.
+    ///
+    /// On a hit the hunks are cloned, not shared: one deep-ish copy per file —
+    /// refcount bumps on line text plus a small struct per line — against the
+    /// interning, search, slide and move detection being skipped, microseconds
+    /// against milliseconds. Sharing an `Arc<Vec<Hunk>>` would ripple that
+    /// wrapper through every consumer in three clients to save half of a win
+    /// the clone already banks.
     pub fn file_using(
         &self,
         over: &Overrides,
         path: &str,
         old: &[Arc<str>],
         new: &[Arc<str>],
+        blobs: Option<(&str, &str)>,
     ) -> FileDiff {
+        // The two resolutions below are the answer's actual inputs beyond the
+        // text, which makes them the non-identity part of the cache key. They
+        // happen here, once, and the same values drive both the lookup and the
+        // computation — a caller never re-derives them, because a second
+        // derivation could drift from this one.
         let differ = over
             .algorithm
             .as_deref()
             .and_then(|name| self.by_name(name))
             .unwrap_or_else(|| self.for_path(path));
-
         let ws = over.whitespace.unwrap_or(self.whitespace);
+
+        // No identity, no entry: compute, exactly as before the cache existed.
+        let Some((old_oid, new_oid)) = blobs else {
+            return self.compute(path, differ, old, new, ws);
+        };
+
+        let key = Key {
+            old: old_oid.to_owned(),
+            new: new_oid.to_owned(),
+            algorithm: differ.name(),
+            whitespace: ws,
+            context: self.context as u32,
+            min_moved: self.min_moved as u32,
+            indent_heuristic: self.indent_heuristic,
+        };
+        if let Some(hunks) = self.locked().get(&key) {
+            return FileDiff {
+                path: path.to_owned(),
+                hunks,
+            };
+        }
+
+        let fresh = self.compute(path, differ, old, new, ws);
+        self.locked().put(key, fresh.hunks.clone());
+        fresh
+    }
+
+    fn locked(&self) -> MutexGuard<'_, Cache> {
+        self.cache.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Everything between routing and a `FileDiff`: the equivalence relation's
+    /// keys, then the four stages of [`Self::assemble`]. The only caller of
+    /// both cache paths, so a hit and a miss are provably the same work.
+    fn compute(
+        &self,
+        path: &str,
+        differ: &dyn Differ,
+        old: &[Arc<str>],
+        new: &[Arc<str>],
+        ws: Whitespace,
+    ) -> FileDiff {
         match ws {
             // Byte-for-byte: the lines themselves are the keys, and their
             // handles are already shared.
-            Whitespace::Exact => self.assemble(path, differ, old, new, old, new),
+            Whitespace::Exact => self.assemble(path, differ, old, new, old, new, None),
             _ => {
-                // Normalised once per file into interned handles; what every
-                // stage below compares are those, equal exactly when the
-                // relation says so. See docs/measurements.md on what `-w` used
-                // to cost.
+                // Normalised once per file into interned handles and ids; what
+                // every stage below compares are those, equal exactly when the
+                // relation says so.
                 let mut arena = KeyArena::default();
                 let (mut ko, mut kn) =
                     (Vec::with_capacity(old.len()), Vec::with_capacity(new.len()));
-                ws.keys(old, &mut arena, &mut ko);
-                ws.keys(new, &mut arena, &mut kn);
-                self.assemble(path, differ, old, new, &ko, &kn)
+                let (mut ido, mut idn) =
+                    (Vec::with_capacity(old.len()), Vec::with_capacity(new.len()));
+                ws.keys(old, &mut arena, &mut ko, &mut ido);
+                ws.keys(new, &mut arena, &mut kn, &mut idn);
+                self.assemble(path, differ, old, new, &ko, &kn, Some((&ido, &idn)))
             }
         }
     }
@@ -1696,8 +1967,15 @@ impl Differs {
         new: &[Arc<str>],
         keys_old: &[Arc<str>],
         keys_new: &[Arc<str>],
+        ids: Option<(&[u32], &[u32])>,
     ) -> FileDiff {
-        let mut edits = differ.diff(path, keys_old, keys_new);
+        // Ids when the caller interned them — the whitespace relations do,
+        // because normalising a line is already a pass over it. `Exact` has
+        // nothing interned yet and the differ does its own.
+        let mut edits = match ids {
+            Some(ids) => differ.diff_interned(path, keys_old, keys_new, ids),
+            None => differ.diff(path, keys_old, keys_new),
+        };
         if self.indent_heuristic {
             // Both: readability is scored against the text a reader will see, and
             // whether a slide is possible at all is decided by the relation. Two
@@ -1818,6 +2096,76 @@ mod tests {
             verify(&old, &new, &edits);
             assert!(!edits.is_empty(), "{} found no change", d.name());
         }
+    }
+
+    #[test]
+    fn built_in_interned_and_text_paths_agree() {
+        let old = lines("start\nrepeat\nold\nrepeat\nend\n");
+        let new = lines("start\nrepeat\nnew\ninsert\nrepeat\nend\n");
+        let ids = intern(&old, &new);
+        for differ in all() {
+            assert_eq!(
+                differ.diff("x", &old, &new),
+                differ.diff_interned("x", &old, &new, (&ids.0, &ids.1)),
+                "{}",
+                differ.name()
+            );
+        }
+    }
+
+    #[test]
+    fn a_default_differ_ignores_ids() {
+        struct Text;
+        impl Differ for Text {
+            fn name(&self) -> &'static str {
+                "text"
+            }
+
+            fn diff(&self, _path: &str, _old: &[Arc<str>], _new: &[Arc<str>]) -> Vec<Edit> {
+                vec![Edit {
+                    old_start: 0,
+                    old_end: 1,
+                    new_start: 0,
+                    new_end: 1,
+                }]
+            }
+        }
+
+        let old = lines("old");
+        let new = lines("new");
+        assert_eq!(
+            Text.diff("x", &old, &new),
+            Text.diff_interned("x", &old, &new, (&[0], &[0]))
+        );
+    }
+
+    #[test]
+    fn whitespace_keys_and_ids_agree() {
+        let source = lines("a  b\na b\na\tb\ntrailing \ntrailing\n");
+        for ws in [Whitespace::Trailing, Whitespace::Change, Whitespace::All] {
+            let mut arena = KeyArena::default();
+            let (mut keys, mut ids) = (Vec::new(), Vec::new());
+            ws.keys(&source, &mut arena, &mut keys, &mut ids);
+            assert_eq!(ids.len(), source.len());
+            for i in 0..source.len() {
+                for j in 0..source.len() {
+                    assert_eq!(ids[i] == ids[j], keys[i] == keys[j], "{ws:?}: {i}, {j}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn whitespace_ids_are_shared_across_both_sides() {
+        let old = lines("left\nshared  line\n");
+        let new = lines("shared line\nright\n");
+        let mut arena = KeyArena::default();
+        let (mut old_keys, mut new_keys) = (Vec::new(), Vec::new());
+        let (mut old_ids, mut new_ids) = (Vec::new(), Vec::new());
+        Whitespace::Change.keys(&old, &mut arena, &mut old_keys, &mut old_ids);
+        Whitespace::Change.keys(&new, &mut arena, &mut new_keys, &mut new_ids);
+        assert_eq!(old_keys[1], new_keys[0]);
+        assert_eq!(old_ids[1], new_ids[0]);
     }
 
     #[test]
@@ -2009,6 +2357,67 @@ mod tests {
         ctx.anchored(&a, &b, MAX_ANCHOR_OCCURRENCES, &mut out);
         verify(&old, &new, &out);
         assert_eq!(out.len(), 1, "{out:?}");
+    }
+
+    #[test]
+    fn histogram_scores_a_run_by_its_rarest_line() {
+        // `fn anchor`'s doc says it plainly: a run is scored by its *rarest*
+        // line, not its most common one. Get that backwards and a long run of
+        // unique code loses to a short one the moment a common line like `}`
+        // falls inside it — the same class of bug that cost 582 spurious
+        // changed-line pairs on this repository's own history.
+        //
+        // Driven through `Ctx::anchor` directly, as `an_exhausted_budget_...`
+        // above does: asserting on the final `Differ::diff` script does not
+        // pin this, because the recursion can absorb a wrong top-level anchor
+        // back into the same edit script on inputs this small.
+        //
+        // Five-line run at the front, identical on both sides, with a `}` as
+        // its third line. `}` is padded to five occurrences total, but only in
+        // `old` — enough to inflate its global count without giving the scan
+        // anything else to trip over. A two-line run further along, also
+        // identical on both sides and made entirely of lines that appear
+        // nowhere else, is the only other candidate.
+        let old: Vec<Arc<str>> = [
+            "run_u0", "run_u1", "}", "run_u2", "run_u3", // the long run: 0..5
+            "a_only_1", "}", "a_only_2", "}", "a_only_3", "}", "a_only_4",
+            "}", // padding, 5..13
+            "mid_a_1", "mid_a_2", // 13..15
+            "run_s0", "run_s1", // the short run: 15..17
+            "a_tail_1", "a_tail_2", // 17..19
+        ]
+        .into_iter()
+        .map(Arc::from)
+        .collect();
+        let new: Vec<Arc<str>> = [
+            "run_u0", "run_u1", "}", "run_u2", "run_u3", // the long run: 0..5
+            "b_only_1", "b_only_2", "b_only_3", "b_only_4", // 5..9
+            "b_only_5", "b_only_6", "b_only_7", "b_only_8", // 9..13
+            "mid_b_1", "mid_b_2", // 13..15
+            "run_s0", "run_s1", // the short run: 15..17
+            "b_tail_1", "b_tail_2", // 17..19
+        ]
+        .into_iter()
+        .map(Arc::from)
+        .collect();
+        let (a, b) = intern(&old, &new);
+
+        let mut ctx = Ctx::default();
+        ctx.begin_file();
+        match ctx.anchor(&a, &b, Region::whole(&a, &b), MAX_ANCHOR_OCCURRENCES) {
+            Anchor::At { a_at, b_at, len } => {
+                assert_eq!(
+                    (a_at, b_at, len),
+                    (0, 0, 5),
+                    "scored by its rarest line, the five-line run must win over \
+                     the two-line one, `}}` inside it or not"
+                );
+            }
+            Anchor::TooCommon => {
+                panic!("expected an anchor, budget or threshold ruled everything out")
+            }
+            Anchor::Disjoint => panic!("expected an anchor, the two runs are common to both sides"),
+        }
     }
 
     #[test]
@@ -2361,7 +2770,7 @@ mod tests {
 
         assert_eq!(d.for_path("x.rs").name(), "reverse");
         let routed = d.file("x.rs", &old, &new);
-        let overridden = d.file_using(&Overrides::algorithm("myers"), "x.rs", &old, &new);
+        let overridden = d.file_using(&Overrides::algorithm("myers"), "x.rs", &old, &new, None);
         assert_ne!(
             routed.hunks[0].lines.len(),
             overridden.hunks[0].lines.len(),
@@ -2371,11 +2780,11 @@ mod tests {
         // An unregistered name is a click that cannot be honoured, so it falls
         // back rather than producing nothing.
         assert_eq!(
-            d.file_using(&Overrides::algorithm("nope"), "x.rs", &old, &new),
+            d.file_using(&Overrides::algorithm("nope"), "x.rs", &old, &new, None),
             routed
         );
         assert_eq!(
-            d.file_using(&Overrides::default(), "x.rs", &old, &new),
+            d.file_using(&Overrides::default(), "x.rs", &old, &new, None),
             routed
         );
     }
@@ -2777,5 +3186,263 @@ mod tests {
             let f = d.file("x", &old, &new);
             assert_eq!(f.hunks[0].lines.len(), 2 + 2 * context, "context {context}");
         }
+    }
+
+    // ---------------------------------------------------------------- cache
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Counts invocations and answers one whole-file replace — the same
+    /// instrument the acquisition tests use, because the property under test
+    /// is "how many times did the differ run", not what it says. Named, so a
+    /// registry can hold two of them and an algorithm override can be
+    /// observed moving work from one to the other.
+    struct Counting(Arc<AtomicUsize>, &'static str);
+
+    impl Differ for Counting {
+        fn name(&self) -> &'static str {
+            self.1
+        }
+        fn diff(&self, _path: &str, old: &[Arc<str>], new: &[Arc<str>]) -> Vec<Edit> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            vec![Edit {
+                old_start: 0,
+                old_end: old.len() as u32,
+                new_start: 0,
+                new_end: new.len() as u32,
+            }]
+        }
+    }
+
+    fn counted() -> (Differs, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut d = Differs::builtin();
+        d.register(Counting(Arc::clone(&calls), "counting"));
+        assert!(d.select("counting"));
+        (d, calls)
+    }
+
+    fn calls(c: &Arc<AtomicUsize>) -> usize {
+        c.load(Ordering::Relaxed)
+    }
+
+    fn sample() -> (Vec<Arc<str>>, Vec<Arc<str>>) {
+        let old: Vec<Arc<str>> = (0..12).map(|i| Arc::from(format!("line {i}"))).collect();
+        let mut new = old.clone();
+        new[4] = "four!".into();
+        (old, new)
+    }
+
+    const OIDS: (&str, &str) = ("aaaa", "bbbb");
+
+    #[test]
+    fn a_second_identical_call_is_a_hit_and_the_differ_never_runs() {
+        let (d, count) = counted();
+        let (old, new) = sample();
+
+        let first = d.file_using(&Overrides::default(), "x.rs", &old, &new, Some(OIDS));
+        assert_eq!(calls(&count), 1);
+
+        // Different line handles, same identity: the whole point is that a
+        // re-acquisition builds fresh `Pair`s whose text happens to be equal.
+        let (old2, new2) = sample();
+        let second = d.file_using(&Overrides::default(), "x.rs", &old2, &new2, Some(OIDS));
+        assert_eq!(calls(&count), 1, "a hit must not reach the differ");
+        assert_eq!(first, second, "a hit must be byte-identical to a miss");
+    }
+
+    #[test]
+    fn every_setting_that_reaches_the_answer_is_in_the_key() {
+        let (mut d, count) = counted();
+        let (old, new) = sample();
+        d.file_using(&Overrides::default(), "x.rs", &old, &new, Some(OIDS));
+        assert_eq!(calls(&count), 1);
+
+        // Context shapes the hunks out of the same script.
+        d.context = 7;
+        d.file_using(&Overrides::default(), "x.rs", &old, &new, Some(OIDS));
+        assert_eq!(calls(&count), 2, "a context change must miss");
+
+        // So does the move floor, even when the script has no moves.
+        d.min_moved = 0;
+        d.file_using(&Overrides::default(), "x.rs", &old, &new, Some(OIDS));
+        assert_eq!(calls(&count), 3, "a min_moved change must miss");
+
+        // And the indent heuristic, which slides the script.
+        d.indent_heuristic = false;
+        d.file_using(&Overrides::default(), "x.rs", &old, &new, Some(OIDS));
+        assert_eq!(calls(&count), 4, "an indent-heuristic change must miss");
+
+        // The algorithm override resolves before the key is built: a second
+        // named counter takes the work, and the fallback's counter does not
+        // move — the miss is visible where the computation landed.
+        let other = Arc::new(AtomicUsize::new(0));
+        d.register(Counting(Arc::clone(&other), "counting2"));
+        d.file_using(
+            &Overrides::algorithm("counting2"),
+            "x.rs",
+            &old,
+            &new,
+            Some(OIDS),
+        );
+        assert_eq!(calls(&other), 1, "the overridden algorithm ran");
+        assert_eq!(calls(&count), 4, "the fallback did not");
+
+        // The whitespace relation changes what the differ compares.
+        d.file_using(
+            &Overrides {
+                whitespace: Some(Whitespace::All),
+                ..Default::default()
+            },
+            "x.rs",
+            &old,
+            &new,
+            Some(OIDS),
+        );
+        // Four fallback misses so far; the override above computed elsewhere.
+        assert_eq!(calls(&count), 5, "a whitespace change must miss");
+    }
+
+    #[test]
+    fn an_oid_change_misses_even_when_no_setting_did() {
+        let (d, count) = counted();
+        let (old, new) = sample();
+        d.file_using(&Overrides::default(), "x.rs", &old, &new, Some(OIDS));
+        d.file_using(
+            &Overrides::default(),
+            "x.rs",
+            &old,
+            &new,
+            Some(("cccc", "dddd")),
+        );
+        assert_eq!(calls(&count), 2, "different blobs are different answers");
+    }
+
+    #[test]
+    fn no_identity_means_always_compute() {
+        let (d, count) = counted();
+        let (old, new) = sample();
+        for _ in 0..3 {
+            d.file_using(&Overrides::default(), "x.rs", &old, &new, None);
+        }
+        assert_eq!(
+            calls(&count),
+            3,
+            "None is bypass: an untracked or half-known pair is never cached"
+        );
+    }
+
+    #[test]
+    fn the_path_is_not_in_the_key_but_the_resolved_algorithm_is() {
+        // Same blobs, same routed algorithm, two names: genuinely the same
+        // hunks — headers and moves come from content alone — so one entry
+        // serves both. A rename that crossed into a differently-routed
+        // extension would change the resolved algorithm and miss instead.
+        let (d, count) = counted();
+        let (old, new) = sample();
+        let a = d.file_using(&Overrides::default(), "a.txt", &old, &new, Some(OIDS));
+        let b = d.file_using(&Overrides::default(), "b.txt", &old, &new, Some(OIDS));
+        assert_eq!(calls(&count), 1);
+        assert_eq!(a.hunks, b.hunks);
+        assert_eq!(d.cache.lock().unwrap().answers.len(), 1);
+
+        // Routing `.rs` elsewhere makes the same blobs a different answer.
+        let mut routed = Differs::builtin();
+        routed.register(Counting(Arc::clone(&count), "counting"));
+        assert!(routed.route(&["rs"], "counting"));
+        routed.select("myers");
+        routed.file_using(&Overrides::default(), "x.rs", &old, &new, Some(OIDS));
+        assert_eq!(calls(&count), 2, "the route changed the resolved algorithm");
+    }
+
+    #[test]
+    fn a_hit_matches_a_fresh_registry_byte_for_byte() {
+        let (d, _) = counted();
+        let (old, new) = sample();
+        let cached = d.file_using(&Overrides::default(), "x.rs", &old, &new, Some(OIDS));
+
+        let (fresh, fresh_count) = counted();
+        let direct = fresh.file_using(&Overrides::default(), "x.rs", &old, &new, None);
+        assert_eq!(calls(&fresh_count), 1, "the comparison registry computed");
+        assert_eq!(cached, direct);
+    }
+
+    #[test]
+    fn the_cap_evicts_oldest_first_and_only_when_crossed() {
+        let (d, count) = counted();
+        let (old, new) = sample();
+        let oids = |n: usize| (format!("old-{n:06}"), format!("new-{n:06}"));
+        let ask = |d: &Differs, n: usize| {
+            let (o, w) = oids(n);
+            d.file_using(
+                &Overrides::default(),
+                "x.rs",
+                &old,
+                &new,
+                Some((o.as_str(), w.as_str())),
+            )
+        };
+
+        // One past the cap: exactly the cap survives, and the first key in is
+        // the first key out.
+        for n in 0..=CACHE_CAP {
+            ask(&d, n);
+        }
+        {
+            let cache = d.cache.lock().unwrap();
+            assert_eq!(cache.answers.len(), CACHE_CAP);
+            assert_eq!(cache.order.len(), CACHE_CAP);
+        }
+        ask(&d, 0);
+        assert_eq!(
+            calls(&count),
+            CACHE_CAP + 2,
+            "the oldest entry was evicted, so it computes again"
+        );
+        // The newest survivor still hits.
+        ask(&d, CACHE_CAP);
+        assert_eq!(calls(&count), CACHE_CAP + 2);
+    }
+
+    #[test]
+    fn two_threads_racing_one_key_agree_and_later_calls_hit() {
+        use std::thread;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut registry = Differs::builtin();
+        registry.register(Counting(Arc::clone(&counter), "counting"));
+        assert!(registry.select("counting"));
+        let d = Arc::new(registry);
+        let (old, new) = sample();
+
+        // Two cold misses at once. The computation runs outside the lock, so
+        // both may compute; determinism makes the answers identical and `put`
+        // keeps whichever landed first. Serialising the computation behind the
+        // lock instead would trade this rare duplicated diff for always
+        // making every pane's refresh wait on every other's — not a trade.
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let d = Arc::clone(&d);
+                let (old, new) = (old.clone(), new.clone());
+                thread::spawn(move || {
+                    d.file_using(&Overrides::default(), "x.rs", &old, &new, Some(OIDS))
+                })
+            })
+            .collect();
+        let results: Vec<FileDiff> = handles
+            .into_iter()
+            .map(|h| h.join().expect("no panic"))
+            .collect();
+
+        assert_eq!(results[0], results[1], "racers must agree byte for byte");
+        let after_race = calls(&counter);
+        assert!(
+            (1..=2).contains(&after_race),
+            "each racer computed at most once: {after_race}"
+        );
+
+        // Whatever the race did, a winner is now the answer of record.
+        d.file_using(&Overrides::default(), "x.rs", &old, &new, Some(OIDS));
+        assert_eq!(calls(&counter), after_race, "settled to a hit");
     }
 }

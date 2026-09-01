@@ -1,0 +1,1887 @@
+//! The working tree, as a list.
+//!
+//! lazygit's Files panel, viewer half: what [`Status`] says, grouped into the
+//! four sections git's own model names — staged, unstaged, untracked, conflicts
+//! — with a section drawn only when it has something in it. Staging is not
+//! here yet; what is here is the shape it will plug into, which is why every
+//! row keeps its [`PathBytes`] beside its display text and which group it
+//! belongs to.
+//!
+//! The list idioms are [`super::commits`]'s, on purpose: one `Viewport`, one
+//! scroll-handle dance, rows flattened **once per refresh** into owned display
+//! strings so the render path allocates nothing per frame.
+
+use super::{accept_deferred_scroll, vertical_scrollbar, DeferredScrollbar, PendingScroll};
+use crate::chrome::{empty_line, list_row, path_spans, section_label};
+use crate::graph::ROW_H;
+use gitten_core::host::Host;
+use gitten_core::status::{Change, ConflictKind, PathBytes, Status};
+use gitten_core::theme::{Rgb, Surface};
+use gitten_core::view::Viewport;
+use gpui::prelude::FluentBuilder as _;
+use gpui::*;
+use std::cell::Cell;
+use std::collections::HashSet;
+use std::rc::Rc;
+
+/// One flat row of the pane: a section heading or one file.
+///
+/// Flattened once per refresh — never per frame. Everything a draw needs that
+/// costs allocation (the lossy path text, the spelled-out count) is computed
+/// at flatten time; what a draw reads per frame is an enum match and a
+/// refcount bump.
+pub(crate) enum Entry {
+    /// A group heading, drawn only because the group under it is non-empty.
+    Heading {
+        /// How many files are in the group, spelled out once.
+        count: SharedString,
+        section: Section,
+    },
+    File(FileEntry),
+}
+
+/// One file of the working tree.
+pub(crate) struct FileEntry {
+    /// Which group it sits under — what stage/unstage will need to know where
+    /// a verb goes, and half of the refresh anchor.
+    pub section: Section,
+    /// The addressing form, byte for byte. Never decoded in place.
+    pub path: PathBytes,
+    /// The display form, decoded lossily once at flatten.
+    pub path_text: SharedString,
+    /// The display form cut at its last slash — directory (with the slash)
+    /// and filename — so the row draws the two inks without splitting or
+    /// copying per frame. [`gitten_core::path::split_dir_name`]'s cut, the
+    /// same one the diff header makes.
+    pub dir: SharedString,
+    pub name: SharedString,
+    /// What a rename moved it from, decoded once; `None` otherwise.
+    pub renamed_from: Option<SharedString>,
+    /// What happened to it — the letter's meaning; the colour is the section's.
+    /// (The mark itself is spent at construction, on [`Mark::letter`]; what the
+    /// row keeps is git's own spelling.)
+    #[allow(dead_code)]
+    pub mark: Mark,
+    /// The letter(s) themselves, git's own spelling: `A`, `M`, `UU`, `?`.
+    pub letters: &'static str,
+}
+
+/// The four questions a status panel asks, in draw order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Section {
+    Staged,
+    Unstaged,
+    Untracked,
+    Conflicts,
+}
+
+impl Section {
+    /// The lowercase spelling the tests outline rows with; the drawn heading
+    /// is [`Section::label`].
+    #[cfg(test)]
+    fn name(self) -> &'static str {
+        match self {
+            Section::Staged => "staged",
+            Section::Unstaged => "unstaged",
+            Section::Untracked => "untracked",
+            Section::Conflicts => "conflicts",
+        }
+    }
+
+    /// The heading drawn over the group, in the caps the design gives it.
+    /// Static, so the row's frame spells nothing.
+    fn label(self) -> &'static str {
+        match self {
+            Section::Staged => "STAGED",
+            Section::Unstaged => "UNSTAGED",
+            Section::Untracked => "UNTRACKED",
+            Section::Conflicts => "CONFLICTS",
+        }
+    }
+
+    fn all() -> [Section; 4] {
+        [
+            Section::Staged,
+            Section::Unstaged,
+            Section::Untracked,
+            Section::Conflicts,
+        ]
+    }
+
+    /// The ink a section's status letters draw in — git's own porcelain
+    /// convention, which every reader's fingers already know: staged is
+    /// green, unstaged is red, untracked recedes, a conflict is the error
+    /// ink because it is the one state that ends work. The *letter* still
+    /// says what kind of change it is; the colour answers the only question
+    /// the panel exists for, which is "what will commit". The greens and
+    /// reds are the diff palette's, where a theme has already tuned those
+    /// two words.
+    fn ink(self, host: &Host) -> Rgb {
+        let t = &host.theme;
+        match self {
+            Section::Staged => t.diff.adds_fg,
+            Section::Unstaged => t.diff.dels_fg,
+            Section::Untracked => t.chrome.faint,
+            Section::Conflicts => t.chrome.error,
+        }
+    }
+}
+
+/// What a status letter means. The mark owns the letter and nothing else —
+/// which side of the index the file sits on is the section's, and so is the
+/// colour: see [`Section::ink`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mark {
+    Add,
+    Modify,
+    Delete,
+    Rename,
+    TypeChange,
+    Untracked,
+    Conflict,
+}
+
+impl Mark {
+    /// From git's change letter set. A rename and a copy both mean "the index
+    /// matched content across two paths", and draw alike.
+    fn of(change: Change) -> Self {
+        match change {
+            Change::Added => Mark::Add,
+            Change::Modified => Mark::Modify,
+            Change::Deleted => Mark::Delete,
+            Change::Renamed | Change::Copied => Mark::Rename,
+            Change::TypeChanged => Mark::TypeChange,
+        }
+    }
+
+    /// The single letter git prints. Drawn from the theme, not spelled here.
+    fn letter(self) -> &'static str {
+        match self {
+            Mark::Add => "A",
+            Mark::Modify => "M",
+            Mark::Delete => "D",
+            Mark::Rename => "R",
+            Mark::TypeChange => "T",
+            // Known to no part of git: git itself prints `??`, and one honest
+            // glyph beats two.
+            Mark::Untracked => "?",
+            Mark::Conflict => "",
+        }
+    }
+}
+
+/// The two-letter state of a conflicted path, exactly as porcelain v2 spells
+/// it — who added and who deleted decides what resolving means, so the letters
+/// are data and not decoration.
+fn conflict_letters(state: ConflictKind) -> &'static str {
+    match state {
+        ConflictKind::BothDeleted => "DD",
+        ConflictKind::AddedByUs => "AU",
+        ConflictKind::DeletedByThem => "UD",
+        ConflictKind::AddedByThem => "UA",
+        ConflictKind::DeletedByUs => "DU",
+        ConflictKind::BothAdded => "AA",
+        ConflictKind::BothModified => "UU",
+    }
+}
+
+/// The whole working tree flattened to rows, plus the title-strip line. Pure —
+/// this is the unit-tested half of a refresh.
+pub(crate) struct Prepared {
+    pub(crate) rows: Vec<Entry>,
+    /// The title-strip line: who we are and how much changed.
+    pub(crate) label: String,
+    /// The distinct-path count the label spells, kept so the pane can hand it
+    /// to the header without recounting — see [`Files::changed`].
+    pub(crate) changed: usize,
+}
+
+/// Flattens a status into display rows: one heading per non-empty section,
+/// then that section's files, in [`Section::all`] order.
+pub(crate) fn flatten(status: &Status) -> Vec<Entry> {
+    use Entry::*;
+    let mut rows = Vec::new();
+    for section in Section::all() {
+        let files: Vec<FileEntry> = match section {
+            Section::Staged => status
+                .staged
+                .iter()
+                .map(|e| {
+                    let mark = Mark::of(e.change);
+                    file(section, &e.path, e.old_path.as_ref(), mark, mark.letter())
+                })
+                .collect(),
+            Section::Unstaged => status
+                .unstaged
+                .iter()
+                .map(|e| {
+                    let mark = Mark::of(e.change);
+                    file(section, &e.path, None, mark, mark.letter())
+                })
+                .collect(),
+            Section::Untracked => status
+                .untracked
+                .iter()
+                .map(|e| file(section, &e.path, None, Mark::Untracked, "?"))
+                .collect(),
+            Section::Conflicts => status
+                .conflicts
+                .iter()
+                .map(|e| {
+                    file(
+                        section,
+                        &e.path,
+                        None,
+                        Mark::Conflict,
+                        conflict_letters(e.state),
+                    )
+                })
+                .collect(),
+        };
+        if files.is_empty() {
+            continue;
+        }
+        rows.push(Heading {
+            count: SharedString::from(files.len().to_string()),
+            section,
+        });
+        rows.extend(files.into_iter().map(File));
+    }
+    rows
+}
+
+fn file(
+    section: Section,
+    path: &PathBytes,
+    old_path: Option<&PathBytes>,
+    mark: Mark,
+    letters: &'static str,
+) -> FileEntry {
+    let path_text = path.to_string_lossy().into_owned();
+    let (dir, name) = gitten_core::path::split_dir_name(&path_text);
+    FileEntry {
+        section,
+        path: path.clone(),
+        dir: dir.to_string().into(),
+        name: name.to_string().into(),
+        path_text: path_text.into(),
+        // The arrow baked in here, not per frame: a rename's origin is
+        // furniture drawn dim, and no string is built for it on the render
+        // path.
+        renamed_from: old_path.map(|p| format!("← {}", p.to_string_lossy()).into()),
+        mark,
+        letters,
+    }
+}
+
+/// [`flatten`] plus what the title strip says about it. The load line goes to
+/// stderr like every other view's, and nothing is stored for an overlay that
+/// does not read panes.
+///
+/// The count is **distinct paths**: one file edited, staged and edited again
+/// sits in two lists and is still one change to a person.
+pub(crate) fn prepare(status: Status, describe: &str) -> Prepared {
+    let t = std::time::Instant::now();
+    let rows = flatten(&status);
+    let mut seen = HashSet::new();
+    let changed = rows
+        .iter()
+        .filter_map(|r| match r {
+            Entry::File(f) => Some(f),
+            _ => None,
+        })
+        .filter(|f| seen.insert(&f.path))
+        .count();
+    if crate::stats::enabled() {
+        eprintln!("files: {changed} entries · flatten {:.0?}", t.elapsed());
+    }
+    Prepared {
+        rows,
+        label: format!("{describe} · {changed} changed"),
+        changed,
+    }
+}
+
+/// Whether row `i` can hold the cursor: a file can, a heading cannot. The
+/// predicate [`Viewport::settle`] runs — the one thing about skipping headings
+/// that is this pane's to say.
+fn selectable(rows: &[Entry], i: usize) -> bool {
+    matches!(rows.get(i), Some(Entry::File(_)))
+}
+
+/// Moves `v` off a heading it landed on, onward from `from`. Called after
+/// every cursor move and every refresh, so the cursor never rests on a
+/// heading — a heading is a label over rows, and a verb aimed at one has
+/// nowhere to go.
+fn settle(rows: &[Entry], v: &mut Viewport, from: usize) {
+    v.settle(from, |i| selectable(rows, i));
+}
+
+/// [`settle`] over the shown rows: the same walk, in the space the cursor
+/// addresses — a heading survives a filter only when a file under it does,
+/// and the cursor never rests on one either way.
+fn settle_shown(rows: &[Entry], visible: &[usize], v: &mut Viewport, from: usize) {
+    v.settle(from, |i| {
+        visible.get(i).is_some_and(|&d| selectable(rows, d))
+    });
+}
+
+/// The one matcher, where the rows live: a query matches when the row's
+/// text contains it, folded — exactly what the commit list's search does.
+fn matches(haystack: &str, needle: &str) -> bool {
+    haystack.to_lowercase().contains(&needle.to_lowercase())
+}
+
+/// The rows a query keeps, as indices into `rows`: a file whose **path** —
+/// dir plus name, the whole string the row shows — matches, plus the
+/// heading of every section that still has a file under it, exactly the
+/// sections an empty one drops at flatten.
+fn search_rows(rows: &[Entry], query: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut pending_heading = None;
+    for (i, entry) in rows.iter().enumerate() {
+        match entry {
+            Entry::Heading { .. } => {
+                pending_heading = Some(i);
+            }
+            Entry::File(f) => {
+                if matches(f.path_text.as_ref(), query) {
+                    if let Some(h) = pending_heading.take() {
+                        out.push(h);
+                    }
+                    out.push(i);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// What an armed discard asks, once, in the notice band. An untracked file
+/// says *delete* because that is what discarding means when there is no
+/// earlier version to go back to — the honest word for the one mechanics
+/// where nothing is recoverable.
+pub(crate) fn discard_question(section: Section, shown: &str) -> String {
+    match section {
+        Section::Untracked => format!("delete {shown}? press again to confirm"),
+        _ => format!("discard {shown}? press again to confirm"),
+    }
+}
+
+/// The working-tree pane. Holds flattened rows behind an `Rc`, so a refresh
+/// swaps one refcount instead of mutating what a frame may be reading.
+///
+/// Destructive verbs confirm **in this pane** rather than in a dialog: there
+/// is no modal anywhere in the window yet, and arming the keyboard's own row
+/// needs none. The first press stores [`Files::armed`] and asks its question
+/// through the notice band; the second press on the same row executes; any
+/// cursor move, wheel or refresh drops the arm — a stale yes waiting on a
+/// file that has already changed under it is exactly the accident the double
+/// press exists to prevent.
+pub struct Files {
+    data: Rc<Vec<Entry>>,
+    /// Rows the list draws right now: indices into `data`, ascending.
+    /// Identity until a query filters it, rebuilt only when the query
+    /// changes — never per frame — which is why the full vector is kept
+    /// and this is all the list draws from.
+    visible: Rc<Vec<usize>>,
+    /// The live filter, as the prompt last left it. `None` — or an empty
+    /// string, which [`Files::apply_query`] folds into `None` — is every
+    /// row; kept so a second `/` edits the query rather than starting
+    /// over, and so clearing restores in one keystroke.
+    filter: Option<String>,
+    scroll: UniformListScrollHandle,
+    /// The cursor, the top row and the height — [`Viewport`], the same model
+    /// every other list holds.
+    view: Rc<Cell<Viewport>>,
+    synced: Rc<Cell<f32>>,
+    pending_scroll: PendingScroll,
+    rendered: Rc<Cell<usize>>,
+    /// The discard awaiting its second press: the section and path of the
+    /// row that asked. One slot — arming a different row moves the question,
+    /// it does not queue two. Outliving a switch to another pane and back is
+    /// deliberate: the question still sits on the row it was asked about,
+    /// and only a cursor move, a wheel or a refresh can make its answer
+    /// stale — none of which is a focus change.
+    armed: Option<(Section, PathBytes)>,
+    /// The distinct-path count from the last refresh — what the shell's FILES
+    /// header prints. A property of the data, decided by [`prepare`] once and
+    /// read for free however often a frame wants it.
+    changed: usize,
+    /// Whether this pane holds the keyboard, as the shell last told it. A
+    /// row's bar is accent only when its pane is focused, and the view cannot
+    /// ask the shell during render — so the shell writes it here when focus
+    /// moves, and render reads a flag.
+    focused: bool,
+    /// The row a right-click landed on, published for the shell — which opens
+    /// the pane's context menu over it. Taken once by whoever opens it: one
+    /// right-click, one open.
+    menu_row: Cell<Option<usize>>,
+}
+
+impl Files {
+    /// The viewport model with everything live folded in — see
+    /// [`super::commits::Commits::live_view`].
+    fn live_view(&self, host: &Host) -> Viewport {
+        let mut v = self.view.get();
+        v.set_len(self.visible.len());
+        v.set_height(self.rendered.get());
+        v.set_scrolloff(host.view.scrolloff);
+        v
+    }
+
+    /// Told by the shell whenever the keyboard moves — never decided here.
+    pub fn set_focused(&mut self, focused: bool) {
+        self.focused = focused;
+    }
+
+    /// Whether this pane holds the keyboard. The rows read it for the bar.
+    #[allow(dead_code)]
+    pub fn focused(&self) -> bool {
+        self.focused
+    }
+
+    pub(crate) fn from_prepared(prepared: Prepared) -> Self {
+        let Prepared { rows, changed, .. } = prepared;
+        // Row 0 is always a heading when there is anything at all; the cursor
+        // opens on the first file under it.
+        let visible = Rc::new(Vec::from_iter(0..rows.len()));
+        let mut view = Viewport::new();
+        view.set_len(visible.len());
+        settle(&rows, &mut view, 0);
+        Self {
+            data: Rc::new(rows),
+            visible,
+            filter: None,
+            scroll: UniformListScrollHandle::new(),
+            view: Rc::new(Cell::new(view)),
+            synced: Rc::new(Cell::new(0.0)),
+            pending_scroll: PendingScroll::default(),
+            rendered: Rc::new(Cell::new(0)),
+            armed: None,
+            focused: false,
+            menu_row: Cell::new(None),
+            changed,
+        }
+    }
+
+    /// Whether the working tree had nothing to say — the empty state's trigger.
+    pub fn is_clean(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    /// How many distinct paths changed as of the last refresh — what the
+    /// shell's FILES header prints. Computed once by [`prepare`] for the
+    /// title label; reading it costs nothing per frame.
+    pub fn changed(&self) -> usize {
+        self.changed
+    }
+
+    /// How many rows the list draws — the shown ones, a query having
+    /// narrowed the loaded set without replacing it. What sizes this
+    /// pane's sidebar section.
+    pub fn rows(&self) -> usize {
+        self.visible.len()
+    }
+
+    /// The live query, for pre-filling an edit of it. Empty means none.
+    pub fn query(&self) -> Option<&str> {
+        self.filter.as_deref()
+    }
+
+    /// What the pane's label appends while filtered: shown over loaded —
+    /// `"1/3"`, counting the files and not the section headings, which are
+    /// furniture the query did not ask about. `None` unfiltered — the
+    /// header then stays exactly what acquisition named it.
+    pub fn filter_note(&self) -> Option<String> {
+        let files = |rows: &[Entry]| {
+            rows.iter()
+                .filter(|e| !matches!(e, Entry::Heading { .. }))
+                .count()
+        };
+        self.filter.is_some().then(|| {
+            let shown = self
+                .visible
+                .iter()
+                .filter_map(|&d| self.data.get(d))
+                .filter(|e| !matches!(e, Entry::Heading { .. }))
+                .count();
+            format!("{shown}/{}", files(&self.data))
+        })
+    }
+
+    /// Replaces repository data while keeping the selection anchored to its
+    /// path — the semantic cursor anchor of this pane. A file that vanished
+    /// falls back to clamping, like a commit list whose sha left the log.
+    #[cfg(test)]
+    fn replace(&mut self, status: Status, host: &Host) {
+        self.replace_prepared(prepare(status, ""), host);
+    }
+
+    pub(crate) fn replace_prepared(&mut self, prepared: Prepared, host: &Host) {
+        // A refresh is the repository saying things moved; an armed discard
+        // was a promise about how they were, so it dies here first.
+        self.armed = None;
+        self.reconcile(host);
+        let old = self.view.get();
+        // Only a file anchors, and on its **section and path together**: the
+        // same path can sit in staged *and* unstaged, and anchoring on the
+        // bare path would walk the cursor to whichever twin flattens first.
+        // A heading is a fact about the last refresh's grouping, not a thing
+        // the eye was reading. The cursor addresses the *shown* rows, so the
+        // anchor is read through the visible index.
+        let anchored = match self
+            .visible
+            .get(old.cursor())
+            .and_then(|&d| self.data.get(d))
+        {
+            Some(Entry::File(f)) => Some((f.section, f.path.clone())),
+            _ => None,
+        };
+        let Prepared { rows, changed, .. } = prepared;
+        self.changed = changed;
+        self.data = Rc::new(rows);
+
+        // The new rows under the *current* query — a refresh must not drop
+        // the filter the user is looking through, and the anchor below is
+        // found in this space, not in the full list's.
+        self.visible = Rc::new(match &self.filter {
+            Some(q) => search_rows(&self.data, q),
+            None => Vec::from_iter(0..self.data.len()),
+        });
+        let cursor = anchored
+            .and_then(|(section, path)| {
+                self.visible.iter().position(|&d| {
+                    matches!(&self.data[d], Entry::File(f) if f.section == section && f.path == path)
+                })
+            })
+            .unwrap_or(old.cursor());
+        let mut view = old;
+        view.set_len(self.visible.len());
+        view.go_to(cursor);
+        // A vanished anchor can leave the cursor on whatever heading took
+        // its row; the direction is "where it was" so it walks on to the
+        // next file rather than back to the previous section's last.
+        settle_shown(&self.data, &self.visible, &mut view, old.cursor());
+        self.view.set(view);
+
+        if self.visible.is_empty() {
+            self.pending_scroll.cancel();
+            let mut state = self.scroll.0.borrow_mut();
+            state.deferred_scroll_to_item = None;
+            state.base_handle.set_offset(point(px(0.0), px(0.0)));
+            self.synced.set(0.0);
+        } else {
+            self.defer_show(view);
+        }
+    }
+
+    /// Sets the filter — once per keystroke, and never anywhere else. The
+    /// visible-index vec is rebuilt here and read everywhere else.
+    ///
+    /// The keyboard stays on the same file it was on: anchored by section
+    /// and path into the next result set wherever that file survives the
+    /// narrower query, clamped to a neighbouring row when it does not. An
+    /// empty query (a trimmed-empty one too) is no query: identity indices,
+    /// so clearing restores exactly what was on screen before.
+    ///
+    /// A strict deferred scroll parks the viewport the way every other jump
+    /// does — the list's geometry still describes the previous length until
+    /// the next prepaint, and writing an offset against it would clamp in
+    /// the wrong place.
+    pub fn apply_query(&mut self, query: &str) {
+        let next = Some(query.trim()).filter(|q| !q.is_empty());
+        if self.filter.as_deref() == next {
+            return;
+        }
+        // A changed filter can move the cursor by clamping, and a question
+        // aimed at yesterday's row is the thing the arm exists to prevent.
+        self.armed = None;
+        // Anchor first, on section and path together like every other
+        // re-anchor in this file, because row numbers are about to stop
+        // meaning anything.
+        let anchored = match self
+            .visible
+            .get(self.view.get().cursor())
+            .and_then(|&d| self.data.get(d))
+        {
+            Some(Entry::File(f)) => Some((f.section, f.path.clone())),
+            _ => None,
+        };
+
+        self.filter = next.map(str::to_string);
+        self.visible = Rc::new(match &self.filter {
+            Some(q) => search_rows(&self.data, q),
+            None => Vec::from_iter(0..self.data.len()),
+        });
+
+        let mut view = self.view.get();
+        let cursor = anchored
+            .and_then(|(section, path)| {
+                self.visible.iter().position(|&d| {
+                    matches!(&self.data[d], Entry::File(f) if f.section == section && f.path == path)
+                })
+            })
+            .unwrap_or_else(|| view.cursor().min(self.visible.len().saturating_sub(1)));
+        view.set_len(self.visible.len());
+        view.go_to(cursor);
+        // A vanished anchor can leave the cursor on whatever heading took
+        // its row; the direction is "where it was" so it walks on to the
+        // next file rather than back to the previous section's last.
+        let from = view.cursor();
+        settle_shown(&self.data, &self.visible, &mut view, from);
+        self.view.set(view);
+        if self.visible.is_empty() {
+            // Nothing survives the query; park nothing and leave no stale
+            // offset for a later keystroke to reconcile against.
+            self.pending_scroll.cancel();
+            let mut state = self.scroll.0.borrow_mut();
+            state.deferred_scroll_to_item = None;
+            state.base_handle.set_offset(point(px(0.0), px(0.0)));
+            self.synced.set(0.0);
+        } else {
+            self.defer_show(view);
+        }
+    }
+
+    // -------------------------------------------------------------- commands
+
+    /// The box the list is drawn in, for hit-testing a wheel event.
+    pub fn list_bounds(&self) -> Bounds<Pixels> {
+        self.scroll.0.borrow().base_handle.bounds()
+    }
+
+    /// Nothing off the left edge to reach — a squeezed path ends in an
+    /// ellipsis (the directory's head gives; [`crate::chrome::path_spans`]
+    /// keeps the filename) rather than pan. Present so the wheel routing can
+    /// offer the axis to every screen alike.
+    pub fn pan_pixels(&self, _dx: f32) -> bool {
+        false
+    }
+
+    /// Moves the list by `dy` pixels — the wheel, whose command resolves
+    /// through `[keys]` but whose delta is pixels. Same dance as the commit
+    /// list, for the same reasons.
+    pub fn scroll_pixels(&mut self, dy: f32, host: &Host) -> bool {
+        let deferred = self.scroll.0.borrow().deferred_scroll_to_item;
+        if let Some(request) = deferred {
+            if self.pending_scroll.is_awaiting() {
+                let pixels = self.pending_scroll.wheel(dy);
+                let mut v = self.live_view(host);
+                let y = -(request.item_index as f32 * ROW_H) + pixels;
+                let from = v.cursor();
+                v.scroll_to((-y / ROW_H).round().max(0.0) as usize);
+                settle_shown(&self.data, &self.visible, &mut v, from);
+                self.view.set(v);
+                // The wheel is also a move of attention — same rule the
+                // arrow keys keep.
+                self.armed = None;
+                return true;
+            }
+            self.scroll.0.borrow_mut().deferred_scroll_to_item = None;
+        }
+        let (offset, max) = {
+            let s = self.scroll.0.borrow();
+            (s.base_handle.offset(), s.base_handle.max_offset())
+        };
+        let y = (f32::from(offset.y) + dy).clamp(-f32::from(max.y), 0.0);
+        if y == f32::from(offset.y) {
+            return false;
+        }
+        self.scroll
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(point(offset.x, px(y)));
+        let mut v = self.live_view(host);
+        // The wheel drags the cursor along at the margin; it must not park
+        // it on a heading any more than a keypress may.
+        let from = v.cursor();
+        v.scroll_to((-y / ROW_H).round().max(0.0) as usize);
+        settle_shown(&self.data, &self.visible, &mut v, from);
+        self.view.set(v);
+        self.synced.set(y);
+        self.armed = None;
+        true
+    }
+
+    /// Meets the list where it actually is after a scrollbar drag — see
+    /// [`super::commits::Commits::reconcile`].
+    pub fn reconcile(&mut self, host: &Host) {
+        if self.scroll.0.borrow().deferred_scroll_to_item.is_some() {
+            return;
+        }
+        let shown_y = f32::from(self.scroll.0.borrow().base_handle.offset().y);
+        if (shown_y - self.synced.get()).abs() < 0.5 {
+            return;
+        }
+        self.synced.set(shown_y);
+        let shown = (-shown_y / ROW_H).round().max(0.0) as usize;
+        let mut v = self.live_view(host);
+        if v.top() == shown {
+            return;
+        }
+        let from = v.cursor();
+        v.scroll_to(shown);
+        settle_shown(&self.data, &self.visible, &mut v, from);
+        self.view.set(v);
+    }
+
+    /// Runs one of the commands this pane answers. The `view.*` family is the
+    /// shared list vocabulary — inherited by every mode through [`GLOBAL`] —
+    /// onto the same [`Viewport`] arithmetic the commit list runs.
+    ///
+    /// False is "not one of mine", and the caller says so.
+    pub fn run_view(&mut self, command: &str, host: &Host) -> bool {
+        self.reconcile(host);
+        let mut v = self.live_view(host);
+        let from = v.cursor();
+        match command {
+            "view.down" => v.down(),
+            "view.up" => v.up(),
+            "view.page-down" => v.page(1),
+            "view.page-up" => v.page(-1),
+            "view.scroll-down" => v.scroll_by(host.view.rows as isize),
+            "view.scroll-up" => v.scroll_by(-(host.view.rows as isize)),
+            "view.top" => v.to_top(),
+            "view.bottom" => v.to_bottom(),
+            // Answered without doing anything, like the commit graph: a
+            // resolved command must not read as a failed one. Nothing moved
+            // either, so an armed discard stands.
+            "view.left" | "view.right" => return true,
+            _ => return false,
+        }
+        // Landed on a heading? Keep going the way the key pointed.
+        settle_shown(&self.data, &self.visible, &mut v, from);
+        // The keyboard moved — including the two scrolls above, which leave
+        // the cursor but not the question's row in view. Whatever was armed
+        // was armed to what the keyboard used to be on.
+        self.armed = None;
+        self.view.set(v);
+        self.show(v);
+        true
+    }
+
+    /// Where a click lands the keyboard: onto the row the mouse hit, with
+    /// exactly the side effects a key move has — see [`Self::run_view`]. The
+    /// row clamps like [`Viewport::go_to`] does, and a heading snaps to the
+    /// nearest selectable row below, the same rule the keyboard runs.
+    /// The row a right-click landed on, published by the row's own handler
+    /// beside the left-click one, and taken once by the shell — which opens
+    /// the pane's context menu over it. Taken, not read: one right-click,
+    /// one open.
+    pub fn take_menu_row(&self) -> Option<usize> {
+        self.menu_row.take()
+    }
+
+    pub fn select_row(&mut self, index: usize, host: &Host) {
+        self.reconcile(host);
+        let mut v = self.live_view(host);
+        v.go_to(index);
+        settle_shown(&self.data, &self.visible, &mut v, index);
+        // The mouse moved — whatever was armed was armed to what the mouse
+        // used to be on.
+        self.armed = None;
+        self.view.set(v);
+        self.show(v);
+    }
+
+    /// Puts row `v.top()` at the top of the viewport, exactly — see
+    /// [`super::commits::Commits::show`].
+    fn show(&self, v: Viewport) {
+        let target = v.top();
+        if self.scroll.0.borrow().deferred_scroll_to_item.is_some() {
+            self.defer_show(v);
+            return;
+        }
+        let s = self.scroll.0.borrow();
+        let cur = s.base_handle.offset();
+        let y = -(target as f32 * ROW_H).clamp(0.0, f32::from(s.base_handle.max_offset().y));
+        s.base_handle.set_offset(point(cur.x, px(y)));
+        self.synced.set(y);
+    }
+
+    fn defer_show(&self, v: Viewport) {
+        self.pending_scroll.begin();
+        self.scroll
+            .scroll_to_item_strict(v.top(), ScrollStrategy::Top);
+    }
+
+    /// What the keyboard is on: the whole file entry — section and path
+    /// together, which is what a stage verb will need to know where its work
+    /// goes. `None` only on an empty tree, since the cursor never rests on a
+    /// heading.
+    pub(crate) fn current_file(&self) -> Option<&FileEntry> {
+        match self
+            .visible
+            .get(self.view.get().cursor())
+            .and_then(|&d| self.data.get(d))
+        {
+            Some(Entry::File(f)) => Some(f),
+            _ => None,
+        }
+    }
+
+    /// Which section the keyboard sits *in* — the side of the index under the
+    /// keyboard decides where a whole-section verb goes. A heading answers
+    /// for its section too, though the cursor no longer rests on one.
+    pub(crate) fn cursor_section(&self) -> Option<Section> {
+        match self
+            .visible
+            .get(self.view.get().cursor())
+            .and_then(|&d| self.data.get(d))
+        {
+            Some(Entry::Heading { section, .. }) => Some(*section),
+            Some(Entry::File(f)) => Some(f.section),
+            None => None,
+        }
+    }
+
+    /// Every path flattened under one section, in draw order — what a
+    /// whole-section verb acts on. Bytes throughout, because these aim
+    /// verbs; the display forms live only in the rows.
+    pub(crate) fn paths_in(&self, section: Section) -> Vec<PathBytes> {
+        self.data
+            .iter()
+            .filter_map(|e| match e {
+                Entry::File(f) if f.section == section => Some(f.path.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Arms — or confirms — a discard of this exact row. The first call on a
+    /// target stores it and returns false: ask, don't act. A second call on
+    /// the same target clears the arm and returns true: act. Anything else
+    /// (a different row, after a move or refresh cleared it) re-arms onto
+    /// the new target and returns false again, so there is no state here a
+    /// caller has to remember.
+    pub(crate) fn confirm_or_arm_discard(&mut self, section: Section, path: &PathBytes) -> bool {
+        let already = matches!(
+            &self.armed,
+            Some((armed_section, armed_path))
+                if *armed_section == section && armed_path == path
+        );
+        self.armed = match already {
+            true => None,
+            false => Some((section, path.clone())),
+        };
+        already
+    }
+
+    /// Whether a discard is waiting for its second press — the render's
+    /// tint of the row the question is about.
+    #[cfg(test)]
+    pub(crate) fn armed_row(&self) -> Option<(Section, PathBytes)> {
+        self.armed.clone()
+    }
+
+    /// What `copy.selection` copies here: the row the keyboard is on, as git
+    /// would spell it — letters, then path. A heading copies nothing, which is
+    /// what makes the empty result skip the clipboard entirely.
+    pub fn cursor_text(&self) -> String {
+        match self.current_file() {
+            Some(f) => format!("{} {}", f.letters, f.path),
+            None => String::new(),
+        }
+    }
+
+    /// No drag selection over a file list yet; `select.all` is inert here, the
+    /// same answer the commit graph gives.
+    pub fn select_all(&mut self) -> bool {
+        false
+    }
+
+    pub fn select_none(&mut self) -> bool {
+        false
+    }
+}
+
+/// Width of the status column, in characters. Two, because a conflict's XY
+/// pair is the widest thing git puts there.
+const STATUS_CHARS: f32 = 2.0;
+/// Air between the columns, also in characters.
+const GAP_CHARS: f32 = 1.5;
+
+impl Render for Files {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // A clean tree is a quiet line, not an empty box: [`chrome::empty_line`]
+        // sits top-left where a reader scans, and the sentence is shared with
+        // the stashes and branches panes so one blank pane means one thing.
+        if self.is_clean() {
+            return empty_line(&crate::config::host(cx), "working tree clean".into());
+        }
+
+        // A click on a row is the keyboard coming back — see [`Self::select_row`].
+        // Built as a plain handle, not `cx.listener`: the rows are drawn in the
+        // list's closure over `&mut App`, where no listener can be minted.
+        let this = cx.entity().downgrade();
+        let data = self.data.clone();
+        let visible = self.visible.clone();
+        let rendered = self.rendered.clone();
+        let view = self.view.clone();
+        let scroll = self.scroll.clone();
+        let synced = self.synced.clone();
+        let pending_scroll = self.pending_scroll.clone();
+        let focused = self.focused;
+        // The row an armed discard is waiting on, found once per frame in the
+        // *shown* rows — the cursor's space — the tint a property of the
+        // question, not of the draw.
+        let armed = self.armed.as_ref().and_then(|(section, path)| {
+            visible.iter().position(
+                |&d| matches!(&data[d], Entry::File(f) if f.section == *section && f.path == *path),
+            )
+        });
+        let list = uniform_list("files", visible.len(), move |range, _, cx| {
+            rendered.set(range.len());
+            let host = crate::config::host(cx);
+            if let Some(accepted) = accept_deferred_scroll(&scroll, &pending_scroll, &synced) {
+                if accepted.wheeled {
+                    let mut v = view.get();
+                    v.set_len(visible.len());
+                    v.set_height(range.len());
+                    v.set_scrolloff(host.view.scrolloff);
+                    v.scroll_to((-accepted.y / ROW_H).round().max(0.0) as usize);
+                    view.set(v);
+                    cx.refresh_windows();
+                }
+            }
+            let cursor = view.get().cursor();
+            range
+                .map(|i| {
+                    let r = row(
+                        &data[visible[i]],
+                        &host,
+                        i == cursor,
+                        focused,
+                        Some(i) == armed,
+                    );
+                    if selectable(&data, visible[i]) {
+                        let this = this.clone();
+                        return r
+                            .id(("row", i))
+                            // Hover says clickable — but the selection tint
+                            // outranks it, so the cursor row keeps its own
+                            // background. `hover` needs identity, so it rides
+                            // this id (plan 045); `chrome::list_row` has none.
+                            .cursor_pointer()
+                            .when(i != cursor, |r| {
+                                r.hover(|s| s.bg(rgb(host.theme.chrome.raised)))
+                            })
+                            .on_mouse_down(MouseButton::Right, {
+                                let this = this.clone();
+                                move |_: &MouseDownEvent, _, cx| {
+                                    let Some(this) = this.upgrade() else { return };
+                                    let host = crate::config::host(cx);
+                                    this.update(cx, |f, cx| {
+                                        f.select_row(i, &host);
+                                        f.menu_row.set(Some(i));
+                                        cx.notify();
+                                    });
+                                }
+                            })
+                            .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, _, cx| {
+                                let Some(this) = this.upgrade() else { return };
+                                let host = crate::config::host(cx);
+                                this.update(cx, |f, cx| {
+                                    f.select_row(i, &host);
+                                    cx.notify();
+                                });
+                            })
+                            .into_any_element();
+                    }
+                    r.into_any_element()
+                })
+                .collect()
+        })
+        .track_scroll(&self.scroll)
+        .size_full();
+
+        // The scrollbar overlays the list, so the container must be positioned
+        // — and only the vertical one: paths clip rather than pan.
+        div()
+            .relative()
+            .size_full()
+            .child(list)
+            .when(crate::config::host(cx).view.scrollbar, |d| {
+                d.child(vertical_scrollbar(&DeferredScrollbar::new(
+                    &self.scroll,
+                    &self.pending_scroll,
+                )))
+            })
+            .into_any_element()
+    }
+}
+
+/// One row: a section label, or a status letter in its colour beside the
+/// path. The frame is [`list_row`]'s — selection tint, the bar on the left
+/// edge in accent while this pane is `focused` — and a heading is
+/// [`section_label`]'s, so it reads as a label over the rows and not as one.
+/// `armed` tints the letters and the path toward `chrome.error`, so the thing
+/// a second press will destroy is named by its own colour and not only by the
+/// band above it.
+fn row(e: &Entry, host: &Host, current: bool, focused: bool, armed: bool) -> Div {
+    let ch = host.font.char_width();
+    let c = host.theme.chrome;
+    match e {
+        Entry::Heading { count, section } => {
+            section_label(host, section.label().into(), Some(count.clone()), ROW_H)
+        }
+        Entry::File(f) => list_row(host, current, focused, ROW_H)
+            .child(
+                div()
+                    .flex_none()
+                    // One character of air *inside* the column — the gap is
+                    // part of it, the way commits.rs sizes WHO_CHARS — so a
+                    // conflict's `UU`, the widest pair git puts here, does
+                    // not weld itself to the path it belongs to. Single
+                    // letters keep the air they had by accident; now every
+                    // state has it by rule.
+                    .w(px((STATUS_CHARS + 1.0) * ch))
+                    // The error colour is already this palette's "this row
+                    // ends work" foreground — conflicts draw their letters
+                    // with it — so the armed tint spends nothing new.
+                    .text_color(rgb(match armed {
+                        true => c.error,
+                        false => f.section.ink(host),
+                    }))
+                    .child(SharedString::from(f.letters)),
+            )
+            .child(
+                // No `flex_none` here: the path is the one thing that gives —
+                // [`path_spans`] shrinks the directory's head under a squeezed
+                // row — and a `flex_none` wrapper would refuse to shrink and
+                // pin the whole row wide.
+                div().min_w_0().child(match armed {
+                    // The question repaints the whole path; unarmed, the
+                    // directory is dim and the name keeps the row's ink.
+                    true => div()
+                        .whitespace_nowrap()
+                        .text_color(rgb(c.error))
+                        .child(f.path_text.clone()),
+                    false => path_spans(
+                        host,
+                        f.dir.clone(),
+                        f.name.clone(),
+                        c.fg,
+                        if current {
+                            Surface::Cursor
+                        } else {
+                            Surface::Context
+                        },
+                    ),
+                }),
+            )
+            .children(f.renamed_from.as_ref().map(|old| {
+                div()
+                    .flex_none()
+                    .ml(px(GAP_CHARS * ch))
+                    // The old path is read — it is where the file came from —
+                    // so quiet, not invisible: through `quiet_on`.
+                    .text_color(rgb(host.theme.quiet_on(c.bg)))
+                    .child(old.clone())
+            })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // By name, not a glob: `use gpui::*` in the parent shadows `#[test]` with
+    // GPUI's own attribute macro and every test in here fails to expand.
+    use super::{
+        conflict_letters, discard_question, flatten, prepare, Entry, Files, Mark, Section, Status,
+    };
+    use gitten_core::host::Host;
+    use gitten_core::status::{
+        Change, ConflictEntry, ConflictKind, Kind, PathBytes, StagedEntry, Submodule,
+        UnstagedEntry, UntrackedEntry,
+    };
+    use std::rc::Rc;
+
+    fn staged(path: &str, change: Change) -> StagedEntry {
+        StagedEntry {
+            path: PathBytes::from(path),
+            change,
+            old_path: None,
+            kind: Kind::File,
+            submodule: Submodule::default(),
+        }
+    }
+
+    fn unstaged(path: &str, change: Change) -> UnstagedEntry {
+        UnstagedEntry {
+            path: PathBytes::from(path),
+            change,
+            kind: Kind::File,
+            submodule: Submodule::default(),
+        }
+    }
+
+    fn untracked(path: &str) -> UntrackedEntry {
+        UntrackedEntry {
+            path: PathBytes::from(path),
+        }
+    }
+
+    fn conflict(path: &str, state: ConflictKind) -> ConflictEntry {
+        ConflictEntry {
+            path: PathBytes::from(path),
+            state,
+            kind: Kind::File,
+            submodule: Submodule::default(),
+        }
+    }
+
+    /// Headings and paths in draw order — the shape the tests read.
+    fn outline(status: &Status) -> Vec<String> {
+        flatten(status)
+            .iter()
+            .map(|e| match e {
+                Entry::Heading { count, section } => {
+                    format!("[{}·{count}]", section.name())
+                }
+                Entry::File(f) => f.path.to_string_lossy().into_owned(),
+            })
+            .collect()
+    }
+
+    fn with_height(f: &mut Files, n: usize) {
+        f.rendered.set(n);
+        let mut v = f.view.get();
+        v.set_len(f.data.len());
+        v.set_height(n);
+        f.view.set(v);
+    }
+
+    /// A pane over one status, as a refresh would leave it. The label carries
+    /// no repository name, which is what the caller would pass.
+    fn files(status: Status) -> Files {
+        Files::from_prepared(prepare(status, ""))
+    }
+
+    fn sample_status() -> Status {
+        Status {
+            staged: vec![
+                staged("src/main.rs", Change::Modified),
+                staged("gone.txt", Change::Deleted),
+            ],
+            unstaged: vec![unstaged("src/main.rs", Change::Modified)],
+            untracked: vec![untracked("notes.md")],
+            conflicts: vec![conflict("merged.rs", ConflictKind::BothModified)],
+            ignored: vec![],
+        }
+    }
+
+    #[test]
+    fn sections_draw_in_order_and_empty_ones_do_not_draw_at_all() {
+        let s = Status {
+            untracked: vec![untracked("a.txt")],
+            ..Default::default()
+        };
+        assert_eq!(
+            outline(&s),
+            vec!["[untracked·1]", "a.txt"],
+            "a lone section draws no neighbours"
+        );
+        assert_eq!(outline(&Status::default()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_full_tree_flattens_into_four_labeled_groups() {
+        let rows = outline(&sample_status());
+        assert_eq!(
+            rows,
+            vec![
+                "[staged·2]",
+                "src/main.rs",
+                "gone.txt",
+                "[unstaged·1]",
+                "src/main.rs",
+                "[untracked·1]",
+                "notes.md",
+                "[conflicts·1]",
+                "merged.rs",
+            ]
+        );
+    }
+
+    #[test]
+    fn letters_match_gits_own_spelling() {
+        assert_eq!(Mark::of(Change::Added).letter(), "A");
+        assert_eq!(Mark::of(Change::Modified).letter(), "M");
+        assert_eq!(Mark::of(Change::Deleted).letter(), "D");
+        assert_eq!(Mark::of(Change::Renamed).letter(), "R");
+        assert_eq!(
+            Mark::of(Change::Copied).letter(),
+            "R",
+            "a copy draws as a move"
+        );
+        assert_eq!(Mark::of(Change::TypeChanged).letter(), "T");
+        assert_eq!(Mark::Untracked.letter(), "?");
+
+        // Porcelain v2's unmerged pairs: who added and who deleted is the whole
+        // message, so the spelling is git's verbatim.
+        for (state, letters) in [
+            (ConflictKind::BothDeleted, "DD"),
+            (ConflictKind::AddedByUs, "AU"),
+            (ConflictKind::DeletedByThem, "UD"),
+            (ConflictKind::AddedByThem, "UA"),
+            (ConflictKind::DeletedByUs, "DU"),
+            (ConflictKind::BothAdded, "AA"),
+            (ConflictKind::BothModified, "UU"),
+        ] {
+            assert_eq!(conflict_letters(state), letters);
+        }
+    }
+
+    #[test]
+    fn a_conflict_row_carries_its_two_letter_state_and_a_path_keeps_its_bytes() {
+        let rows = flatten(&sample_status());
+        let merged = rows.iter().find_map(|e| match e {
+            Entry::File(f) if f.section == Section::Conflicts => Some(f),
+            _ => None,
+        });
+        let f = merged.expect("the conflicted file was flattened");
+        assert_eq!(f.letters, "UU");
+        assert_eq!(f.mark, Mark::Conflict);
+        assert_eq!(
+            f.path.as_bytes(),
+            b"merged.rs",
+            "addressing stays raw bytes"
+        );
+    }
+
+    #[test]
+    fn a_rename_travels_with_the_name_it_had() {
+        let s = Status {
+            staged: vec![StagedEntry {
+                path: PathBytes::from("after.rs"),
+                change: Change::Renamed,
+                old_path: Some(PathBytes::from("before.rs")),
+                kind: Kind::File,
+                submodule: Submodule::default(),
+            }],
+            ..Default::default()
+        };
+        let rows = flatten(&s);
+        let Entry::File(f) = &rows[1] else {
+            panic!("row 1 is the file under the heading");
+        };
+        // The arrow is baked in at flatten, so the render path draws furniture
+        // without building a string for it.
+        assert_eq!(f.renamed_from.as_deref(), Some("← before.rs"));
+        // And a plain modification carries none.
+        let Entry::File(m) = &flatten(&sample_status())[1] else {
+            panic!();
+        };
+        assert!(m.renamed_from.is_none());
+    }
+
+    #[test]
+    fn a_non_utf8_path_keeps_its_bytes_and_displays_lossily() {
+        // `café.txt` in Latin-1: git emits bytes no encoding claims, and the
+        // model keeps them raw while the display string takes U+FFFD for the
+        // one it cannot show.
+        let s = Status {
+            untracked: vec![UntrackedEntry {
+                path: PathBytes::from_bytes(b"caf\xe9.txt"),
+            }],
+            ..Default::default()
+        };
+        let rows = flatten(&s);
+        let Entry::File(f) = &rows[1] else {
+            panic!("row 1 is the file under the heading");
+        };
+        assert_eq!(
+            f.path.as_bytes(),
+            b"caf\xe9.txt",
+            "addressing keeps the bytes"
+        );
+        assert!(
+            f.path_text.contains('\u{FFFD}'),
+            "display decodes lossily instead of failing"
+        );
+    }
+
+    #[test]
+    fn navigation_moves_across_sections_and_clamps_at_both_ends() {
+        let host = Host::new();
+        let mut f = files(sample_status());
+        with_height(&mut f, 4);
+        let last = f.data.len() - 1;
+        // Row 0 is the staged heading; the pane opens on the file under it.
+        assert_eq!(f.view.get().cursor(), 1);
+        assert!(f.run_view("view.down", &host));
+        assert!(f.current_file().is_some());
+        for _ in 0..20 {
+            f.run_view("view.down", &host);
+        }
+        assert_eq!(
+            f.view.get().cursor(),
+            last,
+            "the last row clamps rather than wrapping"
+        );
+        // `gg` lands on the heading and walks forward to the first file.
+        assert!(f.run_view("view.top", &host));
+        assert_eq!(f.view.get().cursor(), 1);
+        assert!(f.run_view("view.bottom", &host));
+        assert_eq!(f.view.get().cursor(), last);
+        // `k` from merged.rs crosses the conflicts heading to notes.md.
+        assert!(f.run_view("view.up", &host));
+        assert_eq!(f.view.get().cursor(), last - 2);
+    }
+
+    #[test]
+    fn the_cursor_never_rests_on_a_heading() {
+        // Down from the top, one row at a time, across every section: every
+        // stop is a file, and the walk is `Section::all` order — staged,
+        // staged, unstaged, untracked, conflicts.
+        let host = Host::new();
+        let mut f = files(sample_status());
+        with_height(&mut f, 4);
+        f.run_view("view.top", &host);
+        let mut visited = vec![f.cursor_text()];
+        for _ in 0..8 {
+            f.run_view("view.down", &host);
+            assert!(
+                f.current_file().is_some(),
+                "landed on a heading at row {}",
+                f.view.get().cursor()
+            );
+            visited.push(f.cursor_text());
+        }
+        visited.dedup();
+        assert_eq!(
+            visited,
+            vec![
+                "M src/main.rs",
+                "D gone.txt",
+                "M src/main.rs",
+                "? notes.md",
+                "UU merged.rs",
+            ]
+        );
+        // And back up the same way: pages and scrolls settle too.
+        for command in [
+            "view.up",
+            "view.page-up",
+            "view.page-down",
+            "view.scroll-down",
+        ] {
+            f.run_view(command, &host);
+            assert!(f.current_file().is_some(), "{command} parked on a heading");
+        }
+    }
+
+    #[test]
+    fn sideways_commands_are_answered_without_doing_anything() {
+        let host = Host::new();
+        let mut f = files(sample_status());
+        with_height(&mut f, 4);
+        assert!(f.run_view("view.left", &host));
+        assert!(f.run_view("view.right", &host));
+        assert!(!f.pan_pixels(40.0));
+        // And an unknown command says so rather than pretending. The write
+        // verbs (`files.stage`, `files.commit`) are not in that company any
+        // more — dispatch answers them before they ever reach this method,
+        // because their work belongs to the job queue, not to a view.
+        assert!(!f.run_view("files.discard", &host));
+    }
+
+    #[test]
+    fn copy_falls_back_to_the_row_the_keyboard_is_on_as_git_would_spell_it() {
+        let host = Host::new();
+        let mut f = files(sample_status());
+        with_height(&mut f, 8);
+        // The pane opens on the first file: `M src/main.rs`.
+        assert_eq!(f.cursor_text(), "M src/main.rs");
+        // Up from there has only the heading above, so the cursor stays put
+        // — a heading is never what copy would spell.
+        f.run_view("view.up", &host);
+        assert_eq!(f.cursor_text(), "M src/main.rs");
+        f.run_view("view.down", &host);
+        assert_eq!(f.cursor_text(), "D gone.txt");
+        // The empty answer is only an empty tree's.
+        assert_eq!(files(Status::default()).cursor_text(), "");
+        assert!(!f.select_all());
+        assert!(!f.select_none());
+    }
+
+    #[test]
+    fn replacement_keeps_the_cursor_on_its_file_within_its_section() {
+        let host = Host::new();
+        let mut f = files(sample_status());
+        with_height(&mut f, 9);
+        // Cursor onto `notes.md` (untracked): from the first staged file, three
+        // steps — gone.txt, the unstaged main.rs, notes.md — with the headings
+        // between them skipped.
+        f.run_view("view.top", &host);
+        for _ in 0..3 {
+            f.run_view("view.down", &host);
+        }
+        assert_eq!(f.cursor_text(), "? notes.md");
+
+        // A refresh that adds a file above it in the same section shifts
+        // notes.md down a row; the keyboard goes with the file.
+        let mut next = sample_status();
+        next.untracked.insert(0, untracked("aaa.md"));
+        f.replace(next, &host);
+        assert_eq!(f.cursor_text(), "? notes.md");
+    }
+
+    #[test]
+    fn an_anchor_does_not_cross_sections_to_a_path_twin() {
+        // `src/main.rs` sits in staged *and* unstaged. The cursor is on the
+        // unstaged one; a refresh must not walk it up to the staged twin just
+        // because that twin flattens first.
+        let host = Host::new();
+        let mut f = files(sample_status());
+        with_height(&mut f, 9);
+        f.run_view("view.top", &host);
+        for _ in 0..2 {
+            f.run_view("view.down", &host);
+        }
+        let before = f.current_file().expect("a file under the cursor");
+        assert_eq!(
+            (before.section, before.path.to_string_lossy().as_ref()),
+            (Section::Unstaged, "src/main.rs")
+        );
+
+        // A staged addition above shifts every staged row; the anchor holds
+        // the unstaged copy anyway.
+        let mut next = sample_status();
+        next.staged.insert(0, staged("aaa.rs", Change::Added));
+        f.replace(next, &host);
+
+        let after = f.current_file().expect("still a file");
+        assert_eq!(
+            after.section,
+            Section::Unstaged,
+            "the cursor walked across sections"
+        );
+        assert_eq!(after.path.as_bytes(), b"src/main.rs");
+    }
+
+    #[test]
+    fn replacement_clamps_a_vanished_anchor_and_accepts_an_empty_tree() {
+        let host = Host::new();
+        let mut f = files(sample_status());
+        with_height(&mut f, 4);
+        f.run_view("view.bottom", &host);
+
+        // Every file gone: the tree went clean mid-session.
+        f.replace(Status::default(), &host);
+        assert!(f.is_clean());
+        assert_eq!((f.view.get().cursor(), f.view.get().top()), (0, 0));
+        assert!(f.scroll.0.borrow().deferred_scroll_to_item.is_none());
+
+        // And back to something: the cursor starts at the top again — the
+        // first file, past the heading.
+        f.replace(sample_status(), &host);
+        assert_eq!(f.view.get().cursor(), 1);
+        assert!(f.current_file().is_some());
+    }
+
+    #[test]
+    fn a_vanished_anchor_that_leaves_a_heading_under_the_cursor_walks_on() {
+        let host = Host::new();
+        let mut f = files(sample_status());
+        with_height(&mut f, 9);
+        f.run_view("view.top", &host);
+        f.run_view("view.down", &host); // gone.txt, row 2
+        assert_eq!(f.cursor_text(), "D gone.txt");
+
+        // gone.txt leaves the index; row 2 is now the unstaged heading. The
+        // cursor may not rest there, and "where it was" points on, so it
+        // lands on the first unstaged file rather than back on staged's last.
+        let mut next = sample_status();
+        next.staged.remove(1);
+        f.replace(next, &host);
+        let current = f.current_file().expect("never a heading");
+        assert_eq!(
+            (current.section, current.path.as_bytes()),
+            (Section::Unstaged, &b"src/main.rs"[..])
+        );
+    }
+
+    #[test]
+    fn what_the_keyboard_is_on_names_the_group_and_the_path() {
+        // The seam stage/unstage hangs off: both halves of "where a verb goes"
+        // in one answer.
+        let host = Host::new();
+        let mut f = files(sample_status());
+        with_height(&mut f, 9);
+        for _ in 0..3 {
+            f.run_view("view.down", &host);
+        }
+        let current = f.current_file().expect("a file under the cursor");
+        assert_eq!(current.section, Section::Untracked);
+        assert_eq!(current.path.as_bytes(), b"notes.md");
+    }
+
+    #[test]
+    fn the_label_counts_what_changed_and_the_load_line_says_how_long_it_took() {
+        let prepared = prepare(sample_status(), "gitten (main)");
+        // Five entries, four paths: src/main.rs sits in staged and unstaged
+        // and counts once.
+        assert_eq!(prepared.label, "gitten (main) · 4 changed");
+        assert_eq!(
+            prepared.changed, 4,
+            "the count behind the label is the distinct-path count"
+        );
+
+        let clean = prepare(Status::default(), "gitten (main)");
+        assert_eq!(clean.label, "gitten (main) · 0 changed");
+        assert_eq!(clean.changed, 0);
+        assert!(clean.rows.is_empty(), "a clean tree flattens to nothing");
+
+        // And the count travels onto the pane, so the header reads it for
+        // free — the very number `prepare` already spelled in the label.
+        assert_eq!(files(sample_status()).changed(), 4);
+        assert_eq!(files(Status::default()).changed(), 0);
+    }
+
+    #[test]
+    fn the_shipped_keymap_resolves_the_files_binding_through_the_registry() {
+        use gitten_core::command::{Code, Commands, HelpRow, Key, Keymap, Modes, Resolve};
+
+        // The command exists and the key resolves to it. The stack draws in
+        // lazygit's order, so files are second — under status, above the
+        // branches.
+        let k = Keymap::builtin();
+        assert_eq!(
+            k.resolve(&Modes::new(), &[Key::char('2')]),
+            Resolve::Run("files.focus")
+        );
+        assert_eq!(k.keys_for("files.focus"), vec!["2"]);
+        assert_eq!(
+            Key::parse("2"),
+            Some(Key::plain(Code::Char('2'))),
+            "the binding round-trips through a config file's spelling"
+        );
+
+        // And both registries feed the help projection directly, so the row
+        // appears under [global] with no help-specific code anywhere.
+        let rows = k.help(&Commands::builtin(), &Modes::new());
+        let global = rows
+            .iter()
+            .position(|r| matches!(r, HelpRow::Mode(m) if m == "global"))
+            .unwrap();
+        assert!(rows[global..]
+            .iter()
+            .any(|r| matches!(r, HelpRow::Command { keys, doc, .. } if keys == "2" && doc == "focus the working-tree pane")));
+    }
+
+    // ------------------------------------------------------- the discard arm
+
+    /// Puts the keyboard on the unstaged `src/main.rs` — row 4 of the
+    /// sample: two steps from the first staged file, the heading skipped.
+    fn onto_unstaged(f: &mut Files, host: &Host) {
+        f.run_view("view.top", host);
+        for _ in 0..2 {
+            f.run_view("view.down", host);
+        }
+    }
+
+    /// The keyboard's row, owned — [`Files::current_file`] borrows the pane,
+    /// and the arm API needs it mutable.
+    fn under(f: &Files) -> (Section, PathBytes) {
+        let current = f.current_file().expect("a file under the cursor");
+        (current.section, current.path.clone())
+    }
+
+    #[test]
+    fn a_discard_arms_then_confirms_on_the_second_press_of_the_same_row() {
+        let host = Host::new();
+        let mut f = files(sample_status());
+        with_height(&mut f, 9);
+        onto_unstaged(&mut f, &host);
+        let (section, path) = under(&f);
+
+        // First press: asked, not acted.
+        assert!(!f.confirm_or_arm_discard(section, &path));
+        assert_eq!(
+            f.armed_row(),
+            Some((Section::Unstaged, PathBytes::from("src/main.rs"))),
+            "the arm names section and path together"
+        );
+
+        // Second press on the same row: act, and the slot is spent.
+        assert!(f.confirm_or_arm_discard(section, &path));
+        assert_eq!(f.armed_row(), None);
+
+        // And a third press starts over: there is no latched yes.
+        assert!(!f.confirm_or_arm_discard(section, &path));
+    }
+
+    #[test]
+    fn arming_a_different_row_moves_the_question_rather_than_confirming_it() {
+        let host = Host::new();
+        let mut f = files(sample_status());
+        with_height(&mut f, 9);
+        onto_unstaged(&mut f, &host);
+        let (unstaged_section, unstaged_path) = under(&f);
+        assert!(!f.confirm_or_arm_discard(unstaged_section, &unstaged_path));
+
+        // The same path under *staged* is a different row and a different
+        // question; pressing there re-arms rather than executes.
+        let staged = PathBytes::from("src/main.rs");
+        assert!(!f.confirm_or_arm_discard(Section::Staged, &staged));
+        assert_eq!(
+            f.armed_row(),
+            Some((Section::Staged, staged)),
+            "one slot, moved — never two questions waiting"
+        );
+    }
+
+    #[test]
+    fn any_cursor_move_disarms_an_armed_discard() {
+        let host = Host::new();
+        let mut f = files(sample_status());
+        with_height(&mut f, 9);
+        onto_unstaged(&mut f, &host);
+        let (section, path) = under(&f);
+        assert!(!f.confirm_or_arm_discard(section, &path));
+
+        // One step down — over the untracked heading onto notes.md: the
+        // keyboard left the question's row.
+        assert!(f.run_view("view.down", &host));
+        assert_eq!(f.armed_row(), None);
+        // So the next press asks again about what it landed on instead of
+        // executing the stale one.
+        let (section, path) = under(&f);
+        assert_eq!(section, Section::Untracked);
+        assert!(!f.confirm_or_arm_discard(section, &path));
+
+        // The scroll family moves attention too, even with the cursor still.
+        assert!(f.run_view("view.scroll-down", &host));
+        assert_eq!(
+            f.armed_row(),
+            None,
+            "the question did not survive its own scroll away"
+        );
+    }
+
+    #[test]
+    fn a_refresh_disarms_even_when_the_file_survives() {
+        let host = Host::new();
+        let mut f = files(sample_status());
+        with_height(&mut f, 9);
+        onto_unstaged(&mut f, &host);
+        let (section, path) = under(&f);
+        assert!(!f.confirm_or_arm_discard(section, &path));
+
+        // A refresh that changes nothing at all still says "things moved".
+        f.replace(sample_status(), &host);
+        assert_eq!(f.armed_row(), None);
+        // The press after it re-arms rather than executes.
+        assert!(!f.confirm_or_arm_discard(section, &path));
+    }
+
+    #[test]
+    fn an_armed_discard_dies_when_its_file_vanishes_under_it() {
+        // The race the double-press exists for: arm on a file, the tree goes
+        // clean underneath, and the second press must not delete something
+        // chosen against a tree that no longer exists.
+        let host = Host::new();
+        let mut f = files(Status {
+            untracked: vec![untracked("notes.md")],
+            ..Default::default()
+        });
+        with_height(&mut f, 4);
+        f.run_view("view.bottom", &host); // onto notes.md
+        let notes = PathBytes::from("notes.md");
+        assert!(!f.confirm_or_arm_discard(Section::Untracked, &notes));
+
+        f.replace(Status::default(), &host);
+        assert_eq!(f.armed_row(), None, "the vanish took the question with it");
+        // And the pane's own answer is empty-tree honest: nothing to arm.
+        assert!(f.current_file().is_none());
+    }
+
+    // -------------------------------------------------------------- search
+
+    #[test]
+    fn a_query_filters_live_and_the_keyboard_stays_on_its_file() {
+        let _host = Host::new();
+        let mut f = files(sample_status());
+        with_height(&mut f, 9);
+        // The keyboard opens on src/main.rs — a path that survives "MAIN",
+        // folded, in both the sections it sits in.
+        let anchored = f
+            .current_file()
+            .expect("a file under the keyboard")
+            .path
+            .clone();
+
+        f.apply_query("  main  ");
+        let v = f.view.get();
+        assert_eq!(
+            v.len(),
+            4,
+            "the two matches plus the headings of their sections"
+        );
+        assert_eq!(f.filter_note().as_deref(), Some("2/5"));
+        assert_eq!(f.rows(), 4);
+        assert_eq!(
+            f.changed(),
+            4,
+            "the filter narrows what is shown, never what is loaded"
+        );
+        // Through the indirection: `current_file` is the anchored file, not
+        // whatever now happens to sit at row 1 of a shorter list.
+        assert_eq!(
+            f.current_file().map(|f| f.path.clone()).as_ref(),
+            Some(&anchored)
+        );
+
+        // The same query again is no change at all — and rebuilds nothing.
+        let before = Rc::as_ptr(&f.visible);
+        f.apply_query("main ");
+        assert_eq!(f.query(), Some("main"), "trimmed before comparing");
+        assert_eq!(
+            Rc::as_ptr(&f.visible),
+            before,
+            "a no-op query did not rebuild the index"
+        );
+
+        // A changed filter is a movement of attention: the keyboard clamps
+        // into what survives, and an armed discard dies with the question's
+        // row.
+        assert!(!f.confirm_or_arm_discard(Section::Staged, &anchored));
+        f.apply_query("nothing matches this");
+        let v = f.view.get();
+        assert_eq!(v.len(), 0);
+        assert!(f.current_file().is_none());
+        assert_eq!(f.filter_note().as_deref(), Some("0/5"));
+        assert_eq!(f.armed_row(), None, "a changed query disarmed");
+
+        // Clearing puts every row back under the same file.
+        f.apply_query("");
+        assert_eq!(f.rows(), 9);
+        assert_eq!(f.query(), None);
+        assert_eq!(f.filter_note(), None);
+        assert_eq!(
+            f.current_file().map(|f| f.path.clone()).as_ref(),
+            Some(&anchored),
+            "empty restores instantly, cursor included"
+        );
+    }
+
+    #[test]
+    fn byte_paths_arm_and_confirm_without_decoding() {
+        // Latin-1 é in an untracked name: the arm holds the bytes it was
+        // given, so the verb that finally runs aims at git's exact file.
+        let host = Host::new();
+        let mut f = files(Status {
+            untracked: vec![UntrackedEntry {
+                path: PathBytes::from_bytes(b"caf\xe9.txt"),
+            }],
+            ..Default::default()
+        });
+        with_height(&mut f, 4);
+        f.run_view("view.bottom", &host);
+        let (section, path) = under(&f);
+        assert_eq!(path.as_bytes(), b"caf\xe9.txt");
+
+        assert!(!f.confirm_or_arm_discard(section, &path));
+        assert!(
+            f.confirm_or_arm_discard(Section::Untracked, &PathBytes::from_bytes(b"caf\xe9.txt"))
+        );
+        assert_eq!(f.armed_row(), None);
+    }
+
+    #[test]
+    fn whole_section_verbs_enumerate_their_own_side_in_draw_order() {
+        let host = Host::new();
+        let mut f = files(sample_status());
+        with_height(&mut f, 9);
+        assert_eq!(f.paths_in(Section::Staged).len(), 2);
+        assert_eq!(
+            f.paths_in(Section::Unstaged)
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            vec!["src/main.rs"]
+        );
+        assert_eq!(
+            f.paths_in(Section::Untracked)
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            vec!["notes.md"]
+        );
+        assert!(f.paths_in(Section::Conflicts).len() == 1);
+
+        // And the side the keyboard sits in: `gg` settles on the first staged
+        // file, and that file is in staged for a stage-all's purposes.
+        f.run_view("view.top", &host);
+        assert_eq!(
+            f.cursor_section(),
+            Some(Section::Staged),
+            "the heading counts as its section"
+        );
+        f.run_view("view.bottom", &host);
+        assert_eq!(f.cursor_section(), Some(Section::Conflicts));
+    }
+
+    #[test]
+    fn the_arm_question_says_delete_for_a_file_with_nothing_to_go_back_to() {
+        assert_eq!(
+            discard_question(Section::Untracked, "notes.md"),
+            "delete notes.md? press again to confirm",
+            "an untracked file has no earlier version; the word is honest"
+        );
+        assert_eq!(
+            discard_question(Section::Unstaged, "src/x.rs"),
+            "discard src/x.rs? press again to confirm"
+        );
+    }
+
+    #[test]
+    fn a_click_moves_the_cursor_to_the_row_it_hit() {
+        let host = Host::new();
+        let mut f = files(sample_status());
+        with_height(&mut f, 20);
+
+        // Row 2 is the second staged file, under row 0's heading. The click
+        // is a place: the keyboard lands there, whatever it believed before.
+        f.select_row(2, &host);
+        assert_eq!(
+            f.view.get().cursor(),
+            2,
+            "the keyboard is on the clicked row"
+        );
+        assert_eq!(
+            f.current_file()
+                .map(|f| f.path.to_string_lossy().into_owned()),
+            Some("gone.txt".into()),
+            "the clicked file is the one under the keyboard"
+        );
+    }
+
+    #[test]
+    fn a_click_on_a_section_label_selects_nothing_and_a_click_disarms_a_question() {
+        let host = Host::new();
+        let mut f = files(sample_status());
+        with_height(&mut f, 20);
+
+        // Arm a discard of the first staged file, row 1 (row 0 is the heading).
+        let path = match &f.data[1] {
+            Entry::File(file) => file.path.clone(),
+            _ => unreachable!("row 1 is a file"),
+        };
+        assert!(!f.confirm_or_arm_discard(Section::Staged, &path));
+        assert!(f.armed_row().is_some(), "armed before the click");
+
+        // A click on the heading — row 0 — selects nothing: the cursor snaps
+        // to the nearest selectable row below, and the question is gone.
+        f.select_row(0, &host);
+        assert_eq!(f.armed_row(), None, "the click disarms the question");
+        assert_eq!(
+            f.view.get().cursor(),
+            1,
+            "the cursor snaps to the nearest selectable row below"
+        );
+    }
+}

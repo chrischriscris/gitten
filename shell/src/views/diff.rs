@@ -58,6 +58,12 @@
 //! nothing outside it can hold one of them still. What the list keeps is the
 //! vertical axis, which is the one that has to virtualize.
 
+use super::{
+    accept_deferred_scroll, horizontal_scrollbar, track_marks, vertical_scrollbar,
+    DeferredScrollbar, PendingScroll,
+};
+use crate::chrome::gap_l;
+pub(crate) use crate::chrome::ROW_BAR;
 use gitten_core::font::Font;
 use gitten_core::host::Host;
 use gitten_core::prepared::{prepare, Prepared};
@@ -66,11 +72,12 @@ use gitten_core::runs::{self, surfaces, Run};
 use gitten_core::select::{self, Caret, RowId, Selected, Selection, Text as _};
 use gitten_core::syntax::Token;
 use gitten_core::theme::{DiffPalette, Rgb, Surface, Theme};
+use gitten_core::view::Viewport;
 use gitten_core::wrap::{Wrap, Wrapped};
 use gitten_core::{FileDiff, LineKind, Span};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
-use gpui_component::scroll::{Scrollbar, ScrollbarHandle};
+use gpui_component::scroll::ScrollbarHandle;
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::rc::Rc;
@@ -94,6 +101,12 @@ pub(crate) const PAD: f32 = 16.0;
 /// two line-number gutters and the sign column. What the wrap budget is measured
 /// against — see [`columns`].
 pub(crate) const TEXT_CHROME: f32 = 2.0 * PAD + 2.0 * GUTTER_W + SIGN_W;
+
+/// Where a hunk header's text starts: the same x as a code line's text, so the
+/// `@@` sits over the code it addresses rather than under the line numbers.
+/// `TEXT_CHROME` less the right-hand padding, which is what a line has in front
+/// of its first character.
+pub(crate) const HUNK_INDENT: f32 = TEXT_CHROME - PAD;
 
 /// Narrowest wrap budget worth having. A window dragged narrower than its own
 /// gutters would otherwise ask for one character a row, which is a diff turned
@@ -121,6 +134,13 @@ pub(crate) fn columns(width: f32, chrome: f32, size: f32, host: &Host) -> usize 
 /// layout is linear in length and a 9.6-million-character line was measured in
 /// the wild; nobody reads past column 2000 either way.
 const MAX_LINE_CHARS: usize = 2000;
+
+/// The expensive client-independent half of building diff rows. Exposed to the
+/// shell so repository refresh can run clipping, intraline and syntax work on
+/// its background load task before GPUI applies the result.
+pub(crate) fn prepare_files(files: &[FileDiff], host: &Host) -> Prepared {
+    prepare(files, &host.syntax, MAX_LINE_CHARS)
+}
 
 /// Where a click landed inside a row — see [`Rows::hit`].
 ///
@@ -153,6 +173,34 @@ pub(crate) fn column_at(text: &str, x: f32, size: f32, host: &Host) -> usize {
 
 // ------------------------------------------------------------------ the seam
 
+/// Everything a presentation needs to know about one row's relationship to
+/// the keyboard, beyond what the row itself holds.
+///
+/// One argument and not three bools because this trait is a documented seam —
+/// `docs/extending.md` — and a presentation after the next must not change the
+/// signature twice.
+#[derive(Clone, Copy, Default)]
+pub struct RowState {
+    /// The keyboard's row.
+    pub current: bool,
+    /// Whether this pane holds the keyboard at all: [`row_bar`] picks the
+    /// cursor bar's ink by it — accent while the pane holds the keyboard,
+    /// faint where the selection is remembered and the keyboard is not.
+    pub focused: bool,
+    /// An armed destructive question stands over this row's hunk: the gutter
+    /// and the sign read it, and tint toward `chrome.error`, so the line a
+    /// second press would destroy is named by its own colour and not only by
+    /// the band above it.
+    pub armed: bool,
+    /// The row is inside the hunk the keyboard is on — its header, its lines
+    /// and the rows a wrapped line spilled onto. The extent a hunk verb acts
+    /// on: the gutter's hairline marks it, row by row, so a hunk that starts
+    /// above the viewport is still shown. Computed against the hunk's span
+    /// once per frame; a row reads it as two integer compares — see
+    /// [`HunkExtent`].
+    pub in_hunk: bool,
+}
+
 /// Turns one file's diff into rows, and draws them.
 ///
 /// Row height is fixed for the whole list because `uniform_list` is what makes a
@@ -170,11 +218,6 @@ pub(crate) fn column_at(text: &str, x: f32, size: f32, host: &Host) -> usize {
 /// **visual** row of that logical one they are drawing. `seg` is 0 for
 /// everything that fits, which is nearly everything.
 ///
-/// [`Rows::rows`] and [`Rows::reflow`] both default, so a presentation that does
-/// not wrap is exactly as long as it was and an extension's compiles unchanged.
-/// A presentation that does wrap gets the hard part —
-/// [`gitten_core::wrap::Wrapped`] — from `core`; see `TextRows::reflow` for what
-/// is left, which is six lines and a column budget.
 pub trait Rows {
     /// Whether this implementation wants the file. The built-in claims
     /// everything; the last registered claimant wins, so a specialist can take
@@ -189,6 +232,20 @@ pub trait Rows {
     /// highlighted — see `gitten_core::prepared`. An implementation draws; it does
     /// not redo any of that.
     fn build(&mut self, file: gitten_core::prepared::File);
+
+    /// Whether logical row `index` is a file header — the `path +n -m` band
+    /// [`file_header`] draws.
+    ///
+    /// Asked so the list can leave it out: a diff of exactly one file is named by
+    /// the pane header above it, and a second copy of the name two rows down is
+    /// furniture. With two files or more the band is the separator and stays.
+    /// The row itself is still built and still addressable — only the order
+    /// table skips it — so nothing an implementation indexes by row moves.
+    /// Defaults to `false`, which is "keep everything" for a presentation that
+    /// draws no such row.
+    fn is_file_header(&self, _index: usize) -> bool {
+        false
+    }
 
     /// How many visual rows logical row `index` occupies at the current wrap.
     /// More than one only when its text wraps.
@@ -209,7 +266,11 @@ pub trait Rows {
 
     /// Draws one visual row. `sel` is the part of it the mouse has selected, in
     /// the row's own byte coordinates — `None` for the overwhelming majority of
-    /// rows on the overwhelming majority of frames.
+    /// rows on the overwhelming majority of frames. `state` is the row's
+    /// relationship to the keyboard: whether it is the row the keyboard is on,
+    /// drawn as a background bar so navigation has a visible cursor — see
+    /// [`gitten_core::view::Viewport`] — whether the pane holding it holds the
+    /// keyboard, and whether an armed question stands over it.
     ///
     /// `shift` is how many pixels of text a horizontal scroll has pulled off the
     /// left edge. A row is as wide as the viewport whatever it holds, so an
@@ -223,8 +284,41 @@ pub trait Rows {
         seg: usize,
         host: &Host,
         sel: Option<Selected>,
+        state: RowState,
         shift: f32,
     ) -> AnyElement;
+
+    /// Whether logical row `index` is a file header. What `]` and `[` jump
+    /// between; the default is no, because only an implementation knows what it
+    /// drew as one.
+    fn is_header(&self, _index: usize) -> bool {
+        false
+    }
+
+    /// Which diff hunk logical row `index` belongs to: `(path, hunk)`, where
+    /// `hunk` indexes that file's hunks in the loaded diff. The keyboard's
+    /// address for hunk-level staging — what space, u and D act on.
+    ///
+    /// On the trait rather than computed outside because a hunk's row shape
+    /// is the implementation's own: split pairs a removal with the addition
+    /// that replaced it onto one row, so the same hunk spans a different
+    /// number of rows in each presentation. The default is none, which is
+    /// what makes "the keyboard is not on a hunk" the honest answer from
+    /// anything that draws no hunks — a rendered document, a graph.
+    fn hunk_at(&self, _index: usize) -> Option<(&str, usize)> {
+        None
+    }
+
+    /// The logical rows the hunk under logical row `index` spans — its header
+    /// row through its last line, the same address [`Rows::hunk_at`] names but
+    /// as a range: what the extent mark and the armed tint are computed
+    /// against, once per frame, so a row reads its membership as integer
+    /// compares against a precomputed key and never a search apiece. The
+    /// default is none, which is what makes "no hunk, no extent" the honest
+    /// answer from anything that draws no hunks — a rendered document, a graph.
+    fn hunk_span(&self, _index: usize) -> Option<(u32, u32)> {
+        None
+    }
 
     /// Width of a visual row in characters. What the widest-row search ranks
     /// rows by, and therefore which row [`Rows::overflow`] is asked about.
@@ -371,17 +465,6 @@ impl Layouts {
     }
 }
 
-// Cycle to the next presentation. Bound to `s` in `main.rs`.
-//
-// The first real action in the app, and deliberately shaped like the last one
-// will be: the view owns a focus handle, the binding is global, and the handler
-// is a method. When command dispatch and the mode stack land in `core` this
-// becomes a named command they can reach — see `docs/extending.md`.
-actions!(
-    gitten,
-    [CycleLayout, CycleWrap, CopySelection, SelectAll, SelectNone]
-);
-
 // The order table's row reference and the table itself are
 // `gitten_core::rows`': 8 bytes a row, `logical()` for what survives a reflow,
 // and the same `widest`/`anchor` a walk of it computes. Only `expand` below is
@@ -395,8 +478,18 @@ actions!(
 /// previous table is its own source of truth. That is the whole reason a reflow
 /// needs no second table to remember the unwrapped shape: 8 bytes a row, once,
 /// however many times the window is dragged.
-fn expand(logical: &[RowRef], renderers: &[Box<dyn Rows>], anchor: Option<RowRef>) -> Ordered {
+///
+/// Returns the table plus where the file headers landed in it — what `]` and
+/// `[` jump between. Core's [`gitten_core::rows::Ordered`] stays as it is because
+/// the terminal indexes headers off its own presentations; this client collects
+/// them during the same walk rather than search the table per keypress.
+fn expand(
+    logical: &[RowRef],
+    renderers: &[Box<dyn Rows>],
+    anchor: Option<RowRef>,
+) -> (Ordered, Vec<usize>) {
     let mut order: Vec<RowRef> = Vec::with_capacity(logical.len());
+    let mut headers: Vec<usize> = Vec::new();
     let (mut widest, mut widest_at) = (0usize, 0usize);
     let mut found = 0usize;
     let mut i = 0;
@@ -411,6 +504,12 @@ fn expand(logical: &[RowRef], renderers: &[Box<dyn Rows>], anchor: Option<RowRef
         if anchor.map(RowRef::logical) == Some(r.logical()) {
             found = order.len();
         }
+        // One branch per visual row, once per rebuild: where the file headers
+        // are is what `]` and `[` jump between, and no presentation has to know
+        // a jump list exists.
+        if rows.is_header(r.index as usize) {
+            headers.push(order.len());
+        }
         let n = rows.rows(r.index as usize).clamp(1, u16::MAX as usize);
         for seg in 0..n {
             let w = rows.width(r.index as usize, seg);
@@ -424,11 +523,14 @@ fn expand(logical: &[RowRef], renderers: &[Box<dyn Rows>], anchor: Option<RowRef
             });
         }
     }
-    Ordered {
-        order,
-        widest: widest_at,
-        anchor: found,
-    }
+    (
+        Ordered {
+            order,
+            widest: widest_at,
+            anchor: found,
+        },
+        headers,
+    )
 }
 
 /// This wheel event's delta with the gesture's axis lock applied: what is left on
@@ -448,7 +550,7 @@ fn expand(logical: &[RowRef], renderers: &[Box<dyn Rows>], anchor: Option<RowRef
 /// it first would call the gesture vertical and hand it to the list. Only when
 /// the platform has not already done the swap itself, which macOS does for some
 /// mice.
-fn locked(
+pub(crate) fn locked(
     mut delta: Point<Pixels>,
     shift: bool,
     ongoing: &mut OngoingScroll,
@@ -547,26 +649,46 @@ impl ScrollbarHandle for Pan {
     }
 }
 
+/// What the pane header says about the file the keyboard is in: its path, the
+/// change counts its own header row printed, and which hunk of it holds the
+/// cursor — the mock's `5 internal/extension/host.go   +18 −6   hunk 1/3`.
+///
+/// One shape rather than three arguments because the header redraws whole every
+/// frame and wants one question answered. The counts are the loaded diff's own,
+/// computed by [`prepare`](gitten_core::prepared::prepare) out of `LineKind`
+/// before anything here ran — which is also why they can never disagree with
+/// what the file's drawn header shows: there is one copy of the numbers, and
+/// both places read it.
+///
+/// `PartialEq`, because the shell memoises the header's spelled-out strings
+/// against the last summary it drew: equal means nothing to re-spell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileSummary {
+    /// As the loaded diff spells it — the same string hunk staging resolves
+    /// by, so a header that copies it acts on exactly what it names.
+    pub path: String,
+    pub adds: u64,
+    pub dels: u64,
+    /// 1-based index of the hunk under the keyboard, within its file.
+    /// `0` when the file has no hunks.
+    pub hunk: usize,
+    pub hunks: usize,
+}
+
 pub struct Diff {
-    /// The prepared diff — clipped, intraline-diffed and highlighted — held
-    /// behind an `Rc` so a layout toggle can rebuild its rows without re-running
-    /// the two expensive passes over every line of every file.
+    /// The parsed diff, kept so a layout change can rebuild the rows.
     ///
     /// This is the memory cost of a live toggle, and it is a real one: on the
-    /// 714k-line fixture it is a second copy of every line, plus that line's span
-    /// and token boxes. It replaces the copy of the parsed `FileDiff`s this field
-    /// once held — the same order of memory — and now the copy earns its keep: a
-    /// toggle clones a `File` out of it (an allocation, but no intraline diff and
-    /// no syntax scan) instead of preparing from scratch, and pays even that only
-    /// for the files a presentation actually draws.
-    ///
-    /// Rebuilt only when the diff itself changes — see [`Diff::swap`]. Its inputs
-    /// are `(the FileDiffs, host.syntax, MAX_LINE_CHARS)`, and `host.syntax` is
-    /// always the built-in router: `gitten.toml` sets token *colours*
-    /// (`[theme.syntax]`, on `host.theme` and read live on the render path) but
-    /// never the *routing*, so a config reload never stales this. Any future
-    /// input to `prepare` that a reload can change must join the invalidation in
-    /// [`Diff::swap`].
+    /// 714k-line fixture it is a second copy of every line. The alternatives are
+    /// worse — cloning the *prepared* diff pays the same memory plus the clone at
+    /// load, whether or not anybody ever presses the key, and re-acquiring means
+    /// the view needs a repository, which it does not have and should not.
+    files: Rc<Vec<FileDiff>>,
+    /// The expensive half, run once per diff and kept: clip, intraline and
+    /// syntax behind an `Rc`, so a layout toggle pays [`arrange`] — renderer
+    /// selection, the order table, one clone per drawn file — and not the two
+    /// passes over every line. Rebuilt only where the diff itself changes:
+    /// [`Diff::swap`] and [`Diff::replace_prepared`].
     prepared: Rc<Prepared>,
     layouts: Rc<Layouts>,
     current: usize,
@@ -596,6 +718,11 @@ pub struct Diff {
     /// does; one borrow per *batch* of rows, not per row.
     renderers: Rc<RefCell<Vec<Box<dyn Rows>>>>,
     order: Rc<Vec<RowRef>>,
+    /// Where each hunk starts, as a fraction of the row order — the diff
+    /// scrollbar's ticks. Computed beside the order table it indexes and
+    /// rebuilt exactly where the order is: load, reflow, a layout swap and a
+    /// reload. See [`hunk_marks`].
+    marks: Rc<Vec<f32>>,
     /// What the mouse has selected, or nothing.
     ///
     /// The model is `gitten_core::select` and this is the only state the window
@@ -610,19 +737,38 @@ pub struct Diff {
     /// Index into `order` of the widest visual row: the one row the horizontal
     /// bound is taken from, because it is the one there is furthest to scroll to.
     widest: usize,
+    /// The logical row an armed hunk-discard was aimed at, if a question is
+    /// standing. Any move of the keyboard, wheel or refresh of the diff
+    /// clears it — see [`Diff::confirm_or_arm_discard_hunk`] — so a press
+    /// can never spend an arm on a hunk it was not asked about.
+    armed_hunk: Option<(u16, u32)>,
+    /// Whether this pane holds the keyboard, as the shell last told it. A
+    /// row's cursor bar is accent only when its pane is focused, and the view
+    /// cannot ask the shell during render — so the shell writes it here when
+    /// focus moves, and render reads a flag.
+    focused: bool,
+    /// Where every file header is, in visual rows — what `]` and `[` jump
+    /// between. Collected by [`expand`] while it builds the order table, so it
+    /// costs one branch per row at rebuild and nothing per frame.
+    headers: Rc<Vec<usize>>,
     scroll: UniformListScrollHandle,
     /// The horizontal axis, which is this view's and not the list's — see the
     /// module note. Bounded from `widest` on every reflow.
     pan: Pan,
-    /// Which axis the wheel gesture in flight belongs to. `gpui`'s own lock, kept
-    /// here because the events arrive at a window handler rather than at a scroll
-    /// container — see [`sideways`].
-    ongoing: Cell<OngoingScroll>,
-    /// Absent in the headless tests, which build a `Diff` with no window and no
-    /// `Context` to take a handle from. Present in the app, where it is what
-    /// puts this view in the key dispatch path at all.
-    focus: Option<FocusHandle>,
-    focused: bool,
+    /// The cursor, the top row and the height, and nothing else about them. The
+    /// keyboard's position in this diff, from [`gitten_core::view::Viewport`] —
+    /// the same model the terminal holds, so a key means the same thing in both.
+    ///
+    /// Behind a shared cell because the render closure reads it per batch, which
+    /// is also why it is not folded into [`Diff::top`]: that one is written *by*
+    /// the list, this one is what moves the list.
+    view: Rc<Cell<Viewport>>,
+    /// The vertical offset this view last wrote. A scrollbar thumb writes the
+    /// same offset without coming through here, and that mismatch — not the
+    /// position itself — is what [`Diff::reconcile`] treats as "the list moved".
+    synced: Rc<Cell<f32>>,
+    /// A strict row waiting for prepaint, plus exact wheel pixels meanwhile.
+    pending_scroll: PendingScroll,
     pub rendered: Rc<Cell<usize>>,
     /// Rows that exist, live: wrapping changes it on every resize, so an
     /// overlay reading a number taken at load would be describing the diff as it
@@ -667,20 +813,6 @@ impl Diff {
         cx.notify();
     }
 
-    /// Moves to the next wrap. Bound to `w` in `main.rs`.
-    ///
-    /// Unlike a layout change this rebuilds nothing below stage 5: the lines,
-    /// their tokens and their spans are the same objects, and only where they
-    /// break moves. That is why it is a keystroke and the algorithm is a menu.
-    pub fn cycle_wrap(&mut self, cx: &mut Context<Self>) {
-        let host = crate::config::host(cx);
-        if host.wrap.len() < 2 {
-            return;
-        }
-        self.wrap = (self.wrap + 1) % host.wrap.len();
-        cx.notify();
-    }
-
     /// Re-expands the rows for a new width, keeping the line you were reading at
     /// the top.
     ///
@@ -712,7 +844,27 @@ impl Diff {
             // Reset first: arrange() has already been given today's host, and the
             // width half of `applied` must re-fire on the rebuilt renderers.
             self.applied = (0.0, "");
+            // Same presentation before and after — only the glyph metrics moved — so
+            // unlike a layout *change* the selection and the exact cursor row both
+            // still mean something. `apply_layout` is written for the change and
+            // drops both (a fraction of the old row count, no selection); stash them
+            // and hand them back. Sound only because `apply_layout` leaves fresh
+            // renderers with `applied` reset, so the `changed` branch below always
+            // runs in this same call and re-resolves both against the rebuilt order
+            // table — this is not restoring stale state.
+            //
+            // `armed_hunk` is not carried the same way: it is a pending
+            // *destructive* action, and making someone re-arm a discard after a
+            // config reload is the safe direction to be wrong in, unlike a
+            // selection.
+            let keep = self.sel.take();
+            let cursor = self.view.get().cursor();
             self.apply_layout(self.current, host);
+            let mut v = self.view.get();
+            v.go_to(cursor.min(self.order.len().saturating_sub(1)));
+            self.view.set(v);
+            self.defer_show(v);
+            self.sel = keep;
         }
         let wrap = host.wrap.at(self.wrap);
         if (width, wrap.name()) == self.applied || width <= 0.0 {
@@ -726,13 +878,13 @@ impl Diff {
                 .fold(false, |acc, r| r.reflow(width, host, wrap) | acc)
         };
         if changed {
-            // Anchored to the logical row at the top, not to a proportion: a
-            // reflow is the same diff at a different width, so the line you were
-            // reading still exists and is the honest thing to keep still. A
-            // layout change has no such correspondence, which is why it uses a
-            // fraction instead.
-            let anchor = self.order.get(self.top.get()).copied();
-            let built = expand(&self.order, &self.renderers.borrow(), anchor);
+            // Anchored to the logical row under the **cursor**, not to a
+            // proportion and not to whatever happens to be at the top: a reflow
+            // is the same diff at a different width, so every line still exists,
+            // and the one being read is the cursor's. A layout change has no
+            // such correspondence, which is why it uses a fraction instead.
+            let anchor = self.order.get(self.view.get().cursor()).copied();
+            let (built, headers) = expand(&self.order, &self.renderers.borrow(), anchor);
             let logical = self
                 .renderers
                 .borrow()
@@ -741,9 +893,20 @@ impl Diff {
                 .sum::<usize>();
             self.order = Rc::new(built.order);
             self.widest = built.widest;
+            self.headers = Rc::new(headers);
+            self.marks = Rc::new(hunk_marks(&self.order, &self.renderers.borrow()));
             self.total.set(self.order.len());
-            self.top.set(built.anchor);
-            self.scroll_to(built.anchor);
+            // The line you were reading is wherever the cursor now is — its row
+            // number moved with the wrapping, which is what `built.anchor`
+            // found — and the viewport follows it, exactly as any cursor move
+            // does.
+            let mut v = self.view.get();
+            v.set_len(self.order.len());
+            v.go_to(built.anchor);
+            self.view.set(v);
+            // Deferred, not written: the list has not laid out the new row
+            // count, and its bound is the old shape's. See `defer_show`.
+            self.defer_show(v);
             // After the order table, because the bound is the widest row's and
             // that is what just moved. Said out loud when it is not zero: "the
             // diff fits" and "there is a kilometre of it off the right of the
@@ -788,58 +951,384 @@ impl Diff {
         })
     }
 
-    /// A wheel or a trackpad, sideways — and the decision about whether *this*
-    /// gesture is sideways at all.
+    // -------------------------------------------------------------- commands
+
+    /// The box the row list is drawn in — what a wheel event over the window is
+    /// hit-tested against. Zero until the first paint.
+    pub fn list_bounds(&self) -> Bounds<Pixels> {
+        self.scroll.0.borrow().base_handle.bounds()
+    }
+
+    /// Moves the text sideways by `dx` pixels. The wheel's horizontal half,
+    /// routed through [`crate::main`]'s axis lock; `h` and `l` arrive as columns
+    /// via [`Diff::pan_columns`].
     ///
-    /// **A sideways gesture never reaches the list**, and that is the whole of
-    /// this method. `uniform_list` scrolls one axis, so `overflow.x` on it is
-    /// visible, and `gpui`'s scroll handler reads that as permission to use a
-    /// horizontal delta for vertical movement — the arm is
-    /// `Overflow::Scroll if !restrict_scroll_to_axis && overflow.x != Scroll => delta.x`.
-    /// With the text panning from the same event, a flick to the right came out
-    /// diagonal. So this runs in the **capture** phase and stops the event dead
-    /// when the gesture is horizontal: one component decides the axis, and the
-    /// one that decides is the one that owns the axis it decided on.
+    /// Returns whether anything moved, which is what decides a redraw.
+    pub fn pan_pixels(&self, dx: f32) -> bool {
+        self.pan.by(dx)
+    }
+
+    /// Moves the text sideways by `columns` characters. `view.left`,
+    /// `view.right` — the terminal's eight columns, in this client's unit.
+    pub fn pan_columns(&mut self, columns: isize, host: &Host) {
+        self.pan_pixels(columns as f32 * host.font.char_width());
+    }
+
+    /// The viewport model with everything live folded in: the list's length,
+    /// the height last measured, and `[view] scrolloff` as the file has it
+    /// *now*. Every path that moves or reads the view starts from here, so a
+    /// reloaded config reaches the next keypress instead of the next launch.
+    fn live_view(&self, host: &Host) -> Viewport {
+        let mut v = self.view.get();
+        v.set_len(self.order.len());
+        v.set_height(self.rendered.get());
+        v.set_scrolloff(host.view.scrolloff);
+        v
+    }
+
+    /// Moves the list by `dy` pixels without translating it into rows first.
     ///
-    /// Whether it *could* move does not come into it. A page with nothing to the
-    /// right does nothing when you swipe right; it does not start scrolling down.
-    fn wheel(&mut self, ev: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
-        // Over the rows, and not over the title bar or a dropdown above them.
-        // A capture-phase handler is registered on the window, so it is outside
-        // the hit test a bubble-phase one gets for free.
-        if !self
-            .scroll
+    /// The wheel reports pixels, not rows, and this is what keeps it *smooth*:
+    /// the command it resolves to (`view.scroll-up`, from `[keys]`) says what the
+    /// wheel does; the event's own delta says how far. A key repeat has no delta
+    /// and uses [`Diff::run_view`] like every other command.
+    ///
+    /// The cursor comes along when the pixels push it off screen — the same rule
+    /// [`Viewport::scroll_by`] applies to a terminal's wheel — so `j` after a
+    /// flick lands on a row you can see.
+    pub fn scroll_pixels(&mut self, dy: f32, host: &Host) -> bool {
+        let deferred = self.scroll.0.borrow().deferred_scroll_to_item;
+        if let Some(request) = deferred {
+            if self.pending_scroll.is_awaiting() {
+                let pixels = self.pending_scroll.wheel(dy);
+                let mut v = self.live_view(host);
+                let y = -(request.item_index as f32 * ROW_H) + pixels;
+                v.scroll_to((-y / ROW_H).round().max(0.0) as usize);
+                self.view.set(v);
+                self.top.set(v.top());
+                // The wheel is also a move of attention.
+                self.armed_hunk = None;
+                return true;
+            }
+            // Selection autoscroll parks its own non-strict request. A newer
+            // wheel cancels it and follows the ordinary live-pixel path rather
+            // than accumulating into state that does not own that request.
+            self.scroll.0.borrow_mut().deferred_scroll_to_item = None;
+        }
+        let (offset, max) = {
+            let s = self.scroll.0.borrow();
+            (s.base_handle.offset(), s.base_handle.max_offset())
+        };
+        let y = (f32::from(offset.y) + dy).clamp(-f32::from(max.y), 0.0);
+        if y == f32::from(offset.y) {
+            return false;
+        }
+        self.scroll
             .0
             .borrow()
             .base_handle
-            .bounds()
-            .contains(&ev.position)
-        {
+            .set_offset(point(offset.x, px(y)));
+        // The top row the pixels landed on, and the viewport dragged to meet it.
+        let mut v = self.live_view(host);
+        v.scroll_to((-y / ROW_H).round().max(0.0) as usize);
+        self.view.set(v);
+        self.synced.set(y);
+        // The wheel is also a move of attention — same rule the arrow keys keep.
+        self.armed_hunk = None;
+        true
+    }
+
+    /// Meets the list where it actually is: a scrollbar drag moves the offset
+    /// without touching anything else, and the next key should act on what is on
+    /// screen now — with the cursor dragged along, exactly as the wheel drags it.
+    ///
+    /// [`Diff::synced`] is what separates "the list moved under us" from "we
+    /// moved the list": only a mismatch counts, so two commands in a row do not
+    /// fight each other through this method.
+    pub fn reconcile(&mut self, host: &Host) {
+        if self.scroll.0.borrow().deferred_scroll_to_item.is_some() {
             return;
         }
-        let mut ongoing = self.ongoing.get();
-        let delta = locked(
-            ev.delta.pixel_delta(window.line_height()),
-            ev.modifiers.shift,
-            &mut ongoing,
-            ev.touch_phase,
-        );
-        self.ongoing.set(ongoing);
-        if delta.x.is_zero() {
+        let shown_y = f32::from(self.scroll.0.borrow().base_handle.offset().y);
+        if (shown_y - self.synced.get()).abs() < 0.5 {
             return;
         }
-        // Ours *alone* only when the lock says so. A gesture that unlocked
-        // mid-flick — swipe left, then up, without lifting — carries both axes
-        // for the rest of its life, and eating it would be a diff that stops
-        // scrolling down until the fingers come off the glass.
-        if delta.y.is_zero() {
-            cx.stop_propagation();
+        self.synced.set(shown_y);
+        let shown = (-shown_y / ROW_H).round().max(0.0) as usize;
+        let mut v = self.live_view(host);
+        if v.top() == shown {
+            return;
         }
-        // A scroll to the right moves the content left, which is further into
-        // the line: the sign is the one thing to get right in here.
-        if self.pan.by(-f32::from(delta.x)) {
-            cx.notify();
+        v.scroll_to(shown);
+        self.view.set(v);
+    }
+
+    /// Runs one of the `view.*` commands against the viewport, keeping the list
+    /// and the saved position honest afterwards. The same names the terminal
+    /// dispatches; [`Viewport`] is the part that must not differ. The `diff.*`
+    /// family rides the same method: one screen, one place its commands live.
+    ///
+    /// False is "not one of mine", and the caller says so.
+    pub fn run_view(&mut self, command: &str, host: &Host) -> bool {
+        // First, meet the list where it actually is: a scrollbar drag moved the
+        // offset without touching the cursor, and the next key should act on
+        // what is on screen now.
+        self.reconcile(host);
+        let mut v = self.live_view(host);
+        match command {
+            "view.down" => v.down(),
+            "view.up" => v.up(),
+            "view.page-down" => v.page(1),
+            "view.page-up" => v.page(-1),
+            "view.scroll-down" => v.scroll_by(host.view.rows as isize),
+            "view.scroll-up" => v.scroll_by(-(host.view.rows as isize)),
+            "view.top" => v.to_top(),
+            "view.bottom" => v.to_bottom(),
+            "view.left" => {
+                let _ = v;
+                self.pan_columns(-8, host);
+                return true;
+            }
+            "view.right" => {
+                let _ = v;
+                self.pan_columns(8, host);
+                return true;
+            }
+            "diff.next-file" => {
+                let _ = v;
+                self.jump_file(1, host);
+                return true;
+            }
+            "diff.prev-file" => {
+                let _ = v;
+                self.jump_file(-1, host);
+                return true;
+            }
+            "diff.cycle-layout" => {
+                let _ = v;
+                // A single-presentation registry has nothing to cycle to, which
+                // is what [`Layouts::len`] says.
+                if self.layouts.len() >= 2 {
+                    self.apply_layout((self.current + 1) % self.layouts.len(), host);
+                }
+                // The rows are about to be re-arranged; whatever the question
+                // was armed against may land somewhere else in them.
+                self.armed_hunk = None;
+                return true;
+            }
+            "diff.cycle-wrap" => {
+                let _ = v;
+                if host.wrap.len() >= 2 {
+                    self.wrap = (self.wrap + 1) % host.wrap.len();
+                }
+                // The rows are about to re-expand; whatever the question was
+                // armed against may land somewhere else in them.
+                self.armed_hunk = None;
+                return true;
+            }
+            _ => return false,
         }
+        // The keyboard moved. Whatever an armed discard was asked about was
+        // where the keyboard used to be — same rule as the working-tree pane.
+        self.armed_hunk = None;
+        self.view.set(v);
+        self.show(v);
+        true
+    }
+
+    /// Puts row `v.top()` at the top of the viewport — exactly, not "if it is
+    /// already visible": the margin arithmetic is [`Viewport::follow`]'s, and
+    /// re-doing it here would be doing it differently.
+    ///
+    /// Direct offset when geometry exists; when a deferred request is still
+    /// parked, replace its target instead. Clearing it and writing immediately
+    /// would clamp against the old row count that made deferral necessary.
+    fn show(&self, v: Viewport) {
+        let target = v.top();
+        if self.scroll.0.borrow().deferred_scroll_to_item.is_some() {
+            self.defer_show(v);
+            return;
+        }
+        let s = self.scroll.0.borrow();
+        let cur = s.base_handle.offset();
+        let y = -(target as f32 * ROW_H).clamp(0.0, f32::from(s.base_handle.max_offset().y));
+        s.base_handle.set_offset(point(cur.x, px(y)));
+        self.synced.set(y);
+        self.top.set(target);
+    }
+
+    /// [`Diff::show`] against geometry that does not exist yet.
+    ///
+    /// A cursor-preserving reflow has just changed how many rows there are,
+    /// which means the list's own bound — what [`Diff::show`] clamps against —
+    /// still describes the *old* shape: narrower rows means more of them, and
+    /// a deep cursor needs more offset than the old maximum allows, so writing
+    /// now would clamp it back on screen-edge and record the wrong place in
+    /// [`Diff::synced`]. GPUI's deferred request is the fix: it is consumed by
+    /// the list's own prepaint, after it has measured the new row count, and
+    /// **strict**, so it lands exactly where the model says even if that row
+    /// would have been visible somewhere else.
+    ///
+    /// The offset itself is deliberately left alone until then; [`Diff::top`]
+    /// says where the list is about to sit, and [`Diff::reconcile`] meets the
+    /// real number once prepaint has written it.
+    fn defer_show(&self, v: Viewport) {
+        let target = v.top();
+        self.pending_scroll.begin();
+        self.scroll
+            .scroll_to_item_strict(target, ScrollStrategy::Top);
+        self.top.set(target);
+    }
+
+    /// The header of the next or previous file. `]` and `[`, tab and backtab.
+    pub fn jump_file(&mut self, by: isize, host: &Host) {
+        let mut v = self.live_view(host);
+        let cursor = v.cursor();
+        // Binary search rather than a scan: a 5,953-file diff is a realistic
+        // input and this is a keypress. Same walk as the terminal's.
+        let target = match by.is_negative() {
+            true => self
+                .headers
+                .partition_point(|&h| h < cursor)
+                .checked_sub(1)
+                .and_then(|i| self.headers.get(i))
+                .copied(),
+            false => self
+                .headers
+                .get(self.headers.partition_point(|&h| h <= cursor))
+                .copied(),
+        };
+        if let Some(t) = target {
+            v.go_to(t);
+            self.view.set(v);
+            // A file jump is a move of the keyboard; see `run_view`'s tail.
+            self.armed_hunk = None;
+            self.show(v);
+        }
+    }
+
+    /// Where the keyboard is. What `copy.selection` falls back to and the tests
+    /// assert against.
+    ///
+    /// `dead_code` for the binary — dispatch reads the cursor through the shared
+    /// viewport cell — and live in the tests, which is what it is here for. A
+    /// binary crate does not count a test as a use.
+    #[allow(dead_code)]
+    pub fn cursor(&self) -> usize {
+        self.view.get().cursor()
+    }
+
+    /// The logical row the keyboard is on: `(owner, index)`, the identity a
+    /// question is armed against.
+    pub(crate) fn cursor_row_id(&self) -> (u16, u32) {
+        self.order
+            .get(self.view.get().cursor())
+            .map(|r| r.logical())
+            .unwrap_or((u16::MAX, u32::MAX))
+    }
+
+    /// The hunk under the keyboard, as the loaded diff holds it: its file's
+    /// path and the [`Hunk`](gitten_core::Hunk) itself, with every line and
+    /// both sides' numbers — exactly what patch synthesis needs. `None` when
+    /// the keyboard sits on a file header or an empty diff; a presentation
+    /// that draws no hunks answers none for the whole view.
+    ///
+    /// The caller meets the list where the last drag left it first — see
+    /// [`Diff::reconcile`].
+    pub fn current_hunk(&self) -> Option<(String, gitten_core::Hunk)> {
+        let r = *self.order.get(self.view.get().cursor())?;
+        let renderers = self.renderers.borrow();
+        let (path, hunk_no) = renderers.get(r.owner as usize)?.hunk_at(r.index as usize)?;
+        let file = self.files.iter().find(|f| f.path == path)?;
+        Some((path.to_string(), file.hunks.get(hunk_no)?.clone()))
+    }
+
+    /// Where the keyboard is, as the pane header names it. `None` when nothing
+    /// on screen answers: an empty diff, a cursor past the end, or a row the
+    /// presentation drew outside both vocabularies — a rendered document's
+    /// body rows are nobody's hunk and nobody's header.
+    ///
+    /// A hunk row answers through [`Rows::hunk_at`], the same address `space`
+    /// stages against, so the header and the staging question can never point
+    /// at different hunks. A file-header row owns no hunk — the spans open
+    /// below it — but it still names its file, through [`Rows::selectable`]:
+    /// a header's copyable text *is* its path (that is what makes a selection
+    /// across files paste readable), so the accessor every presentation already
+    /// implements for copying is the one place they all spell the path. One
+    /// lookup against the prepared diff either way; once per frame, not per row.
+    pub fn file_summary(&self) -> Option<FileSummary> {
+        let r = *self.order.get(self.view.get().cursor())?;
+        let index = r.index as usize;
+        let renderers = self.renderers.borrow();
+        let rows = renderers.get(r.owner as usize)?;
+
+        // Which file the keyboard is over, and which of its hunks is under it.
+        // The latter stays absent when no hunk is under it: whether such a
+        // file has any first hunk to name is the file's own fact, read below.
+        let located = match rows.hunk_at(index) {
+            Some((path, n)) => Some((path, Some(n))),
+            None if rows.is_header(index) => {
+                // Wrapping adds visual rows and never changes the logical one
+                // `index` names, so this covers the wrapped tail of a hunk
+                // line exactly as it does the line itself.
+                rows.selectable(index, 0).map(|p| (p, None))
+            }
+            _ => None,
+        }?;
+        let f = self.prepared.files.iter().find(|f| f.path == located.0)?;
+        Some(FileSummary {
+            path: located.0.to_string(),
+            adds: f.adds as u64,
+            dels: f.dels as u64,
+            // The map addresses hunks from zero because that is how the
+            // presentations enumerate them; people count from one.
+            hunk: located
+                .1
+                .map_or_else(|| usize::from(!f.hunks.is_empty()), |n| n + 1),
+            hunks: f.hunks.len(),
+        })
+    }
+
+    /// Arms — or confirms — a discard of the hunk on logical row `id`. The
+    /// first call stores it and returns false: ask, don't act. A second call
+    /// carrying the same id has the keyboard still sitting where the question
+    /// was asked, and spends the arm.
+    pub(crate) fn confirm_or_arm_discard_hunk(&mut self, id: (u16, u32)) -> bool {
+        match self.armed_hunk {
+            Some(armed) if armed == id => {
+                self.armed_hunk = None;
+                true
+            }
+            _ => {
+                self.armed_hunk = Some(id);
+                false
+            }
+        }
+    }
+
+    /// Told by the shell whenever the keyboard moves — never decided here.
+    pub(crate) fn set_focused(&mut self, focused: bool) {
+        self.focused = focused;
+    }
+
+    /// Whether this pane holds the keyboard. The rows read it for the bar.
+    #[allow(dead_code)]
+    pub(crate) fn focused(&self) -> bool {
+        self.focused
+    }
+
+    /// The text of the row the keyboard is on, or nothing past either end. The
+    /// fallback half of `copy.selection`.
+    pub fn cursor_text(&self) -> String {
+        let v = self.view.get();
+        let r = self.order.get(v.cursor()).copied();
+        let renderers = self.renderers.borrow();
+        r.and_then(|r| {
+            renderers
+                .get(r.owner as usize)
+                .and_then(|rows| rows.selectable(r.index as usize, 0).map(str::to_string))
+        })
+        .unwrap_or_default()
     }
 
     /// Which presentation is loaded. Read by the tests and by anything that
@@ -881,41 +1370,121 @@ impl Diff {
     /// same way a layout change rebuilds them; the only difference is that the
     /// `FileDiff`s underneath are new ones.
     pub fn replace(&mut self, files: Vec<FileDiff>, host: &Host, cx: &mut Context<Self>) {
-        self.swap(files, host);
+        self.reconcile(host);
+        if self.files.as_slice() == files.as_slice() {
+            return;
+        }
+        let prepared = prepare_files(&files, host);
+        self.swap_prepared(files, prepared, host);
+        cx.notify();
+    }
+
+    /// [`Diff::replace`] with the pure preparation already completed off the
+    /// GPUI thread by a pane refresh.
+    pub(crate) fn replace_prepared(
+        &mut self,
+        files: Vec<FileDiff>,
+        prepared: Prepared,
+        host: &Host,
+        cx: &mut Context<Self>,
+    ) {
+        self.reconcile(host);
+        if self.files.as_slice() == files.as_slice() {
+            return;
+        }
+        self.swap_prepared(files, prepared, host);
         cx.notify();
     }
 
     /// The half of [`Diff::replace`] that needs no window, and therefore the
     /// half with tests.
+    #[cfg(test)]
     fn swap(&mut self, files: Vec<FileDiff>, host: &Host) {
-        // The one place the diff itself changes, so the one place the prepared
-        // cache is invalidated: the two expensive passes run here, and every
-        // layout toggle after reuses the result until the next swap.
-        self.prepared = prepare_files(&files, host);
-        self.apply_layout(self.current, host);
+        let prepared = prepare_files(&files, host);
+        self.swap_prepared(files, prepared, host);
     }
 
-    /// Puts a saved row back at the top of the viewport.
+    fn swap_prepared(&mut self, files: Vec<FileDiff>, prepared: Prepared, host: &Host) {
+        let old = self.view.get();
+        let cursor = old.cursor();
+        let top = old.top();
+        let pan = self.pan.at();
+        self.files = Rc::new(files);
+        self.sel = None;
+        self.dragging = false;
+        // A refresh is the repository saying things moved; an armed discard
+        // was a promise about how they were, so it dies here first.
+        self.armed_hunk = None;
+        self.prepared = Rc::new(prepared);
+        let built = arrange(&self.prepared, host, &self.layouts, self.current);
+        self.order = Rc::new(built.order);
+        *self.renderers.borrow_mut() = built.renderers;
+        self.widest = built.widest;
+        self.headers = Rc::new(built.headers);
+        self.marks = Rc::new(built.marks);
+        self.load = built.load;
+        self.total.set(self.order.len());
+        self.applied = (0.0, "");
+
+        let mut view = old;
+        view.set_len(self.order.len());
+        view.go_to(cursor);
+        view.scroll_to(top);
+        self.view.set(view);
+        self.pan.set_max(self.bound(self.measured.get(), host));
+        self.pan.set(pan);
+        if self.order.is_empty() {
+            self.pending_scroll.cancel();
+            let mut state = self.scroll.0.borrow_mut();
+            state.deferred_scroll_to_item = None;
+            state.base_handle.set_offset(point(px(0.0), px(0.0)));
+            self.synced.set(0.0);
+            self.top.set(0);
+        } else {
+            self.defer_show(view);
+        }
+    }
+
+    /// Puts a saved row back at the top of the viewport, with the keyboard on
+    /// it. Clamped rather than validated: the diff may be shorter than it was
+    /// when the position was taken — a rebuild is usually a code change, but
+    /// nothing stops the working tree having moved too.
     ///
-    /// Clamped rather than validated: the diff may be shorter than it was when
-    /// the position was taken — a rebuild is usually a code change, but nothing
-    /// stops the working tree having moved too.
-    pub fn scroll_to(&self, row: usize) {
+    /// The viewport model is filled in **first** — length, measured height, and
+    /// the live `[view] scrolloff` — because a restore lands on a view that has
+    /// never been laid out: without it, `go_to` would clamp a saved row 4,102
+    /// against a list the model still believes is empty, and the first frame
+    /// would open at row zero no matter what was restored.
+    ///
+    /// And **strict**, deferred to the list's own prepaint: the non-strict
+    /// strategy skips scrolling for a row already inside the initial viewport,
+    /// so a saved row 5 of a tall window would leave GPUI parked at row zero
+    /// while the model and the session both claimed 5 — and every later
+    /// reconcile would then read that lie back as the truth. Strict puts row
+    /// `row` at the top, whatever was there.
+    pub fn scroll_to(&self, row: usize, host: &Host) {
         if self.order.is_empty() {
             return;
         }
-        self.scroll
-            .scroll_to_item(row.min(self.order.len() - 1), ScrollStrategy::Top);
+        let row = row.min(self.order.len() - 1);
+        let mut v = self.live_view(host);
+        v.scroll_to(row);
+        self.view.set(v);
+        self.defer_show(v);
+    }
+
+    pub fn go_to(&self, row: usize, host: &Host) {
+        let mut v = self.live_view(host);
+        v.go_to(row);
+        self.view.set(v);
     }
 
     /// The shipped set: the registry of presentations, opened on whichever one
     /// the host names. An unknown name falls back to the first rather than
     /// failing — the config layer is what reports it, because it is the layer
     /// that knows it came from a file somebody is editing.
-    pub fn new(files: Vec<FileDiff>, host: Rc<Host>, cx: &mut Context<Self>) -> Self {
-        let mut d = Self::with_layouts(files, &host, Layouts::builtin());
-        d.focus = Some(cx.focus_handle());
-        d
+    pub fn new(files: Vec<FileDiff>, host: Rc<Host>, _cx: &mut Context<Self>) -> Self {
+        Self::with_layouts(files, &host, Layouts::builtin())
     }
 
     /// One presentation, pinned: no registry, so nothing to cycle to.
@@ -939,7 +1508,7 @@ impl Diff {
         // more than once in general and here can only be called once. A pinned
         // presentation has nothing to switch to, so once is all it gets — and if
         // it is somehow asked twice, the fallback rather than an empty list,
-        // because `arrange` indexes `renderers[0]`.
+        // because `assemble` indexes `renderers[0]`.
         let once = std::cell::RefCell::new(Some(renderers));
         layouts.register("custom", move |_| {
             once.borrow_mut()
@@ -960,22 +1529,27 @@ impl Diff {
         let current = match layouts.position(&host.layout) {
             Some(i) => i,
             None => {
-                eprintln!(
-                    "gitten: unknown diff.layout {:?}; registered: {}",
-                    host.layout,
-                    layouts.names().join(", ")
-                );
+                if crate::stats::enabled() {
+                    eprintln!(
+                        "gitten: unknown diff.layout {:?}; registered: {}",
+                        host.layout,
+                        layouts.names().join(", ")
+                    );
+                }
                 0
             }
         };
-        let prepared = prepare_files(&files, host);
+        let files = Rc::new(files);
+        let prepared = Rc::new(prepare_files(&files, host));
         let built = arrange(&prepared, host, &layouts, current);
         // The host names the wrap this opens on, exactly as it names the layout.
         // An unknown name is reported by the config layer, which is the layer
         // that knows it came from a file somebody is editing.
         let wrap = host.wrap.selected_index();
         let total = Rc::new(Cell::new(built.order.len()));
+        let view = Viewport::new();
         Self {
+            files,
             prepared,
             layouts: Rc::new(layouts),
             current,
@@ -988,14 +1562,18 @@ impl Diff {
             measured: Rc::new(Cell::new(0.0)),
             renderers: Rc::new(RefCell::new(built.renderers)),
             order: Rc::new(built.order),
+            marks: Rc::new(built.marks),
             sel: None,
             dragging: false,
             widest: built.widest,
+            armed_hunk: None,
+            focused: false,
+            headers: Rc::new(built.headers),
             scroll: UniformListScrollHandle::new(),
             pan: Pan::default(),
-            ongoing: Cell::default(),
-            focus: None,
-            focused: false,
+            view: Rc::new(Cell::new(view)),
+            synced: Rc::new(Cell::new(0.0)),
+            pending_scroll: PendingScroll::default(),
             rendered: Rc::new(Cell::new(0)),
             total,
             note: Rc::new(RefCell::new(SharedString::default())),
@@ -1004,62 +1582,40 @@ impl Diff {
         }
     }
 
-    /// Moves to the next presentation and rebuilds the rows, keeping you roughly
-    /// where you were reading.
-    ///
-    /// **Roughly, and not exactly.** The two presentations do not have the same
-    /// number of rows — a replace pair is one row in the two-column layout and
-    /// two in the unified one — so a row index means something different in each
-    /// and there is nothing to preserve exactly. The proportion through the diff
-    /// is preserved instead, which lands you on the same screenful.
-    ///
-    /// The rows are rebuilt, but only from the *prepared* diff, which is held
-    /// behind an `Rc` and reused across toggles — so a press pays [`arrange`]
-    /// (renderer selection, the order table, and one `File` clone per drawn file)
-    /// and not the intraline and syntax passes. Those are the 8 ms on a typical
-    /// diff and 289 ms on the pathological one that this key used to re-pay every
-    /// press; they now run once, when the diff is acquired or swapped. See
-    /// [`Diff::prepared`] for the memory that buys and [`prepare_files`] for the
-    /// half that no longer runs here.
-    pub fn cycle_layout(&mut self, cx: &mut Context<Self>) {
-        if self.layouts.len() < 2 {
-            return;
-        }
-        // The live host, not one captured when this view was built — the same
-        // reason `render` reads it per batch. A layout rebuilt from a stale font
-        // would quietly disagree with the row it replaced.
-        let host = crate::config::host(cx);
-        self.apply_layout((self.current + 1) % self.layouts.len(), &host);
-        cx.notify();
-    }
-
     /// Rebuilds the rows for `index`, keeping the reading position. The half of
-    /// [`Diff::cycle_layout`] and [`Diff::replace`] that needs no window, and
-    /// therefore the half with tests.
+    /// a layout cycle and [`Diff::replace`] that needs no window, and therefore
+    /// the half with tests.
     fn apply_layout(&mut self, index: usize, host: &Host) {
-        let fraction = match self.order.len() {
-            0 => 0.0,
-            n => self.top.get() as f32 / n as f32,
-        };
+        let fraction = self.view.get().progress();
         self.current = index;
         // Every row about to be replaced, so a selection anchored to one of them
         // would be pointing at whatever now has its index. There is no honest
         // way to carry a selection across two presentations of the same diff —
         // a replace pair is one row here and two there — so it goes.
         self.sel = None;
+        // An armed discard rides the same logic: the row it was asked about
+        // is about to have a different meaning.
+        self.armed_hunk = None;
         let built = arrange(&self.prepared, host, &self.layouts, index);
         self.order = Rc::new(built.order);
         *self.renderers.borrow_mut() = built.renderers;
         self.widest = built.widest;
+        self.marks = Rc::new(built.marks);
+
         self.load = built.load;
         self.total.set(self.order.len());
         // Fresh implementations hold no wrap, so the next frame reflows them.
         // Left to that rather than done here, because the width belongs to the
         // window and this half of a layout change is the half with no window.
         self.applied = (0.0, "");
-        let row = (fraction * self.order.len() as f32) as usize;
-        self.top.set(row);
-        self.scroll_to(row);
+        let mut v = self.view.get();
+        v.set_len(self.order.len());
+        v.go_to_fraction(fraction);
+        self.view.set(v);
+        // A presentation swap is a new row count too — split merges a replace
+        // pair onto one row — so the same rule as a reflow: the position lands
+        // when the list has measured what it now holds.
+        self.defer_show(v);
     }
 }
 
@@ -1068,34 +1624,21 @@ struct Built {
     renderers: Vec<Box<dyn Rows>>,
     order: Vec<RowRef>,
     widest: usize,
+    /// Where each file header landed in visual rows — what jump-to-file and
+    /// the widest-row search read. Produced by the same [`expand`] that built
+    /// `order`, so it can never disagree with it.
+    headers: Vec<usize>,
+    /// Where each hunk starts, as a fraction of the order — [`Diff::marks`]'s
+    /// source. Produced beside the order it indexes, by the same [`expand`]
+    /// pass, so the two can never disagree.
+    marks: Vec<f32>,
     load: String,
 }
 
-/// Runs the two expensive passes — clip, intraline, syntax — once, behind an
-/// `Rc` so a layout toggle can [`arrange`] the result again without paying them
-/// twice.
 ///
-/// A free function rather than a method because it runs before a `Diff` exists
-/// (in [`Diff::with_layouts`]) and again when the diff is swapped, and both
-/// callers want exactly this. Its inputs are `(files, host.syntax,
-/// MAX_LINE_CHARS)`; nothing a layout toggle changes is among them, which is the
-/// whole point of caching what it returns.
-fn prepare_files(files: &[FileDiff], host: &Host) -> Rc<Prepared> {
-    // One pass in core, shared with the CLI and the ANSI painter.
-    Rc::new(prepare(files, &host.syntax, MAX_LINE_CHARS))
-}
-
-/// Turns an already-[`prepare`]d diff into the rows one presentation draws: it
-/// selects the renderers for `current`, hands each file to the implementation
-/// that claims it, and builds the order table, the widest-row index and the load
-/// string.
-///
-/// Everything here is a pure function of the *presentation*, which is exactly
-/// what a layout toggle changes — so it is split from [`prepare_files`], which a
-/// toggle must not re-run. Each file is cloned out of the shared [`Prepared`]:
-/// the clone re-allocates that file's text refcount, spans and tokens but runs
-/// neither the intraline diff nor the syntax scan, so it is a fraction of a full
-/// prepare and is paid only for the files a presentation actually draws.
+/// Takes the [`Prepared`] by reference on purpose: the expensive half ran once,
+/// somewhere else, and sits behind an `Rc` on the view — this is the cheap half
+/// a layout toggle pays, and it must not consume what the toggle wants kept.
 fn arrange(prepared: &Prepared, host: &Host, layouts: &Layouts, current: usize) -> Built {
     let t = std::time::Instant::now();
     let mut renderers = match layouts.0.get(current) {
@@ -1120,12 +1663,21 @@ fn arrange(prepared: &Prepared, host: &Host, layouts: &Layouts, current: usize) 
             .rev()
             .find(|(_, r)| r.claims(&f.path))
             .map_or(0, |(i, _)| i);
+        // Cloned out of the shared cache: an allocation and refcount bumps, but
+        // neither the intraline diff nor the syntax scan — which is exactly why
+        // those two live behind the `Rc` and this pass does not.
         let r = &mut renderers[owner];
         let first = r.len();
-        // Cloned out of the shared cache: a `File` clone re-allocates but does no
-        // intraline diff and no syntax scan, so a toggle is not a re-prepare.
         r.build(f.clone());
         for index in first..r.len() {
+            // One file: the pane header names it, so its own band is noise. The
+            // row stays built — hunk numbering, wrapping and the cursor address
+            // rows by index — and only the order table leaves it out. A file
+            // with no hunks keeps it: the band is then the only row there is,
+            // and an empty pane says less than the name does.
+            if file_count == 1 && !f.hunks.is_empty() && r.is_file_header(index) {
+                continue;
+            }
             order.push(RowRef {
                 owner: owner as u16,
                 seg: 0,
@@ -1136,14 +1688,13 @@ fn arrange(prepared: &Prepared, host: &Host, layouts: &Layouts, current: usize) 
 
     // One entry per logical row so far, which is what `expand` wants. Nothing
     // wraps yet — no implementation has been given a width — so this pass only
-    // finds the widest row; the first frame reflows and runs it again.
-    let Ordered { order, widest, .. } = expand(&order, &renderers, None);
+    // finds the widest row and the file headers; the first frame reflows and
+    // runs it again.
+    let (Ordered { order, widest, .. }, headers) = expand(&order, &renderers, None);
 
     // `cpu across N` when the pass fanned out, because these are summed across
-    // workers and `arrange` beside them is wall clock — without the note the two
-    // numbers read as a contradiction rather than as a speed-up. These come from
-    // the cached `Prepared`, so on a toggle they report what the pass cost once,
-    // not a pass that just ran: `arrange` below is the cost of the press.
+    // workers and `build` beside them is wall clock — without the note the two
+    // numbers read as a contradiction rather than as a speed-up.
     let cpu = match prepared.threads > 1 {
         true => format!(" cpu across {}", prepared.threads),
         false => String::new(),
@@ -1152,6 +1703,12 @@ fn arrange(prepared: &Prepared, host: &Host, layouts: &Layouts, current: usize) 
         "intraline {:.0?} · syntax {:.0?}{cpu}",
         prepared.intraline, prepared.syntax
     )];
+    // Distinct from a renderer's own "invalid breaks" report below: this counts
+    // spans and tokens `prepare` threw away at the `Line` boundary — a bad
+    // `Differ` or `Highlighter`, not a bad `Wrap`.
+    if prepared.rejected() > 0 {
+        reports.push(format!("{} spans/tokens rejected", prepared.rejected()));
+    }
     reports.extend(
         renderers
             .iter()
@@ -1159,17 +1716,22 @@ fn arrange(prepared: &Prepared, host: &Host, layouts: &Layouts, current: usize) 
             .filter(|s| !s.is_empty()),
     );
     let load = format!(
-        "{} rows · {} files · {name} · arrange {:.0?} ({})",
+        "{} rows · {} files · {name} · build {:.0?} ({})",
         order.len(),
         file_count,
         t.elapsed(),
         reports.join(" · "),
     );
-    eprintln!("{load}");
+    if crate::stats::enabled() {
+        eprintln!("{load}");
+    }
+    let marks = hunk_marks(&order, &renderers);
     Built {
         renderers,
         order,
         widest,
+        headers,
+        marks,
         load,
     }
 }
@@ -1231,7 +1793,11 @@ impl Diff {
     /// on the row 9 further down, which exists and is exactly what should be
     /// selected — the same as dragging past the bottom of a page in a browser.
     /// Clamped to the *diff*, so it cannot address a row that is not there.
-    fn locate(&self, pos: Point<Pixels>, host: &Host) -> Option<(u16, Caret)> {
+    ///
+    /// The third element is the **visual** row clicked — which of a wrapped
+    /// line's rows it was — because a cursor lands where the mouse did, not at
+    /// the top of whatever line that was.
+    fn locate(&self, pos: Point<Pixels>, host: &Host) -> Option<(u16, Caret, usize)> {
         if self.order.is_empty() {
             return None;
         }
@@ -1269,6 +1835,7 @@ impl Diff {
                 off: hit.off,
                 at: first..first + n,
             },
+            visual,
         ))
     }
 
@@ -1296,6 +1863,27 @@ impl Diff {
             .map(str::to_string)
     }
 
+    /// Moves the keyboard onto a clicked **visual** row, and keeps the list and
+    /// the model agreeing about where that leaves the viewport.
+    ///
+    /// A click is a place: everything a key does next — copy, jump, open — acts
+    /// on the row the cursor is on. On a wrapped line that is the *continuation*
+    /// the mouse actually hit, not the top of the line it belongs to; and since
+    /// [`Viewport::go_to`] may drag the top for its margin, [`Diff::show`]
+    /// writes the list back to where the model now says it is — one write, so
+    /// the two cannot disagree about who moved.
+    ///
+    /// Through [`Diff::live_view`], and not the stored one: a click can be the
+    /// first thing that ever happens to this view — no key has navigated, no
+    /// frame has reported a height — and against a model that still believes
+    /// the list is empty, `go_to` clamps every row onto zero.
+    fn click_row(&mut self, visual: usize, host: &Host) {
+        let mut v = self.live_view(host);
+        v.go_to(visual);
+        self.view.set(v);
+        self.show(v);
+    }
+
     /// Mouse down: a new selection, a widened one on a repeat click, or an
     /// extension of the existing one when shift is held.
     ///
@@ -1304,11 +1892,12 @@ impl Diff {
     /// to mean "no longer selected".
     fn press(&mut self, ev: &MouseDownEvent, cx: &mut Context<Self>) {
         let host = crate::config::host(cx);
-        let Some((part, caret)) = self.locate(ev.position, &host) else {
+        let Some((part, caret, visual)) = self.locate(ev.position, &host) else {
             self.sel = None;
             cx.notify();
             return;
         };
+        self.click_row(visual, &host);
         self.dragging = true;
         // Shift extends whatever is already there, which is how a selection
         // longer than the window gets made without a drag that has to scroll.
@@ -1348,7 +1937,7 @@ impl Diff {
         }
         let host = crate::config::host(cx);
         self.autoscroll(ev.position);
-        let Some((part, mut caret)) = self.locate(ev.position, &host) else {
+        let Some((part, mut caret, _)) = self.locate(ev.position, &host) else {
             return;
         };
         let Some(sel) = &self.sel else { return };
@@ -1406,11 +1995,15 @@ impl Diff {
         }
     }
 
-    /// `copy.selection`. A no-op with nothing selected rather than a cleared
-    /// clipboard — losing what somebody copied elsewhere is worse than a key
-    /// that did nothing.
+    /// `copy.selection`. The selection, or the row the keyboard is on when there
+    /// is none — "copy this line" should not need the mouse. A no-op with
+    /// neither, rather than a cleared clipboard: losing what somebody copied
+    /// elsewhere is worse than a key that did nothing.
     pub fn copy(&self, cx: &mut Context<Self>) {
-        let text = self.selection();
+        let mut text = self.selection();
+        if text.is_empty() {
+            text = self.cursor_text();
+        }
         if !text.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
@@ -1422,11 +2015,13 @@ impl Diff {
         cx.notify();
     }
 
-    /// `select.none`.
-    pub fn select_none(&mut self, cx: &mut Context<Self>) {
-        if self.sel.take().is_some() {
+    /// `select.none`. Whether there was one, which is what `back` wants to know.
+    pub fn select_none(&mut self, cx: &mut Context<Self>) -> bool {
+        let had = self.sel.take().is_some();
+        if had {
             cx.notify();
         }
+        had
     }
 
     /// While a drag is live the mouse belongs to it, wherever the pointer is.
@@ -1459,40 +2054,28 @@ impl Diff {
         .h(px(0.))
         .into_any_element()
     }
-
-    /// The same trick as [`Diff::drag_probe`], for the wheel, and for a different
-    /// reason: not to hear about events outside the box, but to hear about them
-    /// **first**. A `div`'s `on_scroll_wheel` is bubble-phase only, and the list
-    /// is a child — so by the time it fired, the list had already turned a
-    /// sideways flick into vertical scrolling. See [`Diff::wheel`].
-    fn wheel_probe(&self, cx: &mut Context<Self>) -> AnyElement {
-        let me = cx.entity().downgrade();
-        canvas(
-            |_, _, _| {},
-            move |_, _, window, _| {
-                let me = me.clone();
-                window.on_mouse_event(move |ev: &ScrollWheelEvent, phase, window, cx| {
-                    if phase == DispatchPhase::Capture {
-                        _ = me.update(cx, |this, cx| this.wheel(ev, window, cx));
-                    }
-                });
-            },
-        )
-        .absolute()
-        .top_0()
-        .left_0()
-        .h(px(0.))
-        .into_any_element()
-    }
 }
 
 impl Render for Diff {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Zero rows is a sentence, not a bare rectangle: nothing selected, a
+        // clean tree and an empty projection are indistinguishable from out
+        // here, and [`chrome::empty_line`] says so the same way every quiet
+        // pane does. The pane header above already names what was selected.
+        // A one-file diff with no hunks still keeps its header row — only an
+        // empty *order* lands here.
+        if self.order.is_empty() {
+            return crate::chrome::empty_line(
+                &crate::config::host(cx),
+                "no changes to show".into(),
+            );
+        }
         // Whatever the last frame measured this view to be. Reflowing here and
         // not in the probe itself keeps every mutation of the row tables on the
         // one path, and costs one frame of unwrapped rows at startup.
         self.reflow(self.measured.get(), &crate::config::host(cx));
 
+        let pending_scroll = self.pending_scroll.clone();
         let renderers = self.renderers.clone();
         let order = self.order.clone();
         let rendered = self.rendered.clone();
@@ -1501,6 +2084,23 @@ impl Render for Diff {
         // closure lives for one element tree, and every path that changes a
         // selection notifies — so the copy in here is never the stale one.
         let sel = self.sel.clone();
+        // Where the keyboard is, read per batch: commands run between frames and
+        // this cell is what they move.
+        let view = self.view.clone();
+        let scroll = self.scroll.clone();
+        let synced = self.synced.clone();
+        // The same flag the shell last wrote, copied into the rows with the rest
+        // of the frame's reads — a view cannot ask the shell during render.
+        let focused = self.focused;
+        // The question the shell is holding, if any, copied so the rows of one
+        // frame all answer it at the same state of the arm.
+        let armed = self.armed_hunk;
+        // The hunk ticks' two per-frame reads, taken here like every other
+        // setting the frame is drawn from: the offsets, computed at load and
+        // rebuilt where the order was, and the ink they are drawn in. A
+        // refcount bump and a u32 — nothing per frame.
+        let marks = self.marks.clone();
+        let ink = crate::config::host(cx).theme.diff.hunk_fg;
         // Where the scrollbar draws itself and how long its thumb is. Last
         // frame's box, like everything else measured here — a view is handed
         // one and cannot ask before.
@@ -1518,8 +2118,32 @@ impl Render for Diff {
             rendered.set(range.len());
             top.set(range.start);
             let host = crate::config::host(cx);
+            if let Some(accepted) = accept_deferred_scroll(&scroll, &pending_scroll, &synced) {
+                if accepted.wheeled {
+                    let mut v = view.get();
+                    v.set_len(order.len());
+                    v.set_height(range.len());
+                    v.set_scrolloff(host.view.scrolloff);
+                    v.scroll_to((-accepted.y / ROW_H).round().max(0.0) as usize);
+                    view.set(v);
+                    top.set(v.top());
+                    cx.refresh_windows();
+                }
+            }
+            let cursor = view.get().cursor();
             // Once per batch of rows, not once per row.
             let renderers = renderers.borrow();
+            // The keyboard's hunk and the armed one, as the rows address them:
+            // one presentation lookup each, per frame — a row then reads its
+            // extent and its arm as integer compares against the two ranges,
+            // and never a search apiece. `armed` keys the logical row the
+            // question was asked on — see [`Diff::confirm_or_arm_discard_hunk`]
+            // — and no cursor move has moved it, so the rows are the same ones
+            // the arm was spent on.
+            let extent = order
+                .get(cursor)
+                .and_then(|r| extent_of(&renderers, r.owner, r.index));
+            let armed_extent = armed.and_then(|(o, i)| extent_of(&renderers, o, i));
             range
                 .map(|i| {
                     let r = order[i];
@@ -1531,6 +2155,12 @@ impl Render for Diff {
                         r.seg as usize,
                         &host,
                         at,
+                        RowState {
+                            current: i == cursor,
+                            focused,
+                            armed: armed_extent.is_some_and(|e| e.contains(r.owner, r.index)),
+                            in_hunk: extent.is_some_and(|e| e.contains(r.owner, r.index)),
+                        },
                         shift,
                     )
                 })
@@ -1545,7 +2175,7 @@ impl Render for Diff {
         // scrollable width nothing scrolls.
         .size_full();
 
-        let mut root = div()
+        let root = div()
             .relative()
             .size_full()
             // Text, because it is: the whole view is selectable, headers
@@ -1570,7 +2200,6 @@ impl Render for Diff {
             )
             .child(list)
             .child(self.drag_probe(cx))
-            .child(self.wheel_probe(cx))
             // How wide this view actually is, which is the wrap budget. A view
             // is handed its box by whatever assembled it and cannot know it
             // during `render`, so it is read off the paint pass and used on the
@@ -1582,29 +2211,22 @@ impl Render for Diff {
             .when(crate::config::host(cx).view.scrollbar, |d| {
                 // Two handles, because there are two axes and they belong to
                 // different things now: the rows to the list, the text to `Pan`.
-                d.child(Scrollbar::vertical(&self.scroll))
-                    .child(Scrollbar::horizontal(&self.pan))
+                d.child(vertical_scrollbar(&DeferredScrollbar::new(
+                    &self.scroll,
+                    &self.pending_scroll,
+                )))
+                .child(horizontal_scrollbar(&self.pan))
+                // The hunk ticks, last so they ride on the track the widget
+                // paints — an opaque channel of the window's background, which
+                // would cover a strip painted before it. Only when there is a
+                // track to mark: a diff that fits the pane is one the widget
+                // draws no bar on.
+                .when(
+                    self.scroll.0.borrow().base_handle.max_offset().y > px(0.),
+                    |d| d.child(track_marks(marks, ink)),
+                )
             });
-
-        // Key dispatch runs down the focus path, so an action handler on an
-        // element nothing has focused is never reached. Taking focus on the
-        // first frame is what puts this view in that path; there is no other
-        // focusable thing in the window yet, and when there is, a mode stack is
-        // what should be deciding.
-        if let Some(focus) = self.focus.clone() {
-            if !self.focused {
-                self.focused = true;
-                window.focus(&focus, cx);
-            }
-            root = root
-                .track_focus(&focus)
-                .on_action(cx.listener(|this, _: &CycleLayout, _, cx| this.cycle_layout(cx)))
-                .on_action(cx.listener(|this, _: &CycleWrap, _, cx| this.cycle_wrap(cx)))
-                .on_action(cx.listener(|this, _: &CopySelection, _, cx| this.copy(cx)))
-                .on_action(cx.listener(|this, _: &SelectAll, _, cx| this.select_all(cx)))
-                .on_action(cx.listener(|this, _: &SelectNone, _, cx| this.select_none(cx)));
-        }
-        root
+        root.into_any_element()
     }
 }
 
@@ -1644,11 +2266,74 @@ enum Row {
     },
 }
 
+/// Which hunk each drawn row belongs to.
+///
+/// One entry per hunk — not per row, which is the difference between a table
+/// that grows with a 714k-line diff and one that grows with its hunk count.
+/// Both shipped presentations build their rows in hunk order (a file header,
+/// then each hunk's header and lines), so recording a span at build time is
+/// one push per hunk; reading it back is a binary search. The path travels
+/// as the loaded diff spells it, which is the key the staging verbs aim
+/// [`gitten_core::patch::emit`] with.
+#[derive(Default)]
+pub(crate) struct HunkMap {
+    spans: Vec<SpanEntry>,
+}
+
+struct SpanEntry {
+    /// First logical row of the hunk, inclusive — its header row.
+    start: u32,
+    /// How many logical rows the hunk spans, header included.
+    rows: u32,
+    path: std::sync::Arc<str>,
+    hunk: u16,
+}
+
+impl HunkMap {
+    /// Records one hunk occupying logical rows `at..at+rows`. The path is
+    /// interned once per hunk — hunks number in the hundreds where rows
+    /// number in the hundreds of thousands.
+    pub(crate) fn record(&mut self, at: usize, rows: usize, path: &str, hunk: usize) {
+        self.spans.push(SpanEntry {
+            start: at as u32,
+            rows: rows as u32,
+            path: std::sync::Arc::from(path),
+            hunk: hunk as u16,
+        });
+    }
+
+    /// The hunk under logical row `index`, or nothing for the gaps between
+    /// hunks — today only the file headers.
+    pub(crate) fn at(&self, index: usize) -> Option<(&str, usize)> {
+        let i = self.spans.partition_point(|s| s.start as usize <= index);
+        let s = self.spans.get(i.checked_sub(1)?)?;
+        if index < s.start as usize + s.rows as usize {
+            Some((s.path.as_ref(), s.hunk as usize))
+        } else {
+            None
+        }
+    }
+
+    /// The logical rows the hunk under `index` spans — first through last,
+    /// header included, [`HunkMap::at`]'s own answer as a range. What the
+    /// extent mark and the armed tint are computed against, once per frame:
+    /// a row then reads its membership as two integer compares against this
+    /// range and never a binary search apiece.
+    pub(crate) fn span(&self, index: usize) -> Option<(u32, u32)> {
+        let i = self.spans.partition_point(|s| s.start as usize <= index);
+        let s = self.spans.get(i.checked_sub(1)?)?;
+        (index < s.start as usize + s.rows as usize).then_some((s.start, s.start + s.rows))
+    }
+}
+
 /// The default presentation: one line of text per row, behind a line-number
 /// gutter, coloured by the host's theme.
 #[derive(Default)]
 pub struct TextRows {
     rows: Vec<Row>,
+    /// Which hunk every row belongs to — the staging verbs' map from the
+    /// keyboard's row back to the loaded diff. One entry per hunk.
+    hunks: HunkMap,
     /// How many rows are part of a block that moved, for the overlay. Reported
     /// because move detection is otherwise invisible when it finds nothing, and
     /// "it found nothing" and "it is switched off" look identical on screen.
@@ -1691,6 +2376,10 @@ impl Rows for TextRows {
         self.rows.len()
     }
 
+    fn is_file_header(&self, index: usize) -> bool {
+        matches!(self.rows.get(index), Some(Row::File { .. }))
+    }
+
     fn rows(&self, index: usize) -> usize {
         self.wrapped.rows(index)
     }
@@ -1720,15 +2409,23 @@ impl Rows for TextRows {
     }
 
     fn build(&mut self, f: gitten_core::prepared::File) {
+        // Kept beside the rows, which consume the hunks: the hunk map needs
+        // to spell each file the loaded diff spells it.
+        let path = std::sync::Arc::from(f.path.as_str());
         self.rows.push(Row::File {
-            path: f.path.into(),
+            path: std::sync::Arc::clone(&path),
             adds: f.adds,
             dels: f.dels,
         });
-        for h in f.hunks {
+        for (n, h) in f.hunks.into_iter().enumerate() {
+            // The hunk's span opens on its header row and closes after its
+            // last line, so a cursor anywhere inside it — header included —
+            // reads as being *on* the hunk.
+            let at = self.rows.len();
             self.rows.push(Row::Hunk(h.header.into()));
+            let mut moved = 0;
             for l in h.lines {
-                self.moved += l.moved as usize;
+                moved += l.moved as usize;
                 self.rows.push(Row::Line {
                     kind: l.kind,
                     moved: l.moved,
@@ -1739,7 +2436,17 @@ impl Rows for TextRows {
                     tokens: l.tokens,
                 });
             }
+            self.moved += moved;
+            self.hunks.record(at, self.rows.len() - at, &path, n);
         }
+    }
+
+    fn hunk_at(&self, index: usize) -> Option<(&str, usize)> {
+        self.hunks.at(index)
+    }
+
+    fn hunk_span(&self, index: usize) -> Option<(u32, u32)> {
+        self.hunks.span(index)
     }
 
     /// Characters, not bytes, and after `trim_end`: a line of box drawing is a
@@ -1767,11 +2474,12 @@ impl Rows for TextRows {
         (text - (width - TEXT_CHROME)).max(0.0)
     }
 
-    /// The gutters and the sign column, then the text — and for a header, the
-    /// page padding and nothing else, because that is what it draws.
+    /// The gutters and the sign column, then the text — and for a file header,
+    /// the page padding and nothing else, because that is what it draws. A hunk
+    /// header's text sits where the code does, so it measures from there.
     fn hit(&self, index: usize, seg: usize, x: f32, host: &Host, shift: f32) -> Option<Hit> {
         Some(match self.rows.get(index)? {
-            Row::Hunk(h) => header_hit(h, x, host, shift),
+            Row::Hunk(h) => hunk_hit(h, x, host, shift),
             Row::File { path, .. } => header_hit(path, x, host, shift),
             Row::Line { text, .. } => {
                 let at = self.wrapped.range(index, seg, text);
@@ -1800,20 +2508,27 @@ impl Rows for TextRows {
         })
     }
 
+    fn is_header(&self, index: usize) -> bool {
+        matches!(self.rows.get(index), Some(Row::File { .. }))
+    }
+
     fn render(
         &self,
         index: usize,
         seg: usize,
         host: &Host,
         sel: Option<Selected>,
+        state: RowState,
         shift: f32,
     ) -> AnyElement {
         let theme = &host.theme;
         let p = &theme.diff;
         match &self.rows[index] {
-            Row::File { path, adds, dels } => file_header(path, *adds, *dels, theme, sel, shift),
+            Row::File { path, adds, dels } => {
+                file_header(path, *adds, *dels, theme, &host.font, sel, state, shift)
+            }
 
-            Row::Hunk(header) => hunk_header(header, theme, sel, shift),
+            Row::Hunk(header) => hunk_header(header, theme, sel, state, shift),
 
             Row::Line {
                 kind,
@@ -1825,9 +2540,29 @@ impl Rows for TextRows {
                 tokens,
             } => {
                 let (bg, fg, sign) = line_colors(*kind, *moved, p);
+                // The keyboard's row is a bar across the whole line, whatever
+                // kind of line it is — the same background the terminal draws,
+                // so the cursor reads as one thing in both.
+                let bg = row_background(state.current, bg, theme);
                 // Which background this row's furniture lands on, so the line
-                // numbers are resolved against it — see `Theme::gutter_on`.
-                let gutter = theme.gutter_on(surfaces(*kind, *moved).0);
+                // numbers are resolved against it — see `Theme::gutter_on`. On
+                // the keyboard's row that is the wash, and not the line kind's:
+                // the row paints `selection_bg` over both, so a number resolved
+                // for the line it is sits on a background it never lands on.
+                let (plain, _) = surfaces(*kind, *moved);
+                let gutter = theme.gutter_on(match state.current {
+                    true => Surface::Cursor,
+                    false => plain,
+                });
+                // The question stands over the hunk the second press will
+                // spend, and the column that says which hunk that is — the
+                // line numbers and the sign — name it in the colour a conflict
+                // does: the palette's own "this row ends work" foreground,
+                // which a conflict's letters already draw.
+                let gutter = match state.armed {
+                    true => theme.chrome.error,
+                    false => gutter,
+                };
                 let at = self.wrapped.range(index, seg, text);
                 let piece = slice(text, &at);
                 // A continuation carries no number and no sign. The background
@@ -1839,9 +2574,15 @@ impl Rows for TextRows {
                 // numbers are formatted into it and the run list swept into it,
                 // both copied out by the elements as they take them.
                 let mut sc = self.scratch.borrow_mut();
-                row_frame()
-                    .items_center()
-                    .px(px(PAD))
+                extent_line(row_frame().items_center().px(px(PAD)), state, bg, theme)
+                    // The bar on every row, in the row's own background when
+                    // the cursor is elsewhere: the padding gives back what the
+                    // border takes, so the text starts where it started and a
+                    // move of the cursor shifts no line a pixel — the same
+                    // frame the sidebar's rows sit in.
+                    .border_l(px(ROW_BAR))
+                    .border_color(rgb(row_bar(state, bg, theme)))
+                    .pl(px(PAD - ROW_BAR))
                     .bg(rgb(bg))
                     .child(num(sc.number(*old, blank), gutter))
                     .child(num(sc.number(*new, blank), gutter))
@@ -1849,7 +2590,10 @@ impl Rows for TextRows {
                         div()
                             .flex_none()
                             .w(px(SIGN_W))
-                            .text_color(rgb(fg))
+                            .text_color(rgb(match state.armed {
+                                true => theme.chrome.error,
+                                false => fg,
+                            }))
                             .child(if blank { " " } else { sign }),
                     )
                     .child(scrolled(
@@ -1863,7 +2607,8 @@ impl Rows for TextRows {
                                     theme,
                                     *kind,
                                     *moved,
-                                    selected(sel, 0, text.len()),
+                                    state.current,
+                                    selected(sel, 0, text),
                                 )
                                 .iter()
                                 .cloned(),
@@ -1900,16 +2645,6 @@ fn wrappable(row: &Row) -> &str {
 pub(crate) fn slice(text: &std::sync::Arc<str>, at: &Range<usize>) -> SharedString {
     match at.start == 0 && at.end == text.len() {
         true => SharedString::from(text.clone()),
-        false => SharedString::from(&text[at.clone()]),
-    }
-}
-
-/// The same, for text GPUI already owns — a re-flowed Markdown table row.
-/// Whole-row clones stay refcount bumps there too, and wrapped segments take
-/// the by-reference path [`slice`] does.
-pub(crate) fn slice_shared(text: &SharedString, at: &Range<usize>) -> SharedString {
-    match at.start == 0 && at.end == text.len() {
-        true => text.clone(),
         false => SharedString::from(&text[at.clone()]),
     }
 }
@@ -1967,26 +2702,36 @@ pub(crate) fn scrolled(shift: f32, text: Div) -> Div {
         .child(text.flex_none().ml(px(-shift)))
 }
 
-/// The bytes of a `len`-long text that a selection covers, or nothing at all
-/// when the selection is in another of the row's parts — or is not there, which
-/// is the case on nearly every row of nearly every frame.
-pub(crate) fn selected(sel: Option<Selected>, part: u16, len: usize) -> Range<usize> {
+/// The bytes of `text` that a selection covers, or nothing at all when the
+/// selection is in another of the row's parts — or is not there, which is the
+/// case on nearly every row of nearly every frame.
+pub(crate) fn selected(sel: Option<Selected>, part: u16, text: &str) -> Range<usize> {
     match sel.filter(|s| s.part() == part) {
-        Some(s) => s.range(len),
+        Some(s) => s.range(text),
         None => 0..0,
     }
 }
 
-/// Where a click landed in a file or hunk header.
+/// Where a click landed in a file header.
 ///
-/// Shared for the same reason the two headers themselves are: whoever owns the
-/// lines beneath them, a header is drawn by [`file_header`] or [`hunk_header`] and
-/// its text starts at the page padding. Three presentations working that out
-/// separately is three places for the caret to be a gutter's width off.
+/// Shared for the same reason the header itself is: whoever owns the lines
+/// beneath it, a file header is drawn by [`file_header`] and its text starts at
+/// the page padding. Three presentations working that out separately is three
+/// places for the caret to be a gutter's width off.
 pub(crate) fn header_hit(text: &str, x: f32, host: &Host, shift: f32) -> Hit {
     Hit {
         part: 0,
         off: column_at(text, into_text(x, PAD, shift), host.font.size, host),
+    }
+}
+
+/// Where a click landed in a hunk header, whose text [`hunk_header`] draws at
+/// [`HUNK_INDENT`] — the code column — rather than at the page padding. The same
+/// constant on both sides, or the caret is two gutters off.
+pub(crate) fn hunk_hit(text: &str, x: f32, host: &Host, shift: f32) -> Hit {
+    Hit {
+        part: 0,
+        off: column_at(text, into_text(x, HUNK_INDENT, shift), host.font.size, host),
     }
 }
 
@@ -2040,36 +2785,39 @@ fn header_text(text: SharedString, sel: Range<usize>, theme: &Theme) -> AnyEleme
 /// directory/name split below is two subslices of one string, and only what a
 /// header actually draws is handed to GPUI — inline for any piece under 23
 /// bytes, which is nearly all of them.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn file_header(
     path: &std::sync::Arc<str>,
     adds: usize,
     dels: usize,
     theme: &Theme,
+    font: &Font,
     sel: Option<Selected>,
+    state: RowState,
     shift: f32,
 ) -> AnyElement {
     let p = &theme.diff;
     let (dir, name) = split_path(path);
     // One range over the whole path, split between the two elements below.
-    let sel = selected(sel, 0, path.len());
+    let sel = selected(sel, 0, path);
     let cut = dir.as_ref().map_or(0, |d| d.len());
-    row_frame()
+    header_gutter(row_frame(), state, p.file_bg, theme)
         // A column, so the rule is part of the row's own 22 pixels rather than
         // added to them: every row in this list is exactly `ROW_H` tall and the
         // list is what makes 714k of them scroll.
         .flex_col()
-        .bg(rgb(p.file_bg))
+        .bg(rgb(row_background(state.current, p.file_bg, theme)))
         .child(div().flex_none().h(px(1.)).bg(rgb(p.rule)))
         // A path longer than the window is reached the same way a line is: it is
         // the row's text, and the only thing in front of it is the page padding —
         // which is why the padding is out here and the scroll is inside it.
         .child(
-            div().flex().flex_grow(1.0).px_4().child(scrolled(
+            div().flex().flex_grow(1.0).px(px(PAD)).child(scrolled(
                 shift,
                 div()
                     .flex()
                     .items_center()
-                    .gap_3()
+                    .gap(gap_l(font))
                     .child(
                         div()
                             .flex()
@@ -2114,7 +2862,7 @@ pub(crate) fn file_header(
                         div()
                             .flex_none()
                             .text_color(rgb(p.dels_fg))
-                            .child(format!("-{dels}")),
+                            .child(format!("−{dels}")),
                     ),
             )),
         )
@@ -2157,26 +2905,32 @@ fn split_path(path: &str) -> (Option<&str>, &str) {
 /// The band itself recedes now. It used to be the more prominent of the two
 /// headers, which had the hierarchy backwards: a hunk is a place inside a file,
 /// and the file is the boundary that matters.
+///
+/// Its text starts at [`HUNK_INDENT`], where a code line's does, and not at the
+/// gutter: the `@@` is a coordinate *of the lines under it*, and flush left it
+/// read as a heading over them. Lined up with the code it is a quiet rule
+/// between two runs of it. [`hunk_hit`] measures a click from the same place.
 pub(crate) fn hunk_header(
     header: &std::sync::Arc<str>,
     theme: &Theme,
     sel: Option<Selected>,
+    state: RowState,
     shift: f32,
 ) -> AnyElement {
     let p = &theme.diff;
     let (marker, _) = gitten_core::hunk_parts(header);
-    row_frame()
+    header_gutter(row_frame(), state, p.hunk_bg, theme)
         .items_center()
-        .px_4()
-        .bg(rgb(p.hunk_bg))
+        .pl(px(HUNK_INDENT))
+        .pr(px(PAD))
+        .bg(rgb(row_background(state.current, p.hunk_bg, theme)))
         .text_color(rgb(p.hunk_fg))
         .child(scrolled(
             shift,
             div().child(
                 // The row's own handle, adopted rather than copied.
-                StyledText::new(SharedString::from(std::sync::Arc::clone(header))).with_highlights(
-                    hunk_runs(marker.len(), selected(sel, 0, header.len()), theme),
-                ),
+                StyledText::new(SharedString::from(std::sync::Arc::clone(header)))
+                    .with_highlights(hunk_runs(marker.len(), selected(sel, 0, header), theme)),
             ),
         ))
         .into_any_element()
@@ -2247,6 +3001,170 @@ pub(crate) fn line_colors(
         // anywhere, and `mark_moved` says so.
         (LineKind::Context, _) => (p.context_bg, p.context_fg, " "),
     }
+}
+
+/// The background a row paints: its own kind's, unless the keyboard is on it —
+/// then the one bar every presentation shares. Every `render` in this crate
+/// goes through here for exactly that reason: a visible cursor that some rows
+/// honour and others ignore is a cursor that lies about where it is.
+pub(crate) fn row_background(current: bool, base: Rgb, theme: &Theme) -> Rgb {
+    match current {
+        true => theme.chrome.selection_bg,
+        false => base,
+    }
+}
+
+/// The ink on the bar down a row's left edge, on every row: accent while the
+/// row's pane holds the keyboard, faint when the selection is remembered and
+/// the keyboard is elsewhere, and the row's own background when the row is not
+/// the cursor's — which is what keeps the text from shifting a pixel when the
+/// cursor moves. The same rule [`chrome::list_row`] runs; a cursor that some
+/// rows honour and others ignore is a cursor that lies about where it is.
+pub(crate) fn row_bar(state: RowState, base: Rgb, theme: &Theme) -> Rgb {
+    match (state.current, state.focused) {
+        (true, true) => theme.chrome.accent,
+        (true, false) => theme.chrome.faint,
+        (false, _) => base,
+    }
+}
+
+/// The ink the extent hairline takes on a row: `diff.rule` when the row is in
+/// the keyboard's hunk and the keyboard is elsewhere; the row's own background
+/// when it is not — the ink the element always carries when it says nothing,
+/// which is what keeps a cursor moving between hunks from shifting any row a
+/// pixel; and the bar's ink on the keyboard's row, where the 2px bar wins and
+/// the hairline hides inside it.
+fn extent_ink(state: RowState, base: Rgb, theme: &Theme) -> Rgb {
+    match (state.current, state.in_hunk) {
+        (true, _) => row_bar(state, base, theme),
+        (false, true) => theme.diff.rule,
+        (false, false) => base,
+    }
+}
+
+/// The hairline down a row's left edge that says where the keyboard's hunk
+/// starts and ends: one pixel, inside the bar's own 2px column, in
+/// [`extent_ink`]'s ink.
+///
+/// A hairline and not a second tint, because the row backgrounds already
+/// spend their tint saying add and remove — a second tint would compete. And
+/// in `diff.rule`'s ink specifically because that is the ink a 1px line
+/// already proves itself in: the file header's top rule, and the split
+/// layout's divider, draw it against the same backgrounds at the same width.
+pub(crate) fn extent_line(frame: Div, state: RowState, base: Rgb, theme: &Theme) -> Div {
+    frame.relative().child(
+        div()
+            .absolute()
+            .left_0()
+            .top_0()
+            .bottom_0()
+            .w(px(1.))
+            .bg(rgb(extent_ink(state, base, theme))),
+    )
+}
+
+/// A header row's gutter edge: the 2px bar the line rows carry as a border —
+/// same [`row_bar`] ink, so the cursor is one shape on a header and on a line
+/// — with the extent hairline inside it. Both out of the flow, because a
+/// header's geometry was measured to the pixel: the file header's rule across
+/// its top, the indent its text starts at — a border would move them both.
+pub(crate) fn header_gutter(frame: Div, state: RowState, base: Rgb, theme: &Theme) -> Div {
+    extent_line(
+        frame.child(
+            div()
+                .absolute()
+                .left_0()
+                .top_0()
+                .bottom_0()
+                .w(px(ROW_BAR))
+                .bg(rgb(row_bar(state, base, theme))),
+        ),
+        state,
+        base,
+        theme,
+    )
+}
+
+/// A hunk, as the rows address it once per frame: which presentation owns it
+/// and the logical rows it spans there — [`HunkMap::span`]'s shape. The
+/// keyboard's hunk and the armed one are computed like this at the top of a
+/// frame, and every row then reads its membership as two integer compares —
+/// one `u16` for every row of another file, two `u32` for the owner's own —
+/// never a string compare, and never a search per row.
+#[derive(Clone, Copy)]
+pub(crate) struct HunkExtent {
+    owner: u16,
+    /// First logical row of the hunk, its header included, and one past its
+    /// last.
+    span: (u32, u32),
+}
+
+impl HunkExtent {
+    /// Whether a row of the order table is inside this hunk. The owner first:
+    /// it is the compare every row of every other file pays, which is all of
+    /// them but the hunk's own.
+    fn contains(&self, owner: u16, index: u32) -> bool {
+        self.owner == owner && self.span.0 <= index && index < self.span.1
+    }
+}
+
+/// The hunk standing over one row of the order table, as its presentation
+/// holds it. Once per frame, not once per row.
+fn extent_of(renderers: &[Box<dyn Rows>], owner: u16, index: u32) -> Option<HunkExtent> {
+    let span = renderers.get(owner as usize)?.hunk_span(index as usize)?;
+    Some(HunkExtent { owner, span })
+}
+
+/// Where each hunk starts, as a fraction of the order table — the scrollbar
+/// ticks' whole input.
+///
+/// Computed where the order table is — load, reflow, a layout change — and
+/// never per frame. It walks the flat order once, asking each renderer's
+/// [`Rows::hunk_span`] for the hunk a row belongs to (the input 051's
+/// [`HunkMap`] already serves; nothing here re-derives hunks) and recording
+/// `hunk_start_row / total_rows` for a hunk's own first visual row. That is
+/// the row a `scroll_to_item` to the hunk's start lands the viewport on, and
+/// therefore where the thumb's top sits — a uniform list normalizes a row to
+/// a track offset by plain division, which is exactly what a fraction of the
+/// row count is.
+///
+/// Mark data, not hunk data: a fraction per hunk and nothing else. The
+/// painter takes offsets and an ink — [`crate::views::track_marks`] — so
+/// search marks later are another caller, not another painter.
+fn hunk_marks(order: &[RowRef], renderers: &[Box<dyn Rows>]) -> Vec<f32> {
+    let total = order.len();
+    let mut marks = Vec::new();
+    if total == 0 {
+        return marks;
+    }
+    // The hunk the walk is inside of, per owner: the compare every row pays
+    // before it may ask its renderer, so the walk is linear in the rows and
+    // a search only per hunk.
+    let mut open: Option<(u16, u32, u32)> = None;
+    for (i, r) in order.iter().enumerate() {
+        let span = match open {
+            Some((owner, span, end)) if owner == r.owner && r.index < end => (span, end),
+            _ => match renderers
+                .get(r.owner as usize)
+                .and_then(|rows| rows.hunk_span(r.index as usize))
+            {
+                Some(s) => {
+                    open = Some((r.owner, s.0, s.1));
+                    s
+                }
+                None => {
+                    open = None;
+                    continue;
+                }
+            },
+        };
+        // The hunk's header row is its first, and its first visual row is
+        // that row's first segment: one tick per hunk, not one per segment.
+        if r.seg == 0 && span.0 == r.index {
+            marks.push(i as f32 / total as f32);
+        }
+    }
+    marks
 }
 
 /// One line-number column.
@@ -2332,6 +3250,7 @@ impl Scratch {
         theme: &Theme,
         kind: LineKind,
         moved: bool,
+        current: bool,
         sel: Range<usize>,
     ) -> &[(Range<usize>, HighlightStyle)] {
         runs::runs_selected(at.clone(), tokens, spans, kind, moved, sel, &mut self.runs);
@@ -2344,7 +3263,16 @@ impl Scratch {
             }
             // A token resolves against the surface it lands on, so a selected
             // or changed byte gets a foreground that reads on that background.
-            let style = r.kind.map(|k| theme.syntax_on(k, r.surface));
+            // On the keyboard's row the plain one is the wash — the row paints
+            // `selection_bg` over whatever the line was, so a token resolved
+            // for it was resolved against a background it never lands on. A
+            // changed word keeps its own: the wash is a bar *under* the row and
+            // the word is the thing being read on it.
+            let surface = match (current, r.word) {
+                (true, false) => Surface::Cursor,
+                _ => r.surface,
+            };
+            let style = r.kind.map(|k| theme.syntax_on(k, surface));
             Some((
                 r.at.start - at.start..r.at.end - at.start,
                 HighlightStyle {
@@ -2368,16 +3296,21 @@ impl Scratch {
 mod tests {
     // By name, not a glob: `use gpui::*` in the parent shadows `#[test]` with
     // GPUI's own attribute macro and every test in here fails to expand.
-    use super::{line_colors, locked, Diff, Layouts, Pan, Row, Rows, TextRows, PAD, TEXT_CHROME};
+    use super::{
+        extent_ink, extent_of, file_header, hunk_header, line_colors, locked, row_background,
+        row_bar, Diff, FileSummary, Layouts, Pan, Row, RowState, Rows, TextRows, PAD, ROW_H,
+        TEXT_CHROME,
+    };
     use gitten_core::font::Font;
     use gitten_core::host::Host;
     use gitten_core::prepared::{prepare, File as PreparedFile};
     use gitten_core::select::{Caret, Selected, Selection};
     use gitten_core::syntax::{Kind, Token};
     use gitten_core::theme::{Style, Surface, Theme};
-    use gitten_core::{parse_unified_diff, LineKind, Span};
+    use gitten_core::{parse_unified_diff, FileDiff, LineKind, Span};
     use gpui::{
         div, rgb, AnyElement, FontStyle, FontWeight, HighlightStyle, IntoElement, ParentElement,
+        ScrollStrategy,
     };
     use std::cell::Cell;
     use std::rc::Rc;
@@ -2416,7 +3349,7 @@ mod tests {
         sel: std::ops::Range<usize>,
     ) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
         let mut sc = super::Scratch::default();
-        super::Scratch::merged(&mut sc, at, tokens, spans, theme, kind, moved, sel).to_vec()
+        super::Scratch::merged(&mut sc, at, tokens, spans, theme, kind, moved, false, sel).to_vec()
     }
 
     fn well_formed(text: &str, runs: &[(std::ops::Range<usize>, HighlightStyle)]) {
@@ -2489,26 +3422,6 @@ mod tests {
     }
 
     #[test]
-    fn many_tokens_and_spans_stay_sorted_and_disjoint() {
-        let theme = Theme::dark();
-        let text = "fn draw(&self) { self.paint(1); } // later";
-        let tokens = vec![
-            tok(0, 2, Kind::Keyword),
-            tok(3, 7, Kind::Func),
-            tok(9, 13, Kind::Keyword),
-            tok(22, 27, Kind::Func),
-            tok(28, 29, Kind::Number),
-            tok(34, 42, Kind::Comment),
-        ];
-        let spans = vec![Span { start: 3, end: 12 }, Span { start: 28, end: 30 }];
-        let out = runs(all(text), &tokens, &spans, &theme, LineKind::Removed, false);
-        well_formed(text, &out);
-        assert!(out
-            .iter()
-            .any(|(r, s)| *r == (28..29) && s.color.is_some() && s.background_color.is_some()));
-    }
-
-    #[test]
     fn multi_byte_text_keeps_its_boundaries() {
         let theme = Theme::dark();
         let text = "let s = \"café 😀\";";
@@ -2572,6 +3485,230 @@ mod tests {
         assert_eq!(
             line_colors(LineKind::Context, true, p),
             line_colors(LineKind::Context, false, p)
+        );
+    }
+
+    #[test]
+    fn the_cursor_bar_beats_every_row_background_in_every_presentation() {
+        // One helper answers for text rows, split cells, headers and markdown
+        // prose alike — this is the assertion that it answers with the bar,
+        // and only with the bar. The regression it holds: ordinary markdown
+        // lines painted their diff background over the cursor because the
+        // decision was written out per presentation and one of them forgot.
+        let theme = Theme::dark();
+        let p = &theme.diff;
+        let kinds = [
+            (LineKind::Context, false),
+            (LineKind::Context, true),
+            (LineKind::Added, false),
+            (LineKind::Added, true),
+            (LineKind::Removed, false),
+            (LineKind::Removed, true),
+        ];
+        for (kind, moved) in kinds {
+            let (base, _, _) = line_colors(kind, moved, p);
+            assert_eq!(
+                row_background(true, base, &theme),
+                theme.chrome.selection_bg,
+                "{kind:?} hid the cursor"
+            );
+            assert_eq!(row_background(false, base, &theme), base);
+        }
+        // The furniture rows the presentations share.
+        assert_eq!(
+            row_background(true, p.file_bg, &theme),
+            theme.chrome.selection_bg
+        );
+        assert_eq!(
+            row_background(true, p.hunk_bg, &theme),
+            theme.chrome.selection_bg
+        );
+        assert_eq!(
+            row_background(true, p.absent_bg, &theme),
+            theme.chrome.selection_bg
+        );
+        assert_eq!(row_background(false, p.file_bg, &theme), p.file_bg);
+        // The bar, and nothing else: accent while the row's pane holds the
+        // keyboard, faint when the selection is remembered and the keyboard is
+        // elsewhere, and the row's own background when the row is not the
+        // cursor's — which is what keeps the text from shifting a pixel.
+        let state = |current: bool, focused: bool| RowState {
+            current,
+            focused,
+            armed: false,
+            in_hunk: false,
+        };
+        assert_eq!(
+            row_bar(state(true, true), p.context_bg, &theme),
+            theme.chrome.accent
+        );
+        assert_eq!(
+            row_bar(state(true, false), p.context_bg, &theme),
+            theme.chrome.faint
+        );
+        assert_eq!(
+            row_bar(state(false, true), p.context_bg, &theme),
+            row_background(false, p.context_bg, &theme)
+        );
+    }
+    #[test]
+    fn every_row_of_the_cursors_hunk_reports_the_extent() {
+        // The keyboard mid-hunk: every row of the hunk it sits in — its
+        // header row, its lines, nothing else — reads in extent. That range
+        // is what the hairline in the gutter marks row by row, and the
+        // answer to "which lines would `space` stage".
+        let host = Rc::new(Host::new());
+        let mut d = Diff::with_layouts(parse_unified_diff(THREE_HUNKS), &host, Layouts::builtin());
+        with_height(&mut d, 20);
+
+        // Unified layout rows: file header at 0; hunk 0 owns its header row
+        // and its four lines (1..=5); hunk 1 its header and three lines
+        // (6..=9). A file header owns no hunk — the keyboard parked there
+        // reports none.
+        let r = d.order[0];
+        let renderers = d.renderers.borrow();
+        assert!(
+            extent_of(&renderers, r.owner, r.index).is_none(),
+            "row 0 is a file header"
+        );
+        drop(renderers);
+
+        // The keyboard onto hunk 0's header row.
+        d.run_view("view.down", &host);
+        let r = d.order[d.view.get().cursor()];
+        let e = extent_of(&d.renderers.borrow(), r.owner, r.index).expect("on a hunk");
+        let rows: Vec<usize> = (0..d.order.len())
+            .filter(|&i| {
+                let r = d.order[i];
+                e.contains(r.owner, r.index)
+            })
+            .collect();
+        assert_eq!(rows, vec![1, 2, 3, 4, 5], "the hunk's rows, and only them");
+        // The boundaries: the file header above is out, and so is the next
+        // hunk's header — and the second file's first hunk is out twice
+        // over, its own hunk number 0 notwithstanding.
+        assert!(!e.contains(r.owner, 0), "row 0 is above the extent");
+        assert!(!e.contains(r.owner, 6), "row 6 is the next hunk's header");
+        let two = d.order[12];
+        assert!(
+            !e.contains(two.owner, two.index),
+            "the second file maps to no extent here"
+        );
+    }
+
+    #[test]
+    fn the_armed_tint_covers_exactly_the_armed_hunk() {
+        // Armed via the discard verb, the way `D` asks: the tint spans the
+        // hunk the second press would spend — its header row through its
+        // last line — and nothing outside it. A move of the keyboard
+        // disarms, as it always has, so the tint cannot outlive the
+        // question it was asked about.
+        let host = Rc::new(Host::new());
+        let mut d = Diff::with_layouts(parse_unified_diff(THREE_HUNKS), &host, Layouts::builtin());
+        with_height(&mut d, 20);
+        // Walk to hunk 1's first changed line — row 6 is its header, 7 is
+        // `delta` — and arm.
+        for _ in 0..7 {
+            d.run_view("view.down", &host);
+        }
+        let id = d.cursor_row_id();
+        assert!(!d.confirm_or_arm_discard_hunk(id), "first press asks");
+        let armed = d.armed_hunk.expect("armed, and waiting");
+        let e = extent_of(&d.renderers.borrow(), armed.0, armed.1)
+            .expect("the armed row is a hunk row");
+        let rows: Vec<usize> = (0..d.order.len())
+            .filter(|&i| {
+                let r = d.order[i];
+                e.contains(r.owner, r.index)
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![6, 7, 8, 9],
+            "the armed hunk's rows, and only them"
+        );
+        d.run_view("view.down", &host);
+        assert!(d.armed_hunk.is_none(), "a cursor move disarms");
+    }
+
+    #[test]
+    fn a_header_row_carries_the_cursor_bar() {
+        // `file_header` and `hunk_header` take the RowState the line rows do
+        // and ask the same `row_bar` for their bar's ink — so the cursor is
+        // one shape parked on a header and parked on a line — and the extent
+        // hairline inside it takes `extent_ink`'s: `diff.rule` when the row
+        // is in the hunk, the header's own background when it is not, and
+        // the bar's ink on the keyboard's row, where the 2px bar wins.
+        let theme = Theme::dark();
+        let p = &theme.diff;
+        let header: std::sync::Arc<str> = std::sync::Arc::from("@@ -1,3 +1,3 @@");
+        let path: std::sync::Arc<str> = std::sync::Arc::from("one.txt");
+        let state = |current: bool, in_hunk: bool| RowState {
+            current,
+            focused: true,
+            armed: false,
+            in_hunk,
+        };
+        // Both headers draw with the keyboard on them — and, one state down,
+        // with the hairline carrying the extent.
+        let _ = hunk_header(&header, &theme, None, state(true, true), 0.0);
+        let _ = file_header(
+            &path,
+            1,
+            2,
+            &theme,
+            &Font::default(),
+            None,
+            state(true, true),
+            0.0,
+        );
+        let _ = hunk_header(&header, &theme, None, state(false, true), 0.0);
+        let _ = file_header(
+            &path,
+            1,
+            2,
+            &theme,
+            &Font::default(),
+            None,
+            state(false, true),
+            0.0,
+        );
+        // The bar's ink is the line rows', whatever the header's own
+        // background: accent on the keyboard's row, and the row's own
+        // background elsewhere.
+        assert_eq!(
+            row_bar(state(true, false), p.hunk_bg, &theme),
+            theme.chrome.accent
+        );
+        assert_eq!(row_bar(state(false, false), p.hunk_bg, &theme), p.hunk_bg);
+        assert_eq!(row_bar(state(false, false), p.file_bg, &theme), p.file_bg);
+        // The hairline's ink: `diff.rule` in the extent, the row's own
+        // background out of it, and the bar's ink on the keyboard's row.
+        assert_eq!(extent_ink(state(false, true), p.hunk_bg, &theme), p.rule);
+        assert_eq!(
+            extent_ink(state(false, false), p.file_bg, &theme),
+            p.file_bg
+        );
+        assert_eq!(
+            extent_ink(state(true, true), p.hunk_bg, &theme),
+            row_bar(state(true, true), p.hunk_bg, &theme)
+        );
+    }
+
+    #[test]
+    fn a_layout_cycle_disarms_before_the_rows_mean_something_else() {
+        // The rows are about to be re-arranged; whatever the question was
+        // armed against may land somewhere else — the same reason a selection
+        // goes, and the same clear every cursor move already does.
+        let host = Rc::new(Host::new());
+        let mut d = Diff::with_layouts(parse_unified_diff(THREE_HUNKS), &host, Layouts::builtin());
+        let id = d.cursor_row_id();
+        assert!(!d.confirm_or_arm_discard_hunk(id), "first press asks");
+        assert!(d.armed_hunk.is_some(), "armed, and waiting");
+        d.apply_layout(1, &host);
+        assert!(
+            d.armed_hunk.is_none(),
+            "the cycle spent nothing: it cleared"
         );
     }
 
@@ -2662,6 +3799,7 @@ mod tests {
             &theme,
             LineKind::Added,
             false,
+            false,
             6..20,
         );
         well_formed(text, out);
@@ -2674,6 +3812,7 @@ mod tests {
                 &spans,
                 &theme,
                 LineKind::Added,
+                false,
                 false,
                 6..20,
             );
@@ -2790,8 +3929,8 @@ diff --git a/a.rs b/a.rs
     fn a_selection_over_three_rows_copies_the_lines_between_them() {
         let host = Host::new();
         let mut diff = Diff::with_layouts(parse_unified_diff(SAMPLE), &host, Layouts::builtin());
-        // Rows: the file header, the hunk header, then three lines.
-        diff.sel = Some(select(&diff, (2, 0), (4, 9)));
+        // Rows: the hunk header, then three lines — one file, so no file header.
+        diff.sel = Some(select(&diff, (1, 0), (3, 9)));
         assert_eq!(
             diff.selection(),
             "fn main() {
@@ -2799,7 +3938,7 @@ diff --git a/a.rs b/a.rs
     let x"
         );
         // The anchor is not the start: the same drag backwards is the same text.
-        diff.sel = Some(select(&diff, (4, 9), (2, 0)));
+        diff.sel = Some(select(&diff, (3, 9), (1, 0)));
         assert_eq!(
             diff.selection(),
             "fn main() {
@@ -2870,7 +4009,8 @@ diff --git a/a.rs b/a.rs
         diff.sel = Selection::all(&diff.order);
         assert_eq!(
             diff.selection(),
-            "a.rs\n@@ -1,2 +1,2 @@\nfn main() {\n    let x = 1;\n    let x = 2;"
+            "@@ -1,2 +1,2 @@\nfn main() {\n    let x = 1;\n    let x = 2;",
+            "one file: the pane header names it, so the body has no file header row"
         );
     }
 
@@ -3376,13 +4516,14 @@ diff --git a/a.rs b/a.rs
             expect += 1;
         }
 
-        // Park on the last line, reflow narrower, and it is still the line at
-        // the top — at a different row number, because rows above it grew.
+        // Park the keyboard on the last line, reflow narrower, and it is still
+        // the line under the **cursor** — at a different row number, because
+        // rows above it grew.
         let last_line = diff.order.last().unwrap().logical();
-        diff.top.set(diff.total() - 1);
+        diff.go_to(diff.total() - 1, &host);
         diff.reflow(width_for(20, &host), &host);
-        assert_eq!(diff.order[diff.top.get()].logical(), last_line);
-        assert_eq!(diff.order[diff.top.get()].seg, 0, "not the top of its line");
+        assert_eq!(diff.order[diff.cursor()].logical(), last_line);
+        assert_eq!(diff.order[diff.cursor()].seg, 0, "not the top of its line");
     }
 
     #[test]
@@ -3459,6 +4600,95 @@ diff --git a/a.rs b/a.rs
         assert!((0..r.len()).all(|i| r.width(i, 0) > 0));
     }
 
+    #[test]
+    fn a_one_file_diff_leaves_its_file_header_out_of_the_order() {
+        // The pane header above the view names the file, so the band inside it
+        // would name it twice. The row is still built — indices do not move —
+        // but the order table skips it, and the hunk header is the first row.
+        let host = Rc::new(Host::new());
+        let diff = Diff::with_renderers(
+            parse_unified_diff(SAMPLE),
+            host,
+            vec![Box::new(TextRows::default())],
+        );
+        let renderers = diff.renderers.borrow();
+        assert_eq!(
+            renderers[0].len(),
+            5,
+            "file header, hunk header, three lines built"
+        );
+        assert_eq!(diff.order.len(), 4, "but the file header is not drawn");
+        assert!(diff
+            .order
+            .iter()
+            .all(|r| !renderers[0].is_file_header(r.index as usize)));
+        let first = diff.order[0];
+        assert_eq!(
+            renderers[0].selectable(first.index as usize, 0),
+            Some("@@ -1,2 +1,2 @@"),
+            "the body opens on the hunk header"
+        );
+    }
+
+    #[test]
+    fn a_one_file_diff_with_no_hunks_keeps_its_only_row() {
+        // Nothing opens below the band, so dropping it would draw an empty pane
+        // for a file that did change — a mode flip, a binary. The header stays
+        // and `file_summary` still has a row to read the name from.
+        let host = Rc::new(Host::new());
+        let diff = Diff::with_renderers(
+            vec![FileDiff {
+                path: "bin.dat".into(),
+                hunks: Vec::new(),
+            }],
+            host,
+            vec![Box::new(TextRows::default())],
+        );
+        assert_eq!(diff.order.len(), 1);
+        assert_eq!(
+            diff.file_summary().map(|s| s.path),
+            Some("bin.dat".to_string())
+        );
+    }
+
+    #[test]
+    fn a_two_file_diff_keeps_both_file_headers() {
+        // With more than one file the band is the separator between them.
+        let host = Rc::new(Host::new());
+        let diff = Diff::with_renderers(
+            parse_unified_diff(TWO_FILES),
+            host,
+            vec![Box::new(TextRows::default())],
+        );
+        let renderers = diff.renderers.borrow();
+        let headers = diff
+            .order
+            .iter()
+            .filter(|r| renderers[0].is_file_header(r.index as usize))
+            .count();
+        assert_eq!(headers, 2);
+        assert_eq!(diff.order.len(), renderers[0].len());
+    }
+
+    #[test]
+    fn a_hunk_header_is_hit_where_the_code_is() {
+        // The `@@` is drawn at the code column, so a click measured from the page
+        // padding would land two gutters early. `x_for` is the code column.
+        let (r, host) = text_rows(SAMPLE);
+        let header = r.selectable(1, 0).expect("the hunk header");
+        assert!(header.starts_with("@@"));
+        for col in [0, 3, 8] {
+            let hit = r.hit(1, 0, x_for(col, &host), &host, 0.0).expect("a hit");
+            assert_eq!((hit.part, hit.off), (0, col), "column {col}");
+        }
+        // The file header still measures from the padding.
+        let hit = r
+            .hit(0, 0, PAD + 0.1 * host.font.char_width(), &host, 0.0)
+            .unwrap();
+        assert_eq!(hit.off, 0);
+        assert_eq!(super::HUNK_INDENT, TEXT_CHROME - PAD);
+    }
+
     /// A specialist: what a Markdown or an image presentation would look like
     /// from the list's side. One row per hunk line, nothing else.
     #[derive(Default)]
@@ -3485,6 +4715,7 @@ diff --git a/a.rs b/a.rs
             _seg: usize,
             _host: &Host,
             _sel: Option<Selected>,
+            _state: RowState,
             _shift: f32,
         ) -> AnyElement {
             div().child(self.rows[index].clone()).into_any_element()
@@ -3592,68 +4823,33 @@ diff --git a/b.md b/b.md
         let mut diff = Diff::with_layouts(parse_unified_diff(SAMPLE), &host, Layouts::builtin());
         diff.apply_layout(1, &host);
         assert_eq!(diff.layout(), "split");
+        let mut view = diff.view.get();
+        view.set_len(diff.total());
+        view.go_to(diff.total().saturating_sub(1));
+        diff.view.set(view);
+        diff.sel = Some(select(&diff, (0, 0), (1, 0)));
+        diff.dragging = true;
+        diff.pan.set_max(100.0);
+        diff.pan.set(50.0);
 
         diff.swap(parse_unified_diff(TWO_FILES), &host);
         assert_eq!(diff.layout(), "split", "the swap reset the presentation");
         assert!(diff.load.contains("2 files"), "{}", diff.load);
         assert!(diff.load.contains("split"), "{}", diff.load);
+        assert!(
+            diff.cursor() < diff.total(),
+            "the old cursor was not clamped"
+        );
+        assert!(diff.sel.is_none(), "old rows kept a stale selection");
+        assert!(!diff.dragging, "replacement kept a stale mouse drag");
 
         // And an empty diff is a swap too — a revspec whose changes vanished.
         diff.swap(Vec::new(), &host);
         assert_eq!(diff.total(), 0);
         assert_eq!(diff.layout(), "split");
-    }
-
-    #[test]
-    fn a_toggle_reuses_the_prepared_diff_and_a_swap_rebuilds_it() {
-        // The cache this view holds must be transparent and correctly
-        // invalidated. Three claims, and a regression in any one is a bug worth
-        // catching: a toggle draws exactly the rows a fresh build at that layout
-        // would (the prepared diff is a pure input to `arrange`); a toggle reuses
-        // the prepared diff rather than re-running the two expensive passes (the
-        // stall this removes); and a swap rebuilds it (a missed invalidation is a
-        // silently-stale diff, which is worse than the stall).
-        let host = Host::new();
-        let mut diff = Diff::with_layouts(parse_unified_diff(TWO_FILES), &host, Layouts::builtin());
-        assert_eq!(diff.layout(), "unified");
-
-        // The Rc a toggle must leave untouched.
-        let prepared = diff.prepared.clone();
-
-        // Toggle, then compare against a diff that only ever built the split
-        // layout: same order table, same widest row, same row count. If the
-        // cache changed the output, these disagree.
-        diff.apply_layout(1, &host);
-        assert_eq!(diff.layout(), "split");
-        let mut split_host = Host::new();
-        split_host.layout = "split".into();
-        let direct = Diff::with_layouts(
-            parse_unified_diff(TWO_FILES),
-            &split_host,
-            Layouts::builtin(),
-        );
-        assert_eq!(direct.layout(), "split");
-        assert_eq!(
-            *diff.order, *direct.order,
-            "the cached toggle drew a different order table than a fresh build"
-        );
-        assert_eq!(diff.widest, direct.widest);
-        assert_eq!(diff.total(), direct.total());
-
-        // The toggle reused the prepared diff: `prepare` builds a fresh `Rc`, so
-        // an unchanged pointer proves the two expensive passes did not re-run.
-        assert!(
-            Rc::ptr_eq(&prepared, &diff.prepared),
-            "a layout toggle re-prepared the diff"
-        );
-
-        // A swap is new `FileDiff`s underneath, so it must rebuild the prepared
-        // diff — a new pointer.
-        diff.swap(parse_unified_diff(SAMPLE), &host);
-        assert!(
-            !Rc::ptr_eq(&prepared, &diff.prepared),
-            "a swap must invalidate the prepared cache"
-        );
+        assert_eq!((diff.cursor(), diff.view.get().top()), (0, 0));
+        assert_eq!(diff.pan.at(), 0.0);
+        assert!(diff.scroll.0.borrow().deferred_scroll_to_item.is_none());
     }
 
     #[test]
@@ -3722,6 +4918,54 @@ diff --git a/b.md b/b.md
     }
 
     #[test]
+    fn a_font_edit_keeps_the_selection_and_the_row() {
+        // A font edit is not a presentation change: same rows, same row count,
+        // only the glyph metrics moved. Unlike `apply_layout`'s other callers,
+        // the selection and the cursor's logical row both still mean something
+        // afterwards, and both should survive.
+        let host = Host::new();
+        let mut diff = Diff::with_layouts(parse_unified_diff(TWO_FILES), &host, Layouts::builtin());
+        diff.reflow(width_for(40, &host), &host);
+
+        diff.sel = Some(select(&diff, (1, 0), (3, 9)));
+        let text = diff.selection();
+        assert!(!text.is_empty());
+
+        // A known row, past the start, so a fall-back to 0 would not
+        // accidentally pass.
+        let mut v = diff.view.get();
+        v.go_to(3);
+        diff.view.set(v);
+        let logical_before = diff.order[diff.view.get().cursor()].logical();
+
+        let mut bigger = Host::new();
+        bigger.font.size = 18.0;
+        diff.reflow(width_for(40, &host), &bigger);
+
+        assert!(diff.sel.is_some(), "a font edit threw the selection away");
+        assert_eq!(
+            diff.selection(),
+            text,
+            "the same bytes, at the same width, under a new font"
+        );
+        // The visual index may legitimately have moved if the new font
+        // changed the column budget; the row it names must not have.
+        let logical_after = diff.order[diff.view.get().cursor()].logical();
+        assert_eq!(
+            logical_after, logical_before,
+            "the cursor landed on a different logical row"
+        );
+
+        // The other half of the rule still holds: an actual presentation
+        // change still drops the selection.
+        diff.apply_layout(1, &host);
+        assert!(
+            diff.sel.is_none(),
+            "a layout change kept a selection anchored to somebody else's rows"
+        );
+    }
+
+    #[test]
     fn the_font_fingerprint_compares_by_value() {
         // What the reflow guard leans on: `Font` derives `PartialEq`, so a
         // value comparison is the whole fingerprint. Each field individually has
@@ -3743,11 +4987,15 @@ diff --git a/b.md b/b.md
     #[test]
     fn cycling_keeps_you_at_the_same_point_in_the_diff() {
         // Exactly is impossible — the two presentations do not have the same
-        // number of rows — so the proportion is what is preserved.
+        // number of rows — so the proportion is what is preserved. The cursor,
+        // which is where a proportion comes from now.
         let host = Host::new();
         let mut diff = Diff::with_layouts(long_diff(), &host, Layouts::builtin());
         let total = diff.total();
-        diff.top.set(total / 2);
+        let mut v = diff.view.get();
+        v.set_len(total);
+        v.go_to(total / 2);
+        diff.view.set(v);
         diff.apply_layout(1, &host);
         let landed = diff.top.get() as f32 / diff.total() as f32;
         assert!(
@@ -3823,6 +5071,7 @@ diff --git a/b.md b/b.md
             _seg: usize,
             _host: &Host,
             _sel: Option<Selected>,
+            _state: RowState,
             _shift: f32,
         ) -> AnyElement {
             div().child(self.rows[index].clone()).into_any_element()
@@ -3901,5 +5150,848 @@ diff --git a/b.md b/b.md
             vec![Box::new(TextRows::default()), Box::new(OneLiner::default())],
         );
         assert!(diff.order.iter().all(|r| r.owner == 0));
+    }
+
+    // ------------------------------------------------------------ navigation
+
+    /// A viewport of `n` visible rows, as the list would report after a frame.
+    fn with_height(diff: &mut Diff, n: usize) {
+        diff.rendered.set(n);
+        let mut v = diff.view.get();
+        v.set_len(diff.order.len());
+        v.set_height(n);
+        diff.view.set(v);
+    }
+
+    #[test]
+    fn navigation_moves_the_cursor_and_the_view_follows_with_a_margin() {
+        let host = Host::new();
+        let mut d = Diff::with_layouts(long_diff(), &host, Layouts::builtin());
+        with_height(&mut d, 20);
+        assert!(d.run_view("view.down", &host));
+        assert!(d.run_view("view.down", &host));
+        assert!(d.run_view("view.down", &host));
+        assert_eq!(d.cursor(), 3);
+        assert_eq!(d.top.get(), 0, "inside the margin, nothing scrolled");
+        // Past the margin the view moves one row, not a screenful.
+        for _ in 0..20 {
+            assert!(d.run_view("view.down", &host));
+        }
+        assert_eq!(d.cursor(), 23);
+        assert!(d.top.get() > 0, "the margin was breached");
+    }
+
+    #[test]
+    fn pages_move_a_screenful_and_top_bottom_reach_both_ends() {
+        let host = Host::new();
+        let mut d = Diff::with_layouts(long_diff(), &host, Layouts::builtin());
+        let total = d.total();
+        with_height(&mut d, 20);
+        assert!(d.run_view("view.page-down", &host));
+        assert_eq!(d.cursor(), 19, "a screenful less one row");
+        assert!(d.run_view("view.page-up", &host));
+        assert_eq!(d.cursor(), 0);
+        assert!(d.run_view("view.bottom", &host));
+        assert_eq!(d.cursor(), total - 1, "clamped to the last row");
+        assert!(d.run_view("view.top", &host));
+        assert_eq!((d.cursor(), d.view.get().top()), (0, 0));
+    }
+
+    #[test]
+    fn navigation_clamps_instead_of_leaving_the_diff() {
+        let host = Host::new();
+        let mut d = Diff::with_layouts(long_diff(), &host, Layouts::builtin());
+        let total = d.total();
+        with_height(&mut d, 20);
+        for _ in 0..5 {
+            assert!(d.run_view("view.up", &host));
+        }
+        assert_eq!(d.cursor(), 0, "clamped at the first row");
+        assert!(total > 10);
+        assert!(d.run_view("view.scroll-down", &host));
+        // A scroll is not a cursor move — but the cursor is dragged to the near
+        // edge rather than left off screen: top row 1 plus the three-row margin.
+        assert_eq!(d.view.get().top(), 1);
+        assert_eq!(d.cursor(), 4);
+    }
+
+    #[test]
+    fn file_jumps_land_on_headers_in_both_directions() {
+        let host = Host::new();
+        let mut d = Diff::with_layouts(parse_unified_diff(TWO_FILES), &host, Layouts::builtin());
+        assert_eq!(d.headers.len(), 2, "two files, two headers");
+        assert!(d.headers.windows(2).all(|w| w[0] < w[1]));
+        assert!(d.run_view("diff.next-file", &host));
+        assert_eq!(d.cursor(), d.headers[1], "skipped to the second header");
+        assert!(d.run_view("diff.next-file", &host));
+        assert_eq!(d.cursor(), d.headers[1], "no third file: it stayed");
+        assert!(d.run_view("diff.prev-file", &host));
+        assert_eq!(d.cursor(), d.headers[0]);
+        assert!(d.run_view("diff.prev-file", &host));
+        assert_eq!(d.cursor(), d.headers[0], "no row above the first header");
+    }
+
+    #[test]
+    fn cycling_layout_and_wrap_are_commands_too() {
+        let host = Host::new();
+        let mut d = Diff::with_layouts(long_diff(), &host, Layouts::builtin());
+        assert!(d.run_view("diff.cycle-layout", &host));
+        assert_eq!(d.layout_index(), 1);
+        assert_eq!(d.layout(), "split");
+        assert!(d.run_view("diff.cycle-layout", &host));
+        assert_eq!(d.layout_index(), 0, "wrapped round");
+        assert!(d.run_view("diff.cycle-wrap", &host));
+        assert_ne!(d.wrap_index(), host.wrap.selected_index(), "moved on");
+    }
+
+    #[test]
+    fn a_command_no_screen_owns_is_reported_not_swallowed() {
+        let mut host = Host::new();
+        let mut d = Diff::with_layouts(long_diff(), &host, Layouts::builtin());
+        with_height(&mut d, 20);
+        // Registered by an extension somewhere else; nothing here answers it.
+        host.commands.register("blame.toggle", "show blame");
+        assert!(!d.run_view("blame.toggle", &host));
+    }
+
+    #[test]
+    fn consecutive_commands_compose_rather_than_resetting_each_other() {
+        // The regression this guards against: reconcile reading the scroll
+        // handle's position and deciding every previous command had not
+        // happened. In a headless view the handle never paints, so its offset
+        // stays where `show` left it.
+        let host = Host::new();
+        let mut d = Diff::with_layouts(long_diff(), &host, Layouts::builtin());
+        with_height(&mut d, 20);
+        for _ in 0..4 {
+            d.run_view("view.down", &host);
+        }
+        assert_eq!(d.cursor(), 4);
+        d.run_view("view.page-down", &host);
+        assert_eq!(d.cursor(), 23, "four rows plus a nineteen-row page");
+        d.run_view("view.down", &host);
+        assert_eq!(d.cursor(), 24, "and one more, not back to zero plus one");
+    }
+
+    #[test]
+    fn a_thumb_drag_is_reconciled_before_anything_reads_the_cursor() {
+        // What `commits.open-diff` and `copy.selection` would otherwise hit: a
+        // scrollbar drag writes the offset and nothing else, so the model's
+        // cursor is wherever the *keys* left it — rows behind the screen. The
+        // drag has to be met before the read.
+        let host = Host::new();
+        let mut d = Diff::with_layouts(long_diff(), &host, Layouts::builtin());
+        with_height(&mut d, 20);
+        d.run_view("view.top", &host);
+        // Ten rows of drag, straight into the handle like a paint pass writes
+        // it: offset −220 px at 22 px a row.
+        d.scroll
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(gpui::point(gpui::px(0.), gpui::px(-220.)));
+        assert_eq!(d.cursor(), 0, "the stale cursor is what the fix is for");
+
+        d.reconcile(&host);
+        let v = d.view.get();
+        assert_eq!(v.top(), 10, "the model caught up with the visible top");
+        // The cursor was dragged along to the near edge — the same rule the
+        // wheel applies — so a command acts on a row actually on screen.
+        assert_eq!(v.cursor(), 13, "top ten plus the three-row margin");
+
+        // Idempotent: meeting the list twice is not moving it twice.
+        d.reconcile(&host);
+        assert_eq!((d.view.get().top(), d.cursor()), (10, 13));
+    }
+
+    #[test]
+    fn a_click_on_a_wrapped_continuation_moves_the_cursor_there() {
+        // Not to the top of the wrapped line: a click is a place, and the bar
+        // belongs under the mouse.
+        let host = Host::new();
+        let mut d = Diff::with_layouts(parse_unified_diff(LONG), &host, Layouts::builtin());
+        d.reflow(width_for(30, &host), &host);
+        let continuation = d
+            .order
+            .iter()
+            .position(|r| r.seg > 0)
+            .expect("a wrapped line produced a continuation row");
+        with_height(&mut d, 20);
+
+        d.click_row(continuation, &host);
+        assert_eq!(
+            d.cursor(),
+            continuation,
+            "the keyboard is on the clicked visual row"
+        );
+        // The model and the list agree about where the viewport now sits.
+        let v = d.view.get();
+        assert!(
+            v.top() <= d.cursor() && d.cursor() < v.top() + 20,
+            "the clicked row is visible"
+        );
+        assert_eq!(
+            d.synced.get(),
+            f32::from(d.scroll.0.borrow().base_handle.offset().y),
+            "the handle and the sync mark disagree"
+        );
+    }
+
+    #[test]
+    fn a_first_click_lands_where_it_pointed_before_any_navigation() {
+        // The regression: `click_row` read the *stored* viewport, and a view
+        // nothing has navigated yet believes it is empty — so `go_to` clamped
+        // every click onto row zero, deep rows included.
+        let host = Host::new();
+        let mut d = Diff::with_layouts(parse_unified_diff(LONG), &host, Layouts::builtin());
+        assert_eq!(d.view.get().len(), 0, "the test means to start fresh");
+        assert!(d.total() > 0, "but the rows themselves exist");
+
+        // No key has moved, no frame has reported a height — and the click is
+        // on the last row there is.
+        let last = d.order.len() - 1;
+        d.click_row(last, &host);
+        assert_eq!(d.cursor(), last, "row zero is not where I clicked");
+
+        // A wrapped continuation, with the stored model again empty — the
+        // state it is in until the first frame fills it.
+        d.reflow(width_for(30, &host), &host);
+        let continuation = d
+            .order
+            .iter()
+            .position(|r| r.seg > 0)
+            .expect("a wrapped continuation to click on");
+        d.view.set(gitten_core::view::Viewport::new());
+        d.click_row(continuation, &host);
+        assert_eq!(d.cursor(), continuation);
+        // And the list was written back to meet the model, so they agree.
+        assert_eq!(
+            d.synced.get(),
+            f32::from(d.scroll.0.borrow().base_handle.offset().y),
+            "the handle and the sync mark disagree"
+        );
+    }
+
+    #[test]
+    fn a_reflow_keeps_the_line_under_the_cursor_not_the_one_at_the_top() {
+        // The regression: anchoring the reflow to the top row moved the
+        // *cursor* to wherever that line landed, silently relocating the thing
+        // everything above — open-diff, copy — acts on. The cursor's own line
+        // is what survives, wherever it sat in the viewport.
+        let host = Host::new();
+        let mut d = Diff::with_layouts(long_diff(), &host, Layouts::builtin());
+        d.reflow(width_for(80, &host), &host);
+        with_height(&mut d, 20);
+        // Read well past the first screen, then leave the top behind: the
+        // cursor must be neither at nor near the top row for this to bite.
+        for _ in 0..3 {
+            d.run_view("view.page-down", &host);
+        }
+        d.run_view("view.up", &host);
+        let cursor_line = d.order[d.cursor()].logical();
+        let top_line = d.order[d.top.get()].logical();
+        assert_ne!(
+            cursor_line, top_line,
+            "the test wants the cursor away from the top"
+        );
+
+        d.reflow(width_for(12, &host), &host);
+        assert_eq!(
+            d.order[d.cursor()].logical(),
+            cursor_line,
+            "the cursor kept its line"
+        );
+        assert_ne!(
+            d.order[d.top.get()].logical(),
+            top_line,
+            "the old top row was not held still while the cursor moved"
+        );
+        let v = d.view.get();
+        assert!(
+            v.top() <= v.cursor() && v.cursor() < v.top() + 20,
+            "and it stayed on screen through the reflow"
+        );
+    }
+
+    #[test]
+    fn a_cursor_preserving_reflow_waits_for_the_new_geometry() {
+        // The other half of a reflow: the rows have been rebuilt but the list
+        // has not laid them out yet, so its own bound still describes the
+        // *wide* shape. `show` clamps against that stale maximum — and a deep
+        // cursor needs more offset than the old shape ever had — then writes
+        // the clamped lie into the sync mark. The position goes through GPUI's
+        // deferred request instead, which the list consumes after measuring
+        // what it now holds.
+        let host = Host::new();
+        let mut d = Diff::with_layouts(long_diff(), &host, Layouts::builtin());
+        d.reflow(width_for(80, &host), &host);
+        with_height(&mut d, 20);
+        let wide_rows = d.total();
+
+        // Read to the very end, so the cursor sits past anything the wide
+        // shape's geometry could name.
+        assert!(d.run_view("view.bottom", &host));
+        let cursor_line = d.order[d.cursor()].logical();
+
+        d.reflow(width_for(12, &host), &host);
+        assert!(
+            d.total() >= wide_rows * 3 / 2,
+            "{} did not materially grow past {wide_rows}",
+            d.total()
+        );
+
+        let v = d.view.get();
+        assert_eq!(
+            d.order[v.cursor()].logical(),
+            cursor_line,
+            "the reflow moved the keyboard"
+        );
+        let request = d
+            .scroll
+            .0
+            .borrow()
+            .deferred_scroll_to_item
+            .expect("the position was not parked for layout");
+        assert!(request.scroll_strict, "exact, not merely visible");
+        assert_eq!(request.strategy, ScrollStrategy::Top);
+        assert_eq!(request.item_index, v.top(), "on the cursor's viewport");
+        // And the parked row is one the OLD geometry had no offset for — the
+        // clamp this test exists to prevent would have pinned it there.
+        let row_h = super::ROW_H;
+        assert!(
+            (v.top() as f32) * row_h > ((wide_rows - 20) as f32) * row_h,
+            "top {} was inside the old bound; nothing would have been clamped",
+            v.top()
+        );
+
+        // Nothing was claimed about pixels the list has not measured: the old
+        // code wrote a clamped offset and its own sync mark over it.
+        assert_eq!(
+            f32::from(d.scroll.0.borrow().base_handle.offset().y),
+            0.0,
+            "an offset was written against the old shape"
+        );
+        assert_eq!(d.synced.get(), 0.0);
+
+        // ...and when a command moves before layout, it replaces the deferred
+        // target instead of clamping immediately against the old geometry.
+        assert!(d.run_view("view.down", &host));
+        let request = d
+            .scroll
+            .0
+            .borrow()
+            .deferred_scroll_to_item
+            .expect("the updated target was not deferred");
+        assert_eq!(request.item_index, d.view.get().top());
+        assert!(request.scroll_strict);
+        assert_eq!(f32::from(d.scroll.0.borrow().base_handle.offset().y), 0.0);
+
+        let before = request.item_index;
+        assert!(d.scroll_pixels(0.25, &host));
+        let request = d
+            .scroll
+            .0
+            .borrow()
+            .deferred_scroll_to_item
+            .expect("the wheel discarded the deferred target");
+        assert_eq!(request.item_index, before, "the strict baseline moved");
+        assert_eq!(d.pending_scroll.0.wheel.get(), 0.25);
+        assert_eq!(f32::from(d.scroll.0.borrow().base_handle.offset().y), 0.0);
+    }
+
+    #[test]
+    fn a_restored_row_inside_the_first_screen_still_moves_the_list() {
+        // Session restore: a view constructed, a saved row handed to it,
+        // nothing laid out. Row 5 of a tall window is inside the initial
+        // viewport, which is precisely where the non-strict strategy declines
+        // to scroll — the list would open at row zero while model, session and
+        // title all claimed 5.
+        let host = Host::new();
+        let d = Diff::with_layouts(long_diff(), &host, Layouts::builtin());
+        d.scroll_to(5, &host);
+
+        let request = d
+            .scroll
+            .0
+            .borrow()
+            .deferred_scroll_to_item
+            .expect("no request was parked");
+        assert_eq!(request.item_index, 5);
+        assert_eq!(request.strategy, ScrollStrategy::Top);
+        assert!(request.scroll_strict, "visible-in-range is exactly the bug");
+        assert_eq!(d.view.get().top(), 5, "and the model says so too");
+    }
+
+    #[test]
+    fn a_restore_this_view_accepted_is_not_reconciled_as_a_drag() {
+        // The acceptance itself is `views::tests`'; this is the wiring — that
+        // the offset lands on *this* view's `synced`, so its `reconcile` reads
+        // the list where the restore left it rather than as a thumb drag, which
+        // would put the key below on the scrolloff margin.
+        let host = Host::new();
+        let mut d = Diff::with_layouts(long_diff(), &host, Layouts::builtin());
+        d.scroll_to(40, &host);
+        d.go_to(40, &host);
+        {
+            let mut state = d.scroll.0.borrow_mut();
+            state.deferred_scroll_to_item = None;
+            state
+                .base_handle
+                .set_offset(gpui::point(gpui::px(0.0), gpui::px(-40.0 * ROW_H)));
+        }
+        crate::views::accept_deferred_scroll(&d.scroll, &d.pending_scroll, &d.synced)
+            .expect("prepaint's offset was not accepted");
+        assert_eq!(d.synced.get(), -40.0 * ROW_H, "this view's own sync marker");
+
+        d.rendered.set(20);
+        assert!(d.run_view("view.down", &host));
+        assert_eq!(d.cursor(), 41);
+    }
+
+    #[test]
+    fn a_wheel_cancels_selection_autoscroll_instead_of_joining_its_request() {
+        let host = Host::new();
+        let mut d = Diff::with_layouts(long_diff(), &host, Layouts::builtin());
+        with_height(&mut d, 20);
+
+        // The headless handle's bounds end at zero, so this parks a non-strict
+        // request below them exactly as a drag beyond the window edge does.
+        d.autoscroll(gpui::point(gpui::px(0.0), gpui::px(44.0)));
+        assert!(d.scroll.0.borrow().deferred_scroll_to_item.is_some());
+        assert!(!d.pending_scroll.is_awaiting());
+
+        // There is no headless scroll bound to move within, but the newer wheel
+        // must still cancel the foreign request and leave no orphaned pixels.
+        assert!(!d.scroll_pixels(-0.25, &host));
+        assert!(d.scroll.0.borrow().deferred_scroll_to_item.is_none());
+        assert_eq!(d.pending_scroll.0.wheel.get(), 0.0);
+    }
+
+    #[test]
+    fn scrolling_by_pixels_is_smooth_and_drags_the_cursor_along() {
+        // With a measured viewport of two rows, three rows of pixels push the
+        // cursor off the bottom — where it lands is `Viewport`'s rule, shared
+        // with the terminal's wheel.
+        let host = Host::new();
+        let mut d = Diff::with_layouts(long_diff(), &host, Layouts::builtin());
+        with_height(&mut d, 2);
+        // Headless, the handle has no bounds and reports nowhere to go.
+        if d.scroll_pixels(-66.0, &host) {
+            assert_eq!(d.view.get().top(), 3, "66 px at 22 px a row");
+        }
+    }
+
+    #[test]
+    fn a_fresh_viewport_restores_a_saved_row_without_preseeding() {
+        // The startup path: a view constructed, a saved row handed to it,
+        // nothing else. `go_to` once clamped against a list the model believed
+        // was empty, so the restore landed on row zero; the viewport has to be
+        // filled in before the position is.
+        let mut host = Host::new();
+        host.view.scrolloff = 5;
+        let d = Diff::with_layouts(long_diff(), &host, Layouts::builtin());
+        assert_eq!(d.view.get().len(), 0, "the test means to start fresh");
+        assert_eq!(d.rendered.get(), 0);
+
+        d.scroll_to(40, &host);
+        d.go_to(40, &host);
+        let v = d.view.get();
+        assert_eq!(v.cursor(), 40, "the keyboard came back where it left off");
+        assert_eq!(v.top(), 40);
+        assert_eq!(v.len(), d.total(), "and against the real list length");
+
+        // When the first height arrives, the view settles with the *file's*
+        // margin above the cursor — not the built-in's three rows.
+        let mut v = d.view.get();
+        v.set_height(30);
+        assert_eq!(
+            (v.cursor(), v.top()),
+            (40, 35),
+            "scrolloff from the file, not the built-in"
+        );
+    }
+
+    #[test]
+    fn key_navigation_uses_the_live_scrolloff() {
+        // `[view] scrolloff` reaches every command, not just construction: two
+        // hosts identical but for the margin start scrolling at different rows.
+        let build = |scrolloff: usize| -> (Diff, Rc<Host>) {
+            let mut h = Host::new();
+            h.view.scrolloff = scrolloff;
+            let host = Rc::new(h);
+            let mut d = Diff::with_layouts(long_diff(), &host, Layouts::builtin());
+            with_height(&mut d, 20);
+            (d, host)
+        };
+        let (mut tight, tight_host) = build(3);
+        let (mut loose, loose_host) = build(8);
+        for _ in 0..16 {
+            tight.run_view("view.down", &tight_host);
+            loose.run_view("view.down", &loose_host);
+        }
+        assert_eq!(tight.cursor(), loose.cursor());
+        assert_eq!(tight.top.get(), 0, "a three-row margin holds at cursor 16");
+        assert!(loose.top.get() > 0, "an eight-row margin scrolled already");
+    }
+
+    #[test]
+    fn the_cursor_row_text_is_what_copy_falls_back_to() {
+        let host = Host::new();
+        let mut d = Diff::with_layouts(parse_unified_diff(TWO_FILES), &host, Layouts::builtin());
+        with_height(&mut d, 10);
+        d.run_view("diff.prev-file", &host); // already at the first header
+                                             // The path as the diff parsed it: `b/` stripped, which is what the row
+                                             // drew and therefore what a copy of it should hold.
+        assert_eq!(d.cursor_text(), "a.rs");
+    }
+
+    // ------------------------------------------------------- hunk staging
+
+    /// Two files, two hunks in the first and one in the second — enough
+    /// addresses to prove the map reads the *keyboard's* hunk, not the first
+    /// one it finds.
+    const THREE_HUNKS: &str = "\
+diff --git a/one.txt b/one.txt
+--- a/one.txt
++++ b/one.txt
+@@ -1,3 +1,3 @@
+ alpha
+-beta
++BETA
+ gamma
+@@ -10,2 +10,2 @@
+ delta
+-epsilon old
++epsilon new
+diff --git a/two.txt b/two.txt
+--- a/two.txt
++++ b/two.txt
+@@ -5,2 +5,2 @@
+ zeta
+-eta old
++eta new
+";
+
+    /// The hunk under logical row `index`, through the same walk the view
+    /// does — owner first, then the implementation's own answer.
+    fn hunk_at_row(d: &Diff, index: usize) -> Option<String> {
+        let r = *d.order.get(index)?;
+        let renderers = d.renderers.borrow();
+        let (path, n) = renderers.get(r.owner as usize)?.hunk_at(r.index as usize)?;
+        Some(format!("{path}#{}", n))
+    }
+
+    #[test]
+    fn every_row_of_a_hunk_answers_with_that_hunk() {
+        let host = Host::new();
+        let d = Diff::with_layouts(parse_unified_diff(THREE_HUNKS), &host, Layouts::builtin());
+
+        // Unified layout rows: file header at 0; hunk 0 owns its header row
+        // and its four lines (1..=5); hunk 1 its header and three lines
+        // (6..=9); the second file starts at 10.
+        assert_eq!(hunk_at_row(&d, 0), None, "a file header is no hunk");
+        assert_eq!(hunk_at_row(&d, 1), Some("one.txt#0".into()));
+        assert_eq!(hunk_at_row(&d, 3), Some("one.txt#0".into()), "mid-hunk");
+        assert_eq!(hunk_at_row(&d, 5), Some("one.txt#0".into()));
+        assert_eq!(hunk_at_row(&d, 6), Some("one.txt#1".into()));
+        assert_eq!(hunk_at_row(&d, 8), Some("one.txt#1".into()));
+        assert_eq!(
+            hunk_at_row(&d, 12),
+            Some("two.txt#0".into()),
+            "the second file maps by its own path"
+        );
+    }
+
+    #[test]
+    fn every_hunk_leaves_a_tick_at_its_start() {
+        let host = Host::new();
+        let d = Diff::with_layouts(parse_unified_diff(THREE_HUNKS), &host, Layouts::builtin());
+
+        // The same rows `hunk_at_row` names: file header at 0; hunk 0 at 1
+        // (header and four lines); hunk 1 at 6 (header and three lines); the
+        // second file's header 10, its hunk 11 (header and three lines) — 15
+        // rows, and a tick where a `scroll_to_item` to each hunk's header
+        // lands the thumb.
+        assert_eq!(d.order.len(), 15);
+        assert_eq!(d.marks.as_ref(), &[1.0 / 15.0, 6.0 / 15.0, 11.0 / 15.0]);
+    }
+
+    #[test]
+    fn an_empty_diff_holds_no_marks() {
+        let host = Host::new();
+        let d = Diff::with_layouts(Vec::new(), &host, Layouts::builtin());
+        assert!(d.marks.is_empty(), "nothing to divide, nothing to mark");
+    }
+
+    #[test]
+    fn the_smallest_hunk_marks_the_top_of_the_track() {
+        // One line replaced: in unified layout the removal and the addition
+        // are two lines, so the hunk is a header and two lines, the order is
+        // three rows — one file with hunks leaves its band out — and the tick
+        // sits at row 0. The division the one-row guard protects is the empty
+        // order's, tested above; a mark itself can only be a fraction of an
+        // order that holds the hunk it came from, so three is the floor.
+        let src = "\
+diff --git a/one.txt b/one.txt
+--- a/one.txt
++++ b/one.txt
+@@ -1 +1 @@
+-alpha
++beta
+";
+        let host = Host::new();
+        let d = Diff::with_layouts(parse_unified_diff(src), &host, Layouts::builtin());
+        assert_eq!(d.order.len(), 3);
+        assert_eq!(d.marks.as_ref(), &[0.0]);
+    }
+
+    #[test]
+    fn marks_follow_the_order_through_a_reflow_and_a_layout_swap() {
+        // The marks are rebuilt exactly where the order is, so a width that
+        // wraps keeps one tick per hunk at its new start — and a layout
+        // change, which renumbers every row, does not leave the old fractions
+        // behind. The count is read from the loaded diff itself, not from the
+        // marks, so a walk that lost or doubled a hunk would fail here; the
+        // reflow is asserted to have moved the rows at all, so a stale cache
+        // would fail the changed-fractions compare.
+        let host = Host::new();
+        let mut d = Diff::with_layouts(parse_unified_diff(THREE_HUNKS), &host, Layouts::builtin());
+        let hunks: usize = d.files.iter().map(|f| f.hunks.len()).sum();
+        assert_eq!(hunks, 3, "the fixture has hunks to mark");
+        assert_eq!(d.marks.len(), hunks);
+        let before = d.marks.as_ref().to_vec();
+
+        // Five columns wraps `epsilon old` and its friends, so hunk 1's and
+        // hunk 2's starts move down and the fractions move with them.
+        d.reflow(width_for(5, &host), &host);
+        assert!(d.order.len() > 15, "the width wrapped something");
+        assert_eq!(d.marks.len(), hunks, "a wrap renumbers, never re-marks");
+        assert!(d.marks.iter().all(|m| (0.0..=1.0).contains(m)));
+        assert!(d.marks.windows(2).all(|w| w[0] < w[1]), "ascending");
+        assert_ne!(d.marks.as_ref(), before.as_slice());
+
+        d.apply_layout(1, &host);
+        assert_eq!(d.layout(), "split");
+        assert_eq!(d.marks.len(), hunks);
+        assert!(d.marks.iter().all(|m| (0.0..=1.0).contains(m)));
+    }
+
+    #[test]
+    fn current_hunk_hands_over_the_loaded_diffs_own_hunk() {
+        let host = Rc::new(Host::new());
+        let mut d = Diff::with_layouts(parse_unified_diff(THREE_HUNKS), &host, Layouts::builtin());
+        with_height(&mut d, 20);
+
+        // Walk down to hunk 1's changed line — row 6 is its header, 7 is
+        // `delta` — and ask what space would act on.
+        for _ in 0..7 {
+            d.run_view("view.down", &host);
+        }
+        let (path, hunk) = d.current_hunk().expect("on a hunk");
+        assert_eq!(path, "one.txt");
+        assert!(hunk.header.starts_with("@@ -10"), "{}", hunk.header);
+        assert_eq!(hunk.lines.len(), 3);
+
+        // Back up onto the second file's header: nothing to act on, said
+        // rather than guessed.
+        for _ in 0..7 {
+            d.run_view("view.up", &host);
+        }
+        assert!(d.current_hunk().is_none(), "row 0 is the first file header");
+    }
+
+    // ---------------------------------------------------------- file summary
+
+    /// Two files, two hunks each, with totals the other file does not share —
+    /// so a summary resolved against the wrong one fails loudly. `one.txt` is
+    /// +2 −2, `two.txt` is +3 −3.
+    const TWO_FILES_TWO_HUNKS: &str = "\
+diff --git a/one.txt b/one.txt
+--- a/one.txt
++++ b/one.txt
+@@ -1,4 +1,4 @@
+ alpha
+-beta
++BETA
+ gamma
+ delta
+@@ -10,4 +10,4 @@
+-epsilon old
+ zeta
++inserted
+ eta
+ theta
+diff --git a/two.txt b/two.txt
+--- a/two.txt
++++ b/two.txt
+@@ -1,3 +1,3 @@
+ one
+-two old
++two new
+ three
+@@ -20,4 +21,4 @@
+ four
+-five old
+-five more old
++five new
++six new
+ seven
+";
+
+    #[test]
+    fn the_summary_names_the_file_and_hunk_the_keyboard_is_in() {
+        let host = Host::new();
+        let mut d = Diff::with_layouts(
+            parse_unified_diff(TWO_FILES_TWO_HUNKS),
+            &host,
+            Layouts::builtin(),
+        );
+        with_height(&mut d, 30);
+
+        // Unified rows: 0 header; hunk 0 owns 1..=6 (header + five lines);
+        // hunk 1 owns 7..=12. Row 8 — eight downs — is inside the *second*
+        // hunk of one.txt.
+        for _ in 0..8 {
+            d.run_view("view.down", &host);
+        }
+        let s: FileSummary = d.file_summary().expect("on a hunk");
+        assert_eq!(s.path, "one.txt");
+        assert_eq!((s.adds, s.dels), (2, 2));
+        assert_eq!((s.hunk, s.hunks), (2, 2));
+
+        // Twenty-one rows down is still two.txt's second hunk, and its totals
+        // are its own: resolve the summary by path and this passes, resolve it
+        // against whichever file comes first and it cannot.
+        for _ in 8..21 {
+            d.run_view("view.down", &host);
+        }
+        let s = d.file_summary().expect("still on a hunk");
+        assert_eq!(s.path, "two.txt");
+        assert_eq!((s.adds, s.dels), (3, 3));
+        assert_eq!((s.hunk, s.hunks), (2, 2));
+    }
+
+    #[test]
+    fn a_header_row_says_hunk_one_unless_the_file_has_none() {
+        let host = Host::new();
+
+        // A fresh view opens on row 0, which is one.txt's header. The file has
+        // hunks, so "first" exists and is 1.
+        let d = Diff::with_layouts(
+            parse_unified_diff(TWO_FILES_TWO_HUNKS),
+            &host,
+            Layouts::builtin(),
+        );
+        let s = d.file_summary().expect("on a header");
+        assert_eq!(s.path, "one.txt");
+        assert_eq!((s.adds, s.dels), (2, 2));
+        assert_eq!((s.hunk, s.hunks), (1, 2));
+
+        // The second file's header answers with the second file's own counts.
+        let mut d = Diff::with_layouts(
+            parse_unified_diff(TWO_FILES_TWO_HUNKS),
+            &host,
+            Layouts::builtin(),
+        );
+        with_height(&mut d, 30);
+        for _ in 0..13 {
+            d.run_view("view.down", &host);
+        }
+        let s = d.file_summary().expect("on the second header");
+        assert_eq!(s.path, "two.txt");
+        assert_eq!((s.adds, s.dels), (3, 3));
+        assert_eq!((s.hunk, s.hunks), (1, 2));
+
+        // A file with no hunks at all has no first to point at: 0, and zeroed
+        // counts. Built by hand because a unified patch with headers and no
+        // hunks is not text the parser owes an opinion about.
+        let d = Diff::with_layouts(
+            vec![FileDiff {
+                path: "bin.dat".into(),
+                hunks: Vec::new(),
+            }],
+            &host,
+            Layouts::builtin(),
+        );
+        let s = d.file_summary().expect("its header is still there");
+        assert_eq!(s.path, "bin.dat");
+        assert_eq!((s.adds, s.dels), (0, 0));
+        assert_eq!((s.hunk, s.hunks), (0, 0));
+    }
+
+    #[test]
+    fn split_answers_the_same_file_from_fewer_rows() {
+        // Collapsing replace pairs onto one row moves every later row; the
+        // summary must come out identical anyway, because it reads the map
+        // each presentation keeps rather than counting rows itself.
+        let mut host = Host::new();
+        host.layout = "split".into();
+        let mut d = Diff::with_layouts(
+            parse_unified_diff(TWO_FILES_TWO_HUNKS),
+            &host,
+            Layouts::builtin(),
+        );
+        with_height(&mut d, 30);
+
+        // The same walk that lands on hunk 1's pair in unified lands on it in
+        // split too — six downs from the top.
+        for _ in 0..6 {
+            d.run_view("view.down", &host);
+        }
+        let s = d.file_summary().expect("on a hunk in split");
+        assert_eq!(s.path, "one.txt");
+        assert_eq!((s.adds, s.dels), (2, 2));
+        assert_eq!((s.hunk, s.hunks), (2, 2));
+    }
+
+    #[test]
+    fn an_empty_diff_has_nothing_to_name() {
+        let host = Host::new();
+        let d = Diff::with_layouts(Vec::new(), &host, Layouts::builtin());
+        assert!(d.file_summary().is_none());
+    }
+
+    #[test]
+    fn split_pairs_a_replace_but_not_the_hunks_address() {
+        // The whole reason the map lives on the trait: split collapses the
+        // beta->BETA replace pair onto one row, so the same hunk is fewer
+        // rows than unified drew — and must still answer with the same hunk.
+        let mut host = Host::new();
+        host.layout = "split".into();
+        let host = Rc::new(host);
+        let mut d = Diff::with_layouts(parse_unified_diff(THREE_HUNKS), &host, Layouts::builtin());
+        with_height(&mut d, 20);
+
+        // Rows: file header 0; hunk 0 = header + [ctx, pair, ctx] = 1..=4;
+        // hunk 1 = header + pair = 5..=6. Walk to the pair of hunk 1.
+        for _ in 0..6 {
+            d.run_view("view.down", &host);
+        }
+        let (path, hunk) = d.current_hunk().expect("on a hunk");
+        assert_eq!(path, "one.txt");
+        assert!(hunk.header.starts_with("@@ -10"), "{}", hunk.header);
+    }
+
+    #[test]
+    fn an_armed_discard_survives_nothing_but_the_same_spot() {
+        let host = Rc::new(Host::new());
+        let mut d = Diff::with_layouts(parse_unified_diff(THREE_HUNKS), &host, Layouts::builtin());
+        with_height(&mut d, 20);
+
+        let id = d.cursor_row_id();
+        assert!(!d.confirm_or_arm_discard_hunk(id), "first press asks");
+        // The keyboard moves — any move disarms before it can lie.
+        d.run_view("view.down", &host);
+        assert!(
+            !d.confirm_or_arm_discard_hunk(id),
+            "the arm died with the cursor move"
+        );
+
+        // Arm here, stay put: the second press spends it, and a third asks
+        // afresh rather than firing twice off one question.
+        let id = d.cursor_row_id();
+        assert!(!d.confirm_or_arm_discard_hunk(id));
+        assert!(d.confirm_or_arm_discard_hunk(id));
+        assert!(!d.confirm_or_arm_discard_hunk(id));
     }
 }

@@ -38,11 +38,11 @@ version.
 ```
 
 Everything on the left had at least two implementations before, or — for
-`command` — none that was shared at all. `web/src/rows.rs` and
-`shell/src/views/diff.rs` have not been migrated onto `core::rows` yet, so the row
-flattening has one canonical implementation and two copies that predate it;
-`runs` and `graph` are canonical everywhere except `gitten-web`; `command` is used
-by this client and not yet by the window. See [Still to do](#still-to-do).
+`command` — none that was shared at all. The window now dispatches through
+`command` and builds its rows from `core::rows`, so both are canonical in every
+client but `gitten-web`, which still flattens its own rows and runs — a browser
+tab is the one place the copies survive, and they are worth *knowing about*
+rather than worth fixing. See [Still to do](#still-to-do).
 
 ## The one thing a `Rows` implementation owns
 
@@ -176,6 +176,12 @@ Nothing in that file decides what a key *does*. The keymap is on `Host`, so
 actually bound because the help panel is a pure function of the registry. See
 [clients.md](clients.md) for the seam.
 
+**Help is a viewport, not a second screen.** It is capped at three quarters of
+the body and 30 rows, grows horizontally to keep descriptions whole, and uses
+the same edge-aligned scrollbar as every pane. While it is open, the shared
+`view.*` commands — `j`/`k`, pages, Home/End and the wheel — move its rows and
+never the covered pane. Closing and reopening starts at the global keys again.
+
 Four things about it are decisions:
 
 **A wheel notch is a key.** `Code::WheelUp` and `Code::WheelDown` are variants of
@@ -185,9 +191,10 @@ the same enum `j` is, so the wheel resolves through the keymap, appears on the
 `core::command` exists to stop three clients each owning. What it runs is
 `view.scroll-down` / `view.scroll-up`, also on `ctrl-e` / `ctrl-y`, because
 moving the *view* is a different verb from moving the cursor and deserved a
-command rather than a flag on `view.down`. Where the pointer was is dropped:
-there is one scrollable thing on screen, and a coordinate nothing can route is
-one that gets routed wrong the day there are panes.
+command rather than a flag on `view.down`. The terminal input keeps the notch's
+cell beside that key: `main.rs` resolves it in the mode of the pane below the
+pointer and sends the resulting view command there. Focus does not move, so the
+keyboard stays on its pane while the pointer scrolls either neighbour.
 
 **A button is not a key**, for the same reason and pointing the other way: a
 position cannot be a line in `gitten.toml`, because a config file cannot hold a
@@ -211,11 +218,11 @@ on purpose.
 
 ## The mouse
 
-A notch is a key and a button is a place, and that split is the whole design —
-see [decisions/0022](decisions/0022-the-mouse-in-a-terminal.md).
+A notch is a configurable key *at a place*, while a button is only a place — see
+[decisions/0022](decisions/0022-the-mouse-in-a-terminal.md).
 
 ```text
-  wheel   ──► Code::WheelUp/Down ──► Keymap ──► "view.scroll-up"   rebindable
+  wheel   ──► key + cell ──► hovered pane's mode ──► Keymap ──► view command
   button  ──► Input::Mouse ──► main: which row of the body ──► a view's method
 ```
 
@@ -232,8 +239,9 @@ because only a presentation knows where its own text starts:
 | whether finishing one copies it | `[mouse] copy_on_select`, read per gesture |
 
 **A click moves the cursor**, so the keyboard carries on from where the pointer
-left off — `enter` on the commit you just clicked, `y` on the line you just
-pointed at. **A drag selects**, and past the top or the bottom of the body it
+left off. In the commit list that immediately replaces the main diff preview;
+Enter only gives that pane the keyboard. **A drag selects**, and past the top or
+the bottom of the body it
 scrolls by the overshoot and keeps going. **Two clicks take a word and three take
 the row**, with `core::select::word_at` deciding what a word is, because a
 terminal and a window must not disagree about `foo(bar,`. Two clicks in the
@@ -289,11 +297,22 @@ one cell, so 714k rows still have something to grab, and there is no bar at all
 on a list that fits. `[view] scrollbar = false` turns it off; `--ascii` draws it
 as `|` and `#`.
 
-**`enter` opens a diff and `esc` comes back**, as a *stack of screens* rather
-than a pane. The acquisition is in `main`, not in the view: a view takes
-already-loaded data and never learns what a repository is, which is the same rule
-the GPUI client follows. A bare revision is "what did this commit change" to
+**The highlighted commit drives the main diff.** Keyboard movement, a click and
+search re-anchoring all replace the preview without moving focus. `enter` gives
+the diff pane the keyboard and `esc` returns to the last list. Acquisition is in
+`main`, not in the view: a view takes already-loaded data and never learns what a
+repository is. A bare revision is "what did this commit change" to
 `gitten_git::pairs`, merges included.
+
+The commit list drives that preview only while it owns focus. A wheel over it
+while branches, files or the diff owns the keyboard may scroll the list under
+the pointer, but it does not acquire or replace a diff. Clicking commits or
+navigating focus back to it makes its current highlighted row live again.
+
+Selection and scroll position are disjoint. A wheel changes only the first row
+drawn, even when that puts the selected commit, branch, file, stash or diff line
+off-screen. The next keyboard move starts from that unchanged selection and
+reveals it again; scrolling can never silently retarget a command.
 
 ## Cost
 
@@ -339,31 +358,15 @@ to. A terminal does the same.
 
 ## Still to do
 
-- **Assembly.** The views are components: `Diff` and `Commits` hold state and
-  expose commands (`down`, `page`, `jump_file`, `cycle_layout`), and neither
-  knows what a keypress is. There is no `main`, no event loop and no keymap —
-  deliberately, because command dispatch and the mode stack belong on `Host` and
-  are not built, and a keymap written in `tui/` is one `cli/` would have to
-  duplicate.
-- **Migrating `shell` and `web` onto `core::rows`.** Both still hold their own
-  row flattening and order table. `shell`'s is the harder one: `TextRows` stores
-  `SharedString` so GPUI is handed a refcount bump rather than a copy per frame,
-  so it wants `Flat` plus a parallel table rather than `Flat` alone.
-- **`web` onto `core::runs`.** `web/src/rows.rs::pieces` is `runs` with the gap
-  handling that `runs` now has. This is a deletion.
+- **Migrating `web` onto `core::rows` and `core::runs`.** The window is on both
+  (its order table is `core::rows::Ordered`, its keymap `core::command`);
+  `web/src/rows.rs` is the one flattening left outside `core`, and its `pieces`
+  is `runs` with the gap handling that `runs` now has. Both are deletions once
+  somebody wants them.
 - **`MarkdownRows`.** `core/examples/paint.rs` already draws the furniture in
   ANSI, so the terminal version is that function and a `Rows` impl — and the
   furniture itself is then a fourth thing to lift into `core`.
-- **`selection_bg` in the shell.** It was added to `ChromePalette` for this
-  client because a hardcoded selection colour is not a seam, and it means the row
-  the keyboard is on. No GPUI view draws *that* yet. The mouse selection is
-  `chrome.selected_bg` and both clients now draw *that* —
-  [decisions/0018](decisions/0018-selection-is-a-model-not-a-text-element.md).
 - **A drag does not autoscroll on a clock.** Holding the pointer outside the body
   scrolls by the overshoot once, per event, and stops when the pointer stops. A
   timer would fix it and a timer is a thing to own; the selection extends past
   the last visible row without one either way.
-- **Panes.** One screen at a time: `enter` on a commit opens its diff *over* the
-  list and `esc` comes back. lazygit puts them side by side, and
-  `Screen::span` is already the shape that would do it — nothing uses it for
-  that yet.

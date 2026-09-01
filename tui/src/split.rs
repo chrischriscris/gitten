@@ -46,7 +46,7 @@ use crate::MIN_WRAP_COLS;
 use gitten_core::align::align;
 use gitten_core::host::Host;
 use gitten_core::prepared::{File, Line};
-use gitten_core::rows::{Entry, Present};
+use gitten_core::rows::{Entry, Hunks, Present};
 use gitten_core::runs::Run;
 use gitten_core::select::Hit;
 use gitten_core::wrap::{Wrap, Wrapped};
@@ -115,6 +115,12 @@ pub struct SplitRows {
     /// Where each file starts, for a jump list. Built here rather than reused
     /// from a `Flat`, because this presentation's rows are pairs and not lines.
     files: Vec<Entry>,
+    /// Which hunk every logical row belongs to. Recorded in [`SplitRows::build`]
+    /// and not inferred from the row list: a pair collapses a removal and its
+    /// addition onto one row, so nothing but this walk knows where a hunk's
+    /// rows begin and end. The address the staging verbs read through
+    /// [`Present::hunk_at`].
+    hunks: Hunks,
     /// The text budget one column got, and the policy it was built with.
     cols: usize,
     wrap: &'static str,
@@ -219,6 +225,7 @@ impl Present for SplitRows {
     }
 
     fn build(&mut self, f: File) {
+        let file = self.files.len();
         self.files.push(Entry {
             path: f.path.clone(),
             adds: f.adds,
@@ -230,7 +237,10 @@ impl Present for SplitRows {
             adds: f.adds,
             dels: f.dels,
         });
-        for h in f.hunks {
+        for (hunk_no, h) in f.hunks.into_iter().enumerate() {
+            // The span opens on this hunk's header row and closes after the
+            // last aligned pair row — the whole of what the hunk drew.
+            let start = self.rows.len();
             self.rows.push(Row::Hunk(h.header));
 
             // The alignment is computed from the kinds alone, *before* the lines
@@ -256,6 +266,8 @@ impl Present for SplitRows {
                     new: new.map(|i| base + i),
                 });
             }
+            self.hunks
+                .record(start, self.rows.len() - start, file, hunk_no);
         }
     }
 
@@ -289,6 +301,10 @@ impl Present for SplitRows {
 
     fn files(&self) -> &[Entry] {
         &self.files
+    }
+
+    fn hunk_at(&self, index: usize) -> Option<(usize, usize)> {
+        self.hunks.at(index)
     }
 }
 
@@ -678,6 +694,31 @@ diff --git a/a.rs b/a.rs
         // Every row using both columns, context included: three of the four.
         assert!(report.starts_with("split 3 paired"), "{report}");
         assert!(report.contains("cols"), "{report}");
+    }
+
+    #[test]
+    fn a_recorded_span_names_the_hunk_a_pair_row_belongs_to() {
+        // The staging verbs read the hunk through this map, and split is the
+        // one presentation whose rows are not the lines: a pair collapses two
+        // of them. Recorded at build, the span covers the header through the
+        // last aligned pair row — which nothing but this walk knows.
+        let h = Harness::new(DIFF, 60, &Word);
+        let mut answers: Vec<Option<(usize, usize)>> = Vec::new();
+        for r in &h.order {
+            let answer = h.owners[0].hunk_at(r.index as usize);
+            match answer {
+                Some((file, hunk)) => {
+                    assert_eq!((file, hunk), (0, 0), "row {:?}", r);
+                    assert_ne!(r.index, 0, "a file header claimed a hunk");
+                }
+                None => assert_eq!(r.index, 0, "a row outside every hunk"),
+            }
+            answers.push(answer);
+        }
+        // The header row and every pair row are inside the span; only the
+        // file header is outside it.
+        assert_eq!(answers[0], None);
+        assert!(answers[1..].iter().all(|a| a.is_some()), "{answers:?}");
     }
 
     #[test]

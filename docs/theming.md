@@ -157,6 +157,17 @@ Three presentations and two frontends ask that question, and a client that
 answered it locally would be resolving a token against a background it is not
 drawn on.
 
+The same machinery now covers the chrome text: `dim` failed the *text* floor on
+the title strip (3.37), the status bar (3.40) and a selected row (2.97) in every
+shipped theme — tuned against `bg` alone — so the strips took the enum and `dim`
+took the table, `theme.dim_on(Surface::Title)` beside `marker_on` and the gutter.
+`quiet` keeps a single argument because it has one floor everywhere it is drawn.
+The difference in kind is pinned, not just implemented: syntax, gutter, marker,
+quiet and dim are *resolved* (lifted at `rebuild`), while `fg`, `accent` and
+`error` are *asserted* raw — the test
+`chrome_text_inks_clear_the_text_floor_where_they_are_drawn` fails a palette
+that ships an ink below the floor on a background it is drawn on.
+
 ## What a hairline is for
 
 Three colours in the palette are never text and never a surface — `chrome.border`,
@@ -164,6 +175,11 @@ Three colours in the palette are never text and never a surface — `chrome.bord
 edge in a dark theme: `chrome.bg`, `title_bg` and `status_bg` are within **1.05:1**
 of each other, which is invisible as a boundary, and pulling them apart far enough
 to see would make the window three competing panels. One pixel reads at any tint.
+
+The deliberate exception is `chrome.raised` (and `keycap`, one step above it):
+a chip, a pill or the focused pane's header band is furniture *on* a surface,
+not a region of the window, so it alone takes a visible step — ~1.3:1, enough
+to see and not enough to read as a panel.
 
 `diff.rule` is separate from `gutter_fg` for the reason every split field in here
 is separate: that colour has to clear a *text* floor against five row backgrounds,
@@ -218,12 +234,12 @@ shell files before this existed.
 | group | fields |
 |---|---|
 | `diff` | `file_bg` `file_fg` `adds_fg` `dels_fg` `hunk_bg` `hunk_fg` `gutter_fg` `rule` `context_bg` `context_fg` `added_bg` `added_fg` `added_word_bg` `removed_bg` `removed_fg` `removed_word_bg` `moved_removed_bg` `moved_added_bg` `absent_bg` |
-| `markdown` | `code_bar` `quote_bar` `marker` `rule` (also the table grid) |
-| `chrome` | `bg` `fg` `dim` `faint` `accent` `title_bg` `status_bg` `border` `selection_bg` (the row the keyboard is on) `selected_bg` (the text the mouse is holding) `error` |
+| `markdown` | `code_bar` `quote_bar` `marker` (resolved per surface) `rule` (also the table grid) |
+| `chrome` | `bg` `fg` `dim` `faint` `accent` `title_bg` `status_bg` `border` `raised` (chip fills, the focused header band) `keycap` (the key face on it) `selection_bg` (the row the keyboard is on) `selected_bg` (the text the mouse is holding) `error` |
 | graph | `lanes` `lane_overflow` |
 | commits | `authors` |
-| syntax | 12 `Style`s, resolved across 8 surfaces |
-| furniture | `gutter_fg`, resolved across the same 8 |
+| syntax | 12 `Style`s, resolved across 11 surfaces |
+| furniture | `gutter_fg` `marker` `dim`, resolved across the same 11 |
 
 One colour never means two things, which is why the list is long: `file_bg` and
 `title_bg` were the same value, and a theme cannot retune a file header without

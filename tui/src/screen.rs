@@ -70,6 +70,15 @@ pub struct Ink {
     /// changed. Here because a terminal has few other ways to mark a span, and
     /// an extension drawing into a row is entitled to one.
     pub underline: bool,
+    /// The colour of that underline, when it should not be the terminal's own.
+    ///
+    /// `None` keeps the plain SGR 4 everything else uses; `Some` adds SGR 58
+    /// beside it, and a terminal that does not know 58 colours the underline
+    /// with its default and simply ignores the sequence — the boundary stays
+    /// visible either way. This is what a hairline *between* two rows of a
+    /// table becomes here, because a terminal cannot paint between two rows
+    /// and a row of `─` would be a row of the list no line of the file produced.
+    pub underline_color: Option<Rgb>,
 }
 
 impl Ink {
@@ -80,6 +89,7 @@ impl Ink {
             bold: false,
             italic: false,
             underline: false,
+            underline_color: None,
         }
     }
 
@@ -93,6 +103,7 @@ impl Ink {
             bold: style.bold,
             italic: style.italic,
             underline: false,
+            underline_color: None,
         }
     }
 
@@ -103,6 +114,15 @@ impl Ink {
 
     pub const fn underline(mut self) -> Self {
         self.underline = true;
+        self
+    }
+
+    /// An underline in `colour` rather than the terminal's default. The
+    /// Ink-level way to ask for what [`Pen::underline`] writes onto cells that
+    /// are already there.
+    pub const fn underlined(mut self, colour: Rgb) -> Self {
+        self.underline = true;
+        self.underline_color = Some(colour);
         self
     }
 
@@ -359,6 +379,7 @@ impl Screen {
         cell.ink.bold = false;
         cell.ink.italic = false;
         cell.ink.underline = false;
+        cell.ink.underline_color = None;
     }
 
     /// The ink of one cell, for a test that cares about colour rather than text.
@@ -394,6 +415,13 @@ fn sgr(out: &mut impl Write, ink: Ink) -> io::Result<()> {
     }
     if ink.underline {
         out.write_all(b";4")?;
+        // SGR 58, the underline colour: a terminal without it ignores the
+        // sequence and draws the plain SGR 4 underline in its own colour, so
+        // the boundary stays visible either way.
+        if let Some(c) = ink.underline_color {
+            let (r, g, b) = (c >> 16 & 0xff, c >> 8 & 0xff, c & 0xff);
+            write!(out, ";58;2;{r};{g};{b}")?;
+        }
     }
     out.write_all(b"m")
 }
@@ -484,6 +512,30 @@ impl Pen<'_> {
     pub fn wash(&mut self, ink: Ink) {
         let room = self.room();
         self.fill(room, ' ', ink);
+    }
+
+    /// Underlines the cells from column `from` for `cols` columns, in
+    /// `colour`, leaving every character and every background exactly as they
+    /// were written.
+    ///
+    /// The terminal's stand-in for the window's 1px table hairline: a terminal
+    /// cannot paint between two rows of a grid, and drawing the boundary as a
+    /// row of `─` would invent a visual row no line of the file produced — a
+    /// row the gutter's numbers have to skip. So the boundary is drawn on the
+    /// cells the grid itself occupies, under its last visual segment: the
+    /// glyphs and the colours stay, and the underline says a boundary is here.
+    /// A wide character's continuation cell is underlined with its lead, as
+    /// the glyph's own underline would be; cells past the row's end are
+    /// clipped, and the cells already written are not touched beyond the two
+    /// underline fields.
+    pub fn underline(&mut self, from: usize, cols: usize, colour: Rgb) {
+        let len = self.cells.len();
+        let from = from.min(len);
+        let to = from.saturating_add(cols).min(len);
+        for cell in &mut self.cells[from..to] {
+            cell.ink.underline = true;
+            cell.ink.underline_color = Some(colour);
+        }
     }
 
     /// Writes as much of `s` as fits, and returns the columns it took.
@@ -796,6 +848,7 @@ mod tests {
             bold: true,
             italic: true,
             underline: true,
+            underline_color: None,
         };
         s.row(0).put("x", ink);
         let out = flushed(&mut s);
@@ -803,6 +856,62 @@ mod tests {
             out.contains("\x1b[0;38;2;255;0;0;48;2;0;255;0;1;3;4m"),
             "{out:?}"
         );
+    }
+
+    #[test]
+    fn a_coloured_bottom_rule_preserves_cells_and_sgr_state() {
+        // The table hairline's whole trick: the boundary is drawn *on* the cells
+        // the grid already occupies — no character changes, no background
+        // changes, and the next run of cells after it is completely untouched.
+        let mut s = screen(20, 1);
+        let rule = 0xabcdef;
+        {
+            let mut pen = s.row(0);
+            pen.put("grid cells", Ink::new(FG, BG));
+            pen.underline(0, 10, rule);
+            pen.put("plain text", Ink::new(FG, 0x112233));
+        }
+        // The characters and the backgrounds are what they were.
+        assert_eq!(s.row_text(0), "grid cellsplain text");
+        assert_eq!(s.ink(0, 0).unwrap().bg, BG);
+        assert_eq!(s.ink(9, 0).unwrap().bg, BG);
+        // The rule is on the cells it covers and nowhere else.
+        for x in 0..10 {
+            let ink = s.ink(x, 0).unwrap();
+            assert!(ink.underline, "cell {x} missed the rule");
+            assert_eq!(ink.underline_color, Some(rule));
+        }
+        for x in 10..20 {
+            let ink = s.ink(x, 0).unwrap();
+            assert!(!ink.underline, "the rule bled into cell {x}");
+            assert_eq!(ink.underline_color, None);
+        }
+
+        // On the wire: reset first, then the underline and its colour on the
+        // ruled run; the run after it starts from the reset again, so nothing
+        // bleeds.
+        let out = flushed(&mut s);
+        let ruled = "\x1b[0;38;2;232;227;220;48;2;14;13;12;4;58;2;171;205;239m";
+        assert!(out.contains(ruled), "{out:?}");
+        let after = out.split(ruled).nth(1).expect("the run after the rule");
+        assert!(
+            after.contains("\x1b[0;38;2;"),
+            "the next run did not reset: {after:?}"
+        );
+        assert!(!after.contains("58;2;"), "the colour bled: {after:?}");
+        assert!(out.ends_with("\x1b[0m\x1b[?2026l"), "{out:?}");
+    }
+
+    #[test]
+    fn a_plain_underline_still_carries_no_colour() {
+        // The pre-existing SGR 4 semantics are untouched: no 58 beside it when
+        // no colour was asked for, and `underlined` is the only way in.
+        let mut s = screen(4, 2);
+        s.row(0).put("x", Ink::new(FG, BG).underline());
+        s.row(1).put("y", Ink::new(FG, BG).underlined(0xabcdef));
+        let out = flushed(&mut s);
+        assert!(out.contains(";4m"), "{out:?}");
+        assert!(out.contains(";4;58;2;171;205;239m"), "{out:?}");
     }
 
     #[test]

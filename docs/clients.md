@@ -26,7 +26,7 @@ reimplement.
 ```
    gitten-core   the pipeline. no dependencies, no I/O, no idea a UI exists
    gitten-git    acquisition. the only crate that talks to a repository
-   gitten-app    gitten.toml, the command line, loading
+   gitten-app    gitten.toml, the command line, loading, background jobs
    ──────────────────────────────────────────────────────────────────────
    a client     drawing, and input
 ```
@@ -116,7 +116,8 @@ So a client writes exactly two input-shaped things:
 
 1. **A translation** from its platform's event to `command::Key`. In `gitten-tui`
    that is `term.rs`, forty lines, and it is the only file in the crate that
-   imports `crossterm`.
+   imports `crossterm`; in the window it is `dispatch.rs`, whose whole job is
+   GPUI's keystroke spelling.
 2. **A `match` on command names.** `"view.down" => self.down()`. A name it does
    not handle is a key that does nothing, which is what an unbound key does too —
    so a browser tab ignoring `quit` is not a hole.
@@ -129,8 +130,10 @@ are variants of the enum `j` is, so a notch resolves to `view.scroll-down` the
 way a keypress resolves to `view.down` — rebindable, on the help screen, and the
 same name in all three clients. Kept out of `Code`, it would have been a `match`
 in each client deciding that the wheel scrolls: three keymaps nobody could
-configure, which is the exact thing this module exists to prevent. A mouse
-*position* is not a key and is not here; it belongs to whatever was clicked, and
+configure, which is the exact thing this module exists to prevent. A wheel's
+platform position can travel beside that key so a client with panes chooses the
+recipient after resolving the binding. A mouse *position* is not itself a key
+and is not here; it belongs to whatever was pointed at, and
 `gitten-tui/src/main.rs` is what a client routing one looks like.
 
 ### What `Keymap` will not do
@@ -206,11 +209,6 @@ notice a panic in a presentation.
 
 ## Not there yet
 
-- **`gitten-shell` does not read `[keys]`.** `core::command` is built and the
-  terminal dispatches through it; the window still binds `s`, `w`, `cmd-c`,
-  `cmd-a` and `escape` with `KeyBinding::new`. Porting it is a `match` on a
-  command name — the same one `gitten-tui/src/main.rs` has. `copy.selection`,
-  `select.all` and `select.none` are registered commands already, waiting for it.
 - **`gitten-web` has no selection of its own**, and does not need one: a browser
   selects text for free. The window and the terminal both drive `core::select`,
   and the terminal's half of it turned out to be exactly what this entry
@@ -219,10 +217,10 @@ notice a panic in a presentation.
 - **`gitten-web` has no input at all**, so the keymap reaches it only once the
   browser sends keypresses to an endpoint. It has `j`/`k`/`g`/`G` in its own
   script, which is exactly the duplication `core::command` exists to end.
-- **`shell` and `web` still hold their own row flattening.** `core::rows` is the
-  canonical one and `gitten-tui` uses it; the other two predate it. `shell`'s is
-  the harder migration, because `TextRows` stores `SharedString` so GPUI is
-  handed a refcount bump rather than a copy per frame.
+- **`gitten-web` still holds its own row flattening**, and its own copy of
+  `runs`. `core::rows` is canonical everywhere else — the terminal uses it,
+  and the window migrated onto it (`Ordered` plus `RowRef`, so GPUI keeps its
+  refcount-bumped strings and the order table is shared).
 - **Extension loading.** Every seam takes an implementation, and `Host` is
   reachable from a client's `main`, but nothing loads one from outside the
   binary. Today "an extension" means code compiled in — see

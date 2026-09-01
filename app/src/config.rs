@@ -98,6 +98,7 @@ rgb_fields! {
         "faint" = chrome.faint, "accent" = chrome.accent,
         "title_bg" = chrome.title_bg, "status_bg" = chrome.status_bg,
         "border" = chrome.border,
+        "raised" = chrome.raised, "keycap" = chrome.keycap,
         "selection_bg" = chrome.selection_bg,
         "selected_bg" = chrome.selected_bg, "error" = chrome.error;
     "diff":
@@ -273,6 +274,19 @@ fn apply_view(host: &mut Host, value: &toml::Value, warn: &mut Vec<String>) {
             "scrollbar" => match v.as_bool() {
                 Some(on) => host.view.scrollbar = on,
                 None => warn.push("config: view.scrollbar must be true or false".into()),
+            },
+            // A share of the window's width, not a pixel count: the window
+            // has no size the file can name. Out of the band is refused and
+            // named, the way every knob here answers a bad value — a silent
+            // clamp would hide a typo behind a number nobody chose.
+            "sidebar" => match v.as_float().map(|s| s as f32) {
+                Some(s)
+                    if (gitten_core::host::SIDEBAR_MIN..=gitten_core::host::SIDEBAR_MAX)
+                        .contains(&s) =>
+                {
+                    host.sidebar_share = s
+                }
+                _ => warn.push("config: view.sidebar must be between 0.20 and 0.50".into()),
             },
             _ => warn.push(format!("config: unknown key view.{key}")),
         }
@@ -749,13 +763,16 @@ pub fn dump(host: &Host) -> String {
     out.push_str("# `ctrl-e`/`ctrl-y` — one, because a terminal already reports the wheel once\n");
     out.push_str("# per line of however fast the platform says you scrolled. `scrolloff` is the\n");
     out.push_str("# lead the cursor keeps at the edge, and 0 lets it reach the last row.\n");
+    out.push_str("# `sidebar` is the left stack's slice of the window's width; the divider\n");
+    out.push_str("# drag adjusts it for the session, and the file is never written back.\n");
     out.push_str(
         "# `scrollbar` draws one beside a list too long to fit, and nothing when it fits.\n",
     );
     out.push_str("[view]\n");
     out.push_str(&format!("scroll = {}\n", host.view.rows));
     out.push_str(&format!("scrolloff = {}\n", host.view.scrolloff));
-    out.push_str(&format!("scrollbar = {}\n\n", host.view.scrollbar));
+    out.push_str(&format!("scrollbar = {}\n", host.view.scrollbar));
+    out.push_str(&format!("sidebar = {}\n\n", host.sidebar_share));
 
     out.push_str("# In the terminal, finishing a drag puts it on the clipboard, the way that\n");
     out.push_str("# terminal's own selection would — gitten took the drag, so it owes you the\n");
@@ -1449,6 +1466,7 @@ mod tests {
         original.view.rows = 4;
         original.view.scrolloff = 0;
         original.view.scrollbar = false;
+        original.sidebar_share = 0.44;
         original.mouse.copy_on_select = false;
         original.theme.rebuild();
 
@@ -1482,6 +1500,7 @@ mod tests {
         assert_eq!(restored.view.rows, 4, "view.scroll did not survive");
         assert_eq!(restored.view.scrolloff, 0, "view.scrolloff did not survive");
         assert!(!restored.view.scrollbar, "view.scrollbar did not survive");
+        assert_eq!(restored.sidebar_share, 0.44, "view.sidebar did not survive");
         assert!(
             !restored.mouse.copy_on_select,
             "mouse.copy_on_select did not survive"
@@ -1505,6 +1524,19 @@ mod tests {
         assert!(!h.view.scrollbar);
         let warn = apply(&mut h, "[view]\nscrollbar = 3\n");
         assert!(warn[0].contains("view.scrollbar"), "{warn:?}");
+        assert!(apply(&mut h, "[view]\nsidebar = 0.4\n").is_empty());
+        assert_eq!(h.sidebar_share, 0.4);
+        // A share out of the band is refused and named, not silently clamped
+        // into a number nobody chose.
+        let warn = apply(&mut h, "[view]\nsidebar = 0.9\n");
+        assert_eq!(warn.len(), 1, "{warn:?}");
+        assert!(warn[0].contains("view.sidebar"), "{warn:?}");
+        assert_eq!(
+            h.sidebar_share, 0.4,
+            "a rejected value left the old one alone"
+        );
+        let warn = apply(&mut h, "[view]\nsidebar = \"wide\"\n");
+        assert!(warn[0].contains("view.sidebar"), "{warn:?}");
         assert!(apply(&mut h, "[mouse]\ncopy_on_select = false\n").is_empty());
         assert!(!h.mouse.copy_on_select);
         let warn = apply(&mut h, "[mouse]\ncopy_on_select = \"yes\"\n");

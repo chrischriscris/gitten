@@ -23,12 +23,9 @@
 //! # And why scrolling is not the same verb
 //!
 //! [`Viewport::scroll_by`] moves `top` directly and drags the *cursor* along
-//! only as far as it must. That is the wheel, and a wheel that moved the
-//! selection would be a mouse editing your place in the file. What it must not
-//! do is leave the cursor off screen: everything above still anchors to it, so a
-//! resize would yank the view back to a row scrolled past minutes ago. So the
-//! cursor is pushed to the near edge and stops there — vim's behaviour, arrived
-//! at from the same constraint.
+//! only as far as it must. [`Viewport::pan_by`] is the deliberately disjoint
+//! alternative: it changes visibility and never selection. A client chooses
+//! between those contracts rather than reimplementing either arithmetic.
 
 use std::ops::Range;
 
@@ -85,8 +82,9 @@ impl Default for Scrolling {
 ///
 /// Holds no rows: `len` is all it knows about them, because a viewport over a
 /// commit list and one over a wrapped diff differ in nothing else. Every method
-/// leaves both positions valid — clamped into the list and into each other — so
-/// there is no order to call them in and no state to repair afterwards.
+/// leaves both positions valid — clamped into the list and, except for an
+/// explicit [`Viewport::pan_by`], into each other — so there is no state to
+/// repair afterwards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Viewport {
     len: usize,
@@ -125,6 +123,9 @@ impl Viewport {
 
     /// How many rows are drawn at once.
     pub fn set_height(&mut self, height: usize) {
+        if self.height == height {
+            return;
+        }
         self.height = height;
         self.follow();
     }
@@ -225,6 +226,33 @@ impl Viewport {
         self.follow();
     }
 
+    /// Moves the cursor off a row that cannot hold it — a section heading, a
+    /// separator — and onto the nearest row `selectable` says can, continuing
+    /// in the direction the cursor was travelling from `from` and turning back
+    /// only when that direction has nothing left. So `j` from the last file of
+    /// one section lands on the first file of the next, `k` the reverse, and
+    /// `G` onto a trailing heading walks back up to the last real row rather
+    /// than stopping on furniture.
+    ///
+    /// Here and not in a view because every list with headings has this rule
+    /// and the predicate is the only part that differs. A list with no such
+    /// rows never calls it; a list of nothing but unselectable rows is left
+    /// where it was, which is the one honest answer when no row qualifies.
+    pub fn settle(&mut self, from: usize, selectable: impl Fn(usize) -> bool) {
+        if self.len == 0 || selectable(self.cursor) {
+            return;
+        }
+        let below = (self.cursor + 1..self.len).find(|&i| selectable(i));
+        let above = (0..self.cursor).rev().find(|&i| selectable(i));
+        let target = match self.cursor >= from {
+            true => below.or(above),
+            false => above.or(below),
+        };
+        if let Some(row) = target {
+            self.go_to(row);
+        }
+    }
+
     /// Puts the cursor at the row nearest `at` of the way down the list.
     ///
     /// Rounds *down* and clamps, so `1.0` is the last row rather than one past
@@ -237,10 +265,7 @@ impl Viewport {
 
     /// Scrolls the view `by` rows without treating it as a cursor move.
     ///
-    /// The cursor comes along only when it would otherwise leave the screen, and
-    /// stops at the same margin [`follow`](Self::follow) keeps — except at the
-    /// ends of the list, where there is nothing beyond the edge to preview and
-    /// the margin would just make the first and last rows unreachable.
+    /// The cursor comes along only when it would otherwise leave the screen.
     pub fn scroll_by(&mut self, by: isize) {
         let to = match by.is_negative() {
             true => self.top.saturating_sub(by.unsigned_abs()),
@@ -268,9 +293,20 @@ impl Viewport {
             true => last,
             false => (self.top + self.height.saturating_sub(1)).saturating_sub(pad),
         };
-        // `low` first, so a viewport shorter than twice the margin cannot invert
-        // the two and panic in `clamp`.
         self.cursor = self.cursor.clamp(low.min(high), high.max(low)).min(last);
+    }
+
+    /// Pans the visible rows by `by` without changing the selected row.
+    ///
+    /// This is the terminal wheel's contract: the pointer may inspect any pane
+    /// while the keyboard selection remains exactly where it was. A later
+    /// cursor move calls [`follow`](Self::follow) and reveals that selection.
+    pub fn pan_by(&mut self, by: isize) {
+        let top = match by.is_negative() {
+            true => self.top.saturating_sub(by.unsigned_abs()),
+            false => self.top.saturating_add(by as usize),
+        };
+        self.top = top.min(self.max_top());
     }
 
     // ----------------------------------------------------------- the scrollbar
@@ -387,6 +423,47 @@ mod tests {
     }
 
     #[test]
+    fn settle_skips_unselectable_rows_in_the_direction_of_travel() {
+        // Rows 0 and 3 are headings; 1, 2, 4, 5 are files.
+        let heading = |i: usize| i == 0 || i == 3;
+        let file = move |i: usize| !heading(i);
+        let mut v = view(6, 10);
+        v.settle(0, file);
+        assert_eq!(v.cursor(), 1, "a list opens on its first real row");
+        v.down();
+        v.settle(1, file);
+        assert_eq!(v.cursor(), 2);
+        v.down();
+        v.settle(2, file);
+        assert_eq!(v.cursor(), 4, "down over a heading lands past it");
+        v.up();
+        v.settle(4, file);
+        assert_eq!(v.cursor(), 2, "up over a heading lands before it");
+    }
+
+    #[test]
+    fn settle_turns_back_at_the_ends_and_leaves_a_list_of_nothing_alone() {
+        // A trailing heading at row 5: `G` lands on it and must walk back.
+        let file = |i: usize| i != 0 && i != 5;
+        let mut v = view(6, 10);
+        v.to_bottom();
+        v.settle(1, file);
+        assert_eq!(v.cursor(), 4);
+        // `gg` onto the leading heading walks forward.
+        v.to_top();
+        v.settle(4, file);
+        assert_eq!(v.cursor(), 1);
+        // Nothing selectable: stay put rather than invent a row.
+        let mut v = view(3, 10);
+        v.go_to(2);
+        v.settle(0, |_| false);
+        assert_eq!(v.cursor(), 2);
+        let mut empty = view(0, 10);
+        empty.settle(0, |_| true);
+        assert_eq!(empty.cursor(), 0);
+    }
+
+    #[test]
     fn the_cursor_clamps_rather_than_wrapping_at_both_ends() {
         let mut v = view(100, 20);
         v.up();
@@ -454,13 +531,28 @@ mod tests {
     fn a_scroll_drags_the_cursor_rather_than_leaving_it_off_screen() {
         let mut v = view(100, 20);
         v.go_to(50);
-        // Far enough that the cursor cannot stay: it lands on the margin.
         v.scroll_by(30);
         assert_eq!(v.top(), 64);
         assert_eq!(v.cursor(), 67, "the top row plus the margin");
         v.scroll_by(-60);
         assert_eq!(v.top(), 4);
         assert_eq!(v.cursor(), 20, "the bottom row less the margin");
+    }
+
+    #[test]
+    fn a_pan_never_changes_the_cursor_even_when_it_leaves_the_screen() {
+        let mut v = view(100, 20);
+        v.go_to(50);
+        v.pan_by(30);
+        assert_eq!((v.cursor(), v.top()), (50, 64));
+        v.set_height(20);
+        assert_eq!(
+            (v.cursor(), v.top()),
+            (50, 64),
+            "an unchanged layout snapped the pan back to selection"
+        );
+        v.pan_by(-60);
+        assert_eq!((v.cursor(), v.top()), (50, 4));
     }
 
     #[test]
@@ -479,8 +571,7 @@ mod tests {
         let mut v = view(100, 20);
         v.to_bottom();
         assert_eq!((v.top(), v.cursor()), (80, 99));
-        // Scrolling into the end it is already at moves nothing: a margin here
-        // would drag the cursor *off* the last row for no reason.
+        // Scrolling into the end it is already at moves nothing.
         v.scroll_by(5);
         assert_eq!((v.top(), v.cursor()), (80, 99));
     }

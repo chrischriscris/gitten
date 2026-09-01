@@ -1,15 +1,25 @@
 # Everything that can be checked without opening a window — the CI half of
-# ./check.sh. Two jobs, deliberately small:
+# ./check.sh. Five jobs:
 #
-#   test  — the correctness section of check.sh verbatim. Every one of these
-#           crates is headless by design: core has no dependencies at all,
-#           web's tests are payloads and row indexes, tui's screen is a cell
-#           buffer. Ubuntu because it is cheap, and green here doubles as the
-#           Linux canary for every crate but the window.
-#   lint  — formatting and clippy, the same two commands ./.githooks/pre-commit
-#           runs before a commit exists. Clippy type-checks the whole
-#           workspace, so this is also the Linux canary that the old plain
-#           `cargo check` job provided; see decision 0025.
+#   test       — the correctness section of check.sh verbatim. Every one of
+#                these crates is headless by design: core has no dependencies
+#                at all, git's fixtures are throwaway repositories, web's
+#                tests are payloads and row indexes, tui's screen is a cell
+#                buffer. Ubuntu because it is cheap, and green here doubles as
+#                the Linux canary for every crate but the window.
+#   lint       — formatting and clippy, the same two commands
+#                ./.githooks/pre-commit runs before a commit exists. Clippy
+#                type-checks the whole workspace, so this is also the Linux
+#                canary that the old plain `cargo check` job provided; see
+#                decision 0025.
+#   test-shell — the desktop crate's tests, the largest tested surface in the
+#                repo and the only one that needs the GPUI Linux headers.
+#   diffcheck  — the differs against git's own answer, on this repository's
+#                own history — the differs-vs-git section of check.sh, gated
+#                the same way the rest of it is. Needs the full clone `test`
+#                deliberately avoids.
+#   audit      — RUSTSEC advisories against the locked tree. Advisory, not a
+#                gate; see the job below for why.
 #
 name: check
 
@@ -58,6 +68,19 @@ jobs:
       - run: >-
           cargo test -q --locked
           -p gitten-core -p gitten-app -p gitten-git -p gitten-web -p gitten-tui
+
+  diffcheck:
+    runs-on: ubuntu-latest
+    steps:
+      # Diffcheck diffs real history: HEAD~4..HEAD and the whole history from
+      # the root commit, so it needs the full clone the test job deliberately
+      # avoids.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run -q --locked -p gitten-git --example diffcheck --release . HEAD~4..HEAD
+      - run: cargo run -q --locked -p gitten-git --example diffcheck --release . "$(git rev-list --max-parents=0 HEAD | tail -1)..HEAD"
 
   lint:
     runs-on: ubuntu-latest

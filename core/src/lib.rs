@@ -15,10 +15,16 @@ pub mod font;
 pub mod graph;
 pub mod host;
 pub mod markdown;
+pub mod patch;
+pub mod path;
 pub mod prepared;
+pub mod rebase;
+pub mod refs;
 pub mod rows;
 pub mod runs;
+pub mod search;
 pub mod select;
+pub mod status;
 pub mod syntax;
 pub mod theme;
 pub mod view;
@@ -514,39 +520,20 @@ pub const MAX_INTRALINE_TOKENS: usize = 1000;
 /// where dim text stops being legible.
 pub const MIN_INTRALINE_SIMILARITY: f32 = 0.4;
 
-/// Word-level diff of one removed/added line pair, returning the byte ranges
-/// that actually changed on each side.
-///
-/// This is the *second* pass — it runs only on lines a line-level diff already
-/// paired as a replace. That is why a plain LCS is the right call despite being
-/// quadratic: the inputs are one line each, not one file. See
-/// [`MAX_INTRALINE_TOKENS`] for the case where that assumption breaks.
-pub fn intraline(old: &str, new: &str) -> (Vec<Span>, Vec<Span>) {
-    // Offsets are u32, so a line beyond 4 GB has no representation. prepare
-    // clips at 2000 characters; the guard keeps the assumption honest for a
-    // direct caller that does not.
-    if old.len() > u32::MAX as usize || new.len() > u32::MAX as usize {
-        return (Vec::new(), Vec::new());
-    }
-    let mut tokens: Vec<(u32, u32)> = Vec::with_capacity(old.len() / 4 + new.len() / 4 + 8);
-    push_tokens(&mut tokens, old);
-    let na = tokens.len();
-    push_tokens(&mut tokens, new);
-    let (a, b) = tokens.split_at(na);
-
-    if a.len() > MAX_INTRALINE_TOKENS || b.len() > MAX_INTRALINE_TOKENS {
-        return (Vec::new(), Vec::new());
-    }
-
-    // Classic LCS table over tokens — one flat allocation of u32 rather than a
-    // Vec per row of usize: an entry never exceeds either side's token count,
-    // which the cap above bounds far below u32 range, and n+1 heap blocks per
-    // line pair was most of what a small pair cost.
+/// The LCS table over two token slices, and the spans its backtrack produces.
+/// Returns the LCS length alongside them, because the caller needs it for the
+/// similarity ratio and the table's corner is where it is already paid for.
+fn lcs_spans(
+    old: &str,
+    new: &str,
+    a: &[(u32, u32)],
+    b: &[(u32, u32)],
+    lcs: &mut Vec<u32>,
+) -> Option<(u32, Vec<Span>, Vec<Span>)> {
     let w = b.len() + 1;
-    let mut lcs = match (a.len() + 1).checked_mul(w) {
-        Some(cells) => vec![0u32; cells],
-        None => return (Vec::new(), Vec::new()),
-    };
+    let cells = (a.len() + 1).checked_mul(w)?;
+    lcs.clear();
+    lcs.resize(cells, 0);
     for i in (0..a.len()).rev() {
         // Row i is written from row i+1's final values and row i's own right
         // neighbour, so the split borrows them apart without aliasing.
@@ -562,14 +549,7 @@ pub fn intraline(old: &str, new: &str) -> (Vec<Span>, Vec<Span>) {
         }
     }
 
-    // The table's corner is the length of the longest common subsequence, so
-    // the similarity of the pair is already paid for.
     let common = lcs[0];
-    let similarity = 2.0 * common as f32 / (a.len() + b.len()) as f32;
-    if similarity < MIN_INTRALINE_SIMILARITY {
-        return (Vec::new(), Vec::new());
-    }
-
     let (mut old_spans, mut new_spans) = (Vec::new(), Vec::new());
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
@@ -592,6 +572,72 @@ pub fn intraline(old: &str, new: &str) -> (Vec<Span>, Vec<Span>) {
         push_span(&mut new_spans, b[j].0, b[j].0 + b[j].1);
         j += 1;
     }
+    Some((common, old_spans, new_spans))
+}
+
+/// Word-level diff of one removed/added line pair, returning the byte ranges
+/// that actually changed on each side.
+///
+/// This is the *second* pass — it runs only on lines a line-level diff already
+/// paired as a replace. That is why a plain LCS is the right call despite being
+/// quadratic: the inputs are one line each, not one file. See
+/// [`MAX_INTRALINE_TOKENS`] for the case where that assumption breaks.
+pub fn intraline(old: &str, new: &str) -> (Vec<Span>, Vec<Span>) {
+    intraline_with(old, new, &mut Vec::new())
+}
+
+/// [`intraline`], with the LCS table handed in. `prepare` diffs thousands of
+/// pairs per file and the table is the only allocation in here that survives a
+/// call, so a per-worker buffer removes one malloc and one zeroing pass per pair.
+pub fn intraline_with(old: &str, new: &str, lcs: &mut Vec<u32>) -> (Vec<Span>, Vec<Span>) {
+    // Offsets are u32, so a line beyond 4 GB has no representation. prepare
+    // clips at 2000 characters; the guard keeps the assumption honest for a
+    // direct caller that does not.
+    if old.len() > u32::MAX as usize || new.len() > u32::MAX as usize {
+        return (Vec::new(), Vec::new());
+    }
+    let mut tokens: Vec<(u32, u32)> = Vec::with_capacity(old.len() / 4 + new.len() / 4 + 8);
+    push_tokens(&mut tokens, old);
+    let na = tokens.len();
+    push_tokens(&mut tokens, new);
+    let (a, b) = tokens.split_at(na);
+
+    if a.len() > MAX_INTRALINE_TOKENS || b.len() > MAX_INTRALINE_TOKENS {
+        return (Vec::new(), Vec::new());
+    }
+
+    // The head and tail two lines share are in every common subsequence, so the
+    // table only has to cover what is left. Prose is edited a sentence at a time
+    // and code a token at a time, which makes this most of the work on the
+    // fixtures that cost the most: see docs/measurements.md on `md.diff`.
+    let mut pre = 0;
+    while pre < a.len() && pre < b.len() && token_text(old, a[pre]) == token_text(new, b[pre]) {
+        pre += 1;
+    }
+    // Never past the prefix: an identical pair would otherwise count its tokens
+    // twice and the similarity ratio would exceed 1.
+    let room = (a.len() - pre).min(b.len() - pre);
+    let mut suf = 0;
+    while suf < room
+        && token_text(old, a[a.len() - 1 - suf]) == token_text(new, b[b.len() - 1 - suf])
+    {
+        suf += 1;
+    }
+    let (mid_a, mid_b) = (&a[pre..a.len() - suf], &b[pre..b.len() - suf]);
+    let Some((mid_common, mut old_spans, mut new_spans)) = lcs_spans(old, new, mid_a, mid_b, lcs)
+    else {
+        return (Vec::new(), Vec::new());
+    };
+
+    // The trimmed tokens are common by construction, so they count towards the
+    // pair's similarity — which is measured against the whole line either side,
+    // never against the middle the table happened to cover.
+    let common = pre as u32 + suf as u32 + mid_common;
+    let similarity = 2.0 * common as f32 / (a.len() + b.len()) as f32;
+    if similarity < MIN_INTRALINE_SIMILARITY {
+        return (Vec::new(), Vec::new());
+    }
+
     coalesce(&mut old_spans, old);
     coalesce(&mut new_spans, new);
     (old_spans, new_spans)
@@ -1018,5 +1064,85 @@ diff --git a/x b/x
         let ok_b = format!("{}b", "a ".repeat(100));
         let (_, n) = intraline(&ok_a, &ok_b);
         assert!(!n.is_empty(), "normal lines must still be diffed");
+    }
+
+    fn intraline_untrimmed(old: &str, new: &str) -> (Vec<Span>, Vec<Span>) {
+        let mut tokens = Vec::new();
+        push_tokens(&mut tokens, old);
+        let na = tokens.len();
+        push_tokens(&mut tokens, new);
+        let (a, b) = tokens.split_at(na);
+        let Some((common, mut old_spans, mut new_spans)) =
+            lcs_spans(old, new, a, b, &mut Vec::new())
+        else {
+            return (Vec::new(), Vec::new());
+        };
+        let similarity = 2.0 * common as f32 / (a.len() + b.len()) as f32;
+        if similarity < MIN_INTRALINE_SIMILARITY {
+            return (Vec::new(), Vec::new());
+        }
+        coalesce(&mut old_spans, old);
+        coalesce(&mut new_spans, new);
+        (old_spans, new_spans)
+    }
+
+    #[test]
+    fn intraline_trim_agrees_with_the_untrimmed_table() {
+        let pairs = [
+            ("same line", "same line"),
+            ("old tail", "new tail"),
+            ("head old", "head new"),
+            ("head old tail", "head new tail"),
+            ("old middle tail", "new middle end"),
+            ("", "new"),
+            ("old", ""),
+            ("", ""),
+            ("a b", "a x b"),
+            ("a x b", "a b"),
+            ("/**", "// Historical note: nothing here matches"),
+            ("let café = 1;", "let café = 2;"),
+            ("x x x x", "x x x x"),
+        ];
+        for (old, new) in pairs {
+            assert_eq!(
+                intraline(old, new),
+                intraline_untrimmed(old, new),
+                "{old:?} -> {new:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn intraline_similarity_is_measured_against_the_whole_line() {
+        let (old, new) = intraline("prefix alpha suffix", "prefix beta suffix");
+        assert!(!old.is_empty() && !new.is_empty());
+    }
+
+    #[test]
+    fn intraline_identical_lines_have_no_middle_left() {
+        assert_eq!(intraline("abc def", "abc def"), (Vec::new(), Vec::new()));
+    }
+
+    #[test]
+    fn intraline_trims_nothing_when_the_first_token_differs() {
+        assert_eq!(
+            intraline("a b c", "z b c"),
+            (
+                vec![Span { start: 0, end: 1 }],
+                vec![Span { start: 0, end: 1 }]
+            )
+        );
+    }
+
+    #[test]
+    fn intraline_with_reuses_a_dirty_buffer() {
+        let mut scratch = vec![9; 64];
+        for (old, new) in [
+            ("go ext.Run(ev)", "go ext.Submit(ev)"),
+            ("prefix alpha suffix", "prefix beta suffix"),
+        ] {
+            let expected = intraline(old, new);
+            assert_eq!(intraline_with(old, new, &mut scratch), expected);
+        }
     }
 }

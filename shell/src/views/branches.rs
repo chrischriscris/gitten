@@ -1,0 +1,1929 @@
+//! The repository's branches, as a list.
+//!
+//! lazygit's Branches panel, viewer half: local branches first — each opening
+//! with a one-character dot that says what it *is* (HEAD in the accent, every
+//! other local in a lane ink of its own, remote-tracking copies hollow and
+//! faint) — with each tracking pair's **distance** spelled compactly
+//! `↑n`/`↓n` where git can measure it. The upstream ref is not repeated on
+//! the row: those refs sit below as rows of their own. Detached HEAD draws
+//! as its own top row rather than hiding: half a bisect, a rebase in
+//! progress and "just looking at yesterday" are states worth seeing named,
+//! and [`HeadState`] already carries them as data.
+//!
+//! The list idioms are [`super::files`]'s, on purpose: one `Viewport`, one
+//! scroll-handle dance, rows flattened **once per refresh** into owned display
+//! strings so the render path allocates nothing per frame.
+
+use super::{accept_deferred_scroll, vertical_scrollbar, DeferredScrollbar, PendingScroll};
+use crate::chrome;
+use crate::graph::ROW_H;
+use gitten_core::host::Host;
+use gitten_core::refs::{Branch, HeadState, RemoteBranch, Upstream};
+use gitten_core::status::PathBytes;
+use gitten_core::theme::{Rgb, Surface, Theme};
+use gitten_core::view::Viewport;
+use gpui::prelude::FluentBuilder as _;
+use gpui::*;
+use std::cell::Cell;
+use std::rc::Rc;
+
+/// One flat row of the pane.
+///
+/// Flattened once per refresh — never per frame. Everything a draw needs that
+/// costs allocation (the lossy names, the tracking distance, the spelled-out
+/// counts) or a decision (each dot's ink) is computed at flatten time; what a
+/// draw reads per frame is an enum match and a refcount bump.
+#[derive(Debug)]
+pub(crate) enum Row {
+    /// Detached HEAD, its own top row: the honest state, not hidden.
+    Detached {
+        /// The row's dot — [`Dot`] so the state draws in its own ink like
+        /// every other ref, dim where a branch would glow.
+        dot: Dot,
+        /// `(detached at abc12345…)` — abbreviated once, at flatten.
+        text: SharedString,
+    },
+    /// A group heading, drawn only because the group under it is non-empty.
+    Heading {
+        /// How many branches are in the group, spelled out once.
+        count: SharedString,
+        section: Section,
+    },
+    Local(LocalRow),
+    Remote(RemoteRow),
+}
+
+/// The coloured mark that opens every ref row: one character wide, decided
+/// entirely at flatten — glyph **and** `Rgb` stored on the row — so the draw
+/// never consults the theme, cycles nothing and allocates nothing for it.
+///
+/// The design's grammar: a filled ● is a ref living locally, tinted by what
+/// the row *is* — HEAD alone wears the accent, every other local an ink keyed
+/// by a stable hash of its **name** (the fold [`Theme::author`] uses), so a
+/// branch keeps one colour across refreshes, re-orders and other panes'
+/// opinions — while a hollow ○ marks a remote-tracking copy, faint because it
+/// names what a fetch already fetched, not anything checked out here.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Dot {
+    /// `●` locally, `○` for the remote copies.
+    pub glyph: &'static str,
+    /// Handled out at flatten with everything else a draw needs to be free.
+    pub color: Rgb,
+}
+
+/// Which group a row sits under — the two halves of the ref namespace a
+/// panel draws, and the half of the refresh anchor a verb needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Section {
+    Local,
+    Remote,
+}
+
+impl Section {
+    /// The lowercase spelling the tests outline rows with; the drawn heading
+    /// is [`Section::label`].
+    #[cfg(test)]
+    fn name(self) -> &'static str {
+        match self {
+            Section::Local => "local",
+            Section::Remote => "remote",
+        }
+    }
+
+    /// The heading drawn over the group, in caps. Static, so the row's frame
+    /// spells nothing.
+    fn label(self) -> &'static str {
+        match self {
+            Section::Local => "LOCAL",
+            Section::Remote => "REMOTE",
+        }
+    }
+}
+
+/// One local branch.
+#[derive(Debug)]
+pub(crate) struct LocalRow {
+    /// The addressing form, byte for byte. Never decoded in place.
+    pub name: PathBytes,
+    /// The display form, decoded lossily once at flatten.
+    pub name_text: SharedString,
+    /// What its tracking pair says, pre-rendered as **distance only** — see
+    /// [`upstream_counts`]. `None` draws no cell at all: the branch tracks
+    /// nothing, or is in sync with what it tracks.
+    pub counts: Option<SharedString>,
+    /// True when a pair exists but cannot be compared — the state the word
+    /// *gone* names, drawn faint so it never reads as "in sync".
+    pub gone: bool,
+    /// The row's dot, decided once — HEAD accent, otherwise an ink keyed by
+    /// the branch's name, never its place in the list.
+    pub dot: Dot,
+    /// True when git has this branch checked out in **another** worktree —
+    /// a checkout here would be refused, and the right-edge word `worktree`
+    /// says so. Never HEAD's own branch, which is this worktree's checkout.
+    pub worktree: bool,
+}
+
+/// One remote-tracking branch, as the last fetch left it.
+#[derive(Debug)]
+pub(crate) struct RemoteRow {
+    /// The remote it came from, as named locally.
+    pub remote: PathBytes,
+    /// The branch name on that remote.
+    pub branch: PathBytes,
+    /// `origin/main` — the display form, joined once at flatten. The two
+    /// halves above stay separate because the join loses information: a
+    /// remote's name may contain a slash.
+    pub label: SharedString,
+    /// The row's dot — hollow and faint, the grammar for "a fetched copy".
+    pub dot: Dot,
+}
+
+pub(crate) use gitten_core::refs::Target;
+
+/// The distance half of one local row, rendered once.
+///
+/// Zeros stay silent — an in-sync branch reads as a bare name, and `↑0 ↓0`
+/// is furniture nobody reads past the first time; both zeros collapse to
+/// `None`, so the pane draws no cell at all. Unknowable is the other word:
+/// a pair configured against a ref that is no longer there gets `(gone)`,
+/// faint, because a missing number must not dress up as a zero. A `None`
+/// on either side means the comparison failed, not half of it, so the word
+/// covers both.
+///
+/// The upstream **ref** is deliberately absent — `origin/main ↑1 ↓2` here is
+/// exactly what the design takes away — because the remote-tracking branch
+/// already sits below as its own row: naming it twice spends the row's width
+/// to say nothing new, and what remains is the only part a glance reads.
+fn upstream_counts(u: &Upstream) -> (Option<SharedString>, bool) {
+    let mut text = String::new();
+    for (count, arrow) in [(u.ahead, "↑"), (u.behind, "↓")] {
+        let Some(n) = count else {
+            return (Some(SharedString::from("(gone)")), true);
+        };
+        if n > 0 {
+            // Joined by a single space; the first arrow comes alone.
+            if !text.is_empty() {
+                text.push(' ');
+            }
+            text.push_str(arrow);
+            text.push_str(&n.to_string());
+        }
+    }
+    (
+        (!text.is_empty()).then_some(text).map(SharedString::from),
+        false,
+    )
+}
+
+/// Flattens the repository's refs into display rows: detached HEAD first,
+/// then the local branches, then the remote group. Pure — the unit-tested
+/// half of a refresh. The theme rides along because each dot's ink is a
+/// flatten-time decision: it lands on the row, not on the render path.
+/// `taken` names the branches git has checked out in another worktree —
+/// a display garnish, never a state the pane acts on.
+pub(crate) fn flatten(
+    local: &[Branch],
+    remotes: &[RemoteBranch],
+    head: Option<&HeadState>,
+    taken: &[String],
+    theme: &Theme,
+) -> Vec<Row> {
+    let mut rows = Vec::new();
+    if let Some(HeadState::Detached { commit }) = head {
+        // Eight characters is what `git log --oneline` abbreviates to and
+        // what every git UI shows; the full OID stays in the model.
+        rows.push(Row::Detached {
+            dot: Dot {
+                glyph: "●",
+                color: theme.chrome.dim,
+            },
+            text: format!("(detached at {}…)", &commit[..commit.len().min(8)]).into(),
+        });
+    }
+    if !local.is_empty() {
+        rows.push(Row::Heading {
+            count: SharedString::from(local.len().to_string()),
+            section: Section::Local,
+        });
+        let taken: std::collections::HashSet<&str> = taken.iter().map(|s| s.as_str()).collect();
+        rows.extend(local.iter().map(|b| {
+            let (counts, gone) = b.upstream.as_ref().map_or((None, false), upstream_counts);
+            // HEAD's branch alone wears the accent; every other local's ink is
+            // a stable hash of its **name** into the lane palette, so it keeps
+            // one colour across refreshes, re-orders and whatever place the
+            // list gives it — the name is the only thing a refresh never
+            // moves.
+            let dot = match b.head {
+                true => Dot {
+                    glyph: "●",
+                    color: theme.chrome.accent,
+                },
+                false => Dot {
+                    glyph: "●",
+                    color: theme.name_lane(b.name.as_bytes()),
+                },
+            };
+            // A branch checked out elsewhere cannot be checked out here, and
+            // the row says so at its right edge. HEAD's own branch is *this*
+            // worktree's checkout — git never has a branch in two — so it is
+            // excluded by rule, not by the read's courtesy.
+            let worktree = !b.head && taken.contains(b.name.to_string_lossy().as_ref());
+            Row::Local(LocalRow {
+                name: b.name.clone(),
+                name_text: b.display().into_owned().into(),
+                counts,
+                gone,
+                dot,
+                worktree,
+            })
+        }));
+    }
+    if !remotes.is_empty() {
+        rows.push(Row::Heading {
+            count: SharedString::from(remotes.len().to_string()),
+            section: Section::Remote,
+        });
+        rows.extend(remotes.iter().map(|r| {
+            let label = format!(
+                "{}/{}",
+                r.remote.to_string_lossy(),
+                r.branch.to_string_lossy()
+            );
+            Row::Remote(RemoteRow {
+                remote: r.remote.clone(),
+                branch: r.branch.clone(),
+                label: label.into(),
+                // Hollow and faint: a fetched copy of elsewhere, never a
+                // state of this checkout. Faint through `quiet_on` rather
+                // than raw — the dot is read as a state, and raw `faint` is
+                // under the furniture floor on the row it lands on.
+                dot: Dot {
+                    glyph: "○",
+                    color: theme.quiet_on(theme.chrome.bg),
+                },
+            })
+        }));
+    }
+    rows
+}
+
+/// What the title strip names about HEAD: the attached branch and its
+/// tracking distance. The distance is passed through verbatim rather than
+/// re-spelled, because core has already decided what an unknowable means
+/// and dressing that up as a zero here would be wrong exactly where it
+/// matters — a push/pull badge reading "nothing to do" when it cannot know.
+///
+/// Attached without a matching local row (an unborn branch's honest state)
+/// yields `None`: nothing is invented to fill the slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadInfo {
+    /// The branch HEAD sits on, display form, decoded once.
+    pub branch: SharedString,
+    /// Commits to push. `None` while git cannot compare — including gone.
+    pub ahead: Option<u32>,
+    /// Commits to pull. `None` under the same conditions as [`HeadInfo::ahead`].
+    pub behind: Option<u32>,
+    /// `⎇ main` — the chip's bright half, spelled once here so the title
+    /// strip clones a refcount per frame instead of formatting a string.
+    pub chip: SharedString,
+    /// ` · ↑2 ↓0` — the chip's dim half, [`drift`] run once; `None` when
+    /// there is nothing to say.
+    pub drift: Option<SharedString>,
+}
+
+/// How far HEAD has drifted from its upstream, for the title chip: ` · ↑2 ↓0`
+/// when either count is non-zero, nothing when both are zero or unknown. Both
+/// arrows once either shows, because `↑2` alone leaves the reader wondering
+/// whether the pull side was zero or unread.
+pub(crate) fn drift(ahead: Option<u32>, behind: Option<u32>) -> Option<String> {
+    let (up, down) = (ahead.unwrap_or(0), behind.unwrap_or(0));
+    (up > 0 || down > 0).then(|| format!(" · ↑{up} ↓{down}"))
+}
+
+/// Reads [`HeadInfo`] off the model. Pure — the unit-tested half of what the
+/// title strip asks about this pane.
+fn head_info(head: Option<&HeadState>, local: &[Branch]) -> Option<HeadInfo> {
+    match head {
+        Some(HeadState::Branch { .. }) => {}
+        _ => return None,
+    }
+    local.iter().find(|b| b.head).map(|b| {
+        let branch: SharedString = b.display().into_owned().into();
+        let ahead = b.upstream.as_ref().and_then(|u| u.ahead);
+        let behind = b.upstream.as_ref().and_then(|u| u.behind);
+        HeadInfo {
+            chip: format!("⎇ {branch}").into(),
+            drift: drift(ahead, behind).map(SharedString::from),
+            branch,
+            ahead,
+            behind,
+        }
+    })
+}
+
+/// [`flatten`] plus what the title strip says about it. The load line goes to
+/// stderr like every other view's, and nothing is stored for an overlay that
+/// does not read panes.
+pub(crate) fn prepare(
+    local: Vec<Branch>,
+    remotes: Vec<RemoteBranch>,
+    head: Option<HeadState>,
+    taken: Vec<String>,
+    theme: &Theme,
+    describe: &str,
+) -> Prepared {
+    let t = std::time::Instant::now();
+    let label = format!(
+        "{describe} · {} local · {} remote",
+        local.len(),
+        remotes.len()
+    );
+    let rows = flatten(&local, &remotes, head.as_ref(), &taken, theme);
+    let head = head_info(head.as_ref(), &local);
+    if crate::stats::enabled() {
+        eprintln!("branches: {label} · flatten {:.0?}", t.elapsed());
+    }
+    Prepared { rows, label, head }
+}
+
+/// The whole branches panel flattened to rows, plus the title-strip line and
+/// who HEAD is.
+pub(crate) struct Prepared {
+    pub(crate) rows: Vec<Row>,
+    /// The title-strip line: who we are and how much there is.
+    pub(crate) label: String,
+    /// Who HEAD is, read by the window's title strip. `None` while detached.
+    pub(crate) head: Option<HeadInfo>,
+}
+
+/// The branches pane. Holds flattened rows behind an `Rc`, so a refresh swaps
+/// one refcount instead of mutating what a frame may be reading.
+///
+/// Deletion confirms **in this pane** rather than in a dialog, exactly as the
+/// working tree's discard does: the first press stores the target and asks
+/// through the notice band, the second press on the same target executes, and
+/// any cursor move, wheel or refresh drops the arm.
+pub struct Branches {
+    data: Rc<Vec<Row>>,
+    /// Rows the list draws right now: indices into `data`, ascending.
+    /// Identity until a query filters it, rebuilt only when the query
+    /// changes — never per frame — which is why the full vector is kept
+    /// and this is all the list draws from.
+    visible: Rc<Vec<usize>>,
+    /// The live filter, as the prompt last left it. `None` — or an empty
+    /// string, which [`Branches::apply_query`] folds into `None` — is
+    /// every row; kept so a second `/` edits the query rather than
+    /// starting over, and so clearing restores in one keystroke.
+    filter: Option<String>,
+    scroll: UniformListScrollHandle,
+    /// The cursor, the top row and the height — [`Viewport`], the same model
+    /// every other list holds.
+    view: Rc<Cell<Viewport>>,
+    synced: Rc<Cell<f32>>,
+    pending_scroll: PendingScroll,
+    rendered: Rc<Cell<usize>>,
+    /// The delete awaiting its second press. One slot — arming a different
+    /// row moves the question, it does not queue two.
+    armed: Option<Target>,
+    /// Who HEAD is as of the last refresh, for the window's title strip:
+    /// the attached branch and its tracking distance. `None` while detached,
+    /// which is a state worth reading on the row above instead of inventing
+    /// a branch to name here.
+    head: Option<HeadInfo>,
+    /// Whether this pane holds the keyboard, as the shell last told it. A
+    /// row's bar is accent only when its pane is focused, and the view cannot
+    /// ask the shell during render — so the shell writes it here when focus
+    /// moves, and render reads a flag.
+    focused: bool,
+    /// The row a right-click landed on, published for the shell — which opens
+    /// the pane's context menu over it. Taken once by whoever opens it: one
+    /// right-click, one open.
+    menu_row: Cell<Option<usize>>,
+}
+
+/// Where the cursor comes to rest after a move that landed it on `at`.
+///
+/// A heading is a fact about the grouping and not a thing a verb can aim
+/// at, so the keyboard never stops on one: it steps on in the direction it
+/// was going, and only when the heading is the list's edge in that direction
+/// — `k` from the first branch onto `LOCAL` — does it settle the other way,
+/// which keeps `k` on row zero's heading from reading as "nothing happened"
+/// and `G` from resting on a `REMOTE` heading with an empty group under it.
+/// `dir` is the sign of the move; zero counts as forward.
+fn settle(rows: &[Row], at: usize, dir: isize) -> usize {
+    settle_by(
+        rows.len(),
+        |i| matches!(rows.get(i), Some(Row::Heading { .. })),
+        at,
+        dir,
+    )
+}
+
+/// [`settle`] with the heading test lifted out, so the shown-space walk
+/// below can run the same rule in the space the cursor addresses.
+fn settle_by(len: usize, heading: impl Fn(usize) -> bool, at: usize, dir: isize) -> usize {
+    if !heading(at) {
+        return at;
+    }
+    let forward = (at + 1..len).find(|&i| !heading(i));
+    let back = (0..at).rev().find(|&i| !heading(i));
+    match dir.is_negative() {
+        false => forward.or(back),
+        true => back.or(forward),
+    }
+    .unwrap_or(at)
+}
+
+/// [`settle`] over the shown rows: the same walk, in the space the cursor
+/// addresses — a heading survives a filter only when its group under it
+/// does, and the keyboard never rests on one either way.
+fn settle_shown(rows: &[Row], visible: &[usize], at: usize, dir: isize) -> usize {
+    settle_by(
+        visible.len(),
+        |i| {
+            visible
+                .get(i)
+                .is_some_and(|&d| matches!(rows.get(d), Some(Row::Heading { .. })))
+        },
+        at,
+        dir,
+    )
+}
+
+/// The one matcher, where the rows live: a query matches when the row's
+/// text contains it, folded — exactly what the commit list's search does.
+fn matches(haystack: &str, needle: &str) -> bool {
+    haystack.to_lowercase().contains(&needle.to_lowercase())
+}
+
+/// The rows a query keeps, as indices into `rows`: a branch whose name
+/// matches — a local's display name, a remote's `origin/main` — plus the
+/// heading of every group that still has a row under it, exactly the rows
+/// an empty group drops at flatten. A detached HEAD is a place, not a
+/// branch name; it shows unfiltered and a branch query says nothing
+/// about it.
+fn search_rows(rows: &[Row], query: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut pending_heading = None;
+    for (i, row) in rows.iter().enumerate() {
+        let kept = match row {
+            Row::Heading { section, .. } => {
+                pending_heading = Some((i, *section));
+                continue;
+            }
+            Row::Local(l) => matches(l.name_text.as_ref(), query),
+            Row::Remote(r) => matches(r.label.as_ref(), query),
+            Row::Detached { .. } => false,
+        };
+        if kept {
+            if let Some((h, _)) = pending_heading.take() {
+                out.push(h);
+            }
+            out.push(i);
+        }
+    }
+    out
+}
+
+impl Branches {
+    /// The viewport model with everything live folded in.
+    fn live_view(&self, host: &Host) -> Viewport {
+        let mut v = self.view.get();
+        v.set_len(self.visible.len());
+        v.set_height(self.rendered.get());
+        v.set_scrolloff(host.view.scrolloff);
+        v
+    }
+
+    /// Told by the shell whenever the keyboard moves — never decided here.
+    pub fn set_focused(&mut self, focused: bool) {
+        self.focused = focused;
+    }
+
+    /// Whether this pane holds the keyboard. The rows read it for the bar.
+    #[allow(dead_code)]
+    pub fn focused(&self) -> bool {
+        self.focused
+    }
+
+    pub(crate) fn from_prepared(prepared: Prepared) -> Self {
+        let Prepared { rows, head, .. } = prepared;
+        let visible = Rc::new(Vec::from_iter(0..rows.len()));
+        // Row zero is usually the `LOCAL` heading; the keyboard starts on
+        // the first branch under it instead.
+        let mut view = Viewport::new();
+        view.set_len(visible.len());
+        view.go_to(settle(&rows, 0, 1));
+        Self {
+            data: Rc::new(rows),
+            visible,
+            filter: None,
+            scroll: UniformListScrollHandle::new(),
+            view: Rc::new(Cell::new(view)),
+            synced: Rc::new(Cell::new(0.0)),
+            pending_scroll: PendingScroll::default(),
+            rendered: Rc::new(Cell::new(0)),
+            armed: None,
+            focused: false,
+            menu_row: Cell::new(None),
+            head,
+        }
+    }
+
+    /// Whether the repository had nothing to say — the empty state's trigger.
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    /// The flattened rows of the last refresh, read-only: what the tests
+    /// read to see what a refresh actually landed.
+    #[cfg(test)]
+    pub(crate) fn row_slice(&self) -> &[Row] {
+        &self.data
+    }
+    /// How many rows the list draws — the shown ones, a query having
+    /// narrowed the loaded set without replacing it. What sizes this
+    /// pane's sidebar section.
+    pub fn rows(&self) -> usize {
+        self.visible.len()
+    }
+
+    /// What the BRANCHES header counts: the loaded rows minus the group
+    /// headings — locals plus remotes, and detached HEAD's own row, which is
+    /// a ref the pane holds however it is named. A query narrows what is
+    /// *shown*; this stays what the repository holds — see [`filter_note`]
+    /// for the shown count while one stands.
+    pub fn count(&self) -> usize {
+        self.data
+            .iter()
+            .filter(|row| !matches!(row, Row::Heading { .. }))
+            .count()
+    }
+
+    /// The live query, for pre-filling an edit of it. Empty means none.
+    pub fn query(&self) -> Option<&str> {
+        self.filter.as_deref()
+    }
+    pub(crate) fn replace_prepared(&mut self, prepared: Prepared, host: &Host) {
+        // A refresh is the repository saying things moved; an armed delete
+        // was a promise about how they were, so it dies here first.
+        self.armed = None;
+        self.reconcile(host);
+        let old = self.view.get();
+        // Only a branch anchors, and on what a verb aims at — the bytes. A
+        // heading is a fact about the last refresh's grouping, not a thing
+        // the eye was reading. The cursor addresses the *shown* rows, so the
+        // anchor is read through the visible index.
+        let anchored = self
+            .visible
+            .get(old.cursor())
+            .and_then(|&d| self.data.get(d))
+            .and_then(row_target);
+        let Prepared { rows, head, .. } = prepared;
+        self.head = head;
+        self.data = Rc::new(rows);
+        // The new rows under the *current* query — a refresh must not drop
+        // the filter the user is looking through, and the anchor below is
+        // found in this space, not in the full list's.
+        self.visible = Rc::new(match &self.filter {
+            Some(q) => search_rows(&self.data, q),
+            None => Vec::from_iter(0..self.data.len()),
+        });
+
+        let cursor = anchored
+            .and_then(|target| {
+                self.visible
+                    .iter()
+                    .position(|&d| row_target(&self.data[d]).is_some_and(|t| t == target))
+            })
+            .unwrap_or(old.cursor());
+        let mut view = old;
+        view.set_len(self.visible.len());
+        // A refresh that lands the cursor on a heading — the branch it was
+        // on is gone — steps forward, the way a fresh open does.
+        view.go_to(settle_shown(
+            &self.data,
+            &self.visible,
+            cursor.min(self.visible.len().saturating_sub(1)),
+            1,
+        ));
+        self.view.set(view);
+
+        if self.visible.is_empty() {
+            self.pending_scroll.cancel();
+            let mut state = self.scroll.0.borrow_mut();
+            state.deferred_scroll_to_item = None;
+            state.base_handle.set_offset(point(px(0.0), px(0.0)));
+            self.synced.set(0.0);
+        } else {
+            self.defer_show(view);
+        }
+    }
+
+    /// Sets the filter — once per keystroke, and never anywhere else. The
+    /// visible-index vec is rebuilt here and read everywhere else.
+    ///
+    /// The keyboard stays on the same branch it was on: anchored by the row's
+    /// verb target into the next result set wherever that branch survives the
+    /// narrower query, clamped to a neighbouring row when it does not. An
+    /// empty query (a trimmed-empty one too) is no query: identity indices,
+    /// so clearing restores exactly what was on screen before.
+    ///
+    /// A strict deferred scroll parks the viewport the way every other jump
+    /// does — the list's geometry still describes the previous length until
+    /// the next prepaint, and writing an offset against it would clamp in
+    /// the wrong place.
+    pub fn apply_query(&mut self, query: &str) {
+        let next = Some(query.trim()).filter(|q| !q.is_empty());
+        if self.filter.as_deref() == next {
+            return;
+        }
+        // A changed filter can move the cursor by clamping, and a question
+        // aimed at yesterday's row is the thing the arm exists to prevent.
+        self.armed = None;
+        // Anchor first, named by the verb target like every other re-anchor
+        // in this file, because row numbers are about to stop meaning
+        // anything.
+        let anchored = self
+            .visible
+            .get(self.view.get().cursor())
+            .and_then(|&d| self.data.get(d))
+            .and_then(row_target);
+
+        self.filter = next.map(str::to_string);
+        self.visible = Rc::new(match &self.filter {
+            Some(q) => search_rows(&self.data, q),
+            None => Vec::from_iter(0..self.data.len()),
+        });
+
+        let mut view = self.view.get();
+        let cursor = anchored
+            .as_ref()
+            .and_then(|target| {
+                self.visible
+                    .iter()
+                    .position(|&d| row_target(&self.data[d]).as_ref() == Some(target))
+            })
+            .unwrap_or_else(|| view.cursor().min(self.visible.len().saturating_sub(1)));
+        view.set_len(self.visible.len());
+        // A filter that lands the cursor on a heading — the branch it was on
+        // is gone — steps forward, the way a fresh open does.
+        view.go_to(settle_shown(
+            &self.data,
+            &self.visible,
+            cursor.min(self.visible.len().saturating_sub(1)),
+            1,
+        ));
+        self.view.set(view);
+        if self.visible.is_empty() {
+            // Nothing survives the query; park nothing and leave no stale
+            // offset for a later keystroke to reconcile against.
+            self.pending_scroll.cancel();
+            let mut state = self.scroll.0.borrow_mut();
+            state.deferred_scroll_to_item = None;
+            state.base_handle.set_offset(point(px(0.0), px(0.0)));
+            self.synced.set(0.0);
+        } else {
+            self.defer_show(view);
+        }
+    }
+    /// What the pane's label appends while filtered: shown over loaded —
+    /// `"1/3"`, counting the refs and not the group headings, which are
+    /// furniture the query did not ask about. `None` unfiltered — the
+    /// header then stays exactly what acquisition named it.
+    pub fn filter_note(&self) -> Option<String> {
+        let refs = |rows: &[Row]| {
+            rows.iter()
+                .filter(|r| !matches!(r, Row::Heading { .. }))
+                .count()
+        };
+        self.filter.is_some().then(|| {
+            let shown = self
+                .visible
+                .iter()
+                .filter_map(|&d| self.data.get(d))
+                .filter(|r| !matches!(r, Row::Heading { .. }))
+                .count();
+            format!("{shown}/{}", refs(&self.data))
+        })
+    }
+
+    /// Who HEAD is, for anything outside this pane: the window's title strip
+    /// reads this at most once per frame. Cloned rather than borrowed because
+    /// readers sit across an entity boundary; it is one small struct.
+    pub fn head_info(&self) -> Option<HeadInfo> {
+        self.head.clone()
+    }
+
+    // -------------------------------------------------------------- commands
+
+    /// The box the list is drawn in, for hit-testing a wheel event.
+    pub fn list_bounds(&self) -> Bounds<Pixels> {
+        self.scroll.0.borrow().base_handle.bounds()
+    }
+
+    /// Nothing off the left edge to reach — names truncate rather than pan.
+    /// Present so the wheel routing can offer the axis to every screen alike.
+    pub fn pan_pixels(&self, _dx: f32) -> bool {
+        false
+    }
+
+    /// Moves the list by `dy` pixels — the wheel. Same dance as every list,
+    /// for the same reasons.
+    pub fn scroll_pixels(&mut self, dy: f32, host: &Host) -> bool {
+        let deferred = self.scroll.0.borrow().deferred_scroll_to_item;
+        if let Some(request) = deferred {
+            if self.pending_scroll.is_awaiting() {
+                let pixels = self.pending_scroll.wheel(dy);
+                let mut v = self.live_view(host);
+                let y = -(request.item_index as f32 * ROW_H) + pixels;
+                v.scroll_to((-y / ROW_H).round().max(0.0) as usize);
+                self.view.set(v);
+                // The wheel is also a move of attention — same rule the
+                // arrow keys keep.
+                self.armed = None;
+                return true;
+            }
+            self.scroll.0.borrow_mut().deferred_scroll_to_item = None;
+        }
+        let (offset, max) = {
+            let s = self.scroll.0.borrow();
+            (s.base_handle.offset(), s.base_handle.max_offset())
+        };
+        let y = (f32::from(offset.y) + dy).clamp(-f32::from(max.y), 0.0);
+        if y == f32::from(offset.y) {
+            return false;
+        }
+        self.scroll
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(point(offset.x, px(y)));
+        let mut v = self.live_view(host);
+        v.scroll_to((-y / ROW_H).round().max(0.0) as usize);
+        self.view.set(v);
+        self.synced.set(y);
+        self.armed = None;
+        true
+    }
+
+    /// Meets the list where it actually is after a scrollbar drag.
+    pub fn reconcile(&mut self, host: &Host) {
+        if self.scroll.0.borrow().deferred_scroll_to_item.is_some() {
+            return;
+        }
+        let shown_y = f32::from(self.scroll.0.borrow().base_handle.offset().y);
+        if (shown_y - self.synced.get()).abs() < 0.5 {
+            return;
+        }
+        self.synced.set(shown_y);
+        let shown = (-shown_y / ROW_H).round().max(0.0) as usize;
+        let mut v = self.live_view(host);
+        if v.top() == shown {
+            return;
+        }
+        v.scroll_to(shown);
+        self.view.set(v);
+    }
+
+    /// Runs one of the commands this pane answers — the shared `view.*`
+    /// vocabulary onto the same [`Viewport`] arithmetic every list runs.
+    ///
+    /// False is "not one of mine", and the caller says so.
+    pub fn run_view(&mut self, command: &str, host: &Host) -> bool {
+        self.reconcile(host);
+        let mut v = self.live_view(host);
+        // Each move carries its sign, so a landing on a heading knows which
+        // way to step off it — see [`settle`].
+        let dir = match command {
+            "view.down" => {
+                v.down();
+                1
+            }
+            "view.up" => {
+                v.up();
+                -1
+            }
+            "view.page-down" => {
+                v.page(1);
+                1
+            }
+            "view.page-up" => {
+                v.page(-1);
+                -1
+            }
+            "view.scroll-down" => {
+                v.scroll_by(host.view.rows as isize);
+                1
+            }
+            "view.scroll-up" => {
+                v.scroll_by(-(host.view.rows as isize));
+                -1
+            }
+            "view.top" => {
+                v.to_top();
+                1
+            }
+            "view.bottom" => {
+                v.to_bottom();
+                -1
+            }
+            // Answered without doing anything, like the commit graph: a
+            // resolved command must not read as a failed one.
+            "view.left" | "view.right" => return true,
+            _ => return false,
+        };
+        let settled = settle_shown(&self.data, &self.visible, v.cursor(), dir);
+        if settled != v.cursor() {
+            v.go_to(settled);
+        }
+        // The keyboard moved; whatever was armed was armed to what it used
+        // to be on.
+        self.armed = None;
+        self.view.set(v);
+        self.show(v);
+        true
+    }
+
+    /// Where a click lands the keyboard: onto the row the mouse hit, with
+    /// exactly the side effects a key move has — see [`Self::run_view`]. The
+    /// row clamps like [`Viewport::go_to`] does, and a heading snaps forward —
+    /// the nearest selectable row below, the way a key steps off one.
+    /// The row a right-click landed on, published by the row's own handler
+    /// beside the left-click one, and taken once by the shell — which opens
+    /// the pane's context menu over it. Taken, not read: one right-click,
+    /// one open.
+    pub fn take_menu_row(&self) -> Option<usize> {
+        self.menu_row.take()
+    }
+
+    pub fn select_row(&mut self, index: usize, host: &Host) {
+        self.reconcile(host);
+        let mut v = self.live_view(host);
+        v.go_to(index);
+        let settled = settle_shown(&self.data, &self.visible, v.cursor(), 1);
+        if settled != v.cursor() {
+            v.go_to(settled);
+        }
+        // The mouse moved — whatever was armed was armed to what the mouse
+        // used to be on.
+        self.armed = None;
+        self.view.set(v);
+        self.show(v);
+    }
+
+    fn show(&self, v: Viewport) {
+        let target = v.top();
+        if self.scroll.0.borrow().deferred_scroll_to_item.is_some() {
+            self.defer_show(v);
+            return;
+        }
+        let s = self.scroll.0.borrow();
+        let cur = s.base_handle.offset();
+        let y = -(target as f32 * ROW_H).clamp(0.0, f32::from(s.base_handle.max_offset().y));
+        s.base_handle.set_offset(point(cur.x, px(y)));
+        self.synced.set(y);
+    }
+
+    fn defer_show(&self, v: Viewport) {
+        self.pending_scroll.begin();
+        self.scroll
+            .scroll_to_item_strict(v.top(), ScrollStrategy::Top);
+    }
+
+    /// What the keyboard is on, as verbs aim at it. `None` on a heading or
+    /// in an empty pane.
+    pub(crate) fn current(&self) -> Option<Target> {
+        let shown = *self.visible.get(self.view.get().cursor())?;
+        row_target(self.data.get(shown)?)
+    }
+
+    /// Arms — or confirms — a delete of this exact target. First call asks
+    /// (returns false); second call on the same target spends the arm and
+    /// acts (returns true); anything else re-arms and asks again.
+    pub(crate) fn confirm_or_arm_delete(&mut self, target: &Target) -> bool {
+        self.arm(target)
+    }
+
+    /// The same dance for `commits.rebase-onto`, over the one arm slot the
+    /// pane holds: arming anything else moves the question.
+    pub(crate) fn confirm_or_arm_rebase(&mut self, target: &Target) -> bool {
+        self.arm(target)
+    }
+
+    fn arm(&mut self, target: &Target) -> bool {
+        let already = self.armed.as_ref() == Some(target);
+        self.armed = match already {
+            true => None,
+            false => Some(target.clone()),
+        };
+        already
+    }
+
+    /// Whether a delete is waiting for its second press — the render's tint
+    /// of the row the question is about.
+    #[cfg(test)]
+    pub(crate) fn armed_row(&self) -> Option<Target> {
+        self.armed.clone()
+    }
+
+    /// What `copy.selection` copies here: the row the keyboard is on, as git
+    /// would spell it — the bare refname. Headings and the detached row copy
+    /// nothing, which is what makes an empty result skip the clipboard.
+    pub fn cursor_text(&self) -> String {
+        match self.current() {
+            Some(Target::Local(name)) => name.to_string_lossy().into_owned(),
+            Some(Target::Remote { remote, branch }) => {
+                format!("{}/{}", remote.to_string_lossy(), branch.to_string_lossy())
+            }
+            Some(Target::Detached) | None => String::new(),
+        }
+    }
+
+    /// No drag selection over a ref list yet; `select.all` is inert here.
+    pub fn select_all(&mut self) -> bool {
+        false
+    }
+
+    pub fn select_none(&mut self) -> bool {
+        false
+    }
+}
+
+/// A row's verb target, when it has one — headings do not.
+fn row_target(row: &Row) -> Option<Target> {
+    match row {
+        Row::Detached { .. } => Some(Target::Detached),
+        Row::Local(l) => Some(Target::Local(l.name.clone())),
+        Row::Remote(r) => Some(Target::Remote {
+            remote: r.remote.clone(),
+            branch: r.branch.clone(),
+        }),
+        Row::Heading { .. } => None,
+    }
+}
+
+impl Render for Branches {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // No refs at all is a sentence, not an empty box — an unborn
+        // repository's honest answer, drawn by [`chrome::empty_line`] like
+        // the files and stash panes' sentences: this pane is a short section
+        // of the sidebar, and a sentence centred in it would sit where no
+        // row ever does.
+        if self.is_empty() {
+            return chrome::empty_line(&crate::config::host(cx), "no branches yet".into());
+        }
+        let data = self.data.clone();
+        let visible = self.visible.clone();
+        let rendered = self.rendered.clone();
+        let view = self.view.clone();
+        let scroll = self.scroll.clone();
+        let synced = self.synced.clone();
+        let pending_scroll = self.pending_scroll.clone();
+        // The row an armed delete is waiting on, found once per frame in the
+        // *shown* rows — the cursor's space — the tint a property of the
+        // question, not of the draw.
+        let armed = self.armed.as_ref().and_then(|target| {
+            visible
+                .iter()
+                .position(|&d| row_target(&data[d]).as_ref() == Some(target))
+        });
+        let focused = self.focused;
+        // A click on a row is the keyboard coming back — see [`Self::select_row`].
+        // Built as a plain handle, not `cx.listener`: the rows are drawn in the
+        // list's closure over `&mut App`, where no listener can be minted.
+        let this = cx.entity().downgrade();
+        let list = uniform_list("branches", visible.len(), move |range, _, cx| {
+            rendered.set(range.len());
+            let host = crate::config::host(cx);
+            if let Some(accepted) = accept_deferred_scroll(&scroll, &pending_scroll, &synced) {
+                if accepted.wheeled {
+                    let mut v = view.get();
+                    v.set_len(visible.len());
+                    v.set_height(range.len());
+                    v.set_scrolloff(host.view.scrolloff);
+                    v.scroll_to((-accepted.y / ROW_H).round().max(0.0) as usize);
+                    view.set(v);
+                    cx.refresh_windows();
+                }
+            }
+            let cursor = view.get().cursor();
+            range
+                .map(|i| {
+                    let r = row(
+                        &data[visible[i]],
+                        &host,
+                        i == cursor,
+                        focused,
+                        Some(i) == armed,
+                    );
+                    if row_target(&data[visible[i]]).is_some() {
+                        let this = this.clone();
+                        return r
+                            .id(("row", i))
+                            // Hover says clickable — but the selection tint
+                            // outranks it, so the cursor row keeps its own
+                            // background. `hover` needs identity, so it rides
+                            // this id (plan 045); `chrome::list_row` has none.
+                            .cursor_pointer()
+                            .when(i != cursor, |r| {
+                                r.hover(|s| s.bg(rgb(host.theme.chrome.raised)))
+                            })
+                            .on_mouse_down(MouseButton::Right, {
+                                let this = this.clone();
+                                move |_: &MouseDownEvent, _, cx| {
+                                    let Some(this) = this.upgrade() else { return };
+                                    let host = crate::config::host(cx);
+                                    this.update(cx, |b, cx| {
+                                        b.select_row(i, &host);
+                                        b.menu_row.set(Some(i));
+                                        cx.notify();
+                                    });
+                                }
+                            })
+                            .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, _, cx| {
+                                let Some(this) = this.upgrade() else { return };
+                                let host = crate::config::host(cx);
+                                this.update(cx, |b, cx| {
+                                    b.select_row(i, &host);
+                                    cx.notify();
+                                });
+                            })
+                            .into_any_element();
+                    }
+                    r.into_any_element()
+                })
+                .collect()
+        })
+        .track_scroll(&self.scroll)
+        // No padding on the list: `ROW_PAD` is the row's own, so the cursor
+        // bar sits on the region's edge and the background runs to it.
+        .size_full();
+
+        div()
+            .relative()
+            .size_full()
+            .child(list)
+            .when(crate::config::host(cx).view.scrollbar, |d| {
+                d.child(vertical_scrollbar(&DeferredScrollbar::new(
+                    &self.scroll,
+                    &self.pending_scroll,
+                )))
+            })
+            .into_any_element()
+    }
+}
+
+/// One row, on [`chrome::list_row`]'s furniture: `current` is the keyboard's
+/// row and `focused` says whether its bar is the accent or the faint ink.
+/// `armed` tints the text toward `chrome.error`, so the thing a second press
+/// will destroy is named by its own colour and not only by the band above it.
+///
+/// A ref row is dot, one character of air, name, and — pushed to the right
+/// edge — the tracking distance. The name is the one thing that gives:
+/// `min_w_0` and `truncate` let it end in an ellipsis rather than shove the
+/// distance out of the pane, because `↑2` is the fact a narrow sidebar is
+/// being glanced at for and a name's tail is not. A heading is
+/// [`chrome::section_label`] and never the cursor's — see [`settle`].
+fn row(e: &Row, host: &Host, current: bool, focused: bool, armed: bool) -> Div {
+    let ch = host.font.char_width();
+    let c = host.theme.chrome;
+    // The dot was decided beside the text, at flatten; the draw only paints
+    // it. One character wide plus one of air, so every name aligns.
+    let dot = |d: &Dot| {
+        div()
+            .flex_none()
+            .w(px(ch))
+            .mr(px(ch))
+            .text_color(rgb(d.color))
+            .child(SharedString::from(d.glyph))
+    };
+    let name = |text: SharedString, ink: Option<Rgb>| {
+        div()
+            .min_w_0()
+            .truncate()
+            .when_some(ink, |d, ink| d.text_color(rgb(ink)))
+            .when(armed, |d| d.text_color(rgb(c.error)))
+            .child(text)
+    };
+    match e {
+        Row::Heading { count, section } => {
+            chrome::section_label(host, section.label().into(), Some(count.clone()), ROW_H)
+        }
+        Row::Detached { dot: d, text } => chrome::list_row(host, current, focused, ROW_H)
+            .child(dot(d))
+            .child(name(
+                text.clone(),
+                Some(if current {
+                    host.theme.dim_on(Surface::Cursor)
+                } else {
+                    c.dim
+                }),
+            )),
+        Row::Local(l) => chrome::list_row(host, current, focused, ROW_H)
+            .child(dot(&l.dot))
+            .child(name(l.name_text.clone(), None))
+            // The worktree mark: a word, not a glyph — the app ships no
+            // icons, and at the right edge, where `(gone)` already lives, a
+            // word costs nothing. Quiet through `quiet_on` like every other
+            // state word here, never raw `faint`, and it rides **before** the
+            // distance cell. When that cell is absent the mark takes the
+            // auto margin itself, so the word still lands at the far end.
+            .children(l.worktree.then(|| {
+                div()
+                    .flex_none()
+                    .when(l.counts.is_none(), |d| d.ml_auto())
+                    .when(l.counts.is_some(), |d| d.pl(px(ch)))
+                    .text_color(rgb(host.theme.quiet_on(c.bg)))
+                    .child("worktree")
+            }))
+            .children(l.counts.clone().map(|text| {
+                div()
+                    .flex_none()
+                    // The auto margin carries the distance to the row's far
+                    // end however wide its name ran; the right reserve is the
+                    // scrollbar's track, which overlays this edge.
+                    .ml_auto()
+                    .pl(px(ch))
+                    .pr(px(super::SCROLLBAR_TRACK_W))
+                    .text_color(rgb(match l.gone {
+                        // "gone" is read — it is why the upstream is not shown
+                        // — so quiet through `quiet_on`, not invisible.
+                        true => host.theme.quiet_on(c.bg),
+                        // The upstream text is read, and raw dim is under the
+                        // floor when the row is selected — it resolves against
+                        // whichever background the row is wearing.
+                        false => host.theme.dim_on(if current {
+                            Surface::Cursor
+                        } else {
+                            Surface::Context
+                        }),
+                    }))
+                    .child(text)
+            })),
+        Row::Remote(r) => chrome::list_row(host, current, focused, ROW_H)
+            .child(dot(&r.dot))
+            .child(name(
+                r.label.clone(),
+                Some(if current {
+                    host.theme.dim_on(Surface::Cursor)
+                } else {
+                    c.dim
+                }),
+            )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        drift, flatten, head_info, prepare, row_target, Branches, HeadInfo, Prepared, Row, Target,
+    };
+    use gitten_core::host::Host;
+    use gitten_core::refs::{Branch, HeadState, RefName, RemoteBranch, Upstream};
+    use gitten_core::theme::Theme;
+    use std::rc::Rc;
+
+    /// A full-length OID-looking commit id, for shapes rather than values.
+    fn sha() -> String {
+        "0123456789abcdef0123456789abcdef01234567".to_string()
+    }
+
+    fn local(name: &str, head: bool) -> Branch {
+        Branch {
+            name: RefName::from(name),
+            commit: sha(),
+            upstream: None,
+            head,
+        }
+    }
+
+    fn tracked(name: &str, head: bool, ahead: Option<u32>, behind: Option<u32>) -> Branch {
+        Branch {
+            upstream: Some(Upstream {
+                remote: RefName::from("origin"),
+                branch: RefName::from(name),
+                ahead,
+                behind,
+            }),
+            ..local(name, head)
+        }
+    }
+
+    fn remote(name: &str) -> RemoteBranch {
+        RemoteBranch {
+            remote: RefName::from("origin"),
+            branch: RefName::from(name),
+            commit: sha(),
+        }
+    }
+
+    /// Headings and rows in draw order — the shape the tests read. The dots'
+    /// glyphs ride along because a column is only useful while it aligns;
+    /// each row's *colour* argument stays beside that row, in its own test.
+    fn outline(rows: &[Row]) -> Vec<String> {
+        rows.iter()
+            .map(|r| match r {
+                Row::Detached { dot, text } => format!("{}[detached {text}]", dot.glyph),
+                Row::Heading { count, section } => {
+                    format!("[{}·{count}]", section.name())
+                }
+                Row::Local(l) => match &l.counts {
+                    Some(c) => format!("{}{} {c}", l.dot.glyph, l.name_text),
+                    None => format!("{}{}", l.dot.glyph, l.name_text),
+                },
+                Row::Remote(r) => format!("{}{}", r.dot.glyph, r.label),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn locals_come_first_and_the_remote_group_is_quiet_but_there() {
+        let t = Theme::dark();
+        let rows = flatten(
+            &[local("feature", false), local("main", true)],
+            &[remote("main"), remote("wip")],
+            None,
+            &[],
+            &t,
+        );
+        assert_eq!(
+            outline(&rows),
+            vec![
+                "[local·2]",
+                "●feature",
+                "●main",
+                "[remote·2]",
+                "○origin/main",
+                "○origin/wip",
+            ]
+        );
+        // The dots say what every row is: HEAD's branch alone wears the
+        // accent, another local keeps the lane ink keyed by its name — the
+        // one thing a refresh never moves — and a fetched copy draws hollow
+        // and faint.
+        match (&rows[1], &rows[2]) {
+            (Row::Local(feature), Row::Local(main)) => {
+                assert_eq!(
+                    feature.dot.color,
+                    t.name_lane(b"feature"),
+                    "a local's ink follows its name"
+                );
+                assert_eq!(
+                    main.dot.color, t.chrome.accent,
+                    "HEAD alone earns the accent"
+                );
+            }
+            other => panic!("two local rows expected, got {other:?}"),
+        }
+        for row in [&rows[4], &rows[5]] {
+            match row {
+                Row::Remote(r) => assert_eq!(
+                    (r.dot.glyph, r.dot.color),
+                    ("○", t.quiet_on(t.chrome.bg)),
+                    "a remote copy is hollow and quiet — quiet, not invisible"
+                ),
+                other => panic!("a remote row expected, got {other:?}"),
+            }
+        }
+        // An empty group draws no heading at all.
+        assert_eq!(
+            outline(&flatten(&[local("main", true)], &[], None, &[], &t)),
+            vec!["[local·1]", "●main"]
+        );
+    }
+
+    #[test]
+    fn a_detached_head_is_its_own_top_row_not_a_hidden_state() {
+        let t = Theme::dark();
+        let rows = flatten(
+            &[local("main", false)],
+            &[],
+            Some(&HeadState::Detached { commit: sha() }),
+            &[],
+            &t,
+        );
+        assert_eq!(
+            outline(&rows)[0],
+            "●[detached (detached at 01234567…)]",
+            "abbreviated once, at flatten"
+        );
+        // A detached state is real but not alive: dim where a checked-out
+        // branch would glow.
+        match &rows[0] {
+            Row::Detached { dot, .. } => assert_eq!(dot.color, t.chrome.dim),
+            other => panic!("the detached row expected, got {other:?}"),
+        }
+        // And attached heads put no such row anywhere.
+        let attached = flatten(
+            &[local("main", true)],
+            &[],
+            Some(&HeadState::Branch {
+                name: RefName::from("main"),
+                commit: None,
+            }),
+            &[],
+            &t,
+        );
+        assert!(!outline(&attached).iter().any(|r| r.contains("detached")));
+    }
+
+    #[test]
+    fn tracking_speaks_in_arrows_and_zeros_stay_silent() {
+        let t = Theme::dark();
+        let rows = flatten(
+            &[
+                tracked("synced", false, Some(0), Some(0)),
+                tracked("ahead", false, Some(2), Some(0)),
+                tracked("behind", true, Some(0), Some(3)),
+                tracked("both", false, Some(1), Some(4)),
+            ],
+            &[],
+            None,
+            &[],
+            &t,
+        );
+        assert_eq!(
+            outline(&rows),
+            vec![
+                "[local·4]",
+                "●synced",
+                "●ahead ↑2",
+                "●behind ↓3",
+                "●both ↑1 ↓4",
+            ],
+            "distance only — the ref itself is the remote group's job"
+        );
+        // Fully in sync draws nothing at all: `None`, not an empty string.
+        match &rows[1] {
+            Row::Local(l) => assert_eq!(l.counts, None, "an in-sync branch is bare"),
+            other => panic!("the synced row expected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_gone_upstream_is_named_gone_rather_than_reading_as_zero() {
+        // ahead/behind `None` with the pair still configured: the ref the
+        // branch tracks no longer exists locally. A `0` here would invite a
+        // push that fixes nothing.
+        let t = Theme::dark();
+        let rows = flatten(&[tracked("old", false, None, None)], &[], None, &[], &t);
+        assert_eq!(outline(&rows), vec!["[local·1]", "●old (gone)"]);
+        // The row remembers why, for the faint ink the draw gives it.
+        match &rows[1] {
+            Row::Local(l) => {
+                assert!(l.gone);
+                assert_eq!(l.counts.as_deref(), Some("(gone)"));
+            }
+            other => panic!("the tracked row expected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn names_keep_their_bytes_and_display_lossily_once() {
+        // Latin-1 é and ø: legal ref bytes, illegal UTF-8.
+        let t = Theme::dark();
+        let rows = flatten(
+            &[Branch {
+                name: RefName::from_bytes(b"f\xe9ature"),
+                ..local("unused", false)
+            }],
+            &[RemoteBranch {
+                remote: RefName::from("origin"),
+                branch: RefName::from_bytes(b"w\xf8rk"),
+                commit: sha(),
+            }],
+            None,
+            &[],
+            &t,
+        );
+        match &rows[1] {
+            Row::Local(l) => {
+                assert_eq!(l.name.as_bytes(), b"f\xe9ature", "addressing keeps bytes");
+                assert!(
+                    l.name_text.contains('\u{FFFD}'),
+                    "display decodes lossily instead of failing"
+                );
+            }
+            other => panic!("the local row expected, got {other:?}"),
+        }
+        match &rows[3] {
+            Row::Remote(r) => {
+                assert_eq!(r.branch.as_bytes(), b"w\xf8rk");
+                assert!(r.label.contains('\u{FFFD}'));
+            }
+            other => panic!("the remote row expected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn targets_are_what_verbs_aim_at_bytes_included() {
+        let t = Theme::dark();
+        let rows = flatten(
+            &[local("main", true)],
+            &[remote("main")],
+            Some(&HeadState::Detached { commit: sha() }),
+            &[],
+            &t,
+        );
+        assert_eq!(
+            row_target(&rows[0]),
+            Some(Target::Detached),
+            "the detached row is a place verbs can refuse honestly"
+        );
+        assert_eq!(
+            row_target(&rows[2]),
+            Some(Target::Local(RefName::from("main")))
+        );
+        assert_eq!(
+            row_target(&rows[4]),
+            Some(Target::Remote {
+                remote: RefName::from("origin"),
+                branch: RefName::from("main"),
+            })
+        );
+        assert_eq!(row_target(&rows[1]), None, "a heading aims at nothing");
+        assert_eq!(row_target(&rows[3]), None);
+    }
+
+    #[test]
+    fn a_delete_arms_then_confirms_and_any_cursor_move_disarms() {
+        let host = Host::new();
+        let mut b = Branches::from_prepared(prepare(
+            vec![local("feature", false), local("main", true)],
+            Vec::new(),
+            None,
+            Vec::new(),
+            &host.theme,
+            "",
+        ));
+        b.rendered.set(3);
+        let mut v = b.view.get();
+        v.set_len(b.data.len());
+        v.set_height(3);
+        b.view.set(v);
+        // The keyboard opens on `feature`, past the heading; down is `main`.
+        assert!(b.run_view("view.down", &host));
+        let target = b.current().expect("a branch under the keyboard");
+
+        // First press: asked, not acted.
+        assert!(!b.confirm_or_arm_delete(&target));
+        assert_eq!(b.armed_row(), Some(target.clone()));
+
+        // Second press on the same row: act, and the slot is spent.
+        assert!(b.confirm_or_arm_delete(&target));
+        assert_eq!(b.armed_row(), None);
+
+        // A third press starts over — there is no latched yes.
+        assert!(!b.confirm_or_arm_delete(&target));
+
+        // The keyboard moving drops the question before it can lie.
+        assert!(b.run_view("view.down", &host));
+        assert_eq!(
+            b.armed_row(),
+            None,
+            "the arm did not survive its own cursor move"
+        );
+    }
+
+    #[test]
+    fn a_refresh_disarms_an_armed_delete_even_when_the_branch_survives() {
+        // The mirror of the working tree's rule: a refresh is the repository
+        // saying things moved, and an armed delete was a promise about how
+        // they were.
+        let host = Host::new();
+        let mut b = Branches::from_prepared(prepare(
+            vec![local("feature", false), local("main", true)],
+            Vec::new(),
+            None,
+            Vec::new(),
+            &host.theme,
+            "",
+        ));
+        b.rendered.set(3);
+        let mut v = b.view.get();
+        v.set_len(b.data.len());
+        v.set_height(3);
+        b.view.set(v);
+        // The keyboard opens on `feature`, past the heading; down is `main`.
+        assert!(b.run_view("view.down", &host));
+        let target = b.current().expect("a branch under the keyboard");
+        assert!(!b.confirm_or_arm_delete(&target));
+        assert_eq!(b.armed_row(), Some(target.clone()));
+
+        // A refresh that changes nothing at all still says "things moved".
+        b.replace_prepared(
+            prepare(
+                vec![local("feature", false), local("main", true)],
+                Vec::new(),
+                None,
+                vec![],
+                &host.theme,
+                "",
+            ),
+            &host,
+        );
+        assert_eq!(b.armed_row(), None, "the question did not survive");
+        // And the press after it re-arms rather than executes — there was
+        // never a latched yes to lose.
+        assert!(!b.confirm_or_arm_delete(&target));
+
+        // The same when the branch itself is gone under the arm.
+        assert!(b.confirm_or_arm_delete(&target));
+        b.replace_prepared(
+            prepare(
+                vec![local("main", true)],
+                Vec::new(),
+                None,
+                vec![],
+                &host.theme,
+                "",
+            ),
+            &host,
+        );
+        assert_eq!(b.armed_row(), None);
+        // The cursor clamped onto the branch that remains — a real row,
+        // never the ghost of the one the question was about.
+        assert_eq!(
+            b.current(),
+            Some(Target::Local(RefName::from("main"))),
+            "the vanished anchor fell back to clamping"
+        );
+    }
+
+    #[test]
+    fn the_label_counts_both_groups_and_an_empty_repository_flattens_to_nothing() {
+        let host = Host::new();
+        let p = prepare(
+            vec![local("main", true)],
+            vec![remote("main")],
+            None,
+            Vec::new(),
+            &host.theme,
+            "gitten (main)",
+        );
+        assert_eq!(p.label, "gitten (main) · 1 local · 1 remote");
+
+        let empty = prepare(Vec::new(), Vec::new(), None, vec![], &host.theme, "gitten");
+        assert_eq!(empty.label, "gitten · 0 local · 0 remote");
+        assert_eq!(empty.rows.len(), 0);
+        assert_eq!(empty.head, None, "no branch, nothing to name");
+
+        // And the prepared type is what a refresh hands the pane.
+        let p: Prepared = p;
+        assert!(!p.rows.is_empty());
+    }
+
+    #[test]
+    fn head_info_names_the_attached_branch_and_hands_through_its_distance() {
+        let host = Host::new();
+        let attached = HeadState::Branch {
+            name: RefName::from("main"),
+            commit: None,
+        };
+        let p = prepare(
+            vec![tracked("main", true, Some(1), Some(2))],
+            Vec::new(),
+            Some(attached.clone()),
+            Vec::new(),
+            &host.theme,
+            "",
+        );
+        assert_eq!(
+            p.head,
+            Some(HeadInfo {
+                branch: "main".into(),
+                ahead: Some(1),
+                behind: Some(2),
+                chip: "⎇ main".into(),
+                drift: Some(" · ↑1 ↓2".into()),
+            }),
+            "the numbers core measured, verbatim — and the chip spelled once"
+        );
+        // And the pane hands it on for the title strip.
+        let b = Branches::from_prepared(p);
+        let hi = b.head_info().expect("attached HEAD has a name");
+        assert_eq!(&*hi.branch, "main");
+        assert_eq!((hi.ahead, hi.behind), (Some(1), Some(2)));
+
+        // A gone upstream stays honest: unknowable is not zero, and the
+        // title strip must not invent a badge off a missing ref.
+        let hi = head_info(Some(&attached), &[tracked("main", true, None, None)])
+            .expect("gone still names its branch");
+        assert_eq!(
+            (hi.ahead, hi.behind),
+            (None, None),
+            "a vanished ref measures to nothing"
+        );
+        assert_eq!(hi.drift, None, "and the chip invents no zeros for it");
+    }
+
+    #[test]
+    fn drift_shows_both_arrows_once_either_is_non_zero_and_nothing_otherwise() {
+        assert_eq!(drift(Some(2), Some(0)).as_deref(), Some(" · ↑2 ↓0"));
+        assert_eq!(drift(None, Some(3)).as_deref(), Some(" · ↑0 ↓3"));
+        assert_eq!(drift(Some(0), Some(0)), None);
+        assert_eq!(drift(None, None), None);
+    }
+
+    #[test]
+    fn head_info_says_nothing_while_detached_or_unmarked() {
+        let host = Host::new();
+        // Detached: there is no branch to name, and the row above says so
+        // better than an invented one would.
+        let p = prepare(
+            vec![local("main", false)],
+            Vec::new(),
+            Some(HeadState::Detached { commit: sha() }),
+            Vec::new(),
+            &host.theme,
+            "",
+        );
+        assert_eq!(p.head, None);
+
+        // Attached to a name no local row claims — the unborn-branch shape:
+        // nothing invented to fill the slot either way.
+        let bare = prepare(
+            vec![local("other", false)],
+            Vec::new(),
+            Some(HeadState::Branch {
+                name: RefName::from("ghost"),
+                commit: None,
+            }),
+            Vec::new(),
+            &host.theme,
+            "",
+        );
+        assert_eq!(bare.head, None);
+
+        let none: Option<HeadInfo> = None;
+        assert_eq!(Branches::from_prepared(bare).head_info(), none);
+    }
+
+    #[test]
+    fn a_branchs_colour_survives_the_list_reordering() {
+        // The colour a branch carries is a hash of its **name**, not of its
+        // row: inserting a branch above it repaints nobody, so a commit or a
+        // checkout that re-orders the list never reshuffles the rainbow. HEAD
+        // still sits out of the palette in its accent.
+        let t = Theme::dark();
+        let ink = |rows: &[Row], name: &[u8]| {
+            rows.iter()
+                .find_map(|r| match r {
+                    Row::Local(l) if l.name.as_bytes() == name => Some(l.dot.color),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no local row named {}", String::from_utf8_lossy(name)))
+        };
+        let before = flatten(
+            &[local("held", true), local("third", false)],
+            &[],
+            None,
+            &[],
+            &t,
+        );
+        let after = flatten(
+            &[
+                local("held", true),
+                local("second", true),
+                local("third", false),
+            ],
+            &[],
+            None,
+            &[],
+            &t,
+        );
+        assert_eq!(
+            ink(&before, b"third"),
+            ink(&after, b"third"),
+            "a branch inserted above moved nobody's ink"
+        );
+        assert_eq!(ink(&after, b"third"), t.name_lane(b"third"));
+        match &after[1] {
+            Row::Local(head) => {
+                assert_eq!(
+                    head.dot.color, t.chrome.accent,
+                    "HEAD sits out of the palette"
+                );
+            }
+            other => panic!("HEAD's row expected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_branch_taken_by_another_worktree_is_marked_and_heads_own_is_not() {
+        let t = Theme::dark();
+        let rows = flatten(
+            &[local("main", true), local("wip", false)],
+            &[],
+            None,
+            &["wip".to_string()],
+            &t,
+        );
+        match (&rows[1], &rows[2]) {
+            (Row::Local(head), Row::Local(wip)) => {
+                assert!(!head.worktree, "HEAD's branch is this worktree's checkout");
+                assert!(wip.worktree, "a branch checked out elsewhere is named");
+            }
+            other => panic!("two local rows expected, got {other:?}"),
+        }
+    }
+
+    /// A pane over `[LOCAL·2] a b [REMOTE·1] origin/a`, three rows tall.
+    fn pane() -> (Branches, Host) {
+        let host = Host::new();
+        let b = Branches::from_prepared(prepare(
+            vec![local("a", true), local("b", false)],
+            vec![remote("a")],
+            None,
+            Vec::new(),
+            &host.theme,
+            "",
+        ));
+        b.rendered.set(3);
+        let mut v = b.view.get();
+        v.set_len(b.data.len());
+        v.set_height(3);
+        b.view.set(v);
+        (b, host)
+    }
+
+    fn at(b: &Branches) -> usize {
+        b.view.get().cursor()
+    }
+
+    // -------------------------------------------------------------- search
+
+    #[test]
+    fn a_query_filters_live_and_the_keyboard_stays_on_its_branch() {
+        let (mut b, _host) = pane();
+        // The keyboard opens on `a` — a name that survives "A", folded, and
+        let anchored = b.current().expect("a branch under the keyboard");
+
+        b.apply_query("  A  ");
+        let v = b.view.get();
+        assert_eq!(
+            v.len(),
+            4,
+            "the two matches plus the two headings of their groups"
+        );
+        assert_eq!(b.filter_note().as_deref(), Some("2/3"));
+        assert_eq!(b.rows(), 4);
+        assert_eq!(
+            b.count(),
+            3,
+            "the filter narrows what is shown, never what is loaded"
+        );
+        // Through the indirection: `current` is the anchored branch, not
+        // whatever now happens to sit at row 1 of a shorter list.
+        assert_eq!(b.current().as_ref(), Some(&anchored));
+
+        // The same query again is no change at all — and rebuilds nothing.
+        let before = Rc::as_ptr(&b.visible);
+        b.apply_query("A ");
+        assert_eq!(b.query(), Some("A"), "trimmed before comparing");
+        assert_eq!(
+            Rc::as_ptr(&b.visible),
+            before,
+            "a no-op query did not rebuild the index"
+        );
+
+        // A changed filter is a movement of attention: the keyboard clamps
+        // into what survives, and an armed delete dies with the question's
+        // row.
+        assert!(!b.confirm_or_arm_delete(&anchored));
+        b.apply_query("nothing matches this");
+        let v = b.view.get();
+        assert_eq!(v.len(), 0);
+        assert!(b.current().is_none());
+        assert_eq!(b.filter_note().as_deref(), Some("0/3"));
+        assert_eq!(b.armed_row(), None, "a changed query disarmed");
+
+        // Clearing puts every row back under the same branch.
+        b.apply_query("");
+        assert_eq!(b.rows(), 5);
+        assert_eq!(b.query(), None);
+        assert_eq!(b.filter_note(), None);
+        assert_eq!(
+            b.current().as_ref(),
+            Some(&anchored),
+            "empty restores instantly, cursor included"
+        );
+    }
+
+    #[test]
+    fn the_cursor_opens_on_the_first_branch_and_never_rests_on_a_heading() {
+        let (mut b, host) = pane();
+        // Row 0 is `LOCAL`; the keyboard starts under it.
+        assert_eq!(at(&b), 1);
+        assert_eq!(b.current(), Some(Target::Local(RefName::from("a"))));
+
+        // `j` twice: b, then over the `REMOTE` heading onto origin/a.
+        assert!(b.run_view("view.down", &host));
+        assert_eq!(at(&b), 2);
+        assert!(b.run_view("view.down", &host));
+        assert_eq!(at(&b), 4, "down skipped the heading in its own direction");
+
+        // `k` back: over the heading again, landing on b.
+        assert!(b.run_view("view.up", &host));
+        assert_eq!(at(&b), 2, "up skipped the heading in its own direction");
+
+        // `k` from the first branch lands on `LOCAL`, which is the edge —
+        // so it settles forward and the cursor stays where it was.
+        assert!(b.run_view("view.up", &host));
+        assert!(b.run_view("view.up", &host));
+        assert_eq!(at(&b), 1, "the top heading is not a resting place");
+
+        // Jumps obey the same rule: `gg` is the first branch, `G` the last.
+        assert!(b.run_view("view.bottom", &host));
+        assert_eq!(at(&b), 4);
+        assert!(b.run_view("view.top", &host));
+        assert_eq!(at(&b), 1);
+    }
+
+    #[test]
+    fn a_refresh_that_strands_the_cursor_on_a_heading_steps_off_it() {
+        let (mut b, host) = pane();
+        // Onto b.
+        assert!(b.run_view("view.down", &host));
+        // b vanishes and a remote arrives at its place in the list: the
+        // clamped row is now the `REMOTE` heading, and the cursor may not
+        // stay there.
+        b.replace_prepared(
+            prepare(
+                vec![local("a", true)],
+                vec![remote("a"), remote("b")],
+                None,
+                vec![],
+                &host.theme,
+                "",
+            ),
+            &host,
+        );
+        assert!(
+            b.current().is_some(),
+            "the cursor rests on a heading after a refresh: row {}",
+            at(&b)
+        );
+    }
+
+    #[test]
+    fn settle_is_the_identity_off_a_heading_and_survives_a_heading_only_list() {
+        let t = Theme::dark();
+        let rows = flatten(&[local("a", true)], &[remote("a")], None, &[], &t);
+        for i in [1, 3] {
+            assert_eq!(super::settle(&rows, i, 1), i);
+            assert_eq!(super::settle(&rows, i, -1), i);
+        }
+        // Nothing to settle onto: the input comes back, and nothing panics.
+        let only = vec![Row::Heading {
+            count: "0".into(),
+            section: super::Section::Local,
+        }];
+        assert_eq!(super::settle(&only, 0, 1), 0);
+        assert_eq!(super::settle(&only, 0, -1), 0);
+        assert_eq!(super::settle(&[], 0, 1), 0);
+    }
+
+    #[test]
+    fn a_click_moves_the_cursor_to_the_row_it_hit_and_disarms_a_delete() {
+        let host = Host::new();
+        let mut b = Branches::from_prepared(prepare(
+            vec![local("feature", false), local("main", true)],
+            Vec::new(),
+            None,
+            Vec::new(),
+            &host.theme,
+            "",
+        ));
+        b.rendered.set(3);
+        let mut v = b.view.get();
+        v.set_len(b.data.len());
+        v.set_height(3);
+        b.view.set(v);
+
+        // The keyboard opens on `feature`, past the heading. A click on
+        // `main` — row 2 — is a place: the cursor lands there.
+        b.select_row(2, &host);
+        assert_eq!(
+            b.view.get().cursor(),
+            2,
+            "the keyboard is on the clicked row"
+        );
+
+        // And the click is a cursor move like any other: an armed delete dies.
+        let target = b.current().expect("a branch under the keyboard");
+        assert!(!b.confirm_or_arm_delete(&target));
+        assert_eq!(b.armed_row(), Some(target.clone()));
+
+        // A click on the heading — row 0 — selects nothing: the cursor snaps
+        // to the nearest selectable row below, and the question stays gone.
+        b.select_row(0, &host);
+        assert_eq!(b.armed_row(), None, "the click disarms the question");
+        assert_eq!(
+            b.view.get().cursor(),
+            1,
+            "the cursor never rests on a heading"
+        );
+    }
+}

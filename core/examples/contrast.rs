@@ -119,20 +119,49 @@ fn report(t: &Theme) {
         t.min_contrast,
     );
 
-    println!("  -- chrome --");
-    for (name, fg) in [
-        ("fg", c.fg),
-        ("dim", c.dim),
-        ("faint", c.faint),
-        ("accent", c.accent),
-        ("error", c.error),
+    println!("  -- chrome: text inks on the strips they are drawn on --");
+    for (name, fg) in [("fg", c.fg), ("accent", c.accent), ("error", c.error)] {
+        for (bg_name, bg) in [
+            ("bg", c.bg),
+            ("title_bg", c.title_bg),
+            ("status_bg", c.status_bg),
+            ("selection_bg", c.selection_bg),
+        ] {
+            row(
+                &format!("{name} on {bg_name}"),
+                contrast(fg, bg),
+                t.min_contrast,
+            );
+        }
+    }
+    // `dim` is resolved per surface, for the reason the strips are surfaces:
+    // raw, it clears the text floor on `bg` alone. What is drawn is the table,
+    // so the table is what is measured — with the raw value beside it, `*`ed
+    // the same way the gutter's unlifted row is.
+    row("dim, unlifted", contrast(c.dim, c.bg), t.min_contrast);
+    for s in Surface::ALL {
+        let got = contrast(t.dim_on(s), t.background(s));
+        row(&format!("dim on {s:?}"), got, t.min_contrast);
+    }
+
+    println!("  -- quiet, resolved against the background it sits on --");
+    for (name, bg) in [
+        ("bg", c.bg),
+        ("title_bg", c.title_bg),
+        ("status_bg", c.status_bg),
     ] {
-        row(&format!("{name} on bg"), contrast(fg, c.bg), 0.0);
+        row(
+            &format!("quiet on {name}"),
+            contrast(t.quiet_on(bg), bg),
+            t.min_furniture,
+        );
     }
     for (name, bg) in [
         ("title_bg", c.title_bg),
         ("status_bg", c.status_bg),
         ("border", c.border),
+        ("raised", c.raised),
+        ("keycap", c.keycap),
         ("selection_bg", c.selection_bg),
     ] {
         row(&format!("{name} vs bg"), contrast(bg, c.bg), 0.0);
@@ -151,6 +180,38 @@ fn report(t: &Theme) {
     .map(|bg| contrast(c.selected_bg, bg))
     .fold(f32::MAX, f32::min);
     row("selected_bg, worst row", worst, 1.05);
+
+    println!("  -- markdown --");
+    // Below the floor raw, and marked for it: a bullet is furniture drawn on
+    // whichever row the prose landed on, and the lifted value is what is drawn.
+    row(
+        "marker, unlifted",
+        contrast(t.markdown.marker, ctx),
+        t.min_furniture,
+    );
+    for s in Surface::ALL {
+        let got = contrast(t.marker_on(s), t.background(s));
+        row(&format!("marker on {s:?}"), got, t.min_furniture);
+    }
+    for (name, v) in [
+        ("code_bar", t.markdown.code_bar),
+        ("quote_bar", t.markdown.quote_bar),
+        ("rule", t.markdown.rule),
+    ] {
+        row(&format!("{name} vs context"), contrast(v, ctx), 0.0);
+    }
+
+    println!("  -- graph --");
+    for (i, lane) in t.lanes.iter().enumerate() {
+        row(&format!("lane {i}"), contrast(*lane, c.bg), t.min_furniture);
+    }
+    // `lane_overflow` is a stroke with no legibility floor by decision 0020 —
+    // its dimness is the point — so it is measured for the record, not gated.
+    row(
+        "lane_overflow, exempt (0020)",
+        contrast(t.lane_overflow, c.bg),
+        0.0,
+    );
 
     println!("  -- furniture, as written and then resolved per surface --");
     // Below the floor on purpose and marked `*` for it: what a theme *chooses*

@@ -105,7 +105,7 @@ fn main() {
                 repo => {
                     let spec = rest.unwrap_or_default();
                     match gitten_git::diff(
-                        &PathBuf::from(repo),
+                        gitten_git::open(&PathBuf::from(repo)).as_ref(),
                         &spec,
                         &host.differ,
                         &Default::default(),
@@ -129,7 +129,7 @@ fn main() {
             let frames = number("FRAMES", 50);
             let t = Instant::now();
             for _ in 0..frames {
-                view.paint(&mut screen, 0, &host, &mut out);
+                view.paint(&mut screen, 0, 0, true, &host, &mut out);
             }
             eprintln!(
                 "load {load:.0?} · frame {:.0?} · {} rows",
@@ -149,7 +149,7 @@ fn main() {
                 }
                 repo => {
                     let limit = rest.and_then(|n| n.parse().ok()).unwrap_or(5000);
-                    match gitten_git::log(&PathBuf::from(repo), limit) {
+                    match gitten_git::open(&PathBuf::from(repo)).log(limit) {
                         Ok(c) => c,
                         Err(e) => {
                             eprintln!("gitten: {e}");
@@ -166,7 +166,11 @@ fn main() {
             let frames = number("FRAMES", 50);
             let t = Instant::now();
             for _ in 0..frames {
-                view.paint(&mut screen, 0, &host);
+                view.paint(&mut screen, 0, 0, true, &host);
+                // The bar's column is the app's, not the pane's: this example
+                // is one pane over the whole body, so its boundary is the
+                // screen's edge — the rail the paint loop would choose.
+                view.paint_bar(&mut screen, cols - 1, None, 0, &host);
             }
             eprintln!(
                 "load {load:.0?} · frame {:.0?} · {} commits",

@@ -33,11 +33,22 @@
 //! --graph`'s spacing, and the reason a diagonal is expressible at all: with one
 //! column per lane there is nowhere to put the `─` that says two lanes are
 //! joined.
+//!
+//! # Filtering, and what a row number names
+//!
+//! `/` filters the list through [`gitten_core::search::Index`], and the full
+//! commits stay resident: the viewport's row numbers address the *visible*
+//! table, and one lookup at the end of every reader — cursor, copy, mouse,
+//! paint — maps back to the source vector. That is the window's order table
+//! (`shell/src/views/commits.rs`) reduced to a terminal's shape, and it is why
+//! filtering cannot desync what the cursor names from what is drawn, copied or
+//! opened. Search itself runs on edits only, never in a frame.
 
 use crate::screen::{Ink, Pen, Screen};
 use crate::scrollbar::{self, Bar};
 use gitten_core::graph::{lane_count, Hues, MAX_LANES};
 use gitten_core::host::Host;
+use gitten_core::search::Index;
 use gitten_core::theme::{Rgb, Theme};
 use gitten_core::view::Viewport;
 use gitten_core::{assign_lanes, initials, Commit, GraphRow};
@@ -156,16 +167,35 @@ struct Draw {
 pub struct Commits {
     commits: Vec<Commit>,
     draws: Vec<Draw>,
+    /// Every commit's search text, folded once at load — see
+    /// [`gitten_core::search::Index`]. Keystrokes fold only their own needle
+    /// and scan; nothing here lowercases on the way to a frame.
+    search: Index,
+    /// The standing query, `None` when the list is whole. Always the *trimmed*
+    /// text, so a query of only spaces is no query — the same normalisation
+    /// [`Commits::apply_query`] applies.
+    query: Option<String>,
+    /// Which source rows the viewport can see, ascending: the one
+    /// visible-to-source table every row reader goes through. Unfiltered it is
+    /// `0..len` and each lookup costs one indirection; filtered it is what
+    /// [`Index::indices`] answered for the query.
+    ///
+    /// Row numbers below this table — the cursor, the selection, the
+    /// scrollbar, everything [`Viewport`] holds — are rows of the *visible*
+    /// list, and only the final lookup names a commit. That is what keeps
+    /// open-diff, copy, the mouse and painting all agreeing with the cursor
+    /// under a filter, and it is the same shape the window keeps in
+    /// `shell/src/views/commits.rs`.
+    visible: Vec<usize>,
     glyphs: Glyphs,
     /// The honest lane count, uncapped, for the status line.
     lanes: usize,
-    /// Widest gutter of any row, so the subject column starts in the same place
-    /// down the whole list.
-    ///
-    /// Per-row widths are what the window does, because it can scroll a
-    /// container wider than itself; a terminal cannot, and a subject that starts
-    /// in a different column on every row is a list the eye cannot scan. So the
-    /// gutter is one width and it is this one.
+    /// Widest gutter of any row — the lane cap's yardstick, and nothing
+    /// more: the subject hugs each row's own graph, the window's layout,
+    /// so a row's text starts right after the lanes that row actually
+    /// drew. The cost — a subject column that wanders row to row — is the
+    /// owner's accepted trade for never shipping a run of dead cells
+    /// between a narrow graph and its name.
     gutter: usize,
     cols: usize,
     /// The cursor, the top row and the height. [`gitten_core::view::Viewport`]
@@ -183,14 +213,10 @@ pub struct Commits {
     /// [`Commits::selection`] decides what a commit copies as.
     ///
     /// `None` means "just the row the cursor is on", which is what makes the copy
-    /// key useful before the mouse has been touched at all. Held here rather than
-    /// read off the cursor, because the wheel moves the cursor when it has to and
-    /// a selection that grew while you scrolled is one you would paste without
-    /// meaning to. A keyboard *move* clears it outright, for the same reason.
+    /// key useful before the mouse has been touched at all. A dragged range is
+    /// held here rather than inferred again, and a keyboard *move* clears it.
     sel: Option<(usize, usize)>,
     dragging: bool,
-    /// Where in the scrollbar's thumb it was taken hold of, while it is held.
-    grabbed: Option<usize>,
 }
 
 impl Commits {
@@ -209,15 +235,22 @@ impl Commits {
         let rows = assign_lanes(&commits);
         let lanes = lane_count(&rows);
         let draws = draws(&commits, &rows);
-        // The widest *row*, not the widest lane index: a row's gutter is only as
+        // Widest *row*, not the widest lane index: a row's gutter is only as
         // wide as its own lanes, and the trunk-only rows of a busy repository
         // are the majority.
         let gutter = draws.iter().map(|d| d.lanes * LANE_W).max().unwrap_or(0);
+        // Search text folded beside the rest of the load work, and the whole
+        // list visible to start.
+        let search = Index::new(&commits);
+        let visible = Vec::from_iter(0..commits.len());
         let mut view = Viewport::new();
-        view.set_len(commits.len());
+        view.set_len(visible.len());
         Self {
             commits,
             draws,
+            search,
+            visible,
+            query: None,
             glyphs,
             lanes,
             gutter,
@@ -226,10 +259,12 @@ impl Commits {
             bar: Bar::default(),
             sel: None,
             dragging: false,
-            grabbed: None,
         }
     }
 
+    /// How many commits were loaded, whatever a filter shows. Not the count the
+    /// viewport addresses — that is the visible list's length, and one number
+    /// meaning both would be ambiguous under a query.
     pub fn len(&self) -> usize {
         self.commits.len()
     }
@@ -247,13 +282,80 @@ impl Commits {
     }
 
     /// The commit under the cursor, for whatever opens a diff from it.
+    ///
+    /// Through the visible table and not `commits[cursor]`: the cursor is a row
+    /// of the *filtered* list, and under a query those are not the same
+    /// position. Everything that acts on "this commit" — open-diff, copy —
+    /// reads through here, which is why filtering cannot desync them.
     pub fn current(&self) -> Option<&Commit> {
-        self.commits.get(self.view.cursor())
+        self.commits.get(*self.visible.get(self.view.cursor())?)
     }
 
     pub fn resize(&mut self, cols: usize, height: usize) {
         self.cols = cols;
         self.view.set_height(height);
+    }
+
+    // ----------------------------------------------------------------- search
+
+    /// The live query, for pre-filling a second `/`. `None` when unfiltered.
+    pub fn query(&self) -> Option<&str> {
+        self.query.as_deref()
+    }
+
+    /// The filter while one stands, for a status line: `15/30` — hits over
+    /// loaded. `None` unfiltered, so a note is only drawn when there is one.
+    pub fn filter_note(&self) -> Option<String> {
+        self.query
+            .is_some()
+            .then(|| format!("{}/{}", self.visible.len(), self.commits.len()))
+    }
+
+    /// Sets the filter — once per keystroke, and never anywhere else. The
+    /// visible table is rebuilt here and read everywhere else.
+    ///
+    /// The keyboard stays on the commit it was on: anchored by full sha into
+    /// the next result set wherever it survives the narrower query, and left
+    /// clamped onto the last surviving row when it does not. An empty (or
+    /// whitespace-only) query is no query, so clearing restores the whole list;
+    /// the same trimmed query twice does nothing, so a keystroke that changes
+    /// nothing rebuilds nothing.
+    ///
+    /// A selection is dropped whenever the result set changes: its ends are
+    /// rows of the *visible* list, and a range named against yesterday's table
+    /// would read as different commits under today's.
+    pub fn apply_query(&mut self, query: &str) {
+        let next = Some(query.trim()).filter(|q| !q.is_empty());
+        if self.query.as_deref() == next {
+            return;
+        }
+        // Anchor first: named by sha, because row numbers are about to stop
+        // meaning anything.
+        let anchored = self
+            .visible
+            .get(self.view.cursor())
+            .and_then(|&i| self.commits.get(i))
+            .map(|c| c.sha.clone());
+
+        self.query = next.map(str::to_string);
+        self.visible = match &self.query {
+            Some(q) => self.search.indices(q),
+            None => Vec::from_iter(0..self.commits.len()),
+        };
+        self.sel = None;
+        self.dragging = false;
+        // `set_len` clamps the cursor onto the surviving rows; the anchor, where
+        // it survived, is put back by name.
+        self.view.set_len(self.visible.len());
+        let cursor = anchored
+            .as_deref()
+            .and_then(|sha| {
+                self.visible
+                    .iter()
+                    .position(|&i| self.commits[i].sha == sha)
+            })
+            .unwrap_or_else(|| self.view.cursor());
+        self.view.go_to(cursor);
     }
 
     pub fn move_by(&mut self, by: isize) {
@@ -274,9 +376,9 @@ impl Commits {
         self.view.page(pages);
     }
 
-    /// Scrolls without moving the cursor further than it has to go. The wheel.
+    /// Scrolls the viewport without moving the cursor. The wheel.
     pub fn scroll_y(&mut self, by: isize) {
-        self.view.scroll_by(by);
+        self.view.pan_by(by);
     }
 
     /// How much lead the cursor keeps at the edge. `[view] scrolloff`.
@@ -300,6 +402,47 @@ impl Commits {
         self.view.go_to(row);
     }
 
+    /// Swaps in a refreshed list, keeping the selection by identity.
+    ///
+    /// A write moves rows — a commit added above shifts every row down one —
+    /// but the commit the keyboard is on survives more often than its row does,
+    /// so the cursor is anchored by **sha** and not by number. When it survives,
+    /// the view follows it; when it does not, the previous position is clamped
+    /// into whatever the new list can hold. That is the shared
+    /// [`Viewport`] doing the clamping, and nothing here assigns an index the
+    /// list has not blessed.
+    ///
+    /// Glyphs, dimensions and the scrollbar are untouched: the refresh changes
+    /// what the list holds, never how it draws.
+    pub fn replace(&mut self, commits: Vec<Commit>) {
+        let sha = self.current().map(|c| c.sha.clone());
+        let (cursor, top) = (self.view.cursor(), self.view.top());
+        // A drag's range was a promise about rows the refresh may have
+        // renumbered. It is the mouse's, and the mouse has let go.
+        self.sel = None;
+        self.dragging = false;
+        self.commits = commits;
+        let rows = assign_lanes(&self.commits);
+        self.lanes = lane_count(&rows);
+        self.draws = draws(&self.commits, &rows);
+        self.gutter = self
+            .draws
+            .iter()
+            .map(|d| d.lanes * LANE_W)
+            .max()
+            .unwrap_or(0);
+        // The old scroll position first, then the anchor: `go_to` drags the
+        // viewport after the cursor, and the surviving sha's row must be the
+        // one on screen when it survives — restoring the top last could drag
+        // the cursor off the very row it was kept for.
+        self.view.set_len(self.commits.len());
+        self.view.scroll_to(top);
+        let at = sha
+            .and_then(|s| self.commits.iter().position(|c| c.sha == s))
+            .unwrap_or(cursor);
+        self.view.go_to(at);
+    }
+
     // ---------------------------------------------------------------- the mouse
 
     /// The glyphs the scrollbar is drawn with. `--ascii`, or an extension.
@@ -310,9 +453,10 @@ impl Commits {
     /// Which commits are selected: the drag's range, or the row the cursor is on.
     ///
     /// Never empty on a non-empty list, which is what makes `y` copy this commit
-    /// before anything has been dragged.
+    /// before anything has been dragged. Rows of the visible list — [`Commits::lines`]
+    /// maps them through the table, so a filtered list copies only what is shown.
     pub fn selected(&self) -> std::ops::Range<usize> {
-        if self.commits.is_empty() {
+        if self.visible.is_empty() {
             return 0..0;
         }
         let cursor = self.view.cursor();
@@ -325,12 +469,7 @@ impl Commits {
     /// `row` is a row of the body, and `extend` is shift — which moves the free
     /// end of the range rather than starting a new one, so a range longer than
     /// the screen needs no drag that has to scroll.
-    pub fn press(&mut self, col: usize, row: usize, extend: bool, host: &Host) {
-        if scrollbar::hit(col, self.cols, &self.view, host) {
-            let row = row.min(self.view.height().saturating_sub(1));
-            self.grabbed = Some(scrollbar::grab(&mut self.view, host, row));
-            return;
-        }
+    pub fn press(&mut self, _col: usize, row: usize, extend: bool, _host: &Host) {
         let Some(index) = self.view.row_at(row) else {
             return;
         };
@@ -345,11 +484,7 @@ impl Commits {
 
     /// The pointer moved with the button down. A row above or below the body
     /// scrolls by the overshoot and keeps selecting, exactly as in the diff.
-    pub fn drag(&mut self, row: isize, host: &Host) {
-        if let Some(grabbed) = self.grabbed {
-            scrollbar::drag(&mut self.view, host, row.max(0) as usize, grabbed);
-            return;
-        }
+    pub fn drag(&mut self, row: isize, _host: &Host) {
         if !self.dragging {
             return;
         }
@@ -376,16 +511,16 @@ impl Commits {
 
     pub fn release(&mut self) {
         self.dragging = false;
-        self.grabbed = None;
     }
 
     /// `select.all`.
     pub fn select_all(&mut self) {
-        if self.commits.is_empty() {
+        if self.visible.is_empty() {
             return;
         }
-        self.view.go_to(self.commits.len() - 1);
-        self.sel = Some((0, self.commits.len() - 1));
+        let last = self.visible.len() - 1;
+        self.view.go_to(last);
+        self.sel = Some((0, last));
     }
 
     /// `select.none`. Says whether there was a range to drop, so `esc` can fall
@@ -422,16 +557,32 @@ impl Commits {
     /// the initials — a column of box drawing is not a thing anybody pastes, and
     /// the two fields left are the ones that name the commit to git and to a
     /// person.
+    ///
+    /// `rows` names visible rows, mapped through the table here — the one
+    /// lookup that turns a viewport row back into a commit, so a copy under a
+    /// query names the commits on screen and nothing that was filtered out.
     fn lines(&self, rows: std::ops::Range<usize>) -> String {
-        self.commits[rows.start..rows.end.min(self.commits.len())]
+        self.visible[rows.start..rows.end.min(self.visible.len())]
             .iter()
-            .map(|c| format!("{} {}", c.short, c.subject))
+            .map(|&i| {
+                let c = &self.commits[i];
+                format!("{} {}", c.short, c.subject)
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
 
-    /// Draws the visible rows into `screen`, starting at row `y`.
-    pub fn paint(&self, screen: &mut Screen, y: usize, host: &Host) {
+    /// Draws the visible rows into `screen`, at `x` of row `y` onward, inside
+    /// this pane's own columns.
+    ///
+    /// Every row is taken through [`Screen::span`], never [`Screen::row`]:
+    /// the pane is a guest in the row, and a long subject that wrote to the
+    /// whole screen would overwrite the divider and whatever sits beside it.
+    /// draws only when this pane holds the keyboard — `focused` is the
+    /// caller's answer, not something the view knows — while
+    /// a dragged selection keeps its ink either way, because
+    /// focus moves the caret and never what the mouse is holding.
+    pub fn paint(&self, screen: &mut Screen, x: usize, y: usize, focused: bool, host: &Host) {
         let theme = &host.theme;
         let blank = Ink::new(theme.chrome.dim, theme.chrome.bg);
         // A range of one is the cursor and nothing more, so a click looks exactly
@@ -442,30 +593,48 @@ impl Commits {
         };
         for i in 0..self.view.height() {
             let row = y + i;
-            let Some(index) = self.view.row_at(i) else {
-                screen.row(row).wash(blank);
+            // Two lookups, and both have to be read: `row_at` is the viewport
+            // row, which the cursor and the selection address, and `visible`
+            // names the commit it stands for.
+            let Some(vis) = self.view.row_at(i) else {
+                screen.span(row, x, self.cols).wash(blank);
                 continue;
             };
-            let bg = match (index == self.view.cursor(), selected.contains(&index)) {
+            let Some(&index) = self.visible.get(vis) else {
+                screen.span(row, x, self.cols).wash(blank);
+                continue;
+            };
+            let bg = match (
+                focused && vis == self.view.cursor(),
+                selected.contains(&vis),
+            ) {
                 (true, _) => theme.chrome.selection_bg,
                 (false, true) => theme.chrome.selected_bg,
                 (false, false) => theme.chrome.bg,
             };
-            let mut pen = screen.row(row);
+            let mut pen = screen.span(row, x, self.cols);
             self.row(&mut pen, index, bg, theme);
         }
-        scrollbar::paint(
-            screen,
-            self.bar,
-            self.cols.saturating_sub(1),
-            y,
-            &self.view,
-            host,
-        );
+    }
+
+    /// The bar at the edge geometry [`App::paint_scrollbar`] hands it. The
+    /// pane does not choose.
+    pub fn paint_bar(
+        &self,
+        screen: &mut Screen,
+        x: usize,
+        divider: Option<usize>,
+        y: usize,
+        host: &Host,
+    ) {
+        scrollbar::paint(screen, self.bar, x, divider, y, &self.view, host);
     }
 
     /// lazygit's order — sha, author, graph, subject — because the graph is the
     /// column that changes width and putting it last would move the subject.
+    ///
+    /// `index` is a *source* index: [`Commits::paint`] has already consulted the
+    /// visible table and hands over the commit it names.
     fn row(&self, pen: &mut Pen, index: usize, bg: Rgb, theme: &Theme) {
         let c = &self.commits[index];
         let d = &self.draws[index];
@@ -479,11 +648,10 @@ impl Commits {
             .put(&d.initials, Ink::new(theme.author(&c.author), bg));
         pen.put(" ", dim);
 
-        let after = pen.col() + self.gutter;
+        // The subject hugs the row's own graph — the window's per-row
+        // layout. One space after the lanes this row drew, however wide
+        // the busiest row in the history is.
         self.gutter(pen, d, bg, theme);
-        // One width for the whole list, so the subject starts in the same column
-        // on every row even though each row's graph is only as wide as its own.
-        pen.seek(after);
         pen.put(" ", Ink::new(theme.chrome.fg, bg));
         pen.put(&c.subject, Ink::new(theme.chrome.fg, bg));
         pen.wash(Ink::new(theme.chrome.fg, bg));
@@ -582,12 +750,14 @@ impl Commits {
 
     /// One line describing the list, for whatever draws a status bar. The lane
     /// count is the uncapped one: "280 lanes" is worth knowing when twelve are
-    /// drawn.
+    /// drawn. Position is counted over the *visible* rows — what the cursor
+    /// addresses — while `filter_note` is what says the list is narrower than
+    /// what was loaded.
     pub fn status(&self) -> String {
         let mut out = format!(
             "{}/{} · {} lanes",
-            (self.view.cursor() + 1).min(self.commits.len()),
-            self.commits.len(),
+            (self.view.cursor() + 1).min(self.visible.len()),
+            self.visible.len(),
             self.lanes,
         );
         if self.lanes > MAX_LANES {
@@ -682,7 +852,7 @@ r\x1frrrrrrr\x1f\x1fAda Lovelace\x1f1700000100\x1fRoot\x1e";
     fn painted(c: &Commits, host: &Host) -> Vec<String> {
         let mut screen = Screen::new(c.cols, c.view.height() + 2);
         screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
-        c.paint(&mut screen, 0, host);
+        c.paint(&mut screen, 0, 0, true, host);
         (0..c.view.height()).map(|y| screen.row_text(y)).collect()
     }
 
@@ -696,6 +866,32 @@ r\x1frrrrrrr\x1f\x1fAda Lovelace\x1f1700000100\x1fRoot\x1e";
                 };
                 format!(
                     "c{i}\x1fc{i:06}\x1f{parent}\x1fAda Lovelace\x1f17000000{i:02}\x1fCommit {i}\x1e"
+                )
+            })
+            .collect()
+    }
+
+    /// A linear history of `n` commits alternating half by author and half by
+    /// subject — even rows are Ada/engine, odd rows Grace/compiler — so one
+    /// query hits exactly half of either. The window's search fixture, spelled
+    /// for [`parse_log`].
+    fn mixed(n: usize) -> String {
+        (0..n)
+            .map(|i| {
+                let even = i % 2 == 0;
+                let sha = format!("{i:08}");
+                let parent = match i + 1 < n {
+                    true => format!("{:08}", i + 1),
+                    false => String::new(),
+                };
+                format!(
+                    "{sha}\x1f{sha}\x1f{parent}\x1f{}\x1f1\x1f{}\x1e",
+                    if even { "Ada Lovelace" } else { "Grace Hopper" },
+                    if even {
+                        format!("engine note {i}")
+                    } else {
+                        format!("compiler pass {i}")
+                    },
                 )
             })
             .collect()
@@ -721,8 +917,8 @@ r\x1frrrrrrr\x1f\x1fAda Lovelace\x1f1700000100\x1fRoot\x1e";
 
     #[test]
     fn the_wheel_keeps_a_dragged_range_and_a_keyboard_move_drops_it() {
-        // The wheel drags the cursor along when it has to, so a range read off
-        // the cursor would silently grow while you were only looking around.
+        // The viewport and cursor are independent, and an explicit dragged
+        // range stays independent of both.
         let (mut c, host) = view(&many(50), 60, 6);
         c.press(20, 0, false, &host);
         c.drag(2, &host);
@@ -759,7 +955,7 @@ r\x1frrrrrrr\x1f\x1fAda Lovelace\x1f1700000100\x1fRoot\x1e";
         c.press(20, 0, false, &host);
         let mut screen = Screen::new(c.cols, 4);
         screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
-        c.paint(&mut screen, 0, &host);
+        c.paint(&mut screen, 0, 0, true, &host);
         assert_eq!(screen.ink(0, 0).unwrap().bg, host.theme.chrome.selection_bg);
         assert_eq!(
             screen.ink(0, 1).unwrap().bg,
@@ -768,7 +964,7 @@ r\x1frrrrrrr\x1f\x1fAda Lovelace\x1f1700000100\x1fRoot\x1e";
         );
         // Now a real drag: the rows behind the cursor take the selected colour.
         c.drag(2, &host);
-        c.paint(&mut screen, 0, &host);
+        c.paint(&mut screen, 0, 0, true, &host);
         assert_eq!(screen.ink(0, 1).unwrap().bg, host.theme.chrome.selected_bg);
         assert_eq!(
             screen.ink(0, 2).unwrap().bg,
@@ -788,20 +984,20 @@ r\x1frrrrrrr\x1f\x1fAda Lovelace\x1f1700000100\x1fRoot\x1e";
     }
 
     #[test]
-    fn the_scrollbar_takes_a_click_and_the_list_does_not() {
+    fn the_bar_column_is_the_row_under_it_and_the_list_does_not_jump() {
         let (mut c, host) = view(&many(200), 60, 10);
-        c.press(59, 9, false, &host);
-        assert_eq!(c.top(), 190, "the end of the track is the end of the list");
-        assert_eq!(c.cursor(), c.cursor().min(199));
-        c.drag(0, &host);
-        assert_eq!(c.top(), 0);
+        // The bar is an indicator: a press on its column is a press on the
+        // row underneath, like any other column, and nothing about the bar
+        // itself scrolls or grabs.
+        let top = c.top();
+        c.press(59, 4, false, &host);
+        assert_eq!(c.top(), top, "a press on the bar column did not scroll");
+        assert_eq!(
+            c.selected(),
+            4..5,
+            "it selected the row under the bar, as a column of text"
+        );
         c.release();
-        // And it is drawn where it was clicked.
-        let mut screen = Screen::new(60, 10);
-        screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
-        c.paint(&mut screen, 0, &host);
-        assert_eq!(screen.char_at(59, 0), Some('█'));
-        assert_eq!(screen.char_at(59, 9), Some('│'));
     }
 
     #[test]
@@ -818,9 +1014,10 @@ r\x1frrrrrrr\x1f\x1fAda Lovelace\x1f1700000100\x1fRoot\x1e";
     }
 
     #[test]
-    fn the_subject_starts_in_the_same_column_on_every_row() {
-        // A terminal cannot scroll a container wider than itself, so a per-row
-        // gutter would put the subject in a different column on every line.
+    fn the_subject_hugs_the_rows_own_graph() {
+        // The window's layout: one space after the lanes this row drew,
+        // so a trunk row's subject sits left of a merge row's — and no
+        // row ships dead cells between its graph and its name.
         let (c, host) = view(LOG, 60, 4);
         let rows = painted(&c, &host);
         // Display columns, not bytes: box drawing is three bytes a glyph, so a
@@ -828,11 +1025,24 @@ r\x1frrrrrrr\x1f\x1fAda Lovelace\x1f1700000100\x1fRoot\x1e";
         // shape rather than by its width.
         let at =
             |row: &String, word: &str| crate::screen::width(&row[..row.find(word).expect(word)]);
-        let first = at(&rows[0], "Merge branch");
-        assert_eq!(first, 16, "{:?}", rows[0]);
-        assert_eq!(at(&rows[1], "On the trunk"), first);
-        assert_eq!(at(&rows[2], "On a branch"), first);
-        assert_eq!(at(&rows[3], "Root"), first);
+        // SHA_W + WHO_W of furniture, then the row's own lanes × 2, then
+        // the separating space — whatever each row's graph needs, with no
+        // fixed column and no dead cells between graph and name.
+        for (i, row) in rows.iter().enumerate() {
+            let word = match i {
+                0 => "Merge branch",
+                1 => "On the trunk",
+                2 => "On a branch",
+                _ => "Root",
+            };
+            assert_eq!(
+                at(row, word),
+                11 + c.draws[i].lanes * LANE_W + 1,
+                "row {i} ({:?}): {:?}",
+                c.draws[i].lanes,
+                row
+            );
+        }
     }
 
     #[test]
@@ -894,7 +1104,7 @@ r\x1fr\x1f\x1fA\x1f1\x1froot\x1e";
         let (c, host) = view(LOG, 60, 4);
         let mut screen = Screen::new(60, 4);
         screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
-        c.paint(&mut screen, 0, &host);
+        c.paint(&mut screen, 0, 0, true, &host);
         // The trunk is the first colour the wheel hands out.
         let dot = (0..60)
             .find(|x| screen.char_at(*x, 1) == Some('●'))
@@ -927,7 +1137,7 @@ r\x1fr\x1f\x1fA\x1f1\x1froot\x1e";
         );
         let mut screen = Screen::new(120, 8);
         screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
-        c.paint(&mut screen, 0, &host);
+        c.paint(&mut screen, 0, 0, true, &host);
         let last = SHA_W + WHO_W + (MAX_LANES - 1) * LANE_W;
         assert_eq!(screen.ink(last, 0).unwrap().fg, host.theme.lane_overflow);
     }
@@ -949,7 +1159,7 @@ r\x1fr\x1f\x1fA\x1f1\x1froot\x1e";
         assert!(!c.status().contains("drawn"), "{}", c.status());
         let mut screen = Screen::new(120, 4);
         screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
-        c.paint(&mut screen, 0, &host);
+        c.paint(&mut screen, 0, 0, true, &host);
         let last = SHA_W + WHO_W + (MAX_LANES - 1) * LANE_W;
         assert_ne!(screen.ink(last, 0).unwrap().fg, host.theme.lane_overflow);
     }
@@ -976,11 +1186,128 @@ r\x1fr\x1f\x1fA\x1f1\x1froot\x1e";
         c.down();
         let mut screen = Screen::new(60, 4);
         screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
-        c.paint(&mut screen, 0, &host);
+        c.paint(&mut screen, 0, 0, true, &host);
         let bar = host.theme.chrome.selection_bg;
         assert_eq!(screen.ink(0, 1).unwrap().bg, bar);
         assert_eq!(screen.ink(59, 1).unwrap().bg, bar);
         assert_ne!(screen.ink(0, 0).unwrap().bg, bar);
+    }
+
+    /// The clamp, the page and the margin are
+    /// [`gitten_core::view::Viewport`]'s and are tested there, over a viewport
+    /// and no commits at all. What is this list's is the row the rules land on
+    /// meaning a *commit* — everything that opens a diff, copies a sha or names
+    /// a rebase target reads `current`, and a cursor that is right while
+    /// `current` is off by one is the bug none of those would survive.
+    #[test]
+    fn each_pane_clips_to_its_span_and_owns_its_scrollbar() {
+        // The pane is a guest in the row: it draws from column 20 for 30
+        // columns, and the divider on either side of it — and the pane that
+        // owns the rest of the screen — must survive a subject far longer
+        // than the pane is wide. Long enough to scroll, so the bar is there
+        // to be owned.
+        let long = "subject ".repeat(12);
+        let mut log = format!("l\x1flllllll\x1fc1\x1fAda Lovelace\x1f1700000000\x1f{long}\x1e");
+        for i in 1..200 {
+            let parent = format!("c{}", i + 1);
+            log.push_str(&format!(
+                "c{i}\x1fc{i:06}\x1f{parent}\x1fAda Lovelace\x1f17000000{i:02}\x1fCommit {i}\x1e"
+            ));
+        }
+        let (mut c, host) = view(&log, 30, 4);
+        c.press(10, 0, false, &host); // a cursor, to paint ink
+        let mut screen = Screen::new(60, 5);
+        screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
+        // Sentinels on the divider columns, so anything painted outside the
+        // pane's span is visible rather than merely absent.
+        for y in 0..5 {
+            screen.over(19, y, '╎', host.theme.chrome.accent);
+            screen.over(50, y, '╎', host.theme.chrome.accent);
+        }
+        c.paint(&mut screen, 20, 1, true, &host);
+        for y in 0..5 {
+            assert_eq!(
+                screen.char_at(19, y),
+                Some('╎'),
+                "the pane wrote over the left divider at row {y}"
+            );
+            assert_eq!(
+                screen.char_at(50, y),
+                Some('╎'),
+                "the pane wrote over the neighbour at row {y}"
+            );
+        }
+        assert!(
+            screen.row_text(0).chars().all(|c| c == ' ' || c == '╎'),
+            "the pane wrote above its box: {:?}",
+            screen.row_text(0)
+        );
+        // Everything it drew, it drew inside its own columns: nothing past
+        // the pane's right edge, and content inside it.
+        for x in 51..60 {
+            assert_eq!(
+                screen.char_at(x, 1),
+                Some(' '),
+                "the pane drew at column {x}"
+            );
+        }
+        assert!(
+            (20..50).any(|x| screen.char_at(x, 1).is_some_and(|c| c != ' ')),
+            "nothing was drawn inside the pane"
+        );
+        // The pane paints no bar of its own — the column past its span is
+        // the app's, and the pane's paint leaves it exactly as it found it.
+        assert_eq!(
+            screen.char_at(49, 1),
+            Some(' '),
+            "the pane painted a bar into its own last column"
+        );
+        let under = screen.ink(49, 1).unwrap().bg;
+        let divider_under = screen.ink(50, 1).unwrap().bg;
+        // The app overlays the bar on the pane's last cell, whose right edge
+        // meets the divider, and keeps the row's background underneath it.
+        c.paint_bar(&mut screen, 49, Some(50), 1, &host);
+        assert_eq!(
+            screen.char_at(49, 1),
+            Some('▐'),
+            "the bar's inner half is missing"
+        );
+        assert_eq!(
+            screen.ink(49, 1).unwrap().bg,
+            under,
+            "the bar replaced the row background underneath it"
+        );
+        assert_eq!(
+            screen.char_at(50, 1),
+            Some('▌'),
+            "the bar's divider half is missing"
+        );
+        assert_eq!(
+            screen.ink(50, 1).unwrap().bg,
+            divider_under,
+            "the bar replaced the divider background"
+        );
+    }
+
+    #[test]
+    fn an_unfocused_pane_draws_no_cursor_bar_but_keeps_its_selection() {
+        let (mut c, host) = view(LOG, 60, 4);
+        c.press(10, 0, false, &host);
+        c.drag(2, &host);
+        c.release();
+        let mut screen = Screen::new(60, 4);
+        screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
+        c.paint(&mut screen, 0, 0, false, &host);
+        assert_ne!(
+            screen.ink(0, 0).unwrap().bg,
+            host.theme.chrome.selection_bg,
+            "an unfocused pane drew the cursor bar"
+        );
+        assert_eq!(
+            screen.ink(0, 1).unwrap().bg,
+            host.theme.chrome.selected_bg,
+            "focus took the dragged selection's ink with it"
+        );
     }
 
     #[test]
@@ -989,16 +1316,67 @@ r\x1fr\x1f\x1fA\x1f1\x1froot\x1e";
             .map(|i| format!("{i:040}\x1f{i:07}\x1f\x1fA\x1f1\x1fc{i}\x1e"))
             .collect();
         let (mut c, _) = view(&log, 60, 10);
-        c.up();
-        assert_eq!(c.cursor(), 0);
+        assert_eq!(c.current().map(|x| x.subject.as_str()), Some("c0"));
+
         c.page(1);
-        assert_eq!(c.cursor(), 9);
+        assert_eq!(
+            c.current().map(|x| x.subject.as_str()),
+            Some(format!("c{}", c.cursor()).as_str())
+        );
         c.to_bottom();
-        assert_eq!(c.cursor(), 99);
-        assert_eq!(c.top(), 90);
+        assert_eq!(c.cursor(), 99, "the viewport is sized to the log");
+        assert_eq!(c.current().map(|x| x.subject.as_str()), Some("c99"));
+        // Past the end is the end, and `current` follows it rather than
+        // answering about a commit that is not there.
         c.go_to(9999);
         assert_eq!(c.cursor(), 99);
         assert_eq!(c.current().map(|x| x.subject.as_str()), Some("c99"));
+    }
+
+    #[test]
+    fn commit_refresh_anchors_by_sha() {
+        let (mut c, _host) = view(&many(50), 60, 10);
+        c.move_by(25);
+        let sha = c.current().expect("the list has the commit").sha.clone();
+        assert_eq!(sha, "c25");
+        // A commit inserted above: every row moved down one, and the cursor
+        // follows the commit it was on rather than the number it was at.
+        let mut inserted = parse_log(&many(50));
+        inserted.insert(
+            0,
+            Commit {
+                sha: "new".into(),
+                short: "newest".into(),
+                parents: Box::from(&["c0".to_string()][..]),
+                author: "Ada Lovelace".into(),
+                timestamp: 1,
+                subject: "newest".into(),
+            },
+        );
+        c.replace(inserted);
+        assert_eq!(c.current().map(|x| x.sha.as_str()), Some("c25"));
+        // A commit removed above: rows moved up, and the anchor holds.
+        let mut removed = parse_log(&many(50));
+        removed.remove(0);
+        c.replace(removed);
+        assert_eq!(c.current().map(|x| x.sha.as_str()), Some("c25"));
+        // The anchored commit vanishes entirely: the previous position
+        // clamps into what the shorter list can hold, and nothing panics.
+        c.replace(parse_log(&many(10)));
+        assert_eq!(c.cursor(), 9, "clamped, not wrapped");
+        assert!(c.current().is_some());
+        // A drag's range was a promise about rows the refresh renumbered.
+        let (mut c, host) = view(&many(50), 60, 10);
+        c.move_by(5);
+        c.press(20, 2, false, &host);
+        c.drag(6, &host);
+        assert!(c.selection().len() > 1);
+        c.replace(parse_log(&many(50)));
+        assert_eq!(c.selection(), "", "a range outlived the rows it held");
+        // Glyphs and dimensions survive: the refresh changed what, not how.
+        let (c, host) = view(&many(50), 60, 10);
+        let rows = painted(&c, &host);
+        assert!(rows[0].starts_with("c000000 AL "), "{:?}", rows[0]);
     }
 
     #[test]
@@ -1025,6 +1403,162 @@ r\x1fr\x1f\x1fA\x1f1\x1froot\x1e";
             rows[0].contains('◉'),
             "the graph was clipped first: {:?}",
             rows[0]
+        );
+    }
+
+    // ----------------------------------------------------------------- search
+
+    #[test]
+    fn a_query_filters_all_three_fields_in_source_order() {
+        // Four commits so each of the three fields has its own hit: a sha, an
+        // author and a subject, plus one commit nothing below matches. Shas are
+        // written whole — the index folds `sha`, and a short is a prefix of it.
+        let log = "\
+1111aaaa\x1f1111aaa\x1f2222beef\x1fAda Lovelace\x1f1\x1fthe engine, first\x1e\
+2222beef\x1f2222bee\x1fcafe3333\x1fGrace Hopper\x1f2\x1fnothing interesting\x1e\
+cafe3333\x1fcafe333\x1f4444dddd\x1fÉmile Zola\x1f3\x1fa compiler pass\x1e\
+4444dddd\x1f4444ddd\x1f\x1fAda Lovelace\x1f4\x1fnothing else\x1e";
+        let (mut c, host) = view(log, 60, 4);
+
+        c.apply_query("engine");
+        assert_eq!(c.query(), Some("engine"));
+        assert_eq!(c.filter_note().as_deref(), Some("1/4"));
+        assert_eq!(
+            c.current().map(|x| x.sha.as_str()),
+            Some("1111aaaa"),
+            "a subject hit"
+        );
+
+        c.apply_query("hopper");
+        assert_eq!(c.filter_note().as_deref(), Some("1/4"));
+        assert_eq!(
+            c.current().map(|x| x.sha.as_str()),
+            Some("2222beef"),
+            "an author hit"
+        );
+
+        c.apply_query("333");
+        assert_eq!(c.filter_note().as_deref(), Some("1/4"));
+        assert_eq!(
+            c.current().map(|x| x.sha.as_str()),
+            Some("cafe3333"),
+            "a sha hit, interior of the hash and all"
+        );
+
+        // Two hits, and what is drawn keeps core's order — which is the
+        // source's, ascending, never a search's own idea of relevance.
+        c.apply_query("ada");
+        assert_eq!(c.filter_note().as_deref(), Some("2/4"));
+        let rows = painted(&c, &host);
+        assert!(rows[0].contains("engine, first"), "{:?}", rows[0]);
+        assert!(rows[1].contains("nothing else"), "{:?}", rows[1]);
+        assert!(rows[2].is_empty(), "filtered rows are not drawn: {rows:?}");
+    }
+
+    #[test]
+    fn filtering_anchors_the_cursor_by_sha_and_a_miss_clamps() {
+        let (mut c, host) = view(&mixed(30), 60, 10);
+        // The keyboard sits on an *even* commit — one that survives "ENGINE".
+        for _ in 0..4 {
+            c.down();
+        }
+        let anchored = c.current().expect("a commit under the cursor").sha.clone();
+        // Trimmed like the window trims it: spaces around the needle.
+        c.apply_query("  ENGINE  ");
+        assert_eq!(c.filter_note().as_deref(), Some("15/30"));
+        assert_eq!(
+            c.current().map(|x| x.sha.as_str()),
+            Some(anchored.as_str()),
+            "the cursor left its commit because a row number moved"
+        );
+
+        // Now the anchor cannot survive: the query names the other half, and
+        // the cursor clamps onto the surviving rows instead of pointing past
+        // the end of a list that shrank under it.
+        c.apply_query("compiler");
+        assert_eq!(c.filter_note().as_deref(), Some("15/30"));
+        let vis = c.view.len();
+        assert!(c.cursor() < vis, "the cursor outlived its own list");
+        assert!(c.current().is_some());
+
+        // Zero hits: nothing is current, the numbers stay honest and nothing
+        // panics — the list is empty, not broken.
+        c.apply_query("nothing matches this");
+        assert_eq!(c.filter_note().as_deref(), Some("0/30"));
+        assert_eq!(
+            c.len(),
+            30,
+            "the filter narrows what is shown, never what is loaded"
+        );
+        assert_eq!(c.current(), None);
+        assert_eq!(c.cursor(), 0);
+        assert!(painted(&c, &host).iter().all(|r| r.is_empty()));
+    }
+
+    #[test]
+    fn clearing_a_query_restores_every_row_and_copy_uses_visible_rows() {
+        let (mut c, host) = view(&mixed(30), 60, 10);
+        c.apply_query("engine");
+        assert_eq!(c.filter_note().as_deref(), Some("15/30"));
+
+        // A drag over three visible rows copies three *engine* rows: the
+        // selection speaks visible order, and nothing a query removed can leak
+        // into it through a source-row slice.
+        c.press(20, 0, false, &host);
+        c.drag(2, &host);
+        c.release();
+        let text = c.selection();
+        assert_eq!(text.lines().count(), 3, "{text:?}");
+        assert!(text.contains("engine note 0"), "{text:?}");
+        assert!(
+            !text.contains("compiler"),
+            "a filtered-out row was copied: {text:?}"
+        );
+
+        // Whitespace is as good as empty, and empty is the whole list again.
+        // Clearing anchors by sha: the keyboard keeps its commit — which was
+        // visible row two of the filter and is the history's fifth row whole —
+        // and the copy key names that commit, read through the restored table.
+        let under = c.current().map(|x| x.sha.clone());
+        c.apply_query("   ");
+        assert_eq!(c.query(), None);
+        assert_eq!(c.filter_note(), None);
+        assert_eq!(c.view.len(), 30);
+        assert_eq!(
+            c.current().map(|x| x.sha.as_str()),
+            under.as_deref(),
+            "clearing moved the cursor off its commit"
+        );
+        assert_eq!(c.copy_text(), "00000004 engine note 4");
+    }
+
+    #[test]
+    fn a_filtered_cursor_keeps_the_existing_selection_bar() {
+        // Filtering is the hit marker, exactly as in the window: the cursor's
+        // own row keeps the bar it always had, the surviving rows stay plain —
+        // they are hits, but every row on screen is a hit and a wall of colour
+        // would say nothing — and the drag colour stays the drag's.
+        let (mut c, host) = view(LOG, 60, 4);
+        c.apply_query("branch");
+        assert_eq!(c.filter_note().as_deref(), Some("2/4"));
+        let mut screen = Screen::new(c.cols, 4);
+        screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
+        c.paint(&mut screen, 0, 0, true, &host);
+        assert_eq!(screen.ink(0, 0).unwrap().bg, host.theme.chrome.selection_bg);
+        assert_eq!(
+            screen.ink(59, 0).unwrap().bg,
+            host.theme.chrome.selection_bg,
+            "the bar runs the whole width"
+        );
+        assert_eq!(
+            screen.ink(0, 1).unwrap().bg,
+            host.theme.chrome.bg,
+            "an ordinary hit is not lit twice"
+        );
+        assert_ne!(
+            screen.ink(0, 1).unwrap().bg,
+            host.theme.chrome.selected_bg,
+            "nothing dragged, nothing selected"
         );
     }
 }

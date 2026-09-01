@@ -12,9 +12,11 @@
 
 use crate::json::*;
 use crate::log::Log;
-use crate::rows::{pieces, Doc, Piece, Row};
+use crate::rows::Doc;
 use gitten_core::graph::{Draw, MAX_LANES};
 use gitten_core::host::Host;
+use gitten_core::rows::Row;
+use gitten_core::runs::{runs, Run};
 use gitten_core::syntax::Kind;
 use gitten_core::theme::{Surface, Theme};
 use gitten_core::LineKind;
@@ -52,6 +54,9 @@ fn surface_name(s: Surface) -> &'static str {
         Surface::MovedRemoved => "movedRemoved",
         Surface::MovedAdded => "movedAdded",
         Surface::Selected => "selected",
+        Surface::Cursor => "cursor",
+        Surface::Title => "title",
+        Surface::Status => "status",
     }
 }
 
@@ -172,8 +177,8 @@ pub fn meta(out: &mut String, doc: &Doc, host: &Host, label: &str) {
         field_str(o, f, "kind", "diff");
         field_str(o, f, "layout", &host.layout);
         field_num(o, f, "rows", doc.total());
-        field_num(o, f, "lines", doc.rows.len());
-        field_num(o, f, "moved", doc.moved);
+        field_num(o, f, "lines", doc.rows().len());
+        field_num(o, f, "moved", doc.moved());
         field_num(o, f, "intralineMs", doc.intraline.as_secs_f64() * 1000.0);
         field_num(o, f, "syntaxMs", doc.syntax.as_secs_f64() * 1000.0);
 
@@ -200,7 +205,7 @@ pub fn meta(out: &mut String, doc: &Doc, host: &Host, label: &str) {
         // 111 KB payload, so it is the whole cost of `meta` and currently buys
         // one integer.
         key(o, f, "files");
-        list(o, &doc.files, |o, e| {
+        list(o, doc.files(), |o, e| {
             object(o, |o, f| {
                 field_str(o, f, "path", &e.path);
                 field_num(o, f, "adds", e.adds);
@@ -216,13 +221,25 @@ pub fn meta(out: &mut String, doc: &Doc, host: &Host, label: &str) {
     });
 }
 
-fn piece(out: &mut String, p: &Piece) {
+/// One run of a line, as the client draws it.
+///
+/// The text is sliced here and not handed over as byte offsets, on purpose.
+/// [`Run::at`] is in bytes and a JavaScript string is UTF-16, so offsets mean
+/// every consumer converts and the one that forgets breaks on exactly the lines
+/// a diff of anything non-English is made of. Slicing also means the browser
+/// does a `for` over pieces instead of a sweep per row per frame.
+///
+/// The `surface` a [`Run`] carries is dropped: the row already said its kind
+/// and `w` says which words changed, so the client resolves the background from
+/// the two — the one thing a frontend still owns after
+/// [`runs`](gitten_core::runs).
+fn piece(out: &mut String, (text, r): (&str, &Run)) {
     object(out, |o, f| {
-        field_str(o, f, "t", p.text);
-        if let Some(k) = p.kind {
+        field_str(o, f, "t", text);
+        if let Some(k) = r.kind {
             field_str(o, f, "k", kind_name(k));
         }
-        if p.word {
+        if r.word {
             field_bool(o, f, "w", true);
         }
     });
@@ -248,7 +265,7 @@ pub fn rows(out: &mut String, doc: &Doc, from: usize, count: usize) {
                 o.push(',');
             }
             first = false;
-            match &doc.rows[i] {
+            match &doc.rows()[i] {
                 Row::File { path, adds, dels } => object(o, |o, f| {
                     field_str(o, f, "type", "file");
                     field_str(o, f, "path", path);
@@ -260,8 +277,12 @@ pub fn rows(out: &mut String, doc: &Doc, from: usize, count: usize) {
                     field_str(o, f, "header", h);
                 }),
                 Row::Line(l) => {
-                    let at = doc.range(i, seg, &l.text);
-                    pieces(l, at, &mut scratch);
+                    // Line coordinates in, line coordinates out: tokens and
+                    // spans belong to the line and not to one of the rows it
+                    // wrapped onto, so `at` clips them and `Run::at` indexes
+                    // the same string this slices.
+                    let at = doc.range(i, seg);
+                    runs(at, &l.tokens, &l.spans, l.kind, l.moved, &mut scratch);
                     object(o, |o, f| {
                         field_str(o, f, "type", "line");
                         field_str(o, f, "kind", line_kind_name(l.kind));
@@ -282,7 +303,7 @@ pub fn rows(out: &mut String, doc: &Doc, from: usize, count: usize) {
                             }
                         }
                         key(o, f, "x");
-                        list(o, scratch.iter(), piece);
+                        list(o, scratch.iter().map(|r| (&l.text[r.at.clone()], r)), piece);
                     });
                 }
             }

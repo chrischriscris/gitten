@@ -52,11 +52,15 @@
 //! knowing what a row looks like, it has moved to the wrong crate.
 
 pub mod acquire;
+pub mod act;
 pub mod cli;
 pub mod config;
+pub mod jobs;
+pub mod verbs;
 
 use cli::{Request, Source, View};
 use gitten_core::host::Host;
+use std::path::Path;
 use std::time::Instant;
 
 /// How wide a row may get before it is clipped.
@@ -74,6 +78,33 @@ pub const MAX_LINE_CHARS: usize = 2000;
 /// without bound. Overflowing the edge is the better failure.
 pub const MIN_WRAP_COLS: usize = 8;
 
+/// Where a startup's repository handles come from.
+///
+/// One method, because that is all a factory is: a path in, a [`Handle`] out.
+/// The seam exists so a client — or a test — can put its own implementation of
+/// acquisition behind the same shared startup instead of hardcoding this
+/// crate's; everything downstream keeps holding `Arc<dyn Repo>` and cannot
+/// tell which factory ran. Object-safe for the same reason [`Repo`](gitten_git::Repo)
+/// is: the value crosses threads and outlives the call.
+pub trait Opener: Send + Sync {
+    /// Opens (or claims) the repository at `root`.
+    ///
+    /// Infallible like the default it may replace: opening runs nothing, and
+    /// a path that is not a repository fails at the first read.
+    fn open(&self, root: &Path) -> gitten_git::Handle;
+}
+
+/// The shipped opener: `gitten-git`'s binary-backed implementation.
+///
+/// What every client gets when it says nothing about the matter.
+pub struct GitOpener;
+
+impl Opener for GitOpener {
+    fn open(&self, root: &Path) -> gitten_git::Handle {
+        gitten_git::open(root)
+    }
+}
+
 /// The shared startup: arguments, config, acquisition.
 ///
 /// A builder rather than a function of six arguments, because what differs
@@ -86,6 +117,9 @@ pub struct Startup {
     blurb: String,
     extra: String,
     args: Vec<String>,
+    /// Where repository handles come from. The binary opener unless a client
+    /// replaces it; see [`Opener`].
+    opener: std::sync::Arc<dyn Opener>,
 }
 
 /// Everything the startup produced.
@@ -97,6 +131,16 @@ pub struct Started {
     pub loaded: acquire::Loaded,
     /// Where the config file was found, for a client that wants to watch it.
     pub config: std::path::PathBuf,
+    /// One handle for every read this client makes, opened once and held for
+    /// the process.
+    ///
+    /// Persistent on purpose: a re-acquire — a different algorithm from a
+    /// control, a commit's diff opened off the graph — goes through this same
+    /// handle rather than through a fresh one per call, so whatever an
+    /// implementation amortises across calls survives the call. `None` for
+    /// `--fixtures`, which has no repository behind it; a client hands it back
+    /// to [`acquire::acquire`] unchanged, and tests hand in their own.
+    pub repo: Option<gitten_git::Handle>,
 }
 
 impl Started {
@@ -207,6 +251,7 @@ impl Startup {
             blurb: "a git client".into(),
             extra: String::new(),
             args: std::env::args().skip(1).collect(),
+            opener: std::sync::Arc::new(GitOpener),
         }
     }
 
@@ -227,6 +272,17 @@ impl Startup {
     /// took its own flags out first.
     pub fn args(mut self, args: Vec<String>) -> Self {
         self.args = args;
+        self
+    }
+
+    /// Opens repositories with `opener` instead of [`GitOpener`].
+    ///
+    /// The one seam a client needs to put its own acquisition behind the
+    /// shared startup — a wrapper around another binary, an embedded
+    /// implementation, a test's fake — without any of the rest of this crate
+    /// changing hands.
+    pub fn opener(mut self, opener: std::sync::Arc<dyn Opener>) -> Self {
+        self.opener = opener;
         self
     }
 
@@ -270,7 +326,18 @@ impl Startup {
             Request::Help => unreachable!("returned above"),
         };
 
-        match acquire::acquire(view, &source, &host) {
+        // One handle for every read this client makes, from whichever opener
+        // was injected. Opening runs nothing, so a directory that is not a
+        // repository fails at the first read — in the same words it always
+        // failed there — and nothing is put on the road to the first frame to
+        // learn that early. Help and config returned above: neither opens a
+        // repository, so neither invokes the factory.
+        let repo = match &source {
+            Source::Repo { path, .. } => Some(self.opener.open(path)),
+            Source::Fixtures | Source::Patch { .. } => None,
+        };
+
+        match acquire::acquire(view, &source, &host, repo.as_deref()) {
             Ok(loaded) => {
                 clock.stage("acquired");
                 Ok(Started {
@@ -279,6 +346,7 @@ impl Startup {
                     host,
                     loaded,
                     config: path,
+                    repo,
                 })
             }
             Err(e) => Err(Exit::Failed(format!(
@@ -293,11 +361,73 @@ impl Startup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gitten_core::status::Status;
+    use gitten_git::{Pair, Repo};
+    use std::sync::Arc;
 
     fn start(line: &str) -> Result<Started, Exit> {
         Startup::new("gitten-test", View::Commits)
             .args(line.split_whitespace().map(String::from).collect())
             .go()
+    }
+
+    /// A repository that exists only as this struct: every read answers from
+    /// it, and its path need not exist at all.
+    struct Fake;
+
+    impl Repo for Fake {
+        fn log(&self, limit: usize) -> gitten_git::Result<Vec<gitten_core::Commit>> {
+            Ok((0..limit.min(1))
+                .map(|_| gitten_core::Commit {
+                    sha: "f0".into(),
+                    short: "f0".into(),
+                    parents: Box::from(&[][..]),
+                    author: "fake".into(),
+                    timestamp: 0,
+                    subject: "from the fake".into(),
+                })
+                .collect())
+        }
+
+        fn pairs(&self, _revspec: &str) -> gitten_git::Result<Vec<Pair>> {
+            Ok(vec![Pair {
+                path: "fake.txt".into(),
+                old_path: None,
+                status: 'A',
+                old: Vec::new(),
+                new: vec!["fake contents".into()],
+                old_oid: None,
+                new_oid: Some("3333333333333333333333333333333333333333".into()),
+                binary: false,
+            }])
+        }
+
+        fn status(&self) -> gitten_git::Result<Status> {
+            Ok(Status::default())
+        }
+
+        fn describe(&self) -> String {
+            "fake (main)".into()
+        }
+    }
+
+    /// An opener with exactly one answer, handed out by clone so a test can
+    /// prove identity against whatever came back on `Started`.
+    struct OneFake(gitten_git::Handle);
+
+    impl Opener for OneFake {
+        fn open(&self, _root: &Path) -> gitten_git::Handle {
+            Arc::clone(&self.0)
+        }
+    }
+
+    /// An opener that must never be reached.
+    struct Exploding;
+
+    impl Opener for Exploding {
+        fn open(&self, _root: &Path) -> gitten_git::Handle {
+            panic!("nothing before acquisition should open a repository")
+        }
     }
 
     #[test]
@@ -317,6 +447,20 @@ mod tests {
         let mut host = Host::new();
         let warn = config::apply(&mut host, &text);
         assert!(warn.is_empty(), "{warn:?}");
+        // And the shipped verbs ride it without a special line each: a new
+        // binding appears in the dump because the dump walks the keymap.
+        for command in [
+            "files.discard",
+            "files.stage-all",
+            "files.ignore",
+            "commits.cherry-pick",
+            "commits.new-tag",
+        ] {
+            assert!(
+                !host.keys.keys_for(command).is_empty(),
+                "{command} is bound nowhere in the dumped file"
+            );
+        }
     }
 
     #[test]
@@ -343,6 +487,11 @@ mod tests {
         assert!(started.session_key().starts_with("diff:"));
         // The host is the configured one, not `Host::new()` handed back.
         assert!(!started.host.differ.selected().is_empty());
+        // The handle survives the startup, for every read after this one.
+        assert!(
+            started.repo.is_some(),
+            "a repository source keeps its handle"
+        );
     }
 
     #[test]
@@ -360,5 +509,47 @@ mod tests {
         assert_eq!(port.as_deref(), Some("9000"));
         let started = s.go().unwrap_or_else(|_| panic!("start"));
         assert_eq!(started.view, View::Diff);
+    }
+
+    #[test]
+    fn an_injected_opener_opens_and_whatever_it_opens_is_retained() {
+        // `/nonexistent` cannot be read by anything. If startup succeeds, the
+        // acquisition went through the fake — and if the handle it kept is
+        // *this* Arc, every later read a client makes goes through it too.
+        let fake: gitten_git::Handle = Arc::new(Fake);
+        let started = Startup::new("gitten-test", View::Commits)
+            .args(vec!["commits".into(), "/nonexistent".into()])
+            .opener(Arc::new(OneFake(Arc::clone(&fake))))
+            .go()
+            .unwrap_or_else(|_| panic!("the fake has history"));
+        assert_eq!(started.loaded.label, "fake (main)", "acquired from it");
+        match &started.loaded.data {
+            acquire::Data::Commits(commits) => {
+                assert_eq!(commits[0].subject, "from the fake");
+            }
+            other => panic!("a commits view loads commits, got {other:?}"),
+        }
+        assert!(
+            Arc::ptr_eq(started.repo.as_ref().expect("retained"), &fake),
+            "the same handle comes back on Started"
+        );
+    }
+
+    #[test]
+    fn help_and_config_never_touch_the_opener() {
+        for line in ["--help", "config"] {
+            let result = Startup::new("gitten-test", View::Commits)
+                .args(vec![line.into()])
+                .opener(Arc::new(Exploding))
+                .go();
+            assert!(
+                !matches!(result, Err(Exit::Failed(_))),
+                "{line} must not fail, and must not have opened anything"
+            );
+            assert!(
+                matches!(result, Err(Exit::Help(_)) | Err(Exit::Config(_))),
+                "{line} is a success with nothing to draw"
+            );
+        }
     }
 }
