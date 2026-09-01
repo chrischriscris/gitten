@@ -74,18 +74,18 @@ pass into it).
 
 | Plan | Status |
 |---|---|
-| 045 | PLANNED |
-| 046 | PLANNED |
-| 047 | PLANNED |
-| 048 | PLANNED |
-| 049 | PLANNED |
-| 050 | PLANNED |
-| 051 | PLANNED |
-| 052 | PLANNED |
-| 053 | PLANNED |
-| 054 | PLANNED |
-| 055 | PLANNED |
-| 056 | PLANNED |
-| 057 | PLANNED |
-| 058 | PLANNED |
-| 059 | PLANNED |
+| 045 | MERGED (#40, test fix #41) |
+| 046 | MERGED (#42) |
+| 047 | MERGED (#38) |
+| 048 | MERGED (#43) |
+| 049 | MERGED (#37) |
+| 050 | MERGED (#48) |
+| 051 | MERGED (#47) |
+| 052 | MERGED (#44) |
+| 053 | MERGED (#39 items 2–8, #46 item 1; items 3 and 7's branches.rs bullet no-ops on the merged base) |
+| 054 | MERGED (#35) |
+| 055 | MERGED (#45) |
+| 056 | DROPPED — executor STOP condition: the uniform-gutter fix reverses the trunk-readability decision at commits.rs:755-758 (the subject follows its own row's graph so a trunk commit reads from the left). Needs the plan owner to either accept trunk subjects behind the widest-merge gutter or withdraw the plan. |
+| 057 | MERGED (#49) |
+| 058 | MERGED (#50) |
+| 059 | MERGED (#36) |
