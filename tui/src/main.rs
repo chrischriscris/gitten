@@ -1937,21 +1937,7 @@ impl App {
     /// trait refuses it too, but saying so beside the field that just closed
     /// beats making the reader find out twice.
     fn submit_commit(&mut self, message: String) {
-        if message.trim().is_empty() {
-            self.message = "a commit needs a message".into();
-            return;
-        }
-        let Some((_, repo)) = self.repo.as_ref() else {
-            self.message = "a fixture has no repository to commit in".into();
-            return;
-        };
-        if self
-            .submitter
-            .submit(Box::new(Write::commit(repo, message)))
-            .is_err()
-        {
-            self.message = "the job queue is shutting down".into();
-        }
+        gitten_app::act::commit_message(self, message);
     }
 
     /// The accepted amend text, as a job — [`Write::amend`], the commit
@@ -1959,21 +1945,7 @@ impl App {
     /// an empty message is refused with commit's own sentence, because the
     /// field that failed is the same field.
     fn submit_amend(&mut self, message: String) {
-        if message.trim().is_empty() {
-            self.message = "a commit needs a message".into();
-            return;
-        }
-        let Some((_, repo)) = self.repo.as_ref() else {
-            self.message = "a fixture has no repository to amend in".into();
-            return;
-        };
-        if self
-            .submitter
-            .submit(Box::new(Write::amend(repo, message)))
-            .is_err()
-        {
-            self.message = "the job queue is shutting down".into();
-        }
+        gitten_app::act::amend_message(self, message);
     }
 
     /// One mouse event.
@@ -2617,31 +2589,11 @@ impl App {
     /// one word for "the index should hold this". The window's rule,
     /// verbatim, over the terminal's own rows.
     fn files_stage(&mut self) {
-        let under = match self.panes.focused() {
-            Some(Screens::Files { view, .. }) => {
-                view.current_file().map(|r| (r.section, r.path.clone()))
-            }
-            _ => {
-                self.message = "files.stage is not supported here".into();
-                return;
-            }
-        };
-        let Some((section, path)) = under else {
-            self.message = "nothing selected to stage".into();
+        if !matches!(self.panes.focused(), Some(Screens::Files { .. })) {
+            self.message = "files.stage is not supported here".into();
             return;
-        };
-        let Some((_, repo)) = self.repo.as_ref() else {
-            self.message = "a fixture has no working tree to stage in".into();
-            return;
-        };
-        let bytes = path.as_bytes().to_vec();
-        let job = match section {
-            files::Section::Staged => Write::unstage(repo, bytes),
-            _ => Write::stage(repo, bytes),
-        };
-        if self.submitter.submit(Box::new(job)).is_err() {
-            self.message = "the job queue is shutting down".into();
         }
+        gitten_app::act::stage_or_unstage(self);
     }
 
     /// `files.stage-all`: every row, on the side of the index the keyboard
@@ -2653,47 +2605,11 @@ impl App {
     /// decision. One job either way, so one generation bump and one
     /// re-acquire wave per keypress.
     fn files_stage_all(&mut self) {
-        let (staging, targets) = match self.panes.focused() {
-            Some(Screens::Files { view, .. }) => {
-                let staging = view.cursor_section() != Some(files::Section::Staged);
-                let targets = match staging {
-                    // Stage unstaged and untracked; conflicts belong to
-                    // neither direction — staging one records a resolution,
-                    // which is its own decision.
-                    true => {
-                        let mut targets = view.paths_in(files::Section::Unstaged);
-                        targets.extend(view.paths_in(files::Section::Untracked));
-                        targets
-                    }
-                    false => view.paths_in(files::Section::Staged),
-                };
-                (staging, targets)
-            }
-            _ => {
-                self.message = "files.stage-all is not supported here".into();
-                return;
-            }
-        };
-        if targets.is_empty() {
-            self.message = match staging {
-                true => "nothing unstaged or untracked to stage",
-                false => "nothing staged to unstage",
-            }
-            .into();
+        if !matches!(self.panes.focused(), Some(Screens::Files { .. })) {
+            self.message = "files.stage-all is not supported here".into();
             return;
         }
-        let Some((_, repo)) = self.repo.as_ref() else {
-            self.message = "a fixture has no working tree to act on".into();
-            return;
-        };
-        let bytes: Vec<Vec<u8>> = targets.iter().map(|p| p.as_bytes().to_vec()).collect();
-        let job = match staging {
-            true => Write::stage_many(repo, bytes),
-            false => Write::unstage_many(repo, bytes),
-        };
-        if self.submitter.submit(Box::new(job)).is_err() {
-            self.message = "the job queue is shutting down".into();
-        }
+        gitten_app::act::stage_all(self);
     }
 
     /// `files.discard`: the one destructive verb, and it confirms on the
@@ -2705,54 +2621,11 @@ impl App {
     /// badly: a staged row, whose undo is unstage; and a conflict, whose
     /// working-tree side is the merge's open question.
     fn files_discard(&mut self) {
-        let under = match self.panes.focused() {
-            Some(Screens::Files { view, .. }) => view
-                .current_file()
-                .map(|r| (r.section, r.path.clone(), r.text.clone())),
-            _ => {
-                self.message = "files.discard is not supported here".into();
-                return;
-            }
-        };
-        let Some((section, path, shown)) = under else {
-            self.message = "nothing selected to discard".into();
-            return;
-        };
-        match section {
-            files::Section::Staged => {
-                self.message = "that change is staged — unstage it before discarding".into();
-                return;
-            }
-            files::Section::Conflicts => {
-                self.message = "a conflicted file needs its merge resolved, not discarded".into();
-                return;
-            }
-            files::Section::Untracked | files::Section::Unstaged => {}
-        }
-        let Some((_, repo)) = self.repo.as_ref() else {
-            self.message = "a fixture has no working tree to discard from".into();
-            return;
-        };
-        // Arm, or spend the arm. False means the question was just asked.
-        let confirmed = match self.panes.focused_mut() {
-            Some(Screens::Files { view, .. }) => view.confirm_or_arm_discard(section, &path),
-            _ => return,
-        };
-        if !confirmed {
-            self.message = files::discard_question(section, &shown);
+        if !matches!(self.panes.focused(), Some(Screens::Files { .. })) {
+            self.message = "files.discard is not supported here".into();
             return;
         }
-        // The question is spent; the running band speaks next. Untracked
-        // means *delete* — the one mechanics where nothing is recoverable —
-        // and everything else is a checkout of the path's tracked state.
-        let bytes = path.as_bytes().to_vec();
-        let job = match section {
-            files::Section::Untracked => Write::remove_untracked(repo, bytes),
-            _ => Write::discard(repo, bytes),
-        };
-        if self.submitter.submit(Box::new(job)).is_err() {
-            self.message = "the job queue is shutting down".into();
-        }
+        gitten_app::act::discard_file(self);
     }
 
     /// `files.stash`: park the working tree on the stack — `git stash push`
@@ -2764,14 +2637,7 @@ impl App {
     /// at the repository the app is holding, which is also why it answers
     /// on a launch that registered no files tenant at all.
     fn stash_working_tree(&mut self) {
-        let Some((_, handle)) = self.repo.as_ref() else {
-            self.message = "a fixture has no working tree to park".into();
-            return;
-        };
-        let job = Write::stash_push(handle, None);
-        if self.submitter.submit(Box::new(job)).is_err() {
-            self.message = "the job queue is shutting down".into();
-        }
+        gitten_app::act::stash_working_tree(self);
     }
 
     /// `files.ignore`: append the untracked file to the root `.gitignore`
@@ -2780,27 +2646,11 @@ impl App {
     /// git does not yet track, so answering over a tracked change would be
     /// a no-op wearing a success badge.
     fn files_ignore(&mut self) {
-        let under = match self.panes.focused() {
-            Some(Screens::Files { view, .. }) => {
-                view.current_file().map(|r| (r.section, r.path.clone()))
-            }
-            _ => {
-                self.message = "files.ignore is not supported here".into();
-                return;
-            }
-        };
-        let Some((files::Section::Untracked, path)) = under else {
-            self.message = "only an untracked file can be ignored".into();
+        if !matches!(self.panes.focused(), Some(Screens::Files { .. })) {
+            self.message = "files.ignore is not supported here".into();
             return;
-        };
-        let Some((_, repo)) = self.repo.as_ref() else {
-            self.message = "a fixture has no repository to ignore in".into();
-            return;
-        };
-        let job = Write::ignore(repo, path.as_bytes().to_vec());
-        if self.submitter.submit(Box::new(job)).is_err() {
-            self.message = "the job queue is shutting down".into();
         }
+        gitten_app::act::ignore_file(self);
     }
 
     /// Drains the job queue. Called before each frame, so the frame this
@@ -3057,24 +2907,31 @@ impl App {
     }
 }
 
-impl gitten_app::act::Acts for App {
-    fn branch_target(&self) -> Option<Target> {
-        App::branch_target(self)
+fn action_file_section(section: files::Section) -> gitten_app::act::FileSection {
+    match section {
+        files::Section::Staged => gitten_app::act::FileSection::Staged,
+        files::Section::Unstaged => gitten_app::act::FileSection::Unstaged,
+        files::Section::Untracked => gitten_app::act::FileSection::Untracked,
+        files::Section::Conflicts => gitten_app::act::FileSection::Conflicts,
     }
+}
 
+fn view_file_section(section: gitten_app::act::FileSection) -> files::Section {
+    match section {
+        gitten_app::act::FileSection::Staged => files::Section::Staged,
+        gitten_app::act::FileSection::Unstaged => files::Section::Unstaged,
+        gitten_app::act::FileSection::Untracked => files::Section::Untracked,
+        gitten_app::act::FileSection::Conflicts => files::Section::Conflicts,
+    }
+}
+
+impl gitten_app::act::Client for App {
     fn say(&mut self, message: String) {
         self.message = message;
     }
 
     fn ask(&mut self, question: String) {
         self.message = question;
-    }
-
-    fn confirm_or_arm(&mut self, target: &Target) -> bool {
-        match self.panes.focused_mut() {
-            Some(Screens::Branches { view, .. }) => view.confirm_or_arm_delete(target),
-            _ => false,
-        }
     }
 
     fn repo(&self) -> Option<gitten_git::Handle> {
@@ -3085,6 +2942,59 @@ impl gitten_app::act::Acts for App {
 
     fn submit(&mut self, job: Box<dyn Job>) -> bool {
         self.submitter.submit(job).is_ok()
+    }
+}
+
+impl gitten_app::act::BranchClient for App {
+    fn branch_target(&self) -> Option<Target> {
+        App::branch_target(self)
+    }
+
+    fn confirm_or_arm_branch(&mut self, target: &Target) -> bool {
+        match self.panes.focused_mut() {
+            Some(Screens::Branches { view, .. }) => view.confirm_or_arm_delete(target),
+            _ => false,
+        }
+    }
+}
+
+impl gitten_app::act::FileClient for App {
+    fn selected_file(&self) -> Option<gitten_app::act::SelectedFile> {
+        let Some(Screens::Files { view, .. }) = self.panes.focused() else {
+            return None;
+        };
+        view.current_file()
+            .map(|file| gitten_app::act::SelectedFile {
+                section: action_file_section(file.section),
+                path: file.path.clone(),
+                shown: file.text.clone(),
+            })
+    }
+
+    fn cursor_section(&self) -> Option<gitten_app::act::FileSection> {
+        let Some(Screens::Files { view, .. }) = self.panes.focused() else {
+            return None;
+        };
+        view.cursor_section().map(action_file_section)
+    }
+
+    fn paths_in(
+        &self,
+        section: gitten_app::act::FileSection,
+    ) -> Vec<gitten_core::status::PathBytes> {
+        let Some(Screens::Files { view, .. }) = self.panes.focused() else {
+            return Vec::new();
+        };
+        view.paths_in(view_file_section(section))
+    }
+
+    fn confirm_or_arm_file(&mut self, target: &gitten_app::act::SelectedFile) -> bool {
+        match self.panes.focused_mut() {
+            Some(Screens::Files { view, .. }) => {
+                view.confirm_or_arm_discard(view_file_section(target.section), &target.path)
+            }
+            _ => false,
+        }
     }
 }
 

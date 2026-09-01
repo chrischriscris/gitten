@@ -357,17 +357,6 @@ fn search_rows(rows: &[Entry], query: &str) -> Vec<usize> {
     out
 }
 
-/// What an armed discard asks, once, in the notice band. An untracked file
-/// says *delete* because that is what discarding means when there is no
-/// earlier version to go back to — the honest word for the one mechanics
-/// where nothing is recoverable.
-pub(crate) fn discard_question(section: Section, shown: &str) -> String {
-    match section {
-        Section::Untracked => format!("delete {shown}? press again to confirm"),
-        _ => format!("discard {shown}? press again to confirm"),
-    }
-}
-
 /// The working-tree pane. Holds flattened rows behind an `Rc`, so a refresh
 /// swaps one refcount instead of mutating what a frame may be reading.
 ///
@@ -1088,9 +1077,7 @@ fn row(e: &Entry, host: &Host, current: bool, focused: bool, armed: bool) -> Div
 mod tests {
     // By name, not a glob: `use gpui::*` in the parent shadows `#[test]` with
     // GPUI's own attribute macro and every test in here fails to expand.
-    use super::{
-        conflict_letters, discard_question, flatten, prepare, Entry, Files, Mark, Section, Status,
-    };
+    use super::{conflict_letters, flatten, prepare, Entry, Files, Mark, Section, Status};
     use gitten_core::host::Host;
     use gitten_core::status::{
         Change, ConflictEntry, ConflictKind, Kind, PathBytes, StagedEntry, Submodule,
@@ -1823,19 +1810,6 @@ mod tests {
         );
         f.run_view("view.bottom", &host);
         assert_eq!(f.cursor_section(), Some(Section::Conflicts));
-    }
-
-    #[test]
-    fn the_arm_question_says_delete_for_a_file_with_nothing_to_go_back_to() {
-        assert_eq!(
-            discard_question(Section::Untracked, "notes.md"),
-            "delete notes.md? press again to confirm",
-            "an untracked file has no earlier version; the word is honest"
-        );
-        assert_eq!(
-            discard_question(Section::Unstaged, "src/x.rs"),
-            "discard src/x.rs? press again to confirm"
-        );
     }
 
     #[test]
