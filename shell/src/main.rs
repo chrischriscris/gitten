@@ -10,6 +10,8 @@ mod session;
 mod stats;
 mod views;
 
+use controls::Tier;
+
 use gitten_app::acquire::{Data, Loaded};
 use gitten_app::cli::{Source, View};
 use gitten_app::jobs::{Event as JobEvent, Generation, Job, Runner, Submitter};
@@ -316,10 +318,17 @@ enum Open {
     Wrap,
     Algorithm,
     Whitespace,
+    /// The composed tier's one trigger: five pickers' entries as sections
+    /// of a single `view ▾` menu, which needs an open state like any
+    /// other and gets one variant rather than a second state machine.
+    View,
 }
 
 type RefreshValue = Box<dyn std::any::Any + Send>;
 type ApplyRefresh = dyn FnOnce(RefreshValue, &Host, &mut App) -> Result<(), String>;
+/// What one entry of the composed picker's menu does: the same dispatch the
+/// standalone picker's entry ran, routed by section.
+type Route = Rc<dyn Fn(usize, &mut Window, &mut App)>;
 
 /// What the open input's accept means, and the only things the shell's prompt
 /// slot can hold tonight. A third consumer becomes a third variant and nothing
@@ -4090,7 +4099,17 @@ impl DevShell {
     /// Each one is the same shape: a list of names from a registry or an enum,
     /// and an index into it. That is why adding a presentation or an algorithm
     /// needs no work here.
-    fn strip(&self, host: &Host, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn strip(
+        &self,
+        host: &Host,
+        cx: &mut Context<Self>,
+        // The window's width, what sits left of the pickers but the repo
+        // path, and the path's character count — [`controls::tier`]'s
+        // three inputs, from the same source the status bar's budget uses.
+        width_px: f32,
+        left_px: f32,
+        path_chars: usize,
+    ) -> Vec<AnyElement> {
         let me = cx.entity().downgrade();
 
         // `Fn(bool)` per picker rather than one shared handler: which menu is
@@ -4107,57 +4126,61 @@ impl DevShell {
                 });
             }
         };
-        // Every override-driven pick is the same two lines: close, then re-diff.
-        let pick_over = |build: fn(&Overrides, usize) -> Overrides| {
-            let me = me.clone();
-            move |i: usize, _: &mut Window, cx: &mut App| {
-                _ = me.update(cx, |this, cx| {
-                    this.open = None;
-                    this.pending.clear();
-                    let next = build(&this.over, i);
-                    this.set_overrides(next, cx);
-                });
-            }
-        };
 
         // Straight off the registry in `core`, so a theme an extension registers
         // — or one written in `gitten.toml` — is in this menu without a line here
-        // changing. Outside the `diff` check below on purpose: a palette is the
-        // whole window's, and the commit graph is drawn out of the same one.
+        // changing. The pick itself is spelled once: both the standalone trigger
+        // and the composed menu's section route it.
         let theme_names = host.themes.names();
         let themes = controls::Picker::new(
             "theme",
             &theme_names,
             host.themes.index_of(&host.theme.name).unwrap_or(0),
         );
-        let theme_picker = controls::picker(
-            "theme-picker",
-            &themes,
-            self.open == Some(Open::Theme),
-            &host.theme,
-            &host.font,
-            toggle(Open::Theme),
-            {
-                let names: Vec<String> = theme_names.iter().map(|s| s.to_string()).collect();
-                let me = me.clone();
-                move |i, _, cx| {
-                    let Some(name) = names.get(i).cloned() else {
-                        return;
-                    };
-                    _ = me.update(cx, |this, cx| {
-                        this.open = None;
-                        this.pending.clear();
-                        this.set_theme(name, cx);
-                    });
-                }
-            },
-        );
+        let theme_pick = {
+            let names: Vec<String> = theme_names.iter().map(|s| s.to_string()).collect();
+            let me = me.clone();
+            move |i: usize, _: &mut Window, cx: &mut App| {
+                let Some(name) = names.get(i).cloned() else {
+                    return;
+                };
+                _ = me.update(cx, |this, cx| {
+                    this.open = None;
+                    this.pending.clear();
+                    this.set_theme(name, cx);
+                });
+            }
+        };
 
-        // Everything below drives the diff main view, which is always on
-        // screen now — the pickers no longer come and go with what holds the
-        // keyboard.
         let Screen::Diff { view, source, .. } = &self.main else {
-            return vec![theme_picker];
+            // No diff behind the strip — a launch with no repository — leaves
+            // the theme the only picker, and the tier still decides its shape.
+            let tier = controls::tier(&host.font, width_px, left_px, path_chars, &[&themes]);
+            return match tier {
+                Tier::Composed => vec![controls::composed_picker(
+                    "view-picker",
+                    &controls::Section::sections(&[&themes]),
+                    self.open.is_some(),
+                    &host.theme,
+                    &host.font,
+                    toggle(Open::View),
+                    move |s: usize, i: usize, window: &mut Window, cx: &mut App| {
+                        if s == 0 {
+                            theme_pick(i, window, cx);
+                        }
+                    },
+                )],
+                _ => vec![controls::picker(
+                    "theme-picker",
+                    &themes,
+                    self.open == Some(Open::Theme),
+                    !matches!(tier, Tier::Full),
+                    &host.theme,
+                    &host.font,
+                    toggle(Open::Theme),
+                    theme_pick,
+                )],
+            };
         };
         let source = source.borrow().clone();
 
@@ -4195,84 +4218,158 @@ impl DevShell {
         )
         .enabled(from_repo);
 
+        // One dispatch per entry, spelled once: entry `(section, i)` of the
+        // composed menu does exactly what the standalone picker's `i` did,
+        // in the order the triggers stand in. `Rc` because either the five
+        // triggers or the one composed one picks from it — a frame builds
+        // one shape or the other, never both.
+        let routes: Vec<Route> = vec![
+            Rc::new({
+                let me = me.clone();
+                move |i: usize, _: &mut Window, cx: &mut App| {
+                    _ = me.update(cx, |this, cx| {
+                        this.open = None;
+                        this.pending.clear();
+                        this.set_layout(i, cx);
+                    });
+                }
+            }),
+            Rc::new({
+                let me = me.clone();
+                move |i: usize, _: &mut Window, cx: &mut App| {
+                    _ = me.update(cx, |this, cx| {
+                        this.open = None;
+                        this.pending.clear();
+                        this.set_wrap(i, cx);
+                    });
+                }
+            }),
+            Rc::new({
+                // The registry's own order, so an extension's differ is
+                // reachable here the day it is registered.
+                let names: Vec<String> = algorithms.iter().map(|s| s.to_string()).collect();
+                let me = me.clone();
+                move |i: usize, _: &mut Window, cx: &mut App| {
+                    let Some(name) = names.get(i).cloned() else {
+                        return;
+                    };
+                    _ = me.update(cx, |this, cx| {
+                        this.open = None;
+                        this.pending.clear();
+                        let next = Overrides {
+                            algorithm: Some(name),
+                            ..this.over.clone()
+                        };
+                        this.set_overrides(next, cx);
+                    });
+                }
+            }),
+            Rc::new({
+                let me = me.clone();
+                move |i: usize, _: &mut Window, cx: &mut App| {
+                    _ = me.update(cx, |this, cx| {
+                        this.open = None;
+                        this.pending.clear();
+                        let next = Overrides {
+                            whitespace: Whitespace::ALL.get(i).copied(),
+                            ..this.over.clone()
+                        };
+                        this.set_overrides(next, cx);
+                    });
+                }
+            }),
+            Rc::new(theme_pick),
+        ];
+
+        // The tier decides the triggers' shape before any of it is drawn —
+        // the same arithmetic the status bar's hint budget spends, over the
+        // registries as they are right now, so a picker registered tomorrow
+        // is budgeted the day it appears.
+        let pickers = [&layouts, &wrap, &algorithm, &whitespace, &themes];
+        let tier = controls::tier(&host.font, width_px, left_px, path_chars, &pickers);
+        if matches!(tier, Tier::Composed) {
+            return vec![controls::composed_picker(
+                "view-picker",
+                &controls::Section::sections(&pickers),
+                self.open.is_some(),
+                &host.theme,
+                &host.font,
+                toggle(Open::View),
+                move |s: usize, i: usize, window: &mut Window, cx: &mut App| {
+                    if let Some(route) = routes.get(s) {
+                        route(i, window, cx);
+                    }
+                },
+            )];
+        }
+        let value_only = !matches!(tier, Tier::Full);
+
         vec![
             controls::picker(
                 "layout-picker",
                 &layouts,
                 self.open == Some(Open::Layout),
+                value_only,
                 &host.theme,
                 &host.font,
                 toggle(Open::Layout),
                 {
-                    let me = me.clone();
-                    move |i, _, cx| {
-                        _ = me.update(cx, |this, cx| {
-                            this.open = None;
-                            this.pending.clear();
-                            this.set_layout(i, cx);
-                        });
-                    }
+                    let routes = routes.clone();
+                    move |i, window: &mut Window, cx: &mut App| routes[0](i, window, cx)
                 },
             ),
             controls::picker(
                 "wrap-picker",
                 &wrap,
                 self.open == Some(Open::Wrap),
+                value_only,
                 &host.theme,
                 &host.font,
                 toggle(Open::Wrap),
                 {
-                    let me = me.clone();
-                    move |i, _, cx| {
-                        _ = me.update(cx, |this, cx| {
-                            this.open = None;
-                            this.pending.clear();
-                            this.set_wrap(i, cx);
-                        });
-                    }
+                    let routes = routes.clone();
+                    move |i, window: &mut Window, cx: &mut App| routes[1](i, window, cx)
                 },
             ),
             controls::picker(
                 "algorithm-picker",
                 &algorithm,
                 self.open == Some(Open::Algorithm),
+                value_only,
                 &host.theme,
                 &host.font,
                 toggle(Open::Algorithm),
                 {
-                    // The registry's own order, so an extension's differ is
-                    // reachable here the day it is registered.
-                    let names: Vec<String> = algorithms.iter().map(|s| s.to_string()).collect();
-                    let me = me.clone();
-                    move |i, _, cx| {
-                        let Some(name) = names.get(i).cloned() else {
-                            return;
-                        };
-                        _ = me.update(cx, |this, cx| {
-                            this.open = None;
-                            this.pending.clear();
-                            let next = Overrides {
-                                algorithm: Some(name),
-                                ..this.over.clone()
-                            };
-                            this.set_overrides(next, cx);
-                        });
-                    }
+                    let routes = routes.clone();
+                    move |i, window: &mut Window, cx: &mut App| routes[2](i, window, cx)
                 },
             ),
             controls::picker(
                 "whitespace-picker",
                 &whitespace,
                 self.open == Some(Open::Whitespace),
+                value_only,
                 &host.theme,
                 &host.font,
                 toggle(Open::Whitespace),
-                pick_over(|over, i| Overrides {
-                    whitespace: Whitespace::ALL.get(i).copied(),
-                    ..over.clone()
-                }),
+                {
+                    let routes = routes.clone();
+                    move |i, window: &mut Window, cx: &mut App| routes[3](i, window, cx)
+                },
             ),
-            theme_picker,
+            controls::picker(
+                "theme-picker",
+                &themes,
+                self.open == Some(Open::Theme),
+                value_only,
+                &host.theme,
+                &host.font,
+                toggle(Open::Theme),
+                {
+                    let routes = routes.clone();
+                    move |i, window: &mut Window, cx: &mut App| routes[4](i, window, cx)
+                },
+            ),
         ]
     }
     /// The probe cell a section's content wrapper reports its height into —
@@ -4785,7 +4882,83 @@ impl Render for DevShell {
             );
 
         let which = self.active_view_name();
-        let strip = self.strip(&host, cx);
+
+        // The width the strip and the status bar must agree on — the same
+        // `viewport_size` read the status bar's hint budget spends, so the
+        // two bars can never disagree about how wide the window is.
+        let width = f32::from(window.viewport_size().width);
+        let ch = host.font.char_width();
+
+        // The title is the repository and where HEAD is, and nothing else.
+        // The app's name is the icon's job, the view's name is the status
+        // badge's and the version is the bar's; a strip that said all three
+        // again was chrome reading its own labels aloud. The path is drawn
+        // the way every path here is — parent dim, the name bright — and a
+        // launch with no repository behind it (a fixture, a patch) keeps the
+        // acquisition label, which is the only name it has. Read before the
+        // strip is built: the path's character count is the pickers' budget.
+        let title: AnyElement;
+        let path_chars: usize;
+        match &self.repo {
+            Some((path, _)) => {
+                // Cut once per repository — see [`DevShell::title_memo`].
+                let mut memo = self.title_memo.borrow_mut();
+                let (dir, name) = match memo.as_ref() {
+                    Some((at, dir, name)) if at == path => (dir.clone(), name.clone()),
+                    _ => {
+                        let (dir, name) = repo_title(path, home());
+                        let (dir, name) = (SharedString::from(dir), SharedString::from(name));
+                        *memo = Some((path.clone(), dir.clone(), name.clone()));
+                        (dir, name)
+                    }
+                };
+                path_chars = dir.chars().count() + name.chars().count();
+                title = chrome::path_spans(&host, dir, name, c.fg, theme::Surface::Title)
+                    .into_any_element();
+            }
+            None => {
+                let label = self.active_label(cx);
+                path_chars = label.chars().count();
+                title = div()
+                    .whitespace_nowrap()
+                    // From the *start*: the label is a path and a revspec, and
+                    // `…/git HEAD~2..HEAD` is the half worth keeping.
+                    .text_ellipsis_start()
+                    .child(label)
+                    .into_any_element();
+            }
+        }
+
+        // The branch chip, read before the strip is built: its width is part
+        // of what the pickers have to fit beside. One small struct per frame,
+        // no second git call anywhere. Filled with `raised`, the quiet chip
+        // surface — the status badge keeps the accent fill to itself, so the
+        // two never compete. A detached HEAD or a fixture draws nothing:
+        // absence is the honest state.
+        let head_chip = self.panes.get("branches").and_then(|screen| {
+            let Screen::Branches { view, .. } = screen else {
+                return None;
+            };
+            view.read(cx).head_info()
+        });
+
+        // What the strip's right side has to fit beside: the lights inset it
+        // opens with, its paddings and border, and the gaps between its
+        // children — the chip and the debug caveat cost what they render. The
+        // path and the pickers are costed where they are known, in
+        // [`controls::tier`].
+        let mut left_px = LIGHTS_W + 12.0 + 1.0 + 8.0;
+        if let Some(info) = &head_chip {
+            let chars = info.chip.chars().count()
+                + info.drift.as_ref().map(|d| d.chars().count()).unwrap_or(0);
+            left_px += chars as f32 * ch + 16.0 + 2.0 + 8.0;
+        }
+        if cfg!(debug_assertions) {
+            left_px += 5.0 * ch + 8.0;
+        }
+
+        let strip = self.strip(&host, cx, width, left_px, path_chars);
+
         let error = self.error.as_ref().map(|e| e.summary.clone());
         let notice = self.notice.clone();
         let running = self.running.as_ref().map(|(label, at)| {
@@ -4803,37 +4976,6 @@ impl Render for DevShell {
             // one place a background something is spoken of.
             .or_else(|| self.loading.get().then(|| "loading diff".into()));
         let input = self.input.clone();
-
-        // The title is the repository and where HEAD is, and nothing else.
-        // The app's name is the icon's job, the view's name is the status
-        // badge's and the version is the bar's; a strip that said all three
-        // again was chrome reading its own labels aloud. The path is drawn
-        // the way every path here is — parent dim, the name bright — and a
-        // launch with no repository behind it (a fixture, a patch) keeps the
-        // acquisition label, which is the only name it has.
-        let title: AnyElement = match &self.repo {
-            Some((path, _)) => {
-                // Cut once per repository — see [`DevShell::title_memo`].
-                let mut memo = self.title_memo.borrow_mut();
-                let (dir, name) = match memo.as_ref() {
-                    Some((at, dir, name)) if at == path => (dir.clone(), name.clone()),
-                    _ => {
-                        let (dir, name) = repo_title(path, home());
-                        let (dir, name) = (SharedString::from(dir), SharedString::from(name));
-                        *memo = Some((path.clone(), dir.clone(), name.clone()));
-                        (dir, name)
-                    }
-                };
-                chrome::path_spans(&host, dir, name, c.fg, theme::Surface::Title).into_any_element()
-            }
-            None => div()
-                .whitespace_nowrap()
-                // From the *start*: the label is a path and a revspec, and
-                // `…/git HEAD~2..HEAD` is the half worth keeping.
-                .text_ellipsis_start()
-                .child(self.active_label(cx))
-                .into_any_element(),
-        };
 
         // The one focusable element in the window, and where key dispatch enters
         // it: a capture-phase listener on the root, so a keystroke is translated
@@ -4923,46 +5065,41 @@ impl Render for DevShell {
                             .flex_shrink(1.0)
                             .min_w_0()
                             .overflow_hidden()
+                            // Start-ellipsis — the truncation call the
+                            // no-repo fallback uses too: the *name*, the
+                            // last segment, is the part being scanned; the
+                            // parent is the part to sacrifice.
+                            .whitespace_nowrap()
+                            .text_ellipsis_start()
                             .child(title),
                     )
-                    // The branch chip, the design's `⎇ main · ↑2 ↓0`: where
-                    // HEAD sits and how far it has drifted, read from the
-                    // branches pane's own prepared head — one small struct
-                    // per frame, no second git call anywhere. Filled with
-                    // `raised`, the quiet chip surface — the status badge
-                    // keeps the accent fill to itself, so the two never
-                    // compete. A detached HEAD or a fixture draws nothing:
-                    // absence is the honest state.
-                    .children(self.panes.get("branches").and_then(|screen| {
-                        let Screen::Branches { view, .. } = screen else {
-                            return None;
-                        };
-                        let info = view.read(cx).head_info()?;
-                        Some(
-                            div()
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .h(px(CHIP_H))
-                                .px_2()
-                                .bg(rgb(c.raised))
-                                .border_1()
-                                .border_color(rgb(c.border))
-                                .rounded(px(chrome::RADIUS))
-                                .whitespace_nowrap()
-                                // Both halves were spelled at prepare; a
-                                // frame clones two refcounts.
-                                .child(div().flex_none().text_color(rgb(c.fg)).child(info.chip))
-                                .children(info.drift.map(|drift| {
-                                    // A drift figure is read, not glanced at —
-                                    // and raw dim is under the floor on the
-                                    // strip it sits on.
-                                    div()
-                                        .flex_none()
-                                        .text_color(rgb(host.theme.dim_on(theme::Surface::Title)))
-                                        .child(drift)
-                                })),
-                        )
+                    // The branch chip, the design's `⎇ main · ↑2 ↓0` —
+                    // drawn from the head read above the strip, so the
+                    // budget and the pixels come from one read.
+                    .children(head_chip.map(|info| {
+                        div()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .h(px(CHIP_H))
+                            .px_2()
+                            .bg(rgb(c.raised))
+                            .border_1()
+                            .border_color(rgb(c.border))
+                            .rounded(px(chrome::RADIUS))
+                            .whitespace_nowrap()
+                            // Both halves were spelled at prepare; a
+                            // frame clones two refcounts.
+                            .child(div().flex_none().text_color(rgb(c.fg)).child(info.chip))
+                            .children(info.drift.map(|drift| {
+                                // A drift figure is read, not glanced at —
+                                // and raw dim is under the floor on the
+                                // strip it sits on.
+                                div()
+                                    .flex_none()
+                                    .text_color(rgb(host.theme.dim_on(theme::Surface::Title)))
+                                    .child(drift)
+                            }))
                     }))
                     .children(cfg!(debug_assertions).then(|| {
                         // One word and not the sentence this used to be — "DEBUG
@@ -6259,6 +6396,7 @@ mod tests {
             Open::Wrap,
             Open::Algorithm,
             Open::Whitespace,
+            Open::View,
         ] {
             let shell = shell(Some(which), cx);
             shell.update(cx, |s, cx| s.back(cx));
