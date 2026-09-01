@@ -5,6 +5,11 @@
 //! has, so the same control will do for a theme, a font or a highlighter the day
 //! those want one.
 //!
+//! The strip's pickers degrade in two tiers as the window narrows — the
+//! labels drop first, then the five collapse into one `view ▾` — computed,
+//! never guessed, by [`tier`] from the same character arithmetic the
+//! status bar's hint budget spends.
+//!
 //! # Why this is not `gpui_component::popover::Popover`
 //!
 //! AGENTS.md says don't build what the framework already has, and the framework
@@ -91,16 +96,81 @@ impl Picker {
     }
 }
 
+/// How much of their labels the strip's picker triggers keep as the window
+/// narrows. Two steps, computed — never guessed — from the same character
+/// arithmetic the status bar's hint budget spends: the labels drop first
+/// (the value is the information; the label is recoverable from the open
+/// menu), then the five collapse into one `view ▾`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Tier {
+    /// Every trigger draws label and value: `layout unified ▾`.
+    Full,
+    /// The width where the full triggers no longer fit: value-only
+    /// triggers — `unified ▾`, not `layout unified ▾`.
+    ValueOnly,
+    /// Even value-only triggers do not fit: one `view ▾` whose menu is
+    /// the five pickers' entries as sections.
+    Composed,
+}
+
+/// The tier the title strip's pickers draw at. `strip_px` is the window's
+/// width; `left_px` is everything on the strip left of the pickers but the
+/// repo path — the lights inset, the paddings, the chip, the badge, their
+/// gaps — and `path_chars` is the repo path at the length it renders. Each
+/// picker costs `label + value + caret` characters plus the pixels around
+/// it, in characters × [`Font::char_width`], so a picker registered
+/// tomorrow is budgeted the day it appears — and the thresholds are
+/// derived from the budget, not named and then maintained by hand.
+pub fn tier(
+    font: &Font,
+    strip_px: f32,
+    left_px: f32,
+    path_chars: usize,
+    pickers: &[&Picker],
+) -> Tier {
+    let ch = font.char_width();
+    // What one trigger costs around its text: its own padding, its border,
+    // and the gap the strip puts before it (`px_2`, `border_1`, `gap_2`).
+    const TRIGGER_PX: f32 = 8.0 + 8.0 + 1.0 + 1.0 + 8.0;
+    // The air between the trigger's own halves — label, value, caret.
+    const GAP_PX: f32 = 8.0;
+    let cost = |labelled: bool| -> f32 {
+        pickers
+            .iter()
+            .map(|p| {
+                let text = if labelled {
+                    p.label.chars().count() + p.value().chars().count() + 1
+                } else {
+                    p.value().chars().count() + 1
+                };
+                text as f32 * ch + GAP_PX * if labelled { 2.0 } else { 1.0 } + TRIGGER_PX
+            })
+            .sum()
+    };
+    let room = strip_px - left_px - path_chars as f32 * ch;
+    if room >= cost(true) {
+        Tier::Full
+    } else if room >= cost(false) {
+        Tier::ValueOnly
+    } else {
+        Tier::Composed
+    }
+}
+
 /// The control: a trigger, and the list under it when `open`.
 ///
 /// `on_toggle` is called with the *new* open state, so the caller does not have
 /// to track what it just did. `on_pick` gets the chosen index and is responsible
 /// for closing — a pick that left the list open would be a second decision, and
 /// this control does not make decisions.
+#[allow(clippy::too_many_arguments)]
 pub fn picker(
     id: &'static str,
     p: &Picker,
     open: bool,
+    // The trigger drops its label and says only the value — the strip's
+    // second tier, drawn here so the narrowing has one home.
+    value_only: bool,
     theme: &Theme,
     font: &Font,
     on_toggle: impl Fn(bool, &mut Window, &mut App) + 'static,
@@ -159,10 +229,8 @@ pub fn picker(
         .border_1()
         .border_color(rgb(if open { c.faint } else { c.border }))
         .bg(rgb(if open { c.status_bg } else { c.title_bg }))
-        .child(div().text_color(rgb(dim)).child(p.label))
+        .children((!value_only).then(|| div().text_color(rgb(dim)).child(p.label)))
         .child(div().text_color(rgb(fg)).child(p.value()))
-        // A caret and not a glyph from an icon font: the app ships no icons, and
-        // one drawn character is not worth a dependency.
         .child(
             div()
                 .text_color(rgb(dim))
@@ -253,6 +321,164 @@ pub fn picker(
     root.into_any_element()
 }
 
+/// One group of the composed menu: what one picker would have offered.
+pub struct Section {
+    /// The picker's label, naming the group.
+    pub label: &'static str,
+    pub options: Vec<SharedString>,
+    pub current: usize,
+    /// False draws the group's rows quiet and deaf — the same "dim and
+    /// inert rather than removed" rule the standalone trigger follows.
+    pub enabled: bool,
+}
+
+impl Section {
+    /// The composed menu's groups, straight off the same registries the
+    /// standalone triggers read: a pure walk over the pickers, so a picker
+    /// registered tomorrow is a section the day it appears, with no edit
+    /// here. This is the seam the tests hold.
+    pub fn sections(pickers: &[&Picker]) -> Vec<Section> {
+        pickers
+            .iter()
+            .map(|p| Section {
+                label: p.label,
+                options: p.options.clone(),
+                current: p.current,
+                enabled: p.enabled,
+            })
+            .collect()
+    }
+}
+
+/// The five-in-one trigger: one `view ▾`, its menu the pickers' entries as
+/// labeled sections. Selecting an entry does exactly what the standalone
+/// picker's entry did — `on_pick` gets `(section, index)` and the caller
+/// routes it; nothing here is a second decision.
+pub fn composed_picker(
+    id: &'static str,
+    sections: &[Section],
+    open: bool,
+    theme: &Theme,
+    font: &Font,
+    on_toggle: impl Fn(bool, &mut Window, &mut App) + 'static,
+    on_pick: impl Fn(usize, usize, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    let c = &theme.chrome;
+    // The same chrome the standalone trigger wears — the label is
+    // "view" and there is no value, because the value is five menus'
+    // worth of information the open list holds better.
+    let dim = theme.dim_on(if open {
+        Surface::Status
+    } else {
+        Surface::Title
+    });
+    let toggle = Rc::new(on_toggle);
+    let trigger = div()
+        .id("trigger")
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap_2()
+        .h(px(H))
+        .px_2()
+        .rounded(px(RADIUS))
+        .border_1()
+        .border_color(rgb(if open { c.faint } else { c.border }))
+        .bg(rgb(if open { c.status_bg } else { c.title_bg }))
+        .child(div().text_color(rgb(dim)).child("view"))
+        .child(
+            div()
+                .text_color(rgb(dim))
+                .child(if open { "▴" } else { "▾" }),
+        )
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(c.status_bg)))
+        .on_click({
+            let toggle = toggle.clone();
+            move |_, window, cx| toggle(!open, window, cx)
+        });
+
+    let mut root = div().id(id).relative().flex_none().child(trigger);
+
+    if open {
+        let on_pick = Rc::new(on_pick);
+        // Wide enough for the longest option plus its tick, from the font
+        // rather than a constant — the same reason the standalone list is.
+        let widest = sections
+            .iter()
+            .flat_map(|s| s.options.iter().map(|o| o.chars().count()))
+            .max()
+            .unwrap_or(0);
+        let w = px((widest as f32 + 4.0) * font.advance * font.size + 16.0);
+
+        let list = div()
+            .id("list")
+            .absolute()
+            .top(px(H + 4.0))
+            .right_0()
+            .w(w)
+            .py_1()
+            .bg(rgb(c.title_bg))
+            .border_1()
+            .border_color(rgb(c.faint))
+            .rounded(px(RADIUS))
+            .occlude()
+            .on_mouse_down_out({
+                let dismiss = toggle.clone();
+                move |_, window, cx| dismiss(false, window, cx)
+            })
+            .children(sections.iter().enumerate().map(|(s, section)| {
+                let header = div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .h(px(ROW_H))
+                    .px_2()
+                    .text_color(rgb(theme.dim_on(Surface::Title)))
+                    .child(SharedString::from(section.label));
+                div()
+                    .id(("section", s))
+                    .flex()
+                    .flex_col()
+                    .child(header)
+                    .children(section.options.iter().enumerate().map(|(i, option)| {
+                        let row =
+                            div()
+                                .id(("option", i))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .h(px(ROW_H))
+                                .px_2()
+                                .text_color(rgb(if !section.enabled {
+                                    theme.dim_on(Surface::Title)
+                                } else if i == section.current {
+                                    c.accent
+                                } else {
+                                    c.fg
+                                }))
+                                .child(option.clone())
+                                .children((i == section.current && section.enabled).then(|| {
+                                    div().flex_none().text_color(rgb(c.accent)).child("✓")
+                                }));
+                        if section.enabled {
+                            let on_pick = on_pick.clone();
+                            row.cursor_pointer()
+                                .hover(|s| s.bg(rgb(c.status_bg)))
+                                .on_click(move |_, window, cx| on_pick(s, i, window, cx))
+                        } else {
+                            row
+                        }
+                    }))
+            }));
+
+        // Deferred at priority 1, for the same reason the standalone list
+        // is: an ancestor's paint order would otherwise bury it.
+        root = root.child(deferred(list).with_priority(1));
+    }
+    root.into_any_element()
+}
+
 /// The transparent surface behind an open picker.
 ///
 /// Picker lists paint at deferred priority 1. This paints first at priority 0,
@@ -268,7 +494,7 @@ pub fn picker_backdrop() -> AnyElement {
 mod tests {
     // By name, not a glob: `use gpui::*` in the parent shadows `#[test]` with
     // GPUI's own attribute macro and every test in here fails to expand.
-    use super::Picker;
+    use super::{tier, Picker, Section, Tier};
 
     #[test]
     fn a_picker_shows_the_option_it_is_on() {
@@ -298,5 +524,118 @@ mod tests {
             "histogram",
             "it still says what it is on"
         );
+    }
+
+    /// The strip's pickers as the strip builds them: every registry the
+    /// diff screen reads, minus the two that live on a view (`layout`
+    /// and `wrap` name what that view publishes, so a test spells the
+    /// shipped values). The order is the strip's own.
+    fn strip_pickers(host: &gitten_core::host::Host) -> Vec<Picker> {
+        let whitespace: Vec<&str> = gitten_core::differ::Whitespace::ALL
+            .iter()
+            .map(|w| w.name())
+            .collect();
+        vec![
+            Picker::new("layout", &["unified", "split"], 0),
+            Picker::new("wrap", &host.wrap.names(), 0),
+            Picker::new("algorithm", &host.differ.names(), 0),
+            Picker::new("whitespace", &whitespace, 0),
+            Picker::new("theme", &host.themes.names(), 0),
+        ]
+    }
+
+    #[test]
+    fn the_tier_degrades_exactly_at_the_computed_boundaries() {
+        // The thresholds are derived, not named: the test computes what five
+        // full and five value-only triggers cost from the real character
+        // counts and holds the tier to those widths — a picker registered
+        // tomorrow moves the boundaries and this test moves with it.
+        let host = gitten_core::host::Host::new();
+        let pickers = strip_pickers(&host);
+        let refs: Vec<&Picker> = pickers.iter().collect();
+        let font = gitten_core::font::Font::default();
+        let ch = font.char_width();
+
+        // The strip's furniture at the widths the plan names: the lights
+        // inset, the paddings, the border, the chip and its drift, the
+        // gaps — and a 40-character repository path, the length the
+        // threshold is defined against.
+        let left_px = 72.0 + 12.0 + 1.0 + 8.0 + (14.0 * ch + 16.0 + 2.0 + 8.0);
+        let path_chars = 40;
+        let full: f32 = refs
+            .iter()
+            .map(|p| {
+                (p.label.chars().count() + p.value().chars().count() + 1) as f32 * ch + 16.0 + 26.0
+            })
+            .sum();
+        let value: f32 = refs
+            .iter()
+            .map(|p| (p.value().chars().count() + 1) as f32 * ch + 8.0 + 26.0)
+            .sum();
+        let t1 = left_px + path_chars as f32 * ch + full;
+        let t2 = left_px + path_chars as f32 * ch + value;
+
+        assert_eq!(
+            tier(&font, t1, left_px, path_chars, &refs),
+            Tier::Full,
+            "exactly the width five full pickers fit beside a 40-char path"
+        );
+        assert_eq!(
+            tier(&font, t1 - 0.5, left_px, path_chars, &refs),
+            Tier::ValueOnly,
+            "half a character short, the labels give"
+        );
+        assert_eq!(
+            tier(&font, t2, left_px, path_chars, &refs),
+            Tier::ValueOnly,
+            "exactly the width five value-only triggers fit"
+        );
+        assert_eq!(
+            tier(&font, t2 - 0.5, left_px, path_chars, &refs),
+            Tier::Composed,
+            "half a character short of even that, the five compose"
+        );
+    }
+
+    #[test]
+    fn a_560px_window_composes_and_a_1400px_one_is_full() {
+        // The plan's two named widths, held against the shipped registries.
+        let host = gitten_core::host::Host::new();
+        let pickers = strip_pickers(&host);
+        let refs: Vec<&Picker> = pickers.iter().collect();
+        let font = gitten_core::font::Font::default();
+        let left_px = 72.0 + 12.0 + 1.0 + 8.0 + (14.0 * font.char_width() + 26.0);
+        assert_eq!(
+            tier(&font, 560.0, left_px, 40, &refs),
+            Tier::Composed,
+            "at the declared minimum, five pickers are one"
+        );
+        assert_eq!(
+            tier(&font, 1400.0, left_px, 40, &refs),
+            Tier::Full,
+            "at a wide window, every trigger carries its label"
+        );
+    }
+
+    #[test]
+    fn the_composed_menu_holds_every_entry_of_every_picker() {
+        // The seam test: the composed menu is generated from the same
+        // registries, so a sixth registered picker appears in it without
+        // an edit here.
+        let host = gitten_core::host::Host::new();
+        let mut pickers = strip_pickers(&host);
+        pickers.push(Picker::new("sixth", &["a", "b"], 1));
+        let refs: Vec<&Picker> = pickers.iter().collect();
+        let sections = Section::sections(&refs);
+
+        assert_eq!(sections.len(), 6, "a sixth picker is a sixth section");
+        for (p, s) in pickers.iter().zip(&sections) {
+            assert_eq!(s.label, p.label);
+            let wanted: Vec<_> = p.options.iter().map(|o| o.as_ref()).collect();
+            let got: Vec<_> = s.options.iter().map(|o| o.as_ref()).collect();
+            assert_eq!(got, wanted, "section {} lost an entry", p.label);
+            assert_eq!(s.current, p.current);
+            assert_eq!(s.enabled, p.enabled);
+        }
     }
 }
