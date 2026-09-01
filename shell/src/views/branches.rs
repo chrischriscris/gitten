@@ -1624,6 +1624,7 @@ mod tests {
             vec![local("feature", false), local("main", true)],
             Vec::new(),
             None,
+            Vec::new(),
             &host.theme,
             "",
         ));
