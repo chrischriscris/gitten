@@ -182,17 +182,14 @@ pub(crate) fn column_at(text: &str, x: f32, size: f32, host: &Host) -> usize {
 pub struct RowState {
     /// The keyboard's row.
     pub current: bool,
-    /// Whether this pane holds the keyboard at all.
-    ///
-    /// `dead_code` because no drawing reads it yet: the bar that turns it into
-    /// ink is the seam's next change, and the sidebar's are drawn from the flag
-    /// their pane already holds.
-    #[allow(dead_code)]
+    /// Whether this pane holds the keyboard at all: [`row_bar`] picks the
+    /// cursor bar's ink by it — accent while the pane holds the keyboard,
+    /// faint where the selection is remembered and the keyboard is not.
     pub focused: bool,
-    /// An armed destructive question stands over this row's hunk.
-    ///
-    /// Same as `focused`: computed here, read by the tint the next change adds.
-    #[allow(dead_code)]
+    /// An armed destructive question stands over this row's hunk: the gutter
+    /// and the sign read it, and tint toward `chrome.error`, so the line a
+    /// second press would destroy is named by its own colour and not only by
+    /// the band above it.
     pub armed: bool,
 }
 
