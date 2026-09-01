@@ -105,6 +105,11 @@ const CHIP_H: f32 = 22.0;
 /// fit: its header and two rows — the selected one and a neighbour, which
 /// is the least a list can show and still be seen to scroll.
 const SECTION_MIN_H: f32 = chrome::HEADER_H + 2.0 * graph::ROW_H;
+/// The most rows an *unfocused* list section spends its pixels on. Eight:
+/// nobody reads sixteen branches while committing — the focused pane is the
+/// one being read, and it stays uncapped. The slack a cap frees goes to the
+/// commit list, the flexible middle under the stack.
+const SECTION_MAX_ROWS: usize = 8;
 
 /// The shortest window that keeps its promise: five stacked sections at
 /// their [`SECTION_MIN_H`] floor — the three content-sized panes, the commit
@@ -128,6 +133,18 @@ fn section_height(rows: usize) -> f32 {
 /// the layout, and an empty list padded to two rows is air nobody asked for.
 fn section_floor(rows: usize) -> f32 {
     SECTION_MIN_H.min(section_height(rows))
+}
+
+/// The height a section *asks* for: its natural height when the keyboard is
+/// in it, else that natural height capped at [`SECTION_MAX_ROWS`] rows — see
+/// the cap for why. The flex squeeze still bounds both, so a focused
+/// sixteen-row list wins the argument only when there is slack to win.
+fn section_basis(rows: usize, focused: bool) -> f32 {
+    section_height(if focused {
+        rows
+    } else {
+        rows.min(SECTION_MAX_ROWS)
+    })
 }
 
 /// The FILES header's count: the working tree's distinct changed paths, as
@@ -4332,7 +4349,7 @@ impl Render for DevShell {
                         .id(id)
                         .debug_selector(move || id.to_string())
                         .flex_shrink(1.0)
-                        .h(px(section_height(rows)))
+                        .h(px(section_basis(rows, focused)))
                         // The floor never exceeds the basis: a minimum
                         // above the natural height wins the layout and an
                         // empty section would be padded to two rows.
@@ -4390,7 +4407,7 @@ impl Render for DevShell {
                         .id(id)
                         .debug_selector(move || id.to_string())
                         .flex_shrink(1.0)
-                        .h(px(section_height(rows)))
+                        .h(px(section_basis(rows, focused)))
                         .min_h(px(section_floor(rows)))
                         .flex()
                         .flex_col()
@@ -10057,7 +10074,9 @@ diff --git a/added.txt b/added.txt
 
 #[cfg(test)]
 mod title_tests {
-    use super::{repo_title, section_floor, section_height, SECTION_MIN_H};
+    use super::{
+        repo_title, section_basis, section_floor, section_height, SECTION_MAX_ROWS, SECTION_MIN_H,
+    };
     use std::path::Path;
 
     #[test]
@@ -10123,6 +10142,28 @@ mod title_tests {
             SECTION_MIN_H,
             "a long list still squeezes to two rows"
         );
+    }
+
+    #[test]
+    fn an_unfocused_section_never_exceeds_the_cap() {
+        assert_eq!(
+            section_basis(16, false),
+            section_height(SECTION_MAX_ROWS),
+            "a long list asks for the cap, not its rows"
+        );
+        assert_eq!(
+            section_basis(3, false),
+            section_height(3),
+            "a short list keeps its natural height"
+        );
+        assert_eq!(
+            section_basis(16, true),
+            section_height(16),
+            "the focused section is uncapped"
+        );
+        // And the floor survives the cap: a squeezed section still shows two
+        // whole rows, whatever it asked for.
+        assert!(section_basis(16, false) >= SECTION_MIN_H);
     }
 
     #[test]
