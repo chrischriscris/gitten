@@ -147,6 +147,17 @@ fn section_basis(rows: usize, focused: bool) -> f32 {
     })
 }
 
+/// The whole-row cut of a squeezed section's content height: rounded down to
+/// a whole multiple of [`graph::ROW_H`]. Flex may squeeze a section to three
+/// and a half rows, and the half is a line of text cut mid-glyph — so what a
+/// section shows is quantized and the remainder is padded below in the
+/// background colour, and the boundary always lands between rows. Arithmetic
+/// on a measurement, one frame late — the house rule; see
+/// [`DevShell::section_content`].
+fn quantized(content_h: f32) -> f32 {
+    (content_h / graph::ROW_H).floor() * graph::ROW_H
+}
+
 /// The FILES header's count: the working tree's distinct changed paths, as
 /// the header's only right-edge furniture. `None` on a clean tree — a zero
 /// count is the empty state said twice, the rows below it already saying so,
@@ -1270,6 +1281,13 @@ struct DevShell {
     /// must not re-split the path and re-format three numbers to say the
     /// same thing again.
     header_memo: RefCell<Option<(views::diff::FileSummary, HeaderText)>>,
+    /// Each sidebar section's content height, as its canvas probe reported it
+    /// during the last paint — keyed by the section's element id, because the
+    /// wrappers are built fresh every frame and the probe has to write into
+    /// something that survives them. Read by the next frame's build, which is
+    /// what makes the whole-row quantization one frame late; see
+    /// [`DevShell::section_content`] and [`quantized`].
+    quant: RefCell<std::collections::HashMap<&'static str, Rc<Cell<f32>>>>,
     /// Which modes' bindings are live, innermost last: the pane container, the
     /// focused tenant, then input or help over it. Rebuilt by
     /// [`DevShell::sync_modes`] whenever any of those changes.
@@ -4152,6 +4170,82 @@ impl DevShell {
             theme_picker,
         ]
     }
+    /// The probe cell a section's content wrapper reports its height into —
+    /// keyed by the section's element id, because the wrappers are built
+    /// fresh every frame and the probe has to write into something that
+    /// survives them. The probe paints after this frame's build has read the
+    /// cell, so what it writes is the *next* frame's input: correct, and one
+    /// frame late, the house rule for measured layout.
+    fn probed(&self, id: &'static str) -> Rc<Cell<f32>> {
+        self.quant
+            .borrow_mut()
+            .entry(id)
+            .or_insert_with(|| Rc::new(Cell::new(0.0)))
+            .clone()
+    }
+
+    /// A section's content wrapper — the pane's rows under its header —
+    /// sized to whole rows. The zero-height canvas pinned across it is the
+    /// probe: paint reports the wrapper's box, [`DevShell::quant`] carries
+    /// it to the next frame, and that frame rounds the height **down** to a
+    /// whole multiple of [`graph::ROW_H`] ([`quantized`]) and pads the
+    /// remainder below the last full row in the background colour, so the
+    /// boundary always lands between rows and never through a line of
+    /// text. Before the first report the rows take the wrapper as they
+    /// find it; every frame after, squeezed or not, is quantized.
+    fn section_content(
+        &self,
+        id: &'static str,
+        view: AnyView,
+        bg: theme::Rgb,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let probed = self.probed(id);
+        let measured = probed.get();
+        let me = cx.entity().downgrade();
+        let wrapper = div()
+            .min_h_0()
+            .flex_grow(1.0)
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .child({
+                let probed = probed.clone();
+                canvas(
+                    move |bounds, _, cx| {
+                        let h = f32::from(bounds.size.height);
+                        if (h - probed.get()).abs() >= 0.5 {
+                            probed.set(h);
+                            _ = me.update(cx, |_, cx| cx.notify());
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .h(px(0.))
+            });
+        if measured > 0.0 {
+            wrapper
+                .child(
+                    div()
+                        .debug_selector(move || format!("{id}-rows"))
+                        .flex_none()
+                        .w_full()
+                        .h(px(quantized(measured)))
+                        .overflow_hidden()
+                        .child(view),
+                )
+                // The remainder the rows do not spend: background, not a
+                // half row. Growing into exactly the difference is what
+                // flex_grow does here.
+                .child(div().flex_grow(1.0).bg(rgb(bg)))
+        } else {
+            wrapper.child(div().min_h_0().flex_grow(1.0).overflow_hidden().child(view))
+        }
+    }
 
     /// The stack's flexible foot: the commit list, or whichever extension
     /// pane took its region over. Focused-and-not-a-sidebar-name is exactly
@@ -4250,13 +4344,7 @@ impl DevShell {
                     this.set_spot(Spot::List, cx);
                 }))
                 .child(chrome::pane_header(host, "4", name, None, focused, right))
-                .child(
-                    div()
-                        .min_h_0()
-                        .flex_grow(1.0)
-                        .overflow_hidden()
-                        .child(screen.any()),
-                )
+                .child(self.section_content("side-commits", screen.any(), c.bg, cx))
                 .into_any_element(),
         );
     }
@@ -4302,10 +4390,15 @@ impl Render for DevShell {
         // content**: five files take five rows and the branches sit directly
         // under them, the way the design stacks them — not a quarter of the
         // column each with air nobody asked for. The height is arithmetic
-        // (header plus rows), because a view cannot measure itself during
-        // `render`; and when they do not fit, each shrinks from that basis
-        // to a floor of two rows and its `uniform_list` scrolls. No
-        // measurement, no second frame.
+        // (header plus rows, capped at [`SECTION_MAX_ROWS`] when the keyboard
+        // is elsewhere — the focused pane is the one being read), because a
+        // view cannot measure itself during `render`; and when they do not
+        // fit, each shrinks from that basis to a floor of two rows and its
+        // `uniform_list` scrolls. The one measurement the stack does make —
+        // a squeezed section's box, reported one frame late by the canvas
+        // probe — is spent on the boundary only: [`quantized`] rounds what a
+        // section shows down to whole rows, so flex can never cut a line of
+        // text mid-glyph.
         //
         // The commit list is the stack's one *flexible* section: it takes
         // whatever the short panes leave, the way lazygit's log does — it is
@@ -4368,13 +4461,7 @@ impl Render for DevShell {
                             focused,
                             None,
                         ))
-                        .child(
-                            div()
-                                .min_h_0()
-                                .flex_grow(1.0)
-                                .overflow_hidden()
-                                .child(screen.any()),
-                        )
+                        .child(self.section_content(id, screen.any(), c.bg, cx))
                         .into_any_element(),
                 );
             }
@@ -4423,13 +4510,7 @@ impl Render for DevShell {
                             focused,
                             None,
                         ))
-                        .child(
-                            div()
-                                .min_h_0()
-                                .flex_grow(1.0)
-                                .overflow_hidden()
-                                .child(screen.any()),
-                        )
+                        .child(self.section_content(id, screen.any(), c.bg, cx))
                         .into_any_element(),
                 );
             }
@@ -5415,6 +5496,7 @@ fn main() {
                     first_render: Cell::new(false),
                     title_memo: RefCell::new(None),
                     header_memo: RefCell::new(None),
+                    quant: RefCell::default(),
                     modes: Modes::new(),
                     pending: Vec::new(),
                     help: false,
@@ -5762,6 +5844,7 @@ mod tests {
                 first_render: Cell::new(false),
                 title_memo: RefCell::new(None),
                 header_memo: RefCell::new(None),
+                quant: RefCell::default(),
                 modes: Modes::new(),
                 pending: vec![vec![Key::char('g')]],
                 help: false,
@@ -5887,6 +5970,7 @@ mod tests {
                 first_render: Cell::new(false),
                 title_memo: RefCell::new(None),
                 header_memo: RefCell::new(None),
+                quant: RefCell::default(),
                 modes: Modes::new(),
                 pending: Vec::new(),
                 help: false,
@@ -10075,7 +10159,8 @@ diff --git a/added.txt b/added.txt
 #[cfg(test)]
 mod title_tests {
     use super::{
-        repo_title, section_basis, section_floor, section_height, SECTION_MAX_ROWS, SECTION_MIN_H,
+        quantized, repo_title, section_basis, section_floor, section_height, SECTION_MAX_ROWS,
+        SECTION_MIN_H,
     };
     use std::path::Path;
 
@@ -10142,6 +10227,26 @@ mod title_tests {
             SECTION_MIN_H,
             "a long list still squeezes to two rows"
         );
+    }
+
+    #[test]
+    fn a_squeezed_section_shows_only_whole_rows() {
+        let row = crate::graph::ROW_H;
+        assert_eq!(
+            quantized(3.5 * row),
+            3.0 * row,
+            "the half row is padded away"
+        );
+        assert_eq!(
+            quantized(2.0 * row),
+            2.0 * row,
+            "a whole multiple is kept exactly"
+        );
+        assert_eq!(quantized(0.5 * row), 0.0, "less than a row shows nothing");
+        assert_eq!(quantized(0.0), 0.0);
+        // Whatever the squeeze, the shown height plus nothing is a whole-row
+        // multiple: the boundary lands between rows, never through a glyph.
+        assert_eq!(quantized(972.4) % row, 0.0);
     }
 
     #[test]
