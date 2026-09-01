@@ -156,7 +156,7 @@ impl Render for Status {
                 .min_w_full()
                 .h(px(ROW_H))
                 .pl(px(chrome::ROW_PAD))
-                .pr_2()
+                .pr(chrome::gap_m(&host.font))
                 .child(
                     div()
                         .flex_none()
@@ -249,7 +249,7 @@ impl Render for Status {
                         div()
                             .flex_none()
                             .ml_auto()
-                            .pr_2()
+                            .pr(chrome::gap_m(&host.font))
                             .text_color(rgb(c.dim))
                             .child(right),
                     );

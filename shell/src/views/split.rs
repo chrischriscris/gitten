@@ -448,7 +448,7 @@ impl Rows for SplitRows {
         let theme = &host.theme;
         match &self.rows[index] {
             Row::File { path, adds, dels } => {
-                file_header(path, *adds, *dels, theme, sel, state, shift)
+                file_header(path, *adds, *dels, theme, &host.font, sel, state, shift)
             }
             Row::Hunk(header) => hunk_header(header, theme, sel, state, shift),
             Row::Pair { old, new } => {
