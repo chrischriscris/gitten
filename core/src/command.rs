@@ -468,6 +468,13 @@ impl Keymap {
         bind("diff", "space", "diff.stage-hunk");
         bind("diff", "u", "diff.unstage-hunk");
         bind("diff", "D", "diff.discard-hunk");
+        // The status pane's own key. Its rows are command names — pull,
+        // push, fetch, read from the same registry this map and the help
+        // overlay read — and enter runs the row the cursor is on: the same
+        // names the globals P/p/f run from anywhere, dispatched from data
+        // here rather than spelled a second time. The list vocabulary
+        // itself stays global, exactly as every other pane's is.
+        bind("status", "enter", "status.run");
 
         bind("commits", "enter", "commits.open-diff");
         bind("commits", "/", "commits.search");
@@ -1025,6 +1032,11 @@ impl Commands {
                 None,
             ),
             ("status.focus", "focus the status pane", None),
+            (
+                "status.run",
+                "run the verb the status pane's cursor is on",
+                Some("run"),
+            ),
             ("files.focus", "focus the working-tree pane", None),
             (
                 "files.stage",
