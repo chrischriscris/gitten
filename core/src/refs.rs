@@ -34,6 +34,19 @@ use std::borrow::Cow;
 /// lines of the same guarantees drifting apart.
 pub type RefName = crate::status::PathBytes;
 
+/// What the keyboard is on, as verbs aim at it: bytes, never display text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    /// A local branch, named relative to `refs/heads`.
+    Local(RefName),
+    /// A remote-tracking branch. Checkout may aim here — git detaches onto
+    /// the fetched commit — but rename and delete refuse tonight, on purpose.
+    Remote { remote: RefName, branch: RefName },
+    /// The detached-HEAD row: a place, not a branch, and every branch verb
+    /// says so rather than guessing which branch was meant.
+    Detached,
+}
+
 // ----------------------------------------------------------------------- head
 
 /// Where `HEAD` points right now.

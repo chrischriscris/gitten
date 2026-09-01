@@ -1423,6 +1423,43 @@ struct DevShell {
     ongoing: Cell<OngoingScroll>,
 }
 
+struct WindowActs<'shell, 'context, 'app> {
+    shell: &'shell mut DevShell,
+    cx: &'context mut Context<'app, DevShell>,
+}
+
+impl gitten_app::act::Acts for WindowActs<'_, '_, '_> {
+    fn branch_target(&self) -> Option<views::branches::Target> {
+        self.shell.branches_target(self.cx)
+    }
+
+    fn say(&mut self, message: String) {
+        self.shell.set_notice(message);
+    }
+
+    fn ask(&mut self, question: String) {
+        self.shell.set_question(question);
+    }
+
+    fn confirm_or_arm(&mut self, target: &views::branches::Target) -> bool {
+        match self.shell.active() {
+            Some(Screen::Branches { view, .. }) => view.update(self.cx, |branches, _| {
+                branches.confirm_or_arm_delete(target)
+            }),
+            _ => false,
+        }
+    }
+
+    fn repo(&self) -> Option<gitten_git::Handle> {
+        self.shell.writes().map(|writes| writes.repo)
+    }
+
+    fn submit(&mut self, job: Box<dyn Job>) -> bool {
+        self.shell.notice = None;
+        self.shell.writes().is_some_and(|writes| writes.send(job))
+    }
+}
+
 /// One of the four screens a search prompt can drive. [`SearchPane::apply`]
 /// is the whole of what the live half and accept differ by; the prompt
 /// itself is the shell's, the matcher belongs where the flatten rows live.
@@ -2921,45 +2958,8 @@ impl DevShell {
             self.set_notice("branches.delete is not supported here");
             return;
         }
-        let Some(target) = self.branches_target(cx) else {
-            self.set_notice("nothing selected to delete");
-            return;
-        };
-        let shown = match &target {
-            views::branches::Target::Local(name) => String::from_utf8_lossy(name.as_bytes()),
-            views::branches::Target::Remote { remote, branch } => {
-                format!("{}/{}", remote.to_string_lossy(), branch.to_string_lossy()).into()
-            }
-            views::branches::Target::Detached => {
-                self.set_notice("a detached HEAD is not a branch");
-                return;
-            }
-        };
-        if matches!(target, views::branches::Target::Remote { .. }) {
-            self.set_notice("a remote branch is its remote's to delete — fetch prunes it here");
-            return;
-        }
-        let Some(Screen::Branches { view, .. }) = self.active() else {
-            unreachable!("checked above");
-        };
-        let Some(writes) = self.writes() else {
-            self.set_notice("a fixture has no repository to delete branches from");
-            return;
-        };
-        // Arm, or spend the arm. False means the question was just asked.
-        if !view.update(cx, |b, _| b.confirm_or_arm_delete(&target)) {
-            self.set_question(format!("delete branch {shown}? press again to confirm"));
-            return;
-        }
-        self.notice = None; // the question is spent; the running band speaks next
-        let name = match target {
-            views::branches::Target::Local(name) => name.as_bytes().to_vec(),
-            _ => unreachable!("remotes and detached refuse above"),
-        };
-        let job = gitten_app::verbs::Write::delete_branch(&writes.repo, name, false);
-        if !writes.send(Box::new(job)) {
-            self.set_notice("the job queue is shutting down");
-        }
+        let mut client = WindowActs { shell: self, cx };
+        gitten_app::act::delete_branch(&mut client);
     }
 
     /// `*.search`: gather a query over the focused list pane — commits,

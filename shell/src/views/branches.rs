@@ -138,21 +138,7 @@ pub(crate) struct RemoteRow {
     pub dot: Dot,
 }
 
-/// What the keyboard is on, as verbs aim at it: bytes, never display text.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Target {
-    /// A local branch, named relative to `refs/heads`.
-    Local(PathBytes),
-    /// A remote-tracking branch. Checkout may aim here — git detaches onto
-    /// the fetched commit — but rename and delete refuse tonight, on purpose.
-    Remote {
-        remote: PathBytes,
-        branch: PathBytes,
-    },
-    /// The detached-HEAD row: a place, not a branch, and every branch verb
-    /// says so rather than guessing which branch was meant.
-    Detached,
-}
+pub(crate) use gitten_core::refs::Target;
 
 /// The distance half of one local row, rendered once.
 ///

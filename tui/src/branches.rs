@@ -71,22 +71,7 @@ impl Marks {
     }
 }
 
-/// What the keyboard is on, as verbs aim at it: bytes, never display text.
-///
-/// The same three shapes the window's branches pane carries — checkout
-/// accepts a local or a remote row, rename and delete and tag accept a local
-/// only, and the detached row is a place every verb refuses by name rather
-/// than guessing which branch was meant.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Target {
-    /// A local branch, named relative to `refs/heads`.
-    Local(RefName),
-    /// A remote-tracking branch. The two halves stay apart because either may
-    /// hold a slash; a verb that wants the full refname joins them itself.
-    Remote { remote: RefName, branch: RefName },
-    /// The detached-HEAD row: a place, not a branch.
-    Detached,
-}
+pub use gitten_core::refs::Target;
 
 /// One flat row of the pane: a group heading, the detached-HEAD row, or one
 /// ref. Flattened once per refresh — never per frame. Everything a draw needs
