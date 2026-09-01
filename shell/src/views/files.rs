@@ -947,6 +947,14 @@ impl Render for Files {
                         let this = this.clone();
                         return r
                             .id(("row", i))
+                            // Hover says clickable — but the selection tint
+                            // outranks it, so the cursor row keeps its own
+                            // background. `hover` needs identity, so it rides
+                            // this id (plan 045); `chrome::list_row` has none.
+                            .cursor_pointer()
+                            .when(i != cursor, |r| {
+                                r.hover(|s| s.bg(rgb(host.theme.chrome.raised)))
+                            })
                             .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, _, cx| {
                                 let Some(this) = this.upgrade() else { return };
                                 let host = crate::config::host(cx);
