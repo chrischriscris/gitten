@@ -88,8 +88,7 @@ its file holds the STOP rationale.
 | 052 | MERGED (#44) |
 | 053 | MERGED (#39 items 2–8, #46 item 1; items 3 and 7's branches.rs bullet no-ops on the merged base) |
 | 054 | MERGED (#35) |
-| 055 | MERGED (#45) |
-| 056 | DROPPED — executor STOP condition: the uniform-gutter fix reverses the trunk-readability decision at commits.rs:755-758 (the subject follows its own row's graph so a trunk commit reads from the left). Needs the plan owner to either accept trunk subjects behind the widest-merge gutter or withdraw the plan. |
+| 056 | DROPPED — withdrawn by the owner 2026-08-31. Executor STOP condition: the uniform-gutter fix reverses the trunk-readability decision at commits.rs:755-758 (the subject follows its own row's graph so a trunk commit reads from the left). Per-row width stands. |
 | 057 | MERGED (#49) |
 | 058 | MERGED (#50) |
 | 059 | MERGED (#36) |
