@@ -368,6 +368,15 @@ pub trait Repo: Send + Sync {
         Err(unserved("remote branches"))
     }
 
+    /// The local branches checked out in a **worktree other than this one** —
+    /// the branches a checkout here would be refused for. A display garnish,
+    /// so it is not fallible: a backend that cannot say (an old git, a
+    /// missing one) answers empty, the same posture as an upstream's
+    /// `(gone)` — the rows stay true, one word of honesty is lost.
+    fn worktree_branches(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Where `HEAD` points — a branch, or a commit it detached onto, or
     /// nothing at all in a repository with no commits yet. Detached is a
     /// state here and never an error; see [`HeadState`].
@@ -1245,6 +1254,24 @@ impl Repo for Binary {
             });
         }
         Ok(out)
+    }
+
+    fn worktree_branches(&self) -> Vec<String> {
+        // One process, `--porcelain`: machine-readable, stable across git
+        // versions that have the subcommand at all (2.7, January 2016). A
+        // missing or older git fails the run, and a garnish read turning a
+        // failure into an empty answer is the whole point of the trait
+        // default's posture — the pane keeps every row, this one word is
+        // simply not said.
+        //
+        // The root is resolved before the comparison because porcelain prints
+        // absolute, symlink-resolved paths (`/private/var` on macOS), and the
+        // opened root may be neither.
+        let root = std::fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone());
+        parse_worktree_branches(
+            &run(&self.root, &["worktree", "list", "--porcelain"]).unwrap_or_default(),
+            &root,
+        )
     }
 
     fn remote_branches(&self) -> Result<Vec<RemoteBranch>> {
@@ -2537,6 +2564,40 @@ fn parse_branches(raw: &[u8]) -> Vec<RawBranch> {
             head: f[6].first() == Some(&b'*'),
             upstream,
         });
+    }
+    out
+}
+
+/// `git worktree list --porcelain` in: blank-line-separated blocks, each
+/// opening `worktree <path>`, a branch-holding one carrying
+/// `branch refs/heads/<name>` beside its `HEAD <oid>`. Yields the branch
+/// names checked out anywhere **but** `root` — the block whose worktree is
+/// the repository's own toplevel is HEAD's, already marked as the checkout,
+/// and a detached worktree carries no `branch` line at all, so the same
+/// lookup that finds a branch skips it.
+///
+/// Lossy UTF-8 throughout, per house rules: git's output is bytes, and a
+/// ref's near-miss decode is a display word, never an address.
+fn parse_worktree_branches(raw: &[u8], root: &Path) -> Vec<String> {
+    let text = String::from_utf8_lossy(raw);
+    let mut out = Vec::new();
+    for block in text.split("\n\n") {
+        let mut path = None;
+        let mut branch = None;
+        for line in block.lines() {
+            if let Some(p) = line.strip_prefix("worktree ") {
+                path = Some(p);
+            } else if let Some(b) = line.strip_prefix("branch refs/heads/") {
+                branch = Some(b.to_string());
+            }
+        }
+        if let (Some(p), Some(b)) = (path, branch) {
+            // Component-wise, not textual: a trailing slash on the opened
+            // root is the same directory, and must not un-exclude its block.
+            if Path::new(p).components().ne(root.components()) {
+                out.push(b);
+            }
+        }
     }
     out
 }
@@ -5001,6 +5062,41 @@ mod tests {
         assert!(
             matches!(up.track, Track::Gone),
             "the one prose value parsed: it retires the counting process"
+        );
+    }
+
+    #[test]
+    fn worktree_porcelain_names_other_checkouts_and_skips_this_one_and_detached() {
+        // Two linked worktrees plus the main one: only the linked ones are
+        // named, the toplevel's own block is HEAD's checkout and never a
+        // "taken" branch. A detached worktree carries no `branch` line and
+        // is skipped by the same lookup that finds a named one. A non-HEADS
+        // branch line (a worktree could in principle name another ref) is
+        // not a local branch and is not claimed.
+        let raw = b"\
+            worktree /repo\n\
+            HEAD 0123456789abcdef0123456789abcdef01234567\n\
+            branch refs/heads/main\n\
+            \n\
+            worktree /elsewhere/one\n\
+            HEAD 89abcdef0123456789abcdef0123456789abcdef\n\
+            branch refs/heads/worktree-agent-one\n\
+            \n\
+            worktree /elsewhere/two\n\
+            HEAD ccabcdef0123456789abcdef0123456789abcdef\n\
+            bare\n\
+            \n\
+            worktree /elsewhere/three\n\
+            HEAD ddabcdef0123456789abcdef0123456789abcdef\n\
+            detached\n";
+        let got = parse_worktree_branches(raw, Path::new("/repo"));
+        assert_eq!(got, vec!["worktree-agent-one".to_string()]);
+        // The toplevel under a different spelling of the same directory is
+        // still the repository's own — the comparison is component-wise, so a
+        // trailing slash excludes exactly the same block, nothing more.
+        assert_eq!(
+            parse_worktree_branches(raw, Path::new("/repo/")),
+            vec!["worktree-agent-one".to_string()]
         );
     }
 

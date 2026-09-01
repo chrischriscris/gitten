@@ -855,15 +855,17 @@ impl Screen {
                     target,
                     move || {
                         // The whole of the blocking half: the two ref
-                        // listings and HEAD's state, run beside each other —
-                        // four independent processes, one spawn floor. The
-                        // theme rides along because the dots are coloured at
-                        // flatten, once, and not per frame.
+                        // listings, HEAD's state and the worktree checkouts,
+                        // run beside each other — five independent processes,
+                        // one spawn floor. The theme rides along because the
+                        // dots are coloured at flatten, once, and not per
+                        // frame.
                         let prepared = std::thread::scope(|s| {
                             let title = s.spawn(|| repo.describe());
                             let local = s.spawn(|| repo.branches());
                             let remote = s.spawn(|| repo.remote_branches());
                             let head = s.spawn(|| repo.head());
+                            let taken = s.spawn(|| repo.worktree_branches());
                             let described = title.join().unwrap_or_default();
                             let local = local
                                 .join()
@@ -884,8 +886,12 @@ impl Screen {
                                     None
                                 }
                             };
+                            // A failed worktree read is a garnish lost, not a
+                            // listing lost: the rows are still true, one word
+                            // of honesty is simply not said.
+                            let taken = taken.join().unwrap_or_default();
                             Ok::<_, String>(views::branches::prepare(
-                                local, remote, head, &theme, &described,
+                                local, remote, head, taken, &theme, &described,
                             ))
                         });
                         prepared
@@ -5197,6 +5203,7 @@ fn main() {
                         let local = s.spawn(|| handle.branches());
                         let remote = s.spawn(|| handle.remote_branches());
                         let head = s.spawn(|| handle.head());
+                        let taken = s.spawn(|| handle.worktree_branches());
                         let local = local
                             .join()
                             .unwrap_or_else(|p| std::panic::resume_unwind(p));
@@ -5204,6 +5211,7 @@ fn main() {
                             .join()
                             .unwrap_or_else(|p| std::panic::resume_unwind(p));
                         let head = head.join().unwrap_or_else(|p| std::panic::resume_unwind(p));
+                        let taken = taken.join().unwrap_or_default();
                         match (local, remote) {
                             (Ok(local), Ok(remote)) => {
                                 let head = match head {
@@ -5219,6 +5227,7 @@ fn main() {
                                     local,
                                     remote,
                                     head,
+                                    taken,
                                     &host.theme,
                                     &described,
                                 )
@@ -5229,6 +5238,7 @@ fn main() {
                                     Vec::new(),
                                     Vec::new(),
                                     None,
+                                    Vec::new(),
                                     &host.theme,
                                     &described,
                                 )
@@ -6100,6 +6110,7 @@ mod tests {
                     Vec::new(),
                     Vec::new(),
                     None,
+                    Vec::new(),
                     &host.theme,
                     "t",
                 ))
@@ -6386,6 +6397,7 @@ mod tests {
                     Vec::new(),
                     Vec::new(),
                     None,
+                    Vec::new(),
                     &host.theme,
                     "t",
                 ))
@@ -9017,6 +9029,7 @@ diff --git a/added.txt b/added.txt
                 vec![branch_ref("main", true), branch_ref("other", false)],
                 Vec::new(),
                 None,
+                Vec::new(),
                 &gitten_core::theme::Theme::default(),
                 "test",
             );
@@ -9477,6 +9490,7 @@ diff --git a/added.txt b/added.txt
                     name: gitten_core::refs::RefName::from("main"),
                     commit: None,
                 }),
+                Vec::new(),
                 &gitten_core::theme::Theme::default(),
                 "r",
             );
@@ -9689,6 +9703,7 @@ diff --git a/added.txt b/added.txt
                         Some(gitten_core::refs::HeadState::Detached {
                             commit: "0123456789abcdef".into(),
                         }),
+                        Vec::new(),
                         &gitten_core::theme::Theme::default(),
                         "",
                     ),
@@ -9826,6 +9841,7 @@ diff --git a/added.txt b/added.txt
                 }],
                 Vec::new(),
                 None,
+                Vec::new(),
                 &gitten_core::theme::Theme::default(),
                 "r",
             );
@@ -9962,6 +9978,7 @@ diff --git a/added.txt b/added.txt
                         name: gitten_core::refs::RefName::from("main"),
                         commit: None,
                     }),
+                    Vec::new(),
                     &gitten_core::theme::Theme::default(),
                     "",
                 );
@@ -9992,6 +10009,7 @@ diff --git a/added.txt b/added.txt
                         vec![branch_ref("main", true)],
                         Vec::new(),
                         None,
+                        Vec::new(),
                         &gitten_core::theme::Theme::default(),
                         "",
                     ),
