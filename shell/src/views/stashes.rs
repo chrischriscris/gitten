@@ -298,6 +298,20 @@ impl Stashes {
         true
     }
 
+    /// Where a click lands the keyboard: onto the row the mouse hit, with
+    /// exactly the side effects a key move has — see [`Self::run_view`]. The
+    /// row clamps like [`Viewport::go_to`] does; this list has no headings.
+    pub fn select_row(&mut self, index: usize, host: &Host) {
+        self.reconcile(host);
+        let mut v = self.live_view(host);
+        v.go_to(index);
+        // The mouse moved — whatever was armed was armed to what the mouse
+        // used to be on.
+        self.armed = None;
+        self.view.set(v);
+        self.show(v);
+    }
+
     /// Puts row `v.top()` at the top of the viewport, exactly — see
     /// [`super::files::Files::show`].
     fn show(&self, v: Viewport) {
@@ -388,6 +402,10 @@ impl Render for Stashes {
         let pending_scroll = self.pending_scroll.clone();
         let armed = self.armed;
         let focused = self.focused;
+        // A click on a row is the keyboard coming back — see [`Self::select_row`].
+        // Built as a plain handle, not `cx.listener`: the rows are drawn in the
+        // list's closure over `&mut App`, where no listener can be minted.
+        let this = cx.entity().downgrade();
         let list = uniform_list("stashes", data.len(), move |range, _, cx| {
             rendered.set(range.len());
             let host = crate::config::host(cx);
@@ -404,7 +422,20 @@ impl Render for Stashes {
             }
             let cursor = view.get().cursor();
             range
-                .map(|i| row(&data[i], &host, i == cursor, focused, Some(i) == armed))
+                .map(|i| {
+                    let this = this.clone();
+                    row(&data[i], &host, i == cursor, focused, Some(i) == armed)
+                        .id(("row", i))
+                        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, _, cx| {
+                            let Some(this) = this.upgrade() else { return };
+                            let host = crate::config::host(cx);
+                            this.update(cx, |s, cx| {
+                                s.select_row(i, &host);
+                                cx.notify();
+                            });
+                        })
+                        .into_any_element()
+                })
                 .collect()
         })
         .track_scroll(&self.scroll)
@@ -428,7 +459,7 @@ impl Render for Stashes {
 /// the pane's own ink. The frame is [`list_row`]'s: selection tint, the bar
 /// on the left edge in accent while this pane is `focused`. `armed` turns the
 /// whole row toward `chrome.error`, the colour the second press spends.
-fn row(e: &Row, host: &Host, current: bool, focused: bool, armed: bool) -> AnyElement {
+fn row(e: &Row, host: &Host, current: bool, focused: bool, armed: bool) -> Div {
     let ch = host.font.char_width();
     let c = host.theme.chrome;
     list_row(host, current, focused, ROW_H)
@@ -460,7 +491,6 @@ fn row(e: &Row, host: &Host, current: bool, focused: bool, armed: bool) -> AnyEl
                 }))
                 .child(e.message.clone()),
         )
-        .into_any_element()
 }
 
 #[cfg(test)]
@@ -630,5 +660,26 @@ mod tests {
             super::drop_question("stash@{0}"),
             "drop stash@{0}? press again to confirm"
         );
+    }
+
+    #[test]
+    fn a_click_moves_the_cursor_to_the_row_it_hit_and_disarms_a_drop() {
+        let host = Host::new();
+        let mut f = pane(&sample());
+        with_height(&mut f, 4);
+
+        // A click is a place: the keyboard lands on the row the mouse hit.
+        f.select_row(1, &host);
+        assert_eq!(
+            f.view.get().cursor(),
+            1,
+            "the keyboard is on the clicked row"
+        );
+
+        // And the click is a cursor move like any other: an armed drop dies.
+        assert!(!f.confirm_or_arm_drop(1));
+        assert_eq!(f.armed_row(), Some(1));
+        f.select_row(0, &host);
+        assert_eq!(f.armed_row(), None, "the click disarms the question");
     }
 }
