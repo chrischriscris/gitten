@@ -693,10 +693,32 @@ impl Screen {
                     None => base,
                 }
             }
-            Screen::Diff { label, .. }
-            | Screen::Files { label, .. }
-            | Screen::Stashes { label, .. } => label.borrow().clone(),
-            Screen::Branches { label, .. } => label.borrow().clone(),
+            Screen::Diff { label, .. } => label.borrow().clone(),
+            Screen::Files { view, label, .. } => {
+                let base = label.borrow().clone();
+                // The filter's count rides on the acquisition label rather
+                // than replacing it — the same shape the commits pane runs,
+                // and the pane cell keeps holding only what the repository
+                // named, so a refresh has nothing to recompose.
+                match view.read(cx).filter_note() {
+                    Some(note) => format!("{base} · {note}"),
+                    None => base,
+                }
+            }
+            Screen::Branches { view, label, .. } => {
+                let base = label.borrow().clone();
+                match view.read(cx).filter_note() {
+                    Some(note) => format!("{base} · {note}"),
+                    None => base,
+                }
+            }
+            Screen::Stashes { view, label, .. } => {
+                let base = label.borrow().clone();
+                match view.read(cx).filter_note() {
+                    Some(note) => format!("{base} · {note}"),
+                    None => base,
+                }
+            }
             Screen::Status { label, .. } => label.borrow().clone(),
             Screen::Custom(pane) => pane.label(cx),
         }
@@ -1348,6 +1370,40 @@ struct DevShell {
     /// Which axis the wheel gesture in flight belongs to. `gpui`'s own lock,
     /// held here — the one place that sees every wheel event first.
     ongoing: Cell<OngoingScroll>,
+}
+
+/// One of the four screens a search prompt can drive. [`SearchPane::apply`]
+/// is the whole of what the live half and accept differ by; the prompt
+/// itself is the shell's, the matcher belongs where the flatten rows live.
+enum SearchPane {
+    Commits(Entity<views::commits::Commits>),
+    Files(Entity<views::files::Files>),
+    Branches(Entity<views::branches::Branches>),
+    Stashes(Entity<views::stashes::Stashes>),
+}
+
+impl SearchPane {
+    /// Meets the list where its last drag left it, before anything reads the
+    /// cursor — the discipline every list shares.
+    fn reconcile(&self, host: &Host, cx: &mut Context<DevShell>) {
+        match self {
+            SearchPane::Commits(view) => view.update(cx, |v, _| v.reconcile(host)),
+            SearchPane::Files(view) => view.update(cx, |v, _| v.reconcile(host)),
+            SearchPane::Branches(view) => view.update(cx, |v, _| v.reconcile(host)),
+            SearchPane::Stashes(view) => view.update(cx, |v, _| v.reconcile(host)),
+        }
+    }
+
+    /// Writes `query` into the pane's list — the one verb the prompt's live
+    /// half and its accept both end in.
+    fn apply(&self, query: &str, cx: &mut Context<DevShell>) {
+        match self {
+            SearchPane::Commits(view) => view.update(cx, |v, _| v.apply_query(query)),
+            SearchPane::Files(view) => view.update(cx, |v, _| v.apply_query(query)),
+            SearchPane::Branches(view) => view.update(cx, |v, _| v.apply_query(query)),
+            SearchPane::Stashes(view) => view.update(cx, |v, _| v.apply_query(query)),
+        }
+    }
 }
 
 impl DevShell {
@@ -2835,7 +2891,8 @@ impl DevShell {
         }
     }
 
-    /// `commits.search`: gather a query over the focused commits pane.
+    /// `*.search`: gather a query over the focused list pane — commits,
+    /// files, branches or stashes; the one verb every list answers.
     ///
     /// While the field is open every edit filters that pane's list live — the
     /// subscription installed here forwards each [`input::Event::Edited`] to
@@ -2848,13 +2905,26 @@ impl DevShell {
     /// focused screen" read again at close: a click can move focus while the
     /// field holds the keyboard's *mode*, and the query belongs to the pane it
     /// was typed over.
-    fn begin_search(&mut self, cx: &mut Context<Self>) {
-        let Some(Screen::Commits { view, .. }) = self.active() else {
-            self.set_notice("commits.search is not supported here");
-            return;
+    fn begin_search(&mut self, command: &str, cx: &mut Context<Self>) {
+        let initial = match self.active() {
+            Some(Screen::Commits { view, .. }) => {
+                view.read(cx).query().unwrap_or_default().to_string()
+            }
+            Some(Screen::Files { view, .. }) => {
+                view.read(cx).query().unwrap_or_default().to_string()
+            }
+            Some(Screen::Branches { view, .. }) => {
+                view.read(cx).query().unwrap_or_default().to_string()
+            }
+            Some(Screen::Stashes { view, .. }) => {
+                view.read(cx).query().unwrap_or_default().to_string()
+            }
+            _ => {
+                self.set_notice(format!("{command} is not supported here"));
+                return;
+            }
         };
         let target = self.panes.focused_name().to_string();
-        let initial = view.read(cx).query().unwrap_or_default().to_string();
         let input = cx.new(|cx| input::Input::new("search", "search", initial, cx));
         self.open_input(input.clone(), cx);
         // After `open_input`, which may have cancelled a previous prompt.
@@ -2876,20 +2946,21 @@ impl DevShell {
         let Some(Prompt::Search { target }) = &self.prompt else {
             return;
         };
-        if let Some(view) = self.commits_pane(target).map(|(_, view)| view.clone()) {
+        if let Some(pane) = self.search_pane(target) {
             // Meet the list where its last drag left it — the order
             // `open_diff` and `copy` read in — before anchoring. Otherwise
             // typing right after a scrollbar drag anchors to the cursor as it
-            // froze, not to the commit now being looked at.
+            // froze, not to the row now being looked at.
             let host = config::host(cx);
-            view.update(cx, |v, _| {
-                v.reconcile(&host);
-                v.apply_query(text);
-            });
-            // Filtering re-anchors the cursor by sha; when the anchor does
-            // not survive, the keyboard lands somewhere else, and that
-            // somewhere is what the main view should be loading.
-            self.sync_main_diff(cx);
+            pane.reconcile(&host, cx);
+            pane.apply(text, cx);
+            // Filtering re-anchors the cursor; when the anchor does not
+            // survive, the keyboard lands somewhere else — and only the
+            // commits pane's cursor is what the main view loads, so only
+            // there does the main view follow.
+            if matches!(pane, SearchPane::Commits(_)) {
+                self.sync_main_diff(cx);
+            }
             cx.notify();
         }
     }
@@ -2897,22 +2968,28 @@ impl DevShell {
     /// Accept or cancel of a search prompt: what the last edit left standing,
     /// or its absence. Same routing as the live half, one last time.
     fn finish_search(&mut self, target: &str, query: Option<String>, cx: &mut Context<Self>) {
-        let Some((_, view)) = self.commits_pane(target) else {
+        let Some(pane) = self.search_pane(target) else {
             return;
         };
         let query = query.unwrap_or_default();
-        view.update(cx, |v, _| v.apply_query(&query));
-        self.sync_main_diff(cx);
+        pane.apply(&query, cx);
+        if matches!(pane, SearchPane::Commits(_)) {
+            self.sync_main_diff(cx);
+        }
     }
 
-    /// The named pane's commits screen, when that is what the name registers:
-    /// the one place search routing learns which screens answer. A closed pane
-    /// or a kind with no search answers nothing, quietly — the prompt is
-    /// closing anyway.
-    fn commits_pane(&self, target: &str) -> Option<(usize, &Entity<views::commits::Commits>)> {
+    /// The named pane's searchable screen, when that is what the name
+    /// registers: the one place search routing learns which screens answer. A
+    /// closed pane or a kind with no search answers nothing, quietly — the
+    /// prompt is closing anyway. The entities are cloned out, refcounts and
+    /// nothing more, so routing never holds a borrow across an update.
+    fn search_pane(&self, target: &str) -> Option<SearchPane> {
         let at = self.panes.position(target)?;
         match self.panes.iter().nth(at)? {
-            Screen::Commits { view, .. } => Some((at, view)),
+            Screen::Commits { view, .. } => Some(SearchPane::Commits(view.clone())),
+            Screen::Files { view, .. } => Some(SearchPane::Files(view.clone())),
+            Screen::Branches { view, .. } => Some(SearchPane::Branches(view.clone())),
+            Screen::Stashes { view, .. } => Some(SearchPane::Stashes(view.clone())),
             _ => None,
         }
     }
@@ -3294,7 +3371,9 @@ impl DevShell {
             "stashes.focus" => self.focus_named("stashes", cx),
             "branches.focus" => self.focus_named("branches", cx),
             "commits.open-diff" => self.focus_main(cx),
-            "commits.search" => self.begin_search(cx),
+            "commits.search" | "files.search" | "branches.search" | "stashes.search" => {
+                self.begin_search(command, cx)
+            }
             // History's verbs, aimed at the commit the keyboard is on. Reset
             // and revert read the pane; the write goes through the queue.
             // The reset question is lazygit's menu: `g` opens it, and the
@@ -4445,15 +4524,28 @@ impl Render for DevShell {
                 };
                 let focused = self.spot == Spot::List && focused_name == name;
                 let count = match screen {
-                    Screen::Files { view, .. } => files_header_count(view, cx),
+                    Screen::Files { view, .. } => {
+                        // The filter's shown/loaded note over the usual
+                        // count while one stands, the way the commits strip
+                        // swaps its branch name for the note — the filter is
+                        // the thing that changed most recently and the thing
+                        // a count is about.
+                        let v = view.read(cx);
+                        v.filter_note()
+                            .map(SharedString::from)
+                            .or_else(|| files_header_count(view, cx))
+                    }
                     Screen::Branches { view, .. } => {
                         // The pane's total — its rows minus the group
                         // headings, the same rows the in-list LOCAL and
                         // REMOTE labels count — and zero dropped, the rule
                         // the empty state lives by: the pane below already
                         // says there is nothing here.
-                        let n = view.read(cx).count();
-                        (n > 0).then(|| SharedString::from(n.to_string()))
+                        let v = view.read(cx);
+                        v.filter_note().map(SharedString::from).or_else(|| {
+                            let n = v.count();
+                            (n > 0).then(|| SharedString::from(n.to_string()))
+                        })
                     }
                     _ => None,
                 };
@@ -4502,12 +4594,17 @@ impl Render for DevShell {
                 let focused = self.spot == Spot::List && focused_name == name;
                 let count: Option<SharedString> = match screen {
                     Screen::Stashes { view, .. } => {
-                        // The stash list has no headings, so its row count is
-                        // the total — the same number the pane's height reads
-                        // — and zero is dropped, the same rule the other
-                        // headers follow.
-                        let n = view.read(cx).rows();
-                        (n > 0).then(|| SharedString::from(n.to_string()))
+                        // The filter's shown/loaded note over the usual count
+                        // while one stands, the rule the other headers run.
+                        let v = view.read(cx);
+                        v.filter_note().map(SharedString::from).or_else(|| {
+                            // The stash list has no headings, so its row count
+                            // is the total — the same number the pane's height
+                            // reads — and zero is dropped, the same rule the
+                            // other headers follow.
+                            let n = v.rows();
+                            (n > 0).then(|| SharedString::from(n.to_string()))
+                        })
                     }
                     _ => None,
                 };
@@ -6997,22 +7094,12 @@ mod tests {
         shell.update(cx, |shell, cx| shell.run_command("commits.search", cx));
         shell.read_with(cx, |shell, _| assert!(shell.input.is_some()));
 
-        // But the command belongs to the commits mode: over the working tree
-        // it resolves to nothing that can act, and is said rather than done.
+        // And the verb is one keypress away in every list pane now: over
+        // the working tree, the same command filters the focused list.
         let (shell, _repo, _handle) = files_shell(cx);
-        shell.update(cx, |shell, cx| shell.run_command("commits.search", cx));
+        shell.update(cx, |shell, cx| shell.run_command("files.search", cx));
         shell.read_with(cx, |shell, _| {
-            assert!(shell.input.is_none(), "a prompt opened over the files pane");
-            assert!(
-                shell
-                    .notice
-                    .as_ref()
-                    .map(Notice::text)
-                    .unwrap_or_default()
-                    .contains("not supported here"),
-                "{:?}",
-                shell.notice
-            );
+            assert!(shell.input.is_some(), "the files pane answers, too");
         });
     }
 

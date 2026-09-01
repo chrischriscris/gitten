@@ -418,6 +418,10 @@ impl Keymap {
         // lazygit's shift-stash: park what the working tree holds and start
         // again from HEAD.
         bind("files", "s", "files.stash");
+        // The commit list's live filter, over the working tree: `/` opens a
+        // query and every edit narrows the list in place — the same verb
+        // every list pane answers to, on the key lazygit keeps free here.
+        bind("files", "/", "files.search");
 
         // The stash stack, on lazygit's own three: space applies and keeps,
         // g pops — apply, then drop only when the apply was clean — and d
@@ -428,6 +432,9 @@ impl Keymap {
         bind("stashes", "space", "stashes.apply");
         bind("stashes", "g", "stashes.pop");
         bind("stashes", "d", "stashes.drop");
+        // The live filter again, over the stash stack — the messages are
+        // what a query matches, the addresses what the rows are for.
+        bind("stashes", "/", "stashes.search");
 
         // The branches panel, on lazygit's own letters: space checks out the
         // branch under the keyboard, n names a new one, r rebases the
@@ -441,6 +448,9 @@ impl Keymap {
         bind("branches", "R", "branches.rename");
         bind("branches", "d", "branches.delete");
         bind("branches", "T", "branches.new-tag");
+        // The live filter over the ref list — the pane where sixteen
+        // machine-named worktree branches are exactly why a query exists.
+        bind("branches", "/", "branches.search");
 
         bind("diff", "s", "diff.cycle-layout");
         bind("diff", "w", "diff.cycle-wrap");
@@ -1042,6 +1052,7 @@ impl Commands {
                 "add the selected untracked file to .gitignore",
                 Some("ignore"),
             ),
+            ("files.search", "search the working tree", Some("search")),
             ("branches.focus", "focus the branches pane", None),
             (
                 "branches.checkout",
@@ -1064,6 +1075,7 @@ impl Commands {
                 "name the selected branch's commit with a new tag",
                 Some("tag"),
             ),
+            ("branches.search", "search the branches", Some("search")),
             ("stashes.focus", "focus the stash list", None),
             ("commits.focus", "focus the commit list", None),
             (
@@ -1082,6 +1094,7 @@ impl Commands {
                 Some("pop"),
             ),
             ("stashes.drop", "drop this stash, asked twice", Some("drop")),
+            ("stashes.search", "search the stash stack", Some("search")),
             (
                 "repo.push",
                 "send the current branch to its remote, setting the upstream if needed",

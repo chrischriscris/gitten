@@ -93,7 +93,21 @@ pub(crate) fn drop_question(shown: &str) -> String {
 
 /// The stash pane. Holds flattened rows behind an `Rc`, so a refresh swaps
 /// one refcount instead of mutating what a frame may be reading.
-///
+/// The rows a query keeps, as indices into `rows`: a stash whose message
+/// matches. The list is flat — no headings to carry.
+fn search_rows(rows: &[Row], query: &str) -> Vec<usize> {
+    rows.iter()
+        .enumerate()
+        .filter_map(|(i, r)| matches(r.message.as_ref(), query).then_some(i))
+        .collect()
+}
+
+/// The one matcher, where the rows live: a query matches when the row's
+/// text contains it, folded — exactly what the commit list's search does.
+fn matches(haystack: &str, needle: &str) -> bool {
+    haystack.to_lowercase().contains(&needle.to_lowercase())
+}
+
 /// Dropping confirms **in this pane**, by the same mechanics as a file
 /// discard: the first press stores [`Stashes::armed`] and asks through the
 /// notice band; the second press on the same row executes; any cursor move,
@@ -101,6 +115,16 @@ pub(crate) fn drop_question(shown: &str) -> String {
 /// back is deliberate — the question sits on the row it was asked about.
 pub struct Stashes {
     data: Rc<Vec<Row>>,
+    /// Rows the list draws right now: indices into `data`, ascending.
+    /// Identity until a query filters it, rebuilt only when the query
+    /// changes — never per frame — which is why the full vector is kept
+    /// and this is all the list draws from.
+    visible: Rc<Vec<usize>>,
+    /// The live filter, as the prompt last left it. `None` — or an empty
+    /// string, which [`Stashes::apply_query`] folds into `None` — is
+    /// every row; kept so a second `/` edits the query rather than
+    /// starting over, and so clearing restores in one keystroke.
+    filter: Option<String>,
     scroll: UniformListScrollHandle,
     view: Rc<Cell<Viewport>>,
     synced: Rc<Cell<f32>>,
@@ -121,7 +145,7 @@ impl Stashes {
     /// [`super::files::Files::live_view`].
     fn live_view(&self, host: &Host) -> Viewport {
         let mut v = self.view.get();
-        v.set_len(self.data.len());
+        v.set_len(self.visible.len());
         v.set_height(self.rendered.get());
         v.set_scrolloff(host.view.scrolloff);
         v
@@ -140,8 +164,11 @@ impl Stashes {
 
     pub(crate) fn from_prepared(prepared: Prepared) -> Self {
         let Prepared { rows, .. } = prepared;
+        let visible = Rc::new(Vec::from_iter(0..rows.len()));
         Self {
             data: Rc::new(rows),
+            visible,
+            filter: None,
             scroll: UniformListScrollHandle::new(),
             view: Rc::new(Cell::new(Viewport::new())),
             synced: Rc::new(Cell::new(0.0)),
@@ -152,16 +179,31 @@ impl Stashes {
         }
     }
 
+    /// How many rows the list draws — the shown ones, a query having
+    /// narrowed the stack without replacing it. What sizes this pane's
+    /// sidebar section.
+    pub fn rows(&self) -> usize {
+        self.visible.len()
+    }
+
+    /// The live query, for pre-filling an edit of it. Empty means none.
+    pub fn query(&self) -> Option<&str> {
+        self.filter.as_deref()
+    }
+
+    /// What the pane's label appends while filtered: shown over loaded —
+    /// `"1/3"`. `None` unfiltered — the header then stays exactly what
+    /// acquisition named it.
+    pub fn filter_note(&self) -> Option<String> {
+        self.filter
+            .is_some()
+            .then(|| format!("{}/{}", self.visible.len(), self.data.len()))
+    }
+
     /// Whether the stack had nothing on it — the empty state's trigger.
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
-
-    /// How many rows the list draws — what sizes this pane's sidebar section.
-    pub fn rows(&self) -> usize {
-        self.data.len()
-    }
-
     /// Replaces repository data while keeping the selection anchored to its
     /// entry's commit. An index cannot anchor — dropping any entry renumbers
     /// everything above it — but the commit under an entry is stable, which
@@ -177,18 +219,97 @@ impl Stashes {
         self.armed = None;
         self.reconcile(host);
         let old = self.view.get();
-        let anchored = self.data.get(old.cursor()).map(|r| r.commit.clone());
+        // The cursor addresses the *shown* rows, so the anchor is read
+        // through the visible index.
+        let anchored = self
+            .visible
+            .get(old.cursor())
+            .and_then(|&d| self.data.get(d))
+            .map(|r| r.commit.clone());
         let Prepared { rows, .. } = prepared;
         self.data = Rc::new(rows);
+        // The new rows under the *current* query — a refresh must not drop
+        // the filter the user is looking through, and the anchor below is
+        // found in this space, not in the full list's.
+        self.visible = Rc::new(match &self.filter {
+            Some(q) => search_rows(&self.data, q),
+            None => Vec::from_iter(0..self.data.len()),
+        });
 
-        let cursor = anchored.and_then(|commit| self.data.iter().position(|r| r.commit == commit));
-        let cursor = cursor.unwrap_or_else(|| old.cursor().min(self.data.len().saturating_sub(1)));
+        let cursor = anchored
+            .and_then(|commit| {
+                self.visible
+                    .iter()
+                    .position(|&d| self.data[d].commit == commit)
+            })
+            .unwrap_or_else(|| old.cursor().min(self.visible.len().saturating_sub(1)));
         let mut view = old;
-        view.set_len(self.data.len());
+        view.set_len(self.visible.len());
         view.go_to(cursor);
         self.view.set(view);
 
-        if self.data.is_empty() {
+        if self.visible.is_empty() {
+            self.pending_scroll.cancel();
+            let mut state = self.scroll.0.borrow_mut();
+            state.deferred_scroll_to_item = None;
+            state.base_handle.set_offset(point(px(0.0), px(0.0)));
+            self.synced.set(0.0);
+        } else {
+            self.defer_show(view);
+        }
+    }
+
+    /// Sets the filter — once per keystroke, and never anywhere else. The
+    /// visible-index vec is rebuilt here and read everywhere else.
+    ///
+    /// The keyboard stays on the same entry it was on: anchored by the row's
+    /// commit into the next result set wherever that entry survives the
+    /// narrower query, clamped to a neighbouring row when it does not. An
+    /// empty query (a trimmed-empty one too) is no query: identity indices,
+    /// so clearing restores exactly what was on screen before.
+    ///
+    /// A strict deferred scroll parks the viewport the way every other jump
+    /// does — the list's geometry still describes the previous length until
+    /// the next prepaint, and writing an offset against it would clamp in
+    /// the wrong place.
+    pub fn apply_query(&mut self, query: &str) {
+        let next = Some(query.trim()).filter(|q| !q.is_empty());
+        if self.filter.as_deref() == next {
+            return;
+        }
+        // A changed filter can move the cursor by clamping, and a question
+        // aimed at yesterday's row is the thing the arm exists to prevent.
+        self.armed = None;
+        // Anchor first, named by the row's commit like every other re-anchor
+        // in this file, because row numbers are about to stop meaning
+        // anything.
+        let anchored = self
+            .visible
+            .get(self.view.get().cursor())
+            .and_then(|&d| self.data.get(d))
+            .map(|r| r.commit.clone());
+
+        self.filter = next.map(str::to_string);
+        self.visible = Rc::new(match &self.filter {
+            Some(q) => search_rows(&self.data, q),
+            None => Vec::from_iter(0..self.data.len()),
+        });
+
+        let mut view = self.view.get();
+        let cursor = anchored
+            .as_ref()
+            .and_then(|commit| {
+                self.visible
+                    .iter()
+                    .position(|&d| &self.data[d].commit == commit)
+            })
+            .unwrap_or_else(|| view.cursor().min(self.visible.len().saturating_sub(1)));
+        view.set_len(self.visible.len());
+        view.go_to(cursor);
+        self.view.set(view);
+        if self.visible.is_empty() {
+            // Nothing survives the query; park nothing and leave no stale
+            // offset for a later keystroke to reconcile against.
             self.pending_scroll.cancel();
             let mut state = self.scroll.0.borrow_mut();
             state.deferred_scroll_to_item = None;
@@ -335,7 +456,7 @@ impl Stashes {
 
     /// The row the keyboard is on. `None` on an empty stack.
     pub(crate) fn current(&self) -> Option<&Row> {
-        self.data.get(self.view.get().cursor())
+        self.data.get(*self.visible.get(self.view.get().cursor())?)
     }
 
     /// Arms — or confirms — a drop of this exact row. First call on a target
@@ -395,6 +516,7 @@ impl Render for Stashes {
         }
 
         let data = self.data.clone();
+        let visible = self.visible.clone();
         let rendered = self.rendered.clone();
         let view = self.view.clone();
         let scroll = self.scroll.clone();
@@ -406,13 +528,13 @@ impl Render for Stashes {
         // Built as a plain handle, not `cx.listener`: the rows are drawn in the
         // list's closure over `&mut App`, where no listener can be minted.
         let this = cx.entity().downgrade();
-        let list = uniform_list("stashes", data.len(), move |range, _, cx| {
+        let list = uniform_list("stashes", visible.len(), move |range, _, cx| {
             rendered.set(range.len());
             let host = crate::config::host(cx);
             if let Some(accepted) = accept_deferred_scroll(&scroll, &pending_scroll, &synced) {
                 if accepted.wheeled {
                     let mut v = view.get();
-                    v.set_len(data.len());
+                    v.set_len(visible.len());
                     v.set_height(range.len());
                     v.set_scrolloff(host.view.scrolloff);
                     v.scroll_to((-accepted.y / ROW_H).round().max(0.0) as usize);
@@ -424,17 +546,23 @@ impl Render for Stashes {
             range
                 .map(|i| {
                     let this = this.clone();
-                    row(&data[i], &host, i == cursor, focused, Some(i) == armed)
-                        .id(("row", i))
-                        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, _, cx| {
-                            let Some(this) = this.upgrade() else { return };
-                            let host = crate::config::host(cx);
-                            this.update(cx, |s, cx| {
-                                s.select_row(i, &host);
-                                cx.notify();
-                            });
-                        })
-                        .into_any_element()
+                    row(
+                        &data[visible[i]],
+                        &host,
+                        i == cursor,
+                        focused,
+                        Some(i) == armed,
+                    )
+                    .id(("row", i))
+                    .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, _, cx| {
+                        let Some(this) = this.upgrade() else { return };
+                        let host = crate::config::host(cx);
+                        this.update(cx, |s, cx| {
+                            s.select_row(i, &host);
+                            cx.notify();
+                        });
+                    })
+                    .into_any_element()
                 })
                 .collect()
         })
@@ -499,6 +627,66 @@ mod tests {
     // GPUI's own attribute macro and every test in here fails to expand.
     use super::{flatten, prepare, title, Stash};
     use gitten_core::host::Host;
+    use std::rc::Rc;
+
+    #[test]
+    fn a_query_filters_live_and_the_keyboard_stays_on_its_entry() {
+        let _host = Host::new();
+        let mut f = pane(&sample());
+        with_height(&mut f, 4);
+        // The keyboard opens on stash@{0} — a message that survives "HAND",
+        // folded, while "WIP on main" does not.
+        let anchored = f
+            .current()
+            .expect("a row under the keyboard")
+            .commit
+            .clone();
+
+        f.apply_query("  hand  ");
+        let v = f.view.get();
+        assert_eq!(v.len(), 1, "one message matches, folded");
+        assert_eq!(f.filter_note().as_deref(), Some("1/2"));
+        assert_eq!(f.rows(), 1);
+        // Through the indirection: `current` is the anchored entry, not
+        // whatever now happens to sit at row 0 of a shorter list — and the
+        // stack's addresses stay git's, so the match is still stash@{0}.
+        assert_eq!(
+            f.current().map(|r| r.commit.clone()).as_ref(),
+            Some(&anchored)
+        );
+        assert_eq!(f.current().map(|r| r.index), Some(0));
+
+        // The same query again is no change at all — and rebuilds nothing.
+        let before = Rc::as_ptr(&f.visible);
+        f.apply_query("hand ");
+        assert_eq!(f.query(), Some("hand"), "trimmed before comparing");
+        assert_eq!(
+            Rc::as_ptr(&f.visible),
+            before,
+            "a no-op query did not rebuild the index"
+        );
+
+        // A changed filter is a movement of attention: the keyboard clamps
+        // into what survives, and an armed drop dies with the question's row.
+        assert!(!f.confirm_or_arm_drop(0));
+        f.apply_query("nothing matches this");
+        let v = f.view.get();
+        assert_eq!(v.len(), 0);
+        assert!(f.current().is_none());
+        assert_eq!(f.filter_note().as_deref(), Some("0/2"));
+        assert_eq!(f.armed_row(), None, "a changed query disarmed");
+
+        // Clearing puts every entry back under the same commit.
+        f.apply_query("");
+        assert_eq!(f.rows(), 2);
+        assert_eq!(f.query(), None);
+        assert_eq!(f.filter_note(), None);
+        assert_eq!(
+            f.current().map(|r| r.commit.clone()).as_ref(),
+            Some(&anchored),
+            "empty restores instantly, cursor included"
+        );
+    }
 
     fn stash(index: usize, commit: &str, message: &str) -> Stash {
         Stash {

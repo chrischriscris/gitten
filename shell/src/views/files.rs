@@ -317,6 +317,46 @@ fn settle(rows: &[Entry], v: &mut Viewport, from: usize) {
     v.settle(from, |i| selectable(rows, i));
 }
 
+/// [`settle`] over the shown rows: the same walk, in the space the cursor
+/// addresses — a heading survives a filter only when a file under it does,
+/// and the cursor never rests on one either way.
+fn settle_shown(rows: &[Entry], visible: &[usize], v: &mut Viewport, from: usize) {
+    v.settle(from, |i| {
+        visible.get(i).is_some_and(|&d| selectable(rows, d))
+    });
+}
+
+/// The one matcher, where the rows live: a query matches when the row's
+/// text contains it, folded — exactly what the commit list's search does.
+fn matches(haystack: &str, needle: &str) -> bool {
+    haystack.to_lowercase().contains(&needle.to_lowercase())
+}
+
+/// The rows a query keeps, as indices into `rows`: a file whose **path** —
+/// dir plus name, the whole string the row shows — matches, plus the
+/// heading of every section that still has a file under it, exactly the
+/// sections an empty one drops at flatten.
+fn search_rows(rows: &[Entry], query: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut pending_heading = None;
+    for (i, entry) in rows.iter().enumerate() {
+        match entry {
+            Entry::Heading { .. } => {
+                pending_heading = Some(i);
+            }
+            Entry::File(f) => {
+                if matches(f.path_text.as_ref(), query) {
+                    if let Some(h) = pending_heading.take() {
+                        out.push(h);
+                    }
+                    out.push(i);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// What an armed discard asks, once, in the notice band. An untracked file
 /// says *delete* because that is what discarding means when there is no
 /// earlier version to go back to — the honest word for the one mechanics
@@ -340,6 +380,16 @@ pub(crate) fn discard_question(section: Section, shown: &str) -> String {
 /// press exists to prevent.
 pub struct Files {
     data: Rc<Vec<Entry>>,
+    /// Rows the list draws right now: indices into `data`, ascending.
+    /// Identity until a query filters it, rebuilt only when the query
+    /// changes — never per frame — which is why the full vector is kept
+    /// and this is all the list draws from.
+    visible: Rc<Vec<usize>>,
+    /// The live filter, as the prompt last left it. `None` — or an empty
+    /// string, which [`Files::apply_query`] folds into `None` — is every
+    /// row; kept so a second `/` edits the query rather than starting
+    /// over, and so clearing restores in one keystroke.
+    filter: Option<String>,
     scroll: UniformListScrollHandle,
     /// The cursor, the top row and the height — [`Viewport`], the same model
     /// every other list holds.
@@ -370,7 +420,7 @@ impl Files {
     /// [`super::commits::Commits::live_view`].
     fn live_view(&self, host: &Host) -> Viewport {
         let mut v = self.view.get();
-        v.set_len(self.data.len());
+        v.set_len(self.visible.len());
         v.set_height(self.rendered.get());
         v.set_scrolloff(host.view.scrolloff);
         v
@@ -391,11 +441,14 @@ impl Files {
         let Prepared { rows, changed, .. } = prepared;
         // Row 0 is always a heading when there is anything at all; the cursor
         // opens on the first file under it.
+        let visible = Rc::new(Vec::from_iter(0..rows.len()));
         let mut view = Viewport::new();
-        view.set_len(rows.len());
+        view.set_len(visible.len());
         settle(&rows, &mut view, 0);
         Self {
             data: Rc::new(rows),
+            visible,
+            filter: None,
             scroll: UniformListScrollHandle::new(),
             view: Rc::new(Cell::new(view)),
             synced: Rc::new(Cell::new(0.0)),
@@ -419,10 +472,37 @@ impl Files {
         self.changed
     }
 
-    /// How many rows the list draws, headings included — what sizes this
+    /// How many rows the list draws — the shown ones, a query having
+    /// narrowed the loaded set without replacing it. What sizes this
     /// pane's sidebar section.
     pub fn rows(&self) -> usize {
-        self.data.len()
+        self.visible.len()
+    }
+
+    /// The live query, for pre-filling an edit of it. Empty means none.
+    pub fn query(&self) -> Option<&str> {
+        self.filter.as_deref()
+    }
+
+    /// What the pane's label appends while filtered: shown over loaded —
+    /// `"1/3"`, counting the files and not the section headings, which are
+    /// furniture the query did not ask about. `None` unfiltered — the
+    /// header then stays exactly what acquisition named it.
+    pub fn filter_note(&self) -> Option<String> {
+        let files = |rows: &[Entry]| {
+            rows.iter()
+                .filter(|e| !matches!(e, Entry::Heading { .. }))
+                .count()
+        };
+        self.filter.is_some().then(|| {
+            let shown = self
+                .visible
+                .iter()
+                .filter_map(|&d| self.data.get(d))
+                .filter(|e| !matches!(e, Entry::Heading { .. }))
+                .count();
+            format!("{shown}/{}", files(&self.data))
+        })
     }
 
     /// Replaces repository data while keeping the selection anchored to its
@@ -443,8 +523,13 @@ impl Files {
         // same path can sit in staged *and* unstaged, and anchoring on the
         // bare path would walk the cursor to whichever twin flattens first.
         // A heading is a fact about the last refresh's grouping, not a thing
-        // the eye was reading.
-        let anchored = match self.data.get(old.cursor()) {
+        // the eye was reading. The cursor addresses the *shown* rows, so the
+        // anchor is read through the visible index.
+        let anchored = match self
+            .visible
+            .get(old.cursor())
+            .and_then(|&d| self.data.get(d))
+        {
             Some(Entry::File(f)) => Some((f.section, f.path.clone())),
             _ => None,
         };
@@ -452,23 +537,98 @@ impl Files {
         self.changed = changed;
         self.data = Rc::new(rows);
 
+        // The new rows under the *current* query — a refresh must not drop
+        // the filter the user is looking through, and the anchor below is
+        // found in this space, not in the full list's.
+        self.visible = Rc::new(match &self.filter {
+            Some(q) => search_rows(&self.data, q),
+            None => Vec::from_iter(0..self.data.len()),
+        });
         let cursor = anchored
             .and_then(|(section, path)| {
-                self.data.iter().position(
-                    |e| matches!(e, Entry::File(f) if f.section == section && f.path == path),
-                )
+                self.visible.iter().position(|&d| {
+                    matches!(&self.data[d], Entry::File(f) if f.section == section && f.path == path)
+                })
             })
             .unwrap_or(old.cursor());
         let mut view = old;
-        view.set_len(self.data.len());
+        view.set_len(self.visible.len());
         view.go_to(cursor);
         // A vanished anchor can leave the cursor on whatever heading took
         // its row; the direction is "where it was" so it walks on to the
         // next file rather than back to the previous section's last.
-        settle(&self.data, &mut view, old.cursor());
+        settle_shown(&self.data, &self.visible, &mut view, old.cursor());
         self.view.set(view);
 
-        if self.data.is_empty() {
+        if self.visible.is_empty() {
+            self.pending_scroll.cancel();
+            let mut state = self.scroll.0.borrow_mut();
+            state.deferred_scroll_to_item = None;
+            state.base_handle.set_offset(point(px(0.0), px(0.0)));
+            self.synced.set(0.0);
+        } else {
+            self.defer_show(view);
+        }
+    }
+
+    /// Sets the filter — once per keystroke, and never anywhere else. The
+    /// visible-index vec is rebuilt here and read everywhere else.
+    ///
+    /// The keyboard stays on the same file it was on: anchored by section
+    /// and path into the next result set wherever that file survives the
+    /// narrower query, clamped to a neighbouring row when it does not. An
+    /// empty query (a trimmed-empty one too) is no query: identity indices,
+    /// so clearing restores exactly what was on screen before.
+    ///
+    /// A strict deferred scroll parks the viewport the way every other jump
+    /// does — the list's geometry still describes the previous length until
+    /// the next prepaint, and writing an offset against it would clamp in
+    /// the wrong place.
+    pub fn apply_query(&mut self, query: &str) {
+        let next = Some(query.trim()).filter(|q| !q.is_empty());
+        if self.filter.as_deref() == next {
+            return;
+        }
+        // A changed filter can move the cursor by clamping, and a question
+        // aimed at yesterday's row is the thing the arm exists to prevent.
+        self.armed = None;
+        // Anchor first, on section and path together like every other
+        // re-anchor in this file, because row numbers are about to stop
+        // meaning anything.
+        let anchored = match self
+            .visible
+            .get(self.view.get().cursor())
+            .and_then(|&d| self.data.get(d))
+        {
+            Some(Entry::File(f)) => Some((f.section, f.path.clone())),
+            _ => None,
+        };
+
+        self.filter = next.map(str::to_string);
+        self.visible = Rc::new(match &self.filter {
+            Some(q) => search_rows(&self.data, q),
+            None => Vec::from_iter(0..self.data.len()),
+        });
+
+        let mut view = self.view.get();
+        let cursor = anchored
+            .and_then(|(section, path)| {
+                self.visible.iter().position(|&d| {
+                    matches!(&self.data[d], Entry::File(f) if f.section == section && f.path == path)
+                })
+            })
+            .unwrap_or_else(|| view.cursor().min(self.visible.len().saturating_sub(1)));
+        view.set_len(self.visible.len());
+        view.go_to(cursor);
+        // A vanished anchor can leave the cursor on whatever heading took
+        // its row; the direction is "where it was" so it walks on to the
+        // next file rather than back to the previous section's last.
+        let from = view.cursor();
+        settle_shown(&self.data, &self.visible, &mut view, from);
+        self.view.set(view);
+        if self.visible.is_empty() {
+            // Nothing survives the query; park nothing and leave no stale
+            // offset for a later keystroke to reconcile against.
             self.pending_scroll.cancel();
             let mut state = self.scroll.0.borrow_mut();
             state.deferred_scroll_to_item = None;
@@ -506,7 +666,7 @@ impl Files {
                 let y = -(request.item_index as f32 * ROW_H) + pixels;
                 let from = v.cursor();
                 v.scroll_to((-y / ROW_H).round().max(0.0) as usize);
-                settle(&self.data, &mut v, from);
+                settle_shown(&self.data, &self.visible, &mut v, from);
                 self.view.set(v);
                 // The wheel is also a move of attention — same rule the
                 // arrow keys keep.
@@ -533,7 +693,7 @@ impl Files {
         // it on a heading any more than a keypress may.
         let from = v.cursor();
         v.scroll_to((-y / ROW_H).round().max(0.0) as usize);
-        settle(&self.data, &mut v, from);
+        settle_shown(&self.data, &self.visible, &mut v, from);
         self.view.set(v);
         self.synced.set(y);
         self.armed = None;
@@ -558,7 +718,7 @@ impl Files {
         }
         let from = v.cursor();
         v.scroll_to(shown);
-        settle(&self.data, &mut v, from);
+        settle_shown(&self.data, &self.visible, &mut v, from);
         self.view.set(v);
     }
 
@@ -587,7 +747,7 @@ impl Files {
             _ => return false,
         }
         // Landed on a heading? Keep going the way the key pointed.
-        settle(&self.data, &mut v, from);
+        settle_shown(&self.data, &self.visible, &mut v, from);
         // The keyboard moved — including the two scrolls above, which leave
         // the cursor but not the question's row in view. Whatever was armed
         // was armed to what the keyboard used to be on.
@@ -605,7 +765,7 @@ impl Files {
         self.reconcile(host);
         let mut v = self.live_view(host);
         v.go_to(index);
-        settle(&self.data, &mut v, index);
+        settle_shown(&self.data, &self.visible, &mut v, index);
         // The mouse moved — whatever was armed was armed to what the mouse
         // used to be on.
         self.armed = None;
@@ -639,7 +799,11 @@ impl Files {
     /// goes. `None` only on an empty tree, since the cursor never rests on a
     /// heading.
     pub(crate) fn current_file(&self) -> Option<&FileEntry> {
-        match self.data.get(self.view.get().cursor()) {
+        match self
+            .visible
+            .get(self.view.get().cursor())
+            .and_then(|&d| self.data.get(d))
+        {
             Some(Entry::File(f)) => Some(f),
             _ => None,
         }
@@ -649,7 +813,11 @@ impl Files {
     /// keyboard decides where a whole-section verb goes. A heading answers
     /// for its section too, though the cursor no longer rests on one.
     pub(crate) fn cursor_section(&self) -> Option<Section> {
-        match self.data.get(self.view.get().cursor()) {
+        match self
+            .visible
+            .get(self.view.get().cursor())
+            .and_then(|&d| self.data.get(d))
+        {
             Some(Entry::Heading { section, .. }) => Some(*section),
             Some(Entry::File(f)) => Some(f.section),
             None => None,
@@ -736,26 +904,28 @@ impl Render for Files {
         // list's closure over `&mut App`, where no listener can be minted.
         let this = cx.entity().downgrade();
         let data = self.data.clone();
+        let visible = self.visible.clone();
         let rendered = self.rendered.clone();
         let view = self.view.clone();
         let scroll = self.scroll.clone();
         let synced = self.synced.clone();
         let pending_scroll = self.pending_scroll.clone();
         let focused = self.focused;
-        // The row an armed discard is waiting on, found once per frame —
-        // the tint is a property of the question, not of the draw.
+        // The row an armed discard is waiting on, found once per frame in the
+        // *shown* rows — the cursor's space — the tint a property of the
+        // question, not of the draw.
         let armed = self.armed.as_ref().and_then(|(section, path)| {
-            data.iter().position(
-                |e| matches!(e, Entry::File(f) if f.section == *section && f.path == *path),
+            visible.iter().position(
+                |&d| matches!(&data[d], Entry::File(f) if f.section == *section && f.path == *path),
             )
         });
-        let list = uniform_list("files", data.len(), move |range, _, cx| {
+        let list = uniform_list("files", visible.len(), move |range, _, cx| {
             rendered.set(range.len());
             let host = crate::config::host(cx);
             if let Some(accepted) = accept_deferred_scroll(&scroll, &pending_scroll, &synced) {
                 if accepted.wheeled {
                     let mut v = view.get();
-                    v.set_len(data.len());
+                    v.set_len(visible.len());
                     v.set_height(range.len());
                     v.set_scrolloff(host.view.scrolloff);
                     v.scroll_to((-accepted.y / ROW_H).round().max(0.0) as usize);
@@ -766,8 +936,14 @@ impl Render for Files {
             let cursor = view.get().cursor();
             range
                 .map(|i| {
-                    let r = row(&data[i], &host, i == cursor, focused, Some(i) == armed);
-                    if selectable(&data, i) {
+                    let r = row(
+                        &data[visible[i]],
+                        &host,
+                        i == cursor,
+                        focused,
+                        Some(i) == armed,
+                    );
+                    if selectable(&data, visible[i]) {
                         let this = this.clone();
                         return r
                             .id(("row", i))
@@ -887,6 +1063,7 @@ mod tests {
         Change, ConflictEntry, ConflictKind, Kind, PathBytes, StagedEntry, Submodule,
         UnstagedEntry, UntrackedEntry,
     };
+    use std::rc::Rc;
 
     fn staged(path: &str, change: Change) -> StagedEntry {
         StagedEntry {
@@ -1487,6 +1664,75 @@ mod tests {
         assert_eq!(f.armed_row(), None, "the vanish took the question with it");
         // And the pane's own answer is empty-tree honest: nothing to arm.
         assert!(f.current_file().is_none());
+    }
+
+    // -------------------------------------------------------------- search
+
+    #[test]
+    fn a_query_filters_live_and_the_keyboard_stays_on_its_file() {
+        let _host = Host::new();
+        let mut f = files(sample_status());
+        with_height(&mut f, 9);
+        // The keyboard opens on src/main.rs — a path that survives "MAIN",
+        // folded, in both the sections it sits in.
+        let anchored = f
+            .current_file()
+            .expect("a file under the keyboard")
+            .path
+            .clone();
+
+        f.apply_query("  main  ");
+        let v = f.view.get();
+        assert_eq!(
+            v.len(),
+            4,
+            "the two matches plus the headings of their sections"
+        );
+        assert_eq!(f.filter_note().as_deref(), Some("2/5"));
+        assert_eq!(f.rows(), 4);
+        assert_eq!(
+            f.changed(),
+            4,
+            "the filter narrows what is shown, never what is loaded"
+        );
+        // Through the indirection: `current_file` is the anchored file, not
+        // whatever now happens to sit at row 1 of a shorter list.
+        assert_eq!(
+            f.current_file().map(|f| f.path.clone()).as_ref(),
+            Some(&anchored)
+        );
+
+        // The same query again is no change at all — and rebuilds nothing.
+        let before = Rc::as_ptr(&f.visible);
+        f.apply_query("main ");
+        assert_eq!(f.query(), Some("main"), "trimmed before comparing");
+        assert_eq!(
+            Rc::as_ptr(&f.visible),
+            before,
+            "a no-op query did not rebuild the index"
+        );
+
+        // A changed filter is a movement of attention: the keyboard clamps
+        // into what survives, and an armed discard dies with the question's
+        // row.
+        assert!(!f.confirm_or_arm_discard(Section::Staged, &anchored));
+        f.apply_query("nothing matches this");
+        let v = f.view.get();
+        assert_eq!(v.len(), 0);
+        assert!(f.current_file().is_none());
+        assert_eq!(f.filter_note().as_deref(), Some("0/5"));
+        assert_eq!(f.armed_row(), None, "a changed query disarmed");
+
+        // Clearing puts every row back under the same file.
+        f.apply_query("");
+        assert_eq!(f.rows(), 9);
+        assert_eq!(f.query(), None);
+        assert_eq!(f.filter_note(), None);
+        assert_eq!(
+            f.current_file().map(|f| f.path.clone()).as_ref(),
+            Some(&anchored),
+            "empty restores instantly, cursor included"
+        );
     }
 
     #[test]
