@@ -58,7 +58,7 @@ use std::rc::Rc;
 const H: f32 = 22.0;
 /// The open list's row height. Taller than the trigger: a menu row is a target,
 /// not a label, and 22px is uncomfortable to hit.
-const ROW_H: f32 = 24.0;
+pub(crate) const ROW_H: f32 = 24.0;
 
 /// A value, and everything it could be instead.
 pub struct Picker {

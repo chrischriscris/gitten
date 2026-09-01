@@ -108,6 +108,10 @@ pub struct Commits {
     /// ask the shell during render — so the shell writes it here when focus
     /// moves, and render reads a flag.
     focused: bool,
+    /// The row a right-click landed on, published for the shell — which opens
+    /// the pane's context menu over it. Taken once by whoever opens it: one
+    /// right-click, one open.
+    menu_row: Cell<Option<usize>>,
 }
 
 impl Commits {
@@ -310,6 +314,14 @@ impl Commits {
     /// Where a click lands the keyboard: onto the row the mouse hit, with
     /// exactly the side effects a key move has — see [`Self::run_view`]. The
     /// row clamps like [`Viewport::go_to`] does; this list has no headings.
+    /// The row a right-click landed on, published by the row's own handler
+    /// beside the left-click one, and taken once by the shell — which opens
+    /// the pane's context menu over it. Taken, not read: one right-click,
+    /// one open.
+    pub fn take_menu_row(&self) -> Option<usize> {
+        self.menu_row.take()
+    }
+
     pub fn select_row(&mut self, index: usize, host: &Host) {
         self.reconcile(host);
         let mut v = self.live_view(host);
@@ -510,6 +522,7 @@ impl Commits {
             load,
             armed: None,
             focused: false,
+            menu_row: Cell::new(None),
         }
     }
 
@@ -736,6 +749,18 @@ impl Render for Commits {
                     .cursor_pointer()
                     .when(i != cursor, |r| {
                         r.hover(|s| s.bg(rgb(host.theme.chrome.raised)))
+                    })
+                    .on_mouse_down(MouseButton::Right, {
+                        let this = this.clone();
+                        move |_: &MouseDownEvent, _, cx| {
+                            let Some(this) = this.upgrade() else { return };
+                            let host = crate::config::host(cx);
+                            this.update(cx, |v, cx| {
+                                v.select_row(i, &host);
+                                v.menu_row.set(Some(i));
+                                cx.notify();
+                            });
+                        }
                     })
                     .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, _, cx| {
                         let Some(this) = this.upgrade() else { return };
