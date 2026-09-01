@@ -33,6 +33,7 @@ use crate::views::branches::Branches;
 use gitten_core::command::Modes;
 use gitten_core::host::Host;
 use gpui::*;
+use std::cell::Cell;
 
 /// The mode the pane's own keys bind in — the name the shell's screen table
 /// also answers to. Only what is genuinely particular is bound here (`enter`);
@@ -58,6 +59,10 @@ pub struct Status {
     /// clamping is clamping to verbs and nothing else.
     cursor: usize,
     focused: bool,
+    /// The row a right-click landed on, published for the shell — which opens
+    /// the pane's context menu over it. Taken once by whoever opens it: one
+    /// right-click, one open.
+    menu_row: Cell<Option<usize>>,
     /// The verb job the status band is currently describing, as
     /// `(command name, the band's own line)`. Written by the shell from the
     /// band's cell each frame — the pane keeps no timer and no second copy
@@ -72,6 +77,7 @@ impl Status {
             branches,
             cursor: 0,
             focused: false,
+            menu_row: Cell::new(None),
             running: None,
         }
     }
@@ -87,6 +93,14 @@ impl Status {
     /// 0 is the fact, which is not in the cursor's space, so it snaps to
     /// the nearest verb below, the same rule the other panes' headings run;
     /// anything past the rows clamps.
+    /// The row a right-click landed on, published by the row's own handler
+    /// beside the left-click one, and taken once by the shell — which opens
+    /// the pane's context menu over it. Taken, not read: one right-click,
+    /// one open.
+    pub fn take_menu_row(&self) -> Option<usize> {
+        self.menu_row.take()
+    }
+
     pub fn select_row(&mut self, index: usize) {
         self.cursor = index.min(ACTIONS.len()).saturating_sub(1);
     }
@@ -241,6 +255,19 @@ impl Render for Status {
                     );
                 let this = this.clone();
                 row.id(("status-row", i))
+                    .on_mouse_down(MouseButton::Right, {
+                        let this = this.clone();
+                        move |_: &MouseDownEvent, _, cx| {
+                            let Some(this) = this.upgrade() else {
+                                return;
+                            };
+                            this.update(cx, |s, cx| {
+                                s.select_row(i + 1);
+                                s.menu_row.set(Some(i + 1));
+                                cx.notify();
+                            });
+                        }
+                    })
                     .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, _, cx| {
                         let Some(this) = this.upgrade() else {
                             return;

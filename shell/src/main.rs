@@ -5,6 +5,7 @@ mod dispatch;
 mod graph;
 mod help;
 mod input;
+mod menu;
 mod panes;
 mod session;
 mod stats;
@@ -322,6 +323,24 @@ enum Open {
     /// of a single `view ▾` menu, which needs an open state like any
     /// other and gets one variant rather than a second state machine.
     View,
+}
+
+/// The open context menu: the pane it was opened over — whose mode the rows
+/// were projected from, and whose *registration name* a pick routes through,
+/// the way a prompt's pane name routes its result back — the row a
+/// right-click landed on when one was, the pointer, and the rows themselves.
+/// A snapshot of the projection, the way a picker's options are its
+/// registry's: the menu says what the keymap said when it was asked.
+struct ContextMenu {
+    pane: String,
+    /// The row the right-click landed on, as the view published it. Read by
+    /// nothing — the selection already happened, and a pick dispatches by
+    /// name — but the open state's record of what it is over, and what a
+    /// test asserts.
+    #[allow(dead_code)]
+    row: Option<usize>,
+    at: Point<Pixels>,
+    rows: Vec<menu::Row>,
 }
 
 type RefreshValue = Box<dyn std::any::Any + Send>;
@@ -1013,6 +1032,20 @@ impl Screen {
         }
     }
 
+    /// The row a right-click landed on, from the pane the click came over —
+    /// the sidebar views' own publish, taken once so one right-click opens
+    /// one menu. A pane without rows of its own publishes nothing.
+    fn menu_row(&self, cx: &App) -> Option<usize> {
+        match self {
+            Screen::Commits { view, .. } => view.read(cx).take_menu_row(),
+            Screen::Files { view, .. } => view.read(cx).take_menu_row(),
+            Screen::Stashes { view, .. } => view.read(cx).take_menu_row(),
+            Screen::Branches { view, .. } => view.read(cx).take_menu_row(),
+            Screen::Status { view, .. } => view.read(cx).take_menu_row(),
+            Screen::Diff { .. } | Screen::Custom(_) => None,
+        }
+    }
+
     /// Moves this screen's text sideways, where it has any — a commit graph has
     /// nothing off the left edge to reach, and says so by not moving. Whether
     /// anything moved decides a redraw.
@@ -1303,6 +1336,11 @@ struct DevShell {
     /// agrees with `gitten.toml` rather than with a copy of it taken at startup.
     over: Overrides,
     open: Option<Open>,
+    /// The open context menu, if a right-click asked for one. One at a time,
+    /// like the pickers — a second right-click moves the one there is — and
+    /// dismissed by any key, a wheel, a focus change or a pick. See
+    /// [`DevShell::open_context_menu`].
+    context: Option<ContextMenu>,
     /// A failed re-diff. Shown, not swallowed: the usual cause is a repository
     /// that moved under the window, and silently keeping the old rows would be a
     /// diff labelled with an algorithm that did not produce it.
@@ -1514,10 +1552,11 @@ impl DevShell {
     }
 
     /// Rebuilds the mode stack from what is focused, and drops whatever was
-    /// pending against the previous arrangement: any half-typed chord, and any
-    /// open picker — a menu belongs to the pane it was opened over, and one
-    /// left standing after focus changes is invisible but still in
-    /// `self.open`, where [`DevShell::on_wheel`] swallows for it forever.
+    /// pending against the previous arrangement: any half-typed chord, any
+    /// open picker and any context menu — a menu belongs to the pane it was
+    /// opened over, and one left standing after focus changes is invisible
+    /// but still in `self.open` or `self.context`, where
+    /// [`DevShell::on_wheel`] swallows for it forever.
     /// Called on every change of region focus or help state — the places
     /// [`Modes`] can change — and at the tail of [`DevShell::run_command`],
     /// because a cursor move inside a list can end a standing question.
@@ -1525,6 +1564,7 @@ impl DevShell {
         self.modes = self.stack_for(self.active(), cx);
         self.pending.clear();
         self.open = None;
+        self.context = None;
     }
 
     /// The [`Modes`] stack a key would resolve against if `screen` held the
@@ -3932,6 +3972,13 @@ impl DevShell {
             self.focused = now_focused;
             self.pending.clear();
         }
+        // Any press dismisses the context menu first — a keyboard-first app
+        // must never make a key wait for a mouse surface — and then resolves
+        // exactly as if the menu were not there. The menu is the keymap's
+        // rows; the key is still the keymap's.
+        if self.context.take().is_some() {
+            cx.notify();
+        }
         let candidates = dispatch::translate(&ev.keystroke);
         if candidates.is_empty() {
             return;
@@ -4001,6 +4048,61 @@ impl DevShell {
         }
     }
 
+    /// A right-click asked for the pane's context menu: the keymap's own
+    /// answer to "what may I do here", projected over the one pane the click
+    /// landed in and drawn at the pointer. Plan 045's select-row verb has
+    /// already run — the row's own handler, beside the left-click one,
+    /// published it before this listener saw the event — so the verbs the
+    /// menu offers are the row's, wherever the keyboard was.
+    ///
+    /// A pane whose mode the keymap gives nothing refuses the menu rather
+    /// than drawing an empty box: a menu with no rows says nothing and
+    /// takes space.
+    fn open_context_menu(&mut self, pane: &str, at: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(screen) = self.panes.get(pane).cloned() else {
+            return;
+        };
+        let host = self.fresh_host(cx);
+        let modes = self.stack_for(Some(&screen), cx);
+        let rows = menu::rows(
+            &host.keys.help(&host.commands, &modes),
+            screen.mode(),
+            &host.commands,
+        );
+        if rows.is_empty() {
+            return;
+        }
+        // A right-click is an intervening event wherever it lands, the same
+        // rule the wheel runs: a chord half-typed when the finger lands is
+        // not half-typed any more.
+        self.pending.clear();
+        let row = screen.menu_row(cx);
+        self.context = Some(ContextMenu {
+            pane: pane.into(),
+            row,
+            at,
+            rows,
+        });
+        cx.notify();
+    }
+
+    /// The menu's pick: named dispatch over the pane the menu was opened on —
+    /// the same path the wheel's resolved name takes — and the menu gone,
+    /// because a pick is one decision and not two.
+    fn context_pick(&mut self, name: &str, cx: &mut Context<Self>) {
+        let Some(menu) = self.context.take() else {
+            return;
+        };
+        // By the pane's registration name, not a captured tenant: the same
+        // routing a prompt's result takes back to the pane it was opened
+        // over, so a tenant re-registered while the menu stood still answers.
+        let Some(screen) = self.panes.get(&menu.pane).cloned() else {
+            return;
+        };
+        self.notice = None;
+        self.run_command_from(name, Some(&screen), cx);
+    }
+
     /// One wheel event, wherever it rolled.
     ///
     /// Two rules, both inherited from the probe this replaced: the gesture has
@@ -4020,11 +4122,12 @@ impl DevShell {
         // half-typed when the fingers touch the wheel is not half-typed any
         // more. The same rule the focus and host checks apply, one line each.
         self.pending.clear();
-        // Help is up, or a picker menu: their full-window occluding surfaces
-        // keep the rows out of the hit path, while this capture interceptor
-        // stands aside so a handler on the visible panel can still see the
-        // event. Stopping propagation here would prevent that bubble handler.
-        if self.help || self.open.is_some() {
+        // Help is up, or a picker menu or a context menu: their occluding
+        // surfaces keep the rows out of the hit path, while this capture
+        // interceptor stands aside so a handler on the visible panel can
+        // still see the event. Stopping propagation here would prevent that
+        // bubble handler.
+        if self.help || self.open.is_some() || self.context.is_some() {
             return;
         }
         // Over one region's rows or the other's, and not over the title bar
@@ -4545,6 +4648,12 @@ impl DevShell {
             true => screen.label(cx).into(),
             false => "COMMITS".into(),
         };
+        // The context menu's pane: the takeover pane's own registration name
+        // when an extension pane stands here, the commit list's otherwise.
+        let pane = match custom {
+            true => self.panes.focused_name().to_string(),
+            false => "commits".to_string(),
+        };
         out.push(
             div()
                 .id("side-commits")
@@ -4571,6 +4680,12 @@ impl DevShell {
                     }
                     this.set_spot(Spot::List, cx);
                 }))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                        this.open_context_menu(&pane, ev.position, cx);
+                    }),
+                )
                 .child(chrome::pane_header(host, "4", name, None, focused, right))
                 .child(self.section_content("side-commits", screen.any(), c.bg, cx))
                 .into_any_element(),
@@ -4694,6 +4809,12 @@ impl Render for DevShell {
                         .capture_any_mouse_down(cx.listener(move |this, _, _, cx| {
                             this.focus_named(name, cx);
                         }))
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                                this.open_context_menu(name, ev.position, cx);
+                            }),
+                        )
                         .child(chrome::pane_header(
                             &host,
                             number,
@@ -4748,6 +4869,12 @@ impl Render for DevShell {
                         .capture_any_mouse_down(cx.listener(move |this, _, _, cx| {
                             this.focus_named(name, cx);
                         }))
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                                this.open_context_menu(name, ev.position, cx);
+                            }),
+                        )
                         .child(chrome::pane_header(
                             &host,
                             number,
@@ -5214,7 +5341,38 @@ impl Render for DevShell {
             // priority-0 backdrop blocks the rest of the window without
             // covering the menu, so capture can leave overlay wheel ownership
             // alone without exposing the native list scroller underneath.
-            .children(self.open.is_some().then(controls::picker_backdrop))
+            .children(
+                (self.open.is_some() || self.context.is_some()).then(controls::picker_backdrop),
+            )
+            // The context menu itself. Its rows are the keymap's — projected
+            // when it was asked, over the one pane the click landed in — and
+            // its pick dispatches the row's *name*, so no literal command
+            // name reaches this file. The transparent priority-0 backdrop
+            // above already blocks the rest of the window for it.
+            .children(self.context.as_ref().map(|menu| {
+                let me = cx.entity().downgrade();
+                menu::context_menu(
+                    &menu.rows,
+                    &host.theme,
+                    &host.font,
+                    menu.at,
+                    window.viewport_size(),
+                    {
+                        let me = me.clone();
+                        move |name: &str, _: &mut Window, cx: &mut App| {
+                            _ = me.update(cx, |this, cx| this.context_pick(name, cx));
+                        }
+                    },
+                    {
+                        move |_: &mut Window, cx: &mut App| {
+                            _ = me.update(cx, |this, cx| {
+                                this.context = None;
+                                cx.notify();
+                            });
+                        }
+                    },
+                )
+            }))
             // The status bar: where the keyboard is, and what the nearest
             // keys do. A sentence owed to the user — an error, a job's own
             // finish, an armed question — takes the hints' place rather than
@@ -5836,6 +5994,7 @@ fn main() {
                     search_live: None,
                     over: Overrides::default(),
                     open: None,
+                    context: None,
                     error: None,
                     notice: None,
                     config: shell_config_path,
@@ -5989,8 +6148,8 @@ fn window_options(title: SharedString) -> WindowOptions {
 #[cfg(test)]
 mod tests {
     use super::{
-        config, files_header_count, input, panes, DevShell, GitError, Notice, Open, Pane, Refresh,
-        Screen, Writes,
+        config, files_header_count, input, panes, ContextMenu, DevShell, GitError, Notice, Open,
+        Pane, Refresh, Screen, Writes,
     };
     use crate::views::commits::Commits;
     use gitten_app::cli::Source;
@@ -6185,6 +6344,7 @@ mod tests {
                 search_live: None,
                 over: Default::default(),
                 open: which,
+                context: None,
                 error: None,
                 notice: None,
                 config: std::path::PathBuf::new(),
@@ -6312,6 +6472,7 @@ mod tests {
                 search_live: None,
                 over: Default::default(),
                 open: None,
+                context: None,
                 error: None,
                 notice: None,
                 config: std::path::PathBuf::new(),
@@ -6456,6 +6617,104 @@ mod tests {
                 assert!(!s.help, "{which:?}: esc reached past the menu");
             });
         }
+    }
+
+    #[gpui::test]
+    fn a_pick_dispatches_by_name_and_closes(cx: &mut TestAppContext) {
+        // The menu's pick is the wheel's dispatch, aimed at the pane the menu
+        // was opened over — never a client-side match — and it is one decision
+        // and not two: the menu does not outlive it.
+        let (shell, repo, _handle) = files_shell(cx);
+        shell.update(cx, |s, _| {
+            s.context = Some(ContextMenu {
+                pane: "files".into(),
+                row: Some(0),
+                at: gpui::point(gpui::px(20.), gpui::px(20.)),
+                rows: Vec::new(),
+            });
+        });
+        shell.update(cx, |s, cx| s.context_pick("files.stage", cx));
+        pump_write(&shell, cx);
+        assert_eq!(
+            repo.wrote(),
+            vec!["stage notes.md"],
+            "the pick dispatched the name over the menu's own pane"
+        );
+        shell.read_with(cx, |s, _| {
+            assert!(s.context.is_none(), "a pick is one decision, not two")
+        });
+    }
+
+    #[gpui::test]
+    fn a_keypress_dismisses_the_menu_before_resolving(cx: &mut TestAppContext) {
+        // A keyboard-first app must never make a key wait for a mouse
+        // surface: any press dismisses the menu first — and the *same* press
+        // still resolves, here the files pane's stage, which queues a write.
+        let (shell, repo, _handle) = files_shell(cx);
+        shell.update(cx, |s, _| {
+            s.context = Some(ContextMenu {
+                pane: "files".into(),
+                row: Some(0),
+                at: gpui::point(gpui::px(10.), gpui::px(10.)),
+                rows: Vec::new(),
+            });
+        });
+        let window = cx.add_empty_window();
+        window.update(|window, cx| {
+            shell.update(cx, |s, cx| {
+                s.on_key(
+                    &gpui::KeyDownEvent {
+                        keystroke: gpui::Keystroke {
+                            key: "space".into(),
+                            modifiers: gpui::Modifiers::default(),
+                            key_char: Some(" ".into()),
+                        },
+                        is_held: false,
+                        prefer_character_input: false,
+                    },
+                    window,
+                    cx,
+                )
+            });
+        });
+        shell.read_with(cx, |s, _| {
+            assert!(s.context.is_none(), "the menu is gone first");
+        });
+        pump_write(&shell, cx);
+        assert_eq!(
+            repo.wrote(),
+            vec!["stage notes.md"],
+            "the press resolved behind the dismissed menu"
+        );
+    }
+
+    #[gpui::test]
+    fn a_wheel_over_an_open_context_menu_stands_aside(cx: &mut TestAppContext) {
+        // The menu's occluding surface owns the wheel while it is open,
+        // exactly as a picker's does — and only while it is open: the same
+        // wheel over the same pane, menu closed, scrolls it.
+        let (shell, wheeled) = wheel_shell(cx);
+        let current = |v: &Commits| v.current().map(|c| c.sha.to_string());
+        shell.update(cx, |s, _| {
+            s.context = Some(ContextMenu {
+                pane: "wheeled".into(),
+                row: None,
+                at: gpui::point(gpui::px(100.), gpui::px(150.)),
+                rows: Vec::new(),
+            });
+        });
+        let before = wheeled.read_with(cx, |v, _| current(v));
+        let window = cx.add_empty_window();
+        window.update(|window, cx| {
+            shell.update(cx, |s, cx| s.on_wheel(&wheeled_notch(), window, cx));
+            // The wheel stands aside while the menu is open...
+            assert_eq!(current(wheeled.read(cx)), before);
+            // ...and only while it is open: the same wheel, menu closed,
+            // is the keymap's again.
+            shell.update(cx, |s, _| s.context = None);
+            shell.update(cx, |s, cx| s.on_wheel(&wheeled_notch(), window, cx));
+            assert_ne!(current(wheeled.read(cx)), before);
+        });
     }
 
     #[gpui::test]
