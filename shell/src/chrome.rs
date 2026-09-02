@@ -23,69 +23,62 @@ use gitten_core::theme::Surface;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 
-/// Height of a pane's header strip — the same strip the module doc
-/// describes, so the numbers live in the pane stack and nowhere else.
-/// A shade taller than a list row: a header is a label, not a row, and one
-/// pixel of extra air is what keeps it from reading as data.
-pub const HEADER_H: f32 = 26.0;
+/// Height of a pane's header strip. The guide's 28px band is deliberately
+/// taller than a 22px data row: enough separation to read as chrome without
+/// turning each stacked pane into a card.
+pub const HEADER_H: f32 = 28.0;
 
-/// Height of the status bar. Same air as a header: the two strips bracket
-/// the window and should read as a matched pair.
+/// Height of the status bar. It remains denser than the pane headers: the
+/// status bar is transient furniture, while pane headers are navigation.
 pub const STATUS_H: f32 = 26.0;
 
-/// Left padding of every list row and section label. One number, because
-/// the eye runs down a column of rows and a row that starts a pixel later
-/// than its neighbours reads as indented on purpose.
-pub const ROW_PAD: f32 = 12.0;
+/// Left padding of every list row and section label. Ten pixels matches the
+/// pane header inset at the shipped font, so labels, status marks and names
+/// share one quiet vertical axis.
+pub const ROW_PAD: f32 = 10.0;
 
-/// The bar on the selected row's left edge — and on the focused pane's
-/// header. Two pixels: one is a hairline and reads as an edge, three is a
-/// stripe and starts to look like a column of its own.
+/// The bar on the selected row's left edge. Two pixels: one is a hairline and
+/// reads as an edge, three is a stripe and starts to look like a column.
 pub const ROW_BAR: f32 = 2.0;
 
 /// Corner radius for every chip, pill, keycap and floating panel. One value:
-/// three radii in one 32px strip read as three design languages.
+/// mixed radii in one compact strip read as different design languages.
 pub const RADIUS: f32 = 4.0;
+/// Compact text in dense pane furniture.
+pub const COMPACT_TEXT_SCALE: f32 = 0.8;
+/// Title-bar controls and branch status: larger, but still below body text.
+pub const TOPBAR_TEXT_SCALE: f32 = 0.93;
+/// Repository path and other primary title-bar text.
+pub const TITLE_TEXT_SCALE: f32 = 1.0;
 
 // The chrome's spacing ladder — the whole vocabulary of distance the strips
 // spend, in one currency: the live font's advance ([`Font::char_width`]), not
-// GPUI's frozen 16px rem. A rem shorthand (`px_2`, `gap_3`) resolves against a
-// rem size nothing in `gitten.toml` reaches, so at `[font] size = 16` the
-// glyphs grew while their padding stayed at 13px-era values. Padding and gap
-// are one currency — both are a distance between furniture — so one ladder
-// serves both, set through `.px()`, `.gap()`, `.pt()` and friends.
-//
-// Each step is the pixel value the rem shorthand it replaced drew at the
-// shipped default face — JetBrains Mono at 14px, advance 0.6, so `ch` is
-// 8.4px — rounded to the whole pixel: at the default font nothing moves a
-// pixel, and at any other size nothing is frozen.
+// GPUI's frozen 16px rem. Each step follows the shipped face — JetBrains Mono
+// at 15px with a 0.6em advance — and scales with any configured size. The
+// larger default therefore gives the whole interface slightly more breathing
+// room rather than enlarging glyphs inside frozen padding.
 
-/// Half a character. At the default font this is exactly the old `gap_1` /
-/// `py_1` — 4px.
+/// Half a character — 5px at the shipped font.
 pub fn gap_s(font: &Font) -> Pixels {
     px((font.char_width() * 0.5).round())
 }
 
-/// One character. At the default font this is exactly the old `gap_2` /
-/// `px_2` / `pt_2` — 8px.
+/// One character — 9px at the shipped font.
 pub fn gap_m(font: &Font) -> Pixels {
     px(font.char_width().round())
 }
 
-/// One and two fifths. At the default font this is exactly the old `gap_3` /
-/// `pr_3` — 12px.
+/// One and two fifths — 13px at the shipped font.
 pub fn gap_l(font: &Font) -> Pixels {
     px((font.char_width() * 1.4).round())
 }
 
-/// One and nine tenths. At the default font this is exactly the old `px_4` —
-/// 16px.
+/// One and nine tenths — 17px at the shipped font.
 pub fn gap_xl(font: &Font) -> Pixels {
     px((font.char_width() * 1.9).round())
 }
 
-/// Two and four fifths. At the default font this is exactly the old `gap_6` —
-/// 24px.
+/// Two and four fifths — 25px at the shipped font.
 pub fn gap_xxl(font: &Font) -> Pixels {
     px((font.char_width() * 2.8).round())
 }
@@ -125,20 +118,22 @@ pub fn list_row(host: &Host, current: bool, focused: bool, h: f32) -> Div {
 }
 
 /// A section's label inside a list — `STAGED`, `UNSTAGED` — with an optional
-/// count at the right edge. Faint and uppercase so it reads as a heading
-/// over the rows and never as one of them: it is not selectable, and a
-/// label that looked like a row would be one the cursor skips for no reason
-/// the eye can see. Same `ROW_PAD` as the rows, so the column stays a column.
+/// count at the right edge. It sits low in its 22px row, giving the label the
+/// guide's larger top inset without breaking `uniform_list`'s fixed-row
+/// contract. Same `ROW_PAD` as the rows, so the column stays a column.
 /// `text` arrives already in caps — a static per section — so a heading row
 /// costs the frame no string.
 pub fn section_label(host: &Host, text: SharedString, count: Option<SharedString>, h: f32) -> Div {
     let c = host.theme.chrome;
     div()
         .flex()
-        .items_center()
+        .items_end()
         .min_w_full()
         .h(px(h))
+        .pb(gap_s(&host.font))
         .pl(px(ROW_PAD))
+        .text_size(px((host.font.size * 0.72).round()))
+        .font_weight(FontWeight::BOLD)
         // Text, not a border: raw `faint` is 2.05:1 here — half the furniture
         // floor — so "quiet" was in practice invisible. `quiet_on` lifts it to
         // the floor and no further, so the label still reads as a heading over
@@ -159,12 +154,14 @@ pub fn section_label(host: &Host, text: SharedString, count: Option<SharedString
 }
 
 /// A path drawn as the design draws one: directory dim, filename in
-/// `bright` — whatever ink the row has earned. The two halves arrive already
-/// cut, by [`gitten_core::path::split_dir_name`] at flatten or prepare, so
-/// the files pane, the title strip and the diff header agree on where the
-/// filename starts and the render path clones two refcounts instead of
-/// cutting and copying a string per visible row per frame. No wrapping,
-/// because a path is one word to the eye.
+/// `bright` — whatever ink the row has earned. `bold_name` lets the repository
+/// name carry title-bar emphasis without making filenames inside data panes
+/// heavier. The two halves arrive already cut by
+/// [`gitten_core::path::split_dir_name`] at flatten or prepare, so the files
+/// pane, title strip and diff header agree on where the filename starts and
+/// the render path clones two refcounts instead of cutting and copying a
+/// string per visible row per frame. No wrapping, because a path is one word
+/// to the eye.
 ///
 /// When the row is too narrow for the whole path the **directory's head
 /// gives and the filename never does** — `min_w_0` and `flex_shrink` let the
@@ -178,6 +175,7 @@ pub fn path_spans(
     name: SharedString,
     bright: u32,
     surface: Surface,
+    bold_name: bool,
 ) -> Div {
     div()
         .flex()
@@ -196,7 +194,13 @@ pub fn path_spans(
                 .text_color(rgb(host.theme.dim_on(surface)))
                 .child(dir),
         )
-        .child(div().flex_none().text_color(rgb(bright)).child(name))
+        .child(
+            div()
+                .flex_none()
+                .text_color(rgb(bright))
+                .when(bold_name, |name| name.font_weight(FontWeight::BOLD))
+                .child(name),
+        )
 }
 
 /// An empty pane's answer: one quiet faint line, top-left, where a reader
@@ -220,59 +224,45 @@ pub fn empty_line(host: &Host, text: SharedString) -> AnyElement {
 }
 
 /// The keycap a pane header starts with: the number of the key that focuses
-/// the pane, on a small filled key face. The face is the whole point — a
-/// bare numeral reads as a count, a key face reads as *press me* — and it is
-/// the one place the header may spend ink, because it is the one thing the
-/// header teaches. Filled rather than outlined: a one-pixel box at this size
-/// is all corners, and the raised face is what makes it a key rather than a
-/// badge. Which pane holds the keyboard is the numeral's ink — accent or dim
-/// — never the face's, so the caps sit still while focus moves.
+/// it, on a small filled key face. Unfocused caps stay quiet on the dedicated
+/// `keycap` surface. Focus fills the face with the accent and reverses the
+/// numeral into the window background, matching the guide's strongest and
+/// smallest navigation signal without adding another mark to the header.
 fn keycap(host: &Host, number: &str, focused: bool) -> Div {
     let c = host.theme.chrome;
-    let ch = host.font.char_width();
-    let ink = match focused {
-        true => c.accent,
-        false => c.dim,
-    };
-    // The numeral is text and the box around it is a border, so they part
-    // ways here: the box keeps `faint` raw — a hairline has no floor — and
-    // the digit goes through `quiet_on`, because raw it is 1.95:1 on the
-    // strip and a keycap nobody can read teaches nothing.
-    let digit = match focused {
-        true => c.accent,
-        false => host.theme.quiet_on(c.title_bg),
+    let size = px((host.font.char_width() * 1.8).round());
+    let (face, border, digit) = match focused {
+        true => (c.accent, c.accent, c.bg),
+        false => (c.keycap, c.border, c.fg),
     };
     div()
         .flex_none()
         .flex()
         .items_center()
         .justify_center()
-        .w(px(ch * 1.6))
-        .h(px(ch * 1.6))
-        .bg(rgb(c.keycap))
+        .w(size)
+        .h(size)
+        .bg(rgb(face))
         .border_1()
-        .border_color(rgb(ink))
-        .rounded(px(RADIUS))
+        .border_color(rgb(border))
+        .rounded(px(RADIUS - 1.0))
         .text_color(rgb(digit))
+        .when(focused, |d| d.font_weight(FontWeight::BOLD))
         .child(SharedString::from(number.to_string()))
 }
 
 /// One pane's header strip: keycap, name, and — pushed to the right edge —
-/// whatever the pane counts, or anything else the caller has to say. The
-/// focused pane's furniture is drawn in the accent and the rest in the
-/// dim inks, so the stacked headers answer "where is the keyboard" at a
-/// glance without a single extra pixel of chrome.
+/// whatever the pane counts, or anything else the caller has to say. Every
+/// header owns the `title_bg` surface; the focused header steps up to `raised`
+/// and reverses its keycap into the accent. This keeps focus visible in
+/// peripheral vision without turning the entire pane into a bordered card.
 ///
 /// The strip spans its container's width (`w_full`), because the hairline
 /// under it is the region's edge and must reach it whatever the name's
-/// length. The focused pane's header also carries a [`ROW_BAR`] on its left
-/// edge, for the header's height only — the same mark a selected row wears,
-/// so "which pane" and "which row" are answered by the same shape. Unfocused
-/// headers draw the bar in the background, so the keycap does not move when
-/// the keyboard does. The count is right-edge furniture like anything else the caller
+/// length. The count is right-edge furniture like anything else the caller
 /// passes in `right` — the design pins a section's number against its own
-/// right edge, where a drifting count next to a drifting name would wobble
-/// — and both are dropped when the pane has nothing worth counting.
+/// right edge, where a drifting count next to a drifting name would wobble —
+/// and both are dropped when the pane has nothing worth counting.
 pub fn pane_header(
     host: &Host,
     number: &str,
@@ -309,63 +299,44 @@ pub fn pane_header_with(
     right: Option<AnyElement>,
 ) -> Div {
     let c = host.theme.chrome;
+    let ch = host.font.char_width();
+    let surface = match focused {
+        true => c.raised,
+        false => c.title_bg,
+    };
     div()
         .flex_none()
         .w_full()
         .flex()
         .items_center()
-        .gap(gap_m(&host.font))
+        .gap(px((ch * 0.7).round()))
         .h(px(HEADER_H))
-        .relative()
         // Nothing paints outside the strip, ever. The right-edge furniture is
-        // `flex_none` after a name that only lately learned to shrink; a deep
-        // path used to be able to push `hunk 2/7` — the answer to "which hunk
-        // will space stage" — clean out of the window, where no amount of
-        // looking would find it. Clipping keeps the loss at the edge, where a
-        // squeezed [`path_spans`] gives the directory's head up long before
-        // anything gets this far.
+        // `flex_none` after a name that can shrink; a deep path must give its
+        // directory up before it can push `hunk 2/7` out of the window.
         .overflow_hidden()
-        .px(gap_m(&host.font))
-        // The focused pane's band is lifted one step; the rest stay flat.
-        // With the accent bar and the bright name this is the third voice
-        // saying "the keyboard is here", and it is the one that works in
-        // peripheral vision, where neither ink nor a 2px bar registers.
-        .when(focused, |d| d.bg(rgb(c.raised)))
+        .px(px((ch * 1.2).round()))
+        .text_size(px((host.font.size * COMPACT_TEXT_SCALE).round()))
+        .bg(rgb(surface))
         .border_b_1()
-        .border_color(rgb(c.border))
-        .child(
-            // The bar is an absolute child rather than the strip's own left
-            // border: one `border_color` serves every side and the bottom
-            // hairline has to stay `border`. Over the padding, so the keycap
-            // sits where it always did.
-            div()
-                .absolute()
-                .left_0()
-                .top_0()
-                .bottom_0()
-                .w(px(ROW_BAR))
-                .bg(rgb(match focused {
-                    true => c.accent,
-                    false => c.bg,
-                })),
-        )
+        // Focus is an accent-tinted rule, not a second stripe beside the
+        // keycap. One navigation signal per axis: keycap for the header,
+        // left bar for the selected data row.
+        .border_color(match focused {
+            true => rgb(c.accent).alpha(0.35),
+            false => rgb(c.border),
+        })
         .child(keycap(host, number, focused))
-        // `min_w_0` and not `flex_none`: the one header whose name is a path
-        // — the diff pane's, through [`path_spans`] — has to be able to give
-        // its directory's head up when the right-edge furniture crowds it. A
-        // `flex_none` wrapper would pin the path at full width and let the
-        // overflow clip at the strip instead, which is the loss this pane
-        // exists not to make. Plain word names never overflow and never
-        // notice the difference.
-        .child(div().min_w_0().child(name))
+        // Pane names are navigation, not furniture: keep them at the full
+        // desktop body size while keycaps, counts and right-edge metadata stay
+        // compact. The wrapper also lets a diff path surrender its directory.
+        .child(div().min_w_0().text_size(px(host.font.size)).child(name))
         // Everything after the name is right-edge furniture.
         .child(div().min_w_0().flex_grow(1.0))
         .children(count.map(|count| {
             div()
                 .flex_none()
-                // A count is read, so it goes through `quiet_on` — raw `faint`
-                // is 1.95:1 on the strip it sits on.
-                .text_color(rgb(host.theme.quiet_on(c.title_bg)))
+                .text_color(rgb(host.theme.quiet_on(surface)))
                 .child(count)
         }))
         .children(right)
@@ -621,27 +592,25 @@ mod tests {
     }
 
     #[test]
-    fn the_ladder_lands_on_the_old_rem_values_at_the_default_font() {
-        // The shipped face: JetBrains Mono at 14px, advance 0.6 — ch 8.4px.
-        // GPUI's rem shorthands resolved against a frozen 16px rem, so these
-        // are the pixels `gap_1`, `gap_2`, `gap_3`, `px_4` and `gap_6` drew
-        // the day the vocabulary replaced them: at the default font nothing
-        // moves a pixel.
-        let f = Font::default();
-        assert_eq!(gap_s(&f), px(4.0));
-        assert_eq!(gap_m(&f), px(8.0));
-        assert_eq!(gap_l(&f), px(12.0));
-        assert_eq!(gap_xl(&f), px(16.0));
-        assert_eq!(gap_xxl(&f), px(24.0));
+    fn the_ladder_tracks_the_larger_default_font() {
+        // JetBrains Mono at 15px and a measured 0.6em advance gives a 9px
+        // character. Each rung is the rounded multiple documented above.
+        let f = Font {
+            size: 15.0,
+            ..Font::default()
+        };
+        assert_eq!(gap_s(&f), px(5.0));
+        assert_eq!(gap_m(&f), px(9.0));
+        assert_eq!(gap_l(&f), px(13.0));
+        assert_eq!(gap_xl(&f), px(17.0));
+        assert_eq!(gap_xxl(&f), px(25.0));
     }
 
     #[test]
-    fn the_ladder_scales_with_the_glyphs_at_size_16() {
-        // The point of the currency: the same `[font] size = 16` that grew
-        // the glyphs grows every step, and the ladder stays a ladder.
+    fn the_ladder_scales_with_the_glyphs_at_size_20() {
         let d = Font::default();
         let f = Font {
-            size: 16.0,
+            size: 20.0,
             ..Font::default()
         };
         for (small, grown) in [
@@ -653,7 +622,7 @@ mod tests {
         ] {
             assert!(
                 grown > small,
-                "size 16 drew {grown}px where the default drew {small}px"
+                "size 20 drew {grown}px where the default drew {small}px"
             );
         }
     }

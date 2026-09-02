@@ -267,24 +267,25 @@ pub(crate) fn flatten(
     rows
 }
 
-/// What the title strip names about HEAD: the attached branch and its
-/// tracking distance. The distance is passed through verbatim rather than
-/// re-spelled, because core has already decided what an unknowable means
-/// and dressing that up as a zero here would be wrong exactly where it
-/// matters — a push/pull badge reading "nothing to do" when it cannot know.
+/// What the title strip names about HEAD: either its attached branch and
+/// tracking distance, or the abbreviated commit while detached. The distance
+/// is passed through verbatim rather than re-spelled, because core has already
+/// decided what an unknowable means and dressing that up as a zero here would
+/// be wrong exactly where it matters — a push/pull badge reading "nothing to
+/// do" when it cannot know.
 ///
 /// Attached without a matching local row (an unborn branch's honest state)
 /// yields `None`: nothing is invented to fill the slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeadInfo {
-    /// The branch HEAD sits on, display form, decoded once.
-    pub branch: SharedString,
+    /// HEAD's compact display label: a branch name or detached commit.
+    pub label: SharedString,
     /// Commits to push. `None` while git cannot compare — including gone.
     pub ahead: Option<u32>,
     /// Commits to pull. `None` under the same conditions as [`HeadInfo::ahead`].
     pub behind: Option<u32>,
-    /// `⎇ main` — the chip's bright half, spelled once here so the title
-    /// strip clones a refcount per frame instead of formatting a string.
+    /// ` main` or `detached · 01234567` — the chip's bright half, spelled
+    /// once here so the title strip clones a refcount per frame.
     pub chip: SharedString,
     /// ` · ↑2 ↓0` — the chip's dim half, [`drift`] run once; `None` when
     /// there is nothing to say.
@@ -303,22 +304,31 @@ pub(crate) fn drift(ahead: Option<u32>, behind: Option<u32>) -> Option<String> {
 /// Reads [`HeadInfo`] off the model. Pure — the unit-tested half of what the
 /// title strip asks about this pane.
 fn head_info(head: Option<&HeadState>, local: &[Branch]) -> Option<HeadInfo> {
-    match head {
-        Some(HeadState::Branch { .. }) => {}
-        _ => return None,
-    }
-    local.iter().find(|b| b.head).map(|b| {
-        let branch: SharedString = b.display().into_owned().into();
-        let ahead = b.upstream.as_ref().and_then(|u| u.ahead);
-        let behind = b.upstream.as_ref().and_then(|u| u.behind);
-        HeadInfo {
-            chip: format!("⎇ {branch}").into(),
-            drift: drift(ahead, behind).map(SharedString::from),
-            branch,
-            ahead,
-            behind,
+    match head? {
+        HeadState::Detached { commit } => {
+            let short = &commit[..commit.len().min(8)];
+            let label: SharedString = format!("detached · {short}").into();
+            Some(HeadInfo {
+                chip: label.clone(),
+                drift: None,
+                label,
+                ahead: None,
+                behind: None,
+            })
         }
-    })
+        HeadState::Branch { .. } => local.iter().find(|b| b.head).map(|b| {
+            let label: SharedString = b.display().into_owned().into();
+            let ahead = b.upstream.as_ref().and_then(|u| u.ahead);
+            let behind = b.upstream.as_ref().and_then(|u| u.behind);
+            HeadInfo {
+                chip: format!(" {label}").into(),
+                drift: drift(ahead, behind).map(SharedString::from),
+                label,
+                ahead,
+                behind,
+            }
+        }),
+    }
 }
 
 /// [`flatten`] plus what the title strip says about it. The load line goes to
@@ -352,7 +362,7 @@ pub(crate) struct Prepared {
     pub(crate) rows: Vec<Row>,
     /// The title-strip line: who we are and how much there is.
     pub(crate) label: String,
-    /// Who HEAD is, read by the window's title strip. `None` while detached.
+    /// Who HEAD is, read by the window's title strip.
     pub(crate) head: Option<HeadInfo>,
 }
 
@@ -386,9 +396,8 @@ pub struct Branches {
     /// row moves the question, it does not queue two.
     armed: Option<Target>,
     /// Who HEAD is as of the last refresh, for the window's title strip:
-    /// the attached branch and its tracking distance. `None` while detached,
-    /// which is a state worth reading on the row above instead of inventing
-    /// a branch to name here.
+    /// the attached branch and its tracking distance, or the abbreviated
+    /// commit while detached.
     head: Option<HeadInfo>,
     /// Whether this pane holds the keyboard, as the shell last told it. A
     /// row's bar is accent only when its pane is focused, and the view cannot
@@ -1027,7 +1036,7 @@ impl Render for Branches {
                             // this id (plan 045); `chrome::list_row` has none.
                             .cursor_pointer()
                             .when(i != cursor, |r| {
-                                r.hover(|s| s.bg(rgb(host.theme.chrome.raised)))
+                                r.hover(|s| s.bg(rgb(host.theme.chrome.fg).alpha(0.03)))
                             })
                             .on_mouse_down(MouseButton::Right, {
                                 let this = this.clone();
@@ -1079,7 +1088,7 @@ impl Render for Branches {
 /// `armed` tints the text toward `chrome.error`, so the thing a second press
 /// will destroy is named by its own colour and not only by the band above it.
 ///
-/// A ref row is dot, one character of air, name, and — pushed to the right
+/// A ref row is a 6px state dot, 6px of air, name, and — pushed to the right
 /// edge — the tracking distance. The name is the one thing that gives:
 /// `min_w_0` and `truncate` let it end in an ellipsis rather than shove the
 /// distance out of the pane, because `↑2` is the fact a narrow sidebar is
@@ -1088,15 +1097,19 @@ impl Render for Branches {
 fn row(e: &Row, host: &Host, current: bool, focused: bool, armed: bool) -> Div {
     let ch = host.font.char_width();
     let c = host.theme.chrome;
-    // The dot was decided beside the text, at flatten; the draw only paints
-    // it. One character wide plus one of air, so every name aligns.
+    // The dot's state and ink were decided beside the text at flatten. Drawing
+    // it as geometry rather than a font glyph keeps every branch marker exactly
+    // 6px and makes the remote ring visually match a filled local marker.
     let dot = |d: &Dot| {
+        let hollow = d.glyph == "○";
         div()
             .flex_none()
-            .w(px(ch))
-            .mr(px(ch))
-            .text_color(rgb(d.color))
-            .child(SharedString::from(d.glyph))
+            .w(px(6.0))
+            .h(px(6.0))
+            .mr(px(6.0))
+            .rounded(px(3.0))
+            .when(hollow, |dot| dot.border_1().border_color(rgb(d.color)))
+            .when(!hollow, |dot| dot.bg(rgb(d.color)))
     };
     let name = |text: SharedString, ink: Option<Rgb>| {
         div()
@@ -1592,10 +1605,10 @@ mod tests {
         assert_eq!(
             p.head,
             Some(HeadInfo {
-                branch: "main".into(),
+                label: "main".into(),
                 ahead: Some(1),
                 behind: Some(2),
-                chip: "⎇ main".into(),
+                chip: " main".into(),
                 drift: Some(" · ↑1 ↓2".into()),
             }),
             "the numbers core measured, verbatim — and the chip spelled once"
@@ -1603,7 +1616,7 @@ mod tests {
         // And the pane hands it on for the title strip.
         let b = Branches::from_prepared(p);
         let hi = b.head_info().expect("attached HEAD has a name");
-        assert_eq!(&*hi.branch, "main");
+        assert_eq!(&*hi.label, "main");
         assert_eq!((hi.ahead, hi.behind), (Some(1), Some(2)));
 
         // A gone upstream stays honest: unknowable is not zero, and the
@@ -1627,10 +1640,10 @@ mod tests {
     }
 
     #[test]
-    fn head_info_says_nothing_while_detached_or_unmarked() {
+    fn head_info_names_detached_head_but_not_an_unmarked_branch() {
         let host = Host::new();
-        // Detached: there is no branch to name, and the row above says so
-        // better than an invented one would.
+        // Detached HEAD is exactly why the title strip must not rely on a
+        // branch row: the state still needs a visible name.
         let p = prepare(
             vec![local("main", false)],
             Vec::new(),
@@ -1639,7 +1652,11 @@ mod tests {
             &host.theme,
             "",
         );
-        assert_eq!(p.head, None);
+        let detached = p
+            .head
+            .expect("detached HEAD disappeared from the title strip");
+        assert_eq!(&*detached.chip, "detached · 01234567");
+        assert_eq!(detached.drift, None);
 
         // Attached to a name no local row claims — the unborn-branch shape:
         // nothing invented to fill the slot either way.

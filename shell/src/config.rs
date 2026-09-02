@@ -24,6 +24,16 @@ pub struct Active(pub Rc<Host>);
 
 impl Global for Active {}
 
+/// Desktop opening size. The shared host stays at 14px for terminal and web
+/// clients; the window starts one pixel larger unless `[font] size` overrides it.
+const DESKTOP_FONT_SIZE: f32 = 15.0;
+
+fn desktop_defaults() -> Host {
+    let mut host = Host::new();
+    host.font.size = DESKTOP_FONT_SIZE;
+    host
+}
+
 /// The theme the title bar picked, if anything has.
 ///
 /// Client state, and it belongs here for the same reason the diff view keeps its
@@ -49,7 +59,7 @@ impl Global for Chosen {}
 /// line from the file would leave the old value in place and the file would stop
 /// describing what is on screen.
 pub fn reload(path: &Path, cx: &mut App) -> Vec<String> {
-    let mut next = Host::new();
+    let mut next = desktop_defaults();
     let mut warnings = load(&mut next, path);
     let chosen = cx.try_global::<Chosen>().and_then(|c| c.0.clone());
     if let Some(name) = chosen {
@@ -109,4 +119,15 @@ pub fn sync_widgets(host: &Host, cx: &mut App) {
     t.tokens.scrollbar_thumb = hsla(c.faint).into();
     t.tokens.scrollbar_thumb_hover = hsla(c.dim).into();
     gpui_component::Theme::sync_base(cx);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_desktop_opens_one_pixel_larger_without_changing_shared_defaults() {
+        assert_eq!(desktop_defaults().font.size, 15.0);
+        assert_eq!(Host::new().font.size, 14.0);
+    }
 }
