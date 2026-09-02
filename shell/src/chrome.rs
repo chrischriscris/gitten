@@ -28,9 +28,9 @@ use gpui::*;
 /// turning each stacked pane into a card.
 pub const HEADER_H: f32 = 28.0;
 
-/// Height of the status bar. It remains denser than the pane headers: the
-/// status bar is transient furniture, while pane headers are navigation.
-pub const STATUS_H: f32 = 26.0;
+/// Height of the bottom bar. Thirty-six pixels gives its mode and shortcuts
+/// enough weight to balance the 44px title bar without becoming a second pane.
+pub const STATUS_H: f32 = 36.0;
 
 /// Left padding of every list row and section label. Ten pixels matches the
 /// pane header inset at the shipped font, so labels, status marks and names
@@ -41,15 +41,38 @@ pub const ROW_PAD: f32 = 10.0;
 /// reads as an edge, three is a stripe and starts to look like a column.
 pub const ROW_BAR: f32 = 2.0;
 
-/// Corner radius for every chip, pill, keycap and floating panel. One value:
-/// mixed radii in one compact strip read as different design languages.
+/// Shared corner radius for controls, keycaps and floating panels.
+/// The bottom mode badge is the deliberate exception: it is concentric with
+/// the window corner instead ([`STATUS_BADGE_RADIUS`]).
 pub const RADIUS: f32 = 4.0;
+/// The platform's window corner radius. A macOS fact, not a layout choice:
+/// GPUI hands the rounded frame over and nothing here draws it. It exists so
+/// the one control that sits in a corner can curve with it. Sixteen is
+/// macOS 26's frame — measured off a 2x screenshot by fitting a circle to the
+/// border pixels (16.75), not read from a document; older releases drew 10–12.
+pub const WINDOW_RADIUS: f32 = 16.0;
 /// Compact text in dense pane furniture.
 pub const COMPACT_TEXT_SCALE: f32 = 0.8;
 /// Title-bar controls and branch status: larger, but still below body text.
 pub const TOPBAR_TEXT_SCALE: f32 = 0.93;
 /// Repository path and other primary title-bar text.
 pub const TITLE_TEXT_SCALE: f32 = 1.0;
+/// Bottom-bar hints: compact, but large enough to scan continuously.
+pub const STATUS_TEXT_SCALE: f32 = 0.87;
+/// The bottom bar's mode badge is a compact locator, not body text.
+const STATUS_BADGE_TEXT_SCALE: f32 = 0.73;
+/// The version is the quietest text in the bar.
+const STATUS_VERSION_TEXT_SCALE: f32 = 0.8;
+/// The mode badge's height, and the inset it leaves to the bar's edge on
+/// every side — the same distance left as below, so it sits in the corner
+/// rather than beside it.
+const STATUS_BADGE_H: f32 = 22.0;
+const STATUS_BADGE_INSET: f32 = (STATUS_H - STATUS_BADGE_H) / 2.0;
+/// Concentric with the window corner: an inner curve nested inside an outer
+/// one shares its centre, so its radius is the outer radius minus the inset.
+/// A capsule here (11px) sat 7px inside a 16px corner whose concentric
+/// answer is 9, and the two curves visibly fought.
+const STATUS_BADGE_RADIUS: f32 = WINDOW_RADIUS - STATUS_BADGE_INSET;
 
 // The chrome's spacing ladder — the whole vocabulary of distance the strips
 // spend, in one currency: the live font's advance ([`Font::char_width`]), not
@@ -83,11 +106,11 @@ pub fn gap_xxl(font: &Font) -> Pixels {
     px((font.char_width() * 2.8).round())
 }
 
-/// One hint pair's air, in characters: two between the key and its label,
-/// four to the next pair. [`hints`] spends it per pair and [`hints_budget`]
-/// reserves the same six around the badge — one number, so the walk and the
-/// budget cannot drift into two ideas of how much air a pair costs.
-pub(crate) const HINT_AIR_CHARS: f32 = 6.0;
+/// One hint's non-text width: the key-to-label gap and the gap to the next
+/// item. Kept in pixels because those are the gaps the renderer actually uses.
+fn hint_air(font: &Font) -> f32 {
+    f32::from(gap_s(font)) + f32::from(gap_l(font))
+}
 
 /// The frame every list row sits in: a fixed height for `uniform_list`, the
 /// selection tint when `current`, and the bar on the left edge — accent when
@@ -345,16 +368,10 @@ pub fn pane_header_with(
 /// The bar across the bottom: where the keyboard is, and what the nearest
 /// keys do.
 ///
-/// The badge is the focused pane's mode, in a filled chip — the one filled
-/// element in the chrome, because it is the one thing that changes as you
-/// work and the one thing worth finding without scanning. `hints` is
-/// `(key, label)` pairs already resolved and capped by the caller; the key
-/// draws bright and the label dim, so the eye picks the keys out of the bar
-/// and reads labels only when it wants one. `truncated` is [`hints`]'s word
-/// for "there were more pairs than the width allowed": one faint `…` after
-/// the last pair, because a bar that quietly drops its tail advertises keys
-/// that were never there — and an omission the reader cannot see is the one
-/// kind of lie a hint bar must not tell.
+/// The focused mode is the only filled element. Hints read as compact
+/// `key label` pairs, with the key stronger than its description; the live
+/// registry still decides which pairs exist. `truncated` adds a faint ellipsis
+/// rather than silently claiming the visible hints are exhaustive.
 pub fn status_bar(
     host: &Host,
     badge: SharedString,
@@ -364,29 +381,37 @@ pub fn status_bar(
 ) -> Div {
     let c = host.theme.chrome;
     let chip_ink = c.status_bg;
-    div()
+    let hint_ink = host.theme.dim_on(Surface::Status);
+    let label_ink = host.theme.quiet_on(c.status_bg);
+    let badge_pad = px((host.font.char_width() * 0.8).round());
+    #[cfg_attr(not(test), allow(unused_mut))]
+    let mut bar = div()
         .flex_none()
         .flex()
         .items_center()
         .gap(gap_l(&host.font))
         .h(px(STATUS_H))
-        .px(gap_m(&host.font))
+        .pl(px(STATUS_BADGE_INSET))
+        .pr(gap_l(&host.font))
         .bg(rgb(c.status_bg))
         .border_t_1()
         .border_color(rgb(c.border))
         // The bar is read for where the keyboard is; raw dim is under the
         // text floor on it (3.40), so the bar's text resolves against it.
         .text_color(rgb(host.theme.dim_on(Surface::Status)))
+        .text_size(px((host.font.size * STATUS_TEXT_SCALE).round()))
         .child(
             div()
                 .flex_none()
                 .flex()
                 .items_center()
                 .justify_center()
-                .px(gap_m(&host.font))
-                .h(px(host.font.char_width() * 1.7))
-                .rounded(px(RADIUS))
+                .px(badge_pad)
+                .h(px(STATUS_BADGE_H))
+                .rounded(px(STATUS_BADGE_RADIUS))
                 .bg(rgb(c.accent))
+                .text_size(px((host.font.size * STATUS_BADGE_TEXT_SCALE).round()))
+                .font_weight(FontWeight::BOLD)
                 .text_color(rgb(chip_ink))
                 .child(badge),
         )
@@ -396,44 +421,45 @@ pub fn status_bar(
                 .flex()
                 .items_center()
                 .gap(gap_s(&host.font))
-                .child(div().flex_none().text_color(rgb(c.fg)).child(key.clone()))
                 .child(
                     div()
                         .flex_none()
-                        // Read when wanted, glanced past otherwise — raw dim is
-                        // under the floor on the bar, so it resolves against it.
-                        .text_color(rgb(host.theme.dim_on(Surface::Status)))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(hint_ink))
+                        .child(key.clone()),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(rgb(label_ink))
                         .child(label.clone()),
                 )
         }))
-        .children(truncated.then(|| div().flex_none().text_color(rgb(c.faint)).child("…")))
+        .children(truncated.then(|| div().flex_none().text_color(rgb(label_ink)).child("…")))
         .child(div().min_w_0().flex_grow(1.0))
         .child(
             div()
                 .flex_none()
-                // Read, not glanced at — a version nobody can parse might as
-                // well be absent — so it clears the furniture floor.
+                .text_size(px((host.font.size * STATUS_VERSION_TEXT_SCALE).round()))
+                // Kept at the furniture floor rather than raw ghost: the
+                // version is quiet, but never illegible.
                 .text_color(rgb(host.theme.quiet_on(c.status_bg)))
                 .child(SharedString::from(version.to_string())),
-        )
+        );
+    #[cfg(test)]
+    {
+        bar = bar.debug_selector(|| "statusbar".to_string());
+    }
+    bar
 }
 
-/// What the status bar advertises, for the pane holding the keyboard.
+/// What the bottom bar advertises for the pane holding the keyboard.
 ///
 /// A projection and no decision, like [`Keymap::help`]: walk the same rows
-/// the help panel walks, keep the commands that carry a *hint* — the short
-/// status-bar label — and prefer the focused pane's own mode before the
-/// globals, because `stage` means more to a files pane than `push` does.
-/// Stops when `max_px` is spent, so the bar fills whatever width the window
-/// has and never wraps — and says so: the second return is whether it
-/// stopped with hints left over. A bar that silently drops its tail is a
-/// lie by omission; the bar draws a faint `…` in that case and the reader
-/// knows there are keys it is not being shown.
-///
-/// `active` is the focused screen's mode name — the same string `[keys]`
-/// groups bindings under, and the same one [`Modes`] carries innermost, so
-/// a prompt holding the keyboard empties this list honestly: an input has
-/// no hints but its own, and those are drawn by the field.
+/// the help panel walks, keep commands carrying a short hint, and prefer the
+/// focused pane's mode before globals. Stops when `max_px` is spent and reports
+/// whether anything was omitted. A prompt holding the keyboard has no hints
+/// here because its field draws its own exits.
 pub fn hints(
     host: &Host,
     modes: &Modes,
@@ -441,7 +467,7 @@ pub fn hints(
     max_px: f32,
 ) -> (Vec<(SharedString, SharedString)>, bool) {
     let rows = host.keys.help(&host.commands, modes);
-    let ch = host.font.char_width();
+    let ch = host.font.char_width() * STATUS_TEXT_SCALE;
     // One pass collects each mode's hinted rows in registry order, so the
     // bar's left-to-right order is the registry's — the order `[keys]` and
     // the help panel already agree on.
@@ -474,9 +500,9 @@ pub fn hints(
             continue;
         };
         for (key, label) in list {
-            // Key, two spaces of air, label, four to the next pair —
-            // [`HINT_AIR_CHARS`].
-            let w = (key.chars().count() + label.chars().count()) as f32 * ch + HINT_AIR_CHARS * ch;
+            // Compact text plus the same two gaps the bar renders.
+            let w =
+                (key.chars().count() + label.chars().count()) as f32 * ch + hint_air(&host.font);
             if spent + w > max_px {
                 return (out, true);
             }
@@ -493,22 +519,26 @@ pub fn version() -> &'static str {
     concat!("gitten ", env!("CARGO_PKG_VERSION"))
 }
 
-/// How wide the hints may draw: the bar's width, less the badge as it will
-/// actually render — its characters plus the air around it — the version
-/// and their air. The badge is a parameter because its length is the one
-/// part that varies (`PROMPT` against a mode name) and a helper that
-/// guessed it was a second copy of the arithmetic waiting to drift. One
-/// home for the sum, so a caller without a window in hand — a test, a
-/// second client — asks instead of duplicating it.
+/// How wide the hints may draw. Every fixed piece is costed at the exact scale
+/// and spacing the renderer uses; one ellipsis is reserved so truncation never
+/// pushes the version offscreen.
 pub fn hints_budget(host: &Host, bar_px: f32, badge: &str) -> f32 {
-    let ch = host.font.char_width();
-    (bar_px - ch * (badge.chars().count() as f32 + HINT_AIR_CHARS + version().len() as f32 + 4.0))
-        .max(0.0)
+    let body_ch = host.font.char_width();
+    let hint_ch = body_ch * STATUS_TEXT_SCALE;
+    let badge_ch = body_ch * STATUS_BADGE_TEXT_SCALE;
+    let version_ch = body_ch * STATUS_VERSION_TEXT_SCALE;
+    let outer = STATUS_BADGE_INSET + f32::from(gap_l(&host.font));
+    let fixed_gaps = 2.0 * f32::from(gap_l(&host.font));
+    let badge_pad = 2.0 * (body_ch * 0.8).round();
+    let badge = badge.chars().count() as f32 * badge_ch + badge_pad;
+    let version = version().chars().count() as f32 * version_ch;
+    let ellipsis_reserve = hint_ch + f32::from(gap_l(&host.font));
+    (bar_px - outer - fixed_gaps - badge - version - ellipsis_reserve).max(0.0)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{gap_l, gap_m, gap_s, gap_xl, gap_xxl, hints, HINT_AIR_CHARS};
+    use super::{gap_l, gap_m, gap_s, gap_xl, gap_xxl, hint_air, hints};
     use gitten_core::command::{Commands, Keymap, Modes};
     use gitten_core::font::Font;
     use gpui::px;
@@ -556,7 +586,8 @@ mod tests {
         let (key, label) = &all[0];
         let ch = host.font.char_width();
         let one_pair =
-            (key.chars().count() + label.chars().count()) as f32 * ch + HINT_AIR_CHARS * ch;
+            (key.chars().count() + label.chars().count()) as f32 * ch * super::STATUS_TEXT_SCALE
+                + hint_air(&host.font);
         let (some, truncated) = hints(&host, &modes, "files", one_pair);
         assert_eq!(some.len(), 1, "the budget held exactly one pair");
         assert!(truncated, "a bar that stopped with hints left said nothing");

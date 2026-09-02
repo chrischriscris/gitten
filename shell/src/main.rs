@@ -5409,19 +5409,23 @@ impl Render for DevShell {
                         .items_center()
                         .gap(chrome::gap_l(&host.font))
                         .h(px(chrome::STATUS_H))
-                        .px(chrome::gap_m(&host.font))
+                        .px(chrome::gap_l(&host.font))
                         .bg(rgb(c.status_bg))
                         .border_t_1()
                         .border_color(rgb(c.border))
                         .text_color(rgb(host.theme.dim_on(theme::Surface::Status)))
+                        .text_size(px((host.font.size * chrome::STATUS_TEXT_SCALE).round()))
                         .child(div().min_w_0().truncate().text_color(rgb(ink)).child(text))
                         // An error says how to leave, in the faint ink of
                         // furniture: the summary is the sentence, this is the
                         // small print. No live key, no piece — the help
                         // overlay's rule.
-                        .children(
-                            exits.map(|e| div().flex_none().text_color(rgb(c.faint)).child(e)),
-                        )
+                        .children(exits.map(|e| {
+                            div()
+                                .flex_none()
+                                .text_color(rgb(host.theme.quiet_on(c.status_bg)))
+                                .child(e)
+                        }))
                         .into_any_element(),
                     None => chrome::status_bar(&host, badge, &hints, truncated, chrome::version())
                         .into_any_element(),
@@ -7019,6 +7023,11 @@ mod tests {
             .expect("the last top-bar control was not drawn");
         assert!(first_control.size.width > gpui::px(0.0));
         assert!(last_control.right() <= gpui::px(800.0));
+        let statusbar = cx
+            .debug_bounds("statusbar")
+            .expect("the bottom bar was not drawn");
+        assert_eq!(f32::from(statusbar.size.height), 36.0);
+        assert_eq!(statusbar.bottom(), gpui::px(600.0));
         let stack = cx.debug_bounds("sidebar").expect("the stack was not drawn");
         let main = cx
             .debug_bounds("main")
