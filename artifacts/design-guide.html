@@ -1,0 +1,2943 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>gitten — Desktop Git Client Design Guide</title>
+<style>
+  :root {
+    /* Core Theme Tokens — from core/src/theme.rs (Theme::dark) */
+    --c-bg: #0e0d0c;
+    --c-canvas: #131110;
+    --c-canvas-strip: #171514;
+    --c-fg: #e8e3dc;
+    --c-dim: #a39c93;
+    --c-faint: #6e6862;
+    --c-ghost: #4a4540;
+    --c-accent: #dfa851;
+    --c-accent-hover: #f0be6b;
+    --c-title-bg: #151312;
+    --c-status-bg: #131211;
+    --c-border: #282320;
+    --c-border-subtle: #201c19;
+    --c-raised: #1c1a18;
+    --c-keycap: #2c2925;
+    --c-selection-bg: #241f1a;
+    --c-selected-bg: #2f3b4a;
+    --c-error: #d4736b;
+
+    /* Diff Tokens */
+    --diff-file-bg: #231e1a;
+    --diff-adds-fg: #6fbf73;
+    --diff-dels-fg: #d4736b;
+    --diff-hunk-bg: #14181d;
+    --diff-hunk-fg: #7d8fa8;
+    --diff-gutter-fg: #4a4540;
+    --diff-rule: #332c28;
+    --diff-context-bg: #0e0d0c;
+    --diff-context-fg: #a39c93;
+    --diff-added-bg: #16241a;
+    --diff-added-fg: #9dc79b;
+    --diff-added-word-bg: #234228;
+    --diff-removed-bg: #2a1917;
+    --diff-removed-fg: #d4a09a;
+    --diff-removed-word-bg: #522722;
+
+    /* Graph Lane Tokens */
+    --lane-0: #dfa851; /* Gold / Main */
+    --lane-1: #6f9ecf; /* Sky Blue */
+    --lane-2: #a983c9; /* Purple */
+    --lane-3: #5fa8a0; /* Teal */
+    --lane-4: #c97d6f; /* Coral */
+    --lane-5: #8fb35e; /* Olive */
+    --lane-overflow: #453f39;
+
+    /* Syntax Tokens */
+    --syn-keyword: #a88fb5;
+    --syn-func: #d9c98f;
+    --syn-type: #86a6bd;
+    --syn-prop: #b5aea5;
+    --syn-str: #9aab7d;
+    --syn-comment: #615a52;
+    --syn-num: #c2a06a;
+
+    /* Geometry */
+    --row-h: 22px;
+    --lane-w: 14px;
+    --font-mono: "JetBrains Mono", "SF Mono", "Fira Code", Menlo, Monaco, Consolas, monospace;
+    --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, "Helvetica Neue", sans-serif;
+    --font-serif: "Newsreader", "Charter", "Georgia", "Cambria", serif;
+  }
+
+  /* Theme Overrides */
+  body.theme-slate {
+    --c-bg: #0d0f12;
+    --c-canvas: #12151a;
+    --c-canvas-strip: #171b21;
+    --c-fg: #e2e6eb;
+    --c-dim: #9aa1ab;
+    --c-faint: #67707e;
+    --c-ghost: #444b56;
+    --c-accent: #6f9ecf;
+    --c-title-bg: #13171d;
+    --c-status-bg: #111419;
+    --c-border: #242b36;
+    --c-raised: #1a2029;
+    --c-keycap: #262e3b;
+    --c-selection-bg: #1e2634;
+  }
+
+  body.theme-light {
+    --c-bg: #f5f2eb;
+    --c-canvas: #ebe7df;
+    --c-canvas-strip: #e2ddd4;
+    --c-fg: #23201c;
+    --c-dim: #6e675f;
+    --c-faint: #8a837a;
+    --c-ghost: #b0a89d;
+    --c-accent: #b87a1d;
+    --c-title-bg: #eae5dc;
+    --c-status-bg: #e5e0d6;
+    --c-border: #d5cebf;
+    --c-raised: #ded8cb;
+    --c-keycap: #cfc7b7;
+    --c-selection-bg: #e2d9c6;
+    --diff-file-bg: #e9e5dc;
+    --diff-context-bg: #f5f2eb;
+    --diff-context-fg: #45403a;
+    --diff-added-bg: #e2f2e5;
+    --diff-added-fg: #1d5f2a;
+    --diff-added-word-bg: #c1e4c7;
+    --diff-removed-bg: #f8e4e2;
+    --diff-removed-fg: #942b20;
+    --diff-removed-word-bg: #f0c3bf;
+    --diff-hunk-bg: #e7edf5;
+    --diff-hunk-fg: #3b5a7a;
+    --diff-gutter-fg: #9e978d;
+    --diff-rule: #d5cebf;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html, body {
+    width: 100%;
+    min-height: 100vh;
+    background: #0d0b0a;
+    color: var(--c-fg);
+    font-family: var(--font-sans);
+    font-size: 13px;
+    line-height: 1.4;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* ------------------- Outer Guide Navigation Strip ------------------- */
+  .guide-header {
+    background: #11100e;
+    border-bottom: 1px solid #231f1c;
+    padding: 10px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+  }
+
+  .guide-brand {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .guide-logo {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-family: var(--font-mono);
+    font-weight: 700;
+    font-size: 15px;
+    color: var(--c-accent);
+    letter-spacing: -0.02em;
+  }
+  .guide-logo svg {
+    width: 18px;
+    height: 18px;
+  }
+  .guide-badge {
+    background: var(--c-raised);
+    border: 1px solid var(--c-border);
+    padding: 2px 7px;
+    border-radius: 4px;
+    font-size: 11px;
+    color: var(--c-dim);
+    font-family: var(--font-mono);
+  }
+
+  .guide-tabs {
+    display: flex;
+    gap: 4px;
+    background: #0e0d0c;
+    padding: 3px;
+    border-radius: 6px;
+    border: 1px solid #231f1c;
+  }
+  .guide-tab-btn {
+    background: transparent;
+    border: none;
+    color: var(--c-dim);
+    padding: 6px 14px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    transition: all 0.15s ease;
+  }
+  .guide-tab-btn:hover {
+    color: var(--c-fg);
+    background: rgba(255, 255, 255, 0.04);
+  }
+  .guide-tab-btn.active {
+    background: var(--c-raised);
+    color: var(--c-accent);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+  }
+
+  .guide-controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .guide-select, .guide-btn {
+    background: var(--c-raised);
+    color: var(--c-dim);
+    border: 1px solid var(--c-border);
+    padding: 5px 10px;
+    border-radius: 5px;
+    font-size: 12px;
+    cursor: pointer;
+    font-family: inherit;
+    transition: all 0.15s ease;
+  }
+  .guide-select:hover, .guide-btn:hover {
+    color: var(--c-fg);
+    border-color: #3e3731;
+  }
+  .guide-btn.active {
+    background: var(--c-selection-bg);
+    border-color: var(--c-accent);
+    color: var(--c-accent);
+  }
+
+  /* ------------------- Main Guide Content Area ------------------- */
+  .guide-view {
+    display: none !important;
+  }
+  .guide-view.active {
+    display: block !important;
+  }
+  #view-mockup.active {
+    display: flex !important;
+  }
+
+  /* ------------------- Canvas / Frame View (Mockup) ------------------- */
+  #view-mockup {
+    background: var(--c-canvas);
+    min-height: calc(100vh - 54px);
+    padding: 20px 28px 48px;
+    flex-direction: column;
+    align-items: center;
+    position: relative;
+  }
+
+  /* Toolbar imitating the canvas/editor bar in the screenshot */
+  .canvas-toolbar {
+    width: 100%;
+    max-width: 1280px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 12px;
+    color: var(--c-faint);
+    font-size: 12px;
+  }
+
+  .canvas-tools-left {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+  .tool-icon {
+    cursor: pointer;
+    opacity: 0.7;
+    transition: opacity 0.15s;
+    display: flex;
+    align-items: center;
+  }
+  .tool-icon:hover { opacity: 1; color: var(--c-fg); }
+  .canvas-title {
+    color: var(--c-dim);
+    font-size: 12px;
+    font-weight: 500;
+  }
+
+  .canvas-tools-right {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+  .btn-save-pill {
+    background: #24201c;
+    border: 1px solid var(--c-border);
+    color: var(--c-fg);
+    padding: 3px 12px;
+    border-radius: 4px;
+    font-size: 11px;
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+  .btn-save-pill:hover { background: #322d28; }
+
+  /* Window Wrapper with accent tag */
+  .window-wrapper {
+    width: 100%;
+    max-width: 1280px;
+    position: relative;
+  }
+
+  .accent-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: #181514;
+    border: 1px solid var(--c-border);
+    border-bottom: none;
+    padding: 4px 10px;
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+    font-size: 11px;
+    color: var(--c-dim);
+    margin-left: 12px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .accent-tag .dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--c-accent);
+  }
+
+  /* ------------------- The Application Window ------------------- */
+  .app-window {
+    width: 100%;
+    background: var(--c-bg);
+    border: 1px solid var(--c-border);
+    border-radius: 8px;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(223, 168, 81, 0.08);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    position: relative;
+    user-select: none;
+  }
+
+  /* ------------------- Window Title Bar ------------------- */
+  .app-titlebar {
+    height: 38px;
+    background: var(--c-title-bg);
+    border-bottom: 1px solid var(--c-border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 14px;
+    position: relative;
+  }
+
+  .titlebar-left {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+
+  .traffic-lights {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+  }
+  .traffic-dot {
+    width: 11px;
+    height: 11px;
+    border-radius: 50%;
+    background: #312b26;
+    border: 1px solid #3d352f;
+    transition: filter 0.15s;
+  }
+  .traffic-lights:hover .dot-close { background: #d45e54; border-color: #b54940; }
+  .traffic-lights:hover .dot-min { background: #dfa851; border-color: #c28e3b; }
+  .traffic-lights:hover .dot-max { background: #5fa8a0; border-color: #498b84; }
+
+  .repo-path {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    display: flex;
+    align-items: center;
+    color: var(--c-faint);
+  }
+  .repo-path .path-dir { color: var(--c-dim); }
+  .repo-path .path-name { color: var(--c-fg); font-weight: 700; margin-left: 4px; }
+
+  .branch-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--c-raised);
+    border: 1px solid var(--c-border);
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--c-fg);
+  }
+  .branch-pill .branch-icon {
+    width: 12px;
+    height: 12px;
+    color: var(--c-dim);
+  }
+  .branch-pill .sync-stat {
+    color: var(--c-faint);
+    margin-left: 2px;
+    font-size: 10.5px;
+  }
+
+  .titlebar-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .extensions-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--c-raised);
+    border: 1px solid var(--c-border);
+    padding: 2px 10px;
+    border-radius: 4px;
+    font-size: 11px;
+    color: var(--c-dim);
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .extensions-pill:hover { color: var(--c-fg); border-color: #3e3731; }
+  .ext-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #6fbf73;
+    box-shadow: 0 0 6px rgba(111, 191, 115, 0.4);
+  }
+
+  .ask-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    background: var(--c-raised);
+    border: 1px solid var(--c-border);
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .ask-btn:hover {
+    border-color: var(--c-accent);
+    color: var(--c-fg);
+  }
+  .key-combo {
+    color: var(--c-accent);
+    font-family: var(--font-mono);
+    font-weight: 600;
+  }
+  .ask-label {
+    color: var(--c-fg);
+  }
+
+  /* ------------------- Three-Pane Main Area ------------------- */
+  .app-main {
+    display: grid;
+    grid-template-columns: 245px 420px 1fr;
+    min-height: 530px;
+    background: var(--c-bg);
+  }
+
+  .pane {
+    display: flex;
+    flex-direction: column;
+    border-right: 1px solid var(--c-border);
+    overflow: hidden;
+    position: relative;
+  }
+  .pane:last-child {
+    border-right: none;
+  }
+
+  /* Pane Headers */
+  .pane-header {
+    height: 28px;
+    background: var(--c-title-bg);
+    border-bottom: 1px solid var(--c-border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 10px;
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    color: var(--c-dim);
+    transition: background 0.15s;
+  }
+
+  .pane.focused .pane-header {
+    background: #181614;
+    border-bottom-color: rgba(223, 168, 81, 0.35);
+  }
+
+  .pane-header-left {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .pane-keycap {
+    width: 15px;
+    height: 15px;
+    background: var(--c-keycap);
+    border: 1px solid var(--c-border);
+    border-radius: 3px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--c-fg);
+    flex-shrink: 0;
+  }
+  .pane.focused .pane-keycap {
+    background: var(--c-accent);
+    color: #0e0d0c;
+    border-color: var(--c-accent);
+    font-weight: 700;
+  }
+
+  .pane-title-caps {
+    font-weight: 600;
+    font-size: 11px;
+    text-transform: uppercase;
+  }
+  .pane-title-raw {
+    font-weight: 500;
+    font-size: 11.5px;
+    font-family: var(--font-mono);
+    color: var(--c-fg);
+  }
+
+  .pane-header-right {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--c-faint);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+
+  /* ------------------- Pane 1: Files, Branches, Stash ------------------- */
+  .pane-files-body {
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+    font-family: var(--font-mono);
+    font-size: 12px;
+  }
+
+  .section-label {
+    padding: 8px 10px 4px;
+    font-size: 9.5px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--c-faint);
+    font-weight: 600;
+  }
+
+  .file-item {
+    padding: 3px 10px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    line-height: 18px;
+    transition: background 0.1s;
+    white-space: nowrap;
+  }
+  .file-item:hover {
+    background: rgba(255, 255, 255, 0.03);
+  }
+  .file-item.selected {
+    background: var(--c-selection-bg);
+    box-shadow: inset 2px 0 0 var(--c-accent);
+  }
+
+  .status-flag {
+    font-weight: 700;
+    width: 12px;
+    text-align: center;
+  }
+  .status-m-staged { color: #6fbf73; }
+  .status-a-staged { color: #6fbf73; }
+  .status-m-unstaged { color: var(--c-accent); }
+  .status-untracked { color: var(--c-faint); font-weight: normal; }
+
+  .file-path {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--c-fg);
+  }
+  .file-path .dir { color: var(--c-dim); }
+
+  .branches-section {
+    margin-top: 10px;
+    border-top: 1px solid var(--c-border-subtle);
+  }
+  .branch-item {
+    padding: 3px 10px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    cursor: pointer;
+    line-height: 18px;
+  }
+  .branch-item:hover { background: rgba(255, 255, 255, 0.03); }
+  .branch-name-box {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .branch-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+  }
+  .branch-dot.main { background: var(--lane-0); }
+  .branch-dot.feat { background: var(--lane-0); }
+  .branch-dot.fix { background: var(--lane-2); }
+  .branch-dot.remote {
+    background: transparent;
+    border: 1px solid var(--c-faint);
+  }
+  .branch-stat {
+    color: var(--c-faint);
+    font-size: 11px;
+  }
+
+  .stash-section {
+    margin-top: 10px;
+    border-top: 1px solid var(--c-border-subtle);
+  }
+  .stash-empty {
+    padding: 4px 10px;
+    color: var(--c-ghost);
+    font-style: italic;
+  }
+
+  /* ------------------- Pane 4: Commits & Graph ------------------- */
+  .pane-commits-body {
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+    font-family: var(--font-mono);
+    font-size: 12px;
+  }
+
+  .commit-row {
+    height: var(--row-h);
+    display: flex;
+    align-items: center;
+    cursor: pointer;
+    transition: background 0.1s;
+    position: relative;
+    padding-right: 10px;
+    white-space: nowrap;
+  }
+  .commit-row:hover {
+    background: rgba(255, 255, 255, 0.03);
+  }
+  .commit-row.selected {
+    background: var(--c-selection-bg);
+    outline: 1px solid rgba(223, 168, 81, 0.65);
+    outline-offset: -1px;
+    border-radius: 3px;
+  }
+
+  .graph-cell {
+    width: 48px;
+    height: 100%;
+    flex-shrink: 0;
+    position: relative;
+  }
+  .graph-cell svg {
+    display: block;
+    width: 100%;
+    height: 100%;
+  }
+
+  .commit-hash {
+    color: var(--diff-hunk-fg);
+    margin-right: 8px;
+    font-size: 11px;
+    width: 54px;
+    flex-shrink: 0;
+  }
+
+  .commit-subject {
+    color: var(--c-fg);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+    font-size: 11.5px;
+  }
+  .commit-row.selected .commit-subject {
+    font-weight: 600;
+  }
+
+  .commit-age {
+    color: var(--c-faint);
+    font-size: 11px;
+    margin-left: 8px;
+    flex-shrink: 0;
+  }
+
+  /* ------------------- Pane 5: Diff Viewer ------------------- */
+  .pane-diff-body {
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    position: relative;
+    flex: 1;
+  }
+
+  .diff-stats-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+  }
+  .stat-adds { color: var(--diff-adds-fg); font-weight: 600; }
+  .stat-dels { color: var(--diff-dels-fg); font-weight: 600; }
+  .stat-hunk { color: var(--c-faint); }
+
+  .diff-hunk-bar {
+    background: var(--diff-hunk-bg);
+    color: var(--diff-hunk-fg);
+    padding: 3px 10px;
+    font-size: 11px;
+    border-top: 1px solid #1a222c;
+    border-bottom: 1px solid #1a222c;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .diff-table {
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+  }
+
+  .diff-line {
+    display: flex;
+    height: 19px;
+    line-height: 19px;
+    white-space: pre;
+    position: relative;
+  }
+  .diff-line.context {
+    background: var(--diff-context-bg);
+    color: var(--diff-context-fg);
+  }
+  .diff-line.deleted {
+    background: var(--diff-removed-bg);
+    color: var(--diff-removed-fg);
+  }
+  .diff-line.added {
+    background: var(--diff-added-bg);
+    color: var(--diff-added-fg);
+  }
+
+  .gutter-old, .gutter-new {
+    width: 28px;
+    text-align: right;
+    padding-right: 6px;
+    color: var(--diff-gutter-fg);
+    user-select: none;
+    flex-shrink: 0;
+    font-size: 11px;
+  }
+  .gutter-sign {
+    width: 16px;
+    text-align: center;
+    user-select: none;
+    flex-shrink: 0;
+    font-weight: 600;
+  }
+  .diff-line.deleted .gutter-sign { color: var(--diff-dels-fg); }
+  .diff-line.added .gutter-sign { color: var(--diff-adds-fg); }
+
+  .line-content {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .intraline-word {
+    border-radius: 2px;
+    padding: 0 1px;
+  }
+  .diff-line.added .intraline-word {
+    background: var(--diff-added-word-bg);
+    color: #c4ecc2;
+  }
+  .diff-line.deleted .intraline-word {
+    background: var(--diff-removed-word-bg);
+    color: #f7bbb4;
+  }
+
+  /* Code Syntax Highlighting within Diff */
+  .syn-k { color: var(--syn-keyword); }
+  .syn-f { color: var(--syn-func); }
+  .syn-t { color: var(--syn-type); }
+  .syn-p { color: var(--syn-prop); }
+  .syn-s { color: var(--syn-str); }
+  .syn-n { color: var(--syn-num); }
+  .syn-c { color: var(--syn-comment); font-style: italic; }
+
+  /* ------------------- AI Assist Card ("READING THIS HUNK") ------------------- */
+  .ai-hunk-card {
+    margin: 18px 14px 14px;
+    background: #161412;
+    border: 1px solid rgba(223, 168, 81, 0.28);
+    border-radius: 7px;
+    padding: 12px 14px;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+    position: relative;
+    transition: all 0.2s ease;
+  }
+  .ai-hunk-card:hover {
+    border-color: rgba(223, 168, 81, 0.45);
+  }
+
+  .ai-card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 8px;
+  }
+  .ai-card-title {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 10px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--c-accent);
+    font-weight: 700;
+  }
+  .ai-sparkle {
+    font-size: 11px;
+    color: var(--c-accent);
+  }
+  .ai-card-action {
+    font-size: 11px;
+    color: var(--c-faint);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    transition: color 0.15s;
+  }
+  .ai-card-action:hover {
+    color: var(--c-dim);
+  }
+
+  .ai-card-body {
+    font-family: var(--font-serif);
+    font-size: 13.5px;
+    line-height: 1.5;
+    color: #d6d0c7;
+    letter-spacing: 0.01em;
+  }
+
+  /* ------------------- Status Bar ------------------- */
+  .app-statusbar {
+    height: 30px;
+    background: var(--c-status-bg);
+    border-top: 1px solid var(--c-border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 12px;
+    font-size: 11.5px;
+    user-select: none;
+  }
+
+  .statusbar-left {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .mode-badge {
+    background: var(--c-accent);
+    color: #0e0d0c;
+    font-weight: 700;
+    font-size: 10px;
+    letter-spacing: 0.05em;
+    padding: 1px 7px;
+    border-radius: 3px;
+    text-transform: uppercase;
+  }
+
+  .key-hints {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    color: var(--c-faint);
+  }
+  .key-hint-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    cursor: pointer;
+    transition: color 0.1s;
+  }
+  .key-hint-item:hover { color: var(--c-fg); }
+  .key-hint-key {
+    color: var(--c-dim);
+    font-family: var(--font-mono);
+    font-weight: 600;
+  }
+  .key-hint-label {
+    color: var(--c-faint);
+  }
+
+  .statusbar-right {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--c-ghost);
+  }
+
+  /* ------------------- Interactive Modals / Drawers ------------------- */
+  .mock-modal {
+    display: none;
+    position: absolute;
+    top: 50px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 440px;
+    background: #181513;
+    border: 1px solid var(--c-accent);
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.7);
+    border-radius: 8px;
+    z-index: 50;
+    padding: 14px;
+    animation: dropDown 0.18s ease-out;
+  }
+  @keyframes dropDown {
+    from { opacity: 0; transform: translate(-50%, -10px); }
+    to { opacity: 1; transform: translate(-50%, 0); }
+  }
+  .mock-modal.show { display: block; }
+  .modal-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--c-fg);
+    margin-bottom: 8px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .modal-close {
+    cursor: pointer;
+    color: var(--c-faint);
+    background: none;
+    border: none;
+    font-size: 14px;
+  }
+  .modal-input {
+    width: 100%;
+    background: #100e0d;
+    border: 1px solid var(--c-border);
+    border-radius: 5px;
+    padding: 8px 10px;
+    color: var(--c-fg);
+    font-family: var(--font-sans);
+    font-size: 13px;
+    margin-bottom: 10px;
+    outline: none;
+  }
+  .modal-input:focus { border-color: var(--c-accent); }
+  .modal-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .modal-item {
+    padding: 6px 8px;
+    border-radius: 4px;
+    display: flex;
+    justify-content: space-between;
+    color: var(--c-dim);
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .modal-item:hover, .modal-item.active {
+    background: var(--c-selection-bg);
+    color: var(--c-fg);
+  }
+
+  /* ------------------- Blueprint / Annotations Overlay ------------------- */
+  .blueprint-overlay {
+    display: none;
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    z-index: 40;
+  }
+  .blueprint-active .blueprint-overlay {
+    display: block;
+  }
+
+  .annotation-tag {
+    position: absolute;
+    background: rgba(223, 168, 81, 0.95);
+    color: #0e0d0c;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 700;
+    padding: 2px 6px;
+    border-radius: 3px;
+    pointer-events: auto;
+    cursor: help;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+    transform: translateY(-50%);
+  }
+  .annotation-tag::after {
+    content: "";
+    position: absolute;
+    width: 6px;
+    height: 6px;
+    background: rgba(223, 168, 81, 0.95);
+    transform: rotate(45deg);
+  }
+  .tag-left::after { left: -3px; top: calc(50% - 3px); }
+  .tag-right::after { right: -3px; top: calc(50% - 3px); }
+  .tag-top::after { top: -3px; left: calc(50% - 3px); }
+
+  /* ------------------- Documentation Views (Specs, Tokens, Arch) ------------------- */
+  .doc-container {
+    max-width: 1080px;
+    margin: 0 auto;
+    padding: 36px 24px 80px;
+  }
+
+  .doc-title {
+    font-size: 26px;
+    font-weight: 700;
+    margin-bottom: 8px;
+    color: var(--c-fg);
+    letter-spacing: -0.02em;
+  }
+  .doc-lead {
+    font-size: 15px;
+    line-height: 1.6;
+    color: var(--c-dim);
+    margin-bottom: 28px;
+    max-width: 75ch;
+  }
+
+  .doc-section {
+    margin-bottom: 40px;
+    background: #141211;
+    border: 1px solid var(--c-border);
+    border-radius: 8px;
+    padding: 24px;
+  }
+  .doc-section h2 {
+    font-size: 18px;
+    font-weight: 600;
+    color: var(--c-accent);
+    margin-bottom: 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .doc-section p {
+    color: var(--c-dim);
+    margin-bottom: 16px;
+    line-height: 1.6;
+  }
+
+  /* Token Swatch Grid */
+  .swatch-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+    gap: 12px;
+    margin-top: 14px;
+  }
+  .swatch-card {
+    background: #191614;
+    border: 1px solid var(--c-border);
+    border-radius: 6px;
+    padding: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .swatch-preview {
+    height: 36px;
+    border-radius: 4px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .swatch-info {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+  }
+  .swatch-name {
+    font-size: 11.5px;
+    font-weight: 600;
+    color: var(--c-fg);
+    font-family: var(--font-mono);
+  }
+  .swatch-hex {
+    font-size: 10.5px;
+    color: var(--c-faint);
+    font-family: var(--font-mono);
+  }
+  .swatch-role {
+    font-size: 10.5px;
+    color: var(--c-dim);
+  }
+
+  /* Table styles */
+  .guide-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 14px;
+    font-size: 12.5px;
+  }
+  .guide-table th, .guide-table td {
+    padding: 9px 12px;
+    text-align: left;
+    border-bottom: 1px solid var(--c-border);
+  }
+  .guide-table th {
+    background: #181513;
+    color: var(--c-dim);
+    font-weight: 600;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .guide-table tr:hover td {
+    background: rgba(255, 255, 255, 0.02);
+  }
+  .key-chip {
+    background: var(--c-keycap);
+    border: 1px solid var(--c-border);
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--c-fg);
+    display: inline-block;
+  }
+
+  code {
+    background: #1c1917;
+    border: 1px solid var(--c-border);
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-family: var(--font-mono);
+    font-size: 0.9em;
+    color: var(--c-accent);
+  }
+
+  pre {
+    background: #0e0d0c;
+    border: 1px solid var(--c-border);
+    border-radius: 6px;
+    padding: 14px;
+    overflow-x: auto;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--c-dim);
+  }
+</style>
+</head>
+<body>
+
+<!-- Outer Guide Header -->
+<header class="guide-header">
+  <div class="guide-brand">
+    <div class="guide-logo">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <circle cx="6" cy="6" r="3"/>
+        <circle cx="6" cy="18" r="3"/>
+        <circle cx="18" cy="12" r="3"/>
+        <path d="M6 9v6M9 6h4a5 5 0 0 1 5 5v1"/>
+      </svg>
+      gitten
+    </div>
+    <span class="guide-badge">Desktop Client Design Guide</span>
+  </div>
+
+  <nav class="guide-tabs">
+    <button class="guide-tab-btn active" onclick="switchGuideTab('mockup')">
+      <span>🖥️ Live UI Mockup</span>
+    </button>
+    <button class="guide-tab-btn" onclick="switchGuideTab('blueprint')">
+      <span>📐 Visual Blueprint</span>
+    </button>
+    <button class="guide-tab-btn" onclick="switchGuideTab('tokens')">
+      <span>🎨 Tokens &amp; Color System</span>
+    </button>
+    <button class="guide-tab-btn" onclick="switchGuideTab('keyboard')">
+      <span>⌨️ Keyboard Model</span>
+    </button>
+    <button class="guide-tab-btn" onclick="switchGuideTab('architecture')">
+      <span>🏗️ GPUI &amp; Core Architecture</span>
+    </button>
+  </nav>
+
+  <div class="guide-controls">
+    <select class="guide-select" id="keymap-selector" onchange="setKeymapMode(this.value)" title="Choose keyboard numbering scheme">
+      <option value="lazygit" selected>Keymap: Lazygit (1..5 + 0/↵ Diff)</option>
+      <option value="mockup">Keymap: Mockup (1..5 Direct)</option>
+    </select>
+    <button class="guide-btn" id="btn-annotations" onclick="toggleAnnotations()" title="Toggle visual dimension &amp; layout callouts">
+      Annotations: Off
+    </button>
+    <select class="guide-select" id="theme-selector" onchange="changeTheme(this.value)">
+      <option value="dark">Theme: Dark (Warm)</option>
+      <option value="slate">Theme: Slate (Cool)</option>
+      <option value="light">Theme: Light (Paper)</option>
+    </select>
+  </div>
+</header>
+
+<!-- ====================================================================== -->
+<!-- TAB 1: LIVE UI MOCKUP (Image #1 Replica)                               -->
+<!-- ====================================================================== -->
+<div id="view-mockup" class="guide-view active">
+
+  <!-- Outer canvas header -->
+  <div class="canvas-toolbar">
+    <div class="canvas-tools-left">
+      <span class="tool-icon" title="Back">◂</span>
+      <span class="tool-icon" title="Forward">▸</span>
+      <span class="tool-icon" title="Reload">↻</span>
+      <span class="tool-icon" title="Search">🔍</span>
+      <span class="canvas-title">Main view</span>
+    </div>
+    <div class="canvas-tools-right">
+      <span class="tool-icon" title="Run preview">▷</span>
+      <span class="tool-icon" title="Export">↓</span>
+      <span class="tool-icon" title="Grid layout">⊞</span>
+      <button class="btn-save-pill">Save</button>
+    </div>
+  </div>
+
+  <!-- The Mockup Window Wrapper -->
+  <div class="window-wrapper" id="app-window-wrapper">
+    <div class="accent-tag" onclick="cycleAccent()" title="Click to cycle accent color">
+      <span class="dot"></span>
+      <span>accent ▾</span>
+    </div>
+
+    <!-- The Git Client App Window -->
+    <div class="app-window" id="app-window">
+
+      <!-- Blueprint Overlays (annotations) -->
+      <div class="blueprint-overlay">
+        <!-- Annotation Pins -->
+        <div class="annotation-tag tag-left" style="top: 20px; left: 160px;" title="Path breadcrumb with bold repository name">
+          Titlebar: 38px
+        </div>
+        <div class="annotation-tag tag-top" style="top: 55px; left: 75px;" title="Pane 1: Staged &amp; Unstaged files, Branches, Stash">
+          Col 1: 245px (Files)
+        </div>
+        <div class="annotation-tag tag-top" style="top: 55px; left: 420px;" title="Pane 4: Commit log + SVG graph lanes">
+          Col 2: 420px (Commits)
+        </div>
+        <div class="annotation-tag tag-top" style="top: 55px; left: 820px;" title="Pane 5: Diff viewer with word-level highlights">
+          Col 3: 1fr (Diff &amp; AI)
+        </div>
+        <div class="annotation-tag tag-left" style="top: 410px; right: 28px;" title="Editorial serif font with high legibility for AI reasoning">
+          AI Card: Serif 13.5px
+        </div>
+        <div class="annotation-tag tag-left" style="bottom: 12px; left: 100px;" title="Modal status bar with vim-like Normal mode">
+          Status Bar: 30px
+        </div>
+      </div>
+
+      <!-- Window Title Bar -->
+      <div class="app-titlebar">
+        <div class="titlebar-left">
+          <div class="traffic-lights">
+            <span class="traffic-dot dot-close"></span>
+            <span class="traffic-dot dot-min"></span>
+            <span class="traffic-dot dot-max"></span>
+          </div>
+
+          <div class="repo-path">
+            <span class="path-dir">~/src/</span>
+            <span class="path-name">plait</span>
+          </div>
+
+          <div class="branch-pill" onclick="focusPane(0)" title="[1] Status / Working tree branch">
+            <span class="pane-keycap" id="keycap-status" style="width: 14px; height: 14px; font-size: 9px; margin-right: 2px;">1</span>
+            <svg class="branch-icon" viewBox="0 0 16 16" fill="currentColor">
+              <path fill-rule="evenodd" d="M11.75 2.5a.75.75 0 100 1.5.75.75 0 000-1.5zm-2.25.75a2.25 2.25 0 113 2.122V6A2.5 2.5 0 0110 8.5H6a1 1 0 00-1 1v1.128a2.251 2.251 0 11-1.5 0V5.372a2.25 2.25 0 111.5 0v1.836A2.492 2.492 0 016 7h4a1 1 0 001-1v-.628A2.25 2.25 0 019.5 3.25zM4.25 12a.75.75 0 100 1.5.75.75 0 000-1.5zM3.5 3.25a.75.75 0 111.5 0 .75.75 0 01-1.5 0z"/>
+            </svg>
+            <span>main</span>
+            <span class="sync-stat">↑2 ↓0</span>
+          </div>
+        </div>
+
+        <div class="titlebar-right">
+          <div class="extensions-pill" onclick="openExtensionsModal()">
+            <span class="ext-dot"></span>
+            <span>4 extensions</span>
+          </div>
+
+          <div class="ask-btn" onclick="openAskModal()">
+            <span class="key-combo">⌘K</span>
+            <span class="ask-label">ask</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Main Three-Column Area -->
+      <div class="app-main">
+
+        <!-- Column 1: Files / Branches / Stash -->
+        <div class="pane" id="pane-1" onclick="focusPane(1)">
+          <!-- Files Header -->
+          <div class="pane-header">
+            <div class="pane-header-left">
+              <span class="pane-keycap" id="keycap-files">2</span>
+              <span class="pane-title-caps">Files</span>
+            </div>
+            <div class="pane-header-right">
+              <span>5</span>
+            </div>
+          </div>
+
+          <!-- Files Body -->
+          <div class="pane-files-body">
+            <!-- STAGED Section -->
+            <div class="section-label">Staged</div>
+            <div class="file-item" onclick="selectFile(this, 'commit.go')">
+              <span class="status-flag status-m-staged">M</span>
+              <span class="file-path"><span class="dir">internal/ai/</span>commit.go</span>
+            </div>
+            <div class="file-item" onclick="selectFile(this, 'pool.go')">
+              <span class="status-flag status-a-staged">A</span>
+              <span class="file-path"><span class="dir">internal/extension/</span>pool.go</span>
+            </div>
+
+            <!-- UNSTAGED Section -->
+            <div class="section-label" style="margin-top: 6px;">Unstaged</div>
+            <div class="file-item selected" onclick="selectFile(this, 'host.go')">
+              <span class="status-flag status-m-unstaged">M</span>
+              <span class="file-path"><span class="dir">internal/extension/</span>host.go</span>
+            </div>
+            <div class="file-item" onclick="selectFile(this, 'budget.go')">
+              <span class="status-flag status-m-unstaged">M</span>
+              <span class="file-path"><span class="dir">internal/extension/</span>budget.go</span>
+            </div>
+            <div class="file-item" onclick="selectFile(this, 'extensions.md')">
+              <span class="status-flag status-untracked">??</span>
+              <span class="file-path"><span class="dir">docs/</span>extensions.md</span>
+            </div>
+
+            <!-- BRANCHES Section -->
+            <div class="branches-section">
+              <div class="pane-header" style="height: 24px; background: transparent; border-top: 1px solid var(--c-border); padding: 0 10px;">
+                <div class="pane-header-left">
+                  <span class="pane-keycap" id="keycap-branches" style="width: 13px; height: 13px; font-size: 9px;">3</span>
+                  <span class="pane-title-caps" style="font-size: 10px;">Branches</span>
+                </div>
+              </div>
+              <div class="branch-item" onclick="focusPane(2)">
+                <div class="branch-name-box">
+                  <span class="branch-dot main"></span>
+                  <span>main</span>
+                </div>
+                <span class="branch-stat">↑2</span>
+              </div>
+              <div class="branch-item" onclick="focusPane(2)">
+                <div class="branch-name-box">
+                  <span class="branch-dot feat"></span>
+                  <span>feat/ext-host</span>
+                </div>
+                <span class="branch-stat">↑7</span>
+              </div>
+              <div class="branch-item" onclick="focusPane(2)">
+                <div class="branch-name-box">
+                  <span class="branch-dot fix"></span>
+                  <span>fix/graph-lanes</span>
+                </div>
+              </div>
+              <div class="branch-item" onclick="focusPane(2)">
+                <div class="branch-name-box">
+                  <span class="branch-dot remote"></span>
+                  <span style="color: var(--c-dim);">origin/main</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- STASH Section -->
+            <div class="stash-section">
+              <div class="pane-header" style="height: 24px; background: transparent; border-top: 1px solid var(--c-border); padding: 0 10px;">
+                <div class="pane-header-left">
+                  <span class="pane-keycap" id="keycap-stash" style="width: 13px; height: 13px; font-size: 9px;">5</span>
+                  <span class="pane-title-caps" style="font-size: 10px;">Stash</span>
+                </div>
+              </div>
+              <div class="stash-empty">nothing stashed</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Column 2: Commits & SVG Graph -->
+        <div class="pane" id="pane-4" onclick="focusPane(4)">
+          <div class="pane-header">
+            <div class="pane-header-left">
+              <span class="pane-keycap" id="keycap-commits">4</span>
+              <span class="pane-title-caps">Commits</span>
+            </div>
+            <div class="pane-header-right">
+              <span>main</span>
+            </div>
+          </div>
+
+          <div class="pane-commits-body" id="commits-list">
+            <!-- Row 0: a3f1c9d (Active/Selected) -->
+            <div class="commit-row selected" onclick="selectCommit(this, 'a3f1c9d')">
+              <div class="graph-cell">
+                <svg viewBox="0 0 48 22">
+                  <!-- Lane 0 vertical line going down -->
+                  <line x1="7" y1="11" x2="7" y2="22" stroke="var(--lane-0)" stroke-width="2"/>
+                  <!-- Lane 1 merge curve UP from row 1 (x=21, y=22) into node (x=7, y=11) -->
+                  <path d="M 21 22 C 21 16 7 17 7 11" fill="none" stroke="var(--lane-1)" stroke-width="2"/>
+                  <!-- Merge node ring on Lane 0 (r=5, hollow circle with dark background fill) -->
+                  <circle cx="7" cy="11" r="5" fill="var(--c-bg)" stroke="var(--lane-0)" stroke-width="2"/>
+                </svg>
+              </div>
+              <span class="commit-hash">a3f1c9d</span>
+              <span class="commit-subject">Merge extension host into main</span>
+              <span class="commit-age">2h</span>
+            </div>
+
+            <!-- Row 1: 7b02e14 -->
+            <div class="commit-row" onclick="selectCommit(this, '7b02e14')">
+              <div class="graph-cell">
+                <svg viewBox="0 0 48 22">
+                  <!-- Lane 0 through -->
+                  <line x1="7" y1="0" x2="7" y2="22" stroke="var(--lane-0)" stroke-width="2"/>
+                  <!-- Lane 1 through -->
+                  <line x1="21" y1="0" x2="21" y2="22" stroke="var(--lane-1)" stroke-width="2"/>
+                  <!-- Node on Lane 1 -->
+                  <circle cx="21" cy="11" r="4" fill="var(--lane-1)"/>
+                </svg>
+              </div>
+              <span class="commit-hash">7b02e14</span>
+              <span class="commit-subject">Cap per-extension token budget</span>
+              <span class="commit-age">3h</span>
+            </div>
+
+            <!-- Row 2: c40d8aa -->
+            <div class="commit-row" onclick="selectCommit(this, 'c40d8aa')">
+              <div class="graph-cell">
+                <svg viewBox="0 0 48 22">
+                  <line x1="7" y1="0" x2="7" y2="22" stroke="var(--lane-0)" stroke-width="2"/>
+                  <line x1="21" y1="0" x2="21" y2="22" stroke="var(--lane-1)" stroke-width="2"/>
+                  <circle cx="21" cy="11" r="4" fill="var(--lane-1)"/>
+                </svg>
+              </div>
+              <span class="commit-hash">c40d8aa</span>
+              <span class="commit-subject">Sandbox extension filesystem access</span>
+              <span class="commit-age">5h</span>
+            </div>
+
+            <!-- Row 3: 1e9fb37 -->
+            <div class="commit-row" onclick="selectCommit(this, '1e9fb37')">
+              <div class="graph-cell">
+                <svg viewBox="0 0 48 22">
+                  <line x1="7" y1="0" x2="7" y2="22" stroke="var(--lane-0)" stroke-width="2"/>
+                  <!-- Lane 1 runs UP into row 2 -->
+                  <line x1="21" y1="0" x2="21" y2="11" stroke="var(--lane-1)" stroke-width="2"/>
+                  <!-- Lane 1 forked from Lane 0 below (curves down to x=7, y=22) -->
+                  <path d="M 21 11 C 21 17 7 16 7 22" fill="none" stroke="var(--lane-1)" stroke-width="2"/>
+                  <circle cx="21" cy="11" r="4" fill="var(--lane-1)"/>
+                </svg>
+              </div>
+              <span class="commit-hash">1e9fb37</span>
+              <span class="commit-subject">Define the Event/Handles contract</span>
+              <span class="commit-age">6h</span>
+            </div>
+
+            <!-- Row 4: 55ac0f2 -->
+            <div class="commit-row" onclick="selectCommit(this, '55ac0f2')">
+              <div class="graph-cell">
+                <svg viewBox="0 0 48 22">
+                  <line x1="7" y1="0" x2="7" y2="22" stroke="var(--lane-0)" stroke-width="2"/>
+                  <circle cx="7" cy="11" r="4" fill="var(--lane-0)"/>
+                </svg>
+              </div>
+              <span class="commit-hash">55ac0f2</span>
+              <span class="commit-subject">Word-level diff in the hunk renderer</span>
+              <span class="commit-age">1d</span>
+            </div>
+
+            <!-- Row 5: 9d7e3b8 -->
+            <div class="commit-row" onclick="selectCommit(this, '9d7e3b8')">
+              <div class="graph-cell">
+                <svg viewBox="0 0 48 22">
+                  <line x1="7" y1="0" x2="7" y2="22" stroke="var(--lane-0)" stroke-width="2"/>
+                  <!-- Merge curve UP from Lane 2 (x=35, y=22) into node (x=7, y=11) -->
+                  <path d="M 35 22 C 35 16 7 17 7 11" fill="none" stroke="var(--lane-2)" stroke-width="2"/>
+                  <circle cx="7" cy="11" r="5" fill="var(--c-bg)" stroke="var(--lane-0)" stroke-width="2"/>
+                </svg>
+              </div>
+              <span class="commit-hash">9d7e3b8</span>
+              <span class="commit-subject">Merge lane-collapse rewrite</span>
+              <span class="commit-age">1d</span>
+            </div>
+
+            <!-- Row 6: f18c6d0 -->
+            <div class="commit-row" onclick="selectCommit(this, 'f18c6d0')">
+              <div class="graph-cell">
+                <svg viewBox="0 0 48 22">
+                  <line x1="7" y1="0" x2="7" y2="22" stroke="var(--lane-0)" stroke-width="2"/>
+                  <line x1="35" y1="0" x2="35" y2="22" stroke="var(--lane-2)" stroke-width="2"/>
+                  <circle cx="35" cy="11" r="4" fill="var(--lane-2)"/>
+                </svg>
+              </div>
+              <span class="commit-hash">f18c6d0</span>
+              <span class="commit-subject">Collapse dead lanes after a merge</span>
+              <span class="commit-age">2d</span>
+            </div>
+
+            <!-- Row 7: 2ba4471 -->
+            <div class="commit-row" onclick="selectCommit(this, '2ba4471')">
+              <div class="graph-cell">
+                <svg viewBox="0 0 48 22">
+                  <line x1="7" y1="0" x2="7" y2="22" stroke="var(--lane-0)" stroke-width="2"/>
+                  <line x1="35" y1="0" x2="35" y2="11" stroke="var(--lane-2)" stroke-width="2"/>
+                  <!-- Lane 2 forked from Lane 0 below (curves down to x=7, y=22) -->
+                  <path d="M 35 11 C 35 17 7 16 7 22" fill="none" stroke="var(--lane-2)" stroke-width="2"/>
+                  <circle cx="35" cy="11" r="4" fill="var(--lane-2)"/>
+                </svg>
+              </div>
+              <span class="commit-hash">2ba4471</span>
+              <span class="commit-subject">Reserve a lane per open branch tip</span>
+              <span class="commit-age">2d</span>
+            </div>
+
+            <!-- Row 8: d6e5192 -->
+            <div class="commit-row" onclick="selectCommit(this, 'd6e5192')">
+              <div class="graph-cell">
+                <svg viewBox="0 0 48 22">
+                  <line x1="7" y1="0" x2="7" y2="22" stroke="var(--lane-0)" stroke-width="2"/>
+                  <circle cx="7" cy="11" r="4" fill="var(--lane-0)"/>
+                </svg>
+              </div>
+              <span class="commit-hash">d6e5192</span>
+              <span class="commit-subject">Keymap resolves through the mode stack</span>
+              <span class="commit-age">3d</span>
+            </div>
+
+            <!-- Row 9: 08fa2c5 -->
+            <div class="commit-row" onclick="selectCommit(this, '08fa2c5')">
+              <div class="graph-cell">
+                <svg viewBox="0 0 48 22">
+                  <line x1="7" y1="0" x2="7" y2="22" stroke="var(--lane-0)" stroke-width="2"/>
+                  <circle cx="7" cy="11" r="4" fill="var(--lane-0)"/>
+                </svg>
+              </div>
+              <span class="commit-hash">08fa2c5</span>
+              <span class="commit-subject">Pane focus without a mouse</span>
+              <span class="commit-age">3d</span>
+            </div>
+
+            <!-- Row 10: bc31d7e -->
+            <div class="commit-row" onclick="selectCommit(this, 'bc31d7e')">
+              <div class="graph-cell">
+                <svg viewBox="0 0 48 22">
+                  <line x1="7" y1="0" x2="7" y2="22" stroke="var(--lane-0)" stroke-width="2"/>
+                  <circle cx="7" cy="11" r="4" fill="var(--lane-0)"/>
+                </svg>
+              </div>
+              <span class="commit-hash">bc31d7e</span>
+              <span class="commit-subject">Read refs without shelling out to git</span>
+              <span class="commit-age">4d</span>
+            </div>
+
+            <!-- Row 11: 4a90ff1 -->
+            <div class="commit-row" onclick="selectCommit(this, '4a90ff1')">
+              <div class="graph-cell">
+                <svg viewBox="0 0 48 22">
+                  <line x1="7" y1="0" x2="7" y2="22" stroke="var(--lane-0)" stroke-width="2"/>
+                  <circle cx="7" cy="11" r="4" fill="var(--lane-0)"/>
+                </svg>
+              </div>
+              <span class="commit-hash">4a90ff1</span>
+              <span class="commit-subject">Vendor libgit2 bindings</span>
+              <span class="commit-age">5d</span>
+            </div>
+
+            <!-- Row 12: e77b0c3 -->
+            <div class="commit-row" onclick="selectCommit(this, 'e77b0c3')">
+              <div class="graph-cell">
+                <svg viewBox="0 0 48 22">
+                  <!-- Terminating node on Lane 0 (line stops at y=11) -->
+                  <line x1="7" y1="0" x2="7" y2="11" stroke="var(--lane-0)" stroke-width="2"/>
+                  <circle cx="7" cy="11" r="4" fill="var(--lane-0)"/>
+                </svg>
+              </div>
+              <span class="commit-hash">e77b0c3</span>
+              <span class="commit-subject">Initial commit</span>
+              <span class="commit-age">6d</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Column 3: Diff Viewer & AI Assistant Card (FOCUSED) -->
+        <div class="pane focused" id="pane-5" onclick="focusPane(5)">
+          <div class="pane-header">
+            <div class="pane-header-left">
+              <span class="pane-keycap" id="keycap-diff">0</span>
+              <span class="pane-title-raw" id="diff-file-title">internal/extension/host.go</span>
+            </div>
+            <div class="pane-header-right">
+              <div class="diff-stats-header">
+                <span class="stat-adds">+18</span>
+                <span class="stat-dels">-6</span>
+                <span class="stat-hunk">hunk 1/3</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="pane-diff-body" id="diff-body">
+            <!-- Hunk Header -->
+            <div class="diff-hunk-bar">
+              @@ -41,9 +41,11 @@ func (h *Host) Dispatch(ev Event) error {
+            </div>
+
+            <!-- Diff Content Lines -->
+            <div class="diff-table">
+              <!-- Line 41 41: context -->
+              <div class="diff-line context">
+                <span class="gutter-old">41</span>
+                <span class="gutter-new">41</span>
+                <span class="gutter-sign"> </span>
+                <span class="line-content">  <span class="syn-k">for</span> _, ext := <span class="syn-k">range</span> h.<span class="syn-p">enabled</span> {</span>
+              </div>
+
+              <!-- Line 42 (old): deleted -->
+              <div class="diff-line deleted">
+                <span class="gutter-old">42</span>
+                <span class="gutter-new"> </span>
+                <span class="gutter-sign">-</span>
+                <span class="line-content">    <span class="syn-k">if</span> !ext.<span class="syn-f">Handles</span>(ev.<span class="syn-p">Kind</span>) {</span>
+              </div>
+
+              <!-- Line 42 (new): added with intraline highlight -->
+              <div class="diff-line added">
+                <span class="gutter-old"> </span>
+                <span class="gutter-new">42</span>
+                <span class="gutter-sign">+</span>
+                <span class="line-content">    <span class="syn-k">if</span> !ext.<span class="syn-f">Handles</span>(ev.<span class="syn-p">Kind</span>) <span class="intraline-word">|| h.<span class="syn-p">budget</span>.<span class="syn-f">Exhausted</span>()</span> {</span>
+              </div>
+
+              <!-- Line 43 43: context -->
+              <div class="diff-line context">
+                <span class="gutter-old">43</span>
+                <span class="gutter-new">43</span>
+                <span class="gutter-sign"> </span>
+                <span class="line-content">      <span class="syn-k">continue</span></span>
+              </div>
+
+              <!-- Line 44 44: context -->
+              <div class="diff-line context">
+                <span class="gutter-old">44</span>
+                <span class="gutter-new">44</span>
+                <span class="gutter-sign"> </span>
+                <span class="line-content">    }</span>
+              </div>
+
+              <!-- Line 45 (old): deleted -->
+              <div class="diff-line deleted">
+                <span class="gutter-old">45</span>
+                <span class="gutter-new"> </span>
+                <span class="gutter-sign">-</span>
+                <span class="line-content">    <span class="syn-k">go</span> ext.<span class="syn-f">Run</span>(ev)</span>
+              </div>
+
+              <!-- Line 45 (new): added -->
+              <div class="diff-line added">
+                <span class="gutter-old"> </span>
+                <span class="gutter-new">45</span>
+                <span class="gutter-sign">+</span>
+                <span class="line-content">    <span class="syn-k">if</span> err := h.<span class="syn-p">pool</span>.<span class="syn-f">Submit</span>(ctx, ext, ev); err != <span class="syn-k">nil</span> {</span>
+              </div>
+
+              <!-- Line 46 (new): added -->
+              <div class="diff-line added">
+                <span class="gutter-old"> </span>
+                <span class="gutter-new">46</span>
+                <span class="gutter-sign">+</span>
+                <span class="line-content">      <span class="syn-k">return</span> fmt.<span class="syn-f">Errorf</span>(<span class="syn-s">"dispatch %s: %w"</span>, ext.<span class="syn-p">Name</span>, err)</span>
+              </div>
+
+              <!-- Line 47 (new): added -->
+              <div class="diff-line added">
+                <span class="gutter-old"> </span>
+                <span class="gutter-new">47</span>
+                <span class="gutter-sign">+</span>
+                <span class="line-content">    }</span>
+              </div>
+
+              <!-- Line 46 48: context -->
+              <div class="diff-line context">
+                <span class="gutter-old">46</span>
+                <span class="gutter-new">48</span>
+                <span class="gutter-sign"> </span>
+                <span class="line-content">    }</span>
+              </div>
+
+              <!-- Line 47 49: context -->
+              <div class="diff-line context">
+                <span class="gutter-old">47</span>
+                <span class="gutter-new">49</span>
+                <span class="gutter-sign"> </span>
+                <span class="line-content">    <span class="syn-k">return</span> <span class="syn-k">nil</span></span>
+              </div>
+
+              <!-- Line 48 50: context -->
+              <div class="diff-line context">
+                <span class="gutter-old">48</span>
+                <span class="gutter-new">50</span>
+                <span class="gutter-sign"> </span>
+                <span class="line-content">  }</span>
+              </div>
+            </div>
+
+            <!-- AI Assist Card ("READING THIS HUNK") -->
+            <div class="ai-hunk-card" id="ai-card">
+              <div class="ai-card-header">
+                <div class="ai-card-title">
+                  <span class="ai-sparkle">✧</span>
+                  <span>READING THIS HUNK</span>
+                </div>
+                <div class="ai-card-action" onclick="toggleExplain()">
+                  <span>e · explain</span>
+                </div>
+              </div>
+              <div class="ai-card-body" id="ai-card-text">
+                The goroutine became a pool submission, so a dispatch failure now surfaces to the caller instead of dying silently in the background. The budget check moved into the same guard as Handles — which means an exhausted budget skips the extension quietly rather than erroring. Worth confirming that is the intent.
+              </div>
+            </div>
+
+          </div>
+        </div>
+
+      </div>
+
+      <!-- Window Status Bar -->
+      <div class="app-statusbar">
+        <div class="statusbar-left">
+          <span class="mode-badge" id="app-mode">Normal</span>
+
+          <div class="key-hints">
+            <span class="key-hint-item" onclick="handleKeyHint('stage')">
+              <span class="key-hint-key">␣</span>
+              <span class="key-hint-label">stage</span>
+            </span>
+            <span class="key-hint-item" onclick="handleKeyHint('commit')">
+              <span class="key-hint-key">c</span>
+              <span class="key-hint-label">commit</span>
+            </span>
+            <span class="key-hint-item" onclick="handleKeyHint('push')">
+              <span class="key-hint-key">P</span>
+              <span class="key-hint-label">push</span>
+            </span>
+            <span class="key-hint-item" onclick="handleKeyHint('explain')">
+              <span class="key-hint-key">e</span>
+              <span class="key-hint-label">explain hunk</span>
+            </span>
+            <span class="key-hint-item" onclick="handleKeyHint('extensions')">
+              <span class="key-hint-key">x</span>
+              <span class="key-hint-label">extensions</span>
+            </span>
+            <span class="key-hint-item" onclick="handleKeyHint('ask')">
+              <span class="key-hint-key">⌘K</span>
+              <span class="key-hint-label">ask</span>
+            </span>
+          </div>
+        </div>
+
+        <div class="statusbar-right">
+          plait 0.4.1
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- Command Palette / Ask Modal -->
+  <div class="mock-modal" id="modal-ask">
+    <div class="modal-title">
+      <span>Ask AI / Dispatch Command</span>
+      <button class="modal-close" onclick="closeModals()">✕</button>
+    </div>
+    <input type="text" class="modal-input" placeholder="Explain change, generate commit message, or type command..." autofocus>
+    <div class="modal-list">
+      <div class="modal-item active">
+        <span>✧ Explain all changes in internal/extension/host.go</span>
+        <span class="key-chip">↵</span>
+      </div>
+      <div class="modal-item">
+        <span>✎ Generate conventional commit message</span>
+        <span class="key-chip">⌘↵</span>
+      </div>
+      <div class="modal-item">
+        <span>⚡ Check for breaking API changes</span>
+        <span class="key-chip">⌥↵</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Extensions Modal -->
+  <div class="mock-modal" id="modal-extensions">
+    <div class="modal-title">
+      <span>Active Extensions (4)</span>
+      <button class="modal-close" onclick="closeModals()">✕</button>
+    </div>
+    <div class="modal-list">
+      <div class="modal-item">
+        <div>
+          <b style="color: var(--c-fg);">hunk-explainer</b>
+          <div style="font-size: 11px; color: var(--c-faint);">Contextual LLM explanation for diff hunks</div>
+        </div>
+        <span style="color: #6fbf73;">● enabled</span>
+      </div>
+      <div class="modal-item">
+        <div>
+          <b style="color: var(--c-fg);">commit-synthesizer</b>
+          <div style="font-size: 11px; color: var(--c-faint);">Drafts commit messages based on staged diffs</div>
+        </div>
+        <span style="color: #6fbf73;">● enabled</span>
+      </div>
+      <div class="modal-item">
+        <div>
+          <b style="color: var(--c-fg);">histogram-differ</b>
+          <div style="font-size: 11px; color: var(--c-faint);">Anchor-preserving diffing algorithm in core</div>
+        </div>
+        <span style="color: #6fbf73;">● built-in</span>
+      </div>
+      <div class="modal-item">
+        <div>
+          <b style="color: var(--c-fg);">lane-optimizer</b>
+          <div style="font-size: 11px; color: var(--c-faint);">Dead-lane collapse and 12-lane gutter cap</div>
+        </div>
+        <span style="color: #6fbf73;">● built-in</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- lazygit Keybindings Help Modal (?) -->
+  <div class="mock-modal" id="modal-help" style="width: 580px; max-height: 80vh; overflow-y: auto;">
+    <div class="modal-title">
+      <span>lazygit Keybindings Cheat Sheet</span>
+      <button class="modal-close" onclick="closeModals()">✕</button>
+    </div>
+    <div style="display: flex; flex-direction: column; gap: 12px; font-size: 12px;">
+      <div>
+        <div style="color: var(--c-accent); font-weight: 600; margin-bottom: 4px;">Panel Switching</div>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 4px; color: var(--c-dim);">
+          <div><span class="key-chip">1</span> Status / Branch</div>
+          <div><span class="key-chip">2</span> Files</div>
+          <div><span class="key-chip">3</span> Branches</div>
+          <div><span class="key-chip">4</span> Commits</div>
+          <div><span class="key-chip">5</span> Stash</div>
+          <div><span class="key-chip">0</span> / <span class="key-chip">↵</span> Diff View</div>
+        </div>
+      </div>
+      <div>
+        <div style="color: var(--c-accent); font-weight: 600; margin-bottom: 4px;">Navigation</div>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 4px; color: var(--c-dim);">
+          <div><span class="key-chip">h</span> / <span class="key-chip">l</span> Walk left / right pane</div>
+          <div><span class="key-chip">j</span> / <span class="key-chip">k</span> Select down / up item</div>
+          <div><span class="key-chip">[</span> / <span class="key-chip">]</span> Prev / next file in diff</div>
+          <div><span class="key-chip">Esc</span> Return to sidebar / cancel</div>
+        </div>
+      </div>
+      <div>
+        <div style="color: var(--c-accent); font-weight: 600; margin-bottom: 4px;">Global Verbs</div>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 4px; color: var(--c-dim);">
+          <div><span class="key-chip">P</span> Push to remote</div>
+          <div><span class="key-chip">p</span> Pull from remote</div>
+          <div><span class="key-chip">f</span> Fetch from remote</div>
+          <div><span class="key-chip">R</span> Refresh all git state</div>
+          <div><span class="key-chip">y</span> Yank / copy SHA/path</div>
+          <div><span class="key-chip">/</span> Filter / search</div>
+        </div>
+      </div>
+      <div>
+        <div style="color: var(--c-accent); font-weight: 600; margin-bottom: 4px;">Files Panel (2)</div>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 4px; color: var(--c-dim);">
+          <div><span class="key-chip">␣</span> Stage / unstage file</div>
+          <div><span class="key-chip">c</span> Commit staged</div>
+          <div><span class="key-chip">a</span> Stage / unstage all</div>
+          <div><span class="key-chip">A</span> Amend commit</div>
+          <div><span class="key-chip">D</span> Discard changes</div>
+          <div><span class="key-chip">s</span> Stash working tree</div>
+        </div>
+      </div>
+      <div>
+        <div style="color: var(--c-accent); font-weight: 600; margin-bottom: 4px;">Commits Panel (4)</div>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 4px; color: var(--c-dim);">
+          <div><span class="key-chip">s</span> Squash commit down</div>
+          <div><span class="key-chip">f</span> Fixup commit</div>
+          <div><span class="key-chip">d</span> Drop commit</div>
+          <div><span class="key-chip">g</span> Reset menu (s/m/h)</div>
+          <div><span class="key-chip">r</span> Reword commit</div>
+          <div><span class="key-chip">t</span> Revert commit</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+
+<!-- ====================================================================== -->
+<!-- TAB 2: VISUAL BLUEPRINT & ANNOTATIONS                                  -->
+<!-- ====================================================================== -->
+<div id="view-blueprint" class="guide-view">
+  <div class="doc-container">
+    <h1 class="doc-title">Visual Blueprint &amp; Layout Anatomy</h1>
+    <p class="doc-lead">
+      gitten's desktop presentation adopts a quiet, dense, keyboard-driven layout inspired by lazygit.
+      Every region has a strict geometric rhythm, fixed-height rows for virtualization, and explicit contrast floors.
+    </p>
+
+    <div class="doc-section">
+      <h2>1. The 3-Pane Geometry</h2>
+      <p>
+        The window is partitioned into three vertical columns using a CSS Grid layout:
+        <code>grid-template-columns: 245px 420px 1fr;</code>.
+      </p>
+      <table class="guide-table">
+        <thead>
+          <tr>
+            <th>Pane</th>
+            <th>Key</th>
+            <th>Default Width</th>
+            <th>Content &amp; Behavior</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Files / Status</strong></td>
+            <td><span class="key-chip">1</span></td>
+            <td><code>245px</code></td>
+            <td>Staged (<code>M</code>, <code>A</code>) &amp; unstaged (<code>M</code>, <code>??</code>) files. Subsections for Branches (<span class="key-chip">2</span>) and Stashes (<span class="key-chip">3</span>).</td>
+          </tr>
+          <tr>
+            <td><strong>Commits</strong></td>
+            <td><span class="key-chip">4</span></td>
+            <td><code>420px</code></td>
+            <td>Commit topology graph + short SHA + commit subject + relative age. Fixed <code>22px</code> row rhythm.</td>
+          </tr>
+          <tr>
+            <td><strong>Diff Viewer</strong></td>
+            <td><span class="key-chip">5</span></td>
+            <td><code>1fr</code> (Flexible)</td>
+            <td>Hunk header, line-number gutters, added/removed lines, intraline word diffs, and docked AI explanation card.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="doc-section">
+      <h2>2. Window Chrome &amp; Titlebar Strip</h2>
+      <p>
+        Following <strong>macOS titlebar conventions</strong> without an opaque system bar:
+        the app window uses a single transparent strip of height <code>38px</code>.
+      </p>
+      <ul style="color: var(--c-dim); margin-left: 20px; line-height: 1.8;">
+        <li><strong>Traffic Lights:</strong> macOS window controls inset at <code>(10, 10)</code>. Muted dark circles at rest, colored on hover.</li>
+        <li><strong>Repository Path:</strong> Breadcrumb showing working directory <code>~/src/</code> in dim tone and repo name <code>plait</code> / <code>gitten</code> in bold foreground.</li>
+        <li><strong>Branch Pill:</strong> Compact container displaying current active branch with ahead/behind sync counts (<code>↑2 ↓0</code>).</li>
+        <li><strong>Extensions Chip:</strong> Active status indicator with green pulse dot showing loaded extensions.</li>
+        <li><strong>Command Keycap:</strong> Dedicated <code>⌘K ask</code> button opening the AI and command dispatch palette.</li>
+      </ul>
+    </div>
+
+    <div class="doc-section">
+      <h2>3. The Commit Graph Drawing Rules</h2>
+      <p>
+        The commit graph is drawn using SVG Bézier curves and antialiased nodes adhering to <code>core/src/graph.rs</code>:
+      </p>
+      <pre>ROW_H = 22.0 px;
+LANE_W = 14.0 px;
+STROKE = 2.0 px;
+DOT_R = 4.0 px (commit node);
+MERGE_R = 5.0 px (hollow merge ring);
+lane_x = lane * 14.0 + 7.0 px; // Centered exactly at whole pixels</pre>
+      <p style="margin-top: 10px;">
+        Merge curves use cubic Bézier curves (<code>d="M 21 22 C 21 16 7 17 7 11"</code>) ensuring tangent continuity across row boundaries so virtualized row recycling doesn't produce visual seams.
+      </p>
+    </div>
+
+    <div class="doc-section">
+      <h2>4. Docked AI Assist Card ("Reading this hunk")</h2>
+      <p>
+        Rather than a noisy pop-up or a separate chat sidebar, AI reasoning is <strong>docked directly inside the diff view</strong> right below the relevant hunk.
+      </p>
+      <ul style="color: var(--c-dim); margin-left: 20px; line-height: 1.8;">
+        <li><strong>Typeface:</strong> Editorial serif (<code>Newsreader</code>, <code>Charter</code>, <code>Georgia</code>) at <code>13.5px</code> with <code>1.5</code> line-height to distinguish human/machine prose from monospace code.</li>
+        <li><strong>Border:</strong> Muted amber border (<code>rgba(223, 168, 81, 0.28)</code>) creating subtle warm elevation.</li>
+        <li><strong>Interactive shortcut:</strong> Pressing <span class="key-chip">e</span> triggers or collapses the hunk explanation.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+
+<!-- ====================================================================== -->
+<!-- TAB 3: TOKENS & COLOR SYSTEM                                           -->
+<!-- ====================================================================== -->
+<div id="view-tokens" class="guide-view">
+  <div class="doc-container">
+    <h1 class="doc-title">Design Tokens &amp; Color Palette</h1>
+    <p class="doc-lead">
+      Directly extracted from <code>core/src/theme.rs</code>. Every color is defined as a 24-bit RGB integer
+      and checked against WCAG 2.1 contrast floors: <code>min_contrast = 3.5</code> for code tokens, and <code>min_furniture = 3.0</code> for line numbers and rules.
+    </p>
+
+    <!-- Chrome Palette -->
+    <div class="doc-section">
+      <h2>Chrome &amp; Surface Tokens</h2>
+      <div class="swatch-grid">
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #0e0d0c; color: #e8e3dc; border-color: #282320;">Background</div>
+          <div class="swatch-info"><span class="swatch-name">bg</span><span class="swatch-hex">#0e0d0c</span></div>
+          <span class="swatch-role">Window canvas background</span>
+        </div>
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #151312; color: #e8e3dc; border-color: #282320;">Title Bar</div>
+          <div class="swatch-info"><span class="swatch-name">title_bg</span><span class="swatch-hex">#151312</span></div>
+          <span class="swatch-role">Pane header &amp; window title strip</span>
+        </div>
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #131211; color: #e8e3dc; border-color: #282320;">Status Bar</div>
+          <div class="swatch-info"><span class="swatch-name">status_bg</span><span class="swatch-hex">#131211</span></div>
+          <span class="swatch-role">Bottom status &amp; key hint bar</span>
+        </div>
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #dfa851; color: #0e0d0c;">Accent</div>
+          <div class="swatch-info"><span class="swatch-name">accent</span><span class="swatch-hex">#dfa851</span></div>
+          <span class="swatch-role">Amber highlight &amp; Normal mode pill</span>
+        </div>
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #282320; color: #e8e3dc;">Border</div>
+          <div class="swatch-info"><span class="swatch-name">border</span><span class="swatch-hex">#282320</span></div>
+          <span class="swatch-role">Hairline rule between chrome panes</span>
+        </div>
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #1c1a18; color: #e8e3dc; border-color: #282320;">Raised Pill</div>
+          <div class="swatch-info"><span class="swatch-name">raised</span><span class="swatch-hex">#1c1a18</span></div>
+          <span class="swatch-role">Chip surfaces, focused headers</span>
+        </div>
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #2c2925; color: #e8e3dc; border-color: #282320;">Keycap</div>
+          <div class="swatch-info"><span class="swatch-name">keycap</span><span class="swatch-hex">#2c2925</span></div>
+          <span class="swatch-role">Face of key shortcut numbers (1-5)</span>
+        </div>
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #241f1a; color: #e8e3dc; border: 1px solid #dfa851;">Selected Row</div>
+          <div class="swatch-info"><span class="swatch-name">selection_bg</span><span class="swatch-hex">#241f1a</span></div>
+          <span class="swatch-role">Active row under keyboard cursor</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Diff Palette -->
+    <div class="doc-section">
+      <h2>Diff &amp; Hunk Tokens</h2>
+      <div class="swatch-grid">
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #16241a; color: #9dc79b;">+ Added Line</div>
+          <div class="swatch-info"><span class="swatch-name">added_bg</span><span class="swatch-hex">#16241a</span></div>
+          <span class="swatch-role">Addition line tint (1.20:1 ratio)</span>
+        </div>
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #234228; color: #c4ecc2;">+ Added Word</div>
+          <div class="swatch-info"><span class="swatch-name">added_word_bg</span><span class="swatch-hex">#234228</span></div>
+          <span class="swatch-role">Word-level intraline addition emphasis</span>
+        </div>
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #2a1917; color: #d4a09a;">- Removed Line</div>
+          <div class="swatch-info"><span class="swatch-name">removed_bg</span><span class="swatch-hex">#2a1917</span></div>
+          <span class="swatch-role">Deletion line tint</span>
+        </div>
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #522722; color: #f7bbb4;">- Removed Word</div>
+          <div class="swatch-info"><span class="swatch-name">removed_word_bg</span><span class="swatch-hex">#522722</span></div>
+          <span class="swatch-role">Word-level intraline deletion emphasis</span>
+        </div>
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #14181d; color: #7d8fa8;">@@ Hunk Header @@</div>
+          <div class="swatch-info"><span class="swatch-name">hunk_bg</span><span class="swatch-hex">#14181d</span></div>
+          <span class="swatch-role">Hunk coordinate separator band</span>
+        </div>
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #0e0d0c; color: #4a4540;">41  42</div>
+          <div class="swatch-info"><span class="swatch-name">gutter_fg</span><span class="swatch-hex">#4a4540</span></div>
+          <span class="swatch-role">Line number gutter ink</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Graph Lane Colors -->
+    <div class="doc-section">
+      <h2>Commit Graph Lane Hues (Wheel of 6)</h2>
+      <div class="swatch-grid">
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #dfa851; color: #0e0d0c;">Lane 0 (Main)</div>
+          <div class="swatch-info"><span class="swatch-name">lane[0]</span><span class="swatch-hex">#dfa851</span></div>
+          <span class="swatch-role">Primary main branch</span>
+        </div>
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #6f9ecf; color: #0e0d0c;">Lane 1 (Feature)</div>
+          <div class="swatch-info"><span class="swatch-name">lane[1]</span><span class="swatch-hex">#6f9ecf</span></div>
+          <span class="swatch-role">Branch 1 (Sky Blue)</span>
+        </div>
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #a983c9; color: #0e0d0c;">Lane 2 (Fix)</div>
+          <div class="swatch-info"><span class="swatch-name">lane[2]</span><span class="swatch-hex">#a983c9</span></div>
+          <span class="swatch-role">Branch 2 (Lavender / Purple)</span>
+        </div>
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #5fa8a0; color: #0e0d0c;">Lane 3 (Teal)</div>
+          <div class="swatch-info"><span class="swatch-name">lane[3]</span><span class="swatch-hex">#5fa8a0</span></div>
+          <span class="swatch-role">Branch 3 (Teal)</span>
+        </div>
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #c97d6f; color: #0e0d0c;">Lane 4 (Coral)</div>
+          <div class="swatch-info"><span class="swatch-name">lane[4]</span><span class="swatch-hex">#c97d6f</span></div>
+          <span class="swatch-role">Branch 4 (Coral)</span>
+        </div>
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #8fb35e; color: #0e0d0c;">Lane 5 (Olive)</div>
+          <div class="swatch-info"><span class="swatch-name">lane[5]</span><span class="swatch-hex">#8fb35e</span></div>
+          <span class="swatch-role">Branch 5 (Olive Green)</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="view-keyboard" class="guide-view">
+  <div class="doc-container">
+    <h1 class="doc-title">Keyboard &amp; Navigation Model (lazygit)</h1>
+    <p class="doc-lead">
+      <strong>Yes, gitten is built on lazygit's exact keyboard model.</strong> As stated in <code>AGENTS.md</code>:
+      <em>"A desktop git client with lazygit's keyboard model. Rust, GPUI."</em> and in <code>core/src/command.rs</code>:
+      <em>"The shipped keyboard. lazygit's, where lazygit has an opinion, and vi's where it does not."</em>
+    </p>
+
+    <!-- Comparison Notice -->
+    <div class="doc-section" style="border-left: 3px solid var(--c-accent);">
+      <h2>lazygit Numbering vs. The Visual Mockup</h2>
+      <p>
+        In the visual design mockup (Image #1), the designer numbered the three visible columns directly
+        (<code>1 Files</code>, <code>2 Branches</code>, <code>3 Stash</code>, <code>4 Commits</code>, <code>5 Diff</code>).
+      </p>
+      <p>
+        In <strong>canonical lazygit</strong> (and in <code>core/src/command.rs</code>), the numbering reads down the working tree stack:
+      </p>
+      <ul style="color: var(--c-dim); margin-left: 20px; line-height: 1.8;">
+        <li><span class="key-chip">1</span> <strong>Status</strong>: Working directory state, upstream drift, ahead/behind sync (<code>↑2 ↓0</code>).</li>
+        <li><span class="key-chip">2</span> <strong>Files</strong>: Staged, unstaged, untracked, and conflicted files.</li>
+        <li><span class="key-chip">3</span> <strong>Branches</strong>: Local branches, remotes, and tags.</li>
+        <li><span class="key-chip">4</span> <strong>Commits</strong>: The commit log, branch lanes, and history graph.</li>
+        <li><span class="key-chip">5</span> <strong>Stash</strong>: The stash stack.</li>
+        <li><span class="key-chip">0</span> or <span class="key-chip">↵</span> (Enter) / <span class="key-chip">Tab</span>: <strong>Diff (Main View)</strong>: Enters the diff pane to scroll hunks or stage lines.</li>
+        <li><span class="key-chip">Esc</span>: Exits the diff view back to the side panels.</li>
+      </ul>
+      <p style="margin-top: 10px; font-size: 12px; color: var(--c-faint);">
+        You can toggle between <em>Canonical Lazygit (1..5 + 0/↵)</em> and <em>Mockup (1..5)</em> in the toolbar dropdown above. Both schemes dispatch through <code>core::command</code>.
+      </p>
+    </div>
+
+    <!-- Pane Switching & Navigation -->
+    <div class="doc-section">
+      <h2>1. Panel Navigation (Vim + Arrows)</h2>
+      <table class="guide-table">
+        <thead>
+          <tr>
+            <th>Shortcut</th>
+            <th>Action</th>
+            <th>lazygit &amp; core Mapping</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><span class="key-chip">1</span> .. <span class="key-chip">5</span></td>
+            <td>Direct jump to panel</td>
+            <td><code>status.focus</code>, <code>files.focus</code>, <code>branches.focus</code>, <code>commits.focus</code>, <code>stashes.focus</code></td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">0</span> or <span class="key-chip">↵</span></td>
+            <td>Focus main diff panel</td>
+            <td><code>diff.focus</code> (enters diff from any list)</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">Esc</span></td>
+            <td>Return to sidebar / cancel</td>
+            <td>Exits diff focus back to list; closes modals or menus</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">h</span> / <span class="key-chip">l</span> or <span class="key-chip">←</span> / <span class="key-chip">→</span></td>
+            <td>Walk pane left / right</td>
+            <td><code>pane.left</code>, <code>pane.right</code></td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">j</span> / <span class="key-chip">k</span> or <span class="key-chip">↓</span> / <span class="key-chip">↑</span></td>
+            <td>Move selection down / up</td>
+            <td><code>cursor.down</code>, <code>cursor.up</code></td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">[</span> / <span class="key-chip">]</span></td>
+            <td>Previous / next file in diff</td>
+            <td><code>diff.prev-file</code>, <code>diff.next-file</code></td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">&lt;</span> / <span class="key-chip">&gt;</span> (or <span class="key-chip">H</span> / <span class="key-chip">L</span>)</td>
+            <td>Scroll diff horizontally</td>
+            <td><code>view.left</code>, <code>view.right</code></td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">Ctrl+u</span> / <span class="key-chip">Ctrl+d</span></td>
+            <td>Page up / page down</td>
+            <td>Half-page scroll in active list or diff</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Global Git Verbs -->
+    <div class="doc-section">
+      <h2>2. Global Git Verbs</h2>
+      <table class="guide-table">
+        <thead>
+          <tr>
+            <th>Shortcut</th>
+            <th>Command</th>
+            <th>Description</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><span class="key-chip">P</span> (Shift+p)</td>
+            <td><code>repo.push</code></td>
+            <td>Pushes local branch to upstream remote (<code>git push</code>)</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">p</span></td>
+            <td><code>repo.pull</code></td>
+            <td>Pulls upstream changes onto checked-out branch (<code>git pull</code>)</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">f</span></td>
+            <td><code>repo.fetch</code></td>
+            <td>Fetches latest refs from remotes without merging</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">R</span> (Shift+r)</td>
+            <td><code>repo.refresh</code></td>
+            <td>Re-runs reads across all panes; refreshes git state</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">y</span></td>
+            <td><code>copy.selection</code></td>
+            <td>Copies selected commit SHA, branch name, or file path to clipboard</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">/</span></td>
+            <td><code>*.search</code></td>
+            <td>Opens interactive live filter in the focused list</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">?</span></td>
+            <td><code>help.show</code></td>
+            <td>Opens comprehensive lazygit keymap cheat sheet overlay</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Pane-Specific Verbs -->
+    <div class="doc-section">
+      <h2>3. Contextual Pane Verbs</h2>
+      <table class="guide-table">
+        <thead>
+          <tr>
+            <th>Pane</th>
+            <th>Shortcut</th>
+            <th>Action</th>
+            <th>Behavior</th>
+          </tr>
+        </thead>
+        <tbody>
+          <!-- Files -->
+          <tr>
+            <td rowspan="6"><strong>Files</strong> (<span class="key-chip">2</span>)</td>
+            <td><span class="key-chip">␣</span> (Space)</td>
+            <td>Stage / unstage file</td>
+            <td>Toggles selected row between Staged and Unstaged</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">c</span></td>
+            <td>Commit staged</td>
+            <td>Opens commit message editor for staged changes</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">A</span></td>
+            <td>Amend commit</td>
+            <td>Amends staged changes into <code>HEAD</code> commit</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">a</span></td>
+            <td>Stage all</td>
+            <td>Stages (or unstages) all files in the working tree</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">D</span></td>
+            <td>Discard changes</td>
+            <td>Discards working tree modifications (destructive; asks twice)</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">s</span></td>
+            <td>Stash working tree</td>
+            <td>Parks unstaged/working-tree changes into stash</td>
+          </tr>
+
+          <!-- Branches -->
+          <tr>
+            <td rowspan="5"><strong>Branches</strong> (<span class="key-chip">3</span>)</td>
+            <td><span class="key-chip">␣</span> (Space)</td>
+            <td>Checkout branch</td>
+            <td>Switches <code>HEAD</code> to the selected branch</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">n</span></td>
+            <td>New branch</td>
+            <td>Prompts for a new branch name branched from <code>HEAD</code></td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">r</span></td>
+            <td>Rebase onto branch</td>
+            <td>Rebases current branch onto selected branch (asks twice)</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">R</span></td>
+            <td>Rename branch</td>
+            <td>Renames selected branch</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">d</span></td>
+            <td>Delete branch</td>
+            <td>Deletes local branch (destructive; asks twice)</td>
+          </tr>
+
+          <!-- Commits -->
+          <tr>
+            <td rowspan="7"><strong>Commits</strong> (<span class="key-chip">4</span>)</td>
+            <td><span class="key-chip">␣</span> (Space)</td>
+            <td>Checkout commit</td>
+            <td>Detached checkout onto selected commit</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">s</span></td>
+            <td>Squash commit</td>
+            <td>Squashes commit down into parent (rewrites history)</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">f</span></td>
+            <td>Fixup commit</td>
+            <td>Melds commit into parent, discarding commit message</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">d</span></td>
+            <td>Drop commit</td>
+            <td>Deletes commit from branch history (asks twice)</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">r</span></td>
+            <td>Reword commit</td>
+            <td>Edits commit message of selected commit</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">g</span></td>
+            <td>Reset menu</td>
+            <td>Opens reset menu: <span class="key-chip">s</span> soft, <span class="key-chip">m</span> mixed, <span class="key-chip">h</span> hard</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">t</span></td>
+            <td>Revert commit</td>
+            <td>Creates a new commit reversing the changes of this commit</td>
+          </tr>
+
+          <!-- Diff -->
+          <tr>
+            <td rowspan="4"><strong>Diff</strong> (<span class="key-chip">0</span>/<span class="key-chip">↵</span>)</td>
+            <td><span class="key-chip">␣</span> (Space)</td>
+            <td>Stage hunk / line</td>
+            <td>Stages the selected diff hunk or line into the index</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">u</span></td>
+            <td>Unstage hunk</td>
+            <td>Removes hunk from the index back to working tree</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">D</span></td>
+            <td>Discard hunk</td>
+            <td>Discards hunk changes from working tree (asks twice)</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">e</span></td>
+            <td>Explain hunk (AI)</td>
+            <td>Toggles contextual AI explanation for currently focused hunk</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+
+<!-- ====================================================================== -->
+<!-- TAB 5: ARCHITECTURE & GPUI MAPPING                                     -->
+<!-- ====================================================================== -->
+<div id="view-architecture" class="guide-view">
+  <div class="doc-container">
+    <h1 class="doc-title">GPUI &amp; Core Architecture Seams</h1>
+    <p class="doc-lead">
+      How this design guide maps directly to Rust crates in the <code>gitten</code> codebase.
+      As enforced by <code>AGENTS.md</code>: <em>"A client is drawing and input, and nothing else. Everything before it is shared in core."</em>
+    </p>
+
+    <div class="doc-section">
+      <h2>1. The Four-Crate Pipeline</h2>
+      <div style="display: flex; gap: 14px; flex-wrap: wrap; margin-bottom: 20px;">
+        <div style="flex: 1; min-width: 220px; background: #191614; border: 1px solid var(--c-border); border-radius: 6px; padding: 14px;">
+          <h3 style="color: var(--c-accent); font-size: 14px; margin-bottom: 6px;">1. gitten-git</h3>
+          <p style="font-size: 11.5px; color: var(--c-dim);">Acquisition layer. The ONLY crate that talks to repository files or spawns the <code>git</code> binary.</p>
+        </div>
+        <div style="flex: 1; min-width: 220px; background: #191614; border: 1px solid var(--c-border); border-radius: 6px; padding: 14px;">
+          <h3 style="color: var(--c-accent); font-size: 14px; margin-bottom: 6px;">2. gitten-core</h3>
+          <p style="font-size: 11.5px; color: var(--c-dim);">Pure algorithms. Zero UI dependencies. Differs (Histogram), lane assignment, intraline aligner, themes.</p>
+        </div>
+        <div style="flex: 1; min-width: 220px; background: #191614; border: 1px solid var(--c-border); border-radius: 6px; padding: 14px;">
+          <h3 style="color: var(--c-accent); font-size: 14px; margin-bottom: 6px;">3. gitten-app</h3>
+          <p style="font-size: 11.5px; color: var(--c-dim);">Configuration parser, <code>gitten.toml</code> loader, CLI arguments, verb dispatch, and extension runner.</p>
+        </div>
+        <div style="flex: 1; min-width: 220px; background: #191614; border: 1px solid var(--c-border); border-radius: 6px; padding: 14px;">
+          <h3 style="color: var(--c-accent); font-size: 14px; margin-bottom: 6px;">4. shell (GPUI)</h3>
+          <p style="font-size: 11.5px; color: var(--c-dim);">Rendering and input only! <code>uniform_list</code> virtualization, canvas Bézier painter, and window chrome.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="doc-section">
+      <h2>2. Key Source Code File Mapping</h2>
+      <table class="guide-table">
+        <thead>
+          <tr>
+            <th>Visual Component</th>
+            <th>Source Location</th>
+            <th>Responsibility</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Theme &amp; Colors</strong></td>
+            <td><code>core/src/theme.rs</code></td>
+            <td><code>Theme::dark()</code>, <code>DiffPalette</code>, <code>ChromePalette</code>, contrast ratio math.</td>
+          </tr>
+          <tr>
+            <td><strong>Graph Algorithm</strong></td>
+            <td><code>core/src/graph.rs</code></td>
+            <td><code>assign_lanes</code>, <code>MAX_LANES = 12</code> cap, <code>plan</code> curve halves calculation.</td>
+          </tr>
+          <tr>
+            <td><strong>Graph Canvas Rendering</strong></td>
+            <td><code>shell/src/graph.rs</code></td>
+            <td>GPUI <code>canvas()</code>, <code>PathBuilder</code> Bézier arcs, <code>ROW_H = 22.0</code>.</td>
+          </tr>
+          <tr>
+            <td><strong>Diff Calculation</strong></td>
+            <td><code>core/src/differ.rs</code>, <code>core/src/align.rs</code></td>
+            <td>Histogram differ, hunk assembly, word-level intraline pairing.</td>
+          </tr>
+          <tr>
+            <td><strong>Diff View Rendering</strong></td>
+            <td><code>shell/src/views/diff.rs</code></td>
+            <td>Unified diff rendering, line numbers gutter, intraline token spans.</td>
+          </tr>
+          <tr>
+            <td><strong>Window Chrome</strong></td>
+            <td><code>shell/src/chrome.rs</code></td>
+            <td>macOS titlebar inset, traffic light handling, window resize.</td>
+          </tr>
+          <tr>
+            <td><strong>Command Dispatch</strong></td>
+            <td><code>core/src/command.rs</code>, <code>shell/src/dispatch.rs</code></td>
+            <td>Maps keystrokes to command names; executes actions via <code>Repo</code> trait.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+  // ------------------- Navigation & Tab Switching -------------------
+  function switchGuideTab(tabId) {
+    document.querySelectorAll('.guide-tab-btn').forEach(btn => btn.classList.remove('active'));
+    document.querySelectorAll('.guide-view').forEach(view => view.classList.remove('active'));
+
+    const activeBtn = Array.from(document.querySelectorAll('.guide-tab-btn')).find(b => b.getAttribute('onclick').includes(tabId));
+    if (activeBtn) activeBtn.classList.add('active');
+
+    const targetView = document.getElementById('view-' + tabId);
+    if (targetView) targetView.classList.add('active');
+    if (window.history && window.history.replaceState) {
+      window.history.replaceState(null, '', '#' + tabId);
+    }
+  }
+
+  // Check URL query param and hash immediately
+  function applyHashOrParam() {
+    const params = new URLSearchParams(window.location.search);
+    const paramTab = params.get('tab');
+    const hashTab = window.location.hash.replace('#', '');
+    const tab = paramTab || hashTab;
+    if (tab && ['mockup', 'blueprint', 'tokens', 'keyboard', 'architecture'].includes(tab)) {
+      switchGuideTab(tab);
+    }
+  }
+  applyHashOrParam();
+  window.addEventListener('hashchange', applyHashOrParam);
+
+  // ------------------- Blueprint Annotation Overlay -------------------
+  let annotationsOn = false;
+  function toggleAnnotations() {
+    annotationsOn = !annotationsOn;
+    const btn = document.getElementById('btn-annotations');
+    const win = document.getElementById('app-window');
+    if (annotationsOn) {
+      btn.innerText = 'Annotations: On';
+      btn.classList.add('active');
+      win.classList.add('blueprint-active');
+    } else {
+      btn.innerText = 'Annotations: Off';
+      btn.classList.remove('active');
+      win.classList.remove('blueprint-active');
+    }
+  }
+
+  // ------------------- Theme Switching -------------------
+  function changeTheme(theme) {
+    document.body.className = '';
+    if (theme === 'slate') document.body.classList.add('theme-slate');
+    if (theme === 'light') document.body.classList.add('theme-light');
+  }
+
+  // ------------------- Accent Color Cycling -------------------
+  const accents = [
+    { name: 'Amber', hex: '#dfa851' },
+    { name: 'Sky Blue', hex: '#6f9ecf' },
+    { name: 'Lavender', hex: '#a983c9' },
+    { name: 'Teal', hex: '#5fa8a0' },
+    { name: 'Coral', hex: '#c97d6f' },
+    { name: 'Olive', hex: '#8fb35e' }
+  ];
+  let accentIdx = 0;
+  function cycleAccent() {
+    accentIdx = (accentIdx + 1) % accents.length;
+    const accent = accents[accentIdx];
+    document.documentElement.style.setProperty('--c-accent', accent.hex);
+    document.documentElement.style.setProperty('--lane-0', accent.hex);
+    const tag = document.querySelector('.accent-tag span:last-child');
+    if (tag) tag.innerText = accent.name.toLowerCase() + ' ▾';
+  }
+
+  // ------------------- Pane Focus Handling -------------------
+  function focusPane(paneId) {
+    document.querySelectorAll('.pane').forEach(p => p.classList.remove('focused'));
+    const target = document.getElementById('pane-' + paneId);
+    if (target) target.classList.add('focused');
+  }
+
+  // ------------------- File Selection -------------------
+  const fileDiffs = {
+    'commit.go': {
+      title: 'internal/ai/commit.go',
+      adds: '+34',
+      dels: '-2',
+      hunk: '@@ -12,8 +12,14 @@ func SynthesizeCommit(diff *Diff) string {',
+      explanation: 'Generates structured Conventional Commit messages using local heuristic models when offline, falling back to streaming API when connected.'
+    },
+    'pool.go': {
+      title: 'internal/extension/pool.go',
+      adds: '+118',
+      dels: '-0',
+      hunk: '@@ -0,0 +1,48 @@ package extension',
+      explanation: 'New worker pool isolating concurrent extension dispatches with bounded goroutines and token budget pre-allocation.'
+    },
+    'host.go': {
+      title: 'internal/extension/host.go',
+      adds: '+18',
+      dels: '-6',
+      hunk: '@@ -41,9 +41,11 @@ func (h *Host) Dispatch(ev Event) error {',
+      explanation: 'The goroutine became a pool submission, so a dispatch failure now surfaces to the caller instead of dying silently in the background. The budget check moved into the same guard as Handles — which means an exhausted budget skips the extension quietly rather than erroring. Worth confirming that is the intent.'
+    },
+    'budget.go': {
+      title: 'internal/extension/budget.go',
+      adds: '+14',
+      dels: '-8',
+      hunk: '@@ -22,6 +22,8 @@ func (b *Budget) Exhausted() bool {',
+      explanation: 'Adds atomic token decrement tracking to prevent runaway LLM context consumption during multi-file diff analyses.'
+    },
+    'extensions.md': {
+      title: 'docs/extensions.md',
+      adds: '+62',
+      dels: '-0',
+      hunk: '@@ -0,0 +1,24 @@ # Extension Architecture',
+      explanation: 'Architecture document defining the zero-overhead boundary between core algorithms and third-party AI assistants.'
+    }
+  };
+
+  function selectFile(el, fileKey) {
+    document.querySelectorAll('.file-item').forEach(f => f.classList.remove('selected'));
+    el.classList.add('selected');
+
+    const data = fileDiffs[fileKey] || fileDiffs['host.go'];
+    const titleEl = document.getElementById('diff-file-title');
+    if (titleEl) titleEl.innerText = data.title;
+
+    const hunkBar = document.querySelector('.diff-hunk-bar');
+    if (hunkBar) hunkBar.innerText = data.hunk;
+
+    const explainText = document.getElementById('ai-card-text');
+    if (explainText) explainText.innerText = data.explanation;
+
+    const addsEl = document.querySelector('.stat-adds');
+    if (addsEl) addsEl.innerText = data.adds;
+    const delsEl = document.querySelector('.stat-dels');
+    if (delsEl) delsEl.innerText = data.dels;
+
+    focusPane(5);
+  }
+
+  // ------------------- Commit Selection -------------------
+  function selectCommit(el, hash) {
+    document.querySelectorAll('.commit-row').forEach(r => r.classList.remove('selected'));
+    el.classList.add('selected');
+    focusPane(4);
+  }
+
+  // ------------------- Modals (Ask & Extensions) -------------------
+  function openAskModal() {
+    closeModals();
+    document.getElementById('modal-ask').classList.add('show');
+  }
+  function openHelpModal() {
+    closeModals();
+    const modal = document.getElementById('modal-help');
+    if (modal) modal.classList.add('show');
+  }
+  function openExtensionsModal() {
+    closeModals();
+    document.getElementById('modal-extensions').classList.add('show');
+  }
+  function closeModals() {
+    document.querySelectorAll('.mock-modal').forEach(m => m.classList.remove('show'));
+  }
+
+  // ------------------- Keymap Mode (Lazygit vs Mockup) -------------------
+  let keymapMode = 'lazygit';
+  function setKeymapMode(mode) {
+    keymapMode = mode;
+    const kFiles = document.getElementById('keycap-files');
+    const kBranches = document.getElementById('keycap-branches');
+    const kStash = document.getElementById('keycap-stash');
+    const kCommits = document.getElementById('keycap-commits');
+    const kDiff = document.getElementById('keycap-diff');
+    const kStatus = document.getElementById('keycap-status');
+
+    if (mode === 'lazygit') {
+      if (kFiles) kFiles.innerText = '2';
+      if (kBranches) kBranches.innerText = '3';
+      if (kCommits) kCommits.innerText = '4';
+      if (kStash) kStash.innerText = '5';
+      if (kDiff) kDiff.innerText = '0';
+      if (kStatus) kStatus.style.display = 'inline-flex';
+    } else {
+      if (kFiles) kFiles.innerText = '1';
+      if (kBranches) kBranches.innerText = '2';
+      if (kStash) kStash.innerText = '3';
+      if (kCommits) kCommits.innerText = '4';
+      if (kDiff) kDiff.innerText = '5';
+      if (kStatus) kStatus.style.display = 'none';
+    }
+  }
+
+  function toggleExplain() {
+    const card = document.getElementById('ai-card');
+    card.style.display = (card.style.display === 'none') ? 'block' : 'none';
+  }
+
+  function showFeedback(text) {
+    const sb = document.querySelector('.statusbar-right');
+    if (!sb) return;
+    const orig = sb.innerText;
+    sb.innerText = text;
+    sb.style.color = 'var(--c-accent)';
+    setTimeout(() => {
+      sb.innerText = orig;
+      sb.style.color = 'var(--c-ghost)';
+    }, 1500);
+  }
+
+  function handleKeyHint(action) {
+    if (action === 'ask') openAskModal();
+    else if (action === 'extensions') openExtensionsModal();
+    else if (action === 'explain') toggleExplain();
+    else if (action === 'stage') {
+      toggleStageCurrent();
+    }
+  }
+
+  function toggleStageCurrent() {
+    const selectedFile = document.querySelector('.file-item.selected');
+    if (selectedFile) {
+      const flag = selectedFile.querySelector('.status-flag');
+      if (flag) {
+        if (flag.classList.contains('status-m-unstaged')) {
+          flag.className = 'status-flag status-m-staged';
+          showFeedback('Staged 1 file');
+        } else if (flag.classList.contains('status-m-staged')) {
+          flag.className = 'status-flag status-m-unstaged';
+          showFeedback('Unstaged 1 file');
+        }
+      }
+    }
+  }
+
+  let currentFocusedPane = 5;
+  let previousFocusedPane = 1;
+
+  const origFocusPane = focusPane;
+  focusPane = function(paneId) {
+    if (currentFocusedPane !== paneId) {
+      previousFocusedPane = currentFocusedPane;
+      currentFocusedPane = paneId;
+    }
+    origFocusPane(paneId);
+  };
+
+  // ------------------- Complete lazygit Keyboard Dispatcher -------------------
+  window.addEventListener('keydown', (e) => {
+    // If modal open, Escape closes it
+    if (e.key === 'Escape') {
+      const openModal = document.querySelector('.mock-modal.show');
+      if (openModal) {
+        closeModals();
+        return;
+      }
+      // If focused in Diff, Esc exits back to the list stack! (lazygit behavior)
+      if (currentFocusedPane === 5) {
+        focusPane(previousFocusedPane || 1);
+        return;
+      }
+      return;
+    }
+
+    // ⌘K opens ask modal
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+      e.preventDefault();
+      openAskModal();
+      return;
+    }
+
+    // If an input is focused, don't hijack keys
+    if (document.activeElement && document.activeElement.tagName === 'INPUT') return;
+
+    // lazygit panel numbers (1..5)
+    if (keymapMode === 'lazygit') {
+      if (e.key === '1') { focusPane(1); showFeedback('[1] Status'); }
+      else if (e.key === '2') { focusPane(1); showFeedback('[2] Files'); }
+      else if (e.key === '3') { focusPane(1); showFeedback('[3] Branches'); }
+      else if (e.key === '4') { focusPane(4); showFeedback('[4] Commits'); }
+      else if (e.key === '5') { focusPane(1); showFeedback('[5] Stash'); }
+      else if (e.key === '0' || e.key === 'Enter') {
+        e.preventDefault();
+        focusPane(5);
+        showFeedback('[0] Diff Focus');
+      }
+    } else {
+      // Mockup 1..5 direct mapping
+      if (e.key === '1') focusPane(1);
+      else if (e.key === '2') focusPane(1);
+      else if (e.key === '3') focusPane(1);
+      else if (e.key === '4') focusPane(4);
+      else if (e.key === '5') focusPane(5);
+    }
+
+    // Pane left / right walk (h / l or Left / Right)
+    if (e.key === 'h' || e.key === 'ArrowLeft') {
+      if (currentFocusedPane === 5) focusPane(4);
+      else if (currentFocusedPane === 4) focusPane(1);
+    } else if (e.key === 'l' || e.key === 'ArrowRight') {
+      if (currentFocusedPane === 1) focusPane(4);
+      else if (currentFocusedPane === 4) focusPane(5);
+    }
+
+    // Up / Down item selection (j / k or Down / Up)
+    if (e.key === 'j' || e.key === 'ArrowDown') {
+      if (currentFocusedPane === 4) {
+        const rows = Array.from(document.querySelectorAll('.commit-row'));
+        const selIdx = rows.findIndex(r => r.classList.contains('selected'));
+        if (selIdx >= 0 && selIdx < rows.length - 1) {
+          selectCommit(rows[selIdx + 1], 'next');
+        }
+      } else if (currentFocusedPane === 1) {
+        const files = Array.from(document.querySelectorAll('.file-item'));
+        const selIdx = files.findIndex(f => f.classList.contains('selected'));
+        if (selIdx >= 0 && selIdx < files.length - 1) {
+          files[selIdx + 1].click();
+        }
+      }
+    } else if (e.key === 'k' || e.key === 'ArrowUp') {
+      if (currentFocusedPane === 4) {
+        const rows = Array.from(document.querySelectorAll('.commit-row'));
+        const selIdx = rows.findIndex(r => r.classList.contains('selected'));
+        if (selIdx > 0) {
+          selectCommit(rows[selIdx - 1], 'prev');
+        }
+      } else if (currentFocusedPane === 1) {
+        const files = Array.from(document.querySelectorAll('.file-item'));
+        const selIdx = files.findIndex(f => f.classList.contains('selected'));
+        if (selIdx > 0) {
+          files[selIdx - 1].click();
+        }
+      }
+    }
+
+    // Space: context-aware stage / checkout
+    if (e.key === ' ') {
+      e.preventDefault();
+      toggleStageCurrent();
+    }
+
+    // c: commit prompt
+    if (e.key === 'c' && !e.metaKey && !e.ctrlKey) {
+      openAskModal();
+    }
+
+    // a: stage all
+    if (e.key === 'a' && !e.metaKey && !e.ctrlKey) {
+      showFeedback('All files staged');
+    }
+
+    // P: push
+    if (e.key === 'P') {
+      showFeedback('Pushing to origin/main...');
+    }
+
+    // p: pull
+    if (e.key === 'p') {
+      showFeedback('Pulling latest from upstream...');
+    }
+
+    // f: fetch
+    if (e.key === 'f') {
+      showFeedback('Fetching remotes...');
+    }
+
+    // R: refresh
+    if (e.key === 'R') {
+      showFeedback('Refreshed git repository state');
+    }
+
+    // y: yank/copy
+    if (e.key === 'y') {
+      showFeedback('Copied to clipboard');
+    }
+
+    // ?: open help cheat sheet
+    if (e.key === '?') {
+      openHelpModal();
+    }
+
+    // e: toggle AI hunk explanation
+    if (e.key === 'e') {
+      toggleExplain();
+    }
+
+    // x: open extensions
+    if (e.key === 'x') {
+      openExtensionsModal();
+    }
+  });
+</script>
+</body>
+</html>
