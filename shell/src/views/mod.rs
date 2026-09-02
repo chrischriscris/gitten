@@ -11,25 +11,41 @@ use gpui_component::scroll::{Scrollbar, ScrollbarAxis, ScrollbarHandle};
 use std::cell::Cell;
 use std::rc::Rc;
 
-/// Gitten's scrollbar geometry: one quiet, square bar against the container's
-/// edge, rather than gpui-component's narrow thumb inset inside a wider track.
+/// Gitten's desktop scrollbar geometry: a quiet overlay pill inset inside the
+/// pane edge, narrow at rest and wider under the pointer — the platform shape
+/// without platform-specific scroll machinery.
 ///
-/// Keep this beside the shared handle adapter so every built-in pane gets the
-/// same furniture. The library still owns painting, hit testing and dragging;
-/// this only supplies the presentation it deliberately exposes as data.
+/// The library still owns visibility, animation, painting, hit testing and
+/// dragging. These styles only keep the full hit target invisible and shape the
+/// thumb inside it. Keep the track width beside the shared handle adapter so
+/// every built-in pane reserves the same right-edge furniture.
 ///
-/// The scrollbar's track — and thumb, the two are one square bar — in px.
-///
-/// The one number right-edge furniture in a scrollable pane must agree with:
-/// the track overlays the panes' right edge, so every section count, drift
-/// count and clock that ends a row reserves exactly this much, by taking
-/// this constant rather than spelling its own pixels beside it.
+/// The invisible hit track, in px. Right-edge counts and clocks reserve this
+/// exact width while the visible thumb sits inside it.
 pub(crate) const SCROLLBAR_TRACK_W: f32 = 8.0;
+const SCROLLBAR_THUMB_W: f32 = 4.0;
+const SCROLLBAR_THUMB_INSET: f32 = 2.0;
+const SCROLLBAR_ACTIVE_W: f32 = 6.0;
+const SCROLLBAR_ACTIVE_INSET: f32 = 1.0;
 
 fn scrollbar<H: ScrollbarHandle + Clone>(handle: &H, axis: ScrollbarAxis) -> Scrollbar {
     Scrollbar::new(handle).axis(axis).styles(|s| {
         s.track(|s| s.width(px(SCROLLBAR_TRACK_W)))
-            .thumb(|s| s.width(px(SCROLLBAR_TRACK_W)).inset(px(0.)).radius(px(0.)))
+            .thumb(|s| {
+                s.width(px(SCROLLBAR_THUMB_W))
+                    .inset(px(SCROLLBAR_THUMB_INSET))
+                    .radius(px(SCROLLBAR_THUMB_W / 2.0))
+            })
+            .thumb_hover(|s| {
+                s.width(px(SCROLLBAR_ACTIVE_W))
+                    .inset(px(SCROLLBAR_ACTIVE_INSET))
+                    .radius(px(SCROLLBAR_ACTIVE_W / 2.0))
+            })
+            .thumb_active(|s| {
+                s.width(px(SCROLLBAR_ACTIVE_W))
+                    .inset(px(SCROLLBAR_ACTIVE_INSET))
+                    .radius(px(SCROLLBAR_ACTIVE_W / 2.0))
+            })
     })
 }
 

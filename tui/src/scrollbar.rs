@@ -7,10 +7,10 @@
 //!
 //! # It rides the container's edge
 //!
-//! The caller hands [`paint`] the cells around the pane's edge. At a divider
-//! the thumb is `▐▌`: the right half of the last inside cell and the left half
-//! of the divider cell, one cell wide with its right edge exactly on the rule.
-//! At the screen edge it is one full cell. That is lazygit's geometry.
+//! The caller hands [`paint`] the cells around the pane's edge. The thumb is
+//! `▐`: the right half of the pane's last cell. At a divider it sits immediately
+//! inside the existing rule without repainting that rule; at the screen edge its
+//! right edge is flush with the terminal.
 //!
 //! It overlays those cells rather than reserving one: reserving a column is a
 //! different wrap, a different row count, and therefore a different scrollbar.
@@ -38,12 +38,12 @@
 //! # Half rows
 //!
 //! A terminal moves a thumb in whole cells, but a cell is not the finest block
-//! the grid can draw: `▀` and `▄` each paint half of a cell, so the
-//! thumb is computed by the same [`Viewport::thumb`] arithmetic over a track
-//! twice as tall and lands between two rows where that is where it belongs.
-//! The bar is a coordinate, and twice the resolution is twice the reading.
-//! And the floor holds: a thumb never travels less than a cell, so the finer
-//! position never becomes a smaller thumb.
+//! the grid can draw: `▝` and `▗` paint the upper-right and lower-right quarters,
+//! so the thumb is computed by the same [`Viewport::thumb`] arithmetic over a
+//! track twice as tall and lands between two rows where that is where it belongs.
+//! The bar is a coordinate, and twice the resolution is twice the reading. And
+//! the floor holds: a thumb never travels less than a cell, so the finer position
+//! never becomes a smaller thumb.
 //!
 //! # Nothing when there is nothing to say
 //!
@@ -68,7 +68,7 @@ pub struct Bar {
     pub thumb: char,
     /// The thumb's upper and lower half, when the alphabet can draw them.
     ///
-    /// `Some(('▀', '▄'))` lets the thumb land between two rows, which is
+    /// `Some(('▝', '▗'))` lets the thumb land between two rows, which is
     /// where it usually is — see *Half rows* above. `None` rounds back to
     /// whole rows: [`Bar::ascii`], or an alphabet without the glyphs, draws
     /// exactly the bar this module always drew.
@@ -96,21 +96,18 @@ impl Default for Bar {
 }
 
 impl Bar {
-    /// The shipped set: a solid thumb and no track, at the container's edge.
+    /// The shipped set: a right-half-cell thumb and no track, flush with the
+    /// container's edge.
     ///
-    /// This is lazygit's shape: the thumb is the only mark. On a divider the
-    /// pane's existing rule remains visible above and below it; at the screen's
-    /// edge nothing invents a second line through otherwise empty space.
+    /// At a divider the thumb stays in the pane's last cell and leaves the
+    /// existing rule intact. At the screen edge its right side lands exactly on
+    /// the terminal edge.
     pub fn block() -> Self {
         Self {
             track: None,
-            thumb: '█',
-            halves: Some(('▀', '▄')),
-            boundary: Some(Boundary {
-                whole: ('▐', '▌'),
-                upper: ('▝', '▘'),
-                lower: ('▗', '▖'),
-            }),
+            thumb: '▐',
+            halves: Some(('▝', '▗')),
+            boundary: None,
         }
     }
 
@@ -166,11 +163,11 @@ impl Bar {
 /// Draws the bar for `view` down column `x`, over the rows `y..y + height`.
 ///
 /// `x` is the last cell inside the pane. `divider` is the next cell when there
-/// is one; together their facing halves make the edge-aligned thumb. See *It
-/// rides the container's edge* above. A
-/// no-op when the config file says no, when the list fits, or when the view
-/// has not been given a height yet. Costs one `over` per visible row and
-/// allocates nothing.
+/// is one; an extension supplying [`Boundary`] glyphs can span both cells, while
+/// the built-in bar draws flush against the pane edge in column `x`. See *It
+/// rides the container's edge* above. A no-op when the config file says no,
+/// when the list fits, or when the view has not been given a height yet. Costs
+/// one `over` per visible row and allocates nothing.
 pub fn paint(
     screen: &mut Screen,
     bar: Bar,
@@ -236,7 +233,7 @@ mod tests {
         }
         let v = view(100, 10);
         paint(&mut screen, Bar::block(), 19, None, 1, &v, &host);
-        assert_eq!(screen.char_at(19, 1), Some('█'), "the thumb is at the top");
+        assert_eq!(screen.char_at(19, 1), Some('▐'), "the thumb is at the top");
         assert_eq!(
             screen.char_at(19, 9),
             Some(' '),
@@ -295,12 +292,12 @@ mod tests {
         );
         assert_eq!(
             screen.char_at(19, 5),
-            Some('▄'),
+            Some('▗'),
             "the thumb's first half row is the bottom of cell 4"
         );
         assert_eq!(
             screen.char_at(19, 6),
-            Some('▀'),
+            Some('▝'),
             "the thumb's last half row is the top of cell 5"
         );
         assert_eq!(
@@ -339,7 +336,7 @@ mod tests {
         let mut screen = Screen::new(20, 12);
         screen.clear(Ink::new(0xffffff, 0x000000));
         paint(&mut screen, Bar::block(), 19, None, 1, &v, &host);
-        assert_eq!(screen.char_at(19, 10), Some('█'), "the last row whole");
+        assert_eq!(screen.char_at(19, 10), Some('▐'), "the last row whole");
         assert_eq!(screen.char_at(19, 9), Some(' '), "no track above it");
     }
 }

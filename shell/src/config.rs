@@ -14,7 +14,7 @@ pub use gitten_app::config::{load, watch};
 
 use gitten_core::host::Host;
 use gitten_core::theme::Rgb;
-use gpui::{px, App, Global, Hsla};
+use gpui::{App, Global, Hsla};
 use std::path::Path;
 use std::rc::Rc;
 
@@ -86,19 +86,14 @@ pub fn host(cx: &App) -> Rc<Host> {
 /// it: `gpui_component`'s scrollbars.
 ///
 /// `gpui_component::init` sets its theme to **Light** and nothing here ever
-/// changed it, so the two scrollbars — the only widgets from that library the
-/// app uses — were painting a light track and an accent-coloured thumb over a
-/// 0x0e0d0c window. That is the objection `controls.rs` documents about
-/// `Popover`, except live and on screen.
+/// changed it, so its thumb used to paint an unrelated accent over gitten's
+/// palette. The track is explicitly transparent: an overlay scrollbar must
+/// preserve each row's own background rather than cut a dark rail through
+/// additions, removals and the cursor.
 ///
-/// Two writes per colour, because the library reads the track off `ThemeColor`
-/// and the thumb off `ThemeTokens`, and one of those without the other is half a
-/// scrollbar in the wrong palette. `sync_base` is what pushes any of it down to
-/// the layer that actually paints — see its own documentation; writing the
-/// fields alone does nothing.
-///
-/// Called again on every config reload, so a scrollbar follows a saved
-/// `gitten.toml` the way every other colour in the window does.
+/// The library reads the track off `ThemeColor` and the thumb off both
+/// `ThemeColor` and `ThemeTokens`; `Theme::sync_base` is what reaches the
+/// painted layer. Called on startup and every config reload.
 pub fn sync_widgets(host: &Host, cx: &mut App) {
     let c = host.theme.chrome;
     let hsla = |v: Rgb| Hsla::from(gpui::rgb(v));
@@ -107,15 +102,11 @@ pub fn sync_widgets(host: &Host, cx: &mut App) {
     // defensible rather than white.
     gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
     let t = gpui_component::Theme::global_mut(cx);
-    // The track is the window: a scrollbar should be a thumb over the content,
-    // not a channel drawn beside it.
-    t.scrollbar = hsla(c.bg);
+    // An overlay, not a channel: the row's own background continues underneath.
+    t.scrollbar = gpui::transparent_black();
     t.scrollbar_thumb = hsla(c.faint);
     t.scrollbar_thumb_hover = hsla(c.dim);
     t.tokens.scrollbar_thumb = hsla(c.faint).into();
     t.tokens.scrollbar_thumb_hover = hsla(c.dim).into();
-    // 2px, matching the controls in the title bar. The library's default is its
-    // own radius and reads as a different app's widget.
-    t.radius = px(2.);
     gpui_component::Theme::sync_base(cx);
 }

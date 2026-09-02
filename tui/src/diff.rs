@@ -1367,7 +1367,7 @@ mod tests {
             "the pane painted a bar into its own last column"
         );
         d.paint_bar(&mut screen, 119, None, 1, &host);
-        assert_eq!(screen.char_at(119, 1), Some('█'));
+        assert_eq!(screen.char_at(119, 1), Some('▐'));
         assert_eq!(
             screen.ink(119, 1).unwrap().bg,
             screen.ink(118, 1).unwrap().bg,

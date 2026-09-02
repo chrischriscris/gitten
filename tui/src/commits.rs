@@ -1265,12 +1265,12 @@ r\x1fr\x1f\x1fA\x1f1\x1froot\x1e";
         let under = screen.ink(49, 1).unwrap().bg;
         let divider_under = screen.ink(50, 1).unwrap().bg;
         // The app overlays the bar on the pane's last cell, whose right edge
-        // meets the divider, and keeps the row's background underneath it.
+        // meets the divider, and keeps that divider and both backgrounds intact.
         c.paint_bar(&mut screen, 49, Some(50), 1, &host);
         assert_eq!(
             screen.char_at(49, 1),
             Some('▐'),
-            "the bar's inner half is missing"
+            "the bar's edge half is missing"
         );
         assert_eq!(
             screen.ink(49, 1).unwrap().bg,
@@ -1279,8 +1279,8 @@ r\x1fr\x1f\x1fA\x1f1\x1froot\x1e";
         );
         assert_eq!(
             screen.char_at(50, 1),
-            Some('▌'),
-            "the bar's divider half is missing"
+            Some('╎'),
+            "the bar repainted the divider"
         );
         assert_eq!(
             screen.ink(50, 1).unwrap().bg,
