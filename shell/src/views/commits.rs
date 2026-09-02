@@ -1,4 +1,4 @@
-use super::{accept_deferred_scroll, DeferredScrollbar, PendingScroll};
+use super::{accept_deferred_scroll, vertical_scrollbar, DeferredScrollbar, PendingScroll};
 use crate::chrome;
 use crate::graph;
 use gitten_core::host::Host;
@@ -8,7 +8,6 @@ use gitten_core::view::Viewport;
 use gitten_core::{assign_lanes, initials, Commit};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
-use gpui_component::scroll::Scrollbar;
 use std::cell::Cell;
 use std::rc::Rc;
 
@@ -793,7 +792,7 @@ impl Render for Commits {
             .size_full()
             .child(list)
             .when(bars, |d| {
-                d.child(Scrollbar::vertical(&DeferredScrollbar::new(
+                d.child(vertical_scrollbar(&DeferredScrollbar::new(
                     &self.scroll,
                     &self.pending_scroll,
                 )))

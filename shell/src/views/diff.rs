@@ -2216,9 +2216,8 @@ impl Render for Diff {
                     &self.pending_scroll,
                 )))
                 .child(horizontal_scrollbar(&self.pan))
-                // The hunk ticks, last so they ride on the track the widget
-                // paints — an opaque channel of the window's background, which
-                // would cover a strip painted before it. Only when there is a
+                // The hunk ticks, last so they share the scrollbar's strip and
+                // remain visible above its overlaid thumb. Only when there is a
                 // track to mark: a diff that fits the pane is one the widget
                 // draws no bar on.
                 .when(

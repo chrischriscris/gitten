@@ -31,16 +31,17 @@ the wheel's, and the bar is the one thing on screen that says where in a
 714k-row diff you are — at half-cell resolution, never smaller than a cell of
 ink.
 
-**Where it sits** (corrected after looking at the cell geometry next to
-lazygit's): at an internal boundary the block is `▐▌` — the right half of the
-pane's last cell and the left half of the divider cell. Together they are one
-cell wide and their right edge lands exactly on the divider's centred rule. A
-whole block in either cell alone is wrong: inside leaves half a cell black;
-outside straddles the boundary. At the screen edge, where no divider cell
-exists, the block fills the last cell. The overlay costs no reflow for the
-reason 0022 stated: with wrapping on nothing reaches that column, and with
-wrapping off the line is being scrolled sideways underneath it. The pane
-paints itself; the edge geometry is the paint loop's.
+**Where it sits**: the thumb is `▐` — the right half of the pane's last content
+cell. At an internal boundary it sits immediately inside the existing rule
+without repainting or distorting that rule; at the screen edge its right edge
+is flush with the terminal boundary. (An earlier design straddled `▐▌` across
+the pane and divider cells, but painting into the divider column overwrote the
+centred rule `│` / `╎`; keeping the thumb inside the pane preserves both the
+rule and row backgrounds cleanly.) At fractional rows, `▝` and `▗` provide
+half-cell vertical resolution. The overlay costs no reflow for the reason 0022
+stated: with wrapping on nothing reaches that column, and with wrapping off the
+line is being scrolled sideways underneath it. The pane paints itself; the edge
+geometry is the paint loop's.
 
 The window keeps its draggable bar. That is a difference between the doors,
 not a gap in this one — the same kind `split.rs` already documents for

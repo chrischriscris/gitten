@@ -1208,7 +1208,7 @@ mod tests {
         assert_eq!(
             screen.char_at(39, 0),
             Some('▐'),
-            "the bar's inner half is missing"
+            "the bar's edge half is missing"
         );
         assert_eq!(
             screen.char_at(39, 5),
@@ -1227,8 +1227,8 @@ mod tests {
         );
         assert_eq!(
             screen.char_at(40, 0),
-            Some('▌'),
-            "the divider half is missing"
+            Some(' '),
+            "the bar painted into the divider"
         );
         assert_eq!(
             screen.ink(40, 0).unwrap().bg,
