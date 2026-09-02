@@ -77,9 +77,9 @@ impl Font {
     /// box-drawing rule the Markdown presentation draws.
     ///
     /// `advance` is measured, not guessed: 600 units on a 1000-unit em, so 0.6
-    /// exactly. At 14 px that is 8.4 px, which is the same number Menlo was
-    /// giving — Menlo's own ratio is 0.602 — so nothing that depended on the old
-    /// constant had to move.
+    /// exactly. At 14px this gives 8.4px — the same number the old Menlo
+    /// constant was measured at, which is why changing the family did not move
+    /// the graph.
     pub fn jetbrains_mono() -> Self {
         Self {
             family: "JetBrainsMono Nerd Font Mono".into(),

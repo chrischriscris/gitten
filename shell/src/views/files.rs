@@ -955,7 +955,7 @@ impl Render for Files {
                             // this id (plan 045); `chrome::list_row` has none.
                             .cursor_pointer()
                             .when(i != cursor, |r| {
-                                r.hover(|s| s.bg(rgb(host.theme.chrome.raised)))
+                                r.hover(|s| s.bg(rgb(host.theme.chrome.fg).alpha(0.03)))
                             })
                             .on_mouse_down(MouseButton::Right, {
                                 let this = this.clone();
@@ -1020,13 +1020,11 @@ fn row(e: &Entry, host: &Host, current: bool, focused: bool, armed: bool) -> Div
             .child(
                 div()
                     .flex_none()
-                    // One character of air *inside* the column — the gap is
-                    // part of it, the way commits.rs sizes WHO_CHARS — so a
-                    // conflict's `UU`, the widest pair git puts here, does
-                    // not weld itself to the path it belongs to. Single
-                    // letters keep the air they had by accident; now every
-                    // state has it by rule.
-                    .w(px((STATUS_CHARS + 1.0) * ch))
+                    // Half a character of air lives inside the status column:
+                    // enough to part a conflict's `UU`, the widest pair git
+                    // puts here, from its path without turning the two-letter
+                    // flag into a wide gutter of its own.
+                    .w(px((STATUS_CHARS + 0.5) * ch))
                     // The error colour is already this palette's "this row
                     // ends work" foreground — conflicts draw their letters
                     // with it — so the armed tint spends nothing new.
@@ -1058,6 +1056,7 @@ fn row(e: &Entry, host: &Host, current: bool, focused: bool, armed: bool) -> Div
                         } else {
                             Surface::Context
                         },
+                        false,
                     ),
                 }),
             )

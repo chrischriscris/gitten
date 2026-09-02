@@ -25,10 +25,9 @@
 //!
 //! This is also the only presentation whose column budget differs per row, and
 //! [`Metrics::budget`] is why: a bar, three levels of indent and a bullet are
-//! real pixels, and an 18px heading in a 14px body holds a fifth fewer
-//! characters. The *policy* — which block costs what, which rows keep their
-//! grid whole — is core's; this file turns the semantic furniture into pixels
-//! and the budget into a number.
+//! real pixels, and a larger heading holds fewer characters. The *policy* —
+//! which block costs what and which rows keep their grid whole — is core's;
+//! this file turns the semantic furniture into pixels and the budget into a number.
 //!
 //! A table is the exception to all of it. Its grid is aligned character by
 //! character with the rows around it, so a break at a column shears it — and not
@@ -126,8 +125,8 @@ impl Metrics {
     /// draw outside its row.
     pub fn for_font(font: &gitten_core::font::Font) -> Self {
         // A glyph needs roughly 1.2x its point size of line box, so this is the
-        // largest a row can hold. At the default 14px body size it lands at 18px,
-        // which is where the scale was pinned when it was a constant.
+        // largest a row can hold. At the default 15px body size it lands near
+        // 18px, which is where the scale was pinned when it was a constant.
         let ceiling = ROW_H / 1.2;
         let scale = [1.30, 1.18, 1.07, 1.0, 1.0, 1.0];
         let mut heading = [font.size; 6];
@@ -1297,8 +1296,8 @@ diff --git a/a.md b/a.md
     #[test]
     fn a_heading_gets_fewer_columns_than_the_body_it_sits_in() {
         // Nothing else in the app draws two type sizes in one list, and it is why
-        // the column budget is per row rather than per diff: an 18px heading in a
-        // 14px body holds a fifth fewer characters at the same width.
+        // the column budget is per row rather than per diff: a larger heading
+        // holds fewer characters at the same width.
         let (r, host) = reflowed(PROSE, 40);
         let heading = r.budget(Block::Heading(1), 800.0, &host);
         let body = r.budget(Block::Paragraph, 800.0, &host);

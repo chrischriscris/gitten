@@ -374,12 +374,8 @@ impl Keymap {
         bind(GLOBAL, "H", "view.left");
         bind(GLOBAL, "L", "view.right");
 
-        // The panel numbers read down the window's left stack, lazygit's
-        // order: 1 STATUS, 2 FILES, 3 BRANCHES, 4 COMMITS, 5 STASH — the
-        // stash under the commits, where parking ends a session's work. A
-        // direct jump is global so it works whatever is focused, and
-        // registered in that order, so 1 → 5 walks the stack top to bottom.
-        bind(GLOBAL, "1", "status.focus");
+        // lazygit's panel numbers, with the removed status slot left empty so
+        // another client is not silently renumbered by the desktop layout.
         bind(GLOBAL, "2", "files.focus");
         bind(GLOBAL, "3", "branches.focus");
         bind(GLOBAL, "4", "commits.focus");
@@ -468,14 +464,6 @@ impl Keymap {
         bind("diff", "space", "diff.stage-hunk");
         bind("diff", "u", "diff.unstage-hunk");
         bind("diff", "D", "diff.discard-hunk");
-        // The status pane's own key. Its rows are command names — pull,
-        // push, fetch, read from the same registry this map and the help
-        // overlay read — and enter runs the row the cursor is on: the same
-        // names the globals P/p/f run from anywhere, dispatched from data
-        // here rather than spelled a second time. The list vocabulary
-        // itself stays global, exactly as every other pane's is.
-        bind("status", "enter", "status.run");
-
         bind("commits", "enter", "commits.open-diff");
         bind("commits", "/", "commits.search");
         // Resetting to the commit under the keyboard, exactly lazygit's
@@ -1031,12 +1019,6 @@ impl Commands {
                 "carry on the cherry-pick in progress once conflicts are resolved",
                 None,
             ),
-            ("status.focus", "focus the status pane", None),
-            (
-                "status.run",
-                "run the verb the status pane's cursor is on",
-                Some("run"),
-            ),
             ("files.focus", "focus the working-tree pane", None),
             (
                 "files.stage",
@@ -1548,8 +1530,7 @@ mod tests {
             k.resolve(&modes, &keys("r")),
             Resolve::Run("commits.rebase-onto")
         );
-        // The panel jump is global, numbered by the pane layout in lazygit's
-        // order: 3 here, under status and files.
+        // The panel jump is global, numbered by lazygit's stable slots.
         assert_eq!(
             k.resolve(&Modes::new(), &keys("3")),
             Resolve::Run("branches.focus")
@@ -1583,7 +1564,7 @@ mod tests {
     fn the_stash_verbs_resolve_in_stashes_mode_and_focus_is_global() {
         let k = Keymap::builtin();
         // The direct jump works whatever is focused, like files.focus — 5
-        // here, the foot of the stack.
+        // here, at the foot of the stack.
         assert_eq!(
             k.resolve(&Modes::new(), &keys("5")),
             Resolve::Run("stashes.focus")

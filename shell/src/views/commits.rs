@@ -747,7 +747,7 @@ impl Render for Commits {
                     // has none.
                     .cursor_pointer()
                     .when(i != cursor, |r| {
-                        r.hover(|s| s.bg(rgb(host.theme.chrome.raised)))
+                        r.hover(|s| s.bg(rgb(host.theme.chrome.fg).alpha(0.03)))
                     })
                     .on_mouse_down(MouseButton::Right, {
                         let this = this.clone();

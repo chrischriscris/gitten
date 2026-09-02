@@ -3422,12 +3422,7 @@ mod tests {
         assert_eq!(app.panes.focused_name(), "diff");
         app.press(Key::plain(Code::Char('4')));
         assert_eq!(app.panes.focused_name(), "commits");
-        for (digit, name) in [
-            ('1', "status"),
-            ('2', "files"),
-            ('3', "branches"),
-            ('5', "stashes"),
-        ] {
+        for (digit, name) in [('2', "files"), ('3', "branches"), ('5', "stashes")] {
             app.press(Key::plain(Code::Char(digit)));
             assert_eq!(
                 app.panes.focused_name(),
