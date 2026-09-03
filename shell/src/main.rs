@@ -351,6 +351,41 @@ fn home() -> Option<&'static std::path::Path> {
     HOME.get_or_init(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
         .as_deref()
 }
+
+/// Two repository paths naming the same checkout: equal once canonicalised,
+/// or equal as written when one of them cannot be. The recent file and the
+/// window meet through this rather than through strings, because one side
+/// may have recorded a path whose symlink has since moved.
+fn same_project_path(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+/// What the path field's text means: trimmed, `~`-expanded, and resolved
+/// against the current repository's parent when relative — projects live
+/// beside each other far more often than under the launch directory — with
+/// the launch directory behind that when there is no parent to join.
+fn expand_project_path(text: &str, current: &std::path::Path) -> std::path::PathBuf {
+    let trimmed = text.trim();
+    let expanded = match trimmed.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => match home() {
+            Some(dir) => dir.join(rest.trim_start_matches('/')),
+            None => std::path::PathBuf::from(trimmed),
+        },
+        _ => std::path::PathBuf::from(trimmed),
+    };
+    if expanded.is_relative() {
+        let base = current
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| current.to_path_buf()));
+        base.join(expanded)
+    } else {
+        expanded
+    }
+}
 /// How long the commits cursor may keep moving before the main view loads the
 /// commit it settled on. A fast run through the list schedules one timer per
 /// row but only the newest request ever survives its guard to load — see
@@ -369,6 +404,12 @@ const EXTRA: &str =
   -w) and the theme (dark, light, slate, and whatever gitten.toml adds). `s`
   cycles the presentation, `w` the wrap and `T` the theme — all three through
   `[keys]` in gitten.toml, where `?` lists everything.
+
+  The repository title is itself a control: clicking it (or `o`) opens the
+  recent repositories to switch between in place, and `O` takes a path
+  instead; `Browse…` below the list opens the system file picker.
+  Switching re-reads every pane; the recent file lives beside the
+  session, not in gitten.toml.
 
   The file is re-read every time it is saved, and colours and font apply on the
   next frame — no rebuild, no relaunch.
@@ -401,6 +442,12 @@ enum Open {
     Wrap,
     Algorithm,
     Whitespace,
+    /// The recent-repositories menu hanging off the title: the MRU list plus
+    /// an `Open other…` row that trades the menu for the path field and a
+    /// `Browse…` row that trades it for the system file picker.
+    /// No strip trigger of its own — the repository title *is* the trigger —
+    /// so the tier budget never pays for a control that repeats the title.
+    Project,
     /// The composed tier's one trigger: five pickers' entries as sections
     /// of a single view menu, which needs an open state like any
     /// other and gets one variant rather than a second state machine.
@@ -461,6 +508,10 @@ enum Prompt {
     /// so a cursor move inside the field cannot re-aim it. The target is the
     /// pane registration name, same as [`Prompt::BranchName`].
     TagName { target: String, at: String },
+    /// A repository path gathered over the window: accepting switches the
+    /// whole window onto that repository in place. Opened by `project.open`
+    /// and by the project menu's `Open other…` row.
+    ProjectPath,
 }
 
 /// What an accepted [`Prompt::BranchName`] does with its text.
@@ -815,6 +866,33 @@ impl Screen {
             Screen::Custom(pane) => pane.label(cx),
         }
     }
+    /// Re-aims a screen at another repository, keeping its entity — and with
+    /// it the keyboard, the scroll and the focus — while the next refresh
+    /// wave re-acquires its rows. True when the screen is repository-bound
+    /// and now aims at `path`: lists without a source always are; a commits
+    /// or diff screen holding a patch or fixture source is not, and keeps
+    /// pointing where it was.
+    fn retarget(&mut self, path: &std::path::Path) -> bool {
+        match self {
+            Screen::Commits { source, .. } => match source {
+                Source::Repo { path: at, .. } => {
+                    *at = path.to_path_buf();
+                    true
+                }
+                _ => false,
+            },
+            Screen::Diff { source, .. } => match source.borrow_mut().as_mut() {
+                Some(Source::Repo { path: at, .. }) => {
+                    *at = path.to_path_buf();
+                    true
+                }
+                _ => false,
+            },
+            Screen::Files { .. } | Screen::Stashes { .. } | Screen::Branches { .. } => true,
+            Screen::Custom(_) => false,
+        }
+    }
+
     fn refresh(
         &self,
         target: Generation,
@@ -1476,6 +1554,23 @@ struct DevShell {
     /// Which axis the wheel gesture in flight belongs to. `gpui`'s own lock,
     /// held here — the one place that sees every wheel event first.
     ongoing: Cell<OngoingScroll>,
+    /// The project menu's rows, loaded when the menu opens and read while it
+    /// stands — never per frame, because reading them is file I/O and the
+    /// render path does none. Most-recent first; the current repository is
+    /// moved to the front at open time when the file does not name it.
+    projects: Vec<std::path::PathBuf>,
+    /// The session key the scroll position is saved under — the command that
+    /// produced the current view — and where it is saved. Both follow a
+    /// repository switch, so one periodic task serves every repository the
+    /// window ever sits on: it reads these fields per tick rather than
+    /// holding the startup values.
+    session_key: String,
+    session_path: std::path::PathBuf,
+    /// A saved row waiting for the switch's refresh wave to land. Set by
+    /// [`DevShell::switch_repo`] from the new repository's session file and
+    /// consumed by [`DevShell::finish_refresh`] once every pane holds new
+    /// rows — scrolling an empty list first would clamp the restore away.
+    pending_restore: Option<usize>,
 }
 
 fn action_file_section(section: views::files::Section) -> gitten_app::act::FileSection {
@@ -1840,6 +1935,10 @@ impl DevShell {
                 self.branch_named(&target, what, text)
             }
             (true, Some(Prompt::TagName { target, at })) => self.tag_named(&target, at, text),
+            // A repository path is spent only on accept. The switch validates
+            // before it moves anything, so a typo costs a sentence, never the
+            // window's contents.
+            (true, Some(Prompt::ProjectPath)) => self.project_path_entered(text, cx),
             _ => {}
         }
         cx.notify();
@@ -3185,6 +3284,14 @@ impl DevShell {
             } else {
                 self.refresh_error = None;
             }
+            // A repository switch saved its session row for this moment: the
+            // wave has landed, new rows are standing, and the cursor still
+            // sits where the old repository left it. Restored before the
+            // schedule below, so the main view loads the restored commit
+            // rather than row zero's.
+            if let Some(top) = self.pending_restore.take() {
+                self.restore_session_top(top, cx);
+            }
         }
         // A refresh may have re-anchored the commits cursor — the list it was
         // on changed under it — which is a selection change as far as the
@@ -3314,6 +3421,398 @@ impl DevShell {
         self.set_theme(next, cx);
     }
 
+    /// `project.switch`. Opens the recent-repositories menu off the title —
+    /// or closes it, when it is what is open. The rows are loaded here and
+    /// read while the menu stands, never per frame: reading them is file
+    /// I/O, and the render path does none.
+    fn toggle_project_menu(&mut self, cx: &mut Context<Self>) {
+        if self.open == Some(Open::Project) {
+            self.open = None;
+            self.pending.clear();
+            cx.notify();
+            return;
+        }
+        let Some((current, _)) = self.repo.clone() else {
+            self.set_notice("this view has no repository to switch from");
+            self.pending.clear();
+            return;
+        };
+        // Current first: the menu reads most-recent-first, and the window
+        // just touched this one. The file names what was opened; the window
+        // names where it is — a record that failed still gets its tick in
+        // its own menu.
+        let mut listed = vec![current];
+        for found in gitten_app::projects::load() {
+            if !listed.iter().any(|at| same_project_path(at, &found)) {
+                listed.push(found);
+            }
+        }
+        self.projects = listed;
+        self.open = Some(Open::Project);
+        self.pending.clear();
+        cx.notify();
+    }
+
+    /// `project.open`, and the project menu's `Open other…` row. A path
+    /// field over the window, starting from the current repository so a
+    /// sibling is a filename away; accepting switches, cancelling keeps.
+    fn begin_project_path(&mut self, cx: &mut Context<Self>) {
+        let Some((path, _)) = self.repo.clone() else {
+            self.set_notice("this view has no repository to switch from");
+            return;
+        };
+        self.open = None;
+        let start = path.to_string_lossy().to_string();
+        let input = cx.new(|cx| input::Input::new("project", "repository path", start, cx));
+        self.open_input(input, cx);
+        // After `open_input`, which may have cancelled a previous prompt.
+        self.prompt = Some(Prompt::ProjectPath);
+    }
+
+    /// The accepted path-field text: expanded against the current
+    /// repository and switched onto, or a sentence when it opens nothing.
+    fn project_path_entered(&mut self, text: String, cx: &mut Context<Self>) {
+        let Some((current, _)) = self.repo.clone() else {
+            return;
+        };
+        if text.trim().is_empty() {
+            return;
+        }
+        self.switch_repo(expand_project_path(&text, &current), cx);
+    }
+
+    /// `project.browse`: the system file picker aimed at a repository. The
+    /// panel is the platform's own — `NSOpenPanel` on macOS, whatever GPUI
+    /// sits on elsewhere — so no dependency and no `cfg` buys it, and the
+    /// typed path stays on `project.open` for the keyboard. A choice lands
+    /// in [`DevShell::switch_repo`], which validates before it moves
+    /// anything; cancelling lands nowhere.
+    fn browse_for_project(&mut self, cx: &mut Context<Self>) {
+        if self.repo.is_none() {
+            self.set_notice("this view has no repository to browse from");
+            self.pending.clear();
+            return;
+        }
+        self.open = None;
+        self.pending.clear();
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose a repository".into()),
+        });
+        cx.spawn(async move |shell, cx| {
+            // Cancelled, or the platform refused: the first is silence, the
+            // second a sentence — a picker that cannot open says so once.
+            let chosen = match picked.await {
+                Ok(Ok(Some(mut paths))) => paths.pop(),
+                Ok(Ok(None)) | Err(_) => None,
+                Ok(Err(problem)) => {
+                    _ = shell.update(cx, |shell, cx| {
+                        shell.set_notice(format!("the file picker failed: {problem}"));
+                        cx.notify();
+                    });
+                    None
+                }
+            };
+            if let Some(path) = chosen {
+                _ = shell.update(cx, |shell, cx| shell.switch_repo(path, cx));
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// A pick in the project menu. Repository rows switch; the two footer
+    /// rows leave the menu for the path field and the system picker.
+    fn pick_project(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.projects.len() {
+            // The footers, in order: the typed path first, then the file
+            // manager. Both close the menu on their way through.
+            if index == self.projects.len() {
+                self.begin_project_path(cx);
+            } else {
+                self.browse_for_project(cx);
+            }
+            return;
+        }
+        let next = self.projects[index].clone();
+        self.open = None;
+        self.switch_repo(next, cx);
+    }
+
+    /// `project.next` / `project.prev`. Steps through the recent file from
+    /// the current repository, wrapping; a file naming only this window
+    /// says so instead of switching in place.
+    fn cycle_project(&mut self, by: isize, cx: &mut Context<Self>) {
+        let Some((current, _)) = self.repo.clone() else {
+            self.set_notice("this view has no repository to switch from");
+            return;
+        };
+        let listed = gitten_app::projects::load();
+        if listed.is_empty() {
+            self.set_notice("no recent projects");
+            return;
+        }
+        let count = listed.len();
+        // From the current repository when it is listed, else from outside
+        // the file on the side being left — an unlisted window cycles the
+        // file from its head either way.
+        let mut at = match listed.iter().position(|p| same_project_path(p, &current)) {
+            Some(i) => i as isize,
+            None => {
+                if by > 0 {
+                    -1
+                } else {
+                    count as isize
+                }
+            }
+        };
+        for _ in 0..count {
+            at = (at + by).rem_euclid(count as isize);
+            if !same_project_path(&listed[at as usize], &current) {
+                let next = listed[at as usize].clone();
+                self.switch_repo(next, cx);
+                return;
+            }
+        }
+        self.set_notice("no other recent project");
+    }
+
+    /// Moves the whole window onto another repository, in place.
+    ///
+    /// The entities stay: each screen is re-aimed at the new path and the
+    /// next refresh wave re-acquires every row through the same
+    /// generation-guarded rails a write's finish rides. What cannot ride
+    /// along is named and reset: the main view's rows (a commits window's
+    /// diff has no source of its own), the pending diff request, the memos
+    /// keyed on the old path, and the session key. A path that opens no
+    /// repository costs a sentence in the band — the old repository stands
+    /// untouched — and drops out of the recent file.
+    fn switch_repo(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
+        let Some((old_path, _)) = self.repo.clone() else {
+            self.set_notice("this view has no repository to switch from");
+            return;
+        };
+        // A prompt or menu may still stand over the old repository; both
+        // decide about rows that are about to be somebody else's.
+        if self.input.is_some() {
+            self.close_input(false, cx);
+        }
+        self.context = None;
+        self.open = None;
+        self.pending.clear();
+        let path = path.canonicalize().unwrap_or(path);
+        if same_project_path(&path, &old_path) {
+            gitten_app::projects::record(&path);
+            let (dir, name) = repo_title(&path, home());
+            self.set_notice(format!("already in {dir}{name}"));
+            cx.notify();
+            return;
+        }
+        let handle = gitten_git::open(&path);
+        if let Err(problem) = handle.status() {
+            gitten_app::projects::remove(&path);
+            self.set_notice(format!("cannot open {}: {problem}", path.display()));
+            cx.notify();
+            return;
+        }
+        // The old position is saved under the old key before anything moves.
+        if let Some(top) = self.session_top(cx) {
+            session::save(
+                &session::Session {
+                    key: self.session_key.clone(),
+                    top,
+                },
+                &self.session_path,
+            );
+        }
+        // A new epoch: in-flight batches from the old repository fail both
+        // guards — `refresh_id` here, the generation in their apply halves —
+        // and every screen below the new target re-acquires.
+        self.generation = self.generation.advance();
+        self.invalidate_refresh();
+        self.repo = Some((path.clone(), handle.clone()));
+        let for_diff = handle.clone();
+        self.rediff = Some(Rc::new(
+            move |host: &Host, over: &Overrides, revision: &str| {
+                gitten_git::diff(for_diff.as_ref(), revision, &host.differ, over)
+            },
+        ));
+        for screen in self.panes.iter_mut() {
+            screen.retarget(&path);
+        }
+        self.main.retarget(&path);
+        // The main view's rows belong to the old repository, and a commits
+        // window's diff carries no source to re-acquire from — it loads off
+        // the cursor — so it is rebuilt empty. The wave below ends in
+        // `finish_refresh`, which schedules the new HEAD's diff through the
+        // ordinary rails; scheduling here would aim at the old cursor.
+        if self.has_column {
+            let host = config::host(cx);
+            let view = cx.new(|cx| views::diff::Diff::new(Vec::new(), host, cx));
+            self.main = Screen::diff(view, None, self.generation, "");
+        }
+        *self.head.borrow_mut() = None;
+        self.request.set(self.request.get().saturating_add(1));
+        self.loading.set(false);
+        self.error = None;
+        self.title_memo.borrow_mut().take();
+        self.header_memo.borrow_mut().take();
+        // The scroll the new repository file remembers, applied once the
+        // wave lands — scrolling an empty list first would clamp it away.
+        let view = View::parse(self.which).unwrap_or(View::Commits);
+        let source = match self.panes.get("commits") {
+            Some(Screen::Commits { source, .. }) => Some(source.clone()),
+            _ => match &self.main {
+                Screen::Diff { source, .. } => source.borrow().clone(),
+                _ => None,
+            },
+        };
+        let key = source
+            .as_ref()
+            .map(|s| s.key(view))
+            .unwrap_or_else(|| format!("{}:{}:", self.which, path.to_string_lossy()));
+        self.session_key = key.clone();
+        self.pending_restore = session::restore(&key, &self.session_path).map(|r| r.top);
+        gitten_app::projects::record(&path);
+        self.refresh_stale(cx);
+        let (dir, name) = repo_title(&path, home());
+        self.set_notice(format!("switched to {dir}{name}"));
+        cx.notify();
+    }
+
+    /// The first visible row of whichever view the session file tracks: the
+    /// commit list's, when the window has one, else the main diff's — the
+    /// same two places startup restores from.
+    fn session_top(&self, cx: &App) -> Option<usize> {
+        if let Some(Screen::Commits { view, .. }) = self.panes.get("commits") {
+            return Some(view.read(cx).top.get());
+        }
+        if let Screen::Diff { view, .. } = &self.main {
+            return Some(view.read(cx).top.get());
+        }
+        None
+    }
+
+    /// Scrolls the session-tracked view back to a saved row: the commit
+    /// list's cursor and viewport, or the main diff's. Runs after a switch's
+    /// refresh wave, when new rows are standing to be scrolled through.
+    fn restore_session_top(&mut self, top: usize, cx: &mut Context<Self>) {
+        let host = config::host(cx);
+        if let Some(Screen::Commits { view, .. }) = self.panes.get("commits") {
+            let view = view.clone();
+            let held = view.read(cx);
+            held.scroll_to(top, &host);
+            held.go_to(top, &host);
+        } else if let Screen::Diff { view, .. } = &self.main {
+            let view = view.clone();
+            let held = view.read(cx);
+            held.scroll_to(top, &host);
+            held.go_to(top, &host);
+        }
+        cx.notify();
+    }
+
+    /// The project menu's floating list: the recent repositories under the
+    /// title that opened it, plus an `Open other…` row that trades the menu
+    /// for the path field and a `Browse…` row that trades it for the system
+    /// file picker. Hung below the strip at the title's own inset and
+    /// clamped to the window, like the context menu; deferred past the
+    /// regions and occluding, for the same reasons. The rows come from
+    /// [`DevShell::projects`], loaded when the menu opened — building them
+    /// reads no file.
+    fn project_menu(&self, host: &Host, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let c = &host.theme.chrome;
+        let f = &host.font;
+        let me = cx.entity().downgrade();
+        let listed = self.projects.len();
+        let mut labels: Vec<String> = self
+            .projects
+            .iter()
+            .map(|path| {
+                let (dir, name) = repo_title(path, home());
+                format!("{dir}{name}")
+            })
+            .collect();
+        labels.push("Open other…".to_string());
+        labels.push("Browse…".to_string());
+        // Wide enough for the longest row, from the font rather than a
+        // constant — the same reason `font.advance` exists at all.
+        let widest = labels.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+        let w = (widest as f32 + 4.0) * f.advance * f.size + 16.0;
+        let h = labels.len() as f32 * controls::ROW_H + 2.0 * 4.0 + 2.0;
+        let at = crate::menu::clamped(
+            point(px(LIGHTS_W), px(TITLE_H)),
+            window.viewport_size(),
+            w,
+            h,
+        );
+        let list = div()
+            .id("project-menu")
+            .absolute()
+            .top(at.y)
+            .left(at.x)
+            .w(px(w))
+            .py_1()
+            .bg(rgb(c.title_bg))
+            .border_1()
+            .border_color(rgb(c.faint))
+            .rounded(px(chrome::RADIUS))
+            .text_size(px(f.size))
+            .font_family(f.family.clone())
+            // Without this the menu is drawn but the rows beneath it get the
+            // clicks: hit-testing is paint order, and an absolutely
+            // positioned child claims nothing it covers on its own.
+            .occlude()
+            // A menu that only closes by choosing something is a menu you
+            // cannot change your mind about; the backdrop above already
+            // stands for any open picker.
+            .on_mouse_down_out({
+                let me = me.clone();
+                move |_, _, cx| {
+                    _ = me.update(cx, |this, cx| {
+                        this.open = None;
+                        cx.notify();
+                    });
+                }
+            })
+            .children(labels.iter().enumerate().map(|(i, label)| {
+                let me = me.clone();
+                // Row zero is the window's own repository — the menu opens
+                // with it first — and carries the tick.
+                let here = i == 0 && listed > 0;
+                div()
+                    .id(("project-row", i))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .h(px(controls::ROW_H))
+                    .px_2()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(c.status_bg)))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(rgb(if here { c.accent } else { c.fg }))
+                            .child(label.clone()),
+                    )
+                    .children(here.then(|| {
+                        Icon::new(IconName::Check)
+                            .size(px(14.0))
+                            .text_color(rgb(c.accent))
+                    }))
+                    .on_click(move |_, _, cx| {
+                        _ = me.update(cx, |this, cx| {
+                            this.pending.clear();
+                            this.pick_project(i, cx);
+                        });
+                    })
+            }));
+        deferred(list).with_priority(1).into_any_element()
+    }
+
     /// One named command, run. **This is the one dispatch path**: the keymap
     /// resolves to a name, and whatever resolved it — a key, a chord, a menu
     /// item — arrives here and nowhere else.
@@ -3391,6 +3890,16 @@ impl DevShell {
                     None => self.set_notice("a fixture has nothing to refresh"),
                 }
             }
+            // The repository the window sits on is itself switchable: the
+            // title opens the recent menu, `o` does the same from the
+            // keyboard, `O` skips the menu for the path field, `browse`
+            // skips it for the system file picker, and the unbound
+            // next/prev cycle the MRU for whoever binds them.
+            "project.switch" => self.toggle_project_menu(cx),
+            "project.open" => self.begin_project_path(cx),
+            "project.browse" => self.browse_for_project(cx),
+            "project.next" => self.cycle_project(1, cx),
+            "project.prev" => self.cycle_project(-1, cx),
             // lazygit's 0: the main view, from wherever the keyboard was.
             "diff.focus" => self.set_spot(Spot::Main, cx),
             "commits.focus" => self.focus_named("commits", cx),
@@ -5036,6 +5545,7 @@ impl Render for DevShell {
         // strip is built: the path's character count is the pickers' budget.
         let title: AnyElement;
         let path_chars: usize;
+        let me = cx.entity().downgrade();
         match &self.repo {
             Some((path, _)) => {
                 // Cut once per repository — see [`DevShell::title_memo`].
@@ -5050,7 +5560,26 @@ impl Render for DevShell {
                     }
                 };
                 path_chars = dir.chars().count() + name.chars().count();
-                title = chrome::path_spans(&host, dir, name, c.fg, theme::Surface::Title, true)
+                let spans = chrome::path_spans(&host, dir, name, c.fg, theme::Surface::Title, true);
+                // The repository title is the project switcher's trigger: the
+                // recent menu hangs below the strip, and the strip spends no
+                // control budget on a picker that would only repeat the
+                // title. A fixture's label opens nothing and stays plain.
+                // Inline, like every other click handler: a pre-bound
+                // variable pins the event's lifetime and no longer
+                // implements the handler type.
+                title = div()
+                    .id("trigger")
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(c.keycap)))
+                    .rounded(px(chrome::RADIUS))
+                    .on_click({
+                        let me = me.clone();
+                        move |_, _, cx| {
+                            _ = me.update(cx, |this, cx| this.toggle_project_menu(cx));
+                        }
+                    })
+                    .child(spans)
                     .into_any_element();
             }
             None => {
@@ -5206,6 +5735,7 @@ impl Render for DevShell {
                     // and no `min_w_0` did — is a control that no longer exists.
                     .child(
                         div()
+                            .id("project-title")
                             .flex_shrink(1.0)
                             .min_w_0()
                             .mr(chrome::gap_m(&host.font))
@@ -5367,6 +5897,13 @@ impl Render for DevShell {
                     },
                 )
             }))
+            // The project menu, off the title that opened it: the recent
+            // repositories and the `Open other…` row. Beside the context
+            // menu rather than inside it — one floats at a pointer, the
+            // other under the strip, and neither knows the other stands.
+            .children(
+                (self.open == Some(Open::Project)).then(|| self.project_menu(&host, window, cx)),
+            )
             // The status bar: where the keyboard is, and what the nearest
             // keys do. A sentence owed to the user — an error, a job's own
             // finish, an armed question — takes the hints' place rather than
@@ -5580,6 +6117,9 @@ fn main() {
             // default and has no name to put in a title, and a syscall on the
             // render path is not the place to find one.
             let path = path.canonicalize().unwrap_or_else(|_| path.clone());
+            // Every launch is a visit: the project menu reads this file, and
+            // a repository opened any way at all belongs in it.
+            gitten_app::projects::record(&path);
             (Some(rediff), Some((path, repo)))
         }
         _ => (None, None),
@@ -5673,7 +6213,10 @@ fn main() {
                 let resume = session::restore(&session_key, &session_path);
                 start::mark("session restored");
                 #[allow(clippy::type_complexity)]
-                let (screen, rendered, top, total, note, load): (
+                // The saved row is applied to the views above, and the periodic
+                // task below reads the live row off the shell — so the
+                // tuple's own handle is spare by construction.
+                let (screen, rendered, _top, total, note, load): (
                     Screen,
                     Rc<Cell<usize>>,
                     Rc<Cell<usize>>,
@@ -5909,33 +6452,6 @@ fn main() {
                     .detach();
                 }
 
-                // Persist as you scroll, so any kind of death keeps the position:
-                // `dev.sh` kills the process, and nothing runs on the way out.
-                // Only on change, so an idle window writes nothing at all.
-                {
-                    let (key, path) = (session_key.clone(), session_path.clone());
-                    let start = resume.map(|r| r.top).unwrap_or(0);
-                    cx.spawn(async move |cx: &mut AsyncApp| {
-                        let mut last = start;
-                        loop {
-                            cx.background_executor()
-                                .timer(Duration::from_millis(400))
-                                .await;
-                            let now = top.get();
-                            if now != last {
-                                last = now;
-                                session::save(
-                                    &session::Session {
-                                        key: key.clone(),
-                                        top: now,
-                                    },
-                                    &path,
-                                );
-                            }
-                        }
-                    })
-                    .detach();
-                }
                 let stats = stats::enabled().then(|| Stats::new(rendered, total, note, load));
                 let focus = cx.focus_handle();
                 let jobs = Runner::new();
@@ -5988,6 +6504,10 @@ fn main() {
                     focused: None,
                     seen_host: None,
                     ongoing: Cell::default(),
+                    projects: Vec::new(),
+                    session_key: session_key.clone(),
+                    session_path: session_path.clone(),
+                    pending_restore: None,
                 });
                 {
                     let shell = shell.clone();
@@ -6010,6 +6530,41 @@ fn main() {
                             .await;
                         if shell.update(cx, |shell, cx| shell.drain_jobs(cx)).is_err() {
                             break;
+                        }
+                    })
+                    .detach();
+                }
+                // Persist as you scroll, so any kind of death keeps the position:
+                // `dev.sh` kills the process, and nothing runs on the way out.
+                // Only on change, so an idle window writes nothing at all. The
+                // key and the row are read off the shell per tick rather than
+                // held from startup, so one task serves every repository a
+                // switch puts under the window — and dies with it.
+                {
+                    let path = session_path.clone();
+                    let weak = shell.downgrade();
+                    cx.spawn(async move |cx: &mut AsyncApp| {
+                        let mut last = weak
+                            .update(cx, |shell, cx| {
+                                (shell.session_key.clone(), shell.session_top(cx))
+                            })
+                            .unwrap_or_default();
+                        loop {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(400))
+                                .await;
+                            let now = weak.update(cx, |shell, cx| {
+                                (shell.session_key.clone(), shell.session_top(cx))
+                            });
+                            let Ok(now) = now else {
+                                break;
+                            };
+                            if now != last {
+                                last = now.clone();
+                                if let (key, Some(top)) = now {
+                                    session::save(&session::Session { key, top }, &path);
+                                }
+                            }
                         }
                     })
                     .detach();
@@ -6338,6 +6893,10 @@ mod tests {
                 focused: None,
                 seen_host: None,
                 ongoing: Cell::default(),
+                projects: Vec::new(),
+                session_key: String::new(),
+                session_path: std::path::PathBuf::new(),
+                pending_restore: None,
             }
         })
     }
@@ -6469,6 +7028,10 @@ mod tests {
                 focused: None,
                 seen_host: None,
                 ongoing: Cell::default(),
+                projects: Vec::new(),
+                session_key: String::new(),
+                session_path: std::path::PathBuf::new(),
+                pending_restore: None,
             }
         });
         (shell, wheeled)
@@ -7276,6 +7839,19 @@ mod tests {
             observed.read_with(&cx, |shell, _| shell.panes.focused_name().to_string()),
             "branches",
         );
+    }
+
+    #[gpui::test]
+    fn browsing_from_a_fixture_says_so_and_opens_no_panel(cx: &mut TestAppContext) {
+        // No repository behind the view: the file picker is never reached —
+        // the refusal below runs before any platform call — so this needs
+        // no panel stub and asserts the honest `None`, not the dialog.
+        let bare = shell(None, cx);
+        bare.update(cx, |shell, cx| shell.run_command("project.browse", cx));
+        bare.read_with(cx, |shell, _| {
+            assert!(shell.notice.is_some(), "a fixture went unsaid");
+            assert!(shell.open.is_none(), "refusing to browse left a menu open");
+        });
     }
 
     #[gpui::test]
@@ -10784,10 +11360,11 @@ diff --git a/added.txt b/added.txt
 #[cfg(test)]
 mod title_tests {
     use super::{
-        clamped_stack_splits, fitted_stack_heights, heights_from_splits, quantized, repo_title,
-        section_basis, section_height, splits_from_heights, SECTION_MAX_ROWS, SECTION_MIN_H,
+        clamped_stack_splits, expand_project_path, fitted_stack_heights, heights_from_splits,
+        quantized, repo_title, same_project_path, section_basis, section_height,
+        splits_from_heights, SECTION_MAX_ROWS, SECTION_MIN_H,
     };
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn a_repository_under_home_is_spelled_from_tilde_and_cut_at_its_name() {
@@ -10821,6 +11398,60 @@ mod title_tests {
         assert_eq!(
             repo_title(Path::new("/"), None),
             (String::new(), "/".to_string())
+        );
+    }
+
+    #[test]
+    fn one_checkout_spelled_two_ways_is_one_project() {
+        // The temp dir exists, so both spellings canonicalise onto it.
+        let dir = std::env::temp_dir();
+        assert!(same_project_path(&dir, &dir.join(".")));
+        assert!(!same_project_path(
+            &dir,
+            &PathBuf::from("/no-such-project-anywhere")
+        ));
+        // Neither side exists: raw comparison, and still no panic.
+        assert!(same_project_path(
+            Path::new("/no-such-project-anywhere"),
+            Path::new("/no-such-project-anywhere")
+        ));
+        assert!(!same_project_path(
+            Path::new("/no-such-project-anywhere"),
+            Path::new("/no-other-such-project-anywhere")
+        ));
+    }
+
+    #[test]
+    fn a_path_field_absolute_is_taken_as_it_stands() {
+        let current = Path::new("/repo/alpha");
+        assert_eq!(
+            expand_project_path("/repo/beta", current),
+            PathBuf::from("/repo/beta")
+        );
+    }
+
+    #[test]
+    fn a_relative_path_resolves_beside_the_current_repository() {
+        // Projects live beside each other, not under the launch directory.
+        let current = Path::new("/repo/alpha");
+        assert_eq!(
+            expand_project_path("beta", current),
+            PathBuf::from("/repo/beta")
+        );
+        assert_eq!(
+            expand_project_path("  beta  ", current),
+            PathBuf::from("/repo/beta")
+        );
+    }
+
+    #[test]
+    fn tilde_expands_to_home() {
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        assert_eq!(
+            expand_project_path("~/src/beta", Path::new("/repo/alpha")),
+            PathBuf::from(home).join("src/beta")
         );
     }
 

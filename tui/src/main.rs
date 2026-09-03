@@ -8751,12 +8751,15 @@ diff --git a/tracked.txt b/tracked.txt
         // The help panel lists the five included verbs straight out of the
         // shared registry — and the rebase row core binds in this mode,
         // which this pass deliberately leaves unhandled: the gap is visible
-        // in the one place that exists for it, not hidden. Tall enough that
-        // the panel shows past the global section into the focused mode's
+        // in the one place that exists for it, not hidden. The panel is
+        // capped at thirty rows, so no single viewport holds the whole
+        // registry any more: the top shows the globals out of the live
+        // keymap — the pane-focus digits and, since the desktop's recent
+        // menu, the two project rows — and the bottom the focused mode's
         // own bindings.
         app.screen = Screen::new(120, 50);
         app.press(Key::char('?'));
-        app.press(Key::plain(Code::End));
+        app.press(Key::plain(Code::Home));
         app.draw();
         let help = (0..50)
             .map(|y| app.screen.row_text(y))
@@ -8764,6 +8767,18 @@ diff --git a/tracked.txt b/tracked.txt
             .join("\n");
         for doc in [
             "focus the branches pane",
+            "switch to another recent repository",
+            "open a repository by typing its path",
+        ] {
+            assert!(help.contains(doc), "help is missing {doc:?}: {help:?}");
+        }
+        app.press(Key::plain(Code::End));
+        app.draw();
+        let help = (0..50)
+            .map(|y| app.screen.row_text(y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for doc in [
             "check out the selected branch",
             "create a branch",
             "rename the selected branch",
