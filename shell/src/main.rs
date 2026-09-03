@@ -6685,6 +6685,23 @@ fn open_recent(view: View, recents: &[std::path::PathBuf]) -> Option<Started> {
         if let Ok(started) = retry {
             return Some(started);
         }
+        // A clean checkout is still a repository: a working-tree `diff`
+        // startup rejects an empty answer ("no changes"), while the window
+        // itself accepts one (a write can clean the tree at runtime). Fall
+        // back to the graph rather than skipping a repository that opens.
+        if view != View::Commits {
+            let fallback = Startup::new("gitten", View::Commits)
+                .blurb("a git client")
+                .extra(EXTRA)
+                .args(vec![
+                    View::Commits.name().to_string(),
+                    path.to_string_lossy().into_owned(),
+                ])
+                .go();
+            if let Ok(started) = fallback {
+                return Some(started);
+            }
+        }
     }
     None
 }
@@ -6723,6 +6740,20 @@ fn offer_repo_then_open(view: View, cx: &mut App) {
                         dir.to_string_lossy().into_owned(),
                     ])
                     .go();
+                // Same clean-checkout rule as `open_recent`: a picked
+                // repository opens even when its working tree is clean.
+                let retry = match (retry, view) {
+                    (Ok(started), _) => Ok(started),
+                    (Err(_), v) if v != View::Commits => Startup::new("gitten", View::Commits)
+                        .blurb("a git client")
+                        .extra(EXTRA)
+                        .args(vec![
+                            View::Commits.name().to_string(),
+                            dir.to_string_lossy().into_owned(),
+                        ])
+                        .go(),
+                    (Err(exit), _) => Err(exit),
+                };
                 cx.update(|cx| match retry {
                     Ok(started) => open_main_window(started, cx),
                     Err(exit) => exit.finish(),
@@ -6859,10 +6890,68 @@ mod tests {
             Source::Repo { path, .. } => assert_eq!(path, root),
             other => panic!("a repo source opens a repo, got {other:?}"),
         }
-        // The requested view rides along: a bare `diff` launch returns to a
-        // working-tree diff, not to the commits default.
-        let started = open_recent(View::Diff, &[root]).expect("the workspace root is a repository");
+        // The requested view rides along — but only a dirty checkout can prove
+        // it, because a working-tree `diff` startup rejects a clean tree ("no
+        // changes") while `commits` opens anywhere with history. The workspace
+        // root is clean on CI and dirty on a developer's machine, so a scratch
+        // repository with a real edit is the hermetic stand-in.
+        let dirty = scratch_repo("bare-diff", true);
+        let started = open_recent(View::Diff, std::slice::from_ref(&dirty))
+            .expect("a dirty repository has a diff");
         assert_eq!(started.view, View::Diff);
+        match started.source {
+            Source::Repo { path, .. } => assert_eq!(path, dirty),
+            other => panic!("a repo source opens a repo, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dirty);
+    }
+
+    #[test]
+    fn a_bare_diff_launch_on_a_clean_checkout_falls_back_to_the_graph() {
+        // A clean checkout is still a repository: skipping it would land a
+        // bare `diff` relaunch on the picker despite valid history.
+        let clean = scratch_repo("bare-diff-clean", false);
+        let started = open_recent(View::Diff, std::slice::from_ref(&clean))
+            .expect("a clean repository still opens");
+        assert_eq!(
+            started.view,
+            View::Commits,
+            "the graph is the honest fallback for an empty working tree"
+        );
+        let _ = std::fs::remove_dir_all(&clean);
+        assert!(open_recent(View::Diff, &[PathBuf::from("/nonexistent-gitten-repo")]).is_none());
+    }
+
+    /// A throwaway repository with one commit — dirty when asked — so a
+    /// working-tree `diff` has something deterministic to open regardless of
+    /// whether the enclosing checkout is clean (CI) or dirty (a laptop).
+    fn scratch_repo(name: &str, dirty: bool) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("gitten-shell-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a temp dir");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "."]);
+        git(&["config", "core.autocrlf", "false"]);
+        std::fs::write(dir.join("f.txt"), "one\n").expect("wrote the file");
+        git(&["add", "f.txt"]);
+        git(&["commit", "-qm", "x"]);
+        if dirty {
+            std::fs::write(dir.join("f.txt"), "one\ntwo\n").expect("dirtied the worktree");
+        }
+        dir
     }
 
     struct ExtensionPane {
