@@ -55,14 +55,14 @@ pub enum Surface {
     ///
     /// A surface for the same reason Cursor is one: chrome text is read off
     /// both strips, and raw `dim` is under the text floor there — 3.37 on the
-    /// title strip, 3.40 on the bar, in all three shipped themes — while a
+    /// title strip, 3.40 on the bar, in the shipped themes — while a
     /// strip's background is as static as a row's: whoever paints it knows
     /// which one it is.
     Title,
     /// The bar across the bottom, where the keyboard says where it is.
     ///
     /// Same reason: raw `dim` measures 3.40:1 on `status_bg`, under the text
-    /// floor in all three themes, and the bar's background is static.
+    /// floor in the shipped themes, and the bar's background is static.
     Status,
 }
 
@@ -585,6 +585,331 @@ impl Theme {
         .rebuilt()
     }
 
+    /// Gruvbox dark: warm retro groove.
+    ///
+    /// The same ratios as [`Theme::dark`], hue for hue — `file_bg` a visible
+    /// step above context, the hunk a smaller one, the changed-word background
+    /// roughly double the line tint's step. The one place upstream's numbers
+    /// could not be kept is the error ink: bright gruvbox red clears the text
+    /// floor on the chrome strips but not on the lighter cursor row, so it is
+    /// the lightened red, while the diff rows keep the canonical one.
+    pub fn gruvbox() -> Self {
+        use Kind::*;
+        let mut syntax = [Style::fg(0xa89984); Kind::COUNT];
+        let mut set = |k: Kind, s: Style| syntax[k.index()] = s;
+        set(Comment, Style::fg(0x928374).italic());
+        set(Str, Style::fg(0xb8bb26));
+        set(Number, Style::fg(0xfe8019));
+        set(Keyword, Style::fg(0xfb4934));
+        set(Type, Style::fg(0xfabd2f));
+        set(Constant, Style::fg(0xd3869b));
+        set(Func, Style::fg(0x8ec07c));
+        set(Property, Style::fg(0x83a598));
+        set(Heading, Style::fg(0xebdbb2).bold());
+        set(Strong, Style::fg(0xd5c4a1).bold());
+        set(Emphasis, Style::fg(0xa89984).italic());
+        set(Link, Style::fg(0x83a598));
+
+        Self {
+            name: "gruvbox".into(),
+            min_contrast: 3.5,
+            min_furniture: 3.0,
+            syntax,
+            diff: DiffPalette {
+                file_bg: 0x3c3836,
+                file_fg: 0xebdbb2,
+                adds_fg: 0xb8bb26,
+                dels_fg: 0xfb4934,
+                hunk_bg: 0x2c2826,
+                hunk_fg: 0x83a598,
+                gutter_fg: 0x665c54,
+                rule: 0x504945,
+                context_bg: 0x282828,
+                context_fg: 0xa89984,
+                added_bg: 0x333a29,
+                added_fg: 0xb8bb26,
+                added_word_bg: 0x5b6337,
+                removed_bg: 0x3d2a26,
+                removed_fg: 0xfb4934,
+                removed_word_bg: 0x6b3a32,
+                moved_removed_bg: 0x2c2f3a,
+                moved_added_bg: 0x323949,
+                absent_bg: 0x1d2021,
+            },
+            markdown: MarkdownPalette {
+                code_bar: 0x504945,
+                quote_bar: 0x458588,
+                marker: 0x928374,
+                rule: 0x504945,
+            },
+            chrome: ChromePalette {
+                bg: 0x282828,
+                fg: 0xebdbb2,
+                dim: 0x928374,
+                faint: 0x665c54,
+                accent: 0xfabd2f,
+                title_bg: 0x2e2a26,
+                status_bg: 0x2b2825,
+                border: 0x504945,
+                raised: 0x3c3836,
+                keycap: 0x504945,
+                selection_bg: 0x32302c,
+                selected_bg: 0x3c4a55,
+                error: 0xfb4934,
+            },
+            lanes: vec![0xfb4934, 0xb8bb26, 0xfabd2f, 0x83a598, 0xd3869b, 0x8ec07c],
+            lane_overflow: 0x665c54,
+            authors: vec![0xa89984, 0x928374, 0xb0a090, 0x8a9a7b, 0x9a8a7a, 0x7b8a6d],
+            resolved: Vec::new(),
+            gutter: [0; Surface::COUNT],
+            marker: [0; Surface::COUNT],
+            dim: [0; Surface::COUNT],
+        }
+        .rebuilt()
+    }
+
+    /// Catppuccin Mocha: cool lavender dark.
+    ///
+    /// Ported the same way — dark's ratios, Mocha's hues. `crust` is the absent
+    /// cell, `surface0` the file step, `surface1` the text selection: the
+    /// palette already names the hierarchy, so the mapping is mostly reading.
+    pub fn catppuccin() -> Self {
+        use Kind::*;
+        let mut syntax = [Style::fg(0xa6adc8); Kind::COUNT];
+        let mut set = |k: Kind, s: Style| syntax[k.index()] = s;
+        set(Comment, Style::fg(0x6c7086).italic());
+        set(Str, Style::fg(0xa6e3a1));
+        set(Number, Style::fg(0xfab387));
+        set(Keyword, Style::fg(0xcba6f7));
+        set(Type, Style::fg(0x89dceb));
+        set(Constant, Style::fg(0xf9e2af));
+        set(Func, Style::fg(0x89b4fa));
+        set(Property, Style::fg(0x94e2d5));
+        set(Heading, Style::fg(0xcdd6f4).bold());
+        set(Strong, Style::fg(0xbac2de).bold());
+        set(Emphasis, Style::fg(0xa6adc8).italic());
+        set(Link, Style::fg(0x74c7ec));
+
+        Self {
+            name: "catppuccin".into(),
+            min_contrast: 3.5,
+            min_furniture: 3.0,
+            syntax,
+            diff: DiffPalette {
+                file_bg: 0x313244,
+                file_fg: 0xcdd6f4,
+                adds_fg: 0xa6e3a1,
+                dels_fg: 0xf38ba8,
+                hunk_bg: 0x23232f,
+                hunk_fg: 0x7f849c,
+                gutter_fg: 0x585b70,
+                rule: 0x45475a,
+                context_bg: 0x1e1e2e,
+                context_fg: 0xa6adc8,
+                added_bg: 0x243028,
+                added_fg: 0xa6e3a1,
+                added_word_bg: 0x3d5a47,
+                removed_bg: 0x30232e,
+                removed_fg: 0xf38ba8,
+                removed_word_bg: 0x5c3547,
+                moved_removed_bg: 0x23273f,
+                moved_added_bg: 0x2a3049,
+                absent_bg: 0x11111b,
+            },
+            markdown: MarkdownPalette {
+                code_bar: 0x45475a,
+                quote_bar: 0x74c7ec,
+                marker: 0x7f849c,
+                rule: 0x313244,
+            },
+            chrome: ChromePalette {
+                bg: 0x1e1e2e,
+                fg: 0xcdd6f4,
+                dim: 0x7f849c,
+                faint: 0x585b70,
+                accent: 0xfab387,
+                title_bg: 0x232336,
+                status_bg: 0x201f31,
+                border: 0x2a2b3f,
+                raised: 0x313244,
+                keycap: 0x45475a,
+                selection_bg: 0x313244,
+                selected_bg: 0x45475a,
+                error: 0xf38ba8,
+            },
+            lanes: vec![0xfab387, 0xa6e3a1, 0x89b4fa, 0xcba6f7, 0xf5c2e7, 0x94e2d5],
+            lane_overflow: 0x585b70,
+            authors: vec![0x9399b2, 0x7f849c, 0xa6adc8, 0xbac2de, 0xeba0ac, 0xf2cdcd],
+            resolved: Vec::new(),
+            gutter: [0; Surface::COUNT],
+            marker: [0; Surface::COUNT],
+            dim: [0; Surface::COUNT],
+        }
+        .rebuilt()
+    }
+
+    /// Tokyo Night: deep blue dark.
+    ///
+    /// Same port. The background is already blue, so the moved blocks lean
+    /// violet rather than borrowing it — the reason `slate`'s are violet too.
+    /// Upstream's comment grey is the chrome `dim`, and raw it sits under the
+    /// furniture floor on the strips — `rebuild` lifts it toward white there
+    /// and it keeps the hue, which is what the resolver is for.
+    pub fn tokyo_night() -> Self {
+        use Kind::*;
+        let mut syntax = [Style::fg(0xa9b1d6); Kind::COUNT];
+        let mut set = |k: Kind, s: Style| syntax[k.index()] = s;
+        set(Comment, Style::fg(0x565f89).italic());
+        set(Str, Style::fg(0x9ece6a));
+        set(Number, Style::fg(0xff9e64));
+        set(Keyword, Style::fg(0xbb9af7));
+        set(Type, Style::fg(0x7dcfff));
+        set(Constant, Style::fg(0xe0af68));
+        set(Func, Style::fg(0x7aa2f7));
+        set(Property, Style::fg(0x73daca));
+        set(Heading, Style::fg(0xc0caf5).bold());
+        set(Strong, Style::fg(0xa9b1d6).bold());
+        set(Emphasis, Style::fg(0x9aa5ce).italic());
+        set(Link, Style::fg(0x7aa2f7));
+
+        Self {
+            name: "tokyo-night".into(),
+            min_contrast: 3.5,
+            min_furniture: 3.0,
+            syntax,
+            diff: DiffPalette {
+                file_bg: 0x27283b,
+                file_fg: 0xc0caf5,
+                adds_fg: 0x9ece6a,
+                dels_fg: 0xf7768e,
+                hunk_bg: 0x1e202e,
+                hunk_fg: 0x565f89,
+                gutter_fg: 0x3b4261,
+                rule: 0x292e42,
+                context_bg: 0x1a1b26,
+                context_fg: 0xa9b1d6,
+                added_bg: 0x213026,
+                added_fg: 0x9ece6a,
+                added_word_bg: 0x385239,
+                removed_bg: 0x2c2129,
+                removed_fg: 0xf7768e,
+                removed_word_bg: 0x4f2d3a,
+                moved_removed_bg: 0x23233d,
+                moved_added_bg: 0x2b2a4a,
+                absent_bg: 0x16161e,
+            },
+            markdown: MarkdownPalette {
+                code_bar: 0x3b4261,
+                quote_bar: 0x7aa2f7,
+                marker: 0x565f89,
+                rule: 0x292e42,
+            },
+            chrome: ChromePalette {
+                bg: 0x1a1b26,
+                fg: 0xc0caf5,
+                dim: 0x565f89,
+                faint: 0x3b4261,
+                accent: 0x7aa2f7,
+                title_bg: 0x1f2030,
+                status_bg: 0x1e1f2d,
+                border: 0x24283b,
+                raised: 0x292e42,
+                keycap: 0x3b4261,
+                selection_bg: 0x292e42,
+                selected_bg: 0x283457,
+                error: 0xf7768e,
+            },
+            lanes: vec![0x7aa2f7, 0x7dcfff, 0x9ece6a, 0xbb9af7, 0xf7768e, 0xe0af68],
+            lane_overflow: 0x3b4261,
+            authors: vec![0x737aa2, 0x5d6390, 0x4e5579, 0x6f7bb5, 0x7d7fa8, 0x5a6b8a],
+            resolved: Vec::new(),
+            gutter: [0; Surface::COUNT],
+            marker: [0; Surface::COUNT],
+            dim: [0; Surface::COUNT],
+        }
+        .rebuilt()
+    }
+
+    /// Rosé Pine: dark plum.
+    ///
+    /// Same port. `pine` is the keyword hue upstream, but at full strength it
+    /// sits under the text floor on this ground — `rebuild` lifts it toward
+    /// white and it keeps the hue, which is what the resolver is for.
+    pub fn rose_pine() -> Self {
+        use Kind::*;
+        let mut syntax = [Style::fg(0x908caa); Kind::COUNT];
+        let mut set = |k: Kind, s: Style| syntax[k.index()] = s;
+        set(Comment, Style::fg(0x6e6a86).italic());
+        set(Str, Style::fg(0xf6c177));
+        set(Number, Style::fg(0xebbcba));
+        set(Keyword, Style::fg(0x31748f));
+        set(Type, Style::fg(0x9ccfd8));
+        set(Constant, Style::fg(0xc4a7e7));
+        set(Func, Style::fg(0xeb6f92));
+        set(Property, Style::fg(0x908caa));
+        set(Heading, Style::fg(0xe0def4).bold());
+        set(Strong, Style::fg(0xebbcba).bold());
+        set(Emphasis, Style::fg(0x908caa).italic());
+        set(Link, Style::fg(0x31748f));
+
+        Self {
+            name: "rose-pine".into(),
+            min_contrast: 3.5,
+            min_furniture: 3.0,
+            syntax,
+            diff: DiffPalette {
+                file_bg: 0x2a2837,
+                file_fg: 0xe0def4,
+                adds_fg: 0x9ccfd8,
+                dels_fg: 0xeb6f92,
+                hunk_bg: 0x1d1b2a,
+                hunk_fg: 0x6e6a86,
+                gutter_fg: 0x6e6a86,
+                rule: 0x26233a,
+                context_bg: 0x191724,
+                context_fg: 0x908caa,
+                added_bg: 0x1e2a2e,
+                added_fg: 0x9ccfd8,
+                added_word_bg: 0x2f4a4e,
+                removed_bg: 0x2a1f2a,
+                removed_fg: 0xeb6f92,
+                removed_word_bg: 0x523044,
+                moved_removed_bg: 0x232033,
+                moved_added_bg: 0x2c2a44,
+                absent_bg: 0x12111c,
+            },
+            markdown: MarkdownPalette {
+                code_bar: 0x403d52,
+                quote_bar: 0x9ccfd8,
+                marker: 0x6e6a86,
+                rule: 0x26233a,
+            },
+            chrome: ChromePalette {
+                bg: 0x191724,
+                fg: 0xe0def4,
+                dim: 0x908caa,
+                faint: 0x6e6a86,
+                accent: 0xf6c177,
+                title_bg: 0x1f1d2e,
+                status_bg: 0x1c1a2b,
+                border: 0x26233a,
+                raised: 0x2a2837,
+                keycap: 0x403d52,
+                selection_bg: 0x26233a,
+                selected_bg: 0x403d52,
+                error: 0xeb6f92,
+            },
+            lanes: vec![0xeb6f92, 0xf6c177, 0xebbcba, 0x9ccfd8, 0xc4a7e7, 0x31748f],
+            lane_overflow: 0x6e6a86,
+            authors: vec![0x908caa, 0x6e6a86, 0xa8a3b8, 0x7d7a99, 0x9c8a9c, 0x8a8296],
+            resolved: Vec::new(),
+            gutter: [0; Surface::COUNT],
+            marker: [0; Surface::COUNT],
+            dim: [0; Surface::COUNT],
+        }
+        .rebuilt()
+    }
+
     /// Recompute the resolved table. Required after changing `syntax`, `diff` or
     /// `min_contrast` directly; [`Theme::set_syntax`] does it for you.
     pub fn rebuild(&mut self) {
@@ -766,9 +1091,17 @@ impl Default for Themes {
 }
 
 impl Themes {
-    /// The three shipped palettes, in the order a picker shows them.
+    /// The seven shipped palettes, in the order a picker shows them.
     pub fn builtin() -> Self {
-        Self(vec![Theme::dark(), Theme::light(), Theme::slate()])
+        Self(vec![
+            Theme::dark(),
+            Theme::light(),
+            Theme::slate(),
+            Theme::gruvbox(),
+            Theme::catppuccin(),
+            Theme::tokyo_night(),
+            Theme::rose_pine(),
+        ])
     }
 
     pub fn empty() -> Self {
@@ -1000,7 +1333,18 @@ mod tests {
     #[test]
     fn a_theme_is_registered_by_name_and_replaced_by_it() {
         let mut r = Themes::builtin();
-        assert_eq!(r.names(), vec!["dark", "light", "slate"]);
+        assert_eq!(
+            r.names(),
+            vec![
+                "dark",
+                "light",
+                "slate",
+                "gruvbox",
+                "catppuccin",
+                "tokyo-night",
+                "rose-pine"
+            ]
+        );
         assert_eq!(r.get("light").map(|t| t.chrome.bg), Some(0xfaf7f1));
 
         // What a `[theme]` block naming a built-in does: correct it, rather than
@@ -1008,21 +1352,34 @@ mod tests {
         let mut mine = Theme::dark();
         mine.chrome.bg = 0x010203;
         r.register(mine);
-        assert_eq!(r.len(), 3, "registering a known name added an entry");
+        assert_eq!(r.len(), 7, "registering a known name added an entry");
         assert_eq!(r.get("dark").map(|t| t.chrome.bg), Some(0x010203));
 
         // And one nobody shipped is simply another theme.
         let mut theirs = Theme::slate();
         theirs.name = "solarized-ish".into();
         r.register(theirs);
-        assert_eq!(r.names(), vec!["dark", "light", "slate", "solarized-ish"]);
+        assert_eq!(
+            r.names(),
+            vec![
+                "dark",
+                "light",
+                "slate",
+                "gruvbox",
+                "catppuccin",
+                "tokyo-night",
+                "rose-pine",
+                "solarized-ish"
+            ]
+        );
     }
 
     #[test]
     fn cycling_wraps_and_survives_a_name_nobody_registered() {
         let r = Themes::builtin();
         assert_eq!(r.after("dark").map(|t| t.name.as_str()), Some("light"));
-        assert_eq!(r.after("slate").map(|t| t.name.as_str()), Some("dark"));
+        assert_eq!(r.after("slate").map(|t| t.name.as_str()), Some("gruvbox"));
+        assert_eq!(r.after("rose-pine").map(|t| t.name.as_str()), Some("dark"));
         // A theme defined in the file and then renamed leaves this behind, and
         // the answer has to be a theme rather than nothing.
         assert_eq!(r.after("gone").map(|t| t.name.as_str()), Some("dark"));

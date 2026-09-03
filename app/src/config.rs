@@ -1153,7 +1153,7 @@ mod tests {
 
     #[test]
     fn a_theme_written_in_the_file_is_registered_under_its_name() {
-        // Which is what puts it in the picker beside the shipped three: the
+        // Which is what puts it in the picker beside the shipped seven: the
         // frontend lists a registry, so a palette somebody wrote by hand has to
         // be *in* one to be reachable at all.
         let mut h = host();
@@ -1162,7 +1162,16 @@ mod tests {
         assert!(warn.is_empty(), "{warn:?}");
         assert_eq!(
             h.themes.names(),
-            vec!["dark", "light", "slate", "solarized-ish"]
+            vec![
+                "dark",
+                "light",
+                "slate",
+                "gruvbox",
+                "catppuccin",
+                "tokyo-night",
+                "rose-pine",
+                "solarized-ish"
+            ]
         );
         assert_eq!(
             h.themes.get("solarized-ish").map(|t| t.diff.added_bg),
@@ -1183,14 +1192,22 @@ mod tests {
         assert!(warn.is_empty(), "{warn:?}");
         assert_eq!(
             h.themes.names(),
-            vec!["dark", "light", "slate"],
-            "a fourth entry appeared"
+            vec![
+                "dark",
+                "light",
+                "slate",
+                "gruvbox",
+                "catppuccin",
+                "tokyo-night",
+                "rose-pine"
+            ],
+            "an eighth entry appeared"
         );
         assert_eq!(
             h.themes.get("slate").map(|t| t.chrome.accent),
             Some(0xff0000)
         );
-        // The other two are untouched, which is the whole reason a pick can be
+        // The others are untouched, which is the whole reason a pick can be
         // trusted: `gitten config` dumps every colour of the theme you are on,
         // and that must not repaint the ones you are not.
         assert_eq!(h.themes.get("light").map(|t| t.chrome.bg), Some(0xfaf7f1));

@@ -190,7 +190,18 @@ mod tests {
         assert_eq!(host.theme.name, "light");
         // ...and the catalogue is untouched by any of it: `theme` is a copy, so
         // picking `light` again gives back the palette that was registered.
-        assert_eq!(host.themes.names(), vec!["dark", "light", "slate"]);
+        assert_eq!(
+            host.themes.names(),
+            vec![
+                "dark",
+                "light",
+                "slate",
+                "gruvbox",
+                "catppuccin",
+                "tokyo-night",
+                "rose-pine"
+            ]
+        );
         assert_ne!(host.themes.get("light").unwrap().diff.added_bg, 0x001100);
         assert_eq!(host.font.family, "Menlo");
         assert_eq!(host.differ.selected(), "myers");
