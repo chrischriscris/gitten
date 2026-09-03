@@ -217,7 +217,7 @@ GPUI. Drawing and input, and as little else as possible.
 | `input.rs` | native text input: IME composition, UTF-16 selection, grapheme editing; feeds the prompt slot |
 | `panes.rs` | tenants registered under stable names, replaced in place; logical focus — no GPUI in it |
 | `graph.rs` | lane geometry and painting: quads, paths, one canvas per row |
-| `controls.rs` | the title-bar pickers: a label, a value, and the registered alternatives |
+| `settings.rs` | the settings panel: every knob as rows built from the registries |
 | `config.rs` | config reload wiring, widget-theme sync and the live `Host` global |
 | `session.rs` | the row you were on, so `./dev desktop` can put you back after a restart |
 | `stats.rs` | the counting allocator and the `GITTEN_STATS` overlay |
@@ -284,9 +284,11 @@ Listed so nobody reads an intention as a description:
   would still add is a non-interactive door — a diff to stdout, an exit status —
   and `tui/examples/dump.rs` is most of it already.
 - **A settings panel.** Configurable keybindings and the shared command/help
-  registries exist. The title-bar pickers remain the interim answer for the
-  other registries; a panel should read those same names and collapse them into
-  one surface.
+  registries exist. The panel reads those same names and holds every live knob
+  in one surface — see
+  [decisions/0028](decisions/0028-settings-live-in-a-panel.md); what it does
+  not edit is colours and the two next-launch font fields, which stay in the
+  file.
 - **Code hot reload.** The config file reloads *data* live, and `./dev` removes
   everything either side of a code rebuild — but the rebuild itself remains, 3–5 s.
   A dylib swap was investigated and rejected, and the reasons are specific enough

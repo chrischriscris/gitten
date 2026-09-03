@@ -314,14 +314,6 @@ pub struct Drift {
     pub down: SharedString,
 }
 
-impl Drift {
-    /// Characters drawn, for the width the title strip budgets: the ` · `
-    /// opener, both arrows and the space between them.
-    pub fn chars(&self) -> usize {
-        3 + self.up.chars().count() + 1 + self.down.chars().count()
-    }
-}
-
 /// How far HEAD has drifted from its upstream, for the title chip: `Some`
 /// when either count is non-zero, nothing when both are zero or unknown.
 pub(crate) fn drift(ahead: Option<u32>, behind: Option<u32>) -> Option<Drift> {

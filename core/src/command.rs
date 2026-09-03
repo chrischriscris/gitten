@@ -322,6 +322,9 @@ impl Keymap {
         bind(GLOBAL, "q", "quit");
         bind(GLOBAL, "ctrl-c", "quit");
         bind(GLOBAL, "?", "help");
+        // The settings panel, beside the help one: `,` reads as "the knobs"
+        // next to `.`/`/`'s neighbourhood and is unclaimed in every mode.
+        bind(GLOBAL, ",", "settings");
         // Global and not diff-only: a palette is the whole window's, and the
         // commit graph is drawn out of the same one. Shifted, because cycling a
         // theme is a thing done twice a month and `t` is worth more than that.
@@ -557,6 +560,28 @@ impl Keymap {
         bind("help", "home", "view.top");
         bind("help", "G", "view.bottom");
         bind("help", "end", "view.bottom");
+
+        // The settings panel owns the keyboard for as long as it stands, for
+        // the same reason the help overlay does: a press it does not name must
+        // run nothing underneath. Up and down move the selection, left and
+        // right (or enter/space) change the value, `,` and `esc` leave.
+        bind("settings", ",", "settings");
+        bind("settings", "?", "help");
+        bind("settings", "esc", "back");
+        bind("settings", "j", "view.down");
+        bind("settings", "down", "view.down");
+        bind("settings", "k", "view.up");
+        bind("settings", "up", "view.up");
+        bind("settings", "h", "view.left");
+        bind("settings", "left", "view.left");
+        bind("settings", "l", "view.right");
+        bind("settings", "right", "view.right");
+        bind("settings", "g", "view.top");
+        bind("settings", "home", "view.top");
+        bind("settings", "G", "view.bottom");
+        bind("settings", "end", "view.bottom");
+        bind("settings", "enter", "settings.apply");
+        bind("settings", "space", "settings.apply");
 
         bind("panes", "ctrl-j", "pane.next");
         bind("panes", "ctrl-k", "pane.prev");
@@ -895,6 +920,8 @@ impl Commands {
         for (name, doc, hint) in [
             ("quit", "leave", Some("quit")),
             ("help", "show the keys", Some("keys")),
+            ("settings", "change the settings", Some("settings")),
+            ("settings.apply", "use the next value", None),
             ("back", "leave the innermost mode", Some("back")),
             ("view.down", "one row down", None),
             ("view.up", "one row up", None),
@@ -1809,7 +1836,9 @@ mod tests {
         let k = Keymap::builtin();
         let mut found = k.keys_for("view.down");
         found.sort();
-        assert_eq!(found, vec!["down", "j"]);
+        // `view.down` is also how the settings panel moves its selection —
+        // the same verb, intercepted while the panel stands.
+        assert_eq!(found, vec!["down", "down", "j", "j"]);
         assert!(k.keys_for("nothing.at.all").is_empty());
     }
 

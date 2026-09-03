@@ -1,6 +1,5 @@
 mod chrome;
 mod config;
-mod controls;
 mod dispatch;
 mod graph;
 mod help;
@@ -8,10 +7,9 @@ mod input;
 mod menu;
 mod panes;
 mod session;
+mod settings;
 mod stats;
 mod views;
-
-use controls::Tier;
 
 use gitten_app::acquire::{Data, Loaded};
 use gitten_app::cli::{Request, Source, View};
@@ -85,11 +83,12 @@ static ALLOC: stats::Counting = stats::Counting;
 
 // The three keys that stay GPUI actions, and why: they are the platform's.
 // Cmd-Q quits whatever Mac app you are in, Cmd-C and Cmd-A are what the Edit
-// menu exists for, and a Mac user's fingers already know all three. The menu
-// items below carry them; their handlers call [`DevShell::run_command`] with
-// the *named* commands every other door uses — `quit`, `copy.selection`,
-// `select.all` — so a menu item is an adapter and not a second path.
-actions!(gitten, [Quit, CopySelection, SelectAll]);
+// menu exists for, and Cmd-, opens whatever Mac app's settings you are in —
+// a Mac user's fingers already know all four. The menu items below carry
+// them; their handlers call [`DevShell::run_command`] with the *named*
+// commands every other door uses — `quit`, `copy.selection`, `select.all`,
+// `settings` — so a menu item is an adapter and not a second path.
+actions!(gitten, [Quit, CopySelection, SelectAll, OpenSettings]);
 
 /// The title strip, which is also the window's titlebar — see the note on
 /// [`window_options`]. Forty-four pixels gives the larger title and controls
@@ -397,12 +396,12 @@ const DIFF_DEBOUNCE: Duration = Duration::ZERO;
 /// documented once, in `gitten_app::cli::usage`, because they are the same in
 /// every client — see that function for why that is a promise and not a
 /// convenience.
-const EXTRA: &str =
-    "  The title bar carries five pickers: the presentation (unified, side-by-side),
+const EXTRA: &str = "  `,` opens the settings: the presentation (unified, side-by-side),
   where a line too wide for the window breaks (off, word, char), the diff
   algorithm (histogram, patience, myers), how much whitespace has to match
   (exact, trailing, change, all — git's default, --ignore-space-at-eol, -b and
-  -w) and the theme (dark, light, slate, and whatever gitten.toml adds). `s`
+  -w), the theme (dark, light, slate, and whatever gitten.toml adds), and the
+  rest of the live knobs. Changes apply now and save to gitten.toml. `s`
   cycles the presentation, `w` the wrap and `T` the theme — all three through
   `[keys]` in gitten.toml, where `?` lists everything.
 
@@ -434,33 +433,23 @@ const EXTRA: &str =
 /// diffed by somebody else — and the control is drawn inert.
 type Rediff = Rc<dyn Fn(&Host, &Overrides, &str) -> Result<Vec<FileDiff>, String>>;
 
-/// Which picker is open. At most one, because two open menus over a diff is two
+/// Which menu is open. At most one, because two open menus over a diff is two
 /// things to dismiss.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Open {
-    Theme,
-    Layout,
-    Wrap,
-    Algorithm,
-    Whitespace,
     /// The recent-repositories menu hanging off the title: the MRU list plus
     /// an `Open other…` row that trades the menu for the path field and a
     /// `Browse…` row that trades it for the system file picker.
-    /// No strip trigger of its own — the repository title *is* the trigger —
-    /// so the tier budget never pays for a control that repeats the title.
+    /// No strip trigger of its own — the repository title *is* the trigger.
     Project,
-    /// The composed tier's one trigger: five pickers' entries as sections
-    /// of a single view menu, which needs an open state like any
-    /// other and gets one variant rather than a second state machine.
-    View,
 }
 
 /// The open context menu: the pane it was opened over — whose mode the rows
 /// were projected from, and whose *registration name* a pick routes through,
 /// the way a prompt's pane name routes its result back — the row a
 /// right-click landed on when one was, the pointer, and the rows themselves.
-/// A snapshot of the projection, the way a picker's options are its
-/// registry's: the menu says what the keymap said when it was asked.
+/// A snapshot of the projection, the way a settings row is its registry's:
+/// the menu says what the keymap said when it was asked.
 struct ContextMenu {
     pane: String,
     /// The row the right-click landed on, as the view published it. Read by
@@ -475,9 +464,6 @@ struct ContextMenu {
 
 type RefreshValue = Box<dyn std::any::Any + Send>;
 type ApplyRefresh = dyn FnOnce(RefreshValue, &Host, &mut App) -> Result<(), String>;
-/// What one entry of the composed picker's menu does: the same dispatch the
-/// standalone picker's entry ran, routed by section.
-type Route = Rc<dyn Fn(usize, &mut Window, &mut App)>;
 
 /// What the open input's accept means, and the only things the shell's prompt
 /// slot can hold tonight. A third consumer becomes a third variant and nothing
@@ -1457,12 +1443,13 @@ struct DevShell {
     /// replaced when another opens, dropped the moment one closes.
     search_live: Option<Subscription>,
     /// The live picks. Every field `None` means "whatever the config selected",
-    /// which is what the controls show until somebody changes one — so the strip
-    /// agrees with `gitten.toml` rather than with a copy of it taken at startup.
+    /// which is what the settings panel shows until somebody changes one — so
+    /// the panel agrees with `gitten.toml` rather than with a copy of it taken
+    /// at startup.
     over: Overrides,
     open: Option<Open>,
     /// The open context menu, if a right-click asked for one. One at a time,
-    /// like the pickers — a second right-click moves the one there is — and
+    /// like any menu — a second right-click moves the one there is — and
     /// dismissed by any key, a wheel, a focus change or a pick. See
     /// [`DevShell::open_context_menu`].
     context: Option<ContextMenu>,
@@ -1536,7 +1523,7 @@ struct DevShell {
     /// ([`dispatch::translate`]) — which of them runs is the keymap's
     /// `resolve_any` decision, made against the whole chord at once, so a
     /// half-typed `ß`/alt-s stays alive as both. Reset on every change of
-    /// host, mode, focus, picker, help or screen — a pending chord is a
+    /// host, mode, focus, menu, help or screen — a pending chord is a
     /// promise about what is on screen, and none of those promises survive a
     /// change of any of it.
     pending: Vec<Vec<Key>>,
@@ -1548,6 +1535,13 @@ struct DevShell {
     /// a different projection every time — the active modes' — and an offset
     /// the last reading left is a promise about rows that no longer exist.
     help_scroll: ScrollHandle,
+    /// Whether the settings panel stands, which row its selection is on, and
+    /// the panel's row scroll. The selection is the shell's and not the
+    /// panel's for the same reason the help scroll is: the panel is a pure
+    /// element. Reset when the panel opens.
+    settings: bool,
+    settings_sel: usize,
+    settings_scroll: ScrollHandle,
     /// The window's one focusable element: this shell itself. Key events reach a
     /// listener through the focus path, so something has to hold focus, and one
     /// handle owned here means the views never have to know input exists.
@@ -1799,7 +1793,7 @@ impl DevShell {
 
     /// Rebuilds the mode stack from what is focused, and drops whatever was
     /// pending against the previous arrangement: any half-typed chord, any
-    /// open picker and any context menu — a menu belongs to the pane it was
+    /// open menu and any context menu — a menu belongs to the pane it was
     /// opened over, and one left standing after focus changes is invisible
     /// but still in `self.open` or `self.context`, where
     /// [`DevShell::on_wheel`] swallows for it forever.
@@ -1844,6 +1838,9 @@ impl DevShell {
         }
         if self.help {
             modes.push(help::MODE);
+        }
+        if self.settings {
+            modes.push(settings::MODE);
         }
         if self.show_message && self.error.is_some() {
             modes.push(MESSAGE_MODE);
@@ -3333,11 +3330,30 @@ impl DevShell {
     ///
     /// The main view is the only diff there is, so this reads its revspec off
     /// [`DevShell::main`] directly rather than off whatever holds the
-    /// keyboard: a picker in the title bar acts on what the title bar's
-    /// pickers describe.
+    /// keyboard: the settings panel acts on what the diff view describes.
     fn set_overrides(&mut self, next: Overrides, cx: &mut Context<Self>) {
-        let Some(rediff) = self.rediff.clone() else {
+        if next == self.over {
             return;
+        }
+        if self.rediff_with(&next, cx) {
+            self.over = next;
+        }
+    }
+
+    /// Re-acquires the diff under the current overrides — what a context,
+    /// move-floor or indent-heuristic change runs after patching the live
+    /// host, where [`DevShell::set_overrides`] would early-return on an
+    /// unchanged `over`.
+    fn rediff_current(&mut self, cx: &mut Context<Self>) {
+        let over = self.over.clone();
+        self.rediff_with(&over, cx);
+    }
+
+    /// Re-acquires the diff under `over` and swaps it in. True when the new
+    /// rows are on screen — the caller stores the overrides it just applied.
+    fn rediff_with(&mut self, over: &Overrides, cx: &mut Context<Self>) -> bool {
+        let Some(rediff) = self.rediff.clone() else {
+            return false;
         };
         let Some(revision) = (match &self.main {
             Screen::Diff { source, .. } => match source.borrow().as_ref() {
@@ -3346,20 +3362,16 @@ impl DevShell {
             },
             _ => None,
         }) else {
-            return;
+            return false;
         };
-        if next == self.over {
-            return;
-        }
         let host = config::host(cx);
-        match rediff(&host, &next, &revision) {
+        match rediff(&host, over, &revision) {
             Ok(files) => {
                 self.invalidate_refresh();
-                self.over = next;
                 self.error = None;
                 self.error_is_load = false;
                 let Screen::Diff { view, .. } = &self.main else {
-                    return;
+                    return false;
                 };
                 let view = view.clone();
                 view.update(cx, |d, cx| d.replace(files, &host, cx));
@@ -3367,15 +3379,18 @@ impl DevShell {
                 if let Some(stats) = &mut self.stats {
                     stats.reloaded(load);
                 }
+                cx.notify();
+                true
             }
             // The old rows stay on screen, which is the right failure: they are
             // still a true diff, just not the one that was asked for.
             Err(e) => {
                 self.error = Some(GitError::new(e));
                 self.error_is_load = true;
+                cx.notify();
+                false
             }
         }
-        cx.notify();
     }
 
     /// Costs no re-diff and no `prepare` — only where the lines break moves —
@@ -3433,6 +3448,277 @@ impl DevShell {
         };
         drop(host);
         self.set_theme(next, cx);
+    }
+
+    /// The settings panel's rows, spelled from the live state: the view's own
+    /// layout and wrap lists with their current indices, the *effective*
+    /// algorithm and whitespace — the live override where there is one, the
+    /// configured default otherwise — and everything else off the host. The
+    /// panel must agree with what is on screen rather than with the file.
+    fn settings_sections(&self, cx: &App) -> Vec<settings::Section> {
+        let host = config::host(cx);
+        // Both lists hand out `&'static str` — registry names, not borrows —
+        // so the rows can hold them without holding the view.
+        let (layouts, layout, wraps, wrap, from_repo) = match &self.main {
+            Screen::Diff { view, source, .. } => {
+                let cell = view.read(cx);
+                let out = (
+                    cell.layout_names(),
+                    cell.layout_index(),
+                    cell.wrap_names(&host),
+                    cell.wrap_index(),
+                );
+                let repo = self.rediff.is_some()
+                    && matches!(source.borrow().as_ref(), Some(Source::Repo { .. }));
+                (out.0, out.1, out.2, out.3, repo)
+            }
+            _ => (Vec::new(), 0, Vec::new(), 0, false),
+        };
+        let algorithm = self
+            .over
+            .algorithm
+            .as_deref()
+            .unwrap_or(host.differ.selected());
+        let whitespace = self.over.whitespace.unwrap_or(host.differ.whitespace);
+        settings::build(
+            &host, &layouts, layout, &wraps, wrap, algorithm, whitespace, from_repo,
+        )
+    }
+
+    /// Moves the panel's selection, clamping at both ends — a list that wraps
+    /// from the last knob to the first loses your place by the whole panel.
+    fn settings_move(&mut self, by: isize, cx: &mut Context<Self>) {
+        let count = settings::len(&self.settings_sections(cx));
+        if count == 0 {
+            return;
+        }
+        let sel = (self.settings_sel as isize + by).clamp(0, count as isize - 1) as usize;
+        if sel != self.settings_sel {
+            self.settings_sel = sel;
+            cx.notify();
+        }
+    }
+
+    /// The first or the last row — what `g`/`G` run while the panel stands.
+    fn settings_jump(&mut self, bottom: bool, cx: &mut Context<Self>) {
+        let count = settings::len(&self.settings_sections(cx));
+        if count == 0 {
+            return;
+        }
+        self.settings_sel = match bottom {
+            true => count - 1,
+            false => 0,
+        };
+        cx.notify();
+    }
+
+    /// Turns the selected row's value by `dir`: the next or previous choice,
+    /// one step on a number, a flip on a switch. Choosing is doing — the
+    /// change applies now — and it is also written back to `gitten.toml` as
+    /// the new default, so a relaunch opens where the panel left off.
+    fn settings_adjust(&mut self, dir: i32, cx: &mut Context<Self>) {
+        let sections = self.settings_sections(cx);
+        let Some((s, r)) = settings::at(&sections, self.settings_sel) else {
+            return;
+        };
+        if !sections[s].rows[r].enabled {
+            return;
+        }
+        self.settings_apply(sections[s].rows[r].setting, dir, cx);
+    }
+
+    /// One knob, turned. Every arm ends in the same two halves: the live
+    /// change through the route the old strip controls took, and the file
+    /// write that makes it the default — [`DevShell::save_default`].
+    fn settings_apply(&mut self, setting: settings::Setting, dir: i32, cx: &mut Context<Self>) {
+        use settings::Setting as S;
+        let host = config::host(cx);
+        match setting {
+            S::Layout => {
+                let Screen::Diff { view, .. } = &self.main else {
+                    return;
+                };
+                let view = view.clone();
+                let (names, index) = (view.read(cx).layout_names(), view.read(cx).layout_index());
+                let next = settings::cycle(names.len(), index, dir);
+                let name = names.get(next).map(|s| s.to_string());
+                self.set_layout(next, cx);
+                if let Some(name) = name {
+                    self.save_default("diff", "layout", format!("{name:?}"), cx);
+                }
+            }
+            S::Wrap => {
+                let Screen::Diff { view, .. } = &self.main else {
+                    return;
+                };
+                let view = view.clone();
+                let (names, index) = (view.read(cx).wrap_names(&host), view.read(cx).wrap_index());
+                let next = settings::cycle(names.len(), index, dir);
+                let name = names.get(next).map(|s| s.to_string());
+                self.set_wrap(next, cx);
+                if let Some(name) = name {
+                    self.save_default("diff", "wrap", format!("{name:?}"), cx);
+                }
+            }
+            S::Algorithm => {
+                let names = host.differ.names();
+                let current = self
+                    .over
+                    .algorithm
+                    .as_deref()
+                    .unwrap_or(host.differ.selected());
+                let at = names.iter().position(|n| *n == current).unwrap_or(0);
+                let name = names
+                    .get(settings::cycle(names.len(), at, dir))
+                    .map(|s| s.to_string());
+                if let Some(name) = name {
+                    let next = Overrides {
+                        algorithm: Some(name.clone()),
+                        ..self.over.clone()
+                    };
+                    self.set_overrides(next, cx);
+                    self.save_default("diff", "algorithm", format!("{name:?}"), cx);
+                }
+            }
+            S::Whitespace => {
+                let at = Whitespace::ALL
+                    .iter()
+                    .position(|w| *w == self.over.whitespace.unwrap_or(host.differ.whitespace))
+                    .unwrap_or(0);
+                let next = Whitespace::ALL[settings::cycle(Whitespace::ALL.len(), at, dir)];
+                self.set_overrides(
+                    Overrides {
+                        whitespace: Some(next),
+                        ..self.over.clone()
+                    },
+                    cx,
+                );
+                self.save_default("diff", "whitespace", format!("{:?}", next.name()), cx);
+            }
+            S::Context => {
+                let next = (host.differ.context as i32 + dir).clamp(0, 100) as usize;
+                self.save_live("diff", "context", next.to_string(), cx, |live| {
+                    live.differ.context = next;
+                });
+                self.rediff_current(cx);
+            }
+            S::Moves => {
+                let next = (host.differ.min_moved as i32 + dir).clamp(0, 1000) as usize;
+                self.save_live("diff", "moves", next.to_string(), cx, |live| {
+                    live.differ.min_moved = next;
+                });
+                self.rediff_current(cx);
+            }
+            S::IndentHeuristic => {
+                let next = !host.differ.indent_heuristic;
+                self.save_live("diff", "indent_heuristic", next.to_string(), cx, |live| {
+                    live.differ.indent_heuristic = next;
+                });
+                self.rediff_current(cx);
+            }
+            S::Theme => {
+                let names = host.themes.names();
+                let at = names
+                    .iter()
+                    .position(|n| *n == host.theme.name)
+                    .unwrap_or(0);
+                let name = names
+                    .get(settings::cycle(names.len(), at, dir))
+                    .map(|s| s.to_string());
+                if let Some(name) = name {
+                    self.set_theme(name.clone(), cx);
+                    self.save_default("theme", "name", format!("{name:?}"), cx);
+                }
+            }
+            S::FontSize => {
+                let next = (host.font.size + dir as f32).clamp(4.0, 96.0);
+                let spelled = format!("{next}");
+                self.save_live("font", "size", spelled, cx, |live| {
+                    live.font.size = next;
+                });
+            }
+            S::FontFamily => {
+                let mut families = vec![host.font.family.clone()];
+                for known in ["JetBrainsMono Nerd Font Mono", "Menlo"] {
+                    if !families.iter().any(|f| f == known) {
+                        families.push(known.to_string());
+                    }
+                }
+                let at = 0;
+                let next = families[settings::cycle(families.len(), at, dir)].clone();
+                if next != host.font.family {
+                    self.save_live("font", "family", format!("{next:?}"), cx, |live| {
+                        live.font.family = next.clone();
+                    });
+                }
+            }
+            S::Scroll => {
+                let next = (host.view.rows as i32 + dir).clamp(1, 100) as usize;
+                self.save_live("view", "scroll", next.to_string(), cx, |live| {
+                    live.view.rows = next;
+                });
+            }
+            S::Scrolloff => {
+                let next = (host.view.scrolloff as i32 + dir).clamp(0, 50) as usize;
+                self.save_live("view", "scrolloff", next.to_string(), cx, |live| {
+                    live.view.scrolloff = next;
+                });
+            }
+            S::Scrollbar => {
+                let next = !host.view.scrollbar;
+                self.save_live("view", "scrollbar", next.to_string(), cx, |live| {
+                    live.view.scrollbar = next;
+                });
+            }
+            S::Sidebar => {
+                let next = (host.sidebar_share + dir as f32 * 0.01).clamp(
+                    gitten_core::host::SIDEBAR_MIN,
+                    gitten_core::host::SIDEBAR_MAX,
+                );
+                self.save_live("view", "sidebar", format!("{next}"), cx, |live| {
+                    live.sidebar_share = next;
+                });
+                // The drag adjusts a session copy the file never sees; the
+                // panel moves both, so the window follows now and the next
+                // window opens here.
+                self.share.set(next);
+            }
+            S::CopyOnSelect => {
+                let next = !host.mouse.copy_on_select;
+                self.save_live("mouse", "copy_on_select", next.to_string(), cx, |live| {
+                    live.mouse.copy_on_select = next;
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    /// Writes one panel change back to `gitten.toml` as the new default.
+    /// Best effort, the way [`gitten_app::config::load`] reads: a change that
+    /// cannot be saved still applies to the window behind the panel, and says
+    /// so once in the band rather than failing.
+    fn save_default(&mut self, section: &str, key: &str, value: String, cx: &mut Context<Self>) {
+        if let Some(warning) = gitten_app::config::save_setting(&self.config, section, key, &value)
+        {
+            self.set_notice(warning);
+            cx.notify();
+        }
+    }
+
+    /// [`DevShell::save_default`] plus a live-host patch for a knob whose
+    /// route *is* the host: the file carries the default, the patched global
+    /// carries tonight. `tune` must set the same value that was spelled —
+    /// the file and the window must not disagree about what was chosen.
+    fn save_live(
+        &mut self,
+        section: &str,
+        key: &str,
+        value: String,
+        cx: &mut Context<Self>,
+        tune: impl FnOnce(&mut Host),
+    ) {
+        self.save_default(section, key, value, cx);
+        config::patch(cx, tune);
     }
 
     /// `project.switch`. Opens the recent-repositories menu off the title —
@@ -3756,7 +4042,7 @@ impl DevShell {
         // constant — the same reason `font.advance` exists at all.
         let widest = labels.iter().map(|l| l.chars().count()).max().unwrap_or(0);
         let w = (widest as f32 + 4.0) * f.advance * f.size + 16.0;
-        let h = labels.len() as f32 * controls::ROW_H + 2.0 * 4.0 + 2.0;
+        let h = labels.len() as f32 * menu::ROW_H + 2.0 * 4.0 + 2.0;
         let at = crate::menu::clamped(
             point(px(LIGHTS_W), px(TITLE_H)),
             window.viewport_size(),
@@ -3782,7 +4068,7 @@ impl DevShell {
             .occlude()
             // A menu that only closes by choosing something is a menu you
             // cannot change your mind about; the backdrop above already
-            // stands for any open picker.
+            // stands for any open menu.
             .on_mouse_down_out({
                 let me = me.clone();
                 move |_, _, cx| {
@@ -3802,7 +4088,7 @@ impl DevShell {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .h(px(controls::ROW_H))
+                    .h(px(menu::ROW_H))
                     .px_2()
                     .cursor_pointer()
                     .hover(|s| s.bg(rgb(c.status_bg)))
@@ -3863,9 +4149,35 @@ impl DevShell {
                 // longer exist.
                 if self.help {
                     help::scroll_to_end(&self.help_scroll, false);
+                    // One panel at a time: the settings one stood over the
+                    // same keyboard.
+                    self.settings = false;
                 }
                 self.sync_modes(cx);
             }
+            "settings" => {
+                self.settings = !self.settings;
+                if self.settings {
+                    self.settings_sel = 0;
+                    help::scroll_to_end(&self.settings_scroll, false);
+                    // One panel at a time.
+                    self.help = false;
+                }
+                self.sync_modes(cx);
+            }
+            // While the settings panel stands, the movement verbs are the
+            // panel's: up and down move the selection, left and right (or
+            // enter/space) turn the value. The names are the map's — bound
+            // in the settings mode in `core` — so the routing here is the
+            // only client-side half of it, the way the help panel's scroll
+            // routing is.
+            "view.down" if self.settings => self.settings_move(1, cx),
+            "view.up" if self.settings => self.settings_move(-1, cx),
+            "view.left" if self.settings => self.settings_adjust(-1, cx),
+            "view.right" if self.settings => self.settings_adjust(1, cx),
+            "view.top" if self.settings => self.settings_jump(false, cx),
+            "view.bottom" if self.settings => self.settings_jump(true, cx),
+            "settings.apply" if self.settings => self.settings_adjust(1, cx),
             // While the panel stands, the movement verbs are the panel's: the
             // rows under it are occluded, and one of these keys moving the list
             // underneath instead would scroll something the reader cannot see.
@@ -4031,11 +4343,11 @@ impl DevShell {
         cx.notify();
     }
 
-    /// Closes the help, the picker over it, the input field, or the diff
+    /// Closes the help, the settings panel, the input field, or the diff
     /// region's hold on the keyboard.
     ///
     /// One key for all of it, because all of it is "get me out of this" — and
-    /// **innermost first**, or a picker left open after its context is popped
+    /// **innermost first**, or a menu left open after its context is popped
     /// keeps occluding nothing: invisible, but still in `self.open`, where
     /// [`DevShell::on_wheel`] swallows every event for it forever. So an open
     /// menu is the whole of this `esc`: closed, pending dropped with it.
@@ -4058,6 +4370,11 @@ impl DevShell {
             self.sync_modes(cx);
             return;
         }
+        if self.settings {
+            self.settings = false;
+            self.sync_modes(cx);
+            return;
+        }
         // An error is a message, not a context: it stands until dismissed, and
         // `esc` dismisses it before `back` moves anything else.
         if self.error.is_some() {
@@ -4068,7 +4385,6 @@ impl DevShell {
             return;
         }
         if self.open.take().is_some() {
-            // The theme's as much a picker as the rest: same key, same exit.
             self.pending.clear();
             cx.notify();
             return;
@@ -4481,6 +4797,9 @@ impl DevShell {
             // reads as "not bound" instead of arming a discard behind a screen
             // that is only describing it. `Resolve::None` below says so.
             false if self.help => host.keys.resolve_mode_any(help::MODE, &typed),
+            // While the settings panel stands it owns the keyboard the same
+            // way the help panel does: resolved against its mode *alone*.
+            false if self.settings => host.keys.resolve_mode_any(settings::MODE, &typed),
             false => host.keys.resolve_any(&self.modes, &typed),
         };
         match resolved {
@@ -4607,12 +4926,12 @@ impl DevShell {
         // half-typed when the fingers touch the wheel is not half-typed any
         // more. The same rule the focus and host checks apply, one line each.
         self.pending.clear();
-        // Help is up, or a picker menu or a context menu: their occluding
+        // Help is up, or a project menu or a context menu: their occluding
         // surfaces keep the rows out of the hit path, while this capture
         // interceptor stands aside so a handler on the visible panel can
         // still see the event. Stopping propagation here would prevent that
         // bubble handler.
-        if self.help || self.open.is_some() || self.context.is_some() {
+        if self.help || self.settings || self.open.is_some() || self.context.is_some() {
             return;
         }
         // Over one region's rows or the other's, and not over the title bar
@@ -4705,287 +5024,6 @@ impl DevShell {
         }
     }
 
-    /// The pickers, right-aligned in the title bar. The theme is always one of
-    /// them, because a palette is the window's; the other four drive the diff
-    /// view and are drawn only when that is what is on screen — the commit graph
-    /// has none of them to choose.
-    ///
-    /// Each one is the same shape: a list of names from a registry or an enum,
-    /// and an index into it. That is why adding a presentation or an algorithm
-    /// needs no work here.
-    fn strip(
-        &self,
-        host: &Host,
-        cx: &mut Context<Self>,
-        // The window's width, what sits left of the pickers but the repo
-        // path, and the path's character count — [`controls::tier`]'s
-        // three inputs, from the same source the status bar's budget uses.
-        width_px: f32,
-        left_px: f32,
-        path_chars: usize,
-    ) -> Vec<AnyElement> {
-        let me = cx.entity().downgrade();
-
-        // `Fn(bool)` per picker rather than one shared handler: which menu is
-        // open is one field, and the closure is what knows which one it is. Both
-        // halves reset pending chords: an open picker is a context, and keys
-        // pressed into it start from nothing.
-        let toggle = |which: Open| {
-            let me = me.clone();
-            move |next: bool, _: &mut Window, cx: &mut App| {
-                _ = me.update(cx, |this, cx| {
-                    this.open = next.then_some(which);
-                    this.pending.clear();
-                    cx.notify();
-                });
-            }
-        };
-
-        // Straight off the registry in `core`, so a theme an extension registers
-        // — or one written in `gitten.toml` — is in this menu without a line here
-        // changing. The pick itself is spelled once: both the standalone trigger
-        // and the composed menu's section route it.
-        let theme_names = host.themes.names();
-        let themes = controls::Picker::new(
-            "theme",
-            &theme_names,
-            host.themes.index_of(&host.theme.name).unwrap_or(0),
-        );
-        let theme_pick = {
-            let names: Vec<String> = theme_names.iter().map(|s| s.to_string()).collect();
-            let me = me.clone();
-            move |i: usize, _: &mut Window, cx: &mut App| {
-                let Some(name) = names.get(i).cloned() else {
-                    return;
-                };
-                _ = me.update(cx, |this, cx| {
-                    this.open = None;
-                    this.pending.clear();
-                    this.set_theme(name, cx);
-                });
-            }
-        };
-
-        let Screen::Diff { view, source, .. } = &self.main else {
-            // No diff behind the strip — a launch with no repository — leaves
-            // the theme the only picker, and the tier still decides its shape.
-            let tier = controls::tier(&host.font, width_px, left_px, path_chars, &[&themes]);
-            return match tier {
-                Tier::Composed => vec![controls::composed_picker(
-                    "view-picker",
-                    &controls::Section::sections(&[&themes]),
-                    self.open.is_some(),
-                    &host.theme,
-                    &host.font,
-                    toggle(Open::View),
-                    move |s: usize, i: usize, window: &mut Window, cx: &mut App| {
-                        if s == 0 {
-                            theme_pick(i, window, cx);
-                        }
-                    },
-                )],
-                _ => vec![controls::picker(
-                    "theme-picker",
-                    &themes,
-                    self.open == Some(Open::Theme),
-                    !matches!(tier, Tier::Full),
-                    &host.theme,
-                    &host.font,
-                    toggle(Open::Theme),
-                    theme_pick,
-                )],
-            };
-        };
-        let source = source.borrow().clone();
-
-        let names = view.read(cx).layout_names();
-        let layouts = controls::Picker::new("layout", &names, view.read(cx).layout_index());
-
-        // Straight off the registry in `core`, so a wrap an extension registers
-        // is in this menu the day it exists.
-        let wrap_names = view.read(cx).wrap_names(host);
-        let wrap = controls::Picker::new("wrap", &wrap_names, view.read(cx).wrap_index());
-
-        // An algorithm or a whitespace rule only means something when a
-        // repository produced these rows; a fixture was diffed by somebody
-        // else and says so by drawing the control inert.
-        let from_repo = self.rediff.is_some() && matches!(source, Some(Source::Repo { .. }));
-        let algorithms = host.differ.names();
-        let selected = self
-            .over
-            .algorithm
-            .as_deref()
-            .unwrap_or(host.differ.selected());
-        let algorithm = controls::Picker::new(
-            "algorithm",
-            &algorithms,
-            algorithms.iter().position(|n| *n == selected).unwrap_or(0),
-        )
-        .enabled(from_repo);
-
-        let ws_names: Vec<&str> = Whitespace::ALL.iter().map(|w| w.name()).collect();
-        let ws = self.over.whitespace.unwrap_or(host.differ.whitespace);
-        let whitespace = controls::Picker::new(
-            "whitespace",
-            &ws_names,
-            Whitespace::ALL.iter().position(|w| *w == ws).unwrap_or(0),
-        )
-        .enabled(from_repo);
-
-        // One dispatch per entry, spelled once: entry `(section, i)` of the
-        // composed menu does exactly what the standalone picker's `i` did,
-        // in the order the triggers stand in. `Rc` because either the five
-        // triggers or the one composed one picks from it — a frame builds
-        // one shape or the other, never both.
-        let routes: Vec<Route> = vec![
-            Rc::new({
-                let me = me.clone();
-                move |i: usize, _: &mut Window, cx: &mut App| {
-                    _ = me.update(cx, |this, cx| {
-                        this.open = None;
-                        this.pending.clear();
-                        this.set_layout(i, cx);
-                    });
-                }
-            }),
-            Rc::new({
-                let me = me.clone();
-                move |i: usize, _: &mut Window, cx: &mut App| {
-                    _ = me.update(cx, |this, cx| {
-                        this.open = None;
-                        this.pending.clear();
-                        this.set_wrap(i, cx);
-                    });
-                }
-            }),
-            Rc::new({
-                // The registry's own order, so an extension's differ is
-                // reachable here the day it is registered.
-                let names: Vec<String> = algorithms.iter().map(|s| s.to_string()).collect();
-                let me = me.clone();
-                move |i: usize, _: &mut Window, cx: &mut App| {
-                    let Some(name) = names.get(i).cloned() else {
-                        return;
-                    };
-                    _ = me.update(cx, |this, cx| {
-                        this.open = None;
-                        this.pending.clear();
-                        let next = Overrides {
-                            algorithm: Some(name),
-                            ..this.over.clone()
-                        };
-                        this.set_overrides(next, cx);
-                    });
-                }
-            }),
-            Rc::new({
-                let me = me.clone();
-                move |i: usize, _: &mut Window, cx: &mut App| {
-                    _ = me.update(cx, |this, cx| {
-                        this.open = None;
-                        this.pending.clear();
-                        let next = Overrides {
-                            whitespace: Whitespace::ALL.get(i).copied(),
-                            ..this.over.clone()
-                        };
-                        this.set_overrides(next, cx);
-                    });
-                }
-            }),
-            Rc::new(theme_pick),
-        ];
-
-        // The tier decides the triggers' shape before any of it is drawn —
-        // the same arithmetic the status bar's hint budget spends, over the
-        // registries as they are right now, so a picker registered tomorrow
-        // is budgeted the day it appears.
-        let pickers = [&layouts, &wrap, &algorithm, &whitespace, &themes];
-        let tier = controls::tier(&host.font, width_px, left_px, path_chars, &pickers);
-        if matches!(tier, Tier::Composed) {
-            return vec![controls::composed_picker(
-                "view-picker",
-                &controls::Section::sections(&pickers),
-                self.open.is_some(),
-                &host.theme,
-                &host.font,
-                toggle(Open::View),
-                move |s: usize, i: usize, window: &mut Window, cx: &mut App| {
-                    if let Some(route) = routes.get(s) {
-                        route(i, window, cx);
-                    }
-                },
-            )];
-        }
-        let value_only = !matches!(tier, Tier::Full);
-
-        vec![
-            controls::picker(
-                "layout-picker",
-                &layouts,
-                self.open == Some(Open::Layout),
-                value_only,
-                &host.theme,
-                &host.font,
-                toggle(Open::Layout),
-                {
-                    let routes = routes.clone();
-                    move |i, window: &mut Window, cx: &mut App| routes[0](i, window, cx)
-                },
-            ),
-            controls::picker(
-                "wrap-picker",
-                &wrap,
-                self.open == Some(Open::Wrap),
-                value_only,
-                &host.theme,
-                &host.font,
-                toggle(Open::Wrap),
-                {
-                    let routes = routes.clone();
-                    move |i, window: &mut Window, cx: &mut App| routes[1](i, window, cx)
-                },
-            ),
-            controls::picker(
-                "algorithm-picker",
-                &algorithm,
-                self.open == Some(Open::Algorithm),
-                value_only,
-                &host.theme,
-                &host.font,
-                toggle(Open::Algorithm),
-                {
-                    let routes = routes.clone();
-                    move |i, window: &mut Window, cx: &mut App| routes[2](i, window, cx)
-                },
-            ),
-            controls::picker(
-                "whitespace-picker",
-                &whitespace,
-                self.open == Some(Open::Whitespace),
-                value_only,
-                &host.theme,
-                &host.font,
-                toggle(Open::Whitespace),
-                {
-                    let routes = routes.clone();
-                    move |i, window: &mut Window, cx: &mut App| routes[3](i, window, cx)
-                },
-            ),
-            controls::picker(
-                "theme-picker",
-                &themes,
-                self.open == Some(Open::Theme),
-                value_only,
-                &host.theme,
-                &host.font,
-                toggle(Open::Theme),
-                {
-                    let routes = routes.clone();
-                    move |i, window: &mut Window, cx: &mut App| routes[4](i, window, cx)
-                },
-            ),
-        ]
-    }
     /// The probe cell a section's content wrapper reports its height into —
     /// keyed by the section's element id, because the wrappers are built
     /// fresh every frame and the probe has to write into something that
@@ -5569,22 +5607,15 @@ impl Render for DevShell {
 
         let which = self.active_view_name();
 
-        // The width the strip and the status bar must agree on — the same
-        // `viewport_size` read the status bar's hint budget spends, so the
-        // two bars can never disagree about how wide the window is.
-        let width = f32::from(window.viewport_size().width);
         let ch = host.font.char_width();
 
         // The title is the repository and where HEAD is, and nothing else.
         // The app's name is the icon's job, the view's name is the status
         // badge's and the version is the bar's; a strip that said all three
-        // again was chrome reading its own labels aloud. The path is drawn
-        // the way every path here is — parent dim, the name bright — and a
-        // launch with no repository behind it (a fixture, a patch) keeps the
-        // acquisition label, which is the only name it has. Read before the
-        // strip is built: the path's character count is the pickers' budget.
+        // again was chrome reading its own labels aloud. A launch with no
+        // repository behind it (a fixture, a patch) keeps the acquisition
+        // label, which is the only name it has.
         let title: AnyElement;
-        let path_chars: usize;
         let me = cx.entity().downgrade();
         match &self.repo {
             Some((path, _)) => {
@@ -5599,12 +5630,10 @@ impl Render for DevShell {
                         (dir, name)
                     }
                 };
-                path_chars = dir.chars().count() + name.chars().count();
                 let spans = chrome::path_spans(&host, dir, name, c.fg, theme::Surface::Title, true);
                 // The repository title is the project switcher's trigger: the
-                // recent menu hangs below the strip, and the strip spends no
-                // control budget on a picker that would only repeat the
-                // title. A fixture's label opens nothing and stays plain.
+                // recent menu hangs below the strip. A fixture's label opens
+                // nothing and stays plain.
                 // Inline, like every other click handler: a pre-bound
                 // variable pins the event's lifetime and no longer
                 // implements the handler type.
@@ -5624,7 +5653,6 @@ impl Render for DevShell {
             }
             None => {
                 let label = self.active_label(cx);
-                path_chars = label.chars().count();
                 title = div()
                     .whitespace_nowrap()
                     // From the *start*: the label is a path and a revspec, and
@@ -5635,12 +5663,11 @@ impl Render for DevShell {
             }
         }
 
-        // The branch chip, read before the strip is built: its width is part
-        // of what the pickers have to fit beside. One small struct per frame,
-        // no second git call anywhere. Filled with `raised`, the quiet chip
-        // surface — the status badge keeps the accent fill to itself, so the
-        // two never compete. Detached HEAD names its abbreviated commit; a
-        // fixture with no branch pane draws nothing.
+        // The branch chip. One small struct per frame, no second git call
+        // anywhere. Filled with `raised`, the quiet chip surface — the status
+        // badge keeps the accent fill to itself, so the two never compete.
+        // Detached HEAD names its abbreviated commit; a fixture with no
+        // branch pane draws nothing.
         let head_chip = self.panes.get("branches").and_then(|screen| {
             let Screen::Branches { view, .. } = screen else {
                 return None;
@@ -5648,28 +5675,44 @@ impl Render for DevShell {
             view.read(cx).head_info()
         });
 
-        // What the strip's right side has to fit beside: the lights inset it
-        // opens with, its paddings and border, and the gaps between its
-        // children — the chip and the debug caveat cost what they render. The
-        // path and the pickers are costed where they are known, in
-        // [`controls::tier`].
-        let mut left_px = LIGHTS_W + 14.0 + 1.0 + 16.0;
-        if let Some(info) = &head_chip {
-            let chars =
-                info.chip.chars().count() + info.drift.as_ref().map(|d| d.chars()).unwrap_or(0);
-            left_px += chars as f32 * ch * chrome::TOPBAR_TEXT_SCALE
-                + 2.0 * f32::from(chrome::gap_l(f))
-                + 2.0
-                + f32::from(chrome::gap_l(f));
-            if info.drift.is_some() {
-                left_px += (ch * 0.7).round();
-            }
-        }
-        if cfg!(debug_assertions) {
-            left_px += 5.0 * ch * chrome::TITLE_TEXT_SCALE + 8.0;
-        }
-
-        let strip = self.strip(&host, cx, width, left_px, path_chars);
+        // The settings button, right-aligned: one gear where five pickers
+        // stood. `,` and the menu open the same panel; this is the
+        // discoverable third door, wearing the same chrome the branch chip
+        // does so the strip stays one surface.
+        let settings_button = {
+            let me = me.clone();
+            let open = self.settings;
+            div()
+                .id("settings-button")
+                .debug_selector(|| "settings-button".to_string())
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .h(px(CHIP_H))
+                .w(px(CHIP_H))
+                .rounded(px(chrome::RADIUS))
+                .border_1()
+                .border_color(rgb(match open {
+                    true => c.faint,
+                    false => c.border,
+                }))
+                .bg(rgb(match open {
+                    true => c.selection_bg,
+                    false => c.raised,
+                }))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(c.keycap)).border_color(rgb(c.faint)))
+                .child(
+                    Icon::new(IconName::Settings)
+                        .size(px(14.0))
+                        .text_color(rgb(host.theme.dim_on(theme::Surface::Title))),
+                )
+                .on_click(move |_, _, cx| {
+                    _ = me.update(cx, |this, cx| this.run_command("settings", cx));
+                })
+                .into_any_element()
+        };
 
         let error = self.error.as_ref().map(|e| e.summary.clone());
         let notice = self.notice.clone();
@@ -5715,13 +5758,14 @@ impl Render for DevShell {
             .font_family(f.family.clone())
             .track_focus(&self.focus)
             .capture_key_down(cx.listener(Self::on_key))
-            // The menu's three adapters. Each calls the same named dispatch a
+            // The menu's four adapters. Each calls the same named dispatch a
             // key resolves to — see the note on the `actions!` above.
             .on_action(cx.listener(|this, _: &Quit, _, cx| this.native("quit", cx)))
             .on_action(
                 cx.listener(|this, _: &CopySelection, _, cx| this.native("copy.selection", cx)),
             )
-            .on_action(cx.listener(|this, _: &SelectAll, _, cx| this.native("select.all", cx)));
+            .on_action(cx.listener(|this, _: &SelectAll, _, cx| this.native("select.all", cx)))
+            .on_action(cx.listener(|this, _: &OpenSettings, _, cx| this.native("settings", cx)));
 
         // The wheel, heard first: capture phase on a paint-time probe, the same
         // trick the diff view's old one used, moved up to where the mode stack
@@ -5770,9 +5814,10 @@ impl Render for DevShell {
                     .text_color(rgb(host.theme.dim_on(theme::Surface::Title)))
                     // The one thing in the strip that is allowed to shrink, and
                     // everything else is `flex_none`. A repository is the part of
-                    // a title a reader can reconstruct; a picker pushed off the
-                    // right edge — which is what a strip of `flex_none` children
-                    // and no `min_w_0` did — is a control that no longer exists.
+                    // a title a reader can reconstruct; a button pushed off the
+                    // right edge — which is what a strip of `flex_none`
+                    // children and no `min_w_0` did — is a control that no
+                    // longer exists.
                     .child(
                         div()
                             .id("project-title")
@@ -5848,11 +5893,11 @@ impl Render for DevShell {
                         // and the accent alone is unmistakable.
                         div().flex_none().text_color(rgb(c.accent)).child("debug")
                     }))
-                    // Pushes the controls to the right edge and takes the clicks
-                    // that land between them, so a stray click on the title bar
-                    // does not fall through to whatever is under it.
+                    // Pushes the settings button to the right edge and takes the
+                    // clicks that land between them, so a stray click on the
+                    // title bar does not fall through to whatever is under it.
                     .child(div().flex_grow(1.0))
-                    .children(strip),
+                    .child(settings_button),
             )
             // The two regions in one row: the left stack, the diff. A fixture
             // has no stack — no repository to list — and the diff fills the
@@ -5905,9 +5950,7 @@ impl Render for DevShell {
             // priority-0 backdrop blocks the rest of the window without
             // covering the menu, so capture can leave overlay wheel ownership
             // alone without exposing the native list scroller underneath.
-            .children(
-                (self.open.is_some() || self.context.is_some()).then(controls::picker_backdrop),
-            )
+            .children((self.open.is_some() || self.context.is_some()).then(menu::backdrop))
             // The context menu itself. Its rows are the keymap's — projected
             // when it was asked, over the one pane the click landed in — and
             // its pick dispatches the row's *name*, so no literal command
@@ -6054,15 +6097,64 @@ impl Render for DevShell {
                             .child(load),
                     )
             }))
-            // The help overlay, last so it paints over everything: deferred, so
-            // it escapes the regions' paint order; occluding, so the rows under
-            // it get neither the clicks nor the wheel. Its rows come from the
-            // same projection the terminal draws, which is why neither client
-            // can drift from the other.
+            // The help overlay, over everything but the settings panel and the
+            // message: deferred, so it escapes the regions' paint order;
+            // occluding, so the rows under it get neither the clicks nor the
+            // wheel. Its rows come from the same projection the terminal
+            // draws, which is why neither client can drift from the other.
             .children(
                 self.help
                     .then(|| help::overlay(&config::host(cx), &self.modes, &self.help_scroll)),
             )
+            // The settings panel, beside the help one: one panel at a time
+            // stands, and this one carries every knob the title strip used
+            // to. Built from the live state per frame — see
+            // [`DevShell::settings_sections`] — so a config reload behind it
+            // rewrites the rows rather than stranding them.
+            .children(self.settings.then(|| {
+                let sections = self.settings_sections(cx);
+                // Clamped, not trusted: the registries moved since the
+                // selection did, and a stale index is an unmoved one.
+                let sel = self
+                    .settings_sel
+                    .min(settings::len(&sections).saturating_sub(1));
+                let me = cx.entity().downgrade();
+                settings::overlay(
+                    &sections,
+                    sel,
+                    &self.settings_scroll,
+                    &config::host(cx),
+                    &self.modes,
+                    {
+                        let me = me.clone();
+                        move |i: usize, _: &mut Window, cx: &mut App| {
+                            _ = me.update(cx, |this, cx| {
+                                this.settings_sel = i;
+                                cx.notify();
+                            });
+                        }
+                    },
+                    {
+                        let me = me.clone();
+                        move |i: usize, dir: i32, _: &mut Window, cx: &mut App| {
+                            _ = me.update(cx, |this, cx| {
+                                this.settings_sel = i;
+                                this.settings_adjust(dir, cx);
+                            });
+                        }
+                    },
+                    {
+                        let me = me.clone();
+                        move |_: &mut Window, cx: &mut App| {
+                            _ = me.update(cx, |this, cx| {
+                                this.settings = false;
+                                this.sync_modes(cx);
+                                cx.notify();
+                            });
+                        }
+                    },
+                )
+            }))
             // The message overlay, over even the help: it exists because the
             // band's one truncated line was not the whole of git's answer, so
             // the whole of the answer is the one thing it must show.
@@ -6260,7 +6352,7 @@ fn open_main_window(started: Started, cx: &mut App) {
     })
     .detach();
 
-    // The platform's keys, not this app's: these three exist for the menu —
+    // The platform's keys, not this app's: these four exist for the menu —
     // accelerators macOS shows and performs — and their handlers are the
     // element-level adapters in `render`, which call the same named dispatch
     // every keypress uses. Nothing else is a `KeyBinding` anywhere in this
@@ -6270,6 +6362,7 @@ fn open_main_window(started: Started, cx: &mut App) {
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-c", CopySelection, None),
         KeyBinding::new("cmd-a", SelectAll, None),
+        KeyBinding::new("cmd-,", OpenSettings, None),
     ]);
 
     // Open the window here and now, not from a spawned task: the task only
@@ -6568,6 +6661,9 @@ fn open_main_window(started: Started, cx: &mut App) {
                 pending: Vec::new(),
                 help: false,
                 help_scroll: ScrollHandle::default(),
+                settings: false,
+                settings_sel: 0,
+                settings_scroll: ScrollHandle::default(),
                 focus,
                 focused: None,
                 seen_host: None,
@@ -6664,12 +6760,15 @@ fn open_main_window(started: Started, cx: &mut App) {
     // the event loop starts, so registering after the window exists races
     // nothing; the bar just fills in while frame zero paints.
     //
-    // Three items, each an adapter onto a named command — see the note on
+    // Four items, each an adapter onto a named command — see the note on
     // the `actions!`.
     cx.set_menus(vec![
         Menu {
             name: "gitten".into(),
-            items: vec![MenuItem::action("Quit", Quit)],
+            items: vec![
+                MenuItem::action("Settings…", OpenSettings),
+                MenuItem::action("Quit", Quit),
+            ],
             disabled: false,
         },
         // Not decoration: without an Edit menu macOS gives the window no
@@ -7188,6 +7287,9 @@ mod tests {
                 pending: vec![vec![Key::char('g')]],
                 help: false,
                 help_scroll: ScrollHandle::default(),
+                settings: false,
+                settings_sel: 0,
+                settings_scroll: ScrollHandle::default(),
                 focus: cx.focus_handle(),
                 focused: None,
                 seen_host: None,
@@ -7324,6 +7426,9 @@ mod tests {
                 pending: Vec::new(),
                 help: false,
                 help_scroll: ScrollHandle::default(),
+                settings: false,
+                settings_sel: 0,
+                settings_scroll: ScrollHandle::default(),
                 focus: cx.focus_handle(),
                 focused: None,
                 seen_host: None,
@@ -7439,27 +7544,86 @@ mod tests {
     }
 
     #[gpui::test]
-    fn esc_closes_any_open_picker_and_touches_nothing_else(cx: &mut TestAppContext) {
-        for which in [
-            Open::Theme,
-            Open::Layout,
-            Open::Wrap,
-            Open::Algorithm,
-            Open::Whitespace,
-            Open::View,
-        ] {
-            let shell = shell(Some(which), cx);
-            shell.update(cx, |s, cx| s.back(cx));
-            shell.read_with(cx, |s, _| {
-                assert!(s.open.is_none(), "{which:?} stayed open");
-                assert!(
-                    s.pending.is_empty(),
-                    "{which:?}: the half-typed chord survived"
-                );
-                assert_eq!(s.panes.len(), 1, "{which:?}: esc closed the pane too");
-                assert!(!s.help, "{which:?}: esc reached past the menu");
-            });
-        }
+    fn esc_closes_any_open_menu_and_touches_nothing_else(cx: &mut TestAppContext) {
+        // The project menu, standing over the title: one `esc` closes it,
+        // drops the half-typed chord with it, and reaches no further.
+        let shell = shell(Some(Open::Project), cx);
+        shell.update(cx, |s, cx| s.back(cx));
+        shell.read_with(cx, |s, _| {
+            assert!(s.open.is_none(), "the menu stayed open");
+            assert!(s.pending.is_empty(), "the half-typed chord survived");
+            assert_eq!(s.panes.len(), 1, "esc closed the pane too");
+            assert!(!s.help, "esc reached past the menu");
+            assert!(!s.settings, "esc reached past the menu");
+        });
+    }
+
+    #[gpui::test]
+    fn the_settings_panel_stands_over_the_window(cx: &mut TestAppContext) {
+        let shell = shell(None, cx);
+        let observed = shell.clone();
+        let handle = cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_global(config::Active(Rc::new(Host::new())));
+            cx.open_window(
+                gpui::WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds {
+                        origin: Default::default(),
+                        size: gpui::size(gpui::px(800.0), gpui::px(600.0)),
+                    })),
+                    ..Default::default()
+                },
+                move |_, _| shell,
+            )
+            .unwrap()
+        });
+        let mut cx = gpui::VisualTestContext::from_window(handle.into(), cx);
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("settings-button").is_some(),
+            "the strip's one control was not drawn"
+        );
+        assert!(
+            cx.debug_bounds("settings-panel").is_none(),
+            "the panel stood before it was asked"
+        );
+        // `,` is the keymap's name for it — the same dispatch a press runs.
+        observed.update(&mut cx, |s, cx| s.run_command("settings", cx));
+        cx.run_until_parked();
+        let panel = cx
+            .debug_bounds("settings-panel")
+            .expect("the panel was not drawn");
+        assert!(panel.size.width > gpui::px(0.0));
+        // `esc` is the way out, and the panel does not outlive it.
+        observed.update(&mut cx, |s, cx| s.run_command("back", cx));
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("settings-panel").is_none(),
+            "the panel outlived its dismissal"
+        );
+    }
+
+    #[gpui::test]
+    fn esc_closes_the_settings_panel_before_anything_under_it(cx: &mut TestAppContext) {
+        let shell = shell(None, cx);
+        shell.update(cx, |s, _| {
+            s.settings = true;
+        });
+        shell.update(cx, |s, cx| s.back(cx));
+        shell.read_with(cx, |s, _| {
+            assert!(!s.settings, "the panel stayed open");
+            assert!(s.pending.is_empty(), "the half-typed chord survived");
+            assert_eq!(s.panes.len(), 1, "esc closed the pane too");
+        });
+        // And with nothing stacked above, `esc` hands the keyboard back from
+        // the diff to the stack — the panel did not swallow the key.
+        shell.update(cx, |s, cx| {
+            s.set_spot(super::Spot::Main, cx);
+            s.back(cx);
+        });
+        shell.read_with(cx, |s, _| {
+            assert_eq!(s.spot, super::Spot::List, "esc stopped at the panel");
+        });
     }
 
     #[gpui::test]
@@ -7898,14 +8062,13 @@ mod tests {
         });
         let mut cx = gpui::VisualTestContext::from_window(handle.into(), cx);
         cx.run_until_parked();
-        let first_control = cx
-            .debug_bounds("layout-picker")
-            .expect("the first top-bar control was not drawn");
-        let last_control = cx
-            .debug_bounds("theme-picker")
-            .expect("the last top-bar control was not drawn");
-        assert!(first_control.size.width > gpui::px(0.0));
-        assert!(last_control.right() <= gpui::px(800.0));
+        // One control in the top bar, right-aligned: the settings button that
+        // replaced the five pickers.
+        let settings = cx
+            .debug_bounds("settings-button")
+            .expect("the settings button was not drawn");
+        assert!(settings.size.width > gpui::px(0.0));
+        assert!(settings.right() <= gpui::px(800.0));
         let statusbar = cx
             .debug_bounds("statusbar")
             .expect("the bottom bar was not drawn");

@@ -870,6 +870,137 @@ fn hex_list(cs: &[Rgb]) -> String {
         .join(", ")
 }
 
+// ------------------------------------------------------------------- writing back
+
+/// Sets one `key` inside `[section]` of a config text, preserving everything
+/// else byte for byte: comments, key order, blank lines.
+///
+/// Pure, so the settings panel's persistence is a test rather than something
+/// only a real `gitten.toml` exercises. `value` arrives pre-formatted as TOML
+/// (`"word"`, `3`, `true`) because this layer does not know which knob it is
+/// writing — the caller spelled it, the way `dump` spells every line it emits.
+///
+/// - A `key = ...` line under the right header is replaced in place, keeping
+///   its indentation and any trailing comment.
+/// - Otherwise the line is inserted as the section's last line — after its
+///   existing keys, before the next header — so a new knob lands beside its
+///   neighbours rather than at the end of the file.
+/// - A missing section is appended at the end, preceded by a blank line when
+///   the file does not already end in one.
+/// - Only single-level `[section]` headers are tracked. Deeper tables such as
+///   `[theme.diff]` are colours, and the panel does not edit colours.
+pub fn set_value(text: &str, section: &str, key: &str, value: &str) -> String {
+    let header = format!("[{section}]");
+    let trailing_nl = text.ends_with('\n');
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    // `split` on text ending in `\n` leaves an artifact empty piece; drop it
+    // and re-add the newline at the end, so every branch below joins plainly.
+    if trailing_nl && !text.is_empty() {
+        lines.pop();
+    }
+    // The header's line, and the first header line after it (the section's end).
+    let mut head = None;
+    let mut end = lines.len();
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        if t.starts_with('[') && !t.starts_with("[[") {
+            if t == header {
+                head = Some(i);
+            } else if head.is_some() && t.ends_with(']') {
+                end = i;
+                break;
+            }
+        }
+    }
+    let finish = |lines: Vec<String>| -> String {
+        let mut out = lines.join("\n");
+        if !lines.is_empty() {
+            out.push('\n');
+        }
+        out
+    };
+    let Some(head) = head else {
+        // No such section: append it.
+        let mut owned: Vec<String> = match text.is_empty() {
+            true => Vec::new(),
+            false => lines.iter().map(|s| s.to_string()).collect(),
+        };
+        if !owned.is_empty() && !owned.last().is_some_and(|l| l.trim().is_empty()) {
+            owned.push(String::new());
+        }
+        owned.push(header);
+        owned.push(format!("{key} = {value}"));
+        return finish(owned);
+    };
+    // A `key = ...` line inside the section: replace its value, keep the rest.
+    for i in head + 1..end {
+        if let Some(rest) = strip_key(lines[i], key) {
+            let indent = &lines[i][..lines[i].len() - lines[i].trim_start().len()];
+            let comment = rest.find('#').map(|at| &rest[at..]).unwrap_or("");
+            let gap = match comment.is_empty() {
+                true => "",
+                false => " ",
+            };
+            let mut owned: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
+            owned[i] = format!("{indent}{key} = {value}{gap}{comment}");
+            return finish(owned);
+        }
+    }
+    // The section exists but names no such key: append inside it, above any
+    // trailing blank lines so the knob lands beside its neighbours rather
+    // than after the air below them.
+    let mut owned: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
+    let mut at = end;
+    while at > head + 1 && owned[at - 1].trim().is_empty() {
+        at -= 1;
+    }
+    owned.insert(at, format!("{key} = {value}"));
+    finish(owned)
+}
+
+/// Whether `line` sets `key`: `key = ...` with any indentation, not commented
+/// out, and the whole key rather than a prefix of a longer one. Returns the
+/// text after the key — ` = value  # comment` — for the caller to re-spell.
+fn strip_key<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let t = line.trim_start();
+    if t.starts_with('#') {
+        return None;
+    }
+    let rest = t.strip_prefix(key)?;
+    let rest = rest.trim_start();
+    match rest.strip_prefix('=') {
+        Some(after) => Some(after),
+        None => None,
+    }
+}
+
+/// Persists one panel change to the config file: reads it (a missing file is
+/// the shipped defaults, not an error), sets the key, writes it back.
+///
+/// Creates the parent directory when it does not exist yet — the per-user
+/// config's `~/.config/gitten` may never have been created — and returns a
+/// warning when anything fails rather than failing, the same contract
+/// [`load`] keeps: a settings change that cannot be saved still applies to
+/// the window behind the panel.
+pub fn save_setting(path: &Path, section: &str, key: &str, value: &str) -> Option<String> {
+    let current = std::fs::read(path)
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default();
+    let next = set_value(&current, section, key, value);
+    if next == current {
+        return None;
+    }
+    if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            return Some(format!("config: cannot save setting: {e}"));
+        }
+    }
+    match std::fs::write(path, next) {
+        Ok(()) => None,
+        Err(e) => Some(format!("config: cannot save setting: {e}")),
+    }
+}
+
 // ------------------------------------------------------------------ watching
 
 /// Calls `on_change` whenever the config file is written.
@@ -1633,5 +1764,68 @@ mod tests {
         assert_eq!(parse_hex("#abcdefa"), None, "seven digits");
         assert_eq!(parse_hex("#gggggg"), None);
         assert_eq!(parse_hex(""), None);
+    }
+
+    #[test]
+    fn setting_a_key_replaces_its_value_and_keeps_the_rest() {
+        let text = "[diff]\n# which algorithm\nalgorithm = \"myers\"  # trailing\ncontext = 3\n";
+        let next = set_value(text, "diff", "algorithm", "\"histogram\"");
+        assert_eq!(
+            next,
+            "[diff]\n# which algorithm\nalgorithm = \"histogram\" # trailing\ncontext = 3\n"
+        );
+        // And the result still parses to what was written.
+        let mut h = host();
+        assert!(apply(&mut h, &next).is_empty());
+        assert_eq!(h.differ.selected(), "histogram");
+        assert_eq!(h.differ.context, 3);
+    }
+
+    #[test]
+    fn setting_a_missing_key_lands_inside_its_section() {
+        let text = "[diff]\nalgorithm = \"myers\"\n\n[view]\nscroll = 1\n";
+        let next = set_value(text, "diff", "context", "8");
+        assert_eq!(
+            next,
+            "[diff]\nalgorithm = \"myers\"\ncontext = 8\n\n[view]\nscroll = 1\n"
+        );
+    }
+
+    #[test]
+    fn setting_a_key_in_a_missing_section_appends_it() {
+        let next = set_value("[diff]\nalgorithm = \"myers\"\n", "view", "scroll", "3");
+        assert_eq!(
+            next,
+            "[diff]\nalgorithm = \"myers\"\n\n[view]\nscroll = 3\n"
+        );
+        // An empty file is just the section.
+        assert_eq!(set_value("", "view", "scroll", "3"), "[view]\nscroll = 3\n");
+    }
+
+    #[test]
+    fn setting_a_key_ignores_comments_and_prefixes() {
+        // A commented line is not a setting, and `scrolloff` is not `scroll`.
+        let text = "[view]\n# scroll = 9\nscrolloff = 3\n";
+        let next = set_value(text, "view", "scroll", "5");
+        assert_eq!(next, "[view]\n# scroll = 9\nscrolloff = 3\nscroll = 5\n");
+    }
+
+    #[test]
+    fn saving_a_setting_round_trips_through_a_real_file() {
+        let dir = std::env::temp_dir().join(format!("gitten-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("nested").join("gitten.toml");
+        assert!(save_setting(&path, "diff", "context", "8").is_none());
+        assert!(save_setting(&path, "diff", "algorithm", "\"myers\"").is_none());
+        let mut h = host();
+        let warn = load(&mut h, &path);
+        assert!(warn.iter().any(|w| w.contains("next launch")), "{warn:?}");
+        assert_eq!(h.differ.context, 8);
+        assert_eq!(h.differ.selected(), "myers");
+        // Writing the value it already holds is a no-op, not a rewrite.
+        let before = std::fs::read(&path).unwrap();
+        assert!(save_setting(&path, "diff", "context", "8").is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

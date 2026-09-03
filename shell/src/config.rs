@@ -43,7 +43,7 @@ fn desktop_defaults() -> Host {
 /// somewhere outside the host to keep this, saving a colour would silently throw
 /// away the theme you are looking at.
 ///
-/// `None` means the file's, which is what the picker shows until somebody
+/// `None` means the file's, which is what the panel shows until somebody
 /// touches it.
 pub struct Chosen(pub Option<String>);
 
@@ -77,6 +77,23 @@ pub fn reload(path: &Path, cx: &mut App) -> Vec<String> {
     sync_widgets(&next, cx);
     cx.refresh_windows();
     warnings
+}
+
+/// Patches the live host in place — a clone, mutated, swapped wholesale — for
+/// a knob whose route *is* the host.
+///
+/// The settings panel's path for everything `gitten.toml` carries that no
+/// view owns: the window reads these fields on the render path, so the patch
+/// lands on the next frame, and the panel's file write lands them on the next
+/// launch. Wholesale rather than mutated in place, so no view can ever see
+/// half of a new configuration — the same promise [`reload`] keeps.
+pub fn patch(cx: &mut App, tune: impl FnOnce(&mut Host)) {
+    let mut next = (*host(cx)).clone();
+    tune(&mut next);
+    let next = Rc::new(next);
+    cx.set_global(Active(next.clone()));
+    sync_widgets(&next, cx);
+    cx.refresh_windows();
 }
 
 /// The current host.
