@@ -149,6 +149,42 @@ for layout in unified split; do
 done
 
 echo
+echo "── perf gate (advisory) ────────────────────────────────"
+# The hermetic regression harness on the committed small fixtures: no network,
+# no $HOME, median of interleaved rounds as JSON. Advisory on purpose: it
+# validates that the harness runs and the fixtures load, but never fails on a
+# timing — timings are compared across vintages by hand, never gated here.
+# See docs/agent-perf.md. GITTEN_PERF=0 skips it; GITTEN_PERF_ROUNDS sets the
+# rounds (1 here for speed, bench.sh defaults to 3 when run directly).
+if [ "${GITTEN_PERF:-1}" = "0" ]; then
+  echo "  skipped (GITTEN_PERF=0)"
+else
+  if [ ! -f fixtures/small/log.txt ] || [ ! -f fixtures/small/big.diff ]; then
+    FAILED="$FAILED perf:small-fixtures"
+    echo "  ✗ small fixtures missing"
+  else
+    perf_out=$(mktemp)
+    if GITTEN_FIXTURES=fixtures/small ./fixtures/bench.sh --json \
+        --rounds "${GITTEN_PERF_ROUNDS:-1}" --settle 0 >"$perf_out" 2>/dev/null \
+      && python3 - "$perf_out" <<'PY'; then
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["schema"] == "gitten.bench/1", d.get("schema")
+c, f = d["core"], d["frames"]
+print("  small: prepare {:.1f}ms  frames {:.0f}/{:.0f}/{:.0f}us (unified/split/commits)".format(
+    c["prepare_ms"]["median"], f["diff_unified"]["frame_us"]["median"],
+    f["diff_split"]["frame_us"]["median"], f["commits"]["frame_us"]["median"]))
+PY
+      :
+    else
+      FAILED="$FAILED perf:bench"
+      echo "  ✗ bench.sh --json failed or did not parse"
+    fi
+    rm -f "$perf_out"
+  fi
+fi
+
+echo
 if [ -n "$FAILED" ]; then
   echo "✗ failed:$FAILED"
   exit 1

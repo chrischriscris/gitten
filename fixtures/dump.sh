@@ -12,16 +12,29 @@ set -euo pipefail
 
 REPO="${1:?usage: dump.sh <repo-path> [commit-count]}"
 COUNT="${2:-5000}"
-OUT="$(cd "$(dirname "$0")" && pwd)"
+# Hermetic override: point at a scratch dir and the committed fixtures are
+# never touched. Defaults to the fixtures dir beside this script.
+OUT="${GITTEN_FIXTURES:-$(cd "$(dirname "$0")" && pwd)}"
+mkdir -p "$OUT"
+
+# Written to temp files and renamed into place, so an interrupted run never
+# leaves a half-written fixture behind.
+TMPLOG="$(mktemp "$OUT/.log.txt.XXXXXX")"
+TMPDIFF="$(mktemp "$OUT/.big.diff.XXXXXX")"
+trap 'rm -f "$TMPLOG" "$TMPDIFF"' EXIT
 
 git -C "$REPO" log --topo-order -n "$COUNT" \
-  --format='%H%x1f%h%x1f%P%x1f%an%x1f%at%x1f%s%x1e' > "$OUT/log.txt"
+  --format='%H%x1f%h%x1f%P%x1f%an%x1f%at%x1f%s%x1e' > "$TMPLOG"
 
 # A deliberately large diff — the diff view needs to be tested against
 # something that hurts, not a three-line change.
 BIG=$(git -C "$REPO" log -n 300 --format='%H' --merges | tail -1)
-git -C "$REPO" diff "$BIG^" "$BIG" > "$OUT/big.diff" 2>/dev/null \
-  || git -C "$REPO" diff 'HEAD~50' HEAD > "$OUT/big.diff"
+git -C "$REPO" diff "$BIG^" "$BIG" > "$TMPDIFF" 2>/dev/null \
+  || git -C "$REPO" diff 'HEAD~50' HEAD > "$TMPDIFF"
+
+/bin/mv -f "$TMPLOG" "$OUT/log.txt"
+/bin/mv -f "$TMPDIFF" "$OUT/big.diff"
+trap - EXIT
 
 printf 'log.txt  %s commits\nbig.diff %s lines\n' \
   "$(tr -cd '\036' < "$OUT/log.txt" | wc -c | tr -d ' ')" \

@@ -1,0 +1,61 @@
+# What each fixture is, where it came from, and what shape it is.
+#
+# `small` is committed and hermetic: every headless perf check runs on it
+# with no network and no $HOME. Everything under `real/` is fetched by
+# `fixtures/fetch.sh` (or cloned beside the repo) and never committed.
+
+[[fixture]]
+name = "small"
+path = "fixtures/small"
+source = "fixtures/gen.sh 3000 6000 (seed 7, deterministic)"
+rev = "6847ded"
+commits = 3000
+diff_lines = 5577
+files = 36
+bytes_log = 395096
+bytes_diff = 221058
+sha256_log = "1f883eb5464b4738ed1111ffc4d6f7a4177ded4076ef9f7d4dfe58664bef6b96"
+sha256_diff = "e15d7746e8b97271e3590ba24b1aefe7acc16080ef0c31824afe1d76307a9fab"
+
+# The rest are shape, not data: fetched by fixtures/fetch.sh, kept out of
+# history. Line counts are what `bench` reports (hunk lines), from
+# docs/measurements.md.
+
+[[fixture]]
+name = "pr30683"
+path = "fixtures/real/pr30683.diff"
+source = "https://github.com/oven-sh/bun/pull/30683.diff (via fixtures/fetch.sh)"
+diff_lines = 713996
+files = 1375
+note = "near-pure deletion, one 65k-token line"
+
+[[fixture]]
+name = "pr30698"
+path = "fixtures/real/pr30698.diff"
+source = "https://github.com/oven-sh/bun/pull/30698.diff (via fixtures/fetch.sh)"
+diff_lines = 50604
+files = 1398
+note = "zig->rust migration, heaviest intraline"
+
+[[fixture]]
+name = "pr33933"
+path = "fixtures/real/pr33933.diff"
+source = "https://github.com/oven-sh/bun/pull/33933.diff (via fixtures/fetch.sh)"
+diff_lines = 20831
+files = 35
+note = "near-pure addition"
+
+[[fixture]]
+name = "md"
+path = "fixtures/real/md.diff"
+source = "rust-lang/book HEAD~300..HEAD -- *.md (via fixtures/fetch.sh)"
+diff_lines = 71756
+files = 229
+note = "prose, heaviest intraline case in the set"
+
+[[fixture]]
+name = "git-tree"
+path = "~/Projects/git (blobless clone, via fixtures/fetch.sh)"
+source = "https://github.com/git/git.git --filter=blob:none"
+commits = 82000
+note = "tree stress case: 26% merges, 280 lanes, 37 octopus merges, 7 roots"
