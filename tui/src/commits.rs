@@ -613,7 +613,13 @@ impl Commits {
                 (false, false) => theme.chrome.bg,
             };
             let mut pen = screen.span(row, x, self.cols);
-            self.row(&mut pen, index, bg, theme);
+            self.row(
+                &mut pen,
+                index,
+                bg,
+                theme,
+                focused && vis == self.view.cursor(),
+            );
         }
     }
 
@@ -635,7 +641,7 @@ impl Commits {
     ///
     /// `index` is a *source* index: [`Commits::paint`] has already consulted the
     /// visible table and hands over the commit it names.
-    fn row(&self, pen: &mut Pen, index: usize, bg: Rgb, theme: &Theme) {
+    fn row(&self, pen: &mut Pen, index: usize, bg: Rgb, theme: &Theme, cursor: bool) {
         let c = &self.commits[index];
         let d = &self.draws[index];
         // A sub-pen per column, so neither can push the graph sideways however
@@ -653,7 +659,15 @@ impl Commits {
         // the busiest row in the history is.
         self.gutter(pen, d, bg, theme);
         pen.put(" ", Ink::new(theme.chrome.fg, bg));
-        pen.put(&c.subject, Ink::new(theme.chrome.fg, bg));
+        // The cursor row's subject is bold — the mock's one emphasis in a
+        // wall of uniform rows, and what the eye lands on while scrolling.
+        // The sha, initials and graph stay plain: the row is one claim, not
+        // four.
+        let mut subject = Ink::new(theme.chrome.fg, bg);
+        if cursor {
+            subject = subject.bold();
+        }
+        pen.put(&c.subject, subject);
         pen.wash(Ink::new(theme.chrome.fg, bg));
     }
 
@@ -895,6 +909,41 @@ r\x1frrrrrrr\x1f\x1fAda Lovelace\x1f1700000100\x1fRoot\x1e";
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn the_cursor_subject_is_bold_and_its_neighbours_are_not() {
+        // The mock's one emphasis in a wall of uniform rows: the cursor
+        // row's subject, and only while the pane holds the keyboard.
+        let (c, host) = view(LOG, 60, 4);
+        let mut screen = Screen::new(60, 6);
+        screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
+        c.paint(&mut screen, 0, 0, true, &host);
+        for (y, subject) in ["Merge branch", "On the trunk", "On a branch", "Root"]
+            .iter()
+            .enumerate()
+        {
+            let text = screen.row_text(y);
+            let x = text
+                .find(subject)
+                .unwrap_or_else(|| panic!("{subject} not drawn: {text:?}"));
+            assert_eq!(
+                screen.ink(x, y).unwrap().bold,
+                y == 0,
+                "row {y} ({subject})"
+            );
+        }
+
+        // Unfocused, the cursor lends no emphasis: nothing in a pane
+        // without the keyboard claims otherwise.
+        let mut screen = Screen::new(60, 6);
+        c.paint(&mut screen, 0, 0, false, &host);
+        let text = screen.row_text(0);
+        let x = text.find("Merge branch").expect("the subject drawn");
+        assert!(
+            !screen.ink(x, 0).unwrap().bold,
+            "an unfocused pane stayed bold"
+        );
     }
 
     #[test]

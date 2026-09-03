@@ -614,7 +614,13 @@ impl Branches {
         // or branchless repository's honest answer, at the first content row.
         if self.rows.is_empty() {
             let mut pen = screen.span(y, x, self.cols);
-            pen.put("no branches yet", Ink::new(c.faint, c.bg));
+            pen.put(
+                "no branches yet",
+                Ink {
+                    italic: true,
+                    ..Ink::new(c.faint, c.bg)
+                },
+            );
             return;
         }
         let armed = self.armed_index();
@@ -834,6 +840,18 @@ mod tests {
         screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
         b.paint(&mut screen, x, 0, true, host);
         (0..b.view.height()).map(|y| screen.row_text(y)).collect()
+    }
+
+    #[test]
+    fn an_empty_repository_is_a_slanted_quiet_line() {
+        let (b, host) = view(&[], &[], None, 30, 3);
+        let mut screen = Screen::new(30, 3);
+        screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
+        b.paint(&mut screen, 0, 0, true, &host);
+        assert!(screen.row_text(0).contains("no branches yet"));
+        let ink = screen.ink(0, 0).unwrap();
+        assert!(ink.italic, "the quiet line lost its slant");
+        assert_eq!(ink.fg, host.theme.chrome.faint);
     }
 
     #[test]

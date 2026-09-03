@@ -353,7 +353,10 @@ impl Stashes {
         } else if self.rows.is_empty() {
             Some((
                 "nothing stashed",
-                Ink::new(theme.chrome.faint, theme.chrome.bg),
+                Ink {
+                    italic: true,
+                    ..Ink::new(theme.chrome.faint, theme.chrome.bg)
+                },
             ))
         } else {
             None
@@ -474,6 +477,20 @@ mod tests {
                 commit: format!("c{i:02}"),
             })
             .collect()
+    }
+
+    #[test]
+    fn an_empty_stack_is_a_slanted_quiet_line() {
+        let host = Host::new();
+        let mut v = Stashes::new(Vec::new());
+        v.resize(30, 3);
+        let mut screen = Screen::new(30, 3);
+        screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
+        v.paint(&mut screen, 0, 0, true, &host);
+        assert!(screen.row_text(0).contains("nothing stashed"));
+        let ink = screen.ink(0, 0).unwrap();
+        assert!(ink.italic, "the quiet line lost its slant");
+        assert_eq!(ink.fg, host.theme.chrome.faint);
     }
 
     #[test]
