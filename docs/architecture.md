@@ -61,7 +61,7 @@ because it compiles in a second and its tests need no window.
 | `refs.rs` | branches, remote branches, HEAD, stashes, remotes, tags, reflog — names as bytes, absence as data |
 | `search.rs` | commit-list search: the index folded once per load, substring per keystroke |
 | `patch.rs` | chosen hunks synthesized into one unified patch, for the stage/unstage/discard-hunk verbs |
-| `theme.rs` | every colour as `0xRRGGBB` data, the three shipped palettes, contrast resolution |
+| `theme.rs` | every colour as `0xRRGGBB` data, the seven shipped palettes, contrast resolution |
 | `font.rs` | the face as data: family, size, and whether a char is a column |
 | `host.rs` | the struct that holds the swappable pieces |
 

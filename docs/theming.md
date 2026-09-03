@@ -23,12 +23,12 @@ pub struct Style { pub fg: Rgb, pub bold: bool, pub italic: bool }
 Weight and slant are in `Style` because emphasis in prose is not a colour. A
 Markdown `**word**` that only changed hue would be wrong.
 
-## Three of them, and where a fourth comes from
+## Seven of them, and where an eighth comes from
 
 `Themes` is the registry and `host.theme` is the one on screen:
 
 ```rust
-pub struct Themes(Vec<Theme>);        // dark, light, slate
+pub struct Themes(Vec<Theme>);        // dark, light, slate, gruvbox, …
 
 host.select_theme("light");           // a copy, so the registry is not edited
 host.cycle_theme();                   // what `T` runs
@@ -47,31 +47,34 @@ The consequence is the good one: **a theme written in `gitten.toml` is a theme.*
 The config layer applies the file to whatever `name` selected and then registers
 the result back under that name, so a palette somebody tuned by hand is in the
 same registry — and therefore the same title-bar menu and the same `T` — as the
-three that ship. A `name` nobody registered is a new entry rather than an error;
+seven that ship. A `name` nobody registered is a new entry rather than an error;
 a `name` that *is* registered corrects that entry rather than adding a second one
 called the same thing, exactly as registering a differ does.
 
-The three shipped are `dark` (warm, near-black), `light` (the same palette on
-paper) and `slate` (cool). Two are there to make a point the first cannot: warm
-dark is a taste and not a default, and a registry with one dark theme in it
-proves nothing about the seam.
+The seven shipped are `dark` (warm, near-black), `light` (the same palette on
+paper), `slate` (cool), `gruvbox` (warm retro), `catppuccin` (lavender Mocha),
+`tokyo-night` (deep blue) and `rose-pine` (dark plum). The second is there to
+make a point the first cannot: warm dark is a taste and not a default, and a
+registry with one dark theme in it proves nothing about the seam. The other
+five are there to prove it again, in hues somebody else chose.
 
 ### A second palette is a port of the first, not a new one
 
-Every ratio in `light` and `slate` is `dark`'s, hue for hue: `added_bg` sits
-1.20:1 from its context row in all three, `file_bg` 1.18:1, the changed-word
-background 1.29:1 from the line it is inside, the gutter 2.05:1 before it is
+Every ratio in the other six is `dark`'s, hue for hue: `added_bg` sits
+about 1.20:1 from its context row in all seven, `file_bg` a visible step above
+context with the hunk header a smaller one, the changed-word
+background a clear step above the line it is inside, the gutter ~2:1 before it is
 lifted. That is what makes the second theme feel like the first — a floor keeps a
 palette legible, but *hierarchy* is what a reader actually learns, and hierarchy
 is a set of ratios rather than a set of colours.
 
 ```sh
-cargo run -q -p gitten-core --example contrast          # every theme, every ratio
-cargo run -q -p gitten-core --example contrast light
+cargo run -q -p gitten-core --example contrast --release          # every theme
+cargo run -q -p gitten-core --example contrast --release light
 ```
 
-That is the tool the two new palettes were built with, and it is the one to run
-before adding a fourth: take dark's column as the target, pick the hue, and solve
+That is the tool the six ported palettes were built with, and it is the one to run
+before adding an eighth: take dark's column as the target, pick the hue, and solve
 for the tint that lands on the number. Two ratios could not be carried across and
 both are the same point about a light background — the accent is 5.2:1 rather than
 9.1:1, because an amber taken to 9:1 against paper is a brown, and `absent_bg` is
@@ -262,7 +265,8 @@ family = "JetBrainsMono Nerd Font Mono"
 size = 14.0
 
 [theme]
-name = "light"                  # dark, light, slate — or a name of your own
+name = "light"                  # dark, light, slate, gruvbox, catppuccin,
+                                # tokyo-night, rose-pine — or a name of your own
 
 [theme.diff]
 added_bg = "#dde5d7"

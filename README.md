@@ -55,7 +55,7 @@ Pre-release, and honest about it:
 | Intraline | word-level second pass over changed pairs; moved blocks flagged beside their kind, three-line minimum |
 | Syntax highlighting | a hand-written scanner over twenty-odd languages, chosen over tree-sitter on measurement |
 | Markdown diffs | rendered as blocks; tables wider than the window are squeezed per column rather than broken across rows |
-| Themes | three shipped palettes, contrast floors asserted by test, editable live in `gitten.toml` |
+| Themes | seven shipped palettes, contrast floors asserted by test, editable live in `gitten.toml` |
 | Config | `gitten.toml` hot-reloads on the next frame — colours, font, algorithm, layouts, keybindings |
 | Scale | git/git's 82k-commit history and a 714k-line pull request are fixtures, not stress tests |
 
