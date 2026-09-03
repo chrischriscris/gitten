@@ -23,12 +23,14 @@
 //! definition, so there is no disabled row to draw.
 
 use crate::chrome::RADIUS;
-use crate::controls::ROW_H;
 use gitten_core::command::{Commands, HelpRow};
 use gitten_core::font::Font;
 use gitten_core::theme::Theme;
 use gpui::*;
 use std::rc::Rc;
+
+/// Menu rows stay compact; only the title-bar trigger needed the larger target.
+pub(crate) const ROW_H: f32 = 24.0;
 
 /// Air inside the border, top and bottom — the picker list's own `py_1`.
 const PAD_Y: f32 = 8.0;
@@ -182,6 +184,18 @@ pub fn context_menu(
     // would be under the panes beside it. At priority 1, under only the
     // help panel's own priority 2.
     deferred(menu).with_priority(1).into_any_element()
+}
+
+/// The transparent surface behind an open menu.
+///
+/// Menus paint at deferred priority 1. This paints first at priority 0,
+/// occluding the rest of the window so a wheel outside the menu cannot reach
+/// the diff underneath, while the menu remains the target inside its own
+/// bounds.
+pub fn backdrop() -> AnyElement {
+    deferred(div().absolute().inset_0().occlude())
+        .with_priority(0)
+        .into_any_element()
 }
 
 #[cfg(test)]

@@ -8,8 +8,8 @@
 //!
 //! Two GPUI facts shape the element. It is [`deferred`], because it is painted
 //! after every ancestor — as a plain child of the window's column it would be
-//! under the diff beside it and visible nowhere (the same trap the picker menus
-//! dodge). And it is [`occlude`], because hit-testing is paint order too: an
+//! under the diff beside it and visible nowhere (the same trap the settings
+//! panel dodges). And it is [`occlude`], because hit-testing is paint order too: an
 //! overlay that lets clicks fall through is a menu you act on through a hole.
 //!
 //! And one keyboard fact. While the panel stands it owns every press: the shell
@@ -51,7 +51,7 @@ const KEY_SHARE: f32 = 0.6;
 /// The overlay, sized from what the registries say is in it.
 ///
 /// A pure function of the host, the modes and the scroll position: nothing here
-/// has a list of keys in it, which is the whole test the title-bar pickers set
+/// has a list of keys in it, which is the whole test the settings panel sets
 /// for a control built on a registry. `scroll` is the shell's — the panel is
 /// taller than a laptop window and the keyboard has to be able to reach the
 /// tail, which is the one piece of state a pure element cannot hold.
