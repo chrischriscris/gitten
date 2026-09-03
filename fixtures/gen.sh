@@ -11,10 +11,13 @@
 set -euo pipefail
 COMMITS="${1:-100000}"
 DIFFLINES="${2:-100000}"
-OUT="$(cd "$(dirname "$0")" && pwd)"
+# Hermetic override: point at a scratch dir and the committed fixtures are
+# never touched. Defaults to the fixtures dir beside this script.
+OUT="${GITTEN_FIXTURES:-$(cd "$(dirname "$0")" && pwd)}"
+mkdir -p "$OUT"
 
 python3 - "$COMMITS" "$DIFFLINES" "$OUT" <<'PY'
-import sys, random
+import os, sys, random
 n, dl, out = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
 random.seed(7)
 
@@ -26,7 +29,9 @@ NOUNS = ["dispatch loop","lane allocator","diff parser","scroll handle","token b
 # Build newest-first. Commit i's first parent is i+1; every ~40th is a merge
 # whose second parent is a few commits further back, forking a lane that
 # collapses when the allocator reaches the shared ancestor.
-with open(f"{out}/log.txt", "w", buffering=1 << 20) as f:
+# Written to temp files and renamed into place, so an interrupted run never
+# leaves a half-written fixture behind.
+with open(f"{out}/.log.txt.tmp", "w", buffering=1 << 20) as f:
     for i in range(n):
         parents = []
         if i + 1 < n:
@@ -47,7 +52,7 @@ with open(f"{out}/log.txt", "w", buffering=1 << 20) as f:
 
 # Diff: files of hunks, with replace pairs carrying small word-level edits so
 # the intraline pass has real work to do.
-with open(f"{out}/big.diff", "w", buffering=1 << 20) as f:
+with open(f"{out}/.big.diff.tmp", "w", buffering=1 << 20) as f:
     written, fi = 0, 0
     while written < dl:
         f.write(f"diff --git a/pkg/mod{fi}/file{fi}.go b/pkg/mod{fi}/file{fi}.go\n")
@@ -70,6 +75,8 @@ with open(f"{out}/big.diff", "w", buffering=1 << 20) as f:
                 break
         fi += 1
 
+os.replace(f"{out}/.log.txt.tmp", f"{out}/log.txt")
+os.replace(f"{out}/.big.diff.tmp", f"{out}/big.diff")
 print(f"log.txt   {n:,} commits")
 print(f"big.diff  ~{written:,} lines across {fi} files")
 PY
