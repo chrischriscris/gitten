@@ -5086,8 +5086,8 @@ impl Render for DevShell {
         // [`controls::tier`].
         let mut left_px = LIGHTS_W + 14.0 + 1.0 + 16.0;
         if let Some(info) = &head_chip {
-            let chars = info.chip.chars().count()
-                + info.drift.as_ref().map(|d| d.chars().count()).unwrap_or(0);
+            let chars =
+                info.chip.chars().count() + info.drift.as_ref().map(|d| d.chars()).unwrap_or(0);
             left_px += chars as f32 * ch * chrome::TOPBAR_TEXT_SCALE
                 + 2.0 * f32::from(chrome::gap_l(f))
                 + 2.0
@@ -5239,13 +5239,33 @@ impl Render for DevShell {
                             // frame clones two refcounts.
                             .child(div().flex_none().text_color(rgb(c.fg)).child(info.chip))
                             .children(info.drift.map(|drift| {
-                                // A drift figure is read, not glanced at —
-                                // and raw dim is under the floor on the
-                                // strip it sits on.
+                                // Each arrow in its own ink — ↑ outgoing in the
+                                // staged green, ↓ incoming in the unstaged red —
+                                // so the direction reads before the number
+                                // does. Both clear the text floor raw on the
+                                // strip. The ` · ` opener and the spaces ride
+                                // in dim, where the ink is invisible either
+                                // way, so the spelled width is exactly what
+                                // the budget above costed.
+                                let dim = rgb(host.theme.dim_on(theme::Surface::Title));
                                 div()
                                     .flex_none()
-                                    .text_color(rgb(host.theme.dim_on(theme::Surface::Title)))
-                                    .child(drift)
+                                    .flex()
+                                    .items_center()
+                                    .child(div().flex_none().text_color(dim).child(" · "))
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .text_color(rgb(host.theme.diff.adds_fg))
+                                            .child(drift.up),
+                                    )
+                                    .child(div().flex_none().text_color(dim).child(" "))
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .text_color(rgb(host.theme.diff.dels_fg))
+                                            .child(drift.down),
+                                    )
                             }))
                     }))
                     .children(cfg!(debug_assertions).then(|| {
@@ -7026,7 +7046,7 @@ mod tests {
         let statusbar = cx
             .debug_bounds("statusbar")
             .expect("the bottom bar was not drawn");
-        assert_eq!(f32::from(statusbar.size.height), 36.0);
+        assert_eq!(f32::from(statusbar.size.height), 40.0);
         assert_eq!(statusbar.bottom(), gpui::px(600.0));
         let stack = cx.debug_bounds("sidebar").expect("the stack was not drawn");
         let main = cx
@@ -10311,12 +10331,19 @@ diff --git a/added.txt b/added.txt
                 .iter()
                 .find_map(|r| match r {
                     crate::views::branches::Row::Local(l) if l.name.as_bytes() == b"main" => {
-                        l.counts.clone()
+                        Some(match &l.counts {
+                            Some(counts) => [counts.ahead.as_deref(), counts.behind.as_deref()]
+                                .into_iter()
+                                .flatten()
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                            None if l.gone => "(gone)".into(),
+                            None => String::new(),
+                        })
                     }
                     _ => None,
                 })
                 .unwrap_or_default()
-                .to_string()
         })
     }
 

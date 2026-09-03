@@ -9,6 +9,7 @@
 #   ./dev check                                    everything headless
 #   ./dev config                                   a starting gitten.toml
 #   ./dev bundle                                   target/gitten.app, icon and all
+#   ./dev export                                   build prod and install to PATH
 #
 #   ./dev --release tui diff .       when you need honest numbers
 #   GITTEN_STATS=0 ./dev tui          without the frame readout
@@ -240,6 +241,10 @@ PLIST
     dim "── $APP ─────────────────────────"
     echo "$APP"
     ;;
+  export)
+    exec ./export "$@"
+    ;;
+
 
   check)
     exec ./check.sh

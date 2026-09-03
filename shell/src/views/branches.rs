@@ -100,6 +100,20 @@ impl Section {
     }
 }
 
+/// A branch's distance from its upstream, spelled once at flatten — so the
+/// row paints each arrow in its own ink without parsing text per frame.
+/// Each side is `None` at zero (the row shows only what is non-zero); both
+/// `None` means in sync and draws no cell at all. The title chip is the
+/// exception — it shows both sides once either is non-zero — and spells its
+/// own pair in [`Drift`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Counts {
+    /// `↑2`, absent at zero.
+    pub ahead: Option<SharedString>,
+    /// `↓3`, absent at zero.
+    pub behind: Option<SharedString>,
+}
+
 /// One local branch.
 #[derive(Debug)]
 pub(crate) struct LocalRow {
@@ -107,10 +121,10 @@ pub(crate) struct LocalRow {
     pub name: PathBytes,
     /// The display form, decoded lossily once at flatten.
     pub name_text: SharedString,
-    /// What its tracking pair says, pre-rendered as **distance only** — see
-    /// [`upstream_counts`]. `None` draws no cell at all: the branch tracks
-    /// nothing, or is in sync with what it tracks.
-    pub counts: Option<SharedString>,
+    /// What its tracking pair says — see [`upstream_counts`]. `None` draws
+    /// no cell at all: the branch tracks nothing, is in sync with what it
+    /// tracks, or is gone (which [`LocalRow::gone`] names instead).
+    pub counts: Option<Counts>,
     /// True when a pair exists but cannot be compared — the state the word
     /// *gone* names, drawn faint so it never reads as "in sync".
     pub gone: bool,
@@ -140,39 +154,32 @@ pub(crate) struct RemoteRow {
 
 pub(crate) use gitten_core::refs::Target;
 
-/// The distance half of one local row, rendered once.
+/// The distance half of one local row, as numbers.
 ///
 /// Zeros stay silent — an in-sync branch reads as a bare name, and `↑0 ↓0`
 /// is furniture nobody reads past the first time; both zeros collapse to
 /// `None`, so the pane draws no cell at all. Unknowable is the other word:
-/// a pair configured against a ref that is no longer there gets `(gone)`,
-/// faint, because a missing number must not dress up as a zero. A `None`
-/// on either side means the comparison failed, not half of it, so the word
-/// covers both.
+/// a pair configured against a ref that is no longer there gets `(None,
+/// true)`, faint, because a missing number must not dress up as a zero. A
+/// `None` on either side means the comparison failed, not half of it, so the
+/// word covers both.
 ///
 /// The upstream **ref** is deliberately absent — `origin/main ↑1 ↓2` here is
 /// exactly what the design takes away — because the remote-tracking branch
 /// already sits below as its own row: naming it twice spends the row's width
 /// to say nothing new, and what remains is the only part a glance reads.
-fn upstream_counts(u: &Upstream) -> (Option<SharedString>, bool) {
-    let mut text = String::new();
-    for (count, arrow) in [(u.ahead, "↑"), (u.behind, "↓")] {
-        let Some(n) = count else {
-            return (Some(SharedString::from("(gone)")), true);
-        };
-        if n > 0 {
-            // Joined by a single space; the first arrow comes alone.
-            if !text.is_empty() {
-                text.push(' ');
-            }
-            text.push_str(arrow);
-            text.push_str(&n.to_string());
+fn upstream_counts(u: &Upstream) -> (Option<Counts>, bool) {
+    match (u.ahead, u.behind) {
+        (Some(ahead), Some(behind)) => {
+            let counts = Counts {
+                ahead: (ahead > 0).then(|| SharedString::from(format!("↑{ahead}"))),
+                behind: (behind > 0).then(|| SharedString::from(format!("↓{behind}"))),
+            };
+            let any = counts.ahead.is_some() || counts.behind.is_some();
+            (any.then_some(counts), false)
         }
+        _ => (None, true),
     }
-    (
-        (!text.is_empty()).then_some(text).map(SharedString::from),
-        false,
-    )
 }
 
 /// Flattens the repository's refs into display rows: detached HEAD first,
@@ -287,18 +294,42 @@ pub struct HeadInfo {
     /// ` main` or `detached · 01234567` — the chip's bright half, spelled
     /// once here so the title strip clones a refcount per frame.
     pub chip: SharedString,
-    /// ` · ↑2 ↓0` — the chip's dim half, [`drift`] run once; `None` when
-    /// there is nothing to say.
-    pub drift: Option<SharedString>,
+    /// How far HEAD has drifted from its upstream, for the title chip —
+    /// [`drift`] run once; `None` when there is nothing to say. Arrows
+    /// spelled, not numbers, so the strip paints each in its own ink
+    /// without allocating per frame.
+    pub drift: Option<Drift>,
 }
 
-/// How far HEAD has drifted from its upstream, for the title chip: ` · ↑2 ↓0`
-/// when either count is non-zero, nothing when both are zero or unknown. Both
-/// arrows once either shows, because `↑2` alone leaves the reader wondering
-/// whether the pull side was zero or unread.
-pub(crate) fn drift(ahead: Option<u32>, behind: Option<u32>) -> Option<String> {
+/// The title chip's dim half, spelled once at flatten: `↑2` and `↓0` as
+/// separate strings so each draws in its own ink, with the ` · ` opener and
+/// the space between them drawn dim at render from static text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Drift {
+    /// `↑2` — always spelled, even at zero: the chip shows both sides once
+    /// either is non-zero, because `↑2` alone leaves the reader wondering
+    /// whether the pull side was zero or unread.
+    pub up: SharedString,
+    /// `↓0`.
+    pub down: SharedString,
+}
+
+impl Drift {
+    /// Characters drawn, for the width the title strip budgets: the ` · `
+    /// opener, both arrows and the space between them.
+    pub fn chars(&self) -> usize {
+        3 + self.up.chars().count() + 1 + self.down.chars().count()
+    }
+}
+
+/// How far HEAD has drifted from its upstream, for the title chip: `Some`
+/// when either count is non-zero, nothing when both are zero or unknown.
+pub(crate) fn drift(ahead: Option<u32>, behind: Option<u32>) -> Option<Drift> {
     let (up, down) = (ahead.unwrap_or(0), behind.unwrap_or(0));
-    (up > 0 || down > 0).then(|| format!(" · ↑{up} ↓{down}"))
+    (up > 0 || down > 0).then(|| Drift {
+        up: SharedString::from(format!("↑{up}")),
+        down: SharedString::from(format!("↓{down}")),
+    })
 }
 
 /// Reads [`HeadInfo`] off the model. Pure — the unit-tested half of what the
@@ -322,7 +353,7 @@ fn head_info(head: Option<&HeadState>, local: &[Branch]) -> Option<HeadInfo> {
             let behind = b.upstream.as_ref().and_then(|u| u.behind);
             HeadInfo {
                 chip: format!(" {label}").into(),
-                drift: drift(ahead, behind).map(SharedString::from),
+                drift: drift(ahead, behind),
                 label,
                 ahead,
                 behind,
@@ -1145,34 +1176,54 @@ fn row(e: &Row, host: &Host, current: bool, focused: bool, armed: bool) -> Div {
             .children(l.worktree.then(|| {
                 div()
                     .flex_none()
-                    .when(l.counts.is_none(), |d| d.ml_auto())
-                    .when(l.counts.is_some(), |d| d.pl(px(ch)))
+                    .when(l.counts.is_none() && !l.gone, |d| d.ml_auto())
+                    .when(l.counts.is_some() || l.gone, |d| d.pl(px(ch)))
                     .text_color(rgb(host.theme.quiet_on(c.bg)))
                     .child("worktree")
             }))
-            .children(l.counts.clone().map(|text| {
+            // `(gone)` when the upstream vanished: read — it is why no
+            // distance is shown — so quiet through `quiet_on`, not invisible.
+            .children(l.gone.then(|| {
                 div()
                     .flex_none()
+                    .ml_auto()
+                    .pl(px(ch))
+                    .pr(px(super::SCROLLBAR_TRACK_W))
+                    .text_color(rgb(host.theme.quiet_on(c.bg)))
+                    .child("(gone)")
+            }))
+            // The distance cell: each non-zero arrow in its own ink — ↑
+            // outgoing in the staged green, ↓ incoming in the unstaged red —
+            // so the direction reads before the number does. Both clear the
+            // text floor raw on every background this row wears, selected or
+            // not, which is why they skip the `dim_on` resolution the old
+            // single string needed.
+            .children(l.counts.clone().map(|counts| {
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    // One full character between the arrows: the space the old
+                    // single string carried, so the spelled width is unchanged.
+                    .gap(px(ch))
                     // The auto margin carries the distance to the row's far
                     // end however wide its name ran; the right reserve is the
                     // scrollbar's track, which overlays this edge.
                     .ml_auto()
                     .pl(px(ch))
                     .pr(px(super::SCROLLBAR_TRACK_W))
-                    .text_color(rgb(match l.gone {
-                        // "gone" is read — it is why the upstream is not shown
-                        // — so quiet through `quiet_on`, not invisible.
-                        true => host.theme.quiet_on(c.bg),
-                        // The upstream text is read, and raw dim is under the
-                        // floor when the row is selected — it resolves against
-                        // whichever background the row is wearing.
-                        false => host.theme.dim_on(if current {
-                            Surface::Cursor
-                        } else {
-                            Surface::Context
-                        }),
+                    .children(counts.ahead.clone().map(|up| {
+                        div()
+                            .flex_none()
+                            .text_color(rgb(host.theme.diff.adds_fg))
+                            .child(up)
                     }))
-                    .child(text)
+                    .children(counts.behind.clone().map(|down| {
+                        div()
+                            .flex_none()
+                            .text_color(rgb(host.theme.diff.dels_fg))
+                            .child(down)
+                    }))
             })),
         Row::Remote(r) => chrome::list_row(host, current, focused, ROW_H)
             .child(dot(&r.dot))
@@ -1190,7 +1241,8 @@ fn row(e: &Row, host: &Host, current: bool, focused: bool, armed: bool) -> Div {
 #[cfg(test)]
 mod tests {
     use super::{
-        drift, flatten, head_info, prepare, row_target, Branches, HeadInfo, Prepared, Row, Target,
+        drift, flatten, head_info, prepare, row_target, Branches, Drift, HeadInfo, Prepared, Row,
+        Target,
     };
     use gitten_core::host::Host;
     use gitten_core::refs::{Branch, HeadState, RefName, RemoteBranch, Upstream};
@@ -1241,10 +1293,22 @@ mod tests {
                 Row::Heading { count, section } => {
                     format!("[{}·{count}]", section.name())
                 }
-                Row::Local(l) => match &l.counts {
-                    Some(c) => format!("{}{} {c}", l.dot.glyph, l.name_text),
-                    None => format!("{}{}", l.dot.glyph, l.name_text),
-                },
+                Row::Local(l) => {
+                    let mut s = format!("{}{}", l.dot.glyph, l.name_text);
+                    if l.gone {
+                        s.push_str(" (gone)");
+                    } else if let Some(counts) = &l.counts {
+                        let arrows: Vec<&str> = [counts.ahead.as_deref(), counts.behind.as_deref()]
+                            .into_iter()
+                            .flatten()
+                            .collect();
+                        if !arrows.is_empty() {
+                            s.push(' ');
+                            s.push_str(&arrows.join(" "));
+                        }
+                    }
+                    s
+                }
                 Row::Remote(r) => format!("{}{}", r.dot.glyph, r.label),
             })
             .collect()
@@ -1386,7 +1450,7 @@ mod tests {
         match &rows[1] {
             Row::Local(l) => {
                 assert!(l.gone);
-                assert_eq!(l.counts.as_deref(), Some("(gone)"));
+                assert_eq!(l.counts, None, "gone names itself, it keeps no distance");
             }
             other => panic!("the tracked row expected, got {other:?}"),
         }
@@ -1609,7 +1673,10 @@ mod tests {
                 ahead: Some(1),
                 behind: Some(2),
                 chip: " main".into(),
-                drift: Some(" · ↑1 ↓2".into()),
+                drift: Some(Drift {
+                    up: "↑1".into(),
+                    down: "↓2".into(),
+                }),
             }),
             "the numbers core measured, verbatim — and the chip spelled once"
         );
@@ -1633,8 +1700,20 @@ mod tests {
 
     #[test]
     fn drift_shows_both_arrows_once_either_is_non_zero_and_nothing_otherwise() {
-        assert_eq!(drift(Some(2), Some(0)).as_deref(), Some(" · ↑2 ↓0"));
-        assert_eq!(drift(None, Some(3)).as_deref(), Some(" · ↑0 ↓3"));
+        assert_eq!(
+            drift(Some(2), Some(0)),
+            Some(Drift {
+                up: "↑2".into(),
+                down: "↓0".into(),
+            })
+        );
+        assert_eq!(
+            drift(None, Some(3)),
+            Some(Drift {
+                up: "↑0".into(),
+                down: "↓3".into(),
+            })
+        );
         assert_eq!(drift(Some(0), Some(0)), None);
         assert_eq!(drift(None, None), None);
     }
