@@ -768,8 +768,10 @@ impl Branches {
         false
     }
 
-    /// Moves the list by `dy` pixels — the wheel. Same dance as every list,
-    /// for the same reasons.
+    /// Moves the list by `dy` pixels — the wheel. A glance, not a
+    /// commitment: the viewport pans and the keyboard selection stays where
+    /// it was, like the terminal. Same dance as every list, for the same
+    /// reasons.
     pub fn scroll_pixels(&mut self, dy: f32, host: &Host) -> bool {
         let deferred = self.scroll.0.borrow().deferred_scroll_to_item;
         if let Some(request) = deferred {
@@ -777,7 +779,7 @@ impl Branches {
                 let pixels = self.pending_scroll.wheel(dy);
                 let mut v = self.live_view(host);
                 let y = -(request.item_index as f32 * ROW_H) + pixels;
-                v.scroll_to((-y / ROW_H).round().max(0.0) as usize);
+                v.pan_to((-y / ROW_H).round().max(0.0) as usize);
                 self.view.set(v);
                 // The wheel is also a move of attention — same rule the
                 // arrow keys keep.
@@ -800,14 +802,15 @@ impl Branches {
             .base_handle
             .set_offset(point(offset.x, px(y)));
         let mut v = self.live_view(host);
-        v.scroll_to((-y / ROW_H).round().max(0.0) as usize);
+        v.pan_to((-y / ROW_H).round().max(0.0) as usize);
         self.view.set(v);
         self.synced.set(y);
         self.armed = None;
         true
     }
 
-    /// Meets the list where it actually is after a scrollbar drag.
+    /// Meets the list where it actually is after a scrollbar drag. Pans:
+    /// the selection stays where the keyboard left it.
     pub fn reconcile(&mut self, host: &Host) {
         if self.scroll.0.borrow().deferred_scroll_to_item.is_some() {
             return;
@@ -822,7 +825,7 @@ impl Branches {
         if v.top() == shown {
             return;
         }
-        v.scroll_to(shown);
+        v.pan_to(shown);
         self.view.set(v);
     }
 
@@ -834,7 +837,8 @@ impl Branches {
         self.reconcile(host);
         let mut v = self.live_view(host);
         // Each move carries its sign, so a landing on a heading knows which
-        // way to step off it — see [`settle`].
+        // way to step off it — see [`settle`]. A pan carries none: the
+        // cursor stays where it was, so there is nothing to settle.
         let dir = match command {
             "view.down" => {
                 v.down();
@@ -853,12 +857,12 @@ impl Branches {
                 -1
             }
             "view.scroll-down" => {
-                v.scroll_by(host.view.rows as isize);
-                1
+                v.pan_by(host.view.rows as isize);
+                0
             }
             "view.scroll-up" => {
-                v.scroll_by(-(host.view.rows as isize));
-                -1
+                v.pan_by(-(host.view.rows as isize));
+                0
             }
             "view.top" => {
                 v.to_top();
@@ -873,9 +877,11 @@ impl Branches {
             "view.left" | "view.right" => return true,
             _ => return false,
         };
-        let settled = settle_shown(&self.data, &self.visible, v.cursor(), dir);
-        if settled != v.cursor() {
-            v.go_to(settled);
+        if dir != 0 {
+            let settled = settle_shown(&self.data, &self.visible, v.cursor(), dir);
+            if settled != v.cursor() {
+                v.go_to(settled);
+            }
         }
         // The keyboard moved; whatever was armed was armed to what it used
         // to be on.
@@ -1042,7 +1048,7 @@ impl Render for Branches {
                     v.set_len(visible.len());
                     v.set_height(range.len());
                     v.set_scrolloff(host.view.scrolloff);
-                    v.scroll_to((-accepted.y / ROW_H).round().max(0.0) as usize);
+                    v.pan_to((-accepted.y / ROW_H).round().max(0.0) as usize);
                     view.set(v);
                     cx.refresh_windows();
                 }

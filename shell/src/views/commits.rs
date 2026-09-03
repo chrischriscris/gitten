@@ -213,8 +213,10 @@ impl Commits {
     }
 
     /// Moves the list by `dy` pixels — the wheel, whose command resolves through
-    /// `[keys]` but whose delta is pixels. The cursor comes along when pushed
-    /// off screen, exactly as [`Viewport::scroll_by`] does in the terminal.
+    /// `[keys]` but whose delta is pixels. A glance, not a commitment: the
+    /// viewport pans and the keyboard selection stays where it was, exactly
+    /// as the terminal's `pan_by` does — the selected row is not necessarily
+    /// in view.
     pub fn scroll_pixels(&mut self, dy: f32, host: &Host) -> bool {
         let deferred = self.scroll.0.borrow().deferred_scroll_to_item;
         if let Some(request) = deferred {
@@ -222,7 +224,7 @@ impl Commits {
                 let pixels = self.pending_scroll.wheel(dy);
                 let mut v = self.live_view(host);
                 let y = -(request.item_index as f32 * graph::ROW_H) + pixels;
-                v.scroll_to((-y / graph::ROW_H).round().max(0.0) as usize);
+                v.pan_to((-y / graph::ROW_H).round().max(0.0) as usize);
                 self.view.set(v);
                 self.top.set(v.top());
                 // The wheel is also a move of attention — same rule the
@@ -249,7 +251,7 @@ impl Commits {
             .base_handle
             .set_offset(point(offset.x, px(y)));
         let mut v = self.live_view(host);
-        v.scroll_to((-y / graph::ROW_H).round().max(0.0) as usize);
+        v.pan_to((-y / graph::ROW_H).round().max(0.0) as usize);
         self.view.set(v);
         self.synced.set(y);
         self.armed = None;
@@ -257,9 +259,9 @@ impl Commits {
     }
 
     /// Meets the list where it actually is: a scrollbar drag moves the offset
-    /// without touching anything else, and the next key should act on what is on
-    /// screen now. [`Commits::synced`] separates "the list moved under us" from
-    /// "we moved the list" — see the diff view's `reconcile`.
+    /// without touching the selection, and the next key acts from the offset
+    /// now on screen. [`Commits::synced`] separates "the list moved under us"
+    /// from "we moved the list" — see the diff view's `reconcile`.
     pub fn reconcile(&mut self, host: &Host) {
         if self.scroll.0.borrow().deferred_scroll_to_item.is_some() {
             return;
@@ -274,7 +276,7 @@ impl Commits {
         if v.top() == shown {
             return;
         }
-        v.scroll_to(shown);
+        v.pan_to(shown);
         self.view.set(v);
     }
 
@@ -292,8 +294,8 @@ impl Commits {
             "view.up" => v.up(),
             "view.page-down" => v.page(1),
             "view.page-up" => v.page(-1),
-            "view.scroll-down" => v.scroll_by(host.view.rows as isize),
-            "view.scroll-up" => v.scroll_by(-(host.view.rows as isize)),
+            "view.scroll-down" => v.pan_by(host.view.rows as isize),
+            "view.scroll-up" => v.pan_by(-(host.view.rows as isize)),
             "view.top" => v.to_top(),
             "view.bottom" => v.to_bottom(),
             // No sideways half: see `pan_pixels`. Answered without moving
@@ -718,7 +720,7 @@ impl Render for Commits {
                     v.set_len(visible.len());
                     v.set_height(range.len());
                     v.set_scrolloff(host.view.scrolloff);
-                    v.scroll_to((-accepted.y / graph::ROW_H).round().max(0.0) as usize);
+                    v.pan_to((-accepted.y / graph::ROW_H).round().max(0.0) as usize);
                     view.set(v);
                     top.set(v.top());
                     cx.refresh_windows();
@@ -1317,9 +1319,9 @@ mod tests {
 
     #[test]
     fn a_thumb_drag_is_reconciled_before_anything_reads_the_cursor() {
-        // What `commits.open-diff` reads through `current`, and what
-        // `copy.selection` falls back to: both mean the commit being *looked
-        // at*, so a scrollbar drag has to be met first.
+        // A scrollbar drag moves the viewport and never the selection — the
+        // terminal's contract — so `current` still names the commit the
+        // keyboard is on while `top` caught up with what is on screen.
         let host = Rc::new(Host::new());
         let mut c = Commits::new(commits(100), host.clone());
         with_height(&mut c, 20);
@@ -1335,15 +1337,15 @@ mod tests {
         c.reconcile(&host);
         let v = c.view.get();
         assert_eq!(v.top(), 10);
-        assert_eq!(v.cursor(), 13, "top ten plus the three-row margin");
+        assert_eq!(v.cursor(), 0, "a drag pans; it does not select");
         // And the commit under that cursor is the one open/copy now name.
         let text = c.cursor_text();
-        assert!(text.contains("abc0013"), "{text:?}");
-        assert_eq!(c.current().map(|cm| cm.short.as_str()), Some("abc0013"));
+        assert!(text.contains("abc000"), "{text:?}");
+        assert_eq!(c.current().map(|cm| cm.short.as_str()), Some("abc000"));
 
         // Meeting the list twice is not moving it twice.
         c.reconcile(&host);
-        assert_eq!((c.view.get().top(), c.view.get().cursor()), (10, 13));
+        assert_eq!((c.view.get().top(), c.view.get().cursor()), (10, 0));
     }
 
     // ----------------------------------------------------------------- search

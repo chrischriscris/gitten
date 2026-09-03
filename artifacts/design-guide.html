@@ -1200,6 +1200,285 @@
     line-height: 1.5;
     color: var(--c-dim);
   }
+
+  /* ------------------- Client toggle (Desktop / Terminal) ------------------- */
+  .mockup-switcher {
+    width: 100%;
+    max-width: 1280px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 12px;
+    gap: 12px;
+  }
+  .client-toggle {
+    display: inline-flex;
+    background: #0e0d0c;
+    border: 1px solid #231f1c;
+    border-radius: 6px;
+    padding: 3px;
+    gap: 2px;
+  }
+  .client-toggle button {
+    background: transparent;
+    border: none;
+    color: var(--c-dim);
+    padding: 5px 14px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    font-family: inherit;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    transition: all 0.15s ease;
+  }
+  .client-toggle button:hover { color: var(--c-fg); background: rgba(255,255,255,0.04); }
+  .client-toggle button.active {
+    background: var(--c-raised);
+    color: var(--c-accent);
+    box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+  }
+  .mockup-caption {
+    font-size: 12px;
+    color: var(--c-faint);
+    font-family: var(--font-mono);
+  }
+  .tui-tag {
+    display: none;
+    align-items: center;
+    gap: 6px;
+    background: #181514;
+    border: 1px solid var(--c-border);
+    border-bottom: none;
+    padding: 4px 10px;
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+    font-size: 11px;
+    color: var(--c-dim);
+    margin-left: 12px;
+    user-select: none;
+    font-family: var(--font-mono);
+  }
+  .tui-tag .dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #6fbf73;
+  }
+  .tui-toolbar {
+    display: none;
+    align-items: center;
+    gap: 8px;
+    margin-left: auto;
+    margin-right: 4px;
+  }
+  .tui-tbtn {
+    background: #181514;
+    border: 1px solid var(--c-border);
+    border-bottom: none;
+    color: var(--c-dim);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    padding: 4px 10px;
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+    cursor: pointer;
+  }
+  .tui-tbtn:hover { color: var(--c-fg); }
+  .tui-tbtn.active { color: var(--c-accent); border-color: rgba(223,168,81,0.45); }
+
+  /* ------------------- TUI window (gitten-tui cell grid) ------------------- */
+  .tui-window {
+    width: 100%;
+    background: var(--c-bg);
+    border: 1px solid var(--c-border);
+    border-radius: 8px;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.55);
+    overflow: hidden;
+    position: relative;
+    user-select: none;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 19px;
+  }
+  .tui-title {
+    height: 22px;
+    line-height: 22px;
+    background: var(--c-title-bg);
+    border-bottom: 1px solid var(--c-border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 8px;
+    white-space: pre;
+    overflow: hidden;
+  }
+  .tui-title .t-git { color: var(--c-accent); font-weight: 700; }
+  .tui-title .t-pane { color: var(--c-fg); }
+  .tui-title .t-label { color: var(--c-dim); }
+  .tui-title .t-hint { color: var(--c-dim); }
+  .tui-body {
+    display: flex;
+    align-items: stretch;
+    min-height: 520px;
+  }
+  .tui-sidebar {
+    width: 32%;
+    min-width: 300px;
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
+  }
+  .tui-divider {
+    width: 1px;
+    min-width: 1px;
+    background: var(--c-bg);
+    flex-shrink: 0;
+  }
+  .tui-main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  .tui-pane {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    border-bottom: 1px solid var(--c-border-subtle);
+  }
+  .tui-pane:last-child { border-bottom: none; }
+  .tui-pane-header {
+    height: 22px;
+    line-height: 22px;
+    background: var(--c-title-bg);
+    border-bottom: 1px solid var(--c-border);
+    padding: 0 8px;
+    white-space: pre;
+    overflow: hidden;
+    flex-shrink: 0;
+  }
+  .tui-pane-header .k-focused { color: var(--c-accent); }
+  .tui-pane-header .n-focused { color: var(--c-accent); font-weight: 700; }
+  .tui-pane-header .k-idle { color: var(--c-faint); }
+  .tui-pane-header .n-idle { color: var(--c-dim); }
+  .tui-pane-header .l-idle { color: var(--c-faint); }
+  .tui-pane-rows {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .tui-row {
+    height: 19px;
+    line-height: 19px;
+    white-space: pre;
+    overflow: hidden;
+    display: flex;
+    padding-right: 14px;
+    position: relative;
+  }
+  .tui-row.sel { background: var(--c-selection-bg); }
+  .tui-row .bar {
+    position: absolute;
+    right: 1px;
+    top: 0;
+    color: var(--c-dim);
+  }
+  .tui-sec { color: var(--c-faint); }
+  .tui-sha { color: var(--c-dim); }
+  .tui-subj { color: var(--c-fg); overflow: hidden; text-overflow: ellipsis; }
+  .tui-row.sel .tui-subj { font-weight: 700; }
+  .tui-file { color: var(--c-fg); overflow: hidden; text-overflow: ellipsis; }
+  .tui-file .dir { color: var(--c-dim); }
+  .tui-d-add { color: var(--diff-adds-fg); font-weight: 700; }
+  .tui-d-del { color: var(--diff-dels-fg); font-weight: 700; }
+  .tui-d-mod { color: var(--c-accent); font-weight: 700; }
+  .tui-d-un { color: var(--c-faint); }
+  .tui-hunk {
+    background: var(--diff-hunk-bg);
+    color: var(--diff-hunk-fg);
+    height: 19px;
+    line-height: 19px;
+    white-space: pre;
+    overflow: hidden;
+    padding: 0 8px;
+    border-top: 1px solid #1a222c;
+    border-bottom: 1px solid #1a222c;
+  }
+  .tui-dl { display: flex; height: 19px; line-height: 19px; white-space: pre; }
+  .tui-dl.ctx { background: var(--diff-context-bg); color: var(--diff-context-fg); }
+  .tui-dl.del { background: var(--diff-removed-bg); color: var(--diff-removed-fg); }
+  .tui-dl.add { background: var(--diff-added-bg); color: var(--diff-added-fg); }
+  .tui-g { color: var(--diff-gutter-fg); width: 34px; text-align: right; padding-right: 6px; flex-shrink: 0; }
+  .tui-s { width: 16px; text-align: center; flex-shrink: 0; font-weight: 700; }
+  .tui-dl.del .tui-s { color: var(--diff-dels-fg); }
+  .tui-dl.add .tui-s { color: var(--diff-adds-fg); }
+  .tui-w-del { background: var(--diff-removed-word-bg); color: #f7bbb4; border-radius: 2px; }
+  .tui-w-add { background: var(--diff-added-word-bg); color: #c4ecc2; border-radius: 2px; }
+  .tui-fhead { color: var(--c-fg); font-weight: 700; height: 19px; line-height: 19px; white-space: pre; overflow: hidden; padding: 0 8px; }
+  .tui-status {
+    height: 22px;
+    line-height: 22px;
+    background: var(--c-status-bg);
+    border-top: 1px solid var(--c-border);
+    padding: 0 8px;
+    white-space: pre;
+    overflow: hidden;
+    color: var(--c-dim);
+    display: flex;
+    justify-content: space-between;
+  }
+  .tui-status .t-msg { color: var(--c-accent); }
+  .tui-help-overlay {
+    display: none;
+    position: absolute;
+    inset: 22px 0 22px 0;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+    z-index: 20;
+  }
+  .tui-help-overlay.show { display: flex; }
+  .tui-help-box {
+    background: var(--c-title-bg);
+    border: 1px solid var(--c-faint);
+    border-radius: 4px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.7);
+    padding: 0;
+    min-width: 460px;
+    max-width: 640px;
+    pointer-events: auto;
+    font-size: 12px;
+    line-height: 19px;
+  }
+  .tui-help-box .hb-title {
+    color: var(--c-accent);
+    padding: 2px 10px;
+    white-space: pre;
+  }
+  .tui-help-box .hb-row { padding: 0 10px; white-space: pre; }
+  .tui-help-box .hb-key { color: var(--c-fg); }
+  .tui-help-box .hb-doc { color: var(--c-dim); }
+  .tui-help-box .hb-mode { color: var(--c-accent); }
+  .tui-legend {
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+    max-width: 1280px;
+    width: 100%;
+    margin-top: 10px;
+    color: var(--c-faint);
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    line-height: 1.6;
+  }
+  .tui-legend b { color: var(--c-dim); font-weight: 600; }
+  .tui-legend code { font-size: 11px; }
+  /* Narrow TUI layout: focused pane alone */
+  .tui-window.tui-narrow .tui-sidebar { display: none; }
+  .tui-window.tui-narrow .tui-divider { display: none; }
 </style>
 </head>
 <body>
@@ -1216,7 +1495,7 @@
       </svg>
       gitten
     </div>
-    <span class="guide-badge">Desktop Client Design Guide</span>
+    <span class="guide-badge">Desktop + Terminal Design Guide</span>
   </div>
 
   <nav class="guide-tabs">
@@ -1276,10 +1555,28 @@
   </div>
 
   <!-- The Mockup Window Wrapper -->
+  <div class="mockup-switcher">
+    <div class="client-toggle" role="tablist" aria-label="Client variant">
+      <button id="btn-client-desktop" class="active" onclick="setClient('desktop')">🖥️ Desktop</button>
+      <button id="btn-client-tui" onclick="setClient('tui')">▦ Terminal (TUI)</button>
+    </div>
+    <div class="mockup-caption" id="mockup-caption">GPUI window · 3 panes · mouse + keyboard</div>
+  </div>
   <div class="window-wrapper" id="app-window-wrapper">
-    <div class="accent-tag" onclick="cycleAccent()" title="Click to cycle accent color">
-      <span class="dot"></span>
-      <span>accent ▾</span>
+    <div style="display: flex; align-items: flex-end;">
+      <div class="accent-tag" id="accent-tag" onclick="cycleAccent()" title="Click to cycle accent color">
+        <span class="dot"></span>
+        <span>accent ▾</span>
+      </div>
+      <div class="tui-tag" id="tui-tag">
+        <span class="dot"></span>
+        <span>terminal · cells, not pixels</span>
+      </div>
+      <div class="tui-toolbar" id="tui-toolbar">
+        <button class="tui-tbtn" id="tbtn-ascii" onclick="toggleTuiAscii()" title="Swap box-drawing graph + scrollbar for the --ascii alphabet">--ascii: off</button>
+        <button class="tui-tbtn" id="tbtn-narrow" onclick="toggleTuiNarrow()" title="Below 96 columns the layout shows only the focused pane">wide ≥96</button>
+        <button class="tui-tbtn" id="tbtn-help" onclick="toggleTuiHelp()" title="The ? panel is a pure function of the live keymap">? keys</button>
+      </div>
     </div>
 
     <!-- The Git Client App Window -->
@@ -1822,6 +2119,116 @@
         </div>
       </div>
 
+    </div><!-- /app-window -->
+
+    <!-- ================= TUI VARIANT (gitten-tui) ================= -->
+    <div class="tui-window" id="tui-window" style="display: none;">
+      <!-- Row 0: title — names the focused pane, same word the header + status use -->
+      <div class="tui-title">
+        <span><span class="t-git">gitten</span><span class="t-pane">  commits</span><span class="t-label">  plait · main ↑2 ↓0</span></span>
+        <span class="t-hint">? keys </span>
+      </div>
+
+      <div class="tui-body" id="tui-body">
+        <!-- Sidebar: stacked lists, equal slices of the column (panes::BuiltinLayout) -->
+        <div class="tui-sidebar" id="tui-sidebar">
+          <!-- files -->
+          <div class="tui-pane">
+            <div class="tui-pane-header"><span class="k-idle">2</span><span class="n-idle">  files</span><span class="l-idle">  plait · 4 changed</span></div>
+            <div class="tui-pane-rows">
+              <div class="tui-row"><span class="tui-sec">Staged (2)</span></div>
+              <div class="tui-row"><span class="tui-d-mod">M </span><span class="tui-file"><span class="dir">internal/ai/</span>commit.go</span></div>
+              <div class="tui-row"><span class="tui-d-add">A </span><span class="tui-file"><span class="dir">internal/extension/</span>pool.go</span></div>
+              <div class="tui-row"><span class="tui-sec">Unstaged (3)</span></div>
+              <div class="tui-row sel"><span class="tui-d-mod">M </span><span class="tui-file"><span class="dir">internal/extension/</span>host.go</span><span class="bar"> </span></div>
+            </div>
+          </div>
+          <!-- branches -->
+          <div class="tui-pane">
+            <div class="tui-pane-header"><span class="k-idle">3</span><span class="n-idle">  branches</span><span class="l-idle">  main ↑2</span></div>
+            <div class="tui-pane-rows">
+              <div class="tui-row"><span style="color: var(--lane-0);">● </span><span class="tui-file">main ↑2</span></div>
+              <div class="tui-row"><span style="color: var(--lane-0);">● </span><span class="tui-file">feat/ext-host ↑7</span></div>
+              <div class="tui-row"><span style="color: var(--lane-2);">● </span><span class="tui-file">fix/graph-lanes</span></div>
+            </div>
+          </div>
+          <!-- commits (focused) -->
+          <div class="tui-pane" style="flex: 1;">
+            <div class="tui-pane-header"><span class="k-focused">4</span><span class="n-focused">  commits</span><span class="l-idle">  main</span></div>
+            <div class="tui-pane-rows" id="tui-commits">
+              <div class="tui-row sel"><span class="tui-sha">a3f1c9d </span><span style="color: #9c7f75;">JH </span><span data-graph style="color: var(--lane-0);">◉ </span><span class="tui-subj">Merge extension host into main</span><span class="bar">▐</span></div>
+              <div class="tui-row"><span class="tui-sha">7b02e14 </span><span style="color: #9c7f75;">JH </span><span data-graph><span style="color: var(--lane-0);">│ </span><span style="color: var(--lane-1);">● </span></span><span class="tui-subj">Cap per-extension token budget</span><span class="bar"> </span></div>
+              <div class="tui-row"><span class="tui-sha">c40d8aa </span><span style="color: #9c7f75;">JH </span><span data-graph><span style="color: var(--lane-0);">│ </span><span style="color: var(--lane-1);">● </span></span><span class="tui-subj">Sandbox extension filesystem access</span><span class="bar"> </span></div>
+              <div class="tui-row"><span class="tui-sha">1e9fb37 </span><span style="color: #9c7f75;">JH </span><span data-graph><span style="color: var(--lane-0);">│ </span><span style="color: var(--lane-1);">● </span></span><span class="tui-subj">Define the Event/Handles contract</span><span class="bar"> </span></div>
+              <div class="tui-row"><span class="tui-sha">55ac0f2 </span><span style="color: #9c7f75;">JH </span><span data-graph style="color: var(--lane-0);">● </span><span class="tui-subj">Word-level diff in the hunk renderer</span><span class="bar"> </span></div>
+              <div class="tui-row"><span class="tui-sha">9d7e3b8 </span><span style="color: #9c7f75;">JH </span><span data-graph style="color: var(--lane-0);">◉─</span><span data-graph style="color: var(--lane-2);">╮ </span><span class="tui-subj">Merge lane-collapse rewrite</span><span class="bar"> </span></div>
+              <div class="tui-row"><span class="tui-sha">f18c6d0 </span><span style="color: #9c7f75;">JH </span><span data-graph><span style="color: var(--lane-0);">│ </span><span style="color: var(--lane-2);">● </span></span><span class="tui-subj">Collapse dead lanes after a merge</span><span class="bar">▗</span></div>
+              <div class="tui-row"><span class="tui-sha">d6e5192 </span><span style="color: #9c7f75;">JH </span><span data-graph style="color: var(--lane-0);">● </span><span class="tui-subj">Keymap resolves through the mode stack</span><span class="bar"> </span></div>
+            </div>
+          </div>
+          <!-- stashes -->
+          <div class="tui-pane">
+            <div class="tui-pane-header"><span class="k-idle">5</span><span class="n-idle">  stashes</span><span class="l-idle">  0 parked</span></div>
+            <div class="tui-pane-rows">
+              <div class="tui-row"><span class="tui-sec" style="font-style: italic;">nothing stashed</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="tui-divider" id="tui-divider"></div>
+
+        <!-- Main: the diff -->
+        <div class="tui-main" id="tui-main">
+          <div class="tui-pane" style="flex: 1; border-bottom: none;">
+            <div class="tui-pane-header"><span class="k-idle">0</span><span class="n-idle">  diff</span><span class="l-idle">  host.go  +18 -6</span></div>
+            <div class="tui-fhead">internal/extension/host.go  <span class="tui-d-add">+18</span> <span class="tui-d-del">-6</span><span style="float: right; color: var(--c-faint); font-weight: 400;">▐</span></div>
+            <div class="tui-hunk">@@ -41,9 +41,11 @@ func (h *Host) Dispatch(ev Event) error {</div>
+            <div>
+              <div class="tui-dl ctx"><span class="tui-g">41  41</span><span class="tui-s"> </span><span>  <span class="syn-k">for</span> _, ext := <span class="syn-k">range</span> h.<span class="syn-p">enabled</span> {</span></div>
+              <div class="tui-dl del"><span class="tui-g">42    </span><span class="tui-s">-</span><span>    <span class="syn-k">if</span> !ext.<span class="syn-f">Handles</span>(ev.<span class="syn-p">Kind</span>) {</span></div>
+              <div class="tui-dl add"><span class="tui-g">    42</span><span class="tui-s">+</span><span>    <span class="syn-k">if</span> !ext.<span class="syn-f">Handles</span>(ev.<span class="syn-p">Kind</span>) <span class="tui-w-add">|| h.<span class="syn-p">budget</span>.<span class="syn-f">Exhausted</span>()</span> {</span></div>
+              <div class="tui-dl ctx"><span class="tui-g">43  43</span><span class="tui-s"> </span><span>      <span class="syn-k">continue</span></span></div>
+              <div class="tui-dl ctx"><span class="tui-g">44  44</span><span class="tui-s"> </span><span>    }</span></div>
+              <div class="tui-dl del"><span class="tui-g">45    </span><span class="tui-s">-</span><span>    <span class="syn-k">go</span> ext.<span class="syn-f">Run</span>(ev)</span></div>
+              <div class="tui-dl add"><span class="tui-g">    45</span><span class="tui-s">+</span><span>    <span class="syn-k">if</span> err := h.<span class="syn-p">pool</span>.<span class="syn-f">Submit</span>(ctx, ext, ev); err != <span class="syn-k">nil</span> {</span></div>
+              <div class="tui-dl add"><span class="tui-g">    46</span><span class="tui-s">+</span><span>      <span class="syn-k">return</span> fmt.<span class="syn-f">Errorf</span>(<span class="syn-s">"dispatch %s: %w"</span>, ext.<span class="syn-p">Name</span>, err)</span></div>
+              <div class="tui-dl add"><span class="tui-g">    47</span><span class="tui-s">+</span><span>    }</span></div>
+              <div class="tui-dl ctx"><span class="tui-g">46  48</span><span class="tui-s"> </span><span>    }</span></div>
+              <div class="tui-dl ctx"><span class="tui-g">47  49</span><span class="tui-s"> </span><span>    <span class="syn-k">return</span> <span class="syn-k">nil</span></span></div>
+              <div class="tui-dl ctx"><span class="tui-g">48  50</span><span class="tui-s"> </span><span>  }</span></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ? help modal: centred box, bordered on every side -->
+        <div class="tui-help-overlay" id="tui-help">
+          <div class="tui-help-box">
+            <div class="hb-title">╭─ <span style="color: var(--c-accent);">keys</span><span style="color: var(--c-faint);"> ───────────────────────────────────╮</span></div>
+            <div class="hb-row"><span style="color: var(--c-faint);">│ </span><span class="hb-mode">global</span></div>
+            <div class="hb-row"><span style="color: var(--c-faint);">│ </span><span class="hb-key">j / down       </span><span class="hb-doc">one row down</span></div>
+            <div class="hb-row"><span style="color: var(--c-faint);">│ </span><span class="hb-key">k / up         </span><span class="hb-doc">one row up</span></div>
+            <div class="hb-row"><span style="color: var(--c-faint);">│ </span><span class="hb-key">4 / 0          </span><span class="hb-doc">commits / diff focus</span></div>
+            <div class="hb-row"><span style="color: var(--c-faint);">│ </span><span class="hb-key">?              </span><span class="hb-doc">this panel (pure function of keymap)</span></div>
+            <div class="hb-row"><span style="color: var(--c-faint);">│ </span><span class="hb-mode">commits</span></div>
+            <div class="hb-row"><span style="color: var(--c-faint);">│ </span><span class="hb-key">enter          </span><span class="hb-doc">the diff for this commit</span></div>
+            <div class="hb-row"><span style="color: var(--c-faint);">│ </span><span class="hb-key">/              </span><span class="hb-doc">filter, live over the list</span></div>
+            <div class="hb-row"><span style="color: var(--c-faint);">╰────────────────────────────────────────────╯</span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Last row: status — focused pane first, then where it is -->
+      <div class="tui-status">
+        <span id="tui-status-text"> commits · 1/13 · 2 lanes · word · unified</span>
+        <span style="color: var(--c-faint);">120×32 · --ascii off</span>
+      </div>
+    </div><!-- /tui-window -->
+
+    <div class="tui-legend" id="tui-legend" style="display: none;">
+      <span><b>Wide ≥96 cols:</b> sidebar (32%, ≥40 cols) + 1-col gap + main (≥55). <b>Narrow:</b> focused pane alone.</span>
+      <span><b>Graph:</b> 2 cols/lane · <code>●</code> commit <code>◉</code> merge <code>│ ─ ┼ ╮ ╯</code> · capped at 12, overflow grey.</span>
+      <span><b>Bar:</b> <code>▐</code> over the last cell (keeps the row bg) · halves <code>▝ ▗</code> · <code>#</code> with <code>--ascii</code>.</span>
+      <span><b>No AI card</b> in the terminal — same hunk, same <code>e</code> key, status-line answer. Mouse: click moves cursor, drag selects (OSC 52).</span>
     </div>
   </div>
 
@@ -2041,6 +2448,23 @@ lane_x = lane * 14.0 + 7.0 px; // Centered exactly at whole pixels</pre>
         <li><strong>Typeface:</strong> Editorial serif (<code>Newsreader</code>, <code>Charter</code>, <code>Georgia</code>) at <code>13.5px</code> with <code>1.5</code> line-height to distinguish human/machine prose from monospace code.</li>
         <li><strong>Border:</strong> Muted amber border (<code>rgba(223, 168, 81, 0.28)</code>) creating subtle warm elevation.</li>
         <li><strong>Interactive shortcut:</strong> Pressing <span class="key-chip">e</span> triggers or collapses the hunk explanation.</li>
+      </ul>
+    </div>
+
+    <div class="doc-section">
+      <h2>5. Terminal Variant (gitten-tui) — same core, cells not pixels</h2>
+      <p>
+        Toggle <strong>Terminal (TUI)</strong> in the mockup toolbar to see the same repository through
+        <code>tui/src/main.rs</code> + <code>tui/src/panes.rs</code>. Same themes, same lane hues, same keymap —
+        drawn into a cell grid (<code>screen::Screen</code>) instead of GPUI elements. Try the
+        <code>--ascii</code>, <code>wide ≥96</code> and <code>? keys</code> buttons above the terminal frame.
+      </p>
+      <ul style="color: var(--c-dim); margin-left: 20px; line-height: 1.8;">
+        <li><strong>Chrome:</strong> one title row (<code>gitten&nbsp;&nbsp;&lt;pane&gt;&nbsp;&nbsp;&lt;label&gt;</code> + right-aligned <code>? keys</code> hint) and one status row (<code>&lt;pane&gt; · &lt;where&gt;</code>). No traffic lights, no pills, no shadows.</li>
+        <li><strong>Layout:</strong> sidebar (32% of the body, ≥40 cols) + 1 blank divider column + main (≥55). Below <code>WIDE_AT = 96</code> the focused pane takes the whole body. Sidebar lists stack vertically with equal slices — files, branches, commits, stashes — each with its own <code>&lt;key&gt; &lt;name&gt; &lt;label&gt;</code> header; the focused header draws in accent.</li>
+        <li><strong>Graph:</strong> 2 columns per lane with box drawing (<code>● ◉ │ ─ ┼ ╮ ╯</code>), capped at 12 lanes. <code>--ascii</code> swaps to <code>* @ | - + / \</code> (<code>Glyphs::ascii</code>).</li>
+        <li><strong>Scrollbar:</strong> <code>▐</code> drawn <em>over</em> the pane's last cell (row background runs underneath), halves <code>▝ ▗</code>, <code>#</code> in ASCII. No track, no drag — an indicator only.</li>
+        <li><strong>No AI card:</strong> the terminal shows the same hunk and answers the same <span class="key-chip">e</span> on the status line. Mouse: click moves the cursor, drag selects, OSC 52 copies.</li>
       </ul>
     </div>
   </div>
@@ -2591,6 +3015,79 @@ lane_x = lane * 14.0 + 7.0 px; // Centered exactly at whole pixels</pre>
       btn.classList.remove('active');
       win.classList.remove('blueprint-active');
     }
+  }
+
+  // ------------------- Desktop / TUI client toggle -------------------
+  let currentClient = 'desktop';
+  function setClient(which) {
+    currentClient = which;
+    const isTui = which === 'tui';
+    document.getElementById('btn-client-desktop').classList.toggle('active', !isTui);
+    document.getElementById('btn-client-tui').classList.toggle('active', isTui);
+    document.getElementById('app-window').style.display = isTui ? 'none' : 'flex';
+    document.getElementById('tui-window').style.display = isTui ? 'block' : 'none';
+    document.getElementById('tui-legend').style.display = isTui ? 'flex' : 'none';
+    document.getElementById('accent-tag').style.display = isTui ? 'none' : 'inline-flex';
+    document.getElementById('tui-tag').style.display = isTui ? 'inline-flex' : 'none';
+    document.getElementById('tui-toolbar').style.display = isTui ? 'inline-flex' : 'none';
+    document.getElementById('mockup-caption').innerText = isTui
+      ? 'gitten-tui · cell grid · same core, same keymap, same tokens'
+      : 'GPUI window · 3 panes · mouse + keyboard';
+    if (isTui) closeModals();
+    if (window.history && window.history.replaceState) {
+      const url = new URL(window.location.href);
+      if (isTui) url.searchParams.set('client', 'tui');
+      else url.searchParams.delete('client');
+      window.history.replaceState(null, '', url.toString());
+    }
+  }
+  (function applyClientParam() {
+    try {
+      if (new URLSearchParams(window.location.search).get('client') === 'tui') setClient('tui');
+    } catch (e) {}
+  })();
+
+  // TUI: ? help overlay (centred bordered box, like help::paint)
+  function toggleTuiHelp() {
+    const box = document.getElementById('tui-help');
+    const btn = document.getElementById('tbtn-help');
+    const show = !box.classList.contains('show');
+    box.classList.toggle('show', show);
+    btn.classList.toggle('active', show);
+  }
+
+  // TUI: --ascii alphabet (Glyphs::ascii + Bar::ascii)
+  let tuiAscii = false;
+  let tuiCommitsBackup = null;
+  function toggleTuiAscii() {
+    tuiAscii = !tuiAscii;
+    const btn = document.getElementById('tbtn-ascii');
+    btn.innerText = tuiAscii ? '--ascii: on' : '--ascii: off';
+    btn.classList.toggle('active', tuiAscii);
+    const root = document.getElementById('tui-commits');
+    if (!root) return;
+    if (tuiAscii && tuiCommitsBackup === null) tuiCommitsBackup = root.innerHTML;
+    if (tuiAscii) {
+      let html = root.innerHTML;
+      const map = { '◉': '@', '●': '*', '│': '|', '─': '-', '┼': '+', '╮': '\\', '╯': '/', '╰': '\\', '╭': '/', '▐': '#', '▗': '#', '▝': '#' };
+      for (const [a, b] of Object.entries(map)) html = html.split(a).join(b);
+      root.innerHTML = html;
+    } else if (tuiCommitsBackup !== null) {
+      root.innerHTML = tuiCommitsBackup;
+    }
+    const st = document.getElementById('tui-status-text');
+    if (st) st.innerText = tuiAscii ? ' commits · 1/13 · 2 lanes · word · unified · ascii' : ' commits · 1/13 · 2 lanes · word · unified';
+  }
+
+  // TUI: wide (≥96 sidebar + main) vs narrow (focused pane alone)
+  let tuiNarrow = false;
+  function toggleTuiNarrow() {
+    tuiNarrow = !tuiNarrow;
+    const win = document.getElementById('tui-window');
+    const btn = document.getElementById('tbtn-narrow');
+    win.classList.toggle('tui-narrow', tuiNarrow);
+    btn.innerText = tuiNarrow ? 'narrow <96' : 'wide ≥96';
+    btn.classList.toggle('active', tuiNarrow);
   }
 
   // ------------------- Theme Switching -------------------

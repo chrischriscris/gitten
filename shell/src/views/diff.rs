@@ -993,9 +993,9 @@ impl Diff {
     /// wheel does; the event's own delta says how far. A key repeat has no delta
     /// and uses [`Diff::run_view`] like every other command.
     ///
-    /// The cursor comes along when the pixels push it off screen — the same rule
-    /// [`Viewport::scroll_by`] applies to a terminal's wheel — so `j` after a
-    /// flick lands on a row you can see.
+    /// A glance, not a commitment: the viewport pans and the keyboard
+    /// selection stays where it was, exactly as the terminal's `pan_by`
+    /// does — the selected row is not necessarily in view.
     pub fn scroll_pixels(&mut self, dy: f32, host: &Host) -> bool {
         let deferred = self.scroll.0.borrow().deferred_scroll_to_item;
         if let Some(request) = deferred {
@@ -1003,7 +1003,7 @@ impl Diff {
                 let pixels = self.pending_scroll.wheel(dy);
                 let mut v = self.live_view(host);
                 let y = -(request.item_index as f32 * ROW_H) + pixels;
-                v.scroll_to((-y / ROW_H).round().max(0.0) as usize);
+                v.pan_to((-y / ROW_H).round().max(0.0) as usize);
                 self.view.set(v);
                 self.top.set(v.top());
                 // The wheel is also a move of attention.
@@ -1028,9 +1028,9 @@ impl Diff {
             .borrow()
             .base_handle
             .set_offset(point(offset.x, px(y)));
-        // The top row the pixels landed on, and the viewport dragged to meet it.
+        // The top row the pixels landed on, panned to — the selection stays.
         let mut v = self.live_view(host);
-        v.scroll_to((-y / ROW_H).round().max(0.0) as usize);
+        v.pan_to((-y / ROW_H).round().max(0.0) as usize);
         self.view.set(v);
         self.synced.set(y);
         // The wheel is also a move of attention — same rule the arrow keys keep.
@@ -1039,8 +1039,8 @@ impl Diff {
     }
 
     /// Meets the list where it actually is: a scrollbar drag moves the offset
-    /// without touching anything else, and the next key should act on what is on
-    /// screen now — with the cursor dragged along, exactly as the wheel drags it.
+    /// without touching the selection, and the next key acts from the offset
+    /// now on screen.
     ///
     /// [`Diff::synced`] is what separates "the list moved under us" from "we
     /// moved the list": only a mismatch counts, so two commands in a row do not
@@ -1059,7 +1059,7 @@ impl Diff {
         if v.top() == shown {
             return;
         }
-        v.scroll_to(shown);
+        v.pan_to(shown);
         self.view.set(v);
     }
 
@@ -1080,8 +1080,8 @@ impl Diff {
             "view.up" => v.up(),
             "view.page-down" => v.page(1),
             "view.page-up" => v.page(-1),
-            "view.scroll-down" => v.scroll_by(host.view.rows as isize),
-            "view.scroll-up" => v.scroll_by(-(host.view.rows as isize)),
+            "view.scroll-down" => v.pan_by(host.view.rows as isize),
+            "view.scroll-up" => v.pan_by(-(host.view.rows as isize)),
             "view.top" => v.to_top(),
             "view.bottom" => v.to_bottom(),
             "view.left" => {
@@ -2124,7 +2124,7 @@ impl Render for Diff {
                     v.set_len(order.len());
                     v.set_height(range.len());
                     v.set_scrolloff(host.view.scrolloff);
-                    v.scroll_to((-accepted.y / ROW_H).round().max(0.0) as usize);
+                    v.pan_to((-accepted.y / ROW_H).round().max(0.0) as usize);
                     view.set(v);
                     top.set(v.top());
                     cx.refresh_windows();
@@ -5208,10 +5208,10 @@ diff --git a/b.md b/b.md
         assert_eq!(d.cursor(), 0, "clamped at the first row");
         assert!(total > 10);
         assert!(d.run_view("view.scroll-down", &host));
-        // A scroll is not a cursor move — but the cursor is dragged to the near
-        // edge rather than left off screen: top row 1 plus the three-row margin.
+        // A scroll is not a cursor move: the viewport pans a row while the
+        // keyboard stays where it was, like the terminal.
         assert_eq!(d.view.get().top(), 1);
-        assert_eq!(d.cursor(), 4);
+        assert_eq!(d.cursor(), 0);
     }
 
     #[test]
@@ -5274,10 +5274,9 @@ diff --git a/b.md b/b.md
 
     #[test]
     fn a_thumb_drag_is_reconciled_before_anything_reads_the_cursor() {
-        // What `commits.open-diff` and `copy.selection` would otherwise hit: a
-        // scrollbar drag writes the offset and nothing else, so the model's
-        // cursor is wherever the *keys* left it — rows behind the screen. The
-        // drag has to be met before the read.
+        // A scrollbar drag writes the offset and nothing else, so the model
+        // has to meet the visible top — while the cursor, the keyboard's
+        // row, stays exactly where the keys left it, like the terminal.
         let host = Host::new();
         let mut d = Diff::with_layouts(long_diff(), &host, Layouts::builtin());
         with_height(&mut d, 20);
@@ -5294,13 +5293,12 @@ diff --git a/b.md b/b.md
         d.reconcile(&host);
         let v = d.view.get();
         assert_eq!(v.top(), 10, "the model caught up with the visible top");
-        // The cursor was dragged along to the near edge — the same rule the
-        // wheel applies — so a command acts on a row actually on screen.
-        assert_eq!(v.cursor(), 13, "top ten plus the three-row margin");
+        // The drag panned: the selection never left row zero.
+        assert_eq!(v.cursor(), 0, "a drag pans; it does not select");
 
         // Idempotent: meeting the list twice is not moving it twice.
         d.reconcile(&host);
-        assert_eq!((d.view.get().top(), d.cursor()), (10, 13));
+        assert_eq!((d.view.get().top(), d.cursor()), (10, 0));
     }
 
     #[test]

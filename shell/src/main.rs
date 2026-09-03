@@ -386,11 +386,12 @@ fn expand_project_path(text: &str, current: &std::path::Path) -> std::path::Path
         expanded
     }
 }
-/// How long the commits cursor may keep moving before the main view loads the
-/// commit it settled on. A fast run through the list schedules one timer per
-/// row but only the newest request ever survives its guard to load — see
-/// [`DevShell::schedule_main_diff`].
-const DIFF_DEBOUNCE: Duration = Duration::from_millis(150);
+/// Every cursor move and click loads its commit's diff at once — no
+/// settle delay. A fast run through the list schedules one load per row
+/// but only the newest request ever survives its guard to land — see
+/// [`DevShell::schedule_main_diff`]. Like the terminal, which re-acquires
+/// synchronously on each move.
+const DIFF_DEBOUNCE: Duration = Duration::ZERO;
 
 /// What only this client has. The two views, the arguments and `gitten.toml` are
 /// documented once, in `gitten_app::cli::usage`, because they are the same in
@@ -1422,7 +1423,7 @@ struct DevShell {
     /// The newest main-view request. Each schedule bumps it; a timer or a
     /// finished load applies only if it still equals the value it left with,
     /// which is how a fast cursor run collapses to exactly one load — the
-    /// settled row's.
+    /// latest row's.
     request: Cell<u64>,
     /// True between scheduling a main-view load and its rows landing.
     loading: Cell<bool>,
@@ -1469,6 +1470,11 @@ struct DevShell {
     /// that moved under the window, and silently keeping the old rows would be a
     /// diff labelled with an algorithm that did not produce it.
     error: Option<GitError>,
+    /// True when [`DevShell::error`] names a failed diff load rather than a
+    /// failed write. A preview that lands clears only the former: a write's
+    /// refusal must survive whatever the next cursor move loads, while a
+    /// load's own failure is spent the moment newer rows replace it.
+    error_is_load: bool,
     /// Whether the error's full text is on screen — `message.show` opened it,
     /// `esc` or anything that clears the error closes it.
     show_message: bool,
@@ -3148,6 +3154,7 @@ impl DevShell {
                 JobEvent::Started { name } => {
                     self.running = Some((format!("running {name}"), Instant::now()));
                     self.error = None;
+                    self.error_is_load = false;
                     // The seconds will not tick by themselves — GPUI draws
                     // nothing at rest — so a job that runs longer than a
                     // heartbeat needs a notifier of its own. It dies with the
@@ -3175,6 +3182,7 @@ impl DevShell {
                 } => {
                     self.running = None;
                     self.error = Some(GitError::new(error));
+                    self.error_is_load = false;
                     // A refusal is not proof the repository stood still: git
                     // can answer nonzero with work already left behind, and
                     // the conflicted revert is the case that proves it — its
@@ -3281,6 +3289,7 @@ impl DevShell {
         if self.refresh_pending == 0 {
             if self.error.is_none() {
                 self.error = self.refresh_error.take().map(GitError::new);
+                self.error_is_load = self.error.is_some();
             } else {
                 self.refresh_error = None;
             }
@@ -3348,6 +3357,7 @@ impl DevShell {
                 self.invalidate_refresh();
                 self.over = next;
                 self.error = None;
+                self.error_is_load = false;
                 let Screen::Diff { view, .. } = &self.main else {
                     return;
                 };
@@ -3360,7 +3370,10 @@ impl DevShell {
             }
             // The old rows stay on screen, which is the right failure: they are
             // still a true diff, just not the one that was asked for.
-            Err(e) => self.error = Some(GitError::new(e)),
+            Err(e) => {
+                self.error = Some(GitError::new(e));
+                self.error_is_load = true;
+            }
         }
         cx.notify();
     }
@@ -3385,6 +3398,7 @@ impl DevShell {
         // A layout change is a fresh look at the same diff, so a message about
         // an algorithm that failed to load is no longer describing the screen.
         self.error = None;
+        self.error_is_load = false;
         let host = config::host(cx);
         view.update(cx, |d, cx| d.set_layout(index, &host, cx));
         let load = view.read(cx).load.clone();
@@ -3657,6 +3671,7 @@ impl DevShell {
         self.request.set(self.request.get().saturating_add(1));
         self.loading.set(false);
         self.error = None;
+        self.error_is_load = false;
         self.title_memo.borrow_mut().take();
         self.header_memo.borrow_mut().take();
         // The scroll the new repository file remembers, applied once the
@@ -4047,6 +4062,7 @@ impl DevShell {
         // `esc` dismisses it before `back` moves anything else.
         if self.error.is_some() {
             self.error = None;
+            self.error_is_load = false;
             self.sync_modes(cx);
             cx.notify();
             return;
@@ -4176,20 +4192,20 @@ impl DevShell {
     }
 
     /// `commits.open-diff`: hand the keyboard to the diff region, carrying the
-    /// commit under the cursor. The load itself is already riding the
-    /// debounce from the cursor move that got here — enter *flushes* it,
-    /// because pressing enter on a row means that row and not whichever one a
-    /// fast run was settling toward. From the diff, `esc` walks back through
-    /// [`DevShell::back`].
+    /// commit under the cursor. The load for this row is already in flight
+    /// from the cursor move or click that got here — enter only escalates it
+    /// when it is still loading, and moves the keyboard either way. From the
+    /// diff, `esc` walks back through [`DevShell::back`].
     fn focus_main(&mut self, cx: &mut Context<Self>) {
         let Some(view) = self.column_commits() else {
             self.set_notice("no commit selected");
             return;
         };
         let host = config::host(cx);
-        // Meet the list where it actually is: a scrollbar drag moved the offset
-        // without moving the cursor, and "this commit" means the one being
-        // *looked at*.
+        // Meet the list where it actually is: a scrollbar drag moved the
+        // offset without moving the cursor, and the model should start from
+        // the offset now on screen. "This commit" stays the keyboard's row
+        // — a drag pans, it never selects, like the terminal.
         view.update(cx, |v, _| v.reconcile(&host));
         if let Some(commit) = view.read(cx).current().cloned() {
             self.schedule_main_diff(commit, true, cx);
@@ -4222,13 +4238,14 @@ impl DevShell {
 
     /// Aims the main view at `commit`.
     ///
-    /// **Load-on-settle, by timer guard.** Every schedule bumps
-    /// [`DevShell::request`] and spawns one timer ([`DIFF_DEBOUNCE`], zero
-    /// when flushing); a waking timer proceeds only if its request is still
-    /// the newest, so a fast cursor run leaves one live timer — the settled
-    /// row's — and the dead ones cost a wake and a compare each. The
-    /// acquisition then runs on the background executor behind a second copy
-    /// of the same guard, so an older load can never land over a newer one.
+    /// **Load at once, by request guard.** Every schedule bumps
+    /// [`DevShell::request`] and spawns one timer ([`DIFF_DEBOUNCE`], zero —
+    /// loads start on the next executor pump); a waking timer proceeds only
+    /// if its request is still the newest, so a fast cursor run leaves one
+    /// live load — the latest row's — and the dead ones cost a wake and a
+    /// compare each. The acquisition then runs on the background executor
+    /// behind a second copy of the same guard, so an older load can never
+    /// land over a newer one.
     ///
     /// The header is written *now*, not on arrival: the strip naming the
     /// commit whose diff is coming is what makes the load visible in frame
@@ -4334,14 +4351,22 @@ impl DevShell {
                         // strip describing an algorithm that did not produce
                         // this diff.
                         shell.over = Overrides::default();
-                        // A success clears whatever the previous load said.
-                        shell.error = None;
+                        // A success clears a previous *load's* failure — newer
+                        // rows replaced it. A write's refusal survives: it
+                        // names work git left behind, not rows that moved.
+                        if shell.error_is_load {
+                            shell.error = None;
+                            shell.error_is_load = false;
+                        }
                         if let Screen::Diff { label: cell, .. } = &shell.main {
                             cell.replace(label);
                         }
                     }
                     Ok(_) => {}
-                    Err(e) => shell.error = Some(GitError::new(e)),
+                    Err(e) => {
+                        shell.error = Some(GitError::new(e));
+                        shell.error_is_load = true;
+                    }
                 }
                 cx.notify();
             });
@@ -5135,9 +5160,24 @@ impl DevShell {
                     this.set_spot(Spot::List, cx);
                 }))
                 .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        // The row's own click handler (deeper, so earlier in
+                        // bubble) already moved the keyboard via `select_row`;
+                        // the preview follows it here, like every key move
+                        // does through `run_command`'s tail — no debounce,
+                        // like the terminal.
+                        this.sync_main_diff(cx);
+                    }),
+                )
+                .on_mouse_down(
                     MouseButton::Right,
                     cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
                         this.open_context_menu(&pane, ev.position, cx);
+                        // A right-click also moves the keyboard (the row's
+                        // handler ran first), so the preview follows that
+                        // row too.
+                        this.sync_main_diff(cx);
                     }),
                 )
                 .child(chrome::pane_header(host, "4", name, None, focused, right))
@@ -6513,6 +6553,7 @@ fn open_main_window(started: Started, cx: &mut App) {
                 open: None,
                 context: None,
                 error: None,
+                error_is_load: false,
                 notice: None,
                 config: shell_config_path,
                 first_render: Cell::new(false),
@@ -6545,7 +6586,7 @@ fn open_main_window(started: Started, cx: &mut App) {
                     // newest one's diff through the same guarded rails
                     // every later selection rides. The header and the
                     // band are up before the first paint; the rows land
-                    // one debounce later.
+                    // on the next executor pump.
                     shell.sync_main_diff(cx);
                 });
             }
@@ -7132,6 +7173,7 @@ mod tests {
                 open: which,
                 context: None,
                 error: None,
+                error_is_load: false,
                 notice: None,
                 config: std::path::PathBuf::new(),
                 first_render: Cell::new(false),
@@ -7267,6 +7309,7 @@ mod tests {
                 open: None,
                 context: None,
                 error: None,
+                error_is_load: false,
                 notice: None,
                 config: std::path::PathBuf::new(),
                 first_render: Cell::new(false),
@@ -8520,7 +8563,7 @@ diff --git a/one.txt b/one.txt
     #[gpui::test]
     fn a_fast_cursor_run_loads_only_the_commit_it_settles_on(cx: &mut TestAppContext) {
         let (shell, repo) = history_shell(cx);
-        // Five rows of cursor movement inside one debounce window: every row
+        // Five rows of cursor movement before any timer fires: every row
         // re-aims the request, and only the last aim survives its guard.
         for _ in 0..5 {
             shell.update(cx, |shell, cx| shell.run_command("view.down", cx));
