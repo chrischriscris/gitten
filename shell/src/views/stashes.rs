@@ -340,7 +340,9 @@ impl Stashes {
     }
 
     /// Moves the list by `dy` pixels — the wheel, whose command resolves
-    /// through `[keys]` but whose delta is pixels. Same dance as every list.
+    /// through `[keys]` but whose delta is pixels. A glance, not a
+    /// commitment: the viewport pans and the keyboard selection stays where
+    /// it was, like the terminal. Same dance as every list.
     pub fn scroll_pixels(&mut self, dy: f32, host: &Host) -> bool {
         let deferred = self.scroll.0.borrow().deferred_scroll_to_item;
         if let Some(request) = deferred {
@@ -348,7 +350,7 @@ impl Stashes {
                 let pixels = self.pending_scroll.wheel(dy);
                 let mut v = self.live_view(host);
                 let y = -(request.item_index as f32 * ROW_H) + pixels;
-                v.scroll_to((-y / ROW_H).round().max(0.0) as usize);
+                v.pan_to((-y / ROW_H).round().max(0.0) as usize);
                 self.view.set(v);
                 // The wheel is also a move of attention — same rule the
                 // arrow keys keep.
@@ -371,7 +373,7 @@ impl Stashes {
             .base_handle
             .set_offset(point(offset.x, px(y)));
         let mut v = self.live_view(host);
-        v.scroll_to((-y / ROW_H).round().max(0.0) as usize);
+        v.pan_to((-y / ROW_H).round().max(0.0) as usize);
         self.view.set(v);
         self.synced.set(y);
         self.armed = None;
@@ -379,7 +381,8 @@ impl Stashes {
     }
 
     /// Meets the list where it actually is after a scrollbar drag — see
-    /// [`super::files::Files::reconcile`].
+    /// [`super::files::Files::reconcile`]. Pans: the selection stays where
+    /// the keyboard left it.
     pub fn reconcile(&mut self, host: &Host) {
         if self.scroll.0.borrow().deferred_scroll_to_item.is_some() {
             return;
@@ -394,7 +397,7 @@ impl Stashes {
         if v.top() == shown {
             return;
         }
-        v.scroll_to(shown);
+        v.pan_to(shown);
         self.view.set(v);
     }
 
@@ -409,8 +412,8 @@ impl Stashes {
             "view.up" => v.up(),
             "view.page-down" => v.page(1),
             "view.page-up" => v.page(-1),
-            "view.scroll-down" => v.scroll_by(host.view.rows as isize),
-            "view.scroll-up" => v.scroll_by(-(host.view.rows as isize)),
+            "view.scroll-down" => v.pan_by(host.view.rows as isize),
+            "view.scroll-up" => v.pan_by(-(host.view.rows as isize)),
             "view.top" => v.to_top(),
             "view.bottom" => v.to_bottom(),
             "view.left" | "view.right" => return true,
@@ -550,7 +553,7 @@ impl Render for Stashes {
                     v.set_len(visible.len());
                     v.set_height(range.len());
                     v.set_scrolloff(host.view.scrolloff);
-                    v.scroll_to((-accepted.y / ROW_H).round().max(0.0) as usize);
+                    v.pan_to((-accepted.y / ROW_H).round().max(0.0) as usize);
                     view.set(v);
                     cx.refresh_windows();
                 }

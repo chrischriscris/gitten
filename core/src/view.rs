@@ -309,6 +309,16 @@ impl Viewport {
         self.top = top.min(self.max_top());
     }
 
+    /// Pans so that row `top` is the first one drawn, without changing the
+    /// selected row.
+    ///
+    /// [`scroll_to`](Self::scroll_to)'s position with [`pan_by`](Self::pan_by)'s
+    /// contract: what a pixel wheel and a dragged scrollbar thumb call, in any
+    /// client where scrolling is a glance and not a commitment.
+    pub fn pan_to(&mut self, top: usize) {
+        self.top = top.min(self.max_top());
+    }
+
     // ----------------------------------------------------------- the scrollbar
 
     /// Which cells of a `track`-cell scrollbar the thumb covers, or `None` when
