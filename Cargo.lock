@@ -2242,6 +2242,9 @@ dependencies = [
 [[package]]
 name = "gitten-core"
 version = "0.0.0"
+dependencies = [
+ "gitten-app",
+]
 
 [[package]]
 name = "gitten-git"
