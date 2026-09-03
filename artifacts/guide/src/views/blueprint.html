@@ -1,0 +1,106 @@
+<!-- Split from artifacts/design-guide.html (lines 2366-2470) — edit here. -->
+  <div class="doc-container">
+    <h1 class="doc-title">Visual Blueprint &amp; Layout Anatomy</h1>
+    <p class="doc-lead">
+      gitten's desktop presentation adopts a quiet, dense, keyboard-driven layout inspired by lazygit.
+      Every region has a strict geometric rhythm, fixed-height rows for virtualization, and explicit contrast floors.
+    </p>
+
+    <div class="doc-section">
+      <h2>1. The 3-Pane Geometry</h2>
+      <p>
+        The window is partitioned into three vertical columns using a CSS Grid layout:
+        <code>grid-template-columns: 245px 420px 1fr;</code>.
+      </p>
+      <table class="guide-table">
+        <thead>
+          <tr>
+            <th>Pane</th>
+            <th>Key</th>
+            <th>Default Width</th>
+            <th>Content &amp; Behavior</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Files / Status</strong></td>
+            <td><span class="key-chip">1</span></td>
+            <td><code>245px</code></td>
+            <td>Staged (<code>M</code>, <code>A</code>) &amp; unstaged (<code>M</code>, <code>??</code>) files. Subsections for Branches (<span class="key-chip">2</span>) and Stashes (<span class="key-chip">3</span>).</td>
+          </tr>
+          <tr>
+            <td><strong>Commits</strong></td>
+            <td><span class="key-chip">4</span></td>
+            <td><code>420px</code></td>
+            <td>Commit topology graph + short SHA + commit subject + relative age. Fixed <code>22px</code> row rhythm.</td>
+          </tr>
+          <tr>
+            <td><strong>Diff Viewer</strong></td>
+            <td><span class="key-chip">5</span></td>
+            <td><code>1fr</code> (Flexible)</td>
+            <td>Hunk header, line-number gutters, added/removed lines, intraline word diffs, and docked AI explanation card.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="doc-section">
+      <h2>2. Window Chrome &amp; Titlebar Strip</h2>
+      <p>
+        Following <strong>macOS titlebar conventions</strong> without an opaque system bar:
+        the app window uses a single transparent strip of height <code>38px</code>.
+      </p>
+      <ul style="color: var(--c-dim); margin-left: 20px; line-height: 1.8;">
+        <li><strong>Traffic Lights:</strong> macOS window controls inset at <code>(10, 10)</code>. Muted dark circles at rest, colored on hover.</li>
+        <li><strong>Repository Path:</strong> Breadcrumb showing working directory <code>~/src/</code> in dim tone and repo name <code>plait</code> / <code>gitten</code> in bold foreground.</li>
+        <li><strong>Branch Pill:</strong> Compact container displaying current active branch with ahead/behind sync counts (<code>↑2 ↓0</code>).</li>
+        <li><strong>Extensions Chip:</strong> Active status indicator with green pulse dot showing loaded extensions.</li>
+        <li><strong>Command Keycap:</strong> Dedicated <code>⌘K ask</code> button opening the AI and command dispatch palette.</li>
+      </ul>
+    </div>
+
+    <div class="doc-section">
+      <h2>3. The Commit Graph Drawing Rules</h2>
+      <p>
+        The commit graph is drawn using SVG Bézier curves and antialiased nodes adhering to <code>core/src/graph.rs</code>:
+      </p>
+      <pre>ROW_H = 22.0 px;
+LANE_W = 14.0 px;
+STROKE = 2.0 px;
+DOT_R = 4.0 px (commit node);
+MERGE_R = 5.0 px (hollow merge ring);
+lane_x = lane * 14.0 + 7.0 px; // Centered exactly at whole pixels</pre>
+      <p style="margin-top: 10px;">
+        Merge curves use cubic Bézier curves (<code>d="M 21 22 C 21 16 7 17 7 11"</code>) ensuring tangent continuity across row boundaries so virtualized row recycling doesn't produce visual seams.
+      </p>
+    </div>
+
+    <div class="doc-section">
+      <h2>4. Docked AI Assist Card ("Reading this hunk")</h2>
+      <p>
+        Rather than a noisy pop-up or a separate chat sidebar, AI reasoning is <strong>docked directly inside the diff view</strong> right below the relevant hunk.
+      </p>
+      <ul style="color: var(--c-dim); margin-left: 20px; line-height: 1.8;">
+        <li><strong>Typeface:</strong> Editorial serif (<code>Newsreader</code>, <code>Charter</code>, <code>Georgia</code>) at <code>13.5px</code> with <code>1.5</code> line-height to distinguish human/machine prose from monospace code.</li>
+        <li><strong>Border:</strong> Muted amber border (<code>rgba(223, 168, 81, 0.28)</code>) creating subtle warm elevation.</li>
+        <li><strong>Interactive shortcut:</strong> Pressing <span class="key-chip">e</span> triggers or collapses the hunk explanation.</li>
+      </ul>
+    </div>
+
+    <div class="doc-section">
+      <h2>5. Terminal Variant (gitten-tui) — same core, cells not pixels</h2>
+      <p>
+        Toggle <strong>Terminal (TUI)</strong> in the mockup toolbar to see the same repository through
+        <code>tui/src/main.rs</code> + <code>tui/src/panes.rs</code>. Same themes, same lane hues, same keymap —
+        drawn into a cell grid (<code>screen::Screen</code>) instead of GPUI elements. Try the
+        <code>--ascii</code>, <code>wide ≥96</code> and <code>? keys</code> buttons above the terminal frame.
+      </p>
+      <ul style="color: var(--c-dim); margin-left: 20px; line-height: 1.8;">
+        <li><strong>Chrome:</strong> one title row (<code>gitten&nbsp;&nbsp;&lt;pane&gt;&nbsp;&nbsp;&lt;label&gt;</code> + right-aligned <code>? keys</code> hint) and one status row (<code>&lt;pane&gt; · &lt;where&gt;</code>). No traffic lights, no pills, no shadows.</li>
+        <li><strong>Layout:</strong> sidebar (32% of the body, ≥40 cols) + 1 blank divider column + main (≥55). Below <code>WIDE_AT = 96</code> the focused pane takes the whole body. Sidebar lists stack vertically with equal slices — files, branches, commits, stashes — each with its own <code>&lt;key&gt; &lt;name&gt; &lt;label&gt;</code> header; the focused header draws in accent.</li>
+        <li><strong>Graph:</strong> 2 columns per lane with box drawing (<code>● ◉ │ ─ ┼ ╮ ╯</code>), capped at 12 lanes. <code>--ascii</code> swaps to <code>* @ | - + / \</code> (<code>Glyphs::ascii</code>).</li>
+        <li><strong>Scrollbar:</strong> <code>▐</code> drawn <em>over</em> the pane's last cell (row background runs underneath), halves <code>▝ ▗</code>, <code>#</code> in ASCII. No track, no drag — an indicator only.</li>
+        <li><strong>No AI card:</strong> the terminal shows the same hunk and answers the same <span class="key-chip">e</span> on the status line. Mouse: click moves the cursor, drag selects, OSC 52 copies.</li>
+      </ul>
+    </div>
+  </div>

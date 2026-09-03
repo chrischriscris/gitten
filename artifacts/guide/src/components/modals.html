@@ -1,0 +1,124 @@
+<!-- Split from artifacts/design-guide.html (lines 2235-2357) — edit here. -->
+  <!-- Command Palette / Ask Modal -->
+  <div class="mock-modal" id="modal-ask">
+    <div class="modal-title">
+      <span>Ask AI / Dispatch Command</span>
+      <button class="modal-close" onclick="closeModals()">✕</button>
+    </div>
+    <input type="text" class="modal-input" placeholder="Explain change, generate commit message, or type command..." autofocus>
+    <div class="modal-list">
+      <div class="modal-item active">
+        <span>✧ Explain all changes in internal/extension/host.go</span>
+        <span class="key-chip">↵</span>
+      </div>
+      <div class="modal-item">
+        <span>✎ Generate conventional commit message</span>
+        <span class="key-chip">⌘↵</span>
+      </div>
+      <div class="modal-item">
+        <span>⚡ Check for breaking API changes</span>
+        <span class="key-chip">⌥↵</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Extensions Modal -->
+  <div class="mock-modal" id="modal-extensions">
+    <div class="modal-title">
+      <span>Active Extensions (4)</span>
+      <button class="modal-close" onclick="closeModals()">✕</button>
+    </div>
+    <div class="modal-list">
+      <div class="modal-item">
+        <div>
+          <b style="color: var(--c-fg);">hunk-explainer</b>
+          <div style="font-size: 11px; color: var(--c-faint);">Contextual LLM explanation for diff hunks</div>
+        </div>
+        <span style="color: #6fbf73;">● enabled</span>
+      </div>
+      <div class="modal-item">
+        <div>
+          <b style="color: var(--c-fg);">commit-synthesizer</b>
+          <div style="font-size: 11px; color: var(--c-faint);">Drafts commit messages based on staged diffs</div>
+        </div>
+        <span style="color: #6fbf73;">● enabled</span>
+      </div>
+      <div class="modal-item">
+        <div>
+          <b style="color: var(--c-fg);">histogram-differ</b>
+          <div style="font-size: 11px; color: var(--c-faint);">Anchor-preserving diffing algorithm in core</div>
+        </div>
+        <span style="color: #6fbf73;">● built-in</span>
+      </div>
+      <div class="modal-item">
+        <div>
+          <b style="color: var(--c-fg);">lane-optimizer</b>
+          <div style="font-size: 11px; color: var(--c-faint);">Dead-lane collapse and 12-lane gutter cap</div>
+        </div>
+        <span style="color: #6fbf73;">● built-in</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- lazygit Keybindings Help Modal (?) -->
+  <div class="mock-modal" id="modal-help" style="width: 580px; max-height: 80vh; overflow-y: auto;">
+    <div class="modal-title">
+      <span>lazygit Keybindings Cheat Sheet</span>
+      <button class="modal-close" onclick="closeModals()">✕</button>
+    </div>
+    <div style="display: flex; flex-direction: column; gap: 12px; font-size: 12px;">
+      <div>
+        <div style="color: var(--c-accent); font-weight: 600; margin-bottom: 4px;">Panel Switching</div>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 4px; color: var(--c-dim);">
+          <div><span class="key-chip">1</span> Status / Branch</div>
+          <div><span class="key-chip">2</span> Files</div>
+          <div><span class="key-chip">3</span> Branches</div>
+          <div><span class="key-chip">4</span> Commits</div>
+          <div><span class="key-chip">5</span> Stash</div>
+          <div><span class="key-chip">0</span> / <span class="key-chip">↵</span> Diff View</div>
+        </div>
+      </div>
+      <div>
+        <div style="color: var(--c-accent); font-weight: 600; margin-bottom: 4px;">Navigation</div>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 4px; color: var(--c-dim);">
+          <div><span class="key-chip">h</span> / <span class="key-chip">l</span> Walk left / right pane</div>
+          <div><span class="key-chip">j</span> / <span class="key-chip">k</span> Select down / up item</div>
+          <div><span class="key-chip">[</span> / <span class="key-chip">]</span> Prev / next file in diff</div>
+          <div><span class="key-chip">Esc</span> Return to sidebar / cancel</div>
+        </div>
+      </div>
+      <div>
+        <div style="color: var(--c-accent); font-weight: 600; margin-bottom: 4px;">Global Verbs</div>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 4px; color: var(--c-dim);">
+          <div><span class="key-chip">P</span> Push to remote</div>
+          <div><span class="key-chip">p</span> Pull from remote</div>
+          <div><span class="key-chip">f</span> Fetch from remote</div>
+          <div><span class="key-chip">R</span> Refresh all git state</div>
+          <div><span class="key-chip">y</span> Yank / copy SHA/path</div>
+          <div><span class="key-chip">/</span> Filter / search</div>
+        </div>
+      </div>
+      <div>
+        <div style="color: var(--c-accent); font-weight: 600; margin-bottom: 4px;">Files Panel (2)</div>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 4px; color: var(--c-dim);">
+          <div><span class="key-chip">␣</span> Stage / unstage file</div>
+          <div><span class="key-chip">c</span> Commit staged</div>
+          <div><span class="key-chip">a</span> Stage / unstage all</div>
+          <div><span class="key-chip">A</span> Amend commit</div>
+          <div><span class="key-chip">D</span> Discard changes</div>
+          <div><span class="key-chip">s</span> Stash working tree</div>
+        </div>
+      </div>
+      <div>
+        <div style="color: var(--c-accent); font-weight: 600; margin-bottom: 4px;">Commits Panel (4)</div>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 4px; color: var(--c-dim);">
+          <div><span class="key-chip">s</span> Squash commit down</div>
+          <div><span class="key-chip">f</span> Fixup commit</div>
+          <div><span class="key-chip">d</span> Drop commit</div>
+          <div><span class="key-chip">g</span> Reset menu (s/m/h)</div>
+          <div><span class="key-chip">r</span> Reword commit</div>
+          <div><span class="key-chip">t</span> Revert commit</div>
+        </div>
+      </div>
+    </div>
+  </div>

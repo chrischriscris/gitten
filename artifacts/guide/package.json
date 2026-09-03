@@ -1,0 +1,16 @@
+{
+  "name": "gitten-guide",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Modular design guide for the gitten desktop git client. Split from artifacts/design-guide.html; that file is legacy and untouched.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "vite": "^7.1.0"
+  }
+}

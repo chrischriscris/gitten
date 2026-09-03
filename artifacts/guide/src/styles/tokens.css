@@ -1,0 +1,127 @@
+/* Split from artifacts/design-guide.html <style> — keep cascade order, edit here. */
+  :root {
+    /* Core Theme Tokens — from core/src/theme.rs (Theme::dark) */
+    --c-bg: #0e0d0c;
+    --c-canvas: #131110;
+    --c-canvas-strip: #171514;
+    --c-fg: #e8e3dc;
+    --c-dim: #a39c93;
+    --c-faint: #6e6862;
+    --c-ghost: #4a4540;
+    --c-accent: #dfa851;
+    --c-accent-hover: #f0be6b;
+    --c-title-bg: #151312;
+    --c-status-bg: #131211;
+    --c-border: #282320;
+    --c-border-subtle: #201c19;
+    --c-raised: #1c1a18;
+    --c-keycap: #2c2925;
+    --c-selection-bg: #241f1a;
+    --c-selected-bg: #2f3b4a;
+    --c-error: #d4736b;
+
+    /* Diff Tokens */
+    --diff-file-bg: #231e1a;
+    --diff-adds-fg: #6fbf73;
+    --diff-dels-fg: #d4736b;
+    --diff-hunk-bg: #14181d;
+    --diff-hunk-fg: #7d8fa8;
+    --diff-gutter-fg: #4a4540;
+    --diff-rule: #332c28;
+    --diff-context-bg: #0e0d0c;
+    --diff-context-fg: #a39c93;
+    --diff-added-bg: #16241a;
+    --diff-added-fg: #9dc79b;
+    --diff-added-word-bg: #234228;
+    --diff-removed-bg: #2a1917;
+    --diff-removed-fg: #d4a09a;
+    --diff-removed-word-bg: #522722;
+
+    /* Graph Lane Tokens */
+    --lane-0: #dfa851; /* Gold / Main */
+    --lane-1: #6f9ecf; /* Sky Blue */
+    --lane-2: #a983c9; /* Purple */
+    --lane-3: #5fa8a0; /* Teal */
+    --lane-4: #c97d6f; /* Coral */
+    --lane-5: #8fb35e; /* Olive */
+    --lane-overflow: #453f39;
+
+    /* Syntax Tokens */
+    --syn-keyword: #a88fb5;
+    --syn-func: #d9c98f;
+    --syn-type: #86a6bd;
+    --syn-prop: #b5aea5;
+    --syn-str: #9aab7d;
+    --syn-comment: #615a52;
+    --syn-num: #c2a06a;
+
+    /* Geometry */
+    --row-h: 22px;
+    --lane-w: 14px;
+    --font-mono: "JetBrains Mono", "SF Mono", "Fira Code", Menlo, Monaco, Consolas, monospace;
+    --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, "Helvetica Neue", sans-serif;
+    --font-serif: "Newsreader", "Charter", "Georgia", "Cambria", serif;
+  }
+
+  /* Theme Overrides */
+  body.theme-slate {
+    --c-bg: #0d0f12;
+    --c-canvas: #12151a;
+    --c-canvas-strip: #171b21;
+    --c-fg: #e2e6eb;
+    --c-dim: #9aa1ab;
+    --c-faint: #67707e;
+    --c-ghost: #444b56;
+    --c-accent: #6f9ecf;
+    --c-title-bg: #13171d;
+    --c-status-bg: #111419;
+    --c-border: #242b36;
+    --c-raised: #1a2029;
+    --c-keycap: #262e3b;
+    --c-selection-bg: #1e2634;
+  }
+
+  body.theme-light {
+    --c-bg: #f5f2eb;
+    --c-canvas: #ebe7df;
+    --c-canvas-strip: #e2ddd4;
+    --c-fg: #23201c;
+    --c-dim: #6e675f;
+    --c-faint: #8a837a;
+    --c-ghost: #b0a89d;
+    --c-accent: #b87a1d;
+    --c-title-bg: #eae5dc;
+    --c-status-bg: #e5e0d6;
+    --c-border: #d5cebf;
+    --c-raised: #ded8cb;
+    --c-keycap: #cfc7b7;
+    --c-selection-bg: #e2d9c6;
+    --diff-file-bg: #e9e5dc;
+    --diff-context-bg: #f5f2eb;
+    --diff-context-fg: #45403a;
+    --diff-added-bg: #e2f2e5;
+    --diff-added-fg: #1d5f2a;
+    --diff-added-word-bg: #c1e4c7;
+    --diff-removed-bg: #f8e4e2;
+    --diff-removed-fg: #942b20;
+    --diff-removed-word-bg: #f0c3bf;
+    --diff-hunk-bg: #e7edf5;
+    --diff-hunk-fg: #3b5a7a;
+    --diff-gutter-fg: #9e978d;
+    --diff-rule: #d5cebf;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html, body {
+    width: 100%;
+    min-height: 100vh;
+    background: #0d0b0a;
+    color: var(--c-fg);
+    font-family: var(--font-sans);
+    font-size: 13px;
+    line-height: 1.4;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
