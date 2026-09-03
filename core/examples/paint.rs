@@ -8,12 +8,17 @@
 //!
 //!   cargo run -q -p gitten-core --example paint --release [ROWS] [PATH-FILTER]
 //!
+//! `--json` (or `GITTEN_FORMAT=json`) prints one object to stdout instead of
+//! the ANSI frame — the schema is `gitten.paint/1`, documented in
+//! `docs/agent-json.md`.
+//!
 //! `THEME=name` paints it in another registered palette — `dark`, `light`,
 //! `slate`, or one `gitten.toml` defined. `WRAP_COLS=n` sets where a long line
 //! breaks, and `WRAP_COLS=0` turns wrapping off. That is the same [`Wrap`] the
 //! window uses, reached the same way: a break point is a property of text, and
 //! this is the check that nothing about the seam is shaped like GPUI. What a
 //! terminal supplies is the column count — the one thing `core` cannot know.
+use gitten_app::env;
 use gitten_core::host::Host;
 use gitten_core::markdown::{lay_out, Block, Layout};
 use gitten_core::prepared::prepare;
@@ -102,12 +107,84 @@ fn furniture(block: Block, p: &MarkdownPalette, first: bool) -> String {
     }
 }
 
+fn jstr(out: &mut String, s: &str) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+fn key(out: &mut String, first: &mut bool, k: &str) {
+    if !*first {
+        out.push(',');
+    }
+    *first = false;
+    jstr(out, k);
+    out.push(':');
+}
+
+fn sfield(out: &mut String, first: &mut bool, k: &str, v: &str) {
+    key(out, first, k);
+    jstr(out, v);
+}
+
+fn nfield(out: &mut String, first: &mut bool, k: &str, v: impl std::fmt::Display) {
+    key(out, first, k);
+    out.push_str(&v.to_string());
+}
+
+fn fail(json: bool, code: &str, error: &str, hint: &str) -> ! {
+    if json {
+        let mut out = String::from("{");
+        let mut first = true;
+        for (k, v) in [("error", error), ("code", code), ("hint", hint)] {
+            if !first {
+                out.push(',');
+            }
+            first = false;
+            jstr(&mut out, k);
+            out.push(':');
+            jstr(&mut out, v);
+        }
+        out.push('}');
+        eprintln!("{out}");
+        std::process::exit(1);
+    }
+    panic!("{error}");
+}
+
+fn read_fixture(path: &str, json: bool) -> String {
+    match std::fs::read(path) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(e) => fail(
+            json,
+            "io",
+            &format!("{path}: {e}"),
+            "run from the repository root so fixtures/ resolves",
+        ),
+    }
+}
+
 fn main() {
-    let mut args = std::env::args().skip(1);
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    let json = env::wants_json(&raw);
+    let args = env::strip_json_arg(&raw);
+    let mut args = args.into_iter();
     let budget: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(60);
     let filter = args.next().unwrap_or_default();
 
-    let raw = String::from_utf8_lossy(&std::fs::read("fixtures/big.diff").unwrap()).into_owned();
+    let raw = read_fixture("fixtures/big.diff", json);
 
     // Exactly what the shell builds, and exactly the same call: the host, then
     // one prepare pass. Nothing about the assembly is re-implemented here.
@@ -115,7 +192,7 @@ fn main() {
     // `THEME=light`, off the same registry the window's picker lists. A palette
     // is the one thing in here whose only real test is looking at it, and a
     // frame on stdout interrupts nobody.
-    if let Ok(name) = std::env::var("THEME") {
+    if let Some(name) = env::theme() {
         if !host.select_theme(&name) {
             eprintln!(
                 "paint: no theme {name:?}; registered: {}",
@@ -123,6 +200,7 @@ fn main() {
             );
         }
     }
+    let theme_name = host.theme.name.clone();
     let theme = &host.theme;
     let mut p = prepare(&parse_unified_diff(&raw), &host.syntax, 2000);
 
@@ -150,10 +228,7 @@ fn main() {
     }
     // Where every line breaks, from the host's own registry. The sign column and
     // one space are all this draws in front of the text, so that is the chrome.
-    let cols: usize = std::env::var("WRAP_COLS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(100);
+    let cols: usize = env::wrap_cols(100);
     let wrapped: Vec<Wrapped> = p
         .files
         .iter()
@@ -167,6 +242,70 @@ fn main() {
             )
         })
         .collect();
+
+    if json {
+        // The same walk the frame below does — budget, filter, one line at a
+        // time — counting rows instead of printing them. A rule or a blank
+        // draws one row however many the wrap table gives it, exactly as the
+        // frame does.
+        let mut left = budget;
+        let mut rows_printed = 0usize;
+        let mut out = String::from("{");
+        let mut first = true;
+        sfield(&mut out, &mut first, "schema", "gitten.paint/1");
+        sfield(&mut out, &mut first, "tool", "paint");
+        nfield(&mut out, &mut first, "version", 1);
+        sfield(&mut out, &mut first, "theme", &theme_name);
+        nfield(&mut out, &mut first, "wrapCols", cols);
+        nfield(&mut out, &mut first, "budget", budget);
+        sfield(&mut out, &mut first, "filter", &filter);
+        key(&mut out, &mut first, "files");
+        out.push('[');
+        let mut ffirst = true;
+        for ((f, fb), fw) in p.files.iter().zip(&blocks).zip(&wrapped) {
+            let lines: usize = f.hunks.iter().map(|h| h.lines.len()).sum();
+            if !ffirst {
+                out.push(',');
+            }
+            ffirst = false;
+            out.push('{');
+            let mut ifirst = true;
+            sfield(&mut out, &mut ifirst, "path", &f.path);
+            nfield(&mut out, &mut ifirst, "adds", f.adds);
+            nfield(&mut out, &mut ifirst, "dels", f.dels);
+            nfield(&mut out, &mut ifirst, "lines", lines);
+            out.push('}');
+            if left == 0 {
+                continue;
+            }
+            if !filter.is_empty() && !f.path.contains(&filter) {
+                continue;
+            }
+            let mut line_no = 0usize;
+            'hunks: for (h, hb) in f.hunks.iter().zip(fb) {
+                if left == 0 {
+                    break 'hunks;
+                }
+                for (i, _) in h.lines.iter().enumerate() {
+                    if left == 0 {
+                        break 'hunks;
+                    }
+                    left -= 1;
+                    let at = line_no + i;
+                    rows_printed += match hb.get(i).copied() {
+                        Some(Block::Rule | Block::Blank) => 1,
+                        _ => fw.rows(at),
+                    };
+                }
+                line_no += h.lines.len();
+            }
+        }
+        out.push(']');
+        nfield(&mut out, &mut first, "rowsPrinted", rows_printed);
+        out.push('}');
+        println!("{out}");
+        return;
+    }
 
     let mut left = budget;
 

@@ -55,6 +55,7 @@ pub mod acquire;
 pub mod act;
 pub mod cli;
 pub mod config;
+pub mod env;
 pub mod jobs;
 pub mod verbs;
 

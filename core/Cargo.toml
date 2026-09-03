@@ -5,3 +5,9 @@ edition = "2021"
 
 # No dependencies, on purpose. Nothing in here may know a UI exists.
 [dependencies]
+
+# Examples only: the headless bench tools read their COLS/ROWS/--json knobs
+# from the same typed environment the clients use. Never used by the library
+# itself, so `core` still builds and tests with nothing but std.
+[dev-dependencies]
+gitten-app = { path = "../app" }

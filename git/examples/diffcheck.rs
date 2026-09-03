@@ -2,6 +2,12 @@
 //!
 //!     cargo run -q -p gitten-git --example diffcheck --release [REPO] [REVSPEC]
 //!
+//! `--json` (or `GITTEN_FORMAT=json`) prints one object to stdout instead of
+//! the tables — the schema is `gitten.diffcheck/1`, documented in
+//! `docs/agent-json.md`. `WORST=1` keeps its meaning in both modes: the files
+//! each algorithm did worst on, printed as lines for humans and carried as
+//! `worst` arrays for machines.
+//!
 //! `core`'s tests prove an edit script applies and that Myers is minimal, on
 //! inputs small enough to check by hand. This is the other half: real files,
 //! real encodings, real renames, against the tool everybody compares to.
@@ -38,16 +44,131 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+fn jstr(out: &mut String, s: &str) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// Whether this invocation wants machine-readable output: `--json` anywhere
+/// in the arguments, or `GITTEN_FORMAT=json` in the environment.
+fn wants_json(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--json")
+        || std::env::var("GITTEN_FORMAT").is_ok_and(|v| v.trim().eq_ignore_ascii_case("json"))
+}
+
+/// Changed lines in a parsed diff: every added and removed line, no context.
+fn changed_lines(f: &gitten_core::FileDiff) -> usize {
+    f.hunks
+        .iter()
+        .flat_map(|h| &h.lines)
+        .filter(|l| l.kind != LineKind::Context)
+        .count()
+}
+
+/// The files one algorithm did worst on relative to git, worst first, at most
+/// six: `(signed delta, path, ours count, git count)`. The table both modes
+/// report from — human as lines, JSON as objects.
+fn worst_rows(
+    differs: &Differs,
+    pairs: &[gitten_git::Pair],
+    theirs: &[gitten_core::FileDiff],
+) -> Vec<(isize, String, usize, usize)> {
+    let mut rows: Vec<(isize, String, usize, usize)> = Vec::new();
+    for p in pairs.iter().filter(|p| !p.binary) {
+        let ours = changed_lines(&differs.file_using(
+            &Overrides::default(),
+            &p.path,
+            &p.old,
+            &p.new,
+            None,
+        ));
+        let theirs = theirs
+            .iter()
+            .find(|f| f.path == p.path || Some(f.path.as_str()) == p.old_path.as_deref())
+            .map(changed_lines)
+            .unwrap_or(0);
+        if ours != theirs {
+            rows.push((
+                ours as isize - theirs as isize,
+                p.path.clone(),
+                ours,
+                theirs,
+            ));
+        }
+    }
+    rows.sort_by_key(|r| -r.0.abs());
+    rows.truncate(6);
+    rows
+}
+
+/// One algorithm's whole comparison, for the JSON object.
+struct Mode {
+    name: &'static str,
+    flags: String,
+    adds: usize,
+    dels: usize,
+    hunks: usize,
+    ours_ms: f64,
+    g_adds: usize,
+    g_dels: usize,
+    g_hunks: usize,
+    g_ms: f64,
+    drift: isize,
+    verdict: String,
+    hunk_note: String,
+    mismatches: u32,
+    files: Vec<(String, usize, usize, bool)>,
+    worst: Vec<(isize, String, usize, usize)>,
+    /// Whether `WORST` was set: the `worst` array is then always present,
+    /// empty when every file agreed, so a machine can tell "no drift" apart
+    /// from "not asked".
+    worst_on: bool,
+}
+
 fn main() {
-    let mut args = std::env::args().skip(1);
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    let json = wants_json(&raw);
+    let args: Vec<String> = raw.into_iter().filter(|a| a != "--json").collect();
+    let mut args = args.into_iter();
     let repo = PathBuf::from(args.next().unwrap_or_else(|| ".".into()));
     let revspec = args.next().unwrap_or_default();
+    let show_worst = std::env::var_os("WORST").is_some();
 
     let t = Instant::now();
     let pairs = match gitten_git::open(&repo).pairs(&revspec) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("{e}");
+            if json {
+                let mut out = String::from("{");
+                jstr(&mut out, "error");
+                out.push(':');
+                jstr(&mut out, &e.to_string());
+                out.push(',');
+                jstr(&mut out, "code");
+                out.push(':');
+                jstr(&mut out, "acquire");
+                out.push(',');
+                jstr(&mut out, "hint");
+                out.push(':');
+                jstr(&mut out, "check the repository path and the revspec");
+                out.push('}');
+                eprintln!("{out}");
+            } else {
+                eprintln!("{e}");
+            }
             std::process::exit(1);
         }
     };
@@ -55,23 +176,27 @@ fn main() {
     let (old_lines, new_lines): (usize, usize) = pairs
         .iter()
         .fold((0, 0), |(o, n), p| (o + p.old.len(), n + p.new.len()));
+    let binary = pairs.iter().filter(|p| p.binary).count();
 
-    println!(
-        "{} {}\n  {} files  {} old lines  {} new lines  acquire {:.1?}  ({} binary)",
-        repo.display(),
-        if revspec.is_empty() {
-            "(working tree)"
-        } else {
-            &revspec
-        },
-        pairs.len(),
-        old_lines,
-        new_lines,
-        acquire,
-        pairs.iter().filter(|p| p.binary).count(),
-    );
+    if !json {
+        println!(
+            "{} {}\n  {} files  {} old lines  {} new lines  acquire {:.1?}  ({} binary)",
+            repo.display(),
+            if revspec.is_empty() {
+                "(working tree)"
+            } else {
+                &revspec
+            },
+            pairs.len(),
+            old_lines,
+            new_lines,
+            acquire,
+            binary,
+        );
+    }
 
     let mut mismatches = 0;
+    let mut modes: Vec<Mode> = Vec::new();
     // The whitespace rows keep `--histogram` on git's side as well: a whitespace
     // relation is a property of how lines are compared, not of the algorithm, so
     // comparing ours-on-histogram against git's-on-myers measures the wrong
@@ -114,38 +239,54 @@ fn main() {
 
         let t = Instant::now();
         let (mut adds, mut dels, mut hunks) = (0usize, 0usize, 0usize);
-        let mut ours_ranges: Vec<(String, Vec<String>)> = Vec::new();
+        let mut ours_files: Vec<(String, usize, Vec<String>)> = Vec::new();
         for p in pairs.iter().filter(|p| !p.binary) {
             // `None` for the OIDs: this checker measures the differ, and each
             // mode runs on a registry built fresh above — a cache could only
             // make its own timings meaningless.
             let f = differs.file_using(&Overrides::default(), &p.path, &p.old, &p.new, None);
-            ours_ranges.push((p.path.clone(), ranges(&f)));
-            hunks += f.hunks.len();
+            let mut count = 0usize;
             for l in f.hunks.iter().flat_map(|h| &h.lines) {
                 match l.kind {
-                    LineKind::Added => adds += 1,
-                    LineKind::Removed => dels += 1,
+                    LineKind::Added => {
+                        adds += 1;
+                        count += 1;
+                    }
+                    LineKind::Removed => {
+                        dels += 1;
+                        count += 1;
+                    }
                     LineKind::Context => {}
                 }
             }
+            ours_files.push((p.path.clone(), count, ranges(&f)));
+            hunks += f.hunks.len();
         }
         let ours = t.elapsed();
 
         let (g_adds, g_dels, g_hunks, g_time, theirs) = git_diff(&repo, &revspec, flags);
-        report_worst(&repo, &revspec, flags, &differs, &pairs);
+        if !json {
+            report_worst(&repo, &revspec, flags, &differs, &pairs);
+        }
 
         // Where the hunks are, not just how many. `ranges` drops the function
         // suffix and keeps `@@ -a,b +c,d`.
         let mut misplaced = 0usize;
-        for (path, ours) in &ours_ranges {
+        let mut file_rows: Vec<(String, usize, usize, bool)> = Vec::new();
+        for (path, count, ours) in &ours_files {
             let g = theirs
                 .iter()
                 .find(|f| &f.path == path)
                 .map(ranges)
                 .unwrap_or_default();
+            let g_count = theirs
+                .iter()
+                .find(|f| &f.path == path)
+                .map(changed_lines)
+                .unwrap_or(0);
             misplaced += ours.iter().zip(g.iter()).filter(|(a, b)| a != b).count()
                 + ours.len().abs_diff(g.len());
+            file_rows.push((path.clone(), *count, g_count, *ours == g));
         }
         // Myers has one correct length — but only within its step budget.
         // It is O(N*D) in the number of differing lines, and `MAX_STEPS` in
@@ -177,6 +318,7 @@ fn main() {
         // is held to exact positions only when drift is 0; histogram, the
         // shipped default, runs at drift 0 against git in every repository
         // checked here, so this leaves it exactly as strict as before.
+        let mut mode_mismatches = 0u32;
         let hunk_note = match (misplaced, name) {
             (0, _) => String::new(),
             (n, "myers") => format!(" · {n}/{hunks} placed differently (both minimal)"),
@@ -185,6 +327,7 @@ fn main() {
             }
             (n, _) => {
                 mismatches += 1;
+                mode_mismatches += 1;
                 format!(" · {n}/{hunks} hunks IN THE WRONG PLACE")
             }
         };
@@ -199,13 +342,49 @@ fn main() {
             )
         } else {
             mismatches += 1;
+            mode_mismatches += 1;
             format!("{drift:+} of {} — TOO FAR", g_adds + g_dels)
         };
-        println!(
-            "  {name:<10} +{adds:<7} -{dels:<7} {hunks:>6}h {ours:>9.1?}  │  git {:<28} \
-             +{g_adds:<7} -{g_dels:<7} {g_hunks:>6}h {g_time:>9.1?}  {verdict}{hunk_note}",
-            flags.join(" "),
+        if !json {
+            println!(
+                "  {name:<10} +{adds:<7} -{dels:<7} {hunks:>6}h {ours:>9.1?}  │  git {:<28} \
+                 +{g_adds:<7} -{g_dels:<7} {g_hunks:>6}h {g_time:>9.1?}  {verdict}{hunk_note}",
+                flags.join(" "),
+            );
+        }
+        modes.push(Mode {
+            name,
+            flags: flags.join(" "),
+            adds,
+            dels,
+            hunks,
+            ours_ms: ours.as_secs_f64() * 1000.0,
+            g_adds,
+            g_dels,
+            g_hunks,
+            g_ms: g_time.as_secs_f64() * 1000.0,
+            drift,
+            verdict,
+            hunk_note,
+            mismatches: mode_mismatches,
+            files: file_rows,
+            worst: if json && show_worst {
+                worst_rows(&differs, &pairs, &theirs)
+            } else {
+                Vec::new()
+            },
+            worst_on: json && show_worst,
+        });
+    }
+
+    if json {
+        print_json(
+            &repo, &revspec, acquire, &pairs, old_lines, new_lines, binary, &modes, mismatches,
         );
+        if mismatches > 0 {
+            std::process::exit(1);
+        }
+        return;
     }
 
     println!(
@@ -220,6 +399,128 @@ fn main() {
     if mismatches > 0 {
         std::process::exit(1);
     }
+}
+
+fn key(out: &mut String, first: &mut bool, k: &str) {
+    if !*first {
+        out.push(',');
+    }
+    *first = false;
+    jstr(out, k);
+    out.push(':');
+}
+
+fn sfield(out: &mut String, first: &mut bool, k: &str, v: &str) {
+    key(out, first, k);
+    jstr(out, v);
+}
+
+fn nfield(out: &mut String, first: &mut bool, k: &str, v: impl std::fmt::Display) {
+    key(out, first, k);
+    out.push_str(&v.to_string());
+}
+
+/// The one JSON object: acquisition, every mode with its per-file rows, and
+/// the summary. Times are milliseconds; counts are counts.
+#[allow(clippy::too_many_arguments)]
+fn print_json(
+    repo: &Path,
+    revspec: &str,
+    acquire: Duration,
+    pairs: &[gitten_git::Pair],
+    old_lines: usize,
+    new_lines: usize,
+    binary: usize,
+    modes: &[Mode],
+    mismatches: u32,
+) {
+    let compared = pairs.iter().filter(|p| !p.binary).count();
+    let mut out = String::from("{");
+    let mut first = true;
+    sfield(&mut out, &mut first, "schema", "gitten.diffcheck/1");
+    sfield(&mut out, &mut first, "repo", &repo.display().to_string());
+    sfield(&mut out, &mut first, "revspec", revspec);
+    nfield(
+        &mut out,
+        &mut first,
+        "acquireMs",
+        format!("{:.3}", acquire.as_secs_f64() * 1000.0),
+    );
+    nfield(&mut out, &mut first, "files", pairs.len());
+    nfield(&mut out, &mut first, "oldLines", old_lines);
+    nfield(&mut out, &mut first, "newLines", new_lines);
+    nfield(&mut out, &mut first, "binary", binary);
+    key(&mut out, &mut first, "modes");
+    out.push('[');
+    let mut mfirst = true;
+    for m in modes {
+        if !mfirst {
+            out.push(',');
+        }
+        mfirst = false;
+        out.push('{');
+        let mut efirst = true;
+        sfield(&mut out, &mut efirst, "name", m.name);
+        sfield(&mut out, &mut efirst, "flags", &m.flags);
+        nfield(&mut out, &mut efirst, "oursAdds", m.adds);
+        nfield(&mut out, &mut efirst, "oursDels", m.dels);
+        nfield(&mut out, &mut efirst, "oursHunks", m.hunks);
+        nfield(&mut out, &mut efirst, "oursMs", format!("{:.3}", m.ours_ms));
+        nfield(&mut out, &mut efirst, "theirsAdds", m.g_adds);
+        nfield(&mut out, &mut efirst, "theirsDels", m.g_dels);
+        nfield(&mut out, &mut efirst, "theirsHunks", m.g_hunks);
+        nfield(&mut out, &mut efirst, "theirsMs", format!("{:.3}", m.g_ms));
+        nfield(&mut out, &mut efirst, "drift", m.drift);
+        sfield(&mut out, &mut efirst, "verdict", &m.verdict);
+        sfield(&mut out, &mut efirst, "hunkNote", &m.hunk_note);
+        nfield(&mut out, &mut efirst, "mismatches", m.mismatches);
+        key(&mut out, &mut efirst, "files");
+        out.push('[');
+        let mut ffirst = true;
+        for (path, ours, theirs, matched) in &m.files {
+            if !ffirst {
+                out.push(',');
+            }
+            ffirst = false;
+            out.push('{');
+            let mut ifirst = true;
+            sfield(&mut out, &mut ifirst, "path", path);
+            nfield(&mut out, &mut ifirst, "ours", ours);
+            nfield(&mut out, &mut ifirst, "theirs", theirs);
+            key(&mut out, &mut ifirst, "hunkPositionsMatch");
+            out.push_str(if *matched { "true" } else { "false" });
+            out.push('}');
+        }
+        out.push(']');
+        if m.worst_on {
+            key(&mut out, &mut efirst, "worst");
+            out.push('[');
+            let mut wfirst = true;
+            for (delta, path, ours, theirs) in &m.worst {
+                if !wfirst {
+                    out.push(',');
+                }
+                wfirst = false;
+                out.push('{');
+                let mut jfirst = true;
+                sfield(&mut out, &mut jfirst, "path", path);
+                nfield(&mut out, &mut jfirst, "delta", delta);
+                nfield(&mut out, &mut jfirst, "ours", ours);
+                nfield(&mut out, &mut jfirst, "theirs", theirs);
+                out.push('}');
+            }
+            out.push(']');
+        }
+        out.push('}');
+    }
+    out.push(']');
+    key(&mut out, &mut first, "summary");
+    out.push('{');
+    let mut sfirst = true;
+    nfield(&mut out, &mut sfirst, "files", compared);
+    nfield(&mut out, &mut sfirst, "mismatches", mismatches);
+    out.push_str("}}");
+    println!("{out}");
 }
 
 /// git's own answer, and what it cost.
@@ -311,32 +612,7 @@ fn report_worst(
     args.extend_from_slice(flags);
     let out = Command::new("git").args(&args).output().expect("git");
     let theirs = parse_unified_diff(&String::from_utf8_lossy(&out.stdout));
-    let count = |f: &gitten_core::FileDiff| -> usize {
-        f.hunks
-            .iter()
-            .flat_map(|h| &h.lines)
-            .filter(|l| l.kind != LineKind::Context)
-            .count()
-    };
-    let mut rows: Vec<(isize, String, usize, usize)> = Vec::new();
-    for p in pairs.iter().filter(|p| !p.binary) {
-        let ours = count(&differs.file_using(&Overrides::default(), &p.path, &p.old, &p.new, None));
-        let theirs = theirs
-            .iter()
-            .find(|f| f.path == p.path || Some(f.path.as_str()) == p.old_path.as_deref())
-            .map(count)
-            .unwrap_or(0);
-        if ours != theirs {
-            rows.push((
-                ours as isize - theirs as isize,
-                p.path.clone(),
-                ours,
-                theirs,
-            ));
-        }
-    }
-    rows.sort_by_key(|r| -r.0.abs());
-    for (delta, path, ours, theirs) in rows.iter().take(6) {
+    for (delta, path, ours, theirs) in worst_rows(differs, pairs, &theirs) {
         println!("      {delta:+6}  {path}  (ours {ours}, git {theirs})");
     }
 }
