@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+# export — compile production binaries (release mode, no stats readout)
+# and install them into your PATH.
+#
+# Usage:
+#   ./export [--bin-dir DIR] [--app-dir DIR]
+#
+# Installed commands:
+#   gitten       dispatcher: 'gitten tui', 'gitten gui', or 'gitten <command>'
+#   gitten-tui   direct launcher for the terminal client
+#   gitten-gui   direct launcher for the desktop GPUI client
+#
+set -euo pipefail
+cd "$(dirname "$0")"
+
+dim() { printf '\033[2m%s\033[0m\n' "$1" >&2; }
+bold() { printf '\033[1m%s\033[0m\n' "$1" >&2; }
+green() { printf '\033[32m%s\033[0m\n' "$1" >&2; }
+red() { printf '\033[31m%s\033[0m\n' "$1" >&2; }
+
+BIN_DIR=""
+APP_DIR=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --bin-dir)
+      BIN_DIR="$2"
+      shift 2
+      ;;
+    --app-dir)
+      APP_DIR="$2"
+      shift 2
+      ;;
+    -h|--help)
+      cat <<'EOF'
+Usage: ./export [options]
+
+Compiles production binaries in release mode (without debug stats overlay)
+and installs gitten, gitten-tui, and gitten-gui into your PATH.
+
+Options:
+  --bin-dir DIR   Directory for command launchers (default: ~/.local/bin or ~/.cargo/bin or ~/bin)
+  --app-dir DIR   Directory for macOS gitten.app (default: /Applications or ~/Applications)
+  -h, --help      Show this help message
+EOF
+      exit 0
+      ;;
+    *)
+      red "Unknown option: $1"
+      exit 1
+      ;;
+  esac
+done
+
+# Resolve BIN_DIR: pick an existing writable directory in PATH, or default to ~/.local/bin
+if [ -z "$BIN_DIR" ]; then
+  for candidate in "$HOME/.local/bin" "$HOME/.cargo/bin" "$HOME/bin" "/usr/local/bin"; do
+    case ":$PATH:" in
+      *:"$candidate":*)
+        if [ -d "$candidate" ] && [ -w "$candidate" ]; then
+          BIN_DIR="$candidate"
+          break
+        fi
+        ;;
+    esac
+  done
+  if [ -z "$BIN_DIR" ]; then
+    BIN_DIR="$HOME/.local/bin"
+  fi
+fi
+
+# Resolve APP_DIR for macOS .app bundle
+if [ -z "$APP_DIR" ]; then
+  if [ -w "/Applications" ]; then
+    APP_DIR="/Applications"
+  else
+    APP_DIR="$HOME/Applications"
+  fi
+fi
+
+mkdir -p "$BIN_DIR"
+mkdir -p "$APP_DIR"
+
+bold "── building production binaries (release mode, no stats) ──"
+
+# Production build: stats readout explicitly off
+export GITTEN_STATS=0
+
+# 1. Build cargo release binaries
+dim "Building gitten-shell and gitten-tui..."
+cargo build --release -p gitten-shell -p gitten-tui
+
+# 2. Build and install macOS .app bundle if on macOS
+IS_DARWIN=0
+if [ "$(uname -s)" = "Darwin" ]; then
+  IS_DARWIN=1
+  dim "Creating macOS application bundle..."
+  APP_BUNDLE="target/gitten.app"
+  rm -rf "$APP_BUNDLE" "target/gitten.iconset"
+  mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources" "target/gitten.iconset"
+
+  # Render icon at each required size
+  if command -v qlmanage >/dev/null 2>&1 && command -v iconutil >/dev/null 2>&1; then
+    for pair in "16 16x16" "32 16x16@2x" "32 32x32" "64 32x32@2x" \
+                "128 128x128" "256 128x128@2x" "256 256x256" "512 256x256@2x" \
+                "512 512x512" "1024 512x512@2x"; do
+      set -- $pair
+      rm -rf target/.ql && mkdir -p target/.ql
+      qlmanage -t -s "$1" -o target/.ql shell/assets/icon.svg >/dev/null 2>&1 || true
+      if [ -f target/.ql/icon.svg.png ]; then
+        cp target/.ql/icon.svg.png "target/gitten.iconset/icon_$2.png"
+      fi
+    done
+    rm -rf target/.ql
+    iconutil -c icns target/gitten.iconset -o "$APP_BUNDLE/Contents/Resources/gitten.icns" 2>/dev/null || true
+    rm -rf target/gitten.iconset
+  fi
+
+  cp "target/release/gitten-shell" "$APP_BUNDLE/Contents/MacOS/gitten"
+
+  cat > "$APP_BUNDLE/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>gitten</string>
+  <key>CFBundleDisplayName</key><string>gitten</string>
+  <key>CFBundleExecutable</key><string>gitten</string>
+  <key>CFBundleIdentifier</key><string>dev.gitten.desktop</string>
+  <key>CFBundleIconFile</key><string>gitten</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>0.0.0</string>
+  <key>CFBundleVersion</key><string>0</string>
+  <key>LSMinimumSystemVersion</key><string>11.0</string>
+  <key>NSHighResolutionCapable</key><true/>
+</dict>
+</plist>
+PLIST
+
+  codesign --force --deep --sign - "$APP_BUNDLE" >/dev/null 2>&1 || true
+
+  dim "Installing gitten.app to $APP_DIR/gitten.app..."
+  rm -rf "$APP_DIR/gitten.app"
+  cp -R "$APP_BUNDLE" "$APP_DIR/gitten.app"
+fi
+
+# 3. Install gitten-tui binary
+dim "Installing gitten-tui binary to $BIN_DIR/gitten-tui..."
+install -m 755 "target/release/gitten-tui" "$BIN_DIR/gitten-tui"
+
+# Also install standalone gitten-shell binary
+dim "Installing gitten-shell binary to $BIN_DIR/gitten-shell..."
+install -m 755 "target/release/gitten-shell" "$BIN_DIR/gitten-shell"
+
+# 4. Install gitten-gui launcher script
+dim "Installing gitten-gui launcher to $BIN_DIR/gitten-gui..."
+cat > "$BIN_DIR/gitten-gui" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Production default: no stats readout overlay
+export GITTEN_STATS="${GITTEN_STATS:-0}"
+
+# Find the best binary to run:
+# 1. Custom binary override
+if [ -n "${GITTEN_GUI_BIN:-}" ] && [ -x "$GITTEN_GUI_BIN" ]; then
+  exec "$GITTEN_GUI_BIN" "$@"
+fi
+
+# 2. Bundled macOS app (gives Dock icon and proper menu name)
+for app in "/Applications/gitten.app" "$HOME/Applications/gitten.app" "$HOME/.local/share/gitten/gitten.app"; do
+  if [ -x "$app/Contents/MacOS/gitten" ]; then
+    exec "$app/Contents/MacOS/gitten" "$@"
+  fi
+done
+
+# 3. Fallback to standalone gitten-shell
+if command -v gitten-shell >/dev/null 2>&1; then
+  exec "$(command -v gitten-shell)" "$@"
+fi
+
+# 4. Sibling gitten-shell in same directory
+DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -x "$DIR/gitten-shell" ]; then
+  exec "$DIR/gitten-shell" "$@"
+fi
+
+echo "gitten-gui: could not find gitten.app or gitten-shell. Please run ./export." >&2
+exit 1
+EOF
+chmod 755 "$BIN_DIR/gitten-gui"
+
+# 5. Install gitten unified launcher script
+dim "Installing gitten dispatcher to $BIN_DIR/gitten..."
+cat > "$BIN_DIR/gitten" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Production default: no stats readout overlay
+export GITTEN_STATS="${GITTEN_STATS:-0}"
+
+usage() {
+  cat <<'HELP'
+gitten — a desktop and terminal git client
+
+Usage:
+  gitten [gui] [commits|diff] [args...]   desktop GPUI window (default)
+  gitten tui   [commits|diff] [args...]   terminal interface
+
+Direct commands:
+  gitten-gui   [commits|diff] [args...]   desktop client
+  gitten-tui   [commits|diff] [args...]   terminal client
+
+Commands & Views:
+  commits [REPO] [LIMIT]      history graph      (default: . , 5000)
+  diff    [REPO] [REVSPEC]    a diff             (default: . , working tree)
+  diff    --patch FILE        review a patch     (--patch - or diff - = stdin)
+  config                      print theme and font as TOML
+
+Options:
+  --help, -h                  show this help message
+
+Run 'gitten gui --help' or 'gitten tui --help' for client-specific options.
+HELP
+  exit "${1:-0}"
+}
+
+CLIENT=""
+case "${1:-}" in
+  tui|terminal)
+    CLIENT="tui"
+    shift
+    ;;
+  gui|desktop|shell)
+    CLIENT="gui"
+    shift
+    ;;
+  -h|--help|help)
+    usage 0
+    ;;
+  *)
+    # Default client: GUI unless headless/SSH without display
+    if [ -n "${GITTEN_DEFAULT_CLIENT:-}" ]; then
+      CLIENT="$GITTEN_DEFAULT_CLIENT"
+    elif [ -n "${SSH_TTY:-}" ] && [ -z "${DISPLAY:-}" ]; then
+      CLIENT="tui"
+    else
+      CLIENT="gui"
+    fi
+    ;;
+esac
+
+case "$CLIENT" in
+  tui)
+    exec gitten-tui "$@"
+    ;;
+  gui)
+    exec gitten-gui "$@"
+    ;;
+  *)
+    echo "gitten: unknown client '$CLIENT'" >&2
+    exit 1
+    ;;
+esac
+EOF
+chmod 755 "$BIN_DIR/gitten"
+
+green "── successfully exported gitten ──"
+echo
+echo "Installed commands in $BIN_DIR:"
+echo "  • gitten      -> dispatcher ('gitten tui' or 'gitten gui')"
+echo "  • gitten-tui  -> terminal client"
+echo "  • gitten-gui  -> desktop client"
+if [ "$IS_DARWIN" -eq 1 ]; then
+  echo "  • $APP_DIR/gitten.app"
+fi
+echo
+case ":$PATH:" in
+  *:"$BIN_DIR":*)
+    echo "Ready to use in any repository: $BIN_DIR is in your PATH."
+    ;;
+  *)
+    echo "Notice: $BIN_DIR is not currently in your PATH."
+    echo "Add it with: export PATH=\"$BIN_DIR:\$PATH\""
+    ;;
+esac
