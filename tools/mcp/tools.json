@@ -1,0 +1,83 @@
+{
+  "tools": [
+    {
+      "name": "inspect.rows",
+      "description": "A window of rows from a gitten view (diff or commits). Prefers a machine source (future `inspect --json`, then the web loopback API) and falls back to parsing one headless terminal frame.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "view": { "type": "string", "enum": ["diff", "commits"], "default": "diff" },
+          "repo": { "type": "string", "default": "." },
+          "rev": { "type": "string", "description": "Revspec for diff, or commit limit for commits." },
+          "from": { "type": "integer", "default": 0 },
+          "count": { "type": "integer", "default": 50 },
+          "cols": { "type": "integer", "default": 120 },
+          "rows": { "type": "integer", "default": 40 },
+          "layout": { "type": "string" },
+          "wrap": { "type": "string" },
+          "theme": { "type": "string" },
+          "via": { "type": "string", "enum": ["auto", "web", "dump"], "default": "auto" }
+        }
+      }
+    },
+    {
+      "name": "inspect.meta",
+      "description": "Everything about a view that a scroll does not change: label, row counts, wrap state, theme names, load timings.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "view": { "type": "string", "enum": ["diff", "commits"], "default": "diff" },
+          "repo": { "type": "string", "default": "." },
+          "rev": { "type": "string", "description": "Revspec for diff, or commit limit for commits." },
+          "cols": { "type": "integer", "default": 120 },
+          "via": { "type": "string", "enum": ["auto", "web", "dump"], "default": "auto" }
+        }
+      }
+    },
+    {
+      "name": "inspect.keys",
+      "description": "The keymap: which keys run which commands. Machine source when one exists, otherwise the [keys] overrides from gitten.toml with an honest degraded flag.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "mode": { "type": "string", "description": "Restrict to one mode (e.g. diff).", "default": "" }
+        }
+      }
+    },
+    {
+      "name": "dispatch",
+      "description": "Resolve a keypress to a command name through core::command, the way every client does. Degraded until a machine dispatch endpoint lands.",
+      "inputSchema": {
+        "type": "object",
+        "required": ["key"],
+        "properties": {
+          "key": { "type": "string", "description": "Key spelling as it appears in gitten.toml, e.g. j, ctrl-d, G." },
+          "mode": { "type": "string", "default": "global" }
+        }
+      }
+    },
+    {
+      "name": "diffcheck",
+      "description": "Check core's differs against git's own answer on a real repository (changed-line counts and every hunk position).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "repo": { "type": "string", "default": "." },
+          "revspec": { "type": "string", "default": "HEAD~4..HEAD" }
+        }
+      }
+    },
+    {
+      "name": "bench",
+      "description": "Pipeline timings at fixture scale (full), or the cost of one headless frame (quick).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "suite": { "type": "string", "enum": ["full", "quick"], "default": "quick" },
+          "cols": { "type": "integer", "default": 120 },
+          "rows": { "type": "integer", "default": 40 }
+        }
+      }
+    }
+  ]
+}
