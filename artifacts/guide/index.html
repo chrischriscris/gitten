@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>gitten — Desktop Git Client Design Guide</title>
+<!-- Shell for the modular guide. Views mount via src/main.ts from src/views/*.html. -->
+</head>
+<body>
+
+<div class="guide-shell">
+<header class="guide-header">
+  <div class="guide-brand">
+    <div class="guide-logo">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <circle cx="6" cy="6" r="3"/>
+        <circle cx="6" cy="18" r="3"/>
+        <circle cx="18" cy="12" r="3"/>
+        <path d="M6 9v6M9 6h4a5 5 0 0 1 5 5v1"/>
+      </svg>
+      gitten
+    </div>
+    <span class="guide-badge">Desktop + Terminal Design Guide</span>
+  </div>
+
+  <nav class="guide-tabs">
+    <button class="guide-tab-btn active" onclick="switchGuideTab('mockup')">
+      <span>🖥️ Live UI Mockup</span>
+    </button>
+    <button class="guide-tab-btn" onclick="switchGuideTab('blueprint')">
+      <span>📐 Visual Blueprint</span>
+    </button>
+    <button class="guide-tab-btn" onclick="switchGuideTab('tokens')">
+      <span>🎨 Tokens &amp; Color System</span>
+    </button>
+    <button class="guide-tab-btn" onclick="switchGuideTab('keyboard')">
+      <span>⌨️ Keyboard Model</span>
+    </button>
+    <button class="guide-tab-btn" onclick="switchGuideTab('architecture')">
+      <span>🏗️ GPUI &amp; Core Architecture</span>
+    </button>
+  </nav>
+
+  <div class="guide-controls">
+    <select class="guide-select" id="keymap-selector" onchange="setKeymapMode(this.value)" title="Choose keyboard numbering scheme">
+      <option value="lazygit" selected>Keymap: Lazygit (1..5 + 0/↵ Diff)</option>
+      <option value="mockup">Keymap: Mockup (1..5 Direct)</option>
+    </select>
+    <button class="guide-btn" id="btn-annotations" onclick="toggleAnnotations()" title="Toggle visual dimension &amp; layout callouts">
+      Annotations: Off
+    </button>
+    <select class="guide-select" id="theme-selector" onchange="changeTheme(this.value)">
+      <option value="dark">Theme: Dark (Warm)</option>
+      <option value="slate">Theme: Slate (Cool)</option>
+      <option value="light">Theme: Light (Paper)</option>
+    </select>
+  </div>
+</header>
+
+<main class="guide-main">
+<div id="view-mockup" class="guide-view active"></div>
+
+<div id="view-blueprint" class="guide-view"></div>
+
+<div id="view-tokens" class="guide-view"></div>
+
+<div id="view-keyboard" class="guide-view"></div>
+
+<div id="view-architecture" class="guide-view"></div>
+</main>
+</div>
+
+<script type="module" src="/src/main.ts"></script>
+</body>
+</html>

@@ -1,0 +1,695 @@
+<!-- Split from artifacts/design-guide.html (lines 1540-2233) — edit here. -->
+  <!-- Outer canvas header -->
+  <div class="canvas-toolbar">
+    <div class="canvas-tools-left">
+      <span class="tool-icon" title="Back">◂</span>
+      <span class="tool-icon" title="Forward">▸</span>
+      <span class="tool-icon" title="Reload">↻</span>
+      <span class="tool-icon" title="Search">🔍</span>
+      <span class="canvas-title">Main view</span>
+    </div>
+    <div class="canvas-tools-right">
+      <span class="tool-icon" title="Run preview">▷</span>
+      <span class="tool-icon" title="Export">↓</span>
+      <span class="tool-icon" title="Grid layout">⊞</span>
+      <button class="btn-save-pill">Save</button>
+    </div>
+  </div>
+
+  <!-- The Mockup Window Wrapper -->
+  <div class="mockup-switcher">
+    <div class="client-toggle" role="tablist" aria-label="Client variant">
+      <button id="btn-client-desktop" class="active" onclick="setClient('desktop')">🖥️ Desktop</button>
+      <button id="btn-client-tui" onclick="setClient('tui')">▦ Terminal (TUI)</button>
+    </div>
+    <div class="mockup-caption" id="mockup-caption">GPUI window · 3 panes · mouse + keyboard</div>
+  </div>
+  <div class="window-wrapper" id="app-window-wrapper">
+    <div style="display: flex; align-items: flex-end;">
+      <div class="accent-tag" id="accent-tag" onclick="cycleAccent()" title="Click to cycle accent color">
+        <span class="dot"></span>
+        <span>accent ▾</span>
+      </div>
+      <div class="tui-tag" id="tui-tag">
+        <span class="dot"></span>
+        <span>terminal · cells, not pixels</span>
+      </div>
+      <div class="tui-toolbar" id="tui-toolbar">
+        <button class="tui-tbtn" id="tbtn-ascii" onclick="toggleTuiAscii()" title="Swap box-drawing graph + scrollbar for the --ascii alphabet">--ascii: off</button>
+        <button class="tui-tbtn" id="tbtn-narrow" onclick="toggleTuiNarrow()" title="Below 96 columns the layout shows only the focused pane">wide ≥96</button>
+        <button class="tui-tbtn" id="tbtn-help" onclick="toggleTuiHelp()" title="The ? panel is a pure function of the live keymap">? keys</button>
+      </div>
+    </div>
+
+    <!-- The Git Client App Window -->
+    <div class="app-window" id="app-window">
+
+      <!-- Blueprint Overlays (annotations) -->
+      <div class="blueprint-overlay">
+        <!-- Annotation Pins -->
+        <div class="annotation-tag tag-left" style="top: 20px; left: 160px;" title="Path breadcrumb with bold repository name">
+          Titlebar: 38px
+        </div>
+        <div class="annotation-tag tag-top" style="top: 55px; left: 75px;" title="Pane 1: Staged &amp; Unstaged files, Branches, Stash">
+          Col 1: 245px (Files)
+        </div>
+        <div class="annotation-tag tag-top" style="top: 55px; left: 420px;" title="Pane 4: Commit log + SVG graph lanes">
+          Col 2: 420px (Commits)
+        </div>
+        <div class="annotation-tag tag-top" style="top: 55px; left: 820px;" title="Pane 5: Diff viewer with word-level highlights">
+          Col 3: 1fr (Diff &amp; AI)
+        </div>
+        <div class="annotation-tag tag-left" style="top: 410px; right: 28px;" title="Editorial serif font with high legibility for AI reasoning">
+          AI Card: Serif 13.5px
+        </div>
+        <div class="annotation-tag tag-left" style="bottom: 12px; left: 100px;" title="Modal status bar with vim-like Normal mode">
+          Status Bar: 30px
+        </div>
+      </div>
+
+      <!-- Window Title Bar -->
+      <div class="app-titlebar">
+        <div class="titlebar-left">
+          <div class="traffic-lights">
+            <span class="traffic-dot dot-close"></span>
+            <span class="traffic-dot dot-min"></span>
+            <span class="traffic-dot dot-max"></span>
+          </div>
+
+          <div class="repo-path">
+            <span class="path-dir">~/src/</span>
+            <span class="path-name">plait</span>
+          </div>
+
+          <div class="branch-pill" onclick="focusPane(0)" title="[1] Status / Working tree branch">
+            <span class="pane-keycap" id="keycap-status" style="width: 14px; height: 14px; font-size: 9px; margin-right: 2px;">1</span>
+            <svg class="branch-icon" viewBox="0 0 16 16" fill="currentColor">
+              <path fill-rule="evenodd" d="M11.75 2.5a.75.75 0 100 1.5.75.75 0 000-1.5zm-2.25.75a2.25 2.25 0 113 2.122V6A2.5 2.5 0 0110 8.5H6a1 1 0 00-1 1v1.128a2.251 2.251 0 11-1.5 0V5.372a2.25 2.25 0 111.5 0v1.836A2.492 2.492 0 016 7h4a1 1 0 001-1v-.628A2.25 2.25 0 019.5 3.25zM4.25 12a.75.75 0 100 1.5.75.75 0 000-1.5zM3.5 3.25a.75.75 0 111.5 0 .75.75 0 01-1.5 0z"/>
+            </svg>
+            <span>main</span>
+            <span class="sync-stat">↑2 ↓0</span>
+          </div>
+        </div>
+
+        <div class="titlebar-right">
+          <div class="extensions-pill" onclick="openExtensionsModal()">
+            <span class="ext-dot"></span>
+            <span>4 extensions</span>
+          </div>
+
+          <div class="ask-btn" onclick="openAskModal()">
+            <span class="key-combo">⌘K</span>
+            <span class="ask-label">ask</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Main Three-Column Area -->
+      <div class="app-main">
+
+        <!-- Column 1: Files / Branches / Stash -->
+        <div class="pane" id="pane-1" onclick="focusPane(1)">
+          <!-- Files Header -->
+          <div class="pane-header">
+            <div class="pane-header-left">
+              <span class="pane-keycap" id="keycap-files">2</span>
+              <span class="pane-title-caps">Files</span>
+            </div>
+            <div class="pane-header-right">
+              <span>5</span>
+            </div>
+          </div>
+
+          <!-- Files Body -->
+          <div class="pane-files-body">
+            <!-- STAGED Section -->
+            <div class="section-label">Staged</div>
+            <div class="file-item" onclick="selectFile(this, 'commit.go')">
+              <span class="status-flag status-m-staged">M</span>
+              <span class="file-path"><span class="dir">internal/ai/</span>commit.go</span>
+            </div>
+            <div class="file-item" onclick="selectFile(this, 'pool.go')">
+              <span class="status-flag status-a-staged">A</span>
+              <span class="file-path"><span class="dir">internal/extension/</span>pool.go</span>
+            </div>
+
+            <!-- UNSTAGED Section -->
+            <div class="section-label" style="margin-top: 6px;">Unstaged</div>
+            <div class="file-item selected" onclick="selectFile(this, 'host.go')">
+              <span class="status-flag status-m-unstaged">M</span>
+              <span class="file-path"><span class="dir">internal/extension/</span>host.go</span>
+            </div>
+            <div class="file-item" onclick="selectFile(this, 'budget.go')">
+              <span class="status-flag status-m-unstaged">M</span>
+              <span class="file-path"><span class="dir">internal/extension/</span>budget.go</span>
+            </div>
+            <div class="file-item" onclick="selectFile(this, 'extensions.md')">
+              <span class="status-flag status-untracked">??</span>
+              <span class="file-path"><span class="dir">docs/</span>extensions.md</span>
+            </div>
+
+            <!-- BRANCHES Section -->
+            <div class="branches-section">
+              <div class="pane-header" style="height: 24px; background: transparent; border-top: 1px solid var(--c-border); padding: 0 10px;">
+                <div class="pane-header-left">
+                  <span class="pane-keycap" id="keycap-branches" style="width: 13px; height: 13px; font-size: 9px;">3</span>
+                  <span class="pane-title-caps" style="font-size: 10px;">Branches</span>
+                </div>
+              </div>
+              <div class="branch-item" onclick="focusPane(2)">
+                <div class="branch-name-box">
+                  <span class="branch-dot main"></span>
+                  <span>main</span>
+                </div>
+                <span class="branch-stat">↑2</span>
+              </div>
+              <div class="branch-item" onclick="focusPane(2)">
+                <div class="branch-name-box">
+                  <span class="branch-dot feat"></span>
+                  <span>feat/ext-host</span>
+                </div>
+                <span class="branch-stat">↑7</span>
+              </div>
+              <div class="branch-item" onclick="focusPane(2)">
+                <div class="branch-name-box">
+                  <span class="branch-dot fix"></span>
+                  <span>fix/graph-lanes</span>
+                </div>
+              </div>
+              <div class="branch-item" onclick="focusPane(2)">
+                <div class="branch-name-box">
+                  <span class="branch-dot remote"></span>
+                  <span style="color: var(--c-dim);">origin/main</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- STASH Section -->
+            <div class="stash-section">
+              <div class="pane-header" style="height: 24px; background: transparent; border-top: 1px solid var(--c-border); padding: 0 10px;">
+                <div class="pane-header-left">
+                  <span class="pane-keycap" id="keycap-stash" style="width: 13px; height: 13px; font-size: 9px;">5</span>
+                  <span class="pane-title-caps" style="font-size: 10px;">Stash</span>
+                </div>
+              </div>
+              <div class="stash-empty">nothing stashed</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Column 2: Commits & SVG Graph -->
+        <div class="pane" id="pane-4" onclick="focusPane(4)">
+          <div class="pane-header">
+            <div class="pane-header-left">
+              <span class="pane-keycap" id="keycap-commits">4</span>
+              <span class="pane-title-caps">Commits</span>
+            </div>
+            <div class="pane-header-right">
+              <span>main</span>
+            </div>
+          </div>
+
+          <div class="pane-commits-body" id="commits-list">
+            <!-- Row 0: a3f1c9d (Active/Selected) -->
+            <div class="commit-row selected" onclick="selectCommit(this, 'a3f1c9d')">
+              <div class="graph-cell">
+                <svg viewBox="0 0 48 22">
+                  <!-- Lane 0 vertical line going down -->
+                  <line x1="7" y1="11" x2="7" y2="22" stroke="var(--lane-0)" stroke-width="2"/>
+                  <!-- Lane 1 merge curve UP from row 1 (x=21, y=22) into node (x=7, y=11) -->
+                  <path d="M 21 22 C 21 16 7 17 7 11" fill="none" stroke="var(--lane-1)" stroke-width="2"/>
+                  <!-- Merge node ring on Lane 0 (r=5, hollow circle with dark background fill) -->
+                  <circle cx="7" cy="11" r="5" fill="var(--c-bg)" stroke="var(--lane-0)" stroke-width="2"/>
+                </svg>
+              </div>
+              <span class="commit-hash">a3f1c9d</span>
+              <span class="commit-subject">Merge extension host into main</span>
+              <span class="commit-age">2h</span>
+            </div>
+
+            <!-- Row 1: 7b02e14 -->
+            <div class="commit-row" onclick="selectCommit(this, '7b02e14')">
+              <div class="graph-cell">
+                <svg viewBox="0 0 48 22">
+                  <!-- Lane 0 through -->
+                  <line x1="7" y1="0" x2="7" y2="22" stroke="var(--lane-0)" stroke-width="2"/>
+                  <!-- Lane 1 through -->
+                  <line x1="21" y1="0" x2="21" y2="22" stroke="var(--lane-1)" stroke-width="2"/>
+                  <!-- Node on Lane 1 -->
+                  <circle cx="21" cy="11" r="4" fill="var(--lane-1)"/>
+                </svg>
+              </div>
+              <span class="commit-hash">7b02e14</span>
+              <span class="commit-subject">Cap per-extension token budget</span>
+              <span class="commit-age">3h</span>
+            </div>
+
+            <!-- Row 2: c40d8aa -->
+            <div class="commit-row" onclick="selectCommit(this, 'c40d8aa')">
+              <div class="graph-cell">
+                <svg viewBox="0 0 48 22">
+                  <line x1="7" y1="0" x2="7" y2="22" stroke="var(--lane-0)" stroke-width="2"/>
+                  <line x1="21" y1="0" x2="21" y2="22" stroke="var(--lane-1)" stroke-width="2"/>
+                  <circle cx="21" cy="11" r="4" fill="var(--lane-1)"/>
+                </svg>
+              </div>
+              <span class="commit-hash">c40d8aa</span>
+              <span class="commit-subject">Sandbox extension filesystem access</span>
+              <span class="commit-age">5h</span>
+            </div>
+
+            <!-- Row 3: 1e9fb37 -->
+            <div class="commit-row" onclick="selectCommit(this, '1e9fb37')">
+              <div class="graph-cell">
+                <svg viewBox="0 0 48 22">
+                  <line x1="7" y1="0" x2="7" y2="22" stroke="var(--lane-0)" stroke-width="2"/>
+                  <!-- Lane 1 runs UP into row 2 -->
+                  <line x1="21" y1="0" x2="21" y2="11" stroke="var(--lane-1)" stroke-width="2"/>
+                  <!-- Lane 1 forked from Lane 0 below (curves down to x=7, y=22) -->
+                  <path d="M 21 11 C 21 17 7 16 7 22" fill="none" stroke="var(--lane-1)" stroke-width="2"/>
+                  <circle cx="21" cy="11" r="4" fill="var(--lane-1)"/>
+                </svg>
+              </div>
+              <span class="commit-hash">1e9fb37</span>
+              <span class="commit-subject">Define the Event/Handles contract</span>
+              <span class="commit-age">6h</span>
+            </div>
+
+            <!-- Row 4: 55ac0f2 -->
+            <div class="commit-row" onclick="selectCommit(this, '55ac0f2')">
+              <div class="graph-cell">
+                <svg viewBox="0 0 48 22">
+                  <line x1="7" y1="0" x2="7" y2="22" stroke="var(--lane-0)" stroke-width="2"/>
+                  <circle cx="7" cy="11" r="4" fill="var(--lane-0)"/>
+                </svg>
+              </div>
+              <span class="commit-hash">55ac0f2</span>
+              <span class="commit-subject">Word-level diff in the hunk renderer</span>
+              <span class="commit-age">1d</span>
+            </div>
+
+            <!-- Row 5: 9d7e3b8 -->
+            <div class="commit-row" onclick="selectCommit(this, '9d7e3b8')">
+              <div class="graph-cell">
+                <svg viewBox="0 0 48 22">
+                  <line x1="7" y1="0" x2="7" y2="22" stroke="var(--lane-0)" stroke-width="2"/>
+                  <!-- Merge curve UP from Lane 2 (x=35, y=22) into node (x=7, y=11) -->
+                  <path d="M 35 22 C 35 16 7 17 7 11" fill="none" stroke="var(--lane-2)" stroke-width="2"/>
+                  <circle cx="7" cy="11" r="5" fill="var(--c-bg)" stroke="var(--lane-0)" stroke-width="2"/>
+                </svg>
+              </div>
+              <span class="commit-hash">9d7e3b8</span>
+              <span class="commit-subject">Merge lane-collapse rewrite</span>
+              <span class="commit-age">1d</span>
+            </div>
+
+            <!-- Row 6: f18c6d0 -->
+            <div class="commit-row" onclick="selectCommit(this, 'f18c6d0')">
+              <div class="graph-cell">
+                <svg viewBox="0 0 48 22">
+                  <line x1="7" y1="0" x2="7" y2="22" stroke="var(--lane-0)" stroke-width="2"/>
+                  <line x1="35" y1="0" x2="35" y2="22" stroke="var(--lane-2)" stroke-width="2"/>
+                  <circle cx="35" cy="11" r="4" fill="var(--lane-2)"/>
+                </svg>
+              </div>
+              <span class="commit-hash">f18c6d0</span>
+              <span class="commit-subject">Collapse dead lanes after a merge</span>
+              <span class="commit-age">2d</span>
+            </div>
+
+            <!-- Row 7: 2ba4471 -->
+            <div class="commit-row" onclick="selectCommit(this, '2ba4471')">
+              <div class="graph-cell">
+                <svg viewBox="0 0 48 22">
+                  <line x1="7" y1="0" x2="7" y2="22" stroke="var(--lane-0)" stroke-width="2"/>
+                  <line x1="35" y1="0" x2="35" y2="11" stroke="var(--lane-2)" stroke-width="2"/>
+                  <!-- Lane 2 forked from Lane 0 below (curves down to x=7, y=22) -->
+                  <path d="M 35 11 C 35 17 7 16 7 22" fill="none" stroke="var(--lane-2)" stroke-width="2"/>
+                  <circle cx="35" cy="11" r="4" fill="var(--lane-2)"/>
+                </svg>
+              </div>
+              <span class="commit-hash">2ba4471</span>
+              <span class="commit-subject">Reserve a lane per open branch tip</span>
+              <span class="commit-age">2d</span>
+            </div>
+
+            <!-- Row 8: d6e5192 -->
+            <div class="commit-row" onclick="selectCommit(this, 'd6e5192')">
+              <div class="graph-cell">
+                <svg viewBox="0 0 48 22">
+                  <line x1="7" y1="0" x2="7" y2="22" stroke="var(--lane-0)" stroke-width="2"/>
+                  <circle cx="7" cy="11" r="4" fill="var(--lane-0)"/>
+                </svg>
+              </div>
+              <span class="commit-hash">d6e5192</span>
+              <span class="commit-subject">Keymap resolves through the mode stack</span>
+              <span class="commit-age">3d</span>
+            </div>
+
+            <!-- Row 9: 08fa2c5 -->
+            <div class="commit-row" onclick="selectCommit(this, '08fa2c5')">
+              <div class="graph-cell">
+                <svg viewBox="0 0 48 22">
+                  <line x1="7" y1="0" x2="7" y2="22" stroke="var(--lane-0)" stroke-width="2"/>
+                  <circle cx="7" cy="11" r="4" fill="var(--lane-0)"/>
+                </svg>
+              </div>
+              <span class="commit-hash">08fa2c5</span>
+              <span class="commit-subject">Pane focus without a mouse</span>
+              <span class="commit-age">3d</span>
+            </div>
+
+            <!-- Row 10: bc31d7e -->
+            <div class="commit-row" onclick="selectCommit(this, 'bc31d7e')">
+              <div class="graph-cell">
+                <svg viewBox="0 0 48 22">
+                  <line x1="7" y1="0" x2="7" y2="22" stroke="var(--lane-0)" stroke-width="2"/>
+                  <circle cx="7" cy="11" r="4" fill="var(--lane-0)"/>
+                </svg>
+              </div>
+              <span class="commit-hash">bc31d7e</span>
+              <span class="commit-subject">Read refs without shelling out to git</span>
+              <span class="commit-age">4d</span>
+            </div>
+
+            <!-- Row 11: 4a90ff1 -->
+            <div class="commit-row" onclick="selectCommit(this, '4a90ff1')">
+              <div class="graph-cell">
+                <svg viewBox="0 0 48 22">
+                  <line x1="7" y1="0" x2="7" y2="22" stroke="var(--lane-0)" stroke-width="2"/>
+                  <circle cx="7" cy="11" r="4" fill="var(--lane-0)"/>
+                </svg>
+              </div>
+              <span class="commit-hash">4a90ff1</span>
+              <span class="commit-subject">Vendor libgit2 bindings</span>
+              <span class="commit-age">5d</span>
+            </div>
+
+            <!-- Row 12: e77b0c3 -->
+            <div class="commit-row" onclick="selectCommit(this, 'e77b0c3')">
+              <div class="graph-cell">
+                <svg viewBox="0 0 48 22">
+                  <!-- Terminating node on Lane 0 (line stops at y=11) -->
+                  <line x1="7" y1="0" x2="7" y2="11" stroke="var(--lane-0)" stroke-width="2"/>
+                  <circle cx="7" cy="11" r="4" fill="var(--lane-0)"/>
+                </svg>
+              </div>
+              <span class="commit-hash">e77b0c3</span>
+              <span class="commit-subject">Initial commit</span>
+              <span class="commit-age">6d</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Column 3: Diff Viewer & AI Assistant Card (FOCUSED) -->
+        <div class="pane focused" id="pane-5" onclick="focusPane(5)">
+          <div class="pane-header">
+            <div class="pane-header-left">
+              <span class="pane-keycap" id="keycap-diff">0</span>
+              <span class="pane-title-raw" id="diff-file-title">internal/extension/host.go</span>
+            </div>
+            <div class="pane-header-right">
+              <div class="diff-stats-header">
+                <span class="stat-adds">+18</span>
+                <span class="stat-dels">-6</span>
+                <span class="stat-hunk">hunk 1/3</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="pane-diff-body" id="diff-body">
+            <!-- Hunk Header -->
+            <div class="diff-hunk-bar">
+              @@ -41,9 +41,11 @@ func (h *Host) Dispatch(ev Event) error {
+            </div>
+
+            <!-- Diff Content Lines -->
+            <div class="diff-table">
+              <!-- Line 41 41: context -->
+              <div class="diff-line context">
+                <span class="gutter-old">41</span>
+                <span class="gutter-new">41</span>
+                <span class="gutter-sign"> </span>
+                <span class="line-content">  <span class="syn-k">for</span> _, ext := <span class="syn-k">range</span> h.<span class="syn-p">enabled</span> {</span>
+              </div>
+
+              <!-- Line 42 (old): deleted -->
+              <div class="diff-line deleted">
+                <span class="gutter-old">42</span>
+                <span class="gutter-new"> </span>
+                <span class="gutter-sign">-</span>
+                <span class="line-content">    <span class="syn-k">if</span> !ext.<span class="syn-f">Handles</span>(ev.<span class="syn-p">Kind</span>) {</span>
+              </div>
+
+              <!-- Line 42 (new): added with intraline highlight -->
+              <div class="diff-line added">
+                <span class="gutter-old"> </span>
+                <span class="gutter-new">42</span>
+                <span class="gutter-sign">+</span>
+                <span class="line-content">    <span class="syn-k">if</span> !ext.<span class="syn-f">Handles</span>(ev.<span class="syn-p">Kind</span>) <span class="intraline-word">|| h.<span class="syn-p">budget</span>.<span class="syn-f">Exhausted</span>()</span> {</span>
+              </div>
+
+              <!-- Line 43 43: context -->
+              <div class="diff-line context">
+                <span class="gutter-old">43</span>
+                <span class="gutter-new">43</span>
+                <span class="gutter-sign"> </span>
+                <span class="line-content">      <span class="syn-k">continue</span></span>
+              </div>
+
+              <!-- Line 44 44: context -->
+              <div class="diff-line context">
+                <span class="gutter-old">44</span>
+                <span class="gutter-new">44</span>
+                <span class="gutter-sign"> </span>
+                <span class="line-content">    }</span>
+              </div>
+
+              <!-- Line 45 (old): deleted -->
+              <div class="diff-line deleted">
+                <span class="gutter-old">45</span>
+                <span class="gutter-new"> </span>
+                <span class="gutter-sign">-</span>
+                <span class="line-content">    <span class="syn-k">go</span> ext.<span class="syn-f">Run</span>(ev)</span>
+              </div>
+
+              <!-- Line 45 (new): added -->
+              <div class="diff-line added">
+                <span class="gutter-old"> </span>
+                <span class="gutter-new">45</span>
+                <span class="gutter-sign">+</span>
+                <span class="line-content">    <span class="syn-k">if</span> err := h.<span class="syn-p">pool</span>.<span class="syn-f">Submit</span>(ctx, ext, ev); err != <span class="syn-k">nil</span> {</span>
+              </div>
+
+              <!-- Line 46 (new): added -->
+              <div class="diff-line added">
+                <span class="gutter-old"> </span>
+                <span class="gutter-new">46</span>
+                <span class="gutter-sign">+</span>
+                <span class="line-content">      <span class="syn-k">return</span> fmt.<span class="syn-f">Errorf</span>(<span class="syn-s">"dispatch %s: %w"</span>, ext.<span class="syn-p">Name</span>, err)</span>
+              </div>
+
+              <!-- Line 47 (new): added -->
+              <div class="diff-line added">
+                <span class="gutter-old"> </span>
+                <span class="gutter-new">47</span>
+                <span class="gutter-sign">+</span>
+                <span class="line-content">    }</span>
+              </div>
+
+              <!-- Line 46 48: context -->
+              <div class="diff-line context">
+                <span class="gutter-old">46</span>
+                <span class="gutter-new">48</span>
+                <span class="gutter-sign"> </span>
+                <span class="line-content">    }</span>
+              </div>
+
+              <!-- Line 47 49: context -->
+              <div class="diff-line context">
+                <span class="gutter-old">47</span>
+                <span class="gutter-new">49</span>
+                <span class="gutter-sign"> </span>
+                <span class="line-content">    <span class="syn-k">return</span> <span class="syn-k">nil</span></span>
+              </div>
+
+              <!-- Line 48 50: context -->
+              <div class="diff-line context">
+                <span class="gutter-old">48</span>
+                <span class="gutter-new">50</span>
+                <span class="gutter-sign"> </span>
+                <span class="line-content">  }</span>
+              </div>
+            </div>
+
+            <!-- AI Assist Card ("READING THIS HUNK") -->
+            <div class="ai-hunk-card" id="ai-card">
+              <div class="ai-card-header">
+                <div class="ai-card-title">
+                  <span class="ai-sparkle">✧</span>
+                  <span>READING THIS HUNK</span>
+                </div>
+                <div class="ai-card-action" onclick="toggleExplain()">
+                  <span>e · explain</span>
+                </div>
+              </div>
+              <div class="ai-card-body" id="ai-card-text">
+                The goroutine became a pool submission, so a dispatch failure now surfaces to the caller instead of dying silently in the background. The budget check moved into the same guard as Handles — which means an exhausted budget skips the extension quietly rather than erroring. Worth confirming that is the intent.
+              </div>
+            </div>
+
+          </div>
+        </div>
+
+      </div>
+
+      <!-- Window Status Bar -->
+      <div class="app-statusbar">
+        <div class="statusbar-left">
+          <span class="mode-badge" id="app-mode">Normal</span>
+
+          <div class="key-hints">
+            <span class="key-hint-item" onclick="handleKeyHint('stage')">
+              <span class="key-hint-key">␣</span>
+              <span class="key-hint-label">stage</span>
+            </span>
+            <span class="key-hint-item" onclick="handleKeyHint('commit')">
+              <span class="key-hint-key">c</span>
+              <span class="key-hint-label">commit</span>
+            </span>
+            <span class="key-hint-item" onclick="handleKeyHint('push')">
+              <span class="key-hint-key">P</span>
+              <span class="key-hint-label">push</span>
+            </span>
+            <span class="key-hint-item" onclick="handleKeyHint('explain')">
+              <span class="key-hint-key">e</span>
+              <span class="key-hint-label">explain hunk</span>
+            </span>
+            <span class="key-hint-item" onclick="handleKeyHint('extensions')">
+              <span class="key-hint-key">x</span>
+              <span class="key-hint-label">extensions</span>
+            </span>
+            <span class="key-hint-item" onclick="handleKeyHint('ask')">
+              <span class="key-hint-key">⌘K</span>
+              <span class="key-hint-label">ask</span>
+            </span>
+          </div>
+        </div>
+
+        <div class="statusbar-right">
+          plait 0.4.1
+        </div>
+      </div>
+
+    </div><!-- /app-window -->
+
+    <!-- ================= TUI VARIANT (gitten-tui) ================= -->
+    <div class="tui-window" id="tui-window" style="display: none;">
+      <!-- Row 0: title — names the focused pane, same word the header + status use -->
+      <div class="tui-title">
+        <span><span class="t-git">gitten</span><span class="t-pane">  commits</span><span class="t-label">  plait · main ↑2 ↓0</span></span>
+        <span class="t-hint">? keys </span>
+      </div>
+
+      <div class="tui-body" id="tui-body">
+        <!-- Sidebar: stacked lists, equal slices of the column (panes::BuiltinLayout) -->
+        <div class="tui-sidebar" id="tui-sidebar">
+          <!-- files -->
+          <div class="tui-pane">
+            <div class="tui-pane-header"><span class="k-idle">2</span><span class="n-idle">  files</span><span class="l-idle">  plait · 4 changed</span></div>
+            <div class="tui-pane-rows">
+              <div class="tui-row"><span class="tui-sec">Staged (2)</span></div>
+              <div class="tui-row"><span class="tui-d-mod">M </span><span class="tui-file"><span class="dir">internal/ai/</span>commit.go</span></div>
+              <div class="tui-row"><span class="tui-d-add">A </span><span class="tui-file"><span class="dir">internal/extension/</span>pool.go</span></div>
+              <div class="tui-row"><span class="tui-sec">Unstaged (3)</span></div>
+              <div class="tui-row sel"><span class="tui-d-mod">M </span><span class="tui-file"><span class="dir">internal/extension/</span>host.go</span><span class="bar"> </span></div>
+            </div>
+          </div>
+          <!-- branches -->
+          <div class="tui-pane">
+            <div class="tui-pane-header"><span class="k-idle">3</span><span class="n-idle">  branches</span><span class="l-idle">  main ↑2</span></div>
+            <div class="tui-pane-rows">
+              <div class="tui-row"><span style="color: var(--lane-0);">● </span><span class="tui-file">main ↑2</span></div>
+              <div class="tui-row"><span style="color: var(--lane-0);">● </span><span class="tui-file">feat/ext-host ↑7</span></div>
+              <div class="tui-row"><span style="color: var(--lane-2);">● </span><span class="tui-file">fix/graph-lanes</span></div>
+            </div>
+          </div>
+          <!-- commits (focused) -->
+          <div class="tui-pane" style="flex: 1;">
+            <div class="tui-pane-header"><span class="k-focused">4</span><span class="n-focused">  commits</span><span class="l-idle">  main</span></div>
+            <div class="tui-pane-rows" id="tui-commits">
+              <div class="tui-row sel"><span class="tui-sha">a3f1c9d </span><span style="color: #9c7f75;">JH </span><span data-graph style="color: var(--lane-0);">◉ </span><span class="tui-subj">Merge extension host into main</span><span class="bar">▐</span></div>
+              <div class="tui-row"><span class="tui-sha">7b02e14 </span><span style="color: #9c7f75;">JH </span><span data-graph><span style="color: var(--lane-0);">│ </span><span style="color: var(--lane-1);">● </span></span><span class="tui-subj">Cap per-extension token budget</span><span class="bar"> </span></div>
+              <div class="tui-row"><span class="tui-sha">c40d8aa </span><span style="color: #9c7f75;">JH </span><span data-graph><span style="color: var(--lane-0);">│ </span><span style="color: var(--lane-1);">● </span></span><span class="tui-subj">Sandbox extension filesystem access</span><span class="bar"> </span></div>
+              <div class="tui-row"><span class="tui-sha">1e9fb37 </span><span style="color: #9c7f75;">JH </span><span data-graph><span style="color: var(--lane-0);">│ </span><span style="color: var(--lane-1);">● </span></span><span class="tui-subj">Define the Event/Handles contract</span><span class="bar"> </span></div>
+              <div class="tui-row"><span class="tui-sha">55ac0f2 </span><span style="color: #9c7f75;">JH </span><span data-graph style="color: var(--lane-0);">● </span><span class="tui-subj">Word-level diff in the hunk renderer</span><span class="bar"> </span></div>
+              <div class="tui-row"><span class="tui-sha">9d7e3b8 </span><span style="color: #9c7f75;">JH </span><span data-graph style="color: var(--lane-0);">◉─</span><span data-graph style="color: var(--lane-2);">╮ </span><span class="tui-subj">Merge lane-collapse rewrite</span><span class="bar"> </span></div>
+              <div class="tui-row"><span class="tui-sha">f18c6d0 </span><span style="color: #9c7f75;">JH </span><span data-graph><span style="color: var(--lane-0);">│ </span><span style="color: var(--lane-2);">● </span></span><span class="tui-subj">Collapse dead lanes after a merge</span><span class="bar">▗</span></div>
+              <div class="tui-row"><span class="tui-sha">d6e5192 </span><span style="color: #9c7f75;">JH </span><span data-graph style="color: var(--lane-0);">● </span><span class="tui-subj">Keymap resolves through the mode stack</span><span class="bar"> </span></div>
+            </div>
+          </div>
+          <!-- stashes -->
+          <div class="tui-pane">
+            <div class="tui-pane-header"><span class="k-idle">5</span><span class="n-idle">  stashes</span><span class="l-idle">  0 parked</span></div>
+            <div class="tui-pane-rows">
+              <div class="tui-row"><span class="tui-sec" style="font-style: italic;">nothing stashed</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="tui-divider" id="tui-divider"></div>
+
+        <!-- Main: the diff -->
+        <div class="tui-main" id="tui-main">
+          <div class="tui-pane" style="flex: 1; border-bottom: none;">
+            <div class="tui-pane-header"><span class="k-idle">0</span><span class="n-idle">  diff</span><span class="l-idle">  host.go  +18 -6</span></div>
+            <div class="tui-fhead">internal/extension/host.go  <span class="tui-d-add">+18</span> <span class="tui-d-del">-6</span><span style="float: right; color: var(--c-faint); font-weight: 400;">▐</span></div>
+            <div class="tui-hunk">@@ -41,9 +41,11 @@ func (h *Host) Dispatch(ev Event) error {</div>
+            <div>
+              <div class="tui-dl ctx"><span class="tui-g">41  41</span><span class="tui-s"> </span><span>  <span class="syn-k">for</span> _, ext := <span class="syn-k">range</span> h.<span class="syn-p">enabled</span> {</span></div>
+              <div class="tui-dl del"><span class="tui-g">42    </span><span class="tui-s">-</span><span>    <span class="syn-k">if</span> !ext.<span class="syn-f">Handles</span>(ev.<span class="syn-p">Kind</span>) {</span></div>
+              <div class="tui-dl add"><span class="tui-g">    42</span><span class="tui-s">+</span><span>    <span class="syn-k">if</span> !ext.<span class="syn-f">Handles</span>(ev.<span class="syn-p">Kind</span>) <span class="tui-w-add">|| h.<span class="syn-p">budget</span>.<span class="syn-f">Exhausted</span>()</span> {</span></div>
+              <div class="tui-dl ctx"><span class="tui-g">43  43</span><span class="tui-s"> </span><span>      <span class="syn-k">continue</span></span></div>
+              <div class="tui-dl ctx"><span class="tui-g">44  44</span><span class="tui-s"> </span><span>    }</span></div>
+              <div class="tui-dl del"><span class="tui-g">45    </span><span class="tui-s">-</span><span>    <span class="syn-k">go</span> ext.<span class="syn-f">Run</span>(ev)</span></div>
+              <div class="tui-dl add"><span class="tui-g">    45</span><span class="tui-s">+</span><span>    <span class="syn-k">if</span> err := h.<span class="syn-p">pool</span>.<span class="syn-f">Submit</span>(ctx, ext, ev); err != <span class="syn-k">nil</span> {</span></div>
+              <div class="tui-dl add"><span class="tui-g">    46</span><span class="tui-s">+</span><span>      <span class="syn-k">return</span> fmt.<span class="syn-f">Errorf</span>(<span class="syn-s">"dispatch %s: %w"</span>, ext.<span class="syn-p">Name</span>, err)</span></div>
+              <div class="tui-dl add"><span class="tui-g">    47</span><span class="tui-s">+</span><span>    }</span></div>
+              <div class="tui-dl ctx"><span class="tui-g">46  48</span><span class="tui-s"> </span><span>    }</span></div>
+              <div class="tui-dl ctx"><span class="tui-g">47  49</span><span class="tui-s"> </span><span>    <span class="syn-k">return</span> <span class="syn-k">nil</span></span></div>
+              <div class="tui-dl ctx"><span class="tui-g">48  50</span><span class="tui-s"> </span><span>  }</span></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ? help modal: centred box, bordered on every side -->
+        <div class="tui-help-overlay" id="tui-help">
+          <div class="tui-help-box">
+            <div class="hb-title">╭─ <span style="color: var(--c-accent);">keys</span><span style="color: var(--c-faint);"> ───────────────────────────────────╮</span></div>
+            <div class="hb-row"><span style="color: var(--c-faint);">│ </span><span class="hb-mode">global</span></div>
+            <div class="hb-row"><span style="color: var(--c-faint);">│ </span><span class="hb-key">j / down       </span><span class="hb-doc">one row down</span></div>
+            <div class="hb-row"><span style="color: var(--c-faint);">│ </span><span class="hb-key">k / up         </span><span class="hb-doc">one row up</span></div>
+            <div class="hb-row"><span style="color: var(--c-faint);">│ </span><span class="hb-key">4 / 0          </span><span class="hb-doc">commits / diff focus</span></div>
+            <div class="hb-row"><span style="color: var(--c-faint);">│ </span><span class="hb-key">?              </span><span class="hb-doc">this panel (pure function of keymap)</span></div>
+            <div class="hb-row"><span style="color: var(--c-faint);">│ </span><span class="hb-mode">commits</span></div>
+            <div class="hb-row"><span style="color: var(--c-faint);">│ </span><span class="hb-key">enter          </span><span class="hb-doc">the diff for this commit</span></div>
+            <div class="hb-row"><span style="color: var(--c-faint);">│ </span><span class="hb-key">/              </span><span class="hb-doc">filter, live over the list</span></div>
+            <div class="hb-row"><span style="color: var(--c-faint);">╰────────────────────────────────────────────╯</span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Last row: status — focused pane first, then where it is -->
+      <div class="tui-status">
+        <span id="tui-status-text"> commits · 1/13 · 2 lanes · word · unified</span>
+        <span style="color: var(--c-faint);">120×32 · --ascii off</span>
+      </div>
+    </div><!-- /tui-window -->
+
+    <div class="tui-legend" id="tui-legend" style="display: none;">
+      <span><b>Wide ≥96 cols:</b> sidebar (32%, ≥40 cols) + 1-col gap + main (≥55). <b>Narrow:</b> focused pane alone.</span>
+      <span><b>Graph:</b> 2 cols/lane · <code>●</code> commit <code>◉</code> merge <code>│ ─ ┼ ╮ ╯</code> · capped at 12, overflow grey.</span>
+      <span><b>Bar:</b> <code>▐</code> over the last cell (keeps the row bg) · halves <code>▝ ▗</code> · <code>#</code> with <code>--ascii</code>.</span>
+      <span><b>No AI card</b> in the terminal — same hunk, same <code>e</code> key, status-line answer. Mouse: click moves cursor, drag selects (OSC 52).</span>
+    </div>
+  </div>

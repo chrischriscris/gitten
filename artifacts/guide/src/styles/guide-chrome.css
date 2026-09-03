@@ -1,0 +1,136 @@
+/* Split from artifacts/design-guide.html <style> — keep cascade order, edit here. */
+  /* ------------------- Guide Shell: Sidebar + Main ------------------- */
+  .guide-shell {
+    display: grid;
+    grid-template-columns: 248px minmax(0, 1fr);
+    min-height: 100vh;
+  }
+
+  .guide-main {
+    min-width: 0;
+  }
+
+  /* ------------------- Sidebar (was: Outer Guide Navigation Strip) ------------------- */
+  .guide-header {
+    background: #11100e;
+    border-right: 1px solid #231f1c;
+    padding: 18px 14px;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 18px;
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    overflow-y: auto;
+    z-index: 100;
+  }
+
+  .guide-brand {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 0 4px;
+  }
+  .guide-logo {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-family: var(--font-mono);
+    font-weight: 700;
+    font-size: 15px;
+    color: var(--c-accent);
+    letter-spacing: -0.02em;
+  }
+  .guide-logo svg {
+    width: 18px;
+    height: 18px;
+  }
+  .guide-badge {
+    background: var(--c-raised);
+    border: 1px solid var(--c-border);
+    padding: 2px 7px;
+    border-radius: 4px;
+    font-size: 11px;
+    color: var(--c-dim);
+    font-family: var(--font-mono);
+  }
+
+  .guide-tabs {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 2px;
+    background: #0e0d0c;
+    padding: 4px;
+    border-radius: 6px;
+    border: 1px solid #231f1c;
+  }
+  .guide-tab-btn {
+    background: transparent;
+    border: none;
+    color: var(--c-dim);
+    padding: 8px 12px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    width: 100%;
+    gap: 8px;
+    text-align: left;
+    transition: all 0.15s ease;
+  }
+  .guide-tab-btn:hover {
+    color: var(--c-fg);
+    background: rgba(255, 255, 255, 0.04);
+  }
+  .guide-tab-btn.active {
+    background: var(--c-raised);
+    color: var(--c-accent);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+  }
+
+  .guide-controls {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+    margin-top: auto;
+  }
+
+  .guide-select, .guide-btn {
+    background: var(--c-raised);
+    color: var(--c-dim);
+    border: 1px solid var(--c-border);
+    padding: 5px 10px;
+    border-radius: 5px;
+    font-size: 12px;
+    cursor: pointer;
+    font-family: inherit;
+    width: 100%;
+    transition: all 0.15s ease;
+  }
+  .guide-select:hover, .guide-btn:hover {
+    color: var(--c-fg);
+    border-color: #3e3731;
+  }
+  .guide-btn.active {
+    background: var(--c-selection-bg);
+    border-color: var(--c-accent);
+    color: var(--c-accent);
+  }
+
+  /* ------------------- Main Guide Content Area ------------------- */
+  .guide-view {
+    display: none !important;
+  }
+  .guide-view.active {
+    display: block !important;
+  }
+  #view-mockup.active {
+    display: flex !important;
+  }

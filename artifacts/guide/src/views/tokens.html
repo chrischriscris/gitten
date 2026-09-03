@@ -1,0 +1,129 @@
+<!-- Split from artifacts/design-guide.html (lines 2478-2605) — edit here. -->
+  <div class="doc-container">
+    <h1 class="doc-title">Design Tokens &amp; Color Palette</h1>
+    <p class="doc-lead">
+      Directly extracted from <code>core/src/theme.rs</code>. Every color is defined as a 24-bit RGB integer
+      and checked against WCAG 2.1 contrast floors: <code>min_contrast = 3.5</code> for code tokens, and <code>min_furniture = 3.0</code> for line numbers and rules.
+    </p>
+
+    <!-- Chrome Palette -->
+    <div class="doc-section">
+      <h2>Chrome &amp; Surface Tokens</h2>
+      <div class="swatch-grid">
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #0e0d0c; color: #e8e3dc; border-color: #282320;">Background</div>
+          <div class="swatch-info"><span class="swatch-name">bg</span><span class="swatch-hex">#0e0d0c</span></div>
+          <span class="swatch-role">Window canvas background</span>
+        </div>
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #151312; color: #e8e3dc; border-color: #282320;">Title Bar</div>
+          <div class="swatch-info"><span class="swatch-name">title_bg</span><span class="swatch-hex">#151312</span></div>
+          <span class="swatch-role">Pane header &amp; window title strip</span>
+        </div>
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #131211; color: #e8e3dc; border-color: #282320;">Status Bar</div>
+          <div class="swatch-info"><span class="swatch-name">status_bg</span><span class="swatch-hex">#131211</span></div>
+          <span class="swatch-role">Bottom status &amp; key hint bar</span>
+        </div>
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #dfa851; color: #0e0d0c;">Accent</div>
+          <div class="swatch-info"><span class="swatch-name">accent</span><span class="swatch-hex">#dfa851</span></div>
+          <span class="swatch-role">Amber highlight &amp; Normal mode pill</span>
+        </div>
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #282320; color: #e8e3dc;">Border</div>
+          <div class="swatch-info"><span class="swatch-name">border</span><span class="swatch-hex">#282320</span></div>
+          <span class="swatch-role">Hairline rule between chrome panes</span>
+        </div>
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #1c1a18; color: #e8e3dc; border-color: #282320;">Raised Pill</div>
+          <div class="swatch-info"><span class="swatch-name">raised</span><span class="swatch-hex">#1c1a18</span></div>
+          <span class="swatch-role">Chip surfaces, focused headers</span>
+        </div>
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #2c2925; color: #e8e3dc; border-color: #282320;">Keycap</div>
+          <div class="swatch-info"><span class="swatch-name">keycap</span><span class="swatch-hex">#2c2925</span></div>
+          <span class="swatch-role">Face of key shortcut numbers (1-5)</span>
+        </div>
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #241f1a; color: #e8e3dc; border: 1px solid #dfa851;">Selected Row</div>
+          <div class="swatch-info"><span class="swatch-name">selection_bg</span><span class="swatch-hex">#241f1a</span></div>
+          <span class="swatch-role">Active row under keyboard cursor</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Diff Palette -->
+    <div class="doc-section">
+      <h2>Diff &amp; Hunk Tokens</h2>
+      <div class="swatch-grid">
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #16241a; color: #9dc79b;">+ Added Line</div>
+          <div class="swatch-info"><span class="swatch-name">added_bg</span><span class="swatch-hex">#16241a</span></div>
+          <span class="swatch-role">Addition line tint (1.20:1 ratio)</span>
+        </div>
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #234228; color: #c4ecc2;">+ Added Word</div>
+          <div class="swatch-info"><span class="swatch-name">added_word_bg</span><span class="swatch-hex">#234228</span></div>
+          <span class="swatch-role">Word-level intraline addition emphasis</span>
+        </div>
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #2a1917; color: #d4a09a;">- Removed Line</div>
+          <div class="swatch-info"><span class="swatch-name">removed_bg</span><span class="swatch-hex">#2a1917</span></div>
+          <span class="swatch-role">Deletion line tint</span>
+        </div>
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #522722; color: #f7bbb4;">- Removed Word</div>
+          <div class="swatch-info"><span class="swatch-name">removed_word_bg</span><span class="swatch-hex">#522722</span></div>
+          <span class="swatch-role">Word-level intraline deletion emphasis</span>
+        </div>
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #14181d; color: #7d8fa8;">@@ Hunk Header @@</div>
+          <div class="swatch-info"><span class="swatch-name">hunk_bg</span><span class="swatch-hex">#14181d</span></div>
+          <span class="swatch-role">Hunk coordinate separator band</span>
+        </div>
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #0e0d0c; color: #4a4540;">41  42</div>
+          <div class="swatch-info"><span class="swatch-name">gutter_fg</span><span class="swatch-hex">#4a4540</span></div>
+          <span class="swatch-role">Line number gutter ink</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Graph Lane Colors -->
+    <div class="doc-section">
+      <h2>Commit Graph Lane Hues (Wheel of 6)</h2>
+      <div class="swatch-grid">
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #dfa851; color: #0e0d0c;">Lane 0 (Main)</div>
+          <div class="swatch-info"><span class="swatch-name">lane[0]</span><span class="swatch-hex">#dfa851</span></div>
+          <span class="swatch-role">Primary main branch</span>
+        </div>
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #6f9ecf; color: #0e0d0c;">Lane 1 (Feature)</div>
+          <div class="swatch-info"><span class="swatch-name">lane[1]</span><span class="swatch-hex">#6f9ecf</span></div>
+          <span class="swatch-role">Branch 1 (Sky Blue)</span>
+        </div>
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #a983c9; color: #0e0d0c;">Lane 2 (Fix)</div>
+          <div class="swatch-info"><span class="swatch-name">lane[2]</span><span class="swatch-hex">#a983c9</span></div>
+          <span class="swatch-role">Branch 2 (Lavender / Purple)</span>
+        </div>
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #5fa8a0; color: #0e0d0c;">Lane 3 (Teal)</div>
+          <div class="swatch-info"><span class="swatch-name">lane[3]</span><span class="swatch-hex">#5fa8a0</span></div>
+          <span class="swatch-role">Branch 3 (Teal)</span>
+        </div>
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #c97d6f; color: #0e0d0c;">Lane 4 (Coral)</div>
+          <div class="swatch-info"><span class="swatch-name">lane[4]</span><span class="swatch-hex">#c97d6f</span></div>
+          <span class="swatch-role">Branch 4 (Coral)</span>
+        </div>
+        <div class="swatch-card">
+          <div class="swatch-preview" style="background: #8fb35e; color: #0e0d0c;">Lane 5 (Olive)</div>
+          <div class="swatch-info"><span class="swatch-name">lane[5]</span><span class="swatch-hex">#8fb35e</span></div>
+          <span class="swatch-role">Branch 5 (Olive Green)</span>
+        </div>
+      </div>
+    </div>
+  </div>

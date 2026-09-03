@@ -1,0 +1,80 @@
+<!-- Split from artifacts/design-guide.html (lines 2893-2971) — edit here. -->
+  <div class="doc-container">
+    <h1 class="doc-title">GPUI &amp; Core Architecture Seams</h1>
+    <p class="doc-lead">
+      How this design guide maps directly to Rust crates in the <code>gitten</code> codebase.
+      As enforced by <code>AGENTS.md</code>: <em>"A client is drawing and input, and nothing else. Everything before it is shared in core."</em>
+    </p>
+
+    <div class="doc-section">
+      <h2>1. The Four-Crate Pipeline</h2>
+      <div style="display: flex; gap: 14px; flex-wrap: wrap; margin-bottom: 20px;">
+        <div style="flex: 1; min-width: 220px; background: #191614; border: 1px solid var(--c-border); border-radius: 6px; padding: 14px;">
+          <h3 style="color: var(--c-accent); font-size: 14px; margin-bottom: 6px;">1. gitten-git</h3>
+          <p style="font-size: 11.5px; color: var(--c-dim);">Acquisition layer. The ONLY crate that talks to repository files or spawns the <code>git</code> binary.</p>
+        </div>
+        <div style="flex: 1; min-width: 220px; background: #191614; border: 1px solid var(--c-border); border-radius: 6px; padding: 14px;">
+          <h3 style="color: var(--c-accent); font-size: 14px; margin-bottom: 6px;">2. gitten-core</h3>
+          <p style="font-size: 11.5px; color: var(--c-dim);">Pure algorithms. Zero UI dependencies. Differs (Histogram), lane assignment, intraline aligner, themes.</p>
+        </div>
+        <div style="flex: 1; min-width: 220px; background: #191614; border: 1px solid var(--c-border); border-radius: 6px; padding: 14px;">
+          <h3 style="color: var(--c-accent); font-size: 14px; margin-bottom: 6px;">3. gitten-app</h3>
+          <p style="font-size: 11.5px; color: var(--c-dim);">Configuration parser, <code>gitten.toml</code> loader, CLI arguments, verb dispatch, and extension runner.</p>
+        </div>
+        <div style="flex: 1; min-width: 220px; background: #191614; border: 1px solid var(--c-border); border-radius: 6px; padding: 14px;">
+          <h3 style="color: var(--c-accent); font-size: 14px; margin-bottom: 6px;">4. shell (GPUI)</h3>
+          <p style="font-size: 11.5px; color: var(--c-dim);">Rendering and input only! <code>uniform_list</code> virtualization, canvas Bézier painter, and window chrome.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="doc-section">
+      <h2>2. Key Source Code File Mapping</h2>
+      <table class="guide-table">
+        <thead>
+          <tr>
+            <th>Visual Component</th>
+            <th>Source Location</th>
+            <th>Responsibility</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Theme &amp; Colors</strong></td>
+            <td><code>core/src/theme.rs</code></td>
+            <td><code>Theme::dark()</code>, <code>DiffPalette</code>, <code>ChromePalette</code>, contrast ratio math.</td>
+          </tr>
+          <tr>
+            <td><strong>Graph Algorithm</strong></td>
+            <td><code>core/src/graph.rs</code></td>
+            <td><code>assign_lanes</code>, <code>MAX_LANES = 12</code> cap, <code>plan</code> curve halves calculation.</td>
+          </tr>
+          <tr>
+            <td><strong>Graph Canvas Rendering</strong></td>
+            <td><code>shell/src/graph.rs</code></td>
+            <td>GPUI <code>canvas()</code>, <code>PathBuilder</code> Bézier arcs, <code>ROW_H = 22.0</code>.</td>
+          </tr>
+          <tr>
+            <td><strong>Diff Calculation</strong></td>
+            <td><code>core/src/differ.rs</code>, <code>core/src/align.rs</code></td>
+            <td>Histogram differ, hunk assembly, word-level intraline pairing.</td>
+          </tr>
+          <tr>
+            <td><strong>Diff View Rendering</strong></td>
+            <td><code>shell/src/views/diff.rs</code></td>
+            <td>Unified diff rendering, line numbers gutter, intraline token spans.</td>
+          </tr>
+          <tr>
+            <td><strong>Window Chrome</strong></td>
+            <td><code>shell/src/chrome.rs</code></td>
+            <td>macOS titlebar inset, traffic light handling, window resize.</td>
+          </tr>
+          <tr>
+            <td><strong>Command Dispatch</strong></td>
+            <td><code>core/src/command.rs</code>, <code>shell/src/dispatch.rs</code></td>
+            <td>Maps keystrokes to command names; executes actions via <code>Repo</code> trait.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>

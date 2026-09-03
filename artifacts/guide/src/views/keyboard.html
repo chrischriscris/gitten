@@ -1,0 +1,278 @@
+<!-- Split from artifacts/design-guide.html (lines 2609-2885) — edit here. -->
+  <div class="doc-container">
+    <h1 class="doc-title">Keyboard &amp; Navigation Model (lazygit)</h1>
+    <p class="doc-lead">
+      <strong>Yes, gitten is built on lazygit's exact keyboard model.</strong> As stated in <code>AGENTS.md</code>:
+      <em>"A desktop git client with lazygit's keyboard model. Rust, GPUI."</em> and in <code>core/src/command.rs</code>:
+      <em>"The shipped keyboard. lazygit's, where lazygit has an opinion, and vi's where it does not."</em>
+    </p>
+
+    <!-- Comparison Notice -->
+    <div class="doc-section" style="border-left: 3px solid var(--c-accent);">
+      <h2>lazygit Numbering vs. The Visual Mockup</h2>
+      <p>
+        In the visual design mockup (Image #1), the designer numbered the three visible columns directly
+        (<code>1 Files</code>, <code>2 Branches</code>, <code>3 Stash</code>, <code>4 Commits</code>, <code>5 Diff</code>).
+      </p>
+      <p>
+        In <strong>canonical lazygit</strong> (and in <code>core/src/command.rs</code>), the numbering reads down the working tree stack:
+      </p>
+      <ul style="color: var(--c-dim); margin-left: 20px; line-height: 1.8;">
+        <li><span class="key-chip">1</span> <strong>Status</strong>: Working directory state, upstream drift, ahead/behind sync (<code>↑2 ↓0</code>).</li>
+        <li><span class="key-chip">2</span> <strong>Files</strong>: Staged, unstaged, untracked, and conflicted files.</li>
+        <li><span class="key-chip">3</span> <strong>Branches</strong>: Local branches, remotes, and tags.</li>
+        <li><span class="key-chip">4</span> <strong>Commits</strong>: The commit log, branch lanes, and history graph.</li>
+        <li><span class="key-chip">5</span> <strong>Stash</strong>: The stash stack.</li>
+        <li><span class="key-chip">0</span> or <span class="key-chip">↵</span> (Enter) / <span class="key-chip">Tab</span>: <strong>Diff (Main View)</strong>: Enters the diff pane to scroll hunks or stage lines.</li>
+        <li><span class="key-chip">Esc</span>: Exits the diff view back to the side panels.</li>
+      </ul>
+      <p style="margin-top: 10px; font-size: 12px; color: var(--c-faint);">
+        You can toggle between <em>Canonical Lazygit (1..5 + 0/↵)</em> and <em>Mockup (1..5)</em> in the toolbar dropdown above. Both schemes dispatch through <code>core::command</code>.
+      </p>
+    </div>
+
+    <!-- Pane Switching & Navigation -->
+    <div class="doc-section">
+      <h2>1. Panel Navigation (Vim + Arrows)</h2>
+      <table class="guide-table">
+        <thead>
+          <tr>
+            <th>Shortcut</th>
+            <th>Action</th>
+            <th>lazygit &amp; core Mapping</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><span class="key-chip">1</span> .. <span class="key-chip">5</span></td>
+            <td>Direct jump to panel</td>
+            <td><code>status.focus</code>, <code>files.focus</code>, <code>branches.focus</code>, <code>commits.focus</code>, <code>stashes.focus</code></td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">0</span> or <span class="key-chip">↵</span></td>
+            <td>Focus main diff panel</td>
+            <td><code>diff.focus</code> (enters diff from any list)</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">Esc</span></td>
+            <td>Return to sidebar / cancel</td>
+            <td>Exits diff focus back to list; closes modals or menus</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">h</span> / <span class="key-chip">l</span> or <span class="key-chip">←</span> / <span class="key-chip">→</span></td>
+            <td>Walk pane left / right</td>
+            <td><code>pane.left</code>, <code>pane.right</code></td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">j</span> / <span class="key-chip">k</span> or <span class="key-chip">↓</span> / <span class="key-chip">↑</span></td>
+            <td>Move selection down / up</td>
+            <td><code>cursor.down</code>, <code>cursor.up</code></td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">[</span> / <span class="key-chip">]</span></td>
+            <td>Previous / next file in diff</td>
+            <td><code>diff.prev-file</code>, <code>diff.next-file</code></td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">&lt;</span> / <span class="key-chip">&gt;</span> (or <span class="key-chip">H</span> / <span class="key-chip">L</span>)</td>
+            <td>Scroll diff horizontally</td>
+            <td><code>view.left</code>, <code>view.right</code></td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">Ctrl+u</span> / <span class="key-chip">Ctrl+d</span></td>
+            <td>Page up / page down</td>
+            <td>Half-page scroll in active list or diff</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Global Git Verbs -->
+    <div class="doc-section">
+      <h2>2. Global Git Verbs</h2>
+      <table class="guide-table">
+        <thead>
+          <tr>
+            <th>Shortcut</th>
+            <th>Command</th>
+            <th>Description</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><span class="key-chip">P</span> (Shift+p)</td>
+            <td><code>repo.push</code></td>
+            <td>Pushes local branch to upstream remote (<code>git push</code>)</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">p</span></td>
+            <td><code>repo.pull</code></td>
+            <td>Pulls upstream changes onto checked-out branch (<code>git pull</code>)</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">f</span></td>
+            <td><code>repo.fetch</code></td>
+            <td>Fetches latest refs from remotes without merging</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">R</span> (Shift+r)</td>
+            <td><code>repo.refresh</code></td>
+            <td>Re-runs reads across all panes; refreshes git state</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">y</span></td>
+            <td><code>copy.selection</code></td>
+            <td>Copies selected commit SHA, branch name, or file path to clipboard</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">/</span></td>
+            <td><code>*.search</code></td>
+            <td>Opens interactive live filter in the focused list</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">?</span></td>
+            <td><code>help.show</code></td>
+            <td>Opens comprehensive lazygit keymap cheat sheet overlay</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Pane-Specific Verbs -->
+    <div class="doc-section">
+      <h2>3. Contextual Pane Verbs</h2>
+      <table class="guide-table">
+        <thead>
+          <tr>
+            <th>Pane</th>
+            <th>Shortcut</th>
+            <th>Action</th>
+            <th>Behavior</th>
+          </tr>
+        </thead>
+        <tbody>
+          <!-- Files -->
+          <tr>
+            <td rowspan="6"><strong>Files</strong> (<span class="key-chip">2</span>)</td>
+            <td><span class="key-chip">␣</span> (Space)</td>
+            <td>Stage / unstage file</td>
+            <td>Toggles selected row between Staged and Unstaged</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">c</span></td>
+            <td>Commit staged</td>
+            <td>Opens commit message editor for staged changes</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">A</span></td>
+            <td>Amend commit</td>
+            <td>Amends staged changes into <code>HEAD</code> commit</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">a</span></td>
+            <td>Stage all</td>
+            <td>Stages (or unstages) all files in the working tree</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">D</span></td>
+            <td>Discard changes</td>
+            <td>Discards working tree modifications (destructive; asks twice)</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">s</span></td>
+            <td>Stash working tree</td>
+            <td>Parks unstaged/working-tree changes into stash</td>
+          </tr>
+
+          <!-- Branches -->
+          <tr>
+            <td rowspan="5"><strong>Branches</strong> (<span class="key-chip">3</span>)</td>
+            <td><span class="key-chip">␣</span> (Space)</td>
+            <td>Checkout branch</td>
+            <td>Switches <code>HEAD</code> to the selected branch</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">n</span></td>
+            <td>New branch</td>
+            <td>Prompts for a new branch name branched from <code>HEAD</code></td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">r</span></td>
+            <td>Rebase onto branch</td>
+            <td>Rebases current branch onto selected branch (asks twice)</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">R</span></td>
+            <td>Rename branch</td>
+            <td>Renames selected branch</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">d</span></td>
+            <td>Delete branch</td>
+            <td>Deletes local branch (destructive; asks twice)</td>
+          </tr>
+
+          <!-- Commits -->
+          <tr>
+            <td rowspan="7"><strong>Commits</strong> (<span class="key-chip">4</span>)</td>
+            <td><span class="key-chip">␣</span> (Space)</td>
+            <td>Checkout commit</td>
+            <td>Detached checkout onto selected commit</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">s</span></td>
+            <td>Squash commit</td>
+            <td>Squashes commit down into parent (rewrites history)</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">f</span></td>
+            <td>Fixup commit</td>
+            <td>Melds commit into parent, discarding commit message</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">d</span></td>
+            <td>Drop commit</td>
+            <td>Deletes commit from branch history (asks twice)</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">r</span></td>
+            <td>Reword commit</td>
+            <td>Edits commit message of selected commit</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">g</span></td>
+            <td>Reset menu</td>
+            <td>Opens reset menu: <span class="key-chip">s</span> soft, <span class="key-chip">m</span> mixed, <span class="key-chip">h</span> hard</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">t</span></td>
+            <td>Revert commit</td>
+            <td>Creates a new commit reversing the changes of this commit</td>
+          </tr>
+
+          <!-- Diff -->
+          <tr>
+            <td rowspan="4"><strong>Diff</strong> (<span class="key-chip">0</span>/<span class="key-chip">↵</span>)</td>
+            <td><span class="key-chip">␣</span> (Space)</td>
+            <td>Stage hunk / line</td>
+            <td>Stages the selected diff hunk or line into the index</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">u</span></td>
+            <td>Unstage hunk</td>
+            <td>Removes hunk from the index back to working tree</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">D</span></td>
+            <td>Discard hunk</td>
+            <td>Discards hunk changes from working tree (asks twice)</td>
+          </tr>
+          <tr>
+            <td><span class="key-chip">e</span></td>
+            <td>Explain hunk (AI)</td>
+            <td>Toggles contextual AI explanation for currently focused hunk</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
