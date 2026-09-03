@@ -34,6 +34,7 @@ pub mod rows;
 
 use gitten_app::MIN_WRAP_COLS;
 use gitten_core::host::Host;
+use gitten_core::view::Viewport;
 use http::{Request, Response};
 use log::Log;
 use rows::Doc;
@@ -64,6 +65,53 @@ pub struct State {
     pub label: String,
     pub host: Host,
     pub data: Data,
+    /// The agent's cursor: what `POST /api/dispatch` moves.
+    ///
+    /// The browser has none of this — it keeps its own scroll position and asks
+    /// for windows of rows — so one viewport per process is enough for the same
+    /// reason one `Doc` is: this serves a single reader. Behind a `Mutex`
+    /// because a dispatch mutates it, like a reflow mutates the `Doc`.
+    view: Mutex<Viewport>,
+}
+
+/// How many rows one screenful is before the agent says otherwise.
+///
+/// The browser never asks — it draws its own height — so this is only the
+/// opening value for `POST /api/dispatch`, replaceable per request with
+/// `args.height`. Forty rows is a terminal screen, the unit every `page`
+/// command in `core` already thinks in.
+const DISPATCH_HEIGHT: usize = 40;
+
+/// What a dispatch that names a real command but no headless meaning is told.
+///
+/// The registry's own one-liner is the `error`; this is the `hint` — where to
+/// do it instead, because an agent with nobody at the keyboard needs a next
+/// step rather than a refusal.
+const WRITES_HINT: &str =
+    "this API never changes the repository — run the verb in the terminal that started this server";
+const PANES_HINT: &str =
+    "this server holds one view — start gitten-web with the other subcommand for the others";
+const KEYS_HINT: &str = "GET /api/keys lists the commands this view answers to";
+
+impl State {
+    /// One viewport over whichever view was loaded, sized for an agent that
+    /// has not named its own height yet.
+    pub fn new(label: String, host: Host, data: Data) -> Self {
+        let len = match &data {
+            Data::Diff(doc) => doc.lock().unwrap_or_else(|p| p.into_inner()).total(),
+            Data::Commits(log) => log.len(),
+        };
+        let mut view = Viewport::new();
+        view.set_len(len);
+        view.set_height(DISPATCH_HEIGHT);
+        view.set_scrolloff(host.view.scrolloff);
+        Self {
+            label,
+            host,
+            data,
+            view: Mutex::new(view),
+        }
+    }
 }
 
 impl State {
@@ -94,6 +142,17 @@ impl State {
     }
 
     pub fn route(&self, req: &Request) -> Response {
+        // The read routes are `GET`; the cursor is `POST`. A `POST` anywhere
+        // else is not a route that exists under another method — it is a
+        // client guessing at a write API this deliberately does not have.
+        if req.method == "POST" && req.path != "/api/dispatch" {
+            return err_json(
+                405,
+                "only /api/dispatch answers POST",
+                "method-not-allowed",
+                "GET the rows and meta routes; POST a {\"command\":...} body only to /api/dispatch",
+            );
+        }
         match (req.path.as_str(), &self.data) {
             // One page for both views. Which one it is arrives in `meta`, and
             // the script branches on it — a second page would be a second copy
@@ -132,6 +191,26 @@ impl State {
                 Response::json(out)
             }
 
+            // The agent's door: what is bound, what is configured, whether the
+            // server is up. View-independent — a keymap and a catalogue belong
+            // to the host, not to the view — so both views answer all three.
+            ("/api/keys", _) => {
+                let mut out = String::new();
+                api::keys(&mut out, &self.host);
+                Response::json(out)
+            }
+            ("/api/config", _) => {
+                let mut out = String::new();
+                api::config(&mut out, &self.host, &self.label);
+                Response::json(out)
+            }
+            ("/api/health", _) => {
+                let mut out = String::new();
+                api::health(&mut out);
+                Response::json(out)
+            }
+            ("/api/dispatch", _) => self.dispatch(req),
+
             // A route that exists for the other view is a different mistake from
             // one that does not exist at all, and saying so is what stops a
             // wrong subcommand looking like a broken build.
@@ -142,6 +221,241 @@ impl State {
             _ => Response::status(404, "no such route"),
         }
     }
+
+    /// Runs one named command against the loaded view.
+    ///
+    /// Resolution is [`Commands`](gitten_core::command::Commands)-first: an
+    /// unknown name is `unknown-command`, a name from the other view is
+    /// `wrong-view`, and a name nothing headless can do is `unavailable` with
+    /// somewhere to do it instead. What *runs* is the cursor verbs — `view.*`
+    /// and the file walk — because moving a cursor is the whole of what an
+    /// agent needs a server for, and everything else is a `hint`.
+    fn dispatch(&self, req: &Request) -> Response {
+        if req.method != "POST" {
+            return err_json(
+                405,
+                "dispatch takes POST",
+                "method-not-allowed",
+                "POST {\"command\":\"view.down\"} here; the read routes are GET",
+            );
+        }
+        let (command, args) = match api::parse_dispatch(&req.body) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return err_json(
+                    400,
+                    &error,
+                    "bad-request",
+                    "POST {\"command\":\"view.down\",\"args\":{\"by\":1}} — the commands are at GET /api/keys",
+                );
+            }
+        };
+        if !self.host.commands.known(&command) {
+            return err_json(
+                404,
+                &format!("no such command {command:?}"),
+                "unknown-command",
+                KEYS_HINT,
+            );
+        }
+
+        let mut view = self.view.lock().unwrap_or_else(|p| p.into_inner());
+        view.set_scrolloff(self.host.view.scrolloff);
+        match &self.data {
+            Data::Diff(doc) => {
+                let doc = doc.lock().unwrap_or_else(|p| p.into_inner());
+                view.set_len(doc.total());
+                if let Some(height) = args.height {
+                    view.set_height(height.clamp(1, 10_000));
+                }
+                if let Some(row) = args.row {
+                    view.go_to(row);
+                }
+                match command.as_str() {
+                    "view.down" => view.move_by(args.by.unwrap_or(1)),
+                    "view.up" => view.move_by(-args.by.unwrap_or(1)),
+                    "view.page-down" => view.page(args.pages.unwrap_or(1)),
+                    "view.page-up" => view.page(-args.pages.unwrap_or(1)),
+                    "view.top" => view.to_top(),
+                    "view.bottom" => view.to_bottom(),
+                    "view.scroll-down" => {
+                        view.scroll_by(args.by.unwrap_or(self.host.view.rows as isize));
+                    }
+                    "view.scroll-up" => {
+                        view.scroll_by(-args.by.unwrap_or(self.host.view.rows as isize));
+                    }
+                    "diff.next-file" => {
+                        let at = next_file(&doc, view.cursor(), true);
+                        let status = file_status(&doc, at);
+                        view.go_to(at);
+                        return ok_json(&command, &view, &status);
+                    }
+                    "diff.prev-file" => {
+                        let at = next_file(&doc, view.cursor(), false);
+                        let status = file_status(&doc, at);
+                        view.go_to(at);
+                        return ok_json(&command, &view, &status);
+                    }
+                    name if name.starts_with("commits.") || name.starts_with("reset") => {
+                        return err_json(
+                            404,
+                            &format!("{command} needs the commits view"),
+                            "wrong-view",
+                            PANES_HINT,
+                        );
+                    }
+                    _ => return unavailable(&command),
+                }
+            }
+            Data::Commits(log) => {
+                view.set_len(log.len());
+                if let Some(height) = args.height {
+                    view.set_height(height.clamp(1, 10_000));
+                }
+                if let Some(row) = args.row {
+                    view.go_to(row);
+                }
+                match command.as_str() {
+                    "view.down" => view.move_by(args.by.unwrap_or(1)),
+                    "view.up" => view.move_by(-args.by.unwrap_or(1)),
+                    "view.page-down" => view.page(args.pages.unwrap_or(1)),
+                    "view.page-up" => view.page(-args.pages.unwrap_or(1)),
+                    "view.top" => view.to_top(),
+                    "view.bottom" => view.to_bottom(),
+                    "view.scroll-down" => {
+                        view.scroll_by(args.by.unwrap_or(self.host.view.rows as isize));
+                    }
+                    "view.scroll-up" => {
+                        view.scroll_by(-args.by.unwrap_or(self.host.view.rows as isize));
+                    }
+                    name if name.starts_with("diff.") => {
+                        return err_json(
+                            404,
+                            &format!("{command} needs the diff view"),
+                            "wrong-view",
+                            PANES_HINT,
+                        );
+                    }
+                    _ => return unavailable(&command),
+                }
+            }
+        }
+        ok_json(
+            &command,
+            &view,
+            &format!(
+                "row {} of {} · top {}",
+                view.cursor(),
+                view.len(),
+                view.top()
+            ),
+        )
+    }
+}
+
+/// The first file header after `cursor` — or before it — in visual rows.
+///
+/// Clamps rather than wraps, like [`Viewport::move_by`](gitten_core::view::Viewport::move_by):
+/// past the last file stays on the last file, because a list that jumps from
+/// the last file to the first loses the agent's place by the whole diff.
+fn next_file(doc: &Doc, cursor: usize, forward: bool) -> usize {
+    let mut rows: Vec<usize> = doc.files().iter().map(|e| doc.visual(e.row)).collect();
+    rows.sort();
+    match forward {
+        true => rows.into_iter().find(|&r| r > cursor).unwrap_or(cursor),
+        false => rows
+            .into_iter()
+            .rev()
+            .find(|&r| r < cursor)
+            .unwrap_or(cursor),
+    }
+}
+
+/// The status line a file walk answers with: which file the cursor landed on.
+fn file_status(doc: &Doc, at: usize) -> String {
+    let found = doc
+        .files()
+        .iter()
+        .find(|e| doc.visual(e.row) == at)
+        .map(|e| e.path.as_str());
+    match found {
+        Some(path) => format!("file {path} · row {at} of {}", doc.total()),
+        None => format!("row {at} of {}", doc.total()),
+    }
+}
+
+/// A command that names something real but does nothing headless: which kind
+/// of nothing, and where to do it instead.
+fn unavailable(command: &str) -> Response {
+    let hint = match command {
+        "quit" => "close the tab; Ctrl-C the terminal that started this server",
+        "help" => "GET /api/keys is the help screen, as data",
+        "view.left" | "view.right" => {
+            "the web view wraps text instead of scrolling it sideways — see ?wrap= and ?cols="
+        }
+        "diff.cycle-wrap" => {
+            "pass ?wrap= and ?cols= on the rows request instead — the names are at GET /api/config"
+        }
+        "diff.cycle-layout" => {
+            "the browser draws its own presentation; there is no server layout to cycle"
+        }
+        "theme.cycle" => {
+            "the palette rides in every meta payload; pick client-side or restart with another gitten.toml theme"
+        }
+        "commits.open-diff" => {
+            "one server holds one view — start a second gitten-web on that commit"
+        }
+        name
+            if name.starts_with("repo.")
+                || name.starts_with("rebase.")
+                || name.starts_with("files.stage")
+                || name.starts_with("files.commit")
+                || name.starts_with("files.amend")
+                || name.starts_with("files.discard")
+                || name.starts_with("files.ignore")
+                || name.starts_with("files.stash")
+                || name.starts_with("stashes.")
+                || name.starts_with("branches.")
+                || name.starts_with("commits.reset-")
+                || name.starts_with("commits.revert")
+                || name.starts_with("commits.squash")
+                || name.starts_with("commits.fixup")
+                || name.starts_with("commits.drop")
+                || name.starts_with("commits.rebase")
+                || name.starts_with("commits.cherry-pick")
+                || name.starts_with("commits.new-")
+                || name.starts_with("commits.checkout")
+                || name.starts_with("diff.stage-")
+                || name.starts_with("diff.unstage-")
+                || name.starts_with("diff.discard-") =>
+        {
+            WRITES_HINT
+        }
+        name if name.ends_with(".focus") || name.ends_with(".search") => PANES_HINT,
+        _ => KEYS_HINT,
+    };
+    err_json(
+        422,
+        &format!("{command} is not actionable over HTTP"),
+        "unavailable",
+        hint,
+    )
+}
+
+/// A dispatch that ran, with the viewport it left behind.
+fn ok_json(command: &str, view: &Viewport, status: &str) -> Response {
+    let mut out = String::new();
+    api::dispatch_ok(&mut out, command, view, status);
+    Response::json(out)
+}
+
+/// A dispatch that did not run, at the HTTP status its `code` maps to.
+fn err_json(status: u16, error: &str, code: &str, hint: &str) -> Response {
+    let mut out = String::new();
+    api::dispatch_err(&mut out, error, code, hint);
+    let mut response = Response::json(out);
+    response.status = status;
+    response
 }
 
 #[cfg(test)]
@@ -158,11 +472,7 @@ mod tests {
             &host.syntax,
             gitten_app::MAX_LINE_CHARS,
         ));
-        State {
-            label: "test".into(),
-            host,
-            data: Data::Diff(Mutex::new(doc)),
-        }
+        State::new("test".into(), host, Data::Diff(Mutex::new(doc)))
     }
 
     /// `Request` builds from a target the way the server does, so a test asks
@@ -170,6 +480,19 @@ mod tests {
     fn get(state: &State, target: &str) -> Response {
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
         state.route(&Request::new(path, query))
+    }
+
+    /// What an agent posts: the command, as JSON, the way the server reads it.
+    fn post(state: &State, command: &str, args: &str) -> (u16, String) {
+        let r = state.route(&Request::post(
+            "/api/dispatch",
+            "",
+            &format!("{{\"command\":\"{command}\",\"args\":{{{args}}}}}"),
+        ));
+        (
+            r.status,
+            String::from_utf8(r.body).expect("a response is UTF-8"),
+        )
     }
 
     fn body(r: Response) -> String {
@@ -241,11 +564,7 @@ mod tests {
     fn the_commits_view_serves_its_own_rows() {
         let host = Host::new();
         let log = parse_log("aaaa1111\x1faaaa111\x1f\x1fAda Lovelace\x1f1700000000\x1froot\x1e");
-        let s = State {
-            label: "t".into(),
-            host,
-            data: Data::Commits(Log::build(log)),
-        };
+        let s = State::new("t".into(), host, Data::Commits(Log::build(log)));
         let out = body(get(&s, "/api/commits?from=0&count=10"));
         assert!(out.contains("\"subject\":\"root\""));
         assert!(out.contains("\"initials\":\"AL\""));
@@ -277,5 +596,97 @@ mod tests {
         let r = get(&s, "/api/rows?from=0&count=10");
         assert_eq!(r.status, 200);
         assert!(body(r).starts_with("{\"from\":0,"));
+    }
+
+    #[test]
+    fn the_agent_routes_are_served_on_both_views() {
+        for s in [
+            diff_state(),
+            State::new(
+                "t".into(),
+                Host::new(),
+                Data::Commits(Log::build(parse_log(
+                    "aaaa1111\x1faaaa111\x1f\x1fAda Lovelace\x1f1700000000\x1froot\x1e",
+                ))),
+            ),
+        ] {
+            let keys = body(get(&s, "/api/keys"));
+            assert!(keys.contains("\"kind\":\"keys\""), "{keys}");
+            assert!(keys.contains("\"command\":\"view.down\""), "{keys}");
+            let config = body(get(&s, "/api/config"));
+            assert!(config.contains("\"kind\":\"config\""), "{config}");
+            assert!(config.contains("\"selected\":\"histogram\""), "{config}");
+            let health = body(get(&s, "/api/health"));
+            assert!(health.contains("\"ok\":true"), "{health}");
+            assert!(health.contains("\"service\":\"gitten-web\""), "{health}");
+        }
+    }
+
+    #[test]
+    fn a_dispatch_moves_the_cursor_and_says_where_it_landed() {
+        let s = diff_state();
+        let (status, out) = post(&s, "view.down", "\"by\":2");
+        assert_eq!(status, 200, "{out}");
+        assert!(out.contains("\"ok\":true"), "{out}");
+        assert!(out.contains("\"command\":\"view.down\""), "{out}");
+        assert!(out.contains("\"cursor\":2"), "{out}");
+        assert!(out.contains("\"viewport\":"), "{out}");
+        assert!(out.contains("\"status\":"), "{out}");
+        // And the cursor stays moved: the next dispatch starts from row 2.
+        let (status, out) = post(&s, "view.up", "");
+        assert_eq!(status, 200, "{out}");
+        assert!(out.contains("\"cursor\":1"), "{out}");
+        // An absolute row beats a relative one for an agent that just read
+        // `?from=` addresses.
+        let (status, out) = post(&s, "view.down", "\"row\":0,\"by\":0");
+        assert_eq!(status, 200, "{out}");
+        assert!(out.contains("\"cursor\":0"), "{out}");
+    }
+
+    #[test]
+    fn a_dispatch_of_a_file_walk_names_the_file_it_landed_on() {
+        let s = diff_state();
+        let (status, out) = post(&s, "diff.next-file", "");
+        assert_eq!(status, 200, "{out}");
+        // One file in the fixture and the cursor opens on it: clamping keeps
+        // it there rather than inventing a second file.
+        assert!(out.contains("a.rs"), "{out}");
+        assert!(out.contains("\"cursor\":0"), "{out}");
+    }
+
+    #[test]
+    fn a_dispatch_that_cannot_run_names_its_code_and_a_hint() {
+        let s = diff_state();
+        let (status, out) = post(&s, "frobnicate", "");
+        assert_eq!(status, 404, "{out}");
+        assert!(out.contains("\"code\":\"unknown-command\""), "{out}");
+        assert!(out.contains("\"hint\":"), "{out}");
+
+        let (status, out) = post(&s, "commits.search", "");
+        assert_eq!(status, 404, "{out}");
+        assert!(out.contains("\"code\":\"wrong-view\""), "{out}");
+
+        let (status, out) = post(&s, "repo.push", "");
+        assert_eq!(status, 422, "{out}");
+        assert!(out.contains("\"code\":\"unavailable\""), "{out}");
+        assert!(out.contains("never changes the repository"), "{out}");
+
+        // A body with no command is a 400, not a guess.
+        let r = s.route(&Request::post("/api/dispatch", "", "{}"));
+        assert_eq!(r.status, 400);
+        assert!(body(r).contains("\"code\":\"bad-request\""));
+    }
+
+    #[test]
+    fn dispatch_is_post_only_and_post_is_dispatch_only() {
+        let s = diff_state();
+        // Reading the cursor is not a `GET`: a URL that moves state belongs in
+        // no history, prefetch or log.
+        let r = get(&s, "/api/dispatch?command=view.down");
+        assert_eq!(r.status, 405);
+        assert!(body(r).contains("\"code\":\"method-not-allowed\""));
+        // And a `POST` to a read route is not a second way to read it.
+        let r = s.route(&Request::post("/api/rows", "from=0", ""));
+        assert_eq!(r.status, 405);
     }
 }

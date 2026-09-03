@@ -13,12 +13,14 @@
 use crate::json::*;
 use crate::log::Log;
 use crate::rows::Doc;
+use gitten_core::command::{HelpRow, Modes};
 use gitten_core::graph::{Draw, MAX_LANES};
 use gitten_core::host::Host;
 use gitten_core::rows::Row;
 use gitten_core::runs::{runs, Run};
 use gitten_core::syntax::Kind;
 use gitten_core::theme::{Surface, Theme};
+use gitten_core::view::Viewport;
 use gitten_core::LineKind;
 
 /// The name a client uses for a syntax class.
@@ -379,6 +381,295 @@ pub fn commits(out: &mut String, log: &Log, host: &Host, from: usize, count: usi
     });
 }
 
+/// Every key an agent can press, as data.
+///
+/// Two lists and not one, because a key that moves a diff and a key that opens
+/// one never share a screen: `diff` runs [`Modes`] `[global, diff]`, `commits`
+/// runs `[global, commits, reset]` — each through the same
+/// [`Keymap::help`](gitten_core::command::Keymap::help) the window's help panel
+/// reads, so the three can never disagree about what a key does. Flat rows with
+/// the mode on each, rather than headings with rows under them: an agent filters
+/// these, it does not lay them out.
+pub fn keys(out: &mut String, host: &Host) {
+    let mut diff = Modes::new();
+    diff.push("diff");
+    let mut commits = Modes::new();
+    commits.push("commits");
+    commits.push("reset");
+    object(out, |o, f| {
+        field_str(o, f, "kind", "keys");
+        key(o, f, "diff");
+        help_list(o, host, &diff);
+        key(o, f, "commits");
+        help_list(o, host, &commits);
+    });
+}
+
+/// One [`Keymap::help`](gitten_core::command::Keymap::help) projection as a
+/// flat array. The blank separators are presentation — air between two modes —
+/// so they are dropped, and the mode travels on each row instead of in a
+/// heading above it.
+fn help_list(out: &mut String, host: &Host, modes: &Modes) {
+    out.push('[');
+    let mut first_item = true;
+    let rows = host.keys.help(&host.commands, modes);
+    let mut mode = "";
+    for row in &rows {
+        match row {
+            HelpRow::Mode(m) => mode = m,
+            HelpRow::Command { name, keys, doc } => {
+                if !first_item {
+                    out.push(',');
+                }
+                first_item = false;
+                object(out, |o, f| {
+                    field_str(o, f, "mode", mode);
+                    field_str(o, f, "command", name);
+                    field_str(o, f, "keys", keys);
+                    field_str(o, f, "doc", doc);
+                });
+            }
+            HelpRow::Blank => {}
+        }
+    }
+    out.push(']');
+}
+
+/// Everything an agent may assume about the configuration, and the names it
+/// may pass back.
+///
+/// `meta` carries the palette in full; this carries the *catalogues* — every
+/// wrap, differ and theme name registered, with which one is selected — so an
+/// agent asking for `?wrap=word` knows `word` exists before it asks. Read-only:
+/// changing any of these is a `gitten.toml` edit and a restart, not a request.
+pub fn config(out: &mut String, host: &Host, label: &str) {
+    object(out, |o, f| {
+        field_str(o, f, "kind", "config");
+        field_str(o, f, "label", label);
+        field_str(o, f, "layout", &host.layout);
+        key(o, f, "wrap");
+        object(o, |o, f| {
+            key(o, f, "names");
+            list(o, host.wrap.names(), string);
+            field_str(o, f, "selected", host.wrap.selected());
+        });
+        key(o, f, "differ");
+        object(o, |o, f| {
+            key(o, f, "names");
+            list(o, host.differ.names(), string);
+            field_str(o, f, "selected", host.differ.selected());
+            field_num(o, f, "context", host.differ.context);
+        });
+        key(o, f, "themes");
+        object(o, |o, f| {
+            key(o, f, "names");
+            list(o, host.themes.names(), string);
+            field_str(o, f, "selected", &host.theme.name);
+        });
+        key(o, f, "view");
+        object(o, |o, f| {
+            field_num(o, f, "scrollRows", host.view.rows);
+            field_num(o, f, "scrolloff", host.view.scrolloff);
+            field_bool(o, f, "scrollbar", host.view.scrollbar);
+        });
+    });
+}
+
+/// Whether the server is up. Nothing view-specific — an agent polls this before
+/// trusting any other route, and after a restart to learn the process is new.
+pub fn health(out: &mut String) {
+    object(out, |o, f| {
+        field_bool(o, f, "ok", true);
+        field_str(o, f, "service", "gitten-web");
+        field_str(o, f, "version", env!("CARGO_PKG_VERSION"));
+    });
+}
+
+/// Where the agent's cursor is, as `/api/rows?from=` addresses it: visual rows
+/// for a diff, list rows for commits.
+pub fn viewport(out: &mut String, first: &mut bool, v: &Viewport) {
+    key(out, first, "viewport");
+    object(out, |o, f| {
+        field_num(o, f, "cursor", v.cursor());
+        field_num(o, f, "top", v.top());
+        field_num(o, f, "len", v.len());
+        field_num(o, f, "height", v.height());
+    });
+}
+
+/// A dispatch that ran: what it did, where the cursor landed, and one line an
+/// agent can quote back.
+pub fn dispatch_ok(out: &mut String, command: &str, v: &Viewport, status: &str) {
+    object(out, |o, f| {
+        field_bool(o, f, "ok", true);
+        field_str(o, f, "command", command);
+        viewport(o, f, v);
+        field_str(o, f, "status", status);
+    });
+}
+
+/// A dispatch that did not run. `code` is the machine word — `bad-request`,
+/// `unknown-command`, `wrong-view`, `method-not-allowed`, `unavailable` — and
+/// `hint` says what to do instead, because an error an agent cannot act on is
+/// a dead end in the one client that has nobody at the keyboard.
+pub fn dispatch_err(out: &mut String, error: &str, code: &str, hint: &str) {
+    object(out, |o, f| {
+        field_bool(o, f, "ok", false);
+        field_str(o, f, "error", error);
+        field_str(o, f, "code", code);
+        field_str(o, f, "hint", hint);
+    });
+}
+
+/// The arguments a dispatch body may carry, beside its command.
+///
+/// All optional. `row` moves the cursor absolutely first — `?from=` addressing,
+/// visual rows for a diff — `height` sets how many rows a screenful is before
+/// anything else runs, and `by`/`pages` scale the one command they accompany.
+/// Unknown fields are ignored, so a newer agent's body still runs here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DispatchArgs {
+    pub row: Option<usize>,
+    pub by: Option<isize>,
+    pub pages: Option<isize>,
+    pub height: Option<usize>,
+}
+
+/// Parses `{"command":"view.down","args":{"by":3}}` without a JSON dependency.
+///
+/// There is deliberately no JSON reader in this crate — see `json.rs` — and a
+/// four-field body does not justify one. What this understands is a string
+/// valued `command` and a flat `args` object of integers; anything else is a
+/// `bad-request` naming what was wanted rather than a guess.
+pub fn parse_dispatch(body: &str) -> Result<(String, DispatchArgs), String> {
+    const SHAPE: &str = "{\"command\":\"view.down\",\"args\":{\"by\":1}}";
+    let command = extract_str(body, "command")
+        .ok_or_else(|| format!("a dispatch needs a \"command\" string, e.g. {SHAPE}"))?;
+    if command.is_empty() {
+        return Err(format!(
+            "a dispatch needs a \"command\" string, e.g. {SHAPE}"
+        ));
+    }
+    let args = extract_object(body, "args").unwrap_or_default();
+    let num = |name: &str| extract_num(&args, name);
+    let non_negative = |name: &str| match num(name) {
+        Some(n) if n < 0 => Err(format!("\"{name}\" wants zero or more, not {n}")),
+        Some(n) => Ok(Some(n as usize)),
+        None => Ok(None),
+    };
+    Ok((
+        command,
+        DispatchArgs {
+            row: non_negative("row")?,
+            by: num("by").map(|n| n as isize),
+            pages: num("pages").map(|n| n as isize),
+            height: non_negative("height")?,
+        },
+    ))
+}
+
+/// The value of `"key":"..."` in a flat object, with the escapes a command
+/// name could plausibly carry handled and the rest left to the caller to
+/// reject. The first match wins; bodies are machine-made and nesting `command`
+/// inside `args` is not a shape this reads.
+fn extract_str(src: &str, name: &str) -> Option<String> {
+    let mut rest = src;
+    let quoted = format!("\"{name}\"");
+    loop {
+        let at = rest.find(quoted.as_str())?;
+        let after = rest[at + quoted.len()..].trim_start();
+        let value = after.strip_prefix(':').map(str::trim_start)?;
+        rest = value;
+        if let Some(lit) = value.strip_prefix('"') {
+            let mut out = String::new();
+            let mut chars = lit.chars();
+            loop {
+                match chars.next()? {
+                    '"' => return Some(out),
+                    '\\' => match chars.next()? {
+                        '"' => out.push('"'),
+                        '\\' => out.push('\\'),
+                        '/' => out.push('/'),
+                        'n' => out.push('\n'),
+                        'r' => out.push('\r'),
+                        't' => out.push('\t'),
+                        c => {
+                            out.push('\\');
+                            out.push(c);
+                        }
+                    },
+                    c => out.push(c),
+                }
+            }
+        }
+    }
+}
+
+/// The value of `"key":123` in a flat object. Negative for the two arguments
+/// that take a direction; the caller decides which those are.
+fn extract_num(src: &str, name: &str) -> Option<i64> {
+    let mut rest = src;
+    let quoted = format!("\"{name}\"");
+    loop {
+        let at = rest.find(quoted.as_str())?;
+        let after = rest[at + quoted.len()..].trim_start();
+        let value = after.strip_prefix(':').map(str::trim_start)?;
+        rest = value;
+        let digits = value
+            .strip_prefix('-')
+            .unwrap_or(value)
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>();
+        if digits.is_empty() {
+            continue;
+        }
+        let negative = value.starts_with('-');
+        let n: i64 = digits.parse().ok()?;
+        return Some(match negative {
+            true => n.saturating_neg(),
+            false => n,
+        });
+    }
+}
+
+/// The `{...}` valued `"key"` of an object, braces included, or `None` when it
+/// is absent or not an object. Balanced and string-aware, so a `}` inside a
+/// string does not end it early.
+fn extract_object(src: &str, name: &str) -> Option<String> {
+    let quoted = format!("\"{name}\"");
+    let at = src.find(quoted.as_str())?;
+    let mut after = src[at + quoted.len()..].trim_start();
+    after = after.strip_prefix(':')?.trim_start();
+    after = after.strip_prefix('{')?;
+    let mut depth = 1i32;
+    let mut in_str = false;
+    let mut escaped = false;
+    for (i, c) in after.char_indices() {
+        if in_str {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(format!("{{{}}}", &after[..i]));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// One row's plan: where the dot is, and every half that reaches it.
 fn draw(out: &mut String, first: &mut bool, d: &Draw) {
     field_num(out, first, "lane", d.lane);
@@ -546,5 +837,128 @@ diff --git a/a.rs b/a.rs
             meta.contains("\"laneOverflow\":"),
             "the palette did not ride along"
         );
+    }
+
+    #[test]
+    fn the_keys_payload_is_well_formed_and_both_views_agree_with_help() {
+        let host = Host::new();
+        let mut out = String::new();
+        keys(&mut out, &host);
+        well_formed(&out);
+        assert!(out.contains("\"kind\":\"keys\""), "{out}");
+        // One row from each end of the map, each carrying its mode.
+        assert!(
+            out.contains("\"command\":\"view.down\",\"keys\":\"j / down\""),
+            "{out}"
+        );
+        assert!(out.contains("\"command\":\"diff.next-file\""), "{out}");
+        assert!(out.contains("\"command\":\"commits.search\""), "{out}");
+        // The same projection the window's help panel reads — spot-check one
+        // doc line rather than re-asserting the whole registry here.
+        assert!(out.contains("\"doc\":\"one row down\""), "{out}");
+        // No blank separators leak into the wire: air between modes is layout.
+        assert!(!out.contains("Blank"), "{out}");
+    }
+
+    #[test]
+    fn the_config_payload_names_every_catalogue_and_its_selection() {
+        let host = Host::new();
+        let mut out = String::new();
+        config(&mut out, &host, "test");
+        well_formed(&out);
+        assert!(out.contains("\"kind\":\"config\""), "{out}");
+        assert!(out.contains("\"label\":\"test\""), "{out}");
+        assert!(out.contains("\"layout\":\"unified\""), "{out}");
+        for name in host.wrap.names() {
+            assert!(out.contains(&format!("\"{name}\"")), "wrap {name} missing");
+        }
+        assert!(out.contains("\"selected\":\"word\""), "{out}");
+        for name in host.differ.names() {
+            assert!(
+                out.contains(&format!("\"{name}\"")),
+                "differ {name} missing"
+            );
+        }
+        assert!(out.contains("\"selected\":\"histogram\""), "{out}");
+        assert!(out.contains("\"context\":3"), "{out}");
+        for name in host.themes.names() {
+            assert!(out.contains(&format!("\"{name}\"")), "theme {name} missing");
+        }
+        assert!(out.contains("\"scrolloff\":3"), "{out}");
+    }
+
+    #[test]
+    fn the_health_payload_is_well_formed_and_affirmative() {
+        let mut out = String::new();
+        health(&mut out);
+        well_formed(&out);
+        assert!(out.contains("\"ok\":true"), "{out}");
+        assert!(out.contains("\"service\":\"gitten-web\""), "{out}");
+        assert!(out.contains("\"version\":"), "{out}");
+    }
+
+    #[test]
+    fn a_dispatch_outcome_is_well_formed_either_way() {
+        let mut v = gitten_core::view::Viewport::new();
+        v.set_len(100);
+        v.set_height(20);
+        v.move_by(12);
+        let mut ok = String::new();
+        dispatch_ok(&mut ok, "view.down", &v, "row 12 of 100");
+        well_formed(&ok);
+        assert!(ok.contains("\"ok\":true"), "{ok}");
+        assert!(ok.contains("\"command\":\"view.down\""), "{ok}");
+        assert!(ok.contains("\"cursor\":12"), "{ok}");
+        assert!(ok.contains("\"status\":\"row 12 of 100\""), "{ok}");
+
+        let mut err = String::new();
+        dispatch_err(
+            &mut err,
+            "no such command \"frobnicate\"",
+            "unknown-command",
+            "see GET /api/keys",
+        );
+        well_formed(&err);
+        assert!(err.contains("\"ok\":false"), "{err}");
+        assert!(err.contains("\"code\":\"unknown-command\""), "{err}");
+        assert!(err.contains("\"hint\":"), "{err}");
+    }
+
+    #[test]
+    fn a_dispatch_body_parses_the_command_and_its_integers() {
+        let (command, args) =
+            parse_dispatch("{\"command\":\"view.down\",\"args\":{\"by\":3}}").unwrap();
+        assert_eq!(command, "view.down");
+        assert_eq!(
+            args,
+            DispatchArgs {
+                by: Some(3),
+                ..DispatchArgs::default()
+            }
+        );
+        let (command, args) =
+            parse_dispatch("{\"command\": \"view.page-down\", \"args\": {\"pages\": -2, \"height\": 50, \"row\": 7}}")
+                .unwrap();
+        assert_eq!(command, "view.page-down");
+        assert_eq!(args.pages, Some(-2));
+        assert_eq!(args.height, Some(50));
+        assert_eq!(args.row, Some(7));
+        // No args is a body with just a command — everything is optional.
+        let (command, args) = parse_dispatch("{\"command\":\"view.top\"}").unwrap();
+        assert_eq!(command, "view.top");
+        assert_eq!(args, DispatchArgs::default());
+    }
+
+    #[test]
+    fn a_dispatch_body_with_no_command_is_a_named_error_and_not_a_guess() {
+        assert!(parse_dispatch("{}").is_err());
+        assert!(parse_dispatch("{\"command\":\"\"}").is_err());
+        assert!(parse_dispatch("not json at all").is_err());
+        assert!(parse_dispatch("{\"command\":\"view.down\",\"args\":{\"row\":-1}}").is_err());
+        // Extra fields are ignored, so a newer agent's body still runs here.
+        let (command, _) =
+            parse_dispatch("{\"command\":\"view.down\",\"args\":{\"by\":1,\"frob\":\"x\"}}")
+                .unwrap();
+        assert_eq!(command, "view.down");
     }
 }

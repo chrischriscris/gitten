@@ -59,11 +59,7 @@ fn main() {
     // `Rc`, not `Arc`: requests run on the serving thread (see http.rs) and the
     // host behind this state is deliberately not Send. An Arc here is the same
     // type with a promise nothing keeps.
-    let state = Rc::new(State {
-        label: label.clone(),
-        host: started.host,
-        data,
-    });
+    let state = Rc::new(State::new(label.clone(), started.host, data));
 
     // Printed, never opened. A browser window appearing on its own interrupts
     // whoever is at the keyboard — the same reason `./dev` is a rebuild and not
