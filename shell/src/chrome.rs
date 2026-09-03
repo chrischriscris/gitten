@@ -28,9 +28,9 @@ use gpui::*;
 /// turning each stacked pane into a card.
 pub const HEADER_H: f32 = 28.0;
 
-/// Height of the bottom bar. Thirty-six pixels gives its mode and shortcuts
+/// Height of the bottom bar. Forty pixels gives its mode and shortcuts
 /// enough weight to balance the 44px title bar without becoming a second pane.
-pub const STATUS_H: f32 = 36.0;
+pub const STATUS_H: f32 = 40.0;
 
 /// Left padding of every list row and section label. Ten pixels matches the
 /// pane header inset at the shipped font, so labels, status marks and names
@@ -57,8 +57,8 @@ pub const COMPACT_TEXT_SCALE: f32 = 0.8;
 pub const TOPBAR_TEXT_SCALE: f32 = 0.93;
 /// Repository path and other primary title-bar text.
 pub const TITLE_TEXT_SCALE: f32 = 1.0;
-/// Bottom-bar hints: compact, but large enough to scan continuously.
-pub const STATUS_TEXT_SCALE: f32 = 0.87;
+/// Bottom-bar hints: full body size, so the shortcuts scan continuously.
+pub const STATUS_TEXT_SCALE: f32 = 1.0;
 /// The bottom bar's mode badge is a compact locator, not body text.
 const STATUS_BADGE_TEXT_SCALE: f32 = 0.73;
 /// The version is the quietest text in the bar.
