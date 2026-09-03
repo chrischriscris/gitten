@@ -1,5 +1,9 @@
 /target
 
+# Worktree checkouts. See docs/worktrees.md — nested inside the repo by
+# convention, never committed:
+/.worktrees/
+
 # Generated and downloaded fixtures. All reproducible:
 #   ./fixtures/fetch.sh              real diffs + the bun tree
 #   ./fixtures/dump.sh <repo> [n]    from any local repo

@@ -6092,10 +6092,19 @@ fn main() {
             // A bare launch from Finder or `open` arrives with no arguments and a
             // working directory of `/`: the shared parse opens the default view
             // of `.`, which is not a repository, and there is no terminal for the
-            // failure to be printed to. Offer a repository instead of dying
-            // silently — anything explicit keeps today's behaviour and message.
+            // failure to be printed to. Open the most recent repository instead —
+            // or, with no history at all, offer one to pick. Anything explicit
+            // keeps today's behaviour and message.
             if matches!(exit, Exit::Failed(_)) {
                 if let Some(view) = bare {
+                    let recents = gitten_app::projects::load();
+                    if let Some(started) = open_recent(view, &recents) {
+                        let app =
+                            gpui_platform::application().with_assets(gpui_component_assets::Assets);
+                        start::mark("gpui application up; entering run");
+                        app.run(move |cx| open_main_window(started, cx));
+                        return;
+                    }
                     eprintln!("gitten: no repository here; choose one to open");
                     let app =
                         gpui_platform::application().with_assets(gpui_component_assets::Assets);
@@ -6109,9 +6118,10 @@ fn main() {
 }
 
 /// What `main` opens once startup produced it: globals, the config watcher, the
-/// menus and the window itself. One function so both entries — a repository
-/// from the command line, or one picked after a bare launch found none — build
-/// the same window through the same path.
+/// menus and the window itself. One function so every entry — a repository
+/// from the command line, the latest recent after a bare launch found none,
+/// or one picked after that found none either — builds the same window
+/// through the same path.
 fn open_main_window(started: Started, cx: &mut App) {
     start::mark("startup done (args + gitten.toml + acquire)");
     let Started {
@@ -6641,8 +6651,9 @@ fn open_main_window(started: Started, cx: &mut App) {
 /// `open /Applications/gitten.app` arrives with no arguments and a working
 /// directory of `/`: the shared parse reads that as the default view of `.`,
 /// which is not a repository, and startup fails before any window exists. The
-/// shell answers that one case with a picker (see [`offer_repo_then_open`])
-/// instead of a message nobody can see. Anything explicit — a path,
+/// shell answers that one case with the latest recent repository (see
+/// [`open_recent`]), or with a picker when there is no history yet (see
+/// [`offer_repo_then_open`]) instead of a message nobody can see. Anything explicit — a path,
 /// `--fixtures`, a patch — is not this, and fails as it always has.
 fn bare_launch_view(args: &[String]) -> Option<View> {
     match gitten_app::cli::parse(args, View::Commits) {
@@ -6655,6 +6666,31 @@ fn bare_launch_view(args: &[String]) -> Option<View> {
 }
 
 /// A bare launch with nowhere to go: ask which repository to open.
+///
+/// First the latest recent repository that still opens — a Finder launch with
+/// history lands where it was, with no click. Only with no history at all, or
+/// nothing in it still a repository, does the system picker run: the first-ever
+/// launch has nowhere to return to. Takes the list rather than loading it so a
+/// test can hand in scratch paths without touching the real recent file.
+fn open_recent(view: View, recents: &[std::path::PathBuf]) -> Option<Started> {
+    for path in recents {
+        let retry = Startup::new("gitten", View::Commits)
+            .blurb("a git client")
+            .extra(EXTRA)
+            .args(vec![
+                view.name().to_string(),
+                path.to_string_lossy().into_owned(),
+            ])
+            .go();
+        if let Ok(started) = retry {
+            return Some(started);
+        }
+    }
+    None
+}
+
+/// A bare launch with nowhere to go and no recent to return to: ask which
+/// repository to open.
 ///
 /// Inside the event loop because the platform picker lives there. A choice
 /// retries the shared startup with that directory and builds the same window —
@@ -6755,8 +6791,8 @@ fn window_options(title: SharedString) -> WindowOptions {
 #[cfg(test)]
 mod tests {
     use super::{
-        bare_launch_view, config, files_header_count, input, panes, ContextMenu, DevShell,
-        GitError, Notice, Open, Pane, Refresh, Screen, Writes,
+        bare_launch_view, config, files_header_count, input, open_recent, panes, ContextMenu,
+        DevShell, GitError, Notice, Open, Pane, Refresh, Screen, Writes,
     };
     use crate::views::commits::Commits;
     use gitten_app::cli::{Source, View};
@@ -6782,8 +6818,8 @@ mod tests {
     #[test]
     fn a_bare_launch_names_its_view_and_nothing_else() {
         // What `open /Applications/gitten.app` arrives as: no arguments, and no
-        // source beyond the default. Only this shape gets a picker; everything
-        // a user actually typed fails as it always has.
+        // source beyond the default. Only this shape gets the recent-then-picker
+        // treatment; everything a user actually typed fails as it always has.
         assert_eq!(bare_launch_view(&args("")), Some(View::Commits));
         assert_eq!(bare_launch_view(&args("commits")), Some(View::Commits));
         assert_eq!(bare_launch_view(&args("diff")), Some(View::Diff));
@@ -6794,6 +6830,39 @@ mod tests {
         assert_eq!(bare_launch_view(&args("--help")), None);
         assert_eq!(bare_launch_view(&args("config")), None);
         assert_eq!(bare_launch_view(&args("bogus")), None);
+    }
+
+    #[test]
+    fn no_history_means_no_recent_to_open() {
+        assert!(open_recent(View::Commits, &[]).is_none());
+    }
+
+    #[test]
+    fn stale_recents_open_nothing() {
+        assert!(open_recent(View::Commits, &[PathBuf::from("/nonexistent-gitten-repo")]).is_none());
+    }
+
+    #[test]
+    fn a_bare_launch_returns_the_latest_recent_that_still_opens() {
+        // The workspace root is a repository with history — the same assumption
+        // `gitten-app`'s own startup test makes — so it stands in for a recent
+        // entry that survived, behind one that did not.
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the shell lives one level below the workspace root")
+            .to_path_buf();
+        let stale = PathBuf::from("/nonexistent-gitten-repo");
+        let started = open_recent(View::Commits, &[stale, root.clone()])
+            .expect("the workspace root is a repository");
+        assert_eq!(started.view, View::Commits);
+        match started.source {
+            Source::Repo { path, .. } => assert_eq!(path, root),
+            other => panic!("a repo source opens a repo, got {other:?}"),
+        }
+        // The requested view rides along: a bare `diff` launch returns to a
+        // working-tree diff, not to the commits default.
+        let started = open_recent(View::Diff, &[root]).expect("the workspace root is a repository");
+        assert_eq!(started.view, View::Diff);
     }
 
     struct ExtensionPane {

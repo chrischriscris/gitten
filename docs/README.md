@@ -16,6 +16,7 @@ which numbers those decisions rest on, and the diagrams.
 | [theming.md](theming.md) | colour as data, surfaces, contrast resolution |
 | [commit-graph.md](commit-graph.md) | lane assignment, hues, the cap, the drawing |
 | [terminal.md](terminal.md) | the terminal frontend, and what writing it moved into `core` |
+| [worktrees.md](worktrees.md) | where worktrees live, and the checklist for removing one |
 | [extending.md](extending.md) | every seam, with a worked example each |
 | [roadmap.md](roadmap.md) | build order from viewer to product, one block at a time |
 | [competition.md](competition.md) | what else is out there, what to steal and when |
