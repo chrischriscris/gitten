@@ -64,6 +64,14 @@ impl Generation {
         self.0
     }
 
+    /// A repository switch re-reads every pane without a write having
+    /// happened — the same invalidation a finished write causes, from a
+    /// different reason. Every screen's generation compares below the new
+    /// target, so the next refresh wave re-acquires all of them.
+    pub fn advance(self) -> Self {
+        self.next()
+    }
+
     fn next(self) -> Self {
         Self(self.0.saturating_add(1))
     }

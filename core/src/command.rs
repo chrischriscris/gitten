@@ -387,6 +387,12 @@ impl Keymap {
         // reads, not a fetch. The queue's own finish does the same dance
         // after every write; this is the same wave, asked for by hand.
         bind(GLOBAL, "R", "repo.refresh");
+        // The recent-repositories switcher, global because a repository is
+        // what every pane reads from: lowercase opens the list, capital
+        // types a path instead. Stepping between recents stays unbound —
+        // reachable from a config file, not worth a letter of its own.
+        bind(GLOBAL, "o", "project.switch");
+        bind(GLOBAL, "O", "project.open");
         // lazygit's sync keys, global because they aim past every pane
         // at the branch HEAD sits on: P sends it, p pulls onto its upstream,
         // f updates what the remotes hold. The capital is lazygit's own
@@ -1108,6 +1114,23 @@ impl Commands {
                 "repo.refresh",
                 "re-run every pane's reads from the repository",
                 Some("refresh"),
+            ),
+            (
+                "project.switch",
+                "switch to another recent repository",
+                None,
+            ),
+            ("project.next", "switch to the next recent repository", None),
+            (
+                "project.prev",
+                "switch to the previous recent repository",
+                None,
+            ),
+            ("project.open", "open a repository by typing its path", None),
+            (
+                "project.browse",
+                "choose a repository in the file manager",
+                None,
             ),
             ("diff.focus", "focus the diff view", None),
             ("input.accept", "accept the text", None),

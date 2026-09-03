@@ -70,6 +70,13 @@ impl<T> Panes<T> {
         self.entries.iter().map(|entry| &entry.value)
     }
 
+    /// The same registry, mutably — what a window-wide operation that keeps
+    /// every tenant's entity (a repository switch re-aims screens rather
+    /// than rebuilding them) needs to reach each screen in place.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        self.entries.iter_mut().map(|entry| &mut entry.value)
+    }
+
     /// Where a tenant lives, by its stable registration name — what a
     /// focus-by-name command (`files.focus`) needs to find it.
     pub fn position(&self, name: &str) -> Option<usize> {

@@ -57,6 +57,7 @@ pub mod cli;
 pub mod config;
 pub mod env;
 pub mod jobs;
+pub mod projects;
 pub mod verbs;
 
 use cli::{Request, Source, View};
