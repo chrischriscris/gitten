@@ -1,15 +1,19 @@
 //! A web server for one reader on loopback.
 //!
-//! Blocking, a thread per connection, `GET` only, no body parsing. That is not
-//! minimalism for its own sake: the whole traffic pattern is one browser asking
-//! for windows of rows over localhost, which is neither concurrent nor slow, and
-//! an async runtime would be the largest dependency in the repository by two
-//! orders of magnitude to serve it. `shell` has three dependencies and `core`
-//! has none; this has none either.
+//! Blocking, a thread per connection, `GET` plus one `POST`, no body parsing
+//! beyond the dispatch command. That is not minimalism for its own sake: the
+//! whole traffic pattern is one browser asking for windows of rows over
+//! localhost plus an agent moving a cursor, which is neither concurrent nor
+//! slow, and an async runtime would be the largest dependency in the repository
+//! by two orders of magnitude to serve it. `shell` has three dependencies and
+//! `core` has none; this has none either.
 //!
 //! What it is *not* is a server for the internet. It binds loopback, and the
 //! things it therefore does not do — TLS, auth, request limits beyond a header
-//! cap, any write method at all — are the reason that is not a knob.
+//! cap, any method besides `GET` and the one `POST` — are the reason that is
+//! not a knob. The `POST` moves only the server's cursor: nothing reachable
+//! through it changes the repository, which is what keeps a rebound request
+//! from writing as well as reading — see [`addressed_to_us`].
 //!
 //! # Loopback is not the boundary it looks like
 //!
@@ -38,6 +42,9 @@ use std::time::Duration;
 /// Longest request head accepted, headers included. A browser sends about 600
 /// bytes; anything past this is not a browser and gets a `431` rather than a
 /// buffer that grows until the process dies.
+///
+/// The same cap bounds a `POST` body: a dispatch is a command name and four
+/// integers, and anything past 16 KB of it is not one.
 const MAX_HEAD: usize = 16 * 1024;
 
 /// Idle timeout on a kept-alive connection. Long enough that scrolling never
@@ -47,6 +54,11 @@ const IDLE: Duration = Duration::from_secs(90);
 pub struct Request {
     pub path: String,
     query: String,
+    /// `GET`, `POST`, ... The rows and meta routes answer `GET`;
+    /// `/api/dispatch` answers `POST`. Anything else is a `405`.
+    pub method: String,
+    /// The `POST` body, if any. Empty on every `GET`.
+    pub body: String,
 }
 
 impl Request {
@@ -58,6 +70,19 @@ impl Request {
         Self {
             path: decode(path),
             query: query.to_string(),
+            method: "GET".into(),
+            body: String::new(),
+        }
+    }
+
+    /// A `POST`, built the way the server builds one: from the target and the
+    /// bounded body. A test's stand-in for `curl -d`.
+    pub fn post(path: &str, query: &str, body: &str) -> Self {
+        Self {
+            path: decode(path),
+            query: query.to_string(),
+            method: "POST".into(),
+            body: body.to_string(),
         }
     }
 
@@ -183,6 +208,8 @@ fn reason(status: u16) -> &'static str {
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        413 => "Content Too Large",
+        422 => "Unprocessable Entity",
         431 => "Request Header Fields Too Large",
         _ => "Error",
     }
@@ -336,8 +363,49 @@ fn connection(stream: TcpStream, post: &mpsc::Sender<Job>, port: u16) -> std::io
             // Before the method check and before the route: a rebound request
             // must not learn which routes exist either.
             Response::status(403, "not addressed to this server")
+        } else if method == "POST" {
+            // Framed by `Content-Length`, which is the only framing this reads:
+            // a body without one cannot be told apart from the next request, so
+            // it is refused rather than guessed at.
+            match read_body(&mut reader, &head)? {
+                Body::Got(body) => {
+                    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+                    let job = Job {
+                        request: Request::post(path, query, &body),
+                        reply: reply.clone(),
+                    };
+                    if post.send(job).is_err() {
+                        return Ok(());
+                    }
+                    match answers.recv() {
+                        Ok(r) => r,
+                        Err(_) => return Ok(()),
+                    }
+                }
+                // Answered and then *closed*: with no trustworthy length the
+                // pipe cannot be re-framed, and after an oversized claim the
+                // rest of the flood is still arriving.
+                Body::NoLength => {
+                    let _ = write(
+                        &mut out,
+                        &Response::status(400, "POST needs a Content-Length and a body"),
+                    );
+                    return Ok(());
+                }
+                Body::TooLarge => {
+                    let _ = write(
+                        &mut out,
+                        &Response::status(413, "POST body past 16 KB is not a dispatch"),
+                    );
+                    return Ok(());
+                }
+                Body::NotUtf8 => {
+                    let _ = write(&mut out, &Response::status(400, "POST body is not UTF-8"));
+                    return Ok(());
+                }
+            }
         } else if method != "GET" {
-            Response::status(405, "GET only")
+            Response::status(405, "GET and POST only")
         } else {
             let (path, query) = target.split_once('?').unwrap_or((target, ""));
             let job = Job {
@@ -419,6 +487,55 @@ fn read_head<R: Read>(reader: &mut BufReader<R>) -> std::io::Result<Head> {
     }
 }
 
+/// How a `POST` body read ended.
+///
+/// Four outcomes and not an `Option`, for the same reason [`Head`] is not one:
+/// each failure answers differently, and two of them end the connection because
+/// the pipe past them cannot be re-framed.
+enum Body {
+    /// Exactly `Content-Length` bytes, as text.
+    Got(String),
+    /// No usable `Content-Length`: absent, unparsable, or chunked — the one
+    /// framing this does not read.
+    NoLength,
+    /// Past [`MAX_HEAD`]. Not a dispatch.
+    TooLarge,
+    /// The framed bytes, but not text.
+    NotUtf8,
+}
+
+/// Reads exactly `Content-Length` bytes past the head.
+///
+/// Generic over the reader for the same reason [`read_head`] is: a test drives
+/// it from a byte slice rather than a live socket.
+fn read_body<R: Read>(reader: &mut BufReader<R>, head: &str) -> std::io::Result<Body> {
+    let Some(len) = header(head, "content-length") else {
+        return Ok(Body::NoLength);
+    };
+    // Chunked is a second framing and this reads one. A request carrying both
+    // per the spec prefers the length; one carrying only the encoding has no
+    // length to read by, which is `NoLength` above.
+    let Ok(len) = len.trim().parse::<usize>() else {
+        return Ok(Body::NoLength);
+    };
+    if len > MAX_HEAD {
+        return Ok(Body::TooLarge);
+    }
+    let mut buf = vec![0u8; len];
+    if let Err(e) = reader.read_exact(&mut buf) {
+        // An EOF mid-body is a client gone away, not an error worth answering:
+        // there may be nobody left to read it. Other I/O errors end the
+        // connection the same way a closed socket does.
+        return match e.kind() {
+            std::io::ErrorKind::UnexpectedEof => Ok(Body::NoLength),
+            _ => Err(e),
+        };
+    }
+    Ok(match String::from_utf8(buf) {
+        Ok(body) => Body::Got(body),
+        Err(_) => Body::NotUtf8,
+    })
+}
 /// The response head, as its own function so a test asserts on the bytes that
 /// actually go out rather than on a second copy of this format string.
 fn head_of(r: &Response) -> String {
@@ -448,10 +565,7 @@ mod tests {
     use super::*;
 
     fn req(query: &str) -> Request {
-        Request {
-            path: "/api/rows".into(),
-            query: query.into(),
-        }
+        Request::new("/api/rows", query)
     }
 
     #[test]
@@ -557,6 +671,69 @@ mod tests {
         assert!(!CSP.contains("script-src 'self' 'unsafe-inline'"));
     }
 
+    #[test]
+    fn a_post_request_carries_its_method_and_its_body() {
+        let r = Request::post("/api/dispatch", "", "{\"command\":\"view.down\"}");
+        assert_eq!(r.method, "POST");
+        assert_eq!(r.path, "/api/dispatch");
+        assert!(r.body.contains("view.down"));
+        let g = Request::new("/api/rows", "from=0");
+        assert_eq!(g.method, "GET");
+        assert!(g.body.is_empty());
+    }
+
+    fn post_head(len: &str) -> String {
+        format!(
+            "POST /api/dispatch HTTP/1.1\r\nHost: 127.0.0.1:7423\r\nContent-Length: {len}\r\n\r\n"
+        )
+    }
+
+    #[test]
+    fn a_framed_body_is_read_exactly_and_a_missing_one_is_named() {
+        let body = "{\"command\":\"view.down\"}";
+        let mut reader = BufReader::new(body.as_bytes());
+        match read_body(&mut reader, &post_head(&body.len().to_string())) {
+            Ok(Body::Got(got)) => assert_eq!(got, body),
+            _ => panic!("a well-framed body did not read"),
+        }
+        let mut reader = BufReader::new(&b""[..]);
+        assert!(matches!(
+            read_body(&mut reader, "POST /x HTTP/1.1\r\nHost: y\r\n\r\n"),
+            Ok(Body::NoLength)
+        ));
+        assert!(matches!(
+            read_body(&mut reader, &post_head("not-a-number")),
+            Ok(Body::NoLength)
+        ));
+    }
+
+    #[test]
+    fn a_body_past_the_cap_is_refused_before_it_is_read() {
+        // `read_body` never allocates the claimed length without checking it:
+        // the flood below is never sent, only claimed.
+        let mut reader = BufReader::new(&b""[..]);
+        assert!(matches!(
+            read_body(&mut reader, &post_head(&(MAX_HEAD + 1).to_string())),
+            Ok(Body::TooLarge)
+        ));
+        // Exactly the cap is still a body, not a flood.
+        let flood = vec![b'{'; MAX_HEAD];
+        let mut reader = BufReader::new(&flood[..]);
+        assert!(matches!(
+            read_body(&mut reader, &post_head(&MAX_HEAD.to_string())),
+            Ok(Body::Got(_))
+        ));
+    }
+
+    #[test]
+    fn a_body_that_is_not_text_is_named_rather_than_served() {
+        let latin1: &[u8] = b"{\"command\":\"caf\xe9\"}";
+        let mut reader = BufReader::new(latin1);
+        assert!(matches!(
+            read_body(&mut reader, &post_head(&latin1.len().to_string())),
+            Ok(Body::NotUtf8)
+        ));
+    }
     #[test]
     fn a_head_line_with_no_newline_is_bounded_not_grown_forever() {
         // A single line longer than the cap and with no `\n`: the `take` stops
