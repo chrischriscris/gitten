@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["app", "core", "git", "shell", "tui", "web"]
+members = ["app", "cli", "core", "git", "shell", "tui", "web"]
 
 # GPUI unoptimized is unusably slow — path tessellation and text shaping are
 # hot loops. Optimize every dependency even in dev builds, while keeping our own

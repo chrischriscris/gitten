@@ -1,0 +1,20 @@
+[package]
+name = "gitten"
+version = "0.0.0"
+edition = "2021"
+
+# The agent door. A non-interactive client: `inspect` reads state out as text or
+# JSON, `dispatch` steps named commands through a headless viewport the way the
+# window and the terminal step them through a visible one.
+#
+# Drawing and input, and nothing else — everything above that is gitten-app
+# (config, command line, acquisition) and gitten-core. No third-party
+# dependencies: the JSON writer is a `String`, the way gitten-web's is.
+[[bin]]
+name = "gitten"
+path = "src/main.rs"
+
+[dependencies]
+gitten-app = { path = "../app" }
+gitten-core = { path = "../core" }
+gitten-git = { path = "../git" }
