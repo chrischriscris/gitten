@@ -895,6 +895,11 @@ struct App {
     /// The glyphs the scrollbar is drawn with, so a diff opened from the commit
     /// list is drawn with the same ones. `--ascii`.
     bar: Bar,
+    /// Whether `--ascii` replaced the graph, marks and bar alphabets. One
+    /// flag names the state the status line reports on its right-hand end —
+    /// the mock's `120×32 · --ascii off` — because the three alphabets are
+    /// always switched together at startup.
+    ascii: bool,
     /// Text a command asked to be put on the clipboard, handed to the terminal
     /// at the top of the next loop.
     ///
@@ -1140,6 +1145,7 @@ impl App {
             stats: None,
             runs: Vec::new(),
             bar,
+            ascii: glyphs == Glyphs::ascii(),
             copy: None,
             gesture: None,
             clicked: None,
@@ -2880,6 +2886,26 @@ impl App {
             pen.put(" ", ink);
             pen.put(&status, if self.message.is_empty() { ink } else { loud });
             pen.put(&cost, Ink::new(c.faint, c.status_bg));
+            // The frame's own facts, right-aligned: the grid it was drawn
+            // for and the alphabet it was drawn with — the mock's `120×32 ·
+            // --ascii off`, faint so the pane's own status keeps the row. A
+            // left status that already reaches the reservation wins and the
+            // right side yields, because overwriting it would lie about
+            // where the keyboard is.
+            let right = format!(
+                "{}×{} · --ascii {}",
+                w,
+                h,
+                match self.ascii {
+                    true => "on",
+                    false => "off",
+                }
+            );
+            let at = w.saturating_sub(gitten_tui::screen::width(&right) + 1);
+            if pen.col() <= at {
+                pen.fill(at - pen.col(), ' ', ink);
+                pen.put(&right, Ink::new(c.faint, c.status_bg));
+            }
             pen.wash(ink);
         }
         // The keys typed so far, at the right-hand end, where a modal editor
@@ -3934,6 +3960,44 @@ mod tests {
             "the hidden pane drew a header: {:?}",
             app.screen.row_text(1)
         );
+    }
+
+    #[test]
+    fn status_right_names_the_grid_and_the_alphabet() {
+        // The mock's right-hand end: the grid this frame was drawn for and
+        // the alphabet it was drawn with, faint beside the pane's own
+        // status rather than over it.
+        let mut app = app(30);
+        app.screen = Screen::new(120, 32);
+        app.draw();
+        let row = app.screen.row_text(31);
+        assert!(row.contains("commits ·"), "{row:?}");
+        assert!(row.contains("120×32 · --ascii off"), "{row:?}");
+        let x = row.find("120×32").expect("the grid drawn");
+        assert_eq!(
+            app.screen.ink(x, 31).unwrap().fg,
+            app.host.theme.chrome.faint,
+            "the right end is quiet, not loud"
+        );
+
+        // The alphabet follows `--ascii`: the same flag that swaps the
+        // graph, the marks and the bar.
+        app.ascii = true;
+        app.draw();
+        assert!(
+            app.screen.row_text(31).contains("--ascii on"),
+            "{:?}",
+            app.screen.row_text(31)
+        );
+
+        // Narrow: the left status wins and the right side yields rather
+        // than overwriting where the keyboard is.
+        app.ascii = false;
+        app.screen.resize(30, 12);
+        app.draw();
+        let row = app.screen.row_text(11);
+        assert!(row.contains("commits ·"), "{row:?}");
+        assert!(!row.contains("--ascii"), "{row:?}");
     }
 
     #[test]

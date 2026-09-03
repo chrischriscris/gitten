@@ -682,13 +682,21 @@ impl Files {
         // did not come back are not the same sentence.
         if self.rows.is_empty() {
             let mut pen = screen.span(y, x, self.cols);
-            pen.put(
-                match self.available {
-                    true => "working tree clean",
-                    false => "status unavailable",
-                },
-                Ink::new(c.faint, c.bg),
-            );
+            // A clean tree is a quiet truth — faint and slanted, like the
+            // mock's `nothing stashed`. A read that never came back is faint
+            // without the slant: never the error red, which would read as a
+            // verdict on the tree rather than on the read.
+            let (text, ink) = match self.available {
+                true => (
+                    "working tree clean",
+                    Ink {
+                        italic: true,
+                        ..Ink::new(c.faint, c.bg)
+                    },
+                ),
+                false => ("status unavailable", Ink::new(c.faint, c.bg)),
+            };
+            pen.put(text, ink);
             return;
         }
         let armed = self.armed_index();
@@ -764,7 +772,20 @@ impl Files {
                 // puts there.
                 pen.take(2).put(f.letters, letters);
                 pen.put(" ", text);
-                pen.put(&f.text, text);
+                // The directory draws quiet and the basename carries the row —
+                // the mock's reading aid for long paths in a narrow sidebar.
+                // Display only: verbs still aim at `f.path` whole, and an
+                // armed row stays error-red end to end.
+                match (!armed).then(|| f.text.rfind('/')).flatten() {
+                    Some(i) => {
+                        let (dir, base) = f.text.split_at(i + 1);
+                        pen.put(dir, Ink::new(c.dim, bg));
+                        pen.put(base, text);
+                    }
+                    None => {
+                        pen.put(&f.text, text);
+                    }
+                }
                 if let Some(origin) = &f.origin {
                     pen.put(" ", Ink::new(c.fg, bg));
                     pen.put(origin, Ink::new(c.faint, bg));
@@ -1030,6 +1051,42 @@ mod tests {
             .paths_in(Section::Untracked)
             .iter()
             .any(|p| p.as_bytes() == b"caf\xe9.txt"));
+    }
+
+    #[test]
+    fn a_nested_path_keeps_its_directory_quiet_and_clean_is_slanted() {
+        // Two cells of mark, a space, then the path at column 3: the
+        // directory draws in the furniture ink and the basename carries
+        // the row, the mock's reading aid for long paths in a sidebar.
+        let status = Status {
+            unstaged: vec![unstaged("internal/extension/host.go", Change::Modified)],
+            ..Default::default()
+        };
+        let (f, host) = view(&status, 40, 4);
+        let mut screen = Screen::new(40, 4);
+        screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
+        f.paint(&mut screen, 0, 0, true, &host);
+        let row = screen.row_text(1);
+        assert!(row.contains("internal/extension/host.go"), "{row:?}");
+        let c = &host.theme.chrome;
+        assert_eq!(screen.ink(3, 1).unwrap().fg, c.dim, "the directory");
+        let base = 3 + "internal/extension/".len();
+        assert_eq!(screen.ink(base, 1).unwrap().fg, c.fg, "the basename");
+        assert!(
+            !screen.ink(base, 1).unwrap().bold,
+            "no emphasis was added with the quiet"
+        );
+
+        // And a clean tree is the slanted quiet line the mock draws for
+        // an empty stack.
+        let (f, host) = view(&Status::default(), 40, 2);
+        let mut screen = Screen::new(40, 2);
+        screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
+        f.paint(&mut screen, 0, 0, true, &host);
+        assert!(screen.row_text(0).contains("working tree clean"));
+        let ink = screen.ink(0, 0).unwrap();
+        assert!(ink.italic, "the quiet line lost its slant");
+        assert_eq!(ink.fg, host.theme.chrome.faint);
     }
 
     #[test]
