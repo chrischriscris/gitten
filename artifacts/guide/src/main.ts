@@ -6,9 +6,11 @@ import './styles/guide-chrome.css';
 import './styles/desktop.css';
 import './styles/modals.css';
 import './styles/docs.css';
+import './styles/settings-study.css';
 import './styles/tui.css';
 
 import modalsHtml from './components/modals.html?raw';
+import settingsStudyHtml from './views/settings-study.html?raw';
 import architectureHtml from './views/architecture.html?raw';
 import blueprintHtml from './views/blueprint.html?raw';
 import keyboardHtml from './views/keyboard.html?raw';
@@ -41,6 +43,7 @@ mount('view-blueprint', blueprintHtml);
 mount('view-tokens', tokensHtml);
 mount('view-keyboard', keyboardHtml);
 mount('view-architecture', architectureHtml);
+mount('view-settings', settingsStudyHtml);
 
 // Bridge: the partials keep their legacy inline handlers (onclick="..."),
 // so the functions they name must resolve on window. New code should use

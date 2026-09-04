@@ -1,0 +1,173 @@
+<!-- New work: settings study based on Zed's settings window. Not split from legacy. -->
+<div class="doc-container">
+  <h1 class="doc-title">Settings in its own window</h1>
+  <p class="doc-lead">
+    Zed opens settings as a <strong>separate window</strong> (<code>cx.open_window</code>,
+    <code>crates/settings_ui/src/settings_ui.rs:845</code>) — own traffic lights, own
+    title, centered. This study takes that literally for gitten: <code>,</code> opens a
+    <strong>"gitten — Settings" window</strong> with search, a section sidebar and
+    one-line descriptions per row. A window with no keymap would be a mouse surface,
+    so the window carries its own minimal key context (below) instead of borrowing
+    the main window's mode stack.
+  </p>
+
+  <div class="doc-section">
+    <h2>Specimen: filter state</h2>
+    <p>
+      Search narrows rows across every section; sections with no match dim out of the
+      sidebar instead of disappearing, so position stays stable while typing. Values
+      apply live to the shared <code>Host</code> and persist to <code>gitten.toml</code> —
+      there is no save button, and the main window re-renders from the same state.
+      File-only config (custom <code>[keys]</code>) gets the Zed fallback: a button,
+      not a dead row.
+    </p>
+    <div class="ss-window">
+      <div class="ss-windowbar">
+        <div class="ss-lights"><span></span><span></span><span></span></div>
+        <span class="ss-wintitle"><b>gitten</b> — Settings</span>
+      </div>
+      <div class="ss-panel">
+        <div class="ss-head">
+          <span class="ss-title">settings</span>
+          <input type="text" class="ss-search" value="mov" readonly>
+        </div>
+        <div class="ss-body">
+          <div class="ss-side">
+            <div class="ss-sec dimmed"><span>view</span><span class="ss-count">2</span></div>
+            <div class="ss-sec active"><span>diff</span><span class="ss-count">1/5</span></div>
+            <div class="ss-sec dimmed"><span>theme</span><span class="ss-count">1</span></div>
+            <div class="ss-sec dimmed"><span>text</span><span class="ss-count">2</span></div>
+            <div class="ss-sec dimmed"><span>scrolling</span><span class="ss-count">4</span></div>
+            <div class="ss-sec dimmed"><span>mouse</span><span class="ss-count">1</span></div>
+          </div>
+          <div class="ss-content">
+            <h4>diff</h4>
+            <div class="ss-row">
+              <span class="ss-label">moves</span>
+              <span class="ss-desc">a block shorter than this is coincidence, not a move — <code>}</code> is everywhere</span>
+              <span class="ss-ctl">3</span>
+            </div>
+            <h4>file-only</h4>
+            <div class="ss-row">
+              <span class="ss-label">keys</span>
+              <span class="ss-desc">custom bindings live in <code>[keys]</code> — no GUI row, by design</span>
+              <button class="ss-filebtn">Edit in gitten.toml</button>
+            </div>
+          </div>
+        </div>
+        <div class="ss-foot">
+          <span class="live">live-apply · saved to gitten.toml</span>
+          <span>1/15 rows · filter "mov" · esc closes</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="doc-section">
+    <h2>Specimen: full section</h2>
+    <p>
+      Unfiltered, a section reads label → one-line description → control. Choices
+      cycle (<code>&lt; &gt;</code>), toggles flip, numbers step — the same verbs as
+      the old overlay, with the description doing the teaching the keymap can't.
+    </p>
+    <div class="ss-window">
+      <div class="ss-windowbar">
+        <div class="ss-lights"><span></span><span></span><span></span></div>
+        <span class="ss-wintitle"><b>gitten</b> — Settings</span>
+      </div>
+      <div class="ss-panel">
+        <div class="ss-head">
+          <span class="ss-title">settings</span>
+          <input type="text" class="ss-search" placeholder="Filter settings…" readonly>
+        </div>
+        <div class="ss-body">
+          <div class="ss-side">
+            <div class="ss-sec"><span>view</span><span class="ss-count">2</span></div>
+            <div class="ss-sec active"><span>diff</span><span class="ss-count">5</span></div>
+            <div class="ss-sec"><span>theme</span><span class="ss-count">1</span></div>
+            <div class="ss-sec"><span>text</span><span class="ss-count">2</span></div>
+            <div class="ss-sec"><span>scrolling</span><span class="ss-count">4</span></div>
+            <div class="ss-sec"><span>mouse</span><span class="ss-count">1</span></div>
+          </div>
+          <div class="ss-content">
+            <h4>diff</h4>
+            <div class="ss-row">
+              <span class="ss-label">algorithm</span>
+              <span class="ss-desc">which lines correspond — histogram anchors on rare lines, so moves read as moves</span>
+              <span class="ss-ctl">histogram</span>
+            </div>
+            <div class="ss-row">
+              <span class="ss-label">context</span>
+              <span class="ss-desc">unchanged lines around each hunk; applies on next launch</span>
+              <span class="ss-ctl">3</span>
+            </div>
+            <div class="ss-row">
+              <span class="ss-label">moves</span>
+              <span class="ss-desc">a block shorter than this is coincidence, not a move</span>
+              <span class="ss-ctl">3</span>
+            </div>
+            <div class="ss-row">
+              <span class="ss-label">indent heuristic</span>
+              <span class="ss-desc">slide hunk edges by indentation sign, xdiff's weights</span>
+              <span class="ss-ctl is-toggle on">on</span>
+            </div>
+          </div>
+        </div>
+        <div class="ss-foot">
+          <span class="live">live-apply · saved to gitten.toml</span>
+          <span>15 rows · 6 sections · esc closes</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="doc-section">
+    <h2>The window's own keys</h2>
+    <p>
+      The main window's mode stack doesn't reach across windows, so this window
+      defines a fixed, tiny context — <strong>not the full keymap</strong>, which would
+      be a second keymap to maintain. The search field is a native field; everything
+      else is six bindings. Closing returns focus to the main window.
+    </p>
+    <table class="guide-table">
+      <thead><tr><th>Key</th><th>Action</th></tr></thead>
+      <tbody>
+        <tr><td><span class="key-chip">type</span></td><td>filter rows across sections (search field focused on open)</td></tr>
+        <tr><td><span class="key-chip">j</span> / <span class="key-chip">k</span></td><td>row down / up, across sections</td></tr>
+        <tr><td><span class="key-chip">h</span> / <span class="key-chip">l</span></td><td>turn the value down / up (the map's <code>view.left/right</code>)</td></tr>
+        <tr><td><span class="key-chip">space</span> / <span class="key-chip">enter</span></td><td>turn the value up (<code>settings.apply</code>)</td></tr>
+        <tr><td><span class="key-chip">esc</span> or <span class="key-chip">,</span></td><td>close window, focus returns to main</td></tr>
+      </tbody>
+    </table>
+    <div class="ss-src" style="margin-top: 12px;">shell/src/settings.rs:279-475 (overlay this replaces) · one opener: OpenSettings-style action → cx.open_window, reuse-if-open like Zed's original_window</div>
+  </div>
+
+  <div class="doc-section">
+    <h2>What was taken, what was left</h2>
+    <div class="ss-scale">
+      <div class="ss-scale-card here">
+        <h5>Taken<span class="tag">from Zed</span></h5>
+        <p>Separate window with own chrome; search-first sidebar; one-line descriptions; the file fallback as a first-class row; deep-linkable sections, so a bad value in the TOML can open the window at the offending row.</p>
+      </div>
+      <div class="ss-scale-card">
+        <h5>Left<span class="tag">in-window overlay</span></h5>
+        <p>The old centered overlay goes away entirely — two settings surfaces would split the keymap question instead of answering it. One surface, one key context, in its own window.</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="doc-section">
+    <h2>Open decisions</h2>
+    <p>Unchanged — the study assumes these, doesn't settle them.</p>
+    <div class="ss-trade" style="grid-template-columns: 1fr;">
+      <div class="ss-pro"><b>1. Destructive confirms need a modal answer.</b> Double-press arming works for keys but is undiscoverable and has no mouse path — a destructive pick from the context menu has nowhere to confirm <i>to</i>. Either bless double-press inside menu picks too, or admit a small confirm kind.</div>
+    </div>
+    <div class="ss-trade" style="grid-template-columns: 1fr; margin-top: 12px;">
+      <div class="ss-pro"><b>2. Pilot the plumbing on the commit editor.</b> Single-line input is fine for branch names; a real commit editor wants multiline. Whichever modal seam wins proves itself there.</div>
+    </div>
+    <div class="ss-trade" style="grid-template-columns: 1fr; margin-top: 12px;">
+      <div class="ss-pro"><b>3. Share plumbing for the extension seam, not the look.</b> Rule 1: if extensions will ever show a panel, they need a supported container. A second window is a second container to expose — the seam must cover windows, not just overlays.</div>
+    </div>
+  </div>
+
+</div>

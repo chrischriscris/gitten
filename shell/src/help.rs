@@ -6,11 +6,13 @@
 //! which ink; a binding added by `gitten.toml` or by an extension appears in both
 //! without either being told.
 //!
-//! Two GPUI facts shape the element. It is [`deferred`], because it is painted
-//! after every ancestor — as a plain child of the window's column it would be
-//! under the diff beside it and visible nowhere (the same trap the settings
-//! panel dodges). And it is [`occlude`], because hit-testing is paint order too: an
-//! overlay that lets clicks fall through is a menu you act on through a hole.
+//! Two GPUI facts shape the element, and both live in [`crate::modal`]
+//! now: the box is [`deferred`], because it is painted after every ancestor —
+//! as a plain child of the window's column it would be under the diff beside
+//! it and visible nowhere — and [`occlude`], because hit-testing is paint
+//! order too: an overlay that lets clicks fall through is a menu you act on
+//! through a hole. What is here is only the content: the heading, the rows
+//! and the footer, sized from what the registries say is in them.
 //!
 //! And one keyboard fact. While the panel stands it owns every press: the shell
 //! resolves against [`MODE`] alone, the way it does against `input` for a
@@ -19,12 +21,11 @@
 //! out and the panel's own scroll are bound in that mode in `core` — a key is
 //! data, and the panel is not allowed a `match` of its own.
 
-use crate::chrome::{gap_l, gap_m, gap_s, RADIUS};
+use crate::chrome::{gap_l, gap_m, gap_s};
+use crate::modal;
 use gitten_core::command::HelpRow;
 use gitten_core::host::Host;
-use gpui::prelude::FluentBuilder as _;
 use gpui::*;
-use gpui_component::StyledExt as _;
 
 /// The mode the panel pushes, and the only one a press resolves against while
 /// it is up. Beside [`crate::input::MODE`] and [`crate::panes::MODE`]: the name
@@ -77,136 +78,101 @@ pub fn overlay(
     let hidden = hidden_below(&rows, below);
     let cut = below > 0.5;
 
-    let font = host.font.family.clone();
-    div()
-        .absolute()
-        .inset_0()
-        // The whole overlay, not only its panel: a wheel in the dim space
-        // around it must not find the list underneath. And the space really
-        // is dim — a scrim of the window colour at half alpha, so the diff
-        // behind recedes and the panel's border clears ~1.7:1 against every
-        // row background where it cleared as little as 1.35:1 bare.
-        .bg(rgb(c.bg).alpha(0.5))
-        .occlude()
-        .flex()
-        .items_center()
-        .justify_center()
-        .child(
-            deferred(
-                div()
-                    .occlude()
-                    .v_flex()
-                    .w(px(m.w))
-                    .max_h_full()
-                    // The panel's own box, not the row stack's: what leaves
-                    // through here is a rounded corner, and the rows scroll.
-                    .overflow_hidden()
-                    .bg(rgb(c.title_bg))
-                    .border_1()
-                    .border_color(rgb(c.faint))
-                    .rounded(px(RADIUS))
-                    .p(px(PAD))
-                    .text_size(px(host.font.size))
-                    .font_family(font)
-                    .text_color(rgb(c.dim))
-                    // The heading, and why there is no second list of keys in
-                    // it: every chord below came out of the same map this panel
-                    // resolves presses against. The close hint is *live* keys
-                    // for `help` — through the same walk that decides what a
-                    // press means right now — because a key an inner mode took
-                    // over would close nothing, and naming a dead key here is
-                    // the one lie a panel of keys must never tell. No live key,
-                    // no hint. Fixed above the scroll, so the way out is on
-                    // screen wherever the rows are.
+    // The heading, and why there is no second list of keys in
+    // it: every chord below came out of the same map this panel
+    // resolves presses against. The close hint is *live* keys
+    // for `help` — through the same walk that decides what a
+    // press means right now — because a key an inner mode took
+    // over would close nothing, and naming a dead key here is
+    // the one lie a panel of keys must never tell. No live key,
+    // no hint. Fixed above the scroll, so the way out is on
+    // screen wherever the rows are.
+    let heading = div()
+        .flex_none()
+        .pb(gap_m(&host.font))
+        .text_color(rgb(c.accent))
+        .child(SharedString::from(format!(
+            "keys{}",
+            match host.keys.live_keys_for("help", modes).first() {
+                Some(k) => format!("  ·  {k} closes"),
+                None => String::new(),
+            }
+        )));
+    // The rows, and the only part that scrolls. `id` first —
+    // there is no way into `overflow_y_scroll` without one —
+    // and `min_h_0`, or a flex child is never shorter than its
+    // content and a 40-row map draws straight past the window
+    // with nothing to say it did. The wheel arrives here on its
+    // own: the shell's capture interceptor stands aside while
+    // the panel is up precisely so a handler on it can see the
+    // event.
+    let rows_el = div()
+        .id("help-rows")
+        .flex_1()
+        .min_h_0()
+        .overflow_y_scroll()
+        .track_scroll(scroll)
+        .children(rows.iter().map(|row| {
+            match row {
+                HelpRow::Mode(name) => div()
+                    .h(px(ROW_H))
+                    .flex()
+                    .items_center()
+                    .pt(gap_s(&host.font))
+                    .text_color(rgb(c.accent))
+                    .child(name.clone()),
+                HelpRow::Blank => div().h(px(ROW_H / 2.0)),
+                HelpRow::Command { keys, doc, .. } => div()
+                    .h(px(ROW_H))
+                    .flex()
+                    .items_center()
+                    .gap(gap_l(&host.font))
+                    // A column and not a run of text: the width
+                    // is the widest chord's, measured once, and
+                    // right-aligned against it — which is what
+                    // the ` · ` gap in the width formula always
+                    // assumed and what a content-sized cell
+                    // never gave, one x per row instead.
                     .child(
                         div()
                             .flex_none()
-                            .pb(gap_m(&host.font))
-                            .text_color(rgb(c.accent))
-                            .child(SharedString::from(format!(
-                                "keys{}",
-                                match host.keys.live_keys_for("help", modes).first() {
-                                    Some(k) => format!("  ·  {k} closes"),
-                                    None => String::new(),
-                                }
-                            ))),
+                            .w(px(m.key_w))
+                            .flex()
+                            .justify_end()
+                            .text_color(rgb(c.fg))
+                            .child(SharedString::from(keys.clone())),
                     )
-                    // The rows, and the only part that scrolls. `id` first —
-                    // there is no way into `overflow_y_scroll` without one —
-                    // and `min_h_0`, or a flex child is never shorter than its
-                    // content and a 40-row map draws straight past the window
-                    // with nothing to say it did. The wheel arrives here on its
-                    // own: the shell's capture interceptor stands aside while
-                    // the panel is up precisely so a handler on it can see the
-                    // event.
                     .child(
                         div()
-                            .id("help-rows")
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_y_scroll()
-                            .track_scroll(scroll)
-                            .children(rows.iter().map(|row| {
-                                match row {
-                                    HelpRow::Mode(name) => div()
-                                        .h(px(ROW_H))
-                                        .flex()
-                                        .items_center()
-                                        .pt(gap_s(&host.font))
-                                        .text_color(rgb(c.accent))
-                                        .child(name.clone()),
-                                    HelpRow::Blank => div().h(px(ROW_H / 2.0)),
-                                    HelpRow::Command { keys, doc, .. } => div()
-                                        .h(px(ROW_H))
-                                        .flex()
-                                        .items_center()
-                                        .gap(gap_l(&host.font))
-                                        // A column and not a run of text: the width
-                                        // is the widest chord's, measured once, and
-                                        // right-aligned against it — which is what
-                                        // the ` · ` gap in the width formula always
-                                        // assumed and what a content-sized cell
-                                        // never gave, one x per row instead.
-                                        .child(
-                                            div()
-                                                .flex_none()
-                                                .w(px(m.key_w))
-                                                .flex()
-                                                .justify_end()
-                                                .text_color(rgb(c.fg))
-                                                .child(SharedString::from(keys.clone())),
-                                        )
-                                        .child(
-                                            div()
-                                                .min_w_0()
-                                                .truncate()
-                                                .text_color(rgb(c.dim))
-                                                .child(doc.clone()),
-                                        ),
-                                }
-                            })),
-                    )
-                    // Content cut is said, never silent: a panel that ends mid
-                    // list looks exactly like a map with nothing else in it,
-                    // and the tail bindings are the ones nobody has learnt.
-                    .when(cut, |d| {
-                        d.child(
-                            div()
-                                .flex_none()
-                                .h(px(ROW_H))
-                                .flex()
-                                .items_center()
-                                .text_color(rgb(c.faint))
-                                .child(SharedString::from(match hidden {
-                                    0 => "…".to_string(),
-                                    n => format!("…  {n} more below"),
-                                })),
-                        )
-                    }),
-            )
-            .with_priority(2),
-        )
-        .into_any_element()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(rgb(c.dim))
+                            .child(doc.clone()),
+                    ),
+            }
+        }));
+    // Content cut is said, never silent: a panel that ends mid
+    // list looks exactly like a map with nothing else in it,
+    // and the tail bindings are the ones nobody has learnt.
+    let mut children = vec![heading.into_any_element(), rows_el.into_any_element()];
+    if cut {
+        children.push(
+            div()
+                .flex_none()
+                .h(px(ROW_H))
+                .flex()
+                .items_center()
+                .text_color(rgb(c.faint))
+                .child(SharedString::from(match hidden {
+                    0 => "…".to_string(),
+                    n => format!("…  {n} more below"),
+                }))
+                .into_any_element(),
+        );
+    }
+    // The box around the content — scrim, border, paint order — is the
+    // shared centered panel's. This function sizes and fills, nothing else.
+    modal::centered(host, modal::Width::Exact(m.w), children)
 }
 
 /// How far one press moves the panel: a row, in the direction the command

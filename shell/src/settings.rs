@@ -1,11 +1,11 @@
-//! The settings panel: every knob, on one surface.
+//! The settings surface: every knob, its data, on one registry.
 //!
 //! The title strip used to carry five pickers — layout, wrap, algorithm,
 //! whitespace, theme — each a label, a value and the registered alternatives.
 //! Five was already too many for a 44px strip: the tier logic collapsed them
 //! into one composed menu on narrow windows, and every sixth knob would have
 //! needed the same budget arithmetic again. So the strip carries none of them
-//! now, and this panel carries all of them plus the rest of `gitten.toml`'s
+//! now, and this module carries all of them plus the rest of `gitten.toml`'s
 //! live knobs: context, move floor, indent heuristic, font, scrolling,
 //! sidebar share and the mouse.
 //!
@@ -14,45 +14,30 @@
 //! [`Wraps::names`](gitten_core::wrap::Wraps::names) and the view's own layout
 //! list — so an extension's algorithm or theme is a row here the day it is
 //! registered, with no edit to this file. That is the same seam the help
-//! overlay and the context menu hold, drawn as a panel instead of a list.
+//! overlay and the context menu hold.
 //!
 //! Every row applies **live**: choosing is doing, the way the pickers were.
 //! There is no next-launch row in here — `font.monospaced`, `font.advance`
 //! and the syntax colours stay in the file — and every change is also written
 //! back to `gitten.toml` as the new default, so a relaunch opens where the
-//! panel left off. A control that quietly rewrote the file would have been a
-//! settings panel with no confirmation; this panel *is* the confirmation.
+//! window left off. A control that quietly rewrote the file would have been a
+//! settings surface with no confirmation; this surface *is* the confirmation.
 //!
-//! Two GPUI facts shape the element, both shared with the help overlay: it is
-//! [`deferred`], so it paints above the panes beside it rather than under the
-//! sibling that follows them, and it is [`occlude`], so the rows underneath
-//! take neither the clicks nor the wheel. And one keyboard fact, also shared:
-//! while the panel stands it owns every press, resolved against [`MODE`]
-//! alone, so a pane's `D` reads as "not bound" instead of arming a discard
-//! behind a screen that is only describing it.
+//! What draws the rows — the overlay that stood here, the window that stands
+//! here now — is a client of this module, not its content. A row is a setting,
+//! a label, a value, one line of teaching and whether touching it does
+//! anything. And one keyboard fact travels with it: while settings stand they
+//! own every press, resolved against [`MODE`] alone, so a pane's `D` reads as
+//! "not bound" instead of arming a discard behind a screen that is only
+//! describing it.
 
-use crate::chrome::{gap_l, gap_m, RADIUS};
-use gitten_core::command::Modes;
 use gitten_core::differ::Whitespace;
 use gitten_core::host::Host;
-use gitten_core::theme::Surface;
-use gpui::*;
-use gpui_component::StyledExt as _;
-use std::rc::Rc;
 
-/// The mode the panel pushes, and the only one a press resolves against while
-/// it is up. Beside [`crate::help::MODE`] and [`crate::input::MODE`]: the name
-/// belongs to whoever pushes it, and `core` holds the bindings.
+/// The mode a press resolves against while settings stand. Beside
+/// [`crate::help::MODE`] and [`crate::input::MODE`]: the name belongs to
+/// whoever stands it up, and `core` holds the bindings.
 pub const MODE: &str = "settings";
-
-/// One row's height. Roomier than a menu row: a label, a value and the two
-/// chevrons that say the value turns.
-const ROW_H: f32 = 28.0;
-/// Air inside the border, at each edge — the help overlay's own inset.
-const PAD: f32 = 16.0;
-/// Widest the panel gets. Past this the values are further from their labels
-/// than the eye will carry them.
-const MAX_W: f32 = 560.0;
 
 /// Which knob a row edits. Fixed identity for every row the panel holds, so
 /// the shell matches on this rather than on a label that might be reworded.
@@ -75,14 +60,16 @@ pub enum Setting {
     CopyOnSelect,
 }
 
-/// One row of the panel: what it edits, what it is called, what it holds —
-/// and whether touching it does anything, which a fixture's algorithm row
-/// does not, for the same reason its picker drew inert rather than hiding.
+/// One row of the panel: what it edits, what it is called, what it holds,
+/// one line saying what the knob does — and whether touching it does
+/// anything, which a fixture's algorithm row does not, for the same reason
+/// its picker drew inert rather than hiding.
 #[derive(Debug, Clone)]
 pub struct Row {
     pub setting: Setting,
     pub label: &'static str,
     pub value: String,
+    pub desc: &'static str,
     pub enabled: bool,
 }
 
@@ -113,20 +100,26 @@ pub fn build(
     whitespace: Whitespace,
     from_repo: bool,
 ) -> Vec<Section> {
-    let choice =
-        |setting, label: &'static str, options: &[&str], current: usize, enabled: bool| Row {
-            setting,
-            label,
-            value: options.get(current).unwrap_or(&"").to_string(),
-            enabled,
-        };
-    let number = |setting, label: &'static str, value: String| Row {
+    let choice = |setting,
+                  label: &'static str,
+                  desc: &'static str,
+                  options: &[&str],
+                  current: usize,
+                  enabled: bool| Row {
+        setting,
+        label,
+        value: options.get(current).unwrap_or(&"").to_string(),
+        desc,
+        enabled,
+    };
+    let number = |setting, label: &'static str, desc: &'static str, value: String| Row {
         setting,
         label,
         value,
+        desc,
         enabled: true,
     };
-    let toggle = |setting, label: &'static str, on: bool| Row {
+    let toggle = |setting, label: &'static str, desc: &'static str, on: bool| Row {
         setting,
         label,
         value: match on {
@@ -134,6 +127,7 @@ pub fn build(
             false => "off",
         }
         .into(),
+        desc,
         enabled: true,
     };
     let algorithms = host.differ.names();
@@ -149,8 +143,22 @@ pub fn build(
         Section {
             title: "view",
             rows: vec![
-                choice(Setting::Layout, "layout", layouts, layout, true),
-                choice(Setting::Wrap, "wrap", wraps, wrap, true),
+                choice(
+                    Setting::Layout,
+                    "layout",
+                    "unified or side-by-side — s cycles the registry",
+                    layouts,
+                    layout,
+                    true,
+                ),
+                choice(
+                    Setting::Wrap,
+                    "wrap",
+                    "word, character or off — a wrap is more rows, never a taller one",
+                    wraps,
+                    wrap,
+                    true,
+                ),
             ],
         },
         Section {
@@ -159,6 +167,7 @@ pub fn build(
                 choice(
                     Setting::Algorithm,
                     "algorithm",
+                    "which lines correspond — histogram anchors on rare lines",
                     &algorithms,
                     algorithms.iter().position(|n| *n == algorithm).unwrap_or(0),
                     from_repo,
@@ -166,6 +175,7 @@ pub fn build(
                 choice(
                     Setting::Whitespace,
                     "whitespace",
+                    "an equivalence relation, not an algorithm — normalised per line",
                     &ws,
                     Whitespace::ALL
                         .iter()
@@ -173,10 +183,16 @@ pub fn build(
                         .unwrap_or(0),
                     from_repo,
                 ),
-                number(Setting::Context, "context", host.differ.context.to_string()),
+                number(
+                    Setting::Context,
+                    "context",
+                    "unchanged lines around each hunk",
+                    host.differ.context.to_string(),
+                ),
                 number(
                     Setting::Moves,
                     "moves",
+                    "blocks shorter than this are coincidence, not a move",
                     match host.differ.min_moved {
                         0 => "off".into(),
                         n => n.to_string(),
@@ -185,6 +201,7 @@ pub fn build(
                 toggle(
                     Setting::IndentHeuristic,
                     "indent heuristic",
+                    "slide hunk edges by indentation sign",
                     host.differ.indent_heuristic,
                 ),
             ],
@@ -194,6 +211,7 @@ pub fn build(
             rows: vec![choice(
                 Setting::Theme,
                 "theme",
+                "the palette the window reads — colour reloads per frame",
                 &themes,
                 themes
                     .iter()
@@ -208,24 +226,44 @@ pub fn build(
                 number(
                     Setting::FontSize,
                     "font size",
+                    "point size for code and chrome",
                     format!("{:.0}", host.font.size),
                 ),
-                choice(Setting::FontFamily, "font", &families, 0, true),
+                choice(
+                    Setting::FontFamily,
+                    "font",
+                    "family for code and chrome",
+                    &families,
+                    0,
+                    true,
+                ),
             ],
         },
         Section {
             title: "scrolling",
             rows: vec![
-                number(Setting::Scroll, "scroll", host.view.rows.to_string()),
+                number(
+                    Setting::Scroll,
+                    "scroll",
+                    "multiplier on wheel and smooth-scroll pixels",
+                    host.view.rows.to_string(),
+                ),
                 number(
                     Setting::Scrolloff,
                     "scrolloff",
+                    "margin the cursor keeps from the list edges",
                     host.view.scrolloff.to_string(),
                 ),
-                toggle(Setting::Scrollbar, "scrollbar", host.view.scrollbar),
+                toggle(
+                    Setting::Scrollbar,
+                    "scrollbar",
+                    "the bar over the last cell — an indicator, not a track",
+                    host.view.scrollbar,
+                ),
                 number(
                     Setting::Sidebar,
                     "sidebar",
+                    "share of the window the sidebar keeps",
                     format!("{:.0}%", host.sidebar_share * 100.0),
                 ),
             ],
@@ -235,15 +273,16 @@ pub fn build(
             rows: vec![toggle(
                 Setting::CopyOnSelect,
                 "copy on select",
+                "drag-select copies through OSC 52",
                 host.mouse.copy_on_select,
             )],
         },
     ]
 }
 
-/// How many selectable rows the panel holds. The shell clamps its selection
-/// against this, because the sections are rebuilt per frame and the count
-/// moves with the registries.
+/// How many selectable rows the surface holds. Whoever draws clamps its
+/// selection against this, because the sections are rebuilt per frame and the
+/// count moves with the registries.
 pub fn len(sections: &[Section]) -> usize {
     sections.iter().map(|s| s.rows.len()).sum()
 }
@@ -266,212 +305,6 @@ pub fn cycle(count: usize, current: usize, dir: i32) -> usize {
         0 => 0,
         n => (current as i32 + dir).rem_euclid(n as i32) as usize,
     }
-}
-
-/// The panel itself.
-///
-/// A pure function of the sections, the selection and the scroll position:
-/// nothing here names a knob, which is the whole test the pickers set for a
-/// control built on registries. `on_select` moves the highlight,
-/// `on_adjust` turns the value by `dir`, and `on_dismiss` walks away — all
-/// three are the caller's, through the one dispatch path every key uses.
-#[allow(clippy::too_many_arguments)]
-pub fn overlay(
-    sections: &[Section],
-    sel: usize,
-    scroll: &ScrollHandle,
-    host: &Host,
-    modes: &Modes,
-    on_select: impl Fn(usize, &mut Window, &mut App) + 'static,
-    on_adjust: impl Fn(usize, i32, &mut Window, &mut App) + 'static,
-    on_dismiss: impl Fn(&mut Window, &mut App) + 'static,
-) -> AnyElement {
-    let c = &host.theme.chrome;
-    let on_select = Rc::new(on_select);
-    let on_adjust = Rc::new(on_adjust);
-    let on_dismiss = Rc::new(on_dismiss);
-    let font = host.font.family.clone();
-    // A flat counter across the sections, because the selection is one number
-    // and the rows are grouped for reading rather than for addressing.
-    let mut flat = 0;
-    let body = sections
-        .iter()
-        .map(|section| {
-            let heading = div()
-                .flex_none()
-                .flex()
-                .items_center()
-                .h(px(ROW_H))
-                .pt(gap_l(&host.font))
-                .text_color(rgb(c.accent))
-                .child(SharedString::from(section.title));
-            let rows = section.rows.iter().map(|row| {
-                let i = flat;
-                flat += 1;
-                let selected = i == sel;
-                let on_select = on_select.clone();
-                let on_adjust = on_adjust.clone();
-                let value = match row.enabled {
-                    true => div()
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .gap(gap_m(&host.font))
-                        .child(
-                            div()
-                                .id(SharedString::from(format!("settings-less-{i}")))
-                                .flex_none()
-                                .cursor_pointer()
-                                .text_color(rgb(host.theme.dim_on(Surface::Title)))
-                                .child("<")
-                                .on_click({
-                                    let on_adjust = on_adjust.clone();
-                                    move |_, window, cx| on_adjust(i, -1, window, cx)
-                                }),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .text_color(rgb(match selected {
-                                    true => c.accent,
-                                    false => c.fg,
-                                }))
-                                .child(SharedString::from(row.value.clone())),
-                        )
-                        .child(
-                            div()
-                                .id(SharedString::from(format!("settings-more-{i}")))
-                                .flex_none()
-                                .cursor_pointer()
-                                .text_color(rgb(host.theme.dim_on(Surface::Title)))
-                                .child(">")
-                                .on_click({
-                                    let on_adjust = on_adjust.clone();
-                                    move |_, window, cx| on_adjust(i, 1, window, cx)
-                                }),
-                        ),
-                    false => div()
-                        .flex_none()
-                        .text_color(rgb(host.theme.dim_on(Surface::Title)))
-                        .child(SharedString::from(row.value.clone())),
-                };
-                div()
-                    .id(SharedString::from(format!("settings-row-{i}")))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .h(px(ROW_H))
-                    .px(gap_m(&host.font))
-                    .rounded(px(RADIUS))
-                    .bg(rgb(match selected {
-                        true => c.selection_bg,
-                        false => c.title_bg,
-                    }))
-                    .border_l(px(crate::chrome::ROW_BAR))
-                    .border_color(rgb(match selected {
-                        true => c.accent,
-                        false => c.title_bg,
-                    }))
-                    .cursor_pointer()
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_grow(1.0)
-                            .truncate()
-                            .text_color(rgb(match row.enabled {
-                                true => c.fg,
-                                false => host.theme.dim_on(Surface::Title),
-                            }))
-                            .child(row.label),
-                    )
-                    .child(value)
-                    .on_click(move |_, window, cx| on_select(i, window, cx))
-            });
-            div()
-                .flex_none()
-                .flex()
-                .flex_col()
-                .child(heading)
-                .children(rows)
-        })
-        .collect::<Vec<_>>();
-
-    div()
-        .absolute()
-        .inset_0()
-        .bg(rgb(c.bg).alpha(0.5))
-        .occlude()
-        .flex()
-        .items_center()
-        .justify_center()
-        .child(
-            deferred(
-                div()
-                    .occlude()
-                    .v_flex()
-                    .w(px(MAX_W))
-                    .max_h_full()
-                    .overflow_hidden()
-                    .bg(rgb(c.title_bg))
-                    .border_1()
-                    .border_color(rgb(c.faint))
-                    .rounded(px(RADIUS))
-                    .debug_selector(|| "settings-panel".to_string())
-                    .p(px(PAD))
-                    .text_size(px(host.font.size))
-                    .font_family(font)
-                    .text_color(rgb(c.dim))
-                    .child(
-                        div()
-                            .flex_none()
-                            .pb(gap_m(&host.font))
-                            .text_color(rgb(c.accent))
-                            .child(SharedString::from(format!(
-                                "settings{}",
-                                match host.keys.live_keys_for("settings", modes).first() {
-                                    Some(k) => format!("  ·  {k} closes"),
-                                    None => String::new(),
-                                }
-                            ))),
-                    )
-                    .child(
-                        div()
-                            .id("settings-rows")
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_y_scroll()
-                            .track_scroll(scroll)
-                            .children(body),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .h(px(ROW_H))
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .text_color(rgb(host.theme.quiet_on(c.title_bg)))
-                            .child("changes apply now and save to gitten.toml")
-                            .child(
-                                div()
-                                    .id("settings-done")
-                                    .flex_none()
-                                    .cursor_pointer()
-                                    .text_color(rgb(c.accent))
-                                    .child("done")
-                                    .on_click({
-                                        let on_dismiss = on_dismiss.clone();
-                                        move |_, window, cx| {
-                                            cx.stop_propagation();
-                                            on_dismiss(window, cx);
-                                        }
-                                    }),
-                            ),
-                    ),
-            )
-            .with_priority(2),
-        )
-        .into_any_element()
 }
 
 #[cfg(test)]
@@ -594,6 +427,19 @@ mod tests {
             .find(|r| r.setting == Setting::Theme)
             .unwrap();
         assert!(theme.enabled, "a palette is the window's, not the diff's");
+    }
+
+    #[test]
+    fn every_row_teaches_its_knob() {
+        for section in sections(&Host::new()) {
+            for row in &section.rows {
+                assert!(
+                    !row.desc.is_empty(),
+                    "{:?} has no one-line teaching",
+                    row.setting
+                );
+            }
+        }
     }
 
     #[test]

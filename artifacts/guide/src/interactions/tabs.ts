@@ -18,7 +18,7 @@ export function switchGuideTab(tabId: string): void {
   }
 }
 
-const TABS = ['mockup', 'blueprint', 'tokens', 'keyboard', 'architecture'];
+const TABS = ['mockup', 'blueprint', 'tokens', 'keyboard', 'architecture', 'settings'];
 
 function applyHashOrParam(): void {
   const params = new URLSearchParams(window.location.search);
