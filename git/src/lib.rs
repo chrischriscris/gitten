@@ -929,6 +929,7 @@ pub type Handle = Arc<dyn Repo>;
 pub fn open(root: &Path) -> Handle {
     Arc::new(Binary {
         root: root.to_path_buf(),
+        top: Default::default(),
         state_paths: Default::default(),
     })
 }
@@ -940,6 +941,17 @@ pub fn open(root: &Path) -> Handle {
 /// crate notices.
 struct Binary {
     root: PathBuf,
+    /// The repository's top level, resolved on the first working-tree read.
+    ///
+    /// `--raw` and `--porcelain` paths are relative to it, while `root` may be
+    /// any subdirectory of it — so every working-tree read joins onto this,
+    /// never onto `root` itself. The answer cannot move for the life of a
+    /// handle (the same argument `state_paths` below makes), and one `git`
+    /// process per diff to re-learn it is a spawn floor on every acquisition
+    /// — including the first, where it sat between `diff --raw` and
+    /// `cat-file --batch`, three floors in a row. Resolved once, lazily: the
+    /// first read pays it, the rest do not.
+    top: std::sync::OnceLock<PathBuf>,
     /// Where each of git's sequencing state files *would* be, resolved once.
     ///
     /// `rev-parse --git-path` answers a question about the repository's layout,
@@ -1025,7 +1037,7 @@ impl Repo for Binary {
         // the cwd) — so every working-tree read below joins onto the top level,
         // never onto `root` itself. Object reads do not care: `-C` finds the
         // objects from anywhere inside.
-        let top = top_level(&self.root);
+        let top = self.top.get_or_init(|| top_level(&self.root));
 
         // Every blob the whole diff needs, fetched by one `cat-file --batch` —
         // but held one file at a time. The batch answers strictly in request
@@ -1079,7 +1091,7 @@ impl Repo for Binary {
         // `git status` lists them last and that is the wrong way round for a diff,
         // where the thing you just created is the thing you are looking for.
         // Fetching them early changed when they arrive, not where they land.
-        out.extend(loose?.untracked.iter().filter_map(|e| loose_pair(e, &top)));
+        out.extend(loose?.untracked.iter().filter_map(|e| loose_pair(e, top)));
         for c in changes {
             // Both sides pull in request order — old, then new — which is what
             // keeps this loop aligned with the stream.
@@ -1112,7 +1124,7 @@ impl Repo for Binary {
                     // put bytes into a revision where the file did not exist.
                     revspec
                         .is_empty()
-                        .then(|| new_side(&c.new_oid, &top, c.path.as_bytes()))
+                        .then(|| new_side(&c.new_oid, top, c.path.as_bytes()))
                         .flatten()
                 });
             let binary = old.as_ref().is_some_and(|b| is_binary(b))
@@ -7216,6 +7228,7 @@ mod tests {
     fn binary_for(root: &Path) -> Binary {
         Binary {
             root: root.to_path_buf(),
+            top: Default::default(),
             state_paths: Default::default(),
         }
     }
