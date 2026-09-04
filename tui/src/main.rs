@@ -242,6 +242,13 @@ const EMPTY_DIFF_LABEL: &str = "commit preview unavailable";
 /// re-reads the stack, and a read that succeeds replaces this pane outright.
 const STASH_UNAVAILABLE: &str = "unavailable";
 
+/// What a sidebar pane's header says while its first read is still out —
+/// the one frame the launch's skeleton draws in. Never a count and never
+/// `unavailable`: nothing has failed and nothing has been counted yet.
+/// The pane's own unavailable shape stands in for the rows, for the same
+/// honesty a failed read gets — an un-read tree is not a clean tree.
+const STARTUP_LOADING: &str = "loading";
+
 /// The mode a text field owns the keyboard in — the name the keymap and
 /// `gitten.toml` use, and the same name the window's input module holds. While
 /// any prompt stands, bindings are resolved against exactly this mode
@@ -485,11 +492,16 @@ impl Screens {
                 // The whole of the blocking half: three ref reads, run
                 // beside each other — the same reads the pane was built
                 // from, and the same registration-wide wave every other
-                // pane rides. Nothing here touches the view until the reads
-                // have come back, so a failed refresh leaves the last good
-                // rows standing, at its old generation, for a later wave to
-                // retry.
-                let reads = load_branches(repo);
+                // pane rides. The describe rides the same wave, since the
+                // label is spelled with it; nothing here touches the view
+                // until the reads have come back, so a failed refresh
+                // leaves the last good rows standing, at its old
+                // generation, for a later wave to retry.
+                let (reads, described) = std::thread::scope(|s| {
+                    let reads = s.spawn(|| load_branches(repo));
+                    let described = s.spawn(|| repo.describe());
+                    (join_read(reads), join_read(described))
+                });
                 if let Some(e) = reads.error {
                     return Some(Err(e));
                 }
@@ -497,7 +509,7 @@ impl Screens {
                     &reads.local,
                     &reads.remotes,
                     reads.head.as_ref(),
-                    &reads.described,
+                    &described,
                 );
                 *label = next;
                 view.replace(rows);
@@ -923,6 +935,12 @@ struct App {
     /// is unbound. Drawing reads this cache, so a frame allocates nothing for
     /// a header.
     focus_keys: Vec<(String, String)>,
+    /// Whether the skeleton's deferred startup loads still have to run — the
+    /// sidebars' first reads and the preview diff for row zero, registered in
+    /// their loading shape by [`App::new`] and filled in by [`App::load_startup`]
+    /// after the first frame. Cleared by the load itself; a fixture or a patch
+    /// has no repository and never carries it.
+    startup_pending: bool,
 }
 
 impl App {
@@ -944,32 +962,23 @@ impl App {
             true => Marks::ascii(),
             false => Marks::default(),
         };
-        // The ancillary stack, read beside the view that was asked for: one
-        // more `git stash list` after startup already holds the requested
-        // view, through the same handle. A read that fails says so and the
-        // launch goes on — the pane opens as unavailable, the exact error is
-        // kept for the status line, and the next refresh re-reads the stack.
-        let mut stash_error = None;
-        let stash_tenant =
-            repo.as_ref()
-                .map(|(_, handle)| match acquire::stashes(handle.as_ref()) {
-                    Ok(loaded) => {
-                        let parked = loaded.stashes.len();
-                        let mut view = Stashes::new(loaded.stashes);
-                        view.set_bar(bar);
-                        (view, stash_label(&loaded.label, parked))
-                    }
-                    Err(e) => {
-                        let mut view = Stashes::unavailable();
-                        view.set_bar(bar);
-                        stash_error = Some(e);
-                        (view, STASH_UNAVAILABLE.to_string())
-                    }
-                });
-        let stash_tenant = stash_tenant.map(|(view, label)| Screens::Stashes {
-            view,
-            label,
-            generation: Generation::default(),
+        // The ancillary stack, registered before its read exists: the pane is
+        // part of the layout from frame one — the number keys, the cycle and
+        // the walk all derive from it — and the read runs after the first
+        // frame instead of on the road to it. `unavailable()` is the honest
+        // shape for an un-read stack too, exactly as for a failed one: an
+        // un-read tree is not a clean tree, and the label is the only
+        // difference. A read that fails says so and the launch goes on —
+        // the exact error is kept for the status line, and the next refresh
+        // re-reads the stack.
+        let stash_tenant = repo.is_some().then(|| {
+            let mut view = Stashes::unavailable();
+            view.set_bar(bar);
+            Screens::Stashes {
+                view,
+                label: STARTUP_LOADING.to_string(),
+                generation: Generation::default(),
+            }
         });
         let mut panes = panes::Panes::new();
         let mut last_list = None;
@@ -1041,86 +1050,57 @@ impl App {
                 panes.focus_named("diff");
             }
         }
-        // The working tree gets its pane whenever startup opened a repository
-        // — eagerly, one blocking `git status` beside the rest of startup
-        // acquisition, the same product choice the window makes. Registration
-        // is the whole of what a second sidebar list costs: the number keys,
-        // the cycle and the walk derive from it, and no geometry or dispatch
-        // branch learns the name. A fixture or a patch has no repository and
-        // so no pane at all; the name stays absent and `files.focus` says so.
+        // The working tree and the branch lists get their panes whenever
+        // startup opened a repository — as tenants, but not yet as reads:
+        // both register here in their loading shape, and the reads run after
+        // the first frame (see [`App::load_startup`]). The product choice the
+        // comments above record is untouched — one `git status` and three ref
+        // reads still happen before anything can stale them — but they no
+        // longer sit on the road to the first frame behind the view the
+        // person actually asked for. Registration is the whole of what a
+        // second sidebar list costs: the number keys, the cycle and the walk
+        // derive from it, and no geometry or dispatch branch learns the name.
+        // A fixture or a patch has no repository and so no pane at all; the
+        // name stays absent and `files.focus` says so.
         //
-        // A failed initial read still registers — retryable, refreshed by the
-        // first successful read — and says `status unavailable` rather than
-        // drawing a clean tree it cannot prove. The error is logged here,
-        // before raw mode, where stderr still goes somewhere readable.
+        // The panes carry the `unavailable` shape while the reads are out,
+        // for the same reason a failed read does: an un-read tree must never
+        // be drawn where a clean tree goes, and the label is the only
+        // difference. The error is set on the status line by the load, where
+        // a failure is discovered — after the terminal is taken, so a
+        // stderr print here would land behind the alternate screen.
         let launch_focus = panes.focused_name().to_string();
-        let mut branch_error = None;
-        if let Some((_, handle)) = &repo {
-            let described = handle.describe();
-            let (view, files_label) = match handle.status() {
-                Ok(status) => {
-                    let files::Prepared { rows, label } = files::prepare(&status, &described);
-                    let mut view = Files::new(rows);
-                    view.set_bar(bar);
-                    (view, label)
-                }
-                Err(e) => {
-                    eprintln!("gitten-tui: status failed, the files pane starts unavailable: {e}");
-                    (Files::unavailable(), files::unavailable_label(&described))
-                }
-            };
+        if repo.is_some() {
+            let mut files = Files::unavailable();
+            files.set_bar(bar);
             panes.register(
                 "files",
                 panes::Placement::sidebar("files"),
                 Screens::Files {
-                    view,
-                    label: files_label,
+                    view: files,
+                    label: STARTUP_LOADING.to_string(),
                     generation: Generation::default(),
                 },
             );
-            // The branches pane, the same product choice one slot over: three
-            // ref reads run beside each other — one spawn floor covers them
-            // all — and the tenant registers whether or not they all came
-            // back. A read that lost the branch lists registers honest
-            // emptiness and keeps the error for the status line; a HEAD-only
-            // failure keeps the rows it did read — the current bit rode in on
-            // the list, not on the head read — and merely loses the detached
-            // row. Either way the launch goes on: a failed side read must
-            // not abort the view the person actually asked for.
-            let reads = load_branches(handle.as_ref());
-            let (rows, branches_label) = match reads.error.as_ref() {
-                // The lists themselves were lost: the pane's data is not
-                // "empty", it is unread, and the label says so while the
-                // error rides to the status line.
-                Some(_) if reads.local.is_empty() && reads.remotes.is_empty() => {
-                    (Vec::new(), branches::unavailable_label(&reads.described))
-                }
-                _ => {
-                    let prepared = branches::prepare(
-                        &reads.local,
-                        &reads.remotes,
-                        reads.head.as_ref(),
-                        &reads.described,
-                    );
-                    (prepared.rows, prepared.label)
-                }
-            };
-            let mut view = Branches::with_marks(rows, marks);
-            view.set_bar(bar);
+            let mut branches = Branches::with_marks(Vec::new(), marks);
+            branches.set_bar(bar);
             panes.register(
                 "branches",
                 panes::Placement::sidebar("branches"),
                 Screens::Branches {
-                    view,
-                    label: branches_label,
+                    view: branches,
+                    label: STARTUP_LOADING.to_string(),
                     generation: Generation::default(),
                 },
             );
-            branch_error = reads.error;
             // `register` focuses what it adds; the keyboard goes back to
             // whatever the launch opened on — the commit list or the diff.
             panes.focus_named(&launch_focus);
         }
+        // Whether the sidebars and the preview diff still owe the first
+        // frame their data — decided before `repo` moves into the app, since
+        // the flag is a property of the launch, not of the field.
+        let startup_pending = repo.is_some();
         let jobs = Runner::new();
         let submitter = jobs.submitter();
         let mut app = Self {
@@ -1151,21 +1131,215 @@ impl App {
             clicked: None,
             clicks: 0,
             focus_keys: Vec::new(),
+            startup_pending,
         };
-        // A failed side read is kept, not fatal: the pane opened as
-        // unavailable and its header says so; the exact error goes to the
-        // status line, where the person launching can read it, and not to
-        // stderr, which sits behind the alternate screen. A branch read
-        // failure outranks a stash one only because there is one line and
-        // both panes refresh either way.
-        app.message = branch_error.or(stash_error).unwrap_or_default();
         app.sync_header_keys();
         app.sync_modes();
-        // A commits launch opens with row zero highlighted, so the main pane
-        // names and draws that commit immediately. Enter is only the focus
-        // transfer; it is never the trigger that makes the preview exist.
-        app.sync_main_diff(false);
         app
+    }
+
+    /// The startup loads the skeleton deferred: the sidebars' first reads and
+    /// the preview diff for row zero, all of them registered in their loading
+    /// shape by [`App::new`] and filled in here — after the first frame is
+    /// on the terminal, so the list the launch asked for is interactive
+    /// before any of this runs, and everything else arrives on the frame
+    /// after it.
+    ///
+    /// One wave, not four: the stash read, the status read, the describe and
+    /// the branch reads all spawn into one `thread::scope` — the window pays
+    /// one spawn floor for its sidebars and so does the terminal — and the
+    /// preview diff rides the same wave, since the commit it diffs is row
+    /// zero and known before any of this starts. The failures the window
+    /// keeps quiet about are kept here too: a failed side read registers its
+    /// unavailable pane and the error goes to the status line; the preview
+    /// diff failing is a status-line message and an empty main pane.
+    ///
+    /// Synchronous on the terminal loop, deliberately — the same trade every
+    /// refresh makes (see [`Screens::refresh`]): input pauses while the wave
+    /// runs, and nothing here can stale, because nothing a write does can
+    /// have landed between the frame and this call.
+    fn load_startup(&mut self, clock: &mut StartClock) {
+        self.startup_pending = false;
+        let Some((path, repo)) = self.repo.clone() else {
+            return;
+        };
+        let launch_focus = self.panes.focused_name().to_string();
+        // The commit the preview diffs, decided before the wave: row zero of
+        // the list the launch asked for. Enter is only the focus transfer; it
+        // is never the trigger that makes the preview exist.
+        let preview = match self.panes.get("commits") {
+            Some(Screens::Commits { view, .. }) => view.current().cloned(),
+            _ => None,
+        };
+        // An owned host crosses the thread boundary — the same copy the
+        // window's background load carries.
+        let host = self.host.clone();
+
+        let (stash_read, status_read, described, branch_reads, diff_read) =
+            std::thread::scope(|s| {
+                // The handle as a stable borrow the `move` spawns copy: an
+                // `Arc` would be four refcount bumps for the same answer.
+                let repo = &repo;
+                let stashes = s.spawn(move || acquire::stashes(repo.as_ref()));
+                let status = s.spawn(move || repo.status());
+                let described = s.spawn(move || repo.describe());
+                let branches = s.spawn(move || load_branches(repo.as_ref()));
+                let diff = preview.as_ref().map(|commit| {
+                    let source = Source::Repo {
+                        path: path.clone(),
+                        arg: commit.sha.clone(),
+                    };
+                    s.spawn(move || {
+                        acquire::acquire(View::Diff, &source, &host, Some(repo.as_ref()))
+                    })
+                });
+                (
+                    join_read(stashes),
+                    join_read(status),
+                    join_read(described),
+                    join_read(branches),
+                    diff.map(join_read),
+                )
+            });
+        clock.stage("startup reads joined");
+
+        // Apply half, in place — the same `replace` calls the refresh path
+        // makes, on the tenants the skeleton registered. A read that failed
+        // leaves its unavailable pane standing and the error rides to the
+        // status line; a branch failure outranks a stash one and a stash one
+        // outranks a status one only because there is one line and every pane
+        // refreshes either way.
+        let mut error = None;
+        if let Some(Screens::Stashes { view, label, .. }) = self.panes.get_mut("stashes") {
+            match stash_read {
+                Ok(loaded) => {
+                    let parked = loaded.stashes.len();
+                    view.replace(loaded.stashes);
+                    *label = stash_label(&loaded.label, parked);
+                }
+                Err(e) => {
+                    *label = STASH_UNAVAILABLE.to_string();
+                    error.get_or_insert(e);
+                }
+            }
+        }
+        if let Some(Screens::Files { view, label, .. }) = self.panes.get_mut("files") {
+            match &status_read {
+                Ok(status) => {
+                    let files::Prepared { rows, label: next } = files::prepare(status, &described);
+                    view.replace(rows);
+                    *label = next;
+                }
+                // The pane keeps its unavailable shape and only the sentence
+                // changes: the exact error goes to the status line below,
+                // where it can be read — stderr now sits behind the
+                // alternate screen, so the print the eager path made is gone.
+                Err(_) => *label = files::unavailable_label(&described),
+            }
+        }
+        if let Some(e) = status_read.err() {
+            error.get_or_insert(e);
+        }
+        if let Some(Screens::Branches { view, label, .. }) = self.panes.get_mut("branches") {
+            let (rows, next) = match branch_reads.error.as_ref() {
+                // The lists themselves were lost: the pane's data is not
+                // "empty", it is unread, and the label says so while the
+                // error rides to the status line.
+                Some(_) if branch_reads.local.is_empty() && branch_reads.remotes.is_empty() => {
+                    (Vec::new(), branches::unavailable_label(&described))
+                }
+                _ => {
+                    let prepared = branches::prepare(
+                        &branch_reads.local,
+                        &branch_reads.remotes,
+                        branch_reads.head.as_ref(),
+                        &described,
+                    );
+                    (prepared.rows, prepared.label)
+                }
+            };
+            if let Some(e) = &branch_reads.error {
+                error.get_or_insert(e.clone());
+            }
+            view.replace(rows);
+            *label = next;
+        }
+        self.message = error.unwrap_or_default();
+        self.panes.focus_named(&launch_focus);
+        self.sync_header_keys();
+        self.sync_modes();
+
+        // The preview, last: the main pane names and draws row zero from the
+        // wave's answer, and a failed one leaves the empty pane with the
+        // message — the same shape `sync_main_diff` leaves on a failure.
+        if let Some(commit) = preview {
+            match diff_read {
+                Some(Ok(loaded)) => match loaded.data {
+                    Data::Diff(files) => {
+                        self.install_main_diff(&commit, files, false);
+                    }
+                    Data::Commits(_) => {}
+                },
+                Some(Err(e)) => self.message = e,
+                None => {}
+            }
+        }
+        clock.stage("startup loads applied");
+    }
+
+    /// Puts an acquired diff behind the main pane as row zero's preview —
+    /// the registration, geometry and focus restoration both
+    /// [`App::sync_main_diff`] and [`App::load_startup`] share.
+    fn install_main_diff(
+        &mut self,
+        commit: &gitten_core::Commit,
+        files: Vec<gitten_core::FileDiff>,
+        focus: bool,
+    ) {
+        let Some((path, _)) = self.repo.clone() else {
+            if focus {
+                self.message = "a fixture has no repository to diff against".into();
+            }
+            return;
+        };
+        let sha = commit.sha.clone();
+        let subject = commit.subject.clone();
+        let old_focus = self.panes.focused_name().to_string();
+        let source = Source::Repo {
+            path,
+            arg: sha.clone(),
+        };
+        let mut diff = Diff::new(files, &self.host);
+        diff.set_bar(self.bar);
+        self.ensure_geometry();
+        if let Some(rect) = self.pane_content("diff") {
+            diff.set_scrolloff(self.host.view.scrolloff);
+            diff.resize(rect.width, rect.height, &self.host);
+        }
+        self.panes.register(
+            "diff",
+            panes::Placement::Main,
+            Screens::Diff {
+                view: diff,
+                source: Some(source),
+                label: format!("{} {subject}", &sha[..sha.len().min(8)]),
+                // Acquired this instant, so it is as current as the queue's
+                // last finish — not a generation older.
+                generation: self.generation,
+            },
+        );
+        // Only a gesture captured in the tenant just replaced became stale. A
+        // click in commits is what requested this preview and must still
+        // receive its release.
+        if self.gesture.as_deref() == Some("diff") {
+            self.gesture = None;
+        }
+        let target = match focus {
+            true => "diff",
+            false => &old_focus,
+        };
+        self.panes.focus_named(target);
+        self.sync_modes();
     }
 
     /// The mode stack follows the keyboard. Rebuilt rather than pushed and
@@ -1329,6 +1503,19 @@ impl App {
             if first {
                 first = false;
                 clock.stage("first frame flushed");
+                // The skeleton's deferred startup loads run here, not before
+                // the terminal was taken: the list the launch asked for has
+                // been on screen and interactive for every millisecond this
+                // call runs. The second frame they fill is flushed before the
+                // loop blocks on input again — otherwise the tick, not the
+                // load, would decide when the sidebars and the preview
+                // appear.
+                if self.startup_pending {
+                    self.load_startup(clock);
+                    self.draw();
+                    self.screen.flush(term.out())?;
+                    clock.stage("startup frame flushed");
+                }
             }
             if stats_on() {
                 self.stats = Some((t.elapsed(), cells));
@@ -2410,7 +2597,7 @@ impl App {
             }
         };
         let Some(commit) = commit else { return };
-        let (sha, subject) = (commit.sha.clone(), commit.subject.clone());
+        let sha = commit.sha.clone();
         let shown = matches!(
             self.panes.get("diff"),
             Some(Screens::Diff {
@@ -2430,49 +2617,15 @@ impl App {
             }
             return;
         };
-        let old_focus = self.panes.focused_name().to_string();
         let source = Source::Repo {
             path,
             arg: sha.clone(),
         };
         match acquire::acquire(View::Diff, &source, &self.host, Some(repo.as_ref())) {
-            Ok(loaded) => {
-                let files = match loaded.data {
-                    Data::Diff(files) => files,
-                    Data::Commits(_) => return,
-                };
-                let mut diff = Diff::new(files, &self.host);
-                diff.set_bar(self.bar);
-                self.ensure_geometry();
-                if let Some(rect) = self.pane_content("diff") {
-                    diff.set_scrolloff(self.host.view.scrolloff);
-                    diff.resize(rect.width, rect.height, &self.host);
-                }
-                self.panes.register(
-                    "diff",
-                    panes::Placement::Main,
-                    Screens::Diff {
-                        view: diff,
-                        source: Some(source),
-                        label: format!("{} {subject}", &sha[..sha.len().min(8)]),
-                        // Acquired this instant, so it is as current as the
-                        // queue's last finish — not a generation older.
-                        generation: self.generation,
-                    },
-                );
-                // Only a gesture captured in the tenant just replaced became
-                // stale. A click in commits is what requested this preview and
-                // must still receive its release.
-                if self.gesture.as_deref() == Some("diff") {
-                    self.gesture = None;
-                }
-                let target = match focus {
-                    true => "diff",
-                    false => &old_focus,
-                };
-                self.panes.focus_named(target);
-                self.sync_modes();
-            }
+            Ok(loaded) => match loaded.data {
+                Data::Diff(files) => self.install_main_diff(&commit, files, focus),
+                Data::Commits(_) => {}
+            },
             Err(e) => self.message = e,
         }
     }
@@ -3098,8 +3251,6 @@ struct BranchReads {
     local: Vec<gitten_core::refs::Branch>,
     remotes: Vec<gitten_core::refs::RemoteBranch>,
     head: Option<gitten_core::refs::HeadState>,
-    /// Whose repository these are — the describe the label is spelled with.
-    described: String,
     /// The first read that failed, in the sentence the status line says.
     /// `None` is a clean read. The caller — not this helper — decides what a
     /// failed leg costs: the lists are honest while they stand, and a lost
@@ -3109,22 +3260,19 @@ struct BranchReads {
 
 /// Runs the three ref reads beside each other and keeps what came back.
 ///
-/// A failed leg is not a fatal one: the caller decides — at startup the lists
-/// being lost means an honest empty tenant and a message, at refresh it means
-/// the last good rows stand — but the error itself travels verbatim, because
+/// The describe is deliberately *not* one of these reads: every caller has
+/// one of its own already — the files pane names the repository with the
+/// same string — and a describe inside here would be a second `git`
+/// process for text already in hand. What comes back is one prepared-able
+/// snapshot or an
+/// account of which leg failed; nothing here touches a view.
 /// `git` already said the useful thing.
 fn load_branches(repo: &dyn gitten_git::Repo) -> BranchReads {
-    let (local, remotes, head, described) = std::thread::scope(|s| {
+    let (local, remotes, head) = std::thread::scope(|s| {
         let local = s.spawn(|| repo.branches());
         let remotes = s.spawn(|| repo.remote_branches());
         let head = s.spawn(|| repo.head());
-        let described = s.spawn(|| repo.describe());
-        (
-            join_read(local),
-            join_read(remotes),
-            join_read(head),
-            join_read(described),
-        )
+        (join_read(local), join_read(remotes), join_read(head))
     });
     let mut error = None;
     // The lists first: they are the pane's data, and the order of the two
@@ -3154,7 +3302,6 @@ fn load_branches(repo: &dyn gitten_git::Repo) -> BranchReads {
         local,
         remotes,
         head,
-        described,
         error,
     }
 }
@@ -4775,6 +4922,7 @@ diff --git a/tracked.txt b/tracked.txt
             repo,
         };
         let mut app = App::new(started, Glyphs::default());
+        app.load_startup(&mut StartClock::new());
         app.screen = Screen::new(60, 24);
         app
     }
@@ -4795,6 +4943,7 @@ diff --git a/tracked.txt b/tracked.txt
             repo: Some(handle.clone()),
         };
         let mut app = App::new(started, Glyphs::default());
+        app.load_startup(&mut StartClock::new());
         app.screen = Screen::new(60, 24);
         app
     }
@@ -4865,6 +5014,7 @@ diff --git a/tracked.txt b/tracked.txt
             repo: Some(handle.clone()),
         };
         let mut app = App::new(started, Glyphs::default());
+        app.load_startup(&mut StartClock::new());
         app.screen = Screen::new(120, 24);
         app
     }
@@ -9032,6 +9182,114 @@ diff --git a/tracked.txt b/tracked.txt
                 app.panes.get(name).unwrap().generation(),
                 app.generation,
                 "{name} was not refreshed to the generation"
+            );
+        }
+    }
+
+    /// The skeleton, exactly as [`App::new`] leaves it. Every other test
+    /// launches through a helper that calls `load_startup`, so the deferred
+    /// half of startup is never asserted — and the TTI number depends on it:
+    /// the sidebars register in their loading shape, the main pane stays the
+    /// empty one, and nothing runs until the first frame is on the terminal.
+    /// If someone moves the loads back into [`App::new`], this is what breaks.
+    #[test]
+    fn the_skeleton_defers_the_startup_loads() {
+        let (handle, _state) = fake(&[]);
+        let started = gitten_app::Started {
+            view: View::Commits,
+            source: Source::Repo {
+                path: std::path::PathBuf::from("/fake"),
+                arg: String::new(),
+            },
+            host: Host::new(),
+            loaded: acquire::Loaded {
+                label: "fake".into(),
+                data: Data::Commits(hundred_commits()),
+            },
+            config: std::path::PathBuf::from("/nonexistent/gitten.toml"),
+            repo: Some(handle.clone()),
+        };
+        let mut app = App::new(started, Glyphs::default());
+        app.screen = Screen::new(120, 24);
+
+        assert!(app.startup_pending, "App::new ran the startup loads itself");
+        // Three sidebars, all registered — the number keys and the walk derive
+        // from registration, which is the whole of what a deferred pane costs —
+        // and all in the loading shape, which is the honest shape for an
+        // un-read list.
+        for name in ["files", "branches", "stashes"] {
+            let label = match app.panes.get(name) {
+                Some(Screens::Files { label, .. })
+                | Some(Screens::Branches { label, .. })
+                | Some(Screens::Stashes { label, .. }) => label.as_str(),
+                Some(_) => panic!("{name} was registered as the wrong screen"),
+                None => panic!("{name} is not registered in the loading shape"),
+            };
+            assert_eq!(label, STARTUP_LOADING, "{name} is not in its loading shape");
+        }
+        // The main pane is the empty one: nothing was acquired for it yet, and
+        // pretending otherwise would draw a diff nobody acquired.
+        match app.panes.get("diff") {
+            Some(Screens::Diff { view, label, .. }) => {
+                assert_eq!(label, EMPTY_DIFF_LABEL);
+                assert_eq!(view.rows(), 0, "the main pane holds something unacquired");
+            }
+            _ => panic!("the diff pane is not registered"),
+        }
+
+        // The load, one wave: the flag clears and every tenant holds what its
+        // read answered — the sidebars their lists, the main pane row zero's
+        // preview, named and not empty.
+        app.load_startup(&mut StartClock::new());
+        assert!(!app.startup_pending, "the load did not clear the flag");
+        assert!(
+            files_of(&app).is_available(),
+            "the files pane never left its loading shape"
+        );
+        assert_ne!(files_label(&app), STARTUP_LOADING);
+        assert_ne!(branches_label(&app), STARTUP_LOADING);
+        match app.panes.get("stashes") {
+            Some(Screens::Stashes { label, .. }) => {
+                assert_ne!(label, STARTUP_LOADING);
+            }
+            _ => panic!("the stashes pane is not registered"),
+        }
+        match app.panes.get("diff") {
+            Some(Screens::Diff { view, label, .. }) => {
+                assert_ne!(label, EMPTY_DIFF_LABEL, "the preview was never named");
+                assert!(view.rows() > 0, "the preview diff is empty");
+            }
+            _ => panic!("the diff pane is not registered"),
+        }
+    }
+
+    /// A fixture launch defers nothing: no repository behind it means no
+    /// sidebars and no reads to hold back, so [`App::new`] is the whole of
+    /// startup and the flag is false before anything runs. The pair of tests
+    /// pins both halves of the ordering — a repository launch defers, a
+    /// fixture launch never does.
+    #[test]
+    fn a_fixture_launch_never_defers_anything() {
+        let started = gitten_app::Started {
+            view: View::Diff,
+            source: Source::Fixtures,
+            host: Host::new(),
+            loaded: acquire::Loaded {
+                label: "fixtures".into(),
+                data: Data::Diff(parse_unified_diff(HUNK_DIFF)),
+            },
+            config: std::path::PathBuf::from("/nonexistent/gitten.toml"),
+            repo: None,
+        };
+        let app = App::new(started, Glyphs::default());
+        assert!(
+            !app.startup_pending,
+            "a fixture launch carried the deferred flag"
+        );
+        for name in ["files", "branches", "stashes"] {
+            assert!(
+                app.panes.get(name).is_none(),
+                "the {name} pane is on a fixture launch"
             );
         }
     }
