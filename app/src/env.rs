@@ -22,6 +22,15 @@
 //! | `WORST` | presence | unset (off) | `diffcheck`: also report the files each algorithm did worst on |
 //! | `GITTEN_STATS` | `0` off, anything else on | off | overlays: the frame/row/heap readout |
 //! | `GITTEN_START_LOG` | `0` off, anything else on | off | `Startup`: per-stage startup timings on stderr |
+//! | `GITTEN_START_QUIT` | `0` off, anything else on | off | shell: quit once the first rows are drawn — a headless end to a time-to-interactive run |
+//! | `ROUNDS` | `usize` | 7 (`tti`) | `tti`: runs per side, ABBA-interleaved, median reported |
+//! | `SETTLE` | seconds (`f64`) | 1 | `tti`: the gap between two timed runs |
+//! | `GITTEN_BASELINE` | path | unset (single side) | `tti`: an older `gitten-tui` to ABBA against |
+//! | `GITTEN_BASELINE_SHELL` | path | unset (no baseline) | `tti`: an older `gitten-shell` to ABBA against |
+//! | `GITTEN_TTI_SHELL` | `0` off, anything else on | on | `tti`: whether the desktop side runs at all (check.sh turns it off to stay windowless) |
+//! | `GITTEN_TTI_MAX_FIRST_FRAME_MS` | `f64` ms | unset (advisory) | `tti`: exit non-zero when the median exceeds it |
+//! | `GITTEN_TTI_MAX_FILLED_MS` | `f64` ms | unset (advisory) | `tti`: as above, for the filled frame |
+//! | `GITTEN_TTI_MAX_SHELL_MS` | `f64` ms | unset (advisory) | `tti`: as above, for the shell wall clock |
 //! | `GITTEN_FORMAT` | `json` or unset | unset (human) | every `--json` tool: machine-readable output on stdout |
 //! | `GITTEN_CONFIG` | path | see `config::path` | which `gitten.toml` to read; honoured by [`config::path`](crate::config::path) |
 //!
@@ -153,6 +162,66 @@ pub fn stats() -> bool {
 /// but `"0"`.
 pub fn start_log() -> bool {
     enabled("GITTEN_START_LOG")
+}
+
+/// Whether the desktop client should quit the moment its first rows are
+/// drawn. `GITTEN_START_QUIT`, anything but `"0"`.
+///
+/// The terminal measures its own road to the first frame on a private pty;
+/// the window has no such exit and a run otherwise sits there until someone
+/// quits it, so a scriptable time-to-interactive number needs a client that
+/// ends itself at the exact moment the measurement is over. This is that
+/// end: the same "first rows drawn" poll that marks the stage also quits,
+/// and the wall clock around the process is the number. A window still
+/// appears — GPUI draws nothing without one — for however long the road
+/// takes.
+pub fn start_quit() -> bool {
+    enabled("GITTEN_START_QUIT")
+}
+
+/// How many runs per side a measurement interleaves. `ROUNDS`, default
+/// `default` — `tti` asks for 7, the seven alternating runs a side
+/// `docs/measurements.md` reports a startup comparison with.
+pub fn rounds(default: usize) -> usize {
+    number("ROUNDS", default)
+}
+
+/// Seconds between two timed runs. `SETTLE`, default `default` — 1 for
+/// `tti`, the same settle gap `bench.sh` leaves between rounds.
+pub fn settle(default: f64) -> f64 {
+    get("SETTLE")
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+/// An older binary to ABBA against, if the caller named one. `GITTEN_BASELINE`
+/// — the terminal side; the path is a `gitten-tui` of another vintage.
+pub fn baseline() -> Option<PathBuf> {
+    get("GITTEN_BASELINE").map(PathBuf::from)
+}
+
+/// The same for the window: `GITTEN_BASELINE_SHELL`, a `gitten-shell` of
+/// another vintage.
+pub fn baseline_shell() -> Option<PathBuf> {
+    get("GITTEN_BASELINE_SHELL").map(PathBuf::from)
+}
+
+/// Whether the desktop side of a TTI measurement runs. `GITTEN_TTI_SHELL`,
+/// and the default is *on*: the flag is a veto, `0` being the only off —
+/// which is the opposite of the [`enabled`] flags, because the side a caller
+/// wants removed is the desktop (check.sh turns it off to stay windowless),
+/// never the terminal.
+pub fn tti_shell() -> bool {
+    !std::env::var("GITTEN_TTI_SHELL").is_ok_and(|v| v == "0")
+}
+
+/// A ceiling a caller may pin, if it set one. `name` is the whole variable
+/// (`GITTEN_TTI_MAX_FIRST_FRAME_MS` and friends), parsed as milliseconds.
+/// Unset or unparseable is no ceiling — the advisory default, where the suite
+/// only advises — because a threshold that fails to parse must not silently
+/// become a gate.
+pub fn ceiling(name: &str) -> Option<f64> {
+    get(name).and_then(|v| v.trim().parse().ok())
 }
 
 /// An explicit config path, if the caller gave one. `GITTEN_CONFIG`.

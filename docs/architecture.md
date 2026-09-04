@@ -125,8 +125,12 @@ real history, and is run by `./check.sh`.
 
 ## gitten-app
 
-The config file, the command line, and acquisition — everything a client needs
-before it can draw, and nothing that draws.
+The config file, the command line, and acquisition — the whole of a client's
+startup, and nothing that draws. Startup has one seam in it:
+[`Startup::configure`](clients.md) is everything `Startup::go` does but the
+acquisition, for a client with something to draw first — the desktop — and the
+client schedules that acquisition itself. What is shared is the chain, not the
+ordering.
 
 | module | what lives there |
 |---|---|
@@ -135,7 +139,7 @@ before it can draw, and nothing that draws.
 | `acquire.rs` | one view of one source into `Vec<FileDiff>` or `Vec<Commit>`, and re-acquisition after writes |
 | `jobs.rs` | serial blocking jobs and lifecycle events; the finish-counting generation — a refusal advances it too, because git can answer nonzero having left work behind (a conflicted revert) |
 | `verbs.rs` | the write verbs as jobs: each captures a `Handle` clone plus its arguments and calls the trait; an extension composes these exact words |
-| `lib.rs` | `Startup` — the four lines a client's `main` starts with |
+| `lib.rs` | `Startup` — the lines a client's `main` starts with; `configure` stops before acquisition for a client that draws first |
 
 It exists because all of that was written twice and about to be written a third
 time, and because `config.rs` used to live behind GPUI, which made the window the
@@ -202,7 +206,7 @@ GPUI. Drawing and input, and as little else as possible.
 
 | file | what lives there |
 |---|---|
-| `main.rs` | the window, named command dispatch, pane assembly and job-event draining |
+| `main.rs` | the window, its `Launch` seam (`Skeleton` opens before acquiring), named command dispatch, pane assembly and job-event draining |
 | `input.rs` | native GPUI text input: IME composition, UTF-16 selection and grapheme editing |
 | `panes.rs` | stable pane registration, replacement and logical focus |
 | `views/diff.rs` | the `Rows` seam, `TextRows`, run-list merging, the shared row furniture |

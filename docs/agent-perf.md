@@ -58,12 +58,67 @@ rename into place, so an interrupted run never leaves a half-written fixture.
 
 ## The `check.sh` section
 
-`./check.sh` ends with `perf gate (advisory)`: one `--rounds 1` JSON run on
-`fixtures/small` plus a schema/parse validation. It fails only when the
-*harness* is broken (fixtures missing, `bench.sh` errors, JSON does not
-parse) — never on a timing. `GITTEN_PERF=0` skips it,
-`GITTEN_PERF_ROUNDS=N` sets the rounds. Existing sections are untouched: same
-order, same behaviour, same exit codes.
+`./check.sh` has two advisory sections at the end. The first, `perf gate (advisory)`,
+is one `--rounds 1` JSON run on `fixtures/small` plus a schema/parse validation.
+The second, `tti (terminal, advisory)`, is the suite below on this repo, 3
+rounds. Both fail only when the *harness* is broken (fixtures missing,
+`bench.sh` errors, JSON does not parse, the example cannot run) — never on a
+timing. `GITTEN_PERF=0` skips the first, `GITTEN_PERF_ROUNDS=N` sets its
+rounds; `GITTEN_TTI=0` skips the second, `GITTEN_TTI_ROUNDS=N` sets its
+rounds. Existing sections are untouched: same order, same behaviour, same exit
+codes.
+
+## Time to interactive
+
+`bench.sh` measures the load pipeline; `tti` measures the road to the first
+thing a person can *use*, in both real clients. On this repository:
+
+```sh
+cargo build -q --release -p gitten-tui                 # the binary it times
+cargo run -q -p gitten-tui --example tti --release .   # single side, terminal only
+```
+
+- The **terminal** number is spawn → `first frame flushed` on a private pty —
+  the stage the list the launch asked for has been interactive since
+  (`GITTEN_START_LOG=1` puts the stage marks on stderr, which rides the pty).
+  `q` on the pty master ends each run. `spawn → startup frame flushed` adds
+  the deferred sidebars and preview; binaries older than the deferral never
+  print it and its absence is reported, not an error.
+- The **desktop** number is the wall clock around `target/release/gitten-shell`
+  under `GITTEN_START_QUIT=1` — the client quits itself at the first rows. A
+  window does appear, briefly; that is the measurement. The side is skipped
+  with a note when the binary is missing, and `GITTEN_TTI_SHELL=0` turns it
+  off (check.sh does, to stay windowless).
+
+Against another vintage — the only comparison that means anything:
+
+```sh
+GITTEN_BASELINE=$OLD/target/release/gitten-tui \
+GITTEN_BASELINE_SHELL=$OLD/target/release/gitten-shell \
+cargo run -q -p gitten-tui --example tti --release .
+```
+
+Rounds are ABBA-interleaved with settle gaps, the starting side flips every
+round, one warmup per side is discarded, and the reported figure is the
+median — the discipline of `docs/measurements.md` in full (`ROUNDS`, default
+7; `SETTLE` seconds, default 1). Without a baseline, single-side medians and
+no comparison. `--json` (or `GITTEN_FORMAT=json`) prints schema
+`gitten.tti/1`: a median and its samples per figure per side, `deltaPct` for
+the current-vs-baseline comparison. `deltaPct` is the entire extent of what
+the suite concludes. The recorded baseline — today's figures, machine and
+commands — lives in
+[measurements.md](measurements.md#time-to-interactive-as-recorded); a future
+pass measures against it by pointing `GITTEN_BASELINE` at a build of this
+vintage, not by re-reading these paragraphs.
+
+The suite advises and never gates. The one enforcement is opt-in:
+`GITTEN_TTI_MAX_FIRST_FRAME_MS`, `GITTEN_TTI_MAX_FILLED_MS` and
+`GITTEN_TTI_MAX_SHELL_MS` — set one and a median past it exits non-zero.
+Unset, every run exits 0. Two structural tests in `tui/src/main.rs` pin the
+ordering the number depends on — the skeleton defers the startup loads, a
+fixture launch defers nothing — because a timing that drifts is read here, but
+a load that moved back into `App::new` is a regression that no round would
+explain.
 
 ## CI note
 

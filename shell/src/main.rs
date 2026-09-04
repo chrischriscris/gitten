@@ -16,7 +16,7 @@ mod views;
 use gitten_app::acquire::{Data, Loaded};
 use gitten_app::cli::{Request, Source, View};
 use gitten_app::jobs::{Event as JobEvent, Generation, Job, Runner, Submitter};
-use gitten_app::{Exit, Started, Startup};
+use gitten_app::{Configured, Started, Startup};
 use gitten_core::command::{chord_string, Code, Key, Modes, Resolve};
 use gitten_core::differ::{Overrides, Whitespace};
 use gitten_core::host::Host;
@@ -6084,45 +6084,66 @@ fn message_overlay(error: &GitError, host: &Host) -> AnyElement {
 fn main() {
     start::begin(std::time::Instant::now());
     start::mark("main enter");
-    // Arguments, `gitten.toml`, `--help`, `gitten config` and acquisition, all of
-    // it shared with every other client — see `gitten_app`. What is left in this
-    // file is a window.
+    // Arguments, `gitten.toml`, `--help`, `gitten config` — all of it shared
+    // with every other client — see `gitten_app`. The acquisition is the one
+    // stage a window does not wait for: it is scheduled after the window is
+    // up, through the same wave a repository switch rides, and the road to
+    // frame zero is configuration only. What is left in this file is a window.
     let mut startup = Startup::new("gitten", View::Commits)
         .blurb("a git client")
         .extra(EXTRA);
     let bare = bare_launch_view(startup.take());
-    match startup.go() {
-        Ok(started) => {
+    // Which door this launch takes, decided before anything runs: a
+    // repository launch defers its acquisition past the window, and a
+    // fixture or patch — acquired in-process, no spawn floor, no window to
+    // buy time against — keeps the synchronous road and its stderr failures
+    // exactly as they were.
+    let repo_launch = matches!(
+        gitten_app::cli::parse(startup.take(), View::Commits),
+        Request::Open {
+            source: Source::Repo { .. },
+            ..
+        }
+    );
+    // A bare launch from Finder or `open` arrives with no arguments and a
+    // working directory of `/`: the shared parse opens the default view of
+    // `.`, which is usually not a repository, and there is no terminal for
+    // the failure to be printed to. Deciding costs one cheap `git status` on
+    // the one path that needs it — a window-opened-anyway cannot learn it
+    // before drawing. With no repository here, the latest recent one opens —
+    // or, with no history at all, one is offered to pick. Anything explicit
+    // keeps the window-first path and its in-window answer to a repository
+    // that will not open.
+    if let Some(view) = bare {
+        if gitten_git::open(std::path::Path::new("."))
+            .status()
+            .is_err()
+        {
+            let recents = gitten_app::projects::load();
+            if let Some(started) = open_recent(view, &recents) {
+                let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
+                start::mark("gpui application up; entering run");
+                app.run(move |cx| open_main_window(Launch::Ready(started), cx));
+                return;
+            }
+            eprintln!("gitten: no repository here; choose one to open");
+            let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
+            app.run(move |cx| offer_repo_then_open(view, cx));
+            return;
+        }
+    }
+    let launch = if repo_launch {
+        startup.configure().map(Launch::Skeleton)
+    } else {
+        startup.go().map(Launch::Ready)
+    };
+    match launch {
+        Ok(launch) => {
             let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
             start::mark("gpui application up; entering run");
-            app.run(move |cx| open_main_window(started, cx));
+            app.run(move |cx| open_main_window(launch, cx));
         }
-        Err(exit) => {
-            // A bare launch from Finder or `open` arrives with no arguments and a
-            // working directory of `/`: the shared parse opens the default view
-            // of `.`, which is not a repository, and there is no terminal for the
-            // failure to be printed to. Open the most recent repository instead —
-            // or, with no history at all, offer one to pick. Anything explicit
-            // keeps today's behaviour and message.
-            if matches!(exit, Exit::Failed(_)) {
-                if let Some(view) = bare {
-                    let recents = gitten_app::projects::load();
-                    if let Some(started) = open_recent(view, &recents) {
-                        let app =
-                            gpui_platform::application().with_assets(gpui_component_assets::Assets);
-                        start::mark("gpui application up; entering run");
-                        app.run(move |cx| open_main_window(started, cx));
-                        return;
-                    }
-                    eprintln!("gitten: no repository here; choose one to open");
-                    let app =
-                        gpui_platform::application().with_assets(gpui_component_assets::Assets);
-                    app.run(move |cx| offer_repo_then_open(view, cx));
-                    return;
-                }
-            }
-            exit.finish();
-        }
+        Err(exit) => exit.finish(),
     }
 }
 
@@ -6131,17 +6152,80 @@ fn main() {
 /// from the command line, the latest recent after a bare launch found none,
 /// or one picked after that found none either — builds the same window
 /// through the same path.
-fn open_main_window(started: Started, cx: &mut App) {
-    start::mark("startup done (args + gitten.toml + acquire)");
-    let Started {
-        view: which,
-        source,
-        host,
-        loaded,
-        config: config_path,
-        repo,
-    } = started;
-    let host = Rc::new(host);
+/// What `main` hands [`open_main_window`]: a launch that already holds its
+/// rows, and one that will hold them shortly.
+enum Launch {
+    /// Startup acquired before the window opened — `loaded` is here, and the
+    /// views build from it. Two launches keep the synchronous road: a
+    /// fixture or a patch, whose acquisition is an in-process read with no
+    /// spawn floor to defer, and a bare launch, whose acquisition is what
+    /// *chose* the repository.
+    Ready(Started),
+    /// The window first. Screens register empty at the wave's source
+    /// generation, the restore waits for the wave, and the acquisition runs
+    /// through the same background wave a repository switch rides — nothing
+    /// about it is new code; what is new is that startup rides it too.
+    Skeleton(Configured),
+}
+
+/// A sidebar pane's header while the wave that fills it is still running —
+/// the skeleton frame's one honest word. Never a count: nothing has been
+/// counted yet. The wave's apply halves replace it with the real label.
+const STARTUP_LOADING: &str = "loading";
+
+fn open_main_window(launch: Launch, cx: &mut App) {
+    start::mark(match &launch {
+        Launch::Ready(_) => "startup done (args + gitten.toml + acquire)",
+        Launch::Skeleton(_) => {
+            "startup done (args + gitten.toml; acquisition deferred to the wave)"
+        }
+    });
+    let (which, source, host, data, label, config_path, repo_open) = match launch {
+        Launch::Ready(started) => {
+            let Started {
+                view: which,
+                source,
+                host,
+                loaded,
+                config: config_path,
+                repo,
+            } = started;
+            let label = loaded.label.clone();
+            (
+                which,
+                source,
+                Rc::new(host),
+                Some(loaded.data),
+                label,
+                config_path,
+                repo,
+            )
+        }
+        Launch::Skeleton(configured) => {
+            let Configured {
+                view: which,
+                source,
+                host,
+                config: config_path,
+                repo,
+            } = configured;
+            (
+                which,
+                source,
+                Rc::new(host),
+                None,
+                STARTUP_LOADING.to_string(),
+                config_path,
+                repo,
+            )
+        }
+    };
+    // The generation the skeleton's wave targets: every screen registers one
+    // below it, so the first wave — like every later one — fills exactly what
+    // is stale. A Ready launch needs no wave; its screens register at the
+    // generation they were acquired at.
+    let wave_target = Generation::default().advance();
+    let skeleton = data.is_none();
 
     // Names this exact view, so a saved scroll position is only ever restored
     // into the diff it was taken in — see `session.rs`.
@@ -6153,7 +6237,7 @@ fn open_main_window(started: Started, cx: &mut App) {
     // nothing downstream has to learn what a repository is. `None` for a `.diff`
     // fixture. The handle is the one Startup opened, so every re-acquisition
     // keeps any backend state alive rather than opening the path again.
-    let (rediff, repo) = match (&source, repo) {
+    let (rediff, repo) = match (&source, repo_open) {
         (Source::Repo { path, .. }, Some(repo)) => {
             let for_diff = repo.clone();
             let rediff: Rediff = Rc::new(move |host: &Host, over: &Overrides, revision: &str| {
@@ -6172,8 +6256,6 @@ fn open_main_window(started: Started, cx: &mut App) {
     };
 
     let which_name = which.name();
-    let label = loaded.label.clone();
-    let data = loaded.data;
 
     // One for the action handler, one for the strip: both reload from the file,
     // and the async task below takes the original.
@@ -6271,7 +6353,7 @@ fn open_main_window(started: Started, cx: &mut App) {
                 Rc<std::cell::RefCell<SharedString>>,
                 String,
             ) = match data {
-                Data::Commits(commits) => {
+                Some(Data::Commits(commits)) => {
                     let e = cx.new(|_| views::commits::Commits::new(commits, host.clone()));
                     let v = e.read(cx);
                     if let Some(r) = &resume {
@@ -6293,7 +6375,7 @@ fn open_main_window(started: Started, cx: &mut App) {
                         v.load.clone(),
                     )
                 }
-                Data::Diff(files) => {
+                Some(Data::Diff(files)) => {
                     let e = cx.new(|cx| views::diff::Diff::new(files, host.clone(), cx));
                     let v = e.read(cx);
                     if let Some(r) = &resume {
@@ -6314,6 +6396,49 @@ fn open_main_window(started: Started, cx: &mut App) {
                         v.load.clone(),
                     )
                 }
+                // The skeleton: the same screens at their loading shapes,
+                // one generation below the wave that fills them. The saved
+                // row waits — restoring into an empty list would clamp it
+                // away — and rides `pending_restore`, which the wave's
+                // `finish_refresh` applies before it schedules the preview.
+                None => match which {
+                    View::Commits => {
+                        let e = cx.new(|_| views::commits::Commits::new(Vec::new(), host.clone()));
+                        let v = e.read(cx);
+                        (
+                            Screen::commits(
+                                e,
+                                source.clone(),
+                                Generation::default(),
+                                STARTUP_LOADING,
+                            ),
+                            v.rendered.clone(),
+                            // The commit graph has a fixed row count: one
+                            // per commit, and nothing reflows it.
+                            v.top.clone(),
+                            Rc::new(Cell::new(0)),
+                            Rc::new(std::cell::RefCell::new(SharedString::default())),
+                            String::new(),
+                        )
+                    }
+                    View::Diff => {
+                        let e = cx.new(|cx| views::diff::Diff::new(Vec::new(), host.clone(), cx));
+                        let v = e.read(cx);
+                        (
+                            Screen::diff(
+                                e.clone(),
+                                Some(source.clone()),
+                                Generation::default(),
+                                STARTUP_LOADING,
+                            ),
+                            v.rendered.clone(),
+                            v.top.clone(),
+                            v.total.clone(),
+                            v.note.clone(),
+                            v.load.clone(),
+                        )
+                    }
+                },
             };
             let has_column = matches!(screen, Screen::Commits { .. });
             // The diff main view. A launch that opened on a *list* starts
@@ -6336,139 +6461,197 @@ fn open_main_window(started: Started, cx: &mut App) {
             // rest of startup acquisition; from the next write on, the
             // generation-guarded refresh path keeps it current. A fixture
             // has no repository and so no pane at all.
-            if let Some((_, handle)) = &repo {
-                start::mark("files status begin");
-                let described = std::thread::scope(|s| {
-                    // Beside, not behind — describe, status and the stash
-                    // stack spawn together and are joined only once all
-                    // three are back. Joining each in sequence would put
-                    // three git processes on the launch path one after
-                    // another.
-                    let title = s.spawn(|| handle.describe());
-                    let status = s.spawn(|| handle.status());
-                    let parked = s.spawn(|| handle.stashes());
-                    let title = title.join().unwrap_or_default();
-                    let files_prepared = match status
-                        .join()
-                        .unwrap_or_else(|p| std::panic::resume_unwind(p))
-                    {
-                        Ok(status) => views::files::prepare(status, &title),
-                        // Shown as a clean tree rather than failing the
-                        // window: one bad status must not take the launch.
-                        Err(e) => {
-                            eprintln!("gitten: status failed, showing an empty pane: {e}");
-                            views::files::prepare(Default::default(), &title)
-                        }
-                    };
-                    // The same trade for the stack: a failed read is an
-                    // empty pane and a line on stderr, not a lost launch.
-                    let stashes_prepared = match parked
-                        .join()
-                        .unwrap_or_else(|p| std::panic::resume_unwind(p))
-                    {
-                        Ok(stashes) => views::stashes::prepare(&stashes, &title),
-                        Err(e) => {
-                            eprintln!("gitten: stashes failed, showing an empty pane: {e}");
-                            views::stashes::prepare(&[], &title)
-                        }
-                    };
-                    (files_prepared, stashes_prepared)
-                });
-                start::mark("files status done");
-                let (files_prepared, stashes_prepared) = described;
-                // Registration order is the *startup* order — commits is
-                // the root tenant, then the three sidebar panes join it.
-                // The number keys and ctrl-j walk the design's order
-                // (files → branches → stashes → commits), derived in
-                // [`DevShell::list_order`], so this list's order is only
-                // about who was here first. Registration focuses what it
-                // adds; the `focus(0)` calls put the keyboard back where
-                // it launched.
-                let files_label = files_prepared.label.clone();
-                initial_panes.register(
-                    "files",
-                    Screen::files(
-                        cx.new(|_| views::files::Files::from_prepared(files_prepared)),
-                        Generation::default(),
-                        files_label,
-                    ),
-                );
-                initial_panes.focus(0);
-                start::mark("files pane built");
+            if repo.is_some() {
+                if skeleton {
+                    // The skeleton's sidebars: registered at their loading
+                    // shape, one generation below the wave — the wave's own
+                    // `refresh` halves are what fill them, so no read here
+                    // is a read the refresh path does not already run. The
+                    // pane exists from frame one, which is the whole point:
+                    // the number keys, the cycle and the walk derive from
+                    // registration, not from data. An empty working tree
+                    // would be a *claim*; the loading label on the header is
+                    // the only sentence these rows are allowed to make.
+                    initial_panes.register(
+                        "files",
+                        Screen::files(
+                            cx.new(|_| {
+                                views::files::Files::from_prepared(views::files::prepare(
+                                    Default::default(),
+                                    "",
+                                ))
+                            }),
+                            Generation::default(),
+                            STARTUP_LOADING,
+                        ),
+                    );
+                    initial_panes.focus(0);
+                    let branches = cx.new(|_| {
+                        views::branches::Branches::from_prepared(views::branches::prepare(
+                            Vec::new(),
+                            Vec::new(),
+                            None,
+                            Vec::new(),
+                            &host.theme,
+                            "",
+                        ))
+                    });
+                    initial_panes.register(
+                        "branches",
+                        Screen::branches(branches, Generation::default(), STARTUP_LOADING),
+                    );
+                    initial_panes.focus(0);
+                    initial_panes.register(
+                        "stashes",
+                        Screen::stashes(
+                            cx.new(|_| {
+                                views::stashes::Stashes::from_prepared(views::stashes::prepare(
+                                    &[],
+                                    "",
+                                ))
+                            }),
+                            Generation::default(),
+                            STARTUP_LOADING,
+                        ),
+                    );
+                    initial_panes.focus(0);
+                    start::mark("skeleton panes built");
+                } else if let Some((_, handle)) = &repo {
+                    start::mark("files status begin");
+                    let described = std::thread::scope(|s| {
+                        // Beside, not behind — describe, status and the stash
+                        // stack spawn together and are joined only once all
+                        // three are back. Joining each in sequence would put
+                        // three git processes on the launch path one after
+                        // another.
+                        let title = s.spawn(|| handle.describe());
+                        let status = s.spawn(|| handle.status());
+                        let parked = s.spawn(|| handle.stashes());
+                        let title = title.join().unwrap_or_default();
+                        let files_prepared = match status
+                            .join()
+                            .unwrap_or_else(|p| std::panic::resume_unwind(p))
+                        {
+                            Ok(status) => views::files::prepare(status, &title),
+                            // Shown as a clean tree rather than failing the
+                            // window: one bad status must not take the launch.
+                            Err(e) => {
+                                eprintln!("gitten: status failed, showing an empty pane: {e}");
+                                views::files::prepare(Default::default(), &title)
+                            }
+                        };
+                        // The same trade for the stack: a failed read is an
+                        // empty pane and a line on stderr, not a lost launch.
+                        let stashes_prepared = match parked
+                            .join()
+                            .unwrap_or_else(|p| std::panic::resume_unwind(p))
+                        {
+                            Ok(stashes) => views::stashes::prepare(&stashes, &title),
+                            Err(e) => {
+                                eprintln!("gitten: stashes failed, showing an empty pane: {e}");
+                                views::stashes::prepare(&[], &title)
+                            }
+                        };
+                        (files_prepared, stashes_prepared)
+                    });
+                    start::mark("files status done");
+                    let (files_prepared, stashes_prepared) = described;
+                    // Registration order is the *startup* order — commits is
+                    // the root tenant, then the three sidebar panes join it.
+                    // The number keys and ctrl-j walk the design's order
+                    // (files → branches → stashes → commits), derived in
+                    // [`DevShell::list_order`], so this list's order is only
+                    // about who was here first. Registration focuses what it
+                    // adds; the `focus(0)` calls put the keyboard back where
+                    // it launched.
+                    let files_label = files_prepared.label.clone();
+                    initial_panes.register(
+                        "files",
+                        Screen::files(
+                            cx.new(|_| views::files::Files::from_prepared(files_prepared)),
+                            Generation::default(),
+                            files_label,
+                        ),
+                    );
+                    initial_panes.focus(0);
+                    start::mark("files pane built");
 
-                // The branches panel beside it — three reads run side by
-                // side, behind the same spawn floor the files pane pays.
-                // A failed read shows an empty panel rather than failing
-                // the launch, for the same reason a bad status does.
-                start::mark("branches read begin");
-                let described = handle.describe();
-                let prepared = std::thread::scope(|s| {
-                    let local = s.spawn(|| handle.branches());
-                    let remote = s.spawn(|| handle.remote_branches());
-                    let head = s.spawn(|| handle.head());
-                    let taken = s.spawn(|| handle.worktree_branches());
-                    let local = local
-                        .join()
-                        .unwrap_or_else(|p| std::panic::resume_unwind(p));
-                    let remote = remote
-                        .join()
-                        .unwrap_or_else(|p| std::panic::resume_unwind(p));
-                    let head = head.join().unwrap_or_else(|p| std::panic::resume_unwind(p));
-                    let taken = taken.join().unwrap_or_default();
-                    match (local, remote) {
-                        (Ok(local), Ok(remote)) => {
-                            let head = match head {
-                                Ok(head) => Some(head),
-                                Err(e) => {
-                                    eprintln!("gitten: head read failed, showing attached: {e}");
-                                    None
-                                }
-                            };
-                            views::branches::prepare(
-                                local,
-                                remote,
-                                head,
-                                taken,
-                                &host.theme,
-                                &described,
-                            )
+                    // The branches panel beside it — three reads run side by
+                    // side, behind the same spawn floor the files pane pays.
+                    // A failed read shows an empty panel rather than failing
+                    // the launch, for the same reason a bad status does.
+                    start::mark("branches read begin");
+                    let described = handle.describe();
+                    let prepared = std::thread::scope(|s| {
+                        let local = s.spawn(|| handle.branches());
+                        let remote = s.spawn(|| handle.remote_branches());
+                        let head = s.spawn(|| handle.head());
+                        let taken = s.spawn(|| handle.worktree_branches());
+                        let local = local
+                            .join()
+                            .unwrap_or_else(|p| std::panic::resume_unwind(p));
+                        let remote = remote
+                            .join()
+                            .unwrap_or_else(|p| std::panic::resume_unwind(p));
+                        let head = head.join().unwrap_or_else(|p| std::panic::resume_unwind(p));
+                        let taken = taken.join().unwrap_or_default();
+                        match (local, remote) {
+                            (Ok(local), Ok(remote)) => {
+                                let head = match head {
+                                    Ok(head) => Some(head),
+                                    Err(e) => {
+                                        eprintln!(
+                                            "gitten: head read failed, showing attached: {e}"
+                                        );
+                                        None
+                                    }
+                                };
+                                views::branches::prepare(
+                                    local,
+                                    remote,
+                                    head,
+                                    taken,
+                                    &host.theme,
+                                    &described,
+                                )
+                            }
+                            (Err(e), _) | (_, Err(e)) => {
+                                eprintln!("gitten: branch reads failed, empty panel: {e}");
+                                views::branches::prepare(
+                                    Vec::new(),
+                                    Vec::new(),
+                                    None,
+                                    Vec::new(),
+                                    &host.theme,
+                                    &described,
+                                )
+                            }
                         }
-                        (Err(e), _) | (_, Err(e)) => {
-                            eprintln!("gitten: branch reads failed, empty panel: {e}");
-                            views::branches::prepare(
-                                Vec::new(),
-                                Vec::new(),
-                                None,
-                                Vec::new(),
-                                &host.theme,
-                                &described,
-                            )
-                        }
-                    }
-                });
-                start::mark("branches read done");
-                let label = prepared.label.clone();
-                let branches = cx.new(|_| views::branches::Branches::from_prepared(prepared));
-                initial_panes.register(
-                    "branches",
-                    Screen::branches(branches, Generation::default(), label),
-                );
-                initial_panes.focus(0);
-                start::mark("branches pane built");
+                    });
+                    start::mark("branches read done");
+                    let label = prepared.label.clone();
+                    let branches = cx.new(|_| views::branches::Branches::from_prepared(prepared));
+                    initial_panes.register(
+                        "branches",
+                        Screen::branches(branches, Generation::default(), label),
+                    );
+                    initial_panes.focus(0);
+                    start::mark("branches pane built");
 
-                // The stack, last in the cycle like its key is last on the
-                // number row.
-                let stashes_label = stashes_prepared.label.clone();
-                initial_panes.register(
-                    "stashes",
-                    Screen::stashes(
-                        cx.new(|_| views::stashes::Stashes::from_prepared(stashes_prepared)),
-                        Generation::default(),
-                        stashes_label,
-                    ),
-                );
-                initial_panes.focus(0);
-                start::mark("stashes pane built");
+                    // The stack, last in the cycle like its key is last on the
+                    // number row.
+                    let stashes_label = stashes_prepared.label.clone();
+                    initial_panes.register(
+                        "stashes",
+                        Screen::stashes(
+                            cx.new(|_| views::stashes::Stashes::from_prepared(stashes_prepared)),
+                            Generation::default(),
+                            stashes_label,
+                        ),
+                    );
+                    initial_panes.focus(0);
+                    start::mark("stashes pane built");
+                }
             }
             start::mark("view built");
 
@@ -6476,8 +6659,13 @@ fn open_main_window(started: Started, cx: &mut App) {
             // rows as the list builds them (see `rendered`), so the counter
             // going non-zero is the first frame actually carrying content.
             // Polled at 5 ms rather than hooked into a render — a paint has
-            // no callback, and this task dies as soon as it fires.
-            if start::on() {
+            // no callback, and this task dies as soon as it fires. The same
+            // moment is where a `GITTEN_START_QUIT` run ends: the task quits
+            // the process instead of only marking, so a wall clock around the
+            // binary *is* the time to interactive. A window still appears —
+            // GPUI draws nothing without one — for however long the road
+            // takes.
+            if start::on() || gitten_app::env::start_quit() {
                 let drawn = rendered.clone();
                 cx.spawn(async move |cx| loop {
                     cx.background_executor()
@@ -6485,7 +6673,14 @@ fn open_main_window(started: Started, cx: &mut App) {
                         .await;
                     let n = drawn.get();
                     if n > 0 {
-                        start::mark(&format!("first rows drawn ({n})"));
+                        if start::on() {
+                            start::mark(&format!("first rows drawn ({n})"));
+                        }
+                        if gitten_app::env::start_quit() {
+                            // An error here means the window is already
+                            // gone — the measurement is over either way.
+                            cx.update(|cx| cx.quit());
+                        }
                         break;
                     }
                 })
@@ -6513,7 +6708,14 @@ fn open_main_window(started: Started, cx: &mut App) {
                 repo,
                 jobs,
                 submitter,
-                generation: Generation::default(),
+                // The skeleton's screens register one generation below this,
+                // so the startup wave — the same `refresh_stale` a repository
+                // switch runs — targets exactly them. A Ready launch acquired
+                // its screens at the default generation and has no wave.
+                generation: match skeleton {
+                    true => wave_target,
+                    false => Generation::default(),
+                },
                 refresh_id: 0,
                 refresh_pending: 0,
                 refresh_error: None,
@@ -6548,7 +6750,14 @@ fn open_main_window(started: Started, cx: &mut App) {
                 projects: Vec::new(),
                 session_key: session_key.clone(),
                 session_path: session_path.clone(),
-                pending_restore: None,
+                // A Ready launch restored above, straight into views that
+                // hold rows. The skeleton restores with the wave — into an
+                // empty list would clamp the row away — through the same
+                // `pending_restore` a repository switch hands its wave.
+                pending_restore: match (&resume, skeleton) {
+                    (Some(session), true) => Some(session.top),
+                    _ => None,
+                },
             });
             {
                 let shell = shell.clone();
@@ -6559,8 +6768,14 @@ fn open_main_window(started: Started, cx: &mut App) {
                     // newest one's diff through the same guarded rails
                     // every later selection rides. The header and the
                     // band are up before the first paint; the rows land
-                    // on the next executor pump.
-                    shell.sync_main_diff(cx);
+                    // on the next executor pump. The skeleton has no rows
+                    // yet — its preview is scheduled by `finish_refresh`
+                    // when the wave lands, the way a switch's is.
+                    if skeleton {
+                        shell.refresh_stale(cx);
+                    } else {
+                        shell.sync_main_diff(cx);
+                    }
                 });
             }
             {
@@ -6667,11 +6882,13 @@ fn open_main_window(started: Started, cx: &mut App) {
 ///
 /// `open /Applications/gitten.app` arrives with no arguments and a working
 /// directory of `/`: the shared parse reads that as the default view of `.`,
-/// which is not a repository, and startup fails before any window exists. The
-/// shell answers that one case with the latest recent repository (see
-/// [`open_recent`]), or with a picker when there is no history yet (see
-/// [`offer_repo_then_open`]) instead of a message nobody can see. Anything explicit — a path,
-/// `--fixtures`, a patch — is not this, and fails as it always has.
+/// which is usually not a repository. The shell answers that one case with
+/// the latest recent repository (see [`open_recent`]), or with a picker when
+/// there is no history yet (see [`offer_repo_then_open`]) instead of a
+/// message nobody can see. Anything explicit — a path, `--fixtures`, a patch —
+/// is not this: a repository launch defers its acquisition past the window
+/// and answers a repository that will not open in the window's error band,
+/// and a fixture or patch fails on stderr as it always has.
 fn bare_launch_view(args: &[String]) -> Option<View> {
     match gitten_app::cli::parse(args, View::Commits) {
         Request::Open { view, source } => match source {
@@ -6772,7 +6989,7 @@ fn offer_repo_then_open(view: View, cx: &mut App) {
                     (Err(exit), _) => Err(exit),
                 };
                 cx.update(|cx| match retry {
-                    Ok(started) => open_main_window(started, cx),
+                    Ok(started) => open_main_window(Launch::Ready(started), cx),
                     Err(exit) => exit.finish(),
                 });
             }

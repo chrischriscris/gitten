@@ -185,6 +185,34 @@ PY
 fi
 
 echo
+echo "── tti (terminal, advisory) ────────────────────────────"
+# Time to interactive: the terminal's spawn→first-frame on a private pty,
+# measured by the `tti` example against the release binary. Advisory like the
+# perf gate above — it fails only when the harness itself is broken (a build,
+# a spawn, a missing marker), never on a timing. Thresholds are opt-in via
+# GITTEN_TTI_MAX_* and none is set here. GITTEN_TTI=0 skips it;
+# GITTEN_TTI_ROUNDS sets the rounds (3; the example defaults to 7 by hand).
+# The desktop side is off (GITTEN_TTI_SHELL=0): this script opens no windows,
+# and that number needs one — run the example without it for the desktop.
+if [ "${GITTEN_TTI:-1}" = "0" ]; then
+  echo "  skipped (GITTEN_TTI=0)"
+else
+  if cargo build -q --release -p gitten-tui; then
+    tti_status=0
+    ROUNDS="${GITTEN_TTI_ROUNDS:-3}" GITTEN_TTI_SHELL=0 SETTLE=0 \
+      cargo run -q -p gitten-tui --example tti --release -- . 2>&1 \
+      | sed 's/^/  /' || tti_status=$?
+    if [ "$tti_status" -ne 0 ]; then
+      FAILED="$FAILED tti:harness"
+      echo "  ✗ tti example failed to run"
+    fi
+  else
+    FAILED="$FAILED tti:build"
+    echo "  ✗ gitten-tui (release) build failed"
+  fi
+fi
+
+echo
 if [ -n "$FAILED" ]; then
   echo "✗ failed:$FAILED"
   exit 1
