@@ -124,6 +124,25 @@ pub struct Startup {
     opener: std::sync::Arc<dyn Opener>,
 }
 
+/// Everything startup produced before a repository was read.
+///
+/// [`Startup::configure`] hands this to a client that has something to draw
+/// first — a window, mainly — and the client schedules the acquisition itself
+/// through the same [`acquire::acquire`] [`Startup::go`] would have run. A
+/// client without one takes [`Startup::go`] and never sees this type.
+pub struct Configured {
+    pub view: View,
+    pub source: Source,
+    /// The configured host: the file has been read and its warnings printed.
+    pub host: Host,
+    /// Where the config file was found, for a client that wants to watch it.
+    pub config: std::path::PathBuf,
+    /// One handle for every read this client makes, opened once and held for
+    /// the process. See [`Started::repo`] — the same handle, minus the
+    /// acquisition that turns it into rows.
+    pub repo: Option<gitten_git::Handle>,
+}
+
 /// Everything the startup produced.
 pub struct Started {
     pub view: View,
@@ -298,12 +317,20 @@ impl Startup {
         cli::usage(self.binary, &self.blurb, &self.extra)
     }
 
-    /// Parses, configures, acquires.
+    /// Parses, configures, and stops before acquisition.
     ///
     /// Warnings from the config file go to stderr as they are found — a colour
     /// that did not parse is worth saying at once, and is never worth refusing
     /// to start over.
-    pub fn go(self) -> Result<Started, Exit> {
+    ///
+    /// The one seam a client with something to draw before its data exists
+    /// needs: everything [`Startup::go`] does except the acquisition, which
+    /// the client schedules itself — a window opened on empty screens whose
+    /// rows arrive on the next wave, a terminal that cannot draw until the
+    /// list is acquired and therefore never wants this. The acquisition the
+    /// client runs is the same `acquire::acquire` [`Startup::go`] would have
+    /// run; what is shared is the chain, not the ordering.
+    pub fn configure(self) -> Result<Configured, Exit> {
         let mut clock = StartClock::new();
         let request = cli::parse(&self.args, self.default);
         clock.stage("args parsed");
@@ -339,6 +366,28 @@ impl Startup {
             Source::Fixtures | Source::Patch { .. } => None,
         };
 
+        Ok(Configured {
+            view,
+            source,
+            host,
+            repo,
+            config: path,
+        })
+    }
+
+    /// Parses, configures, acquires.
+    pub fn go(self) -> Result<Started, Exit> {
+        let mut clock = StartClock::new();
+        // Captured before `configure` takes `self`: the failure line names the
+        // binary and the usage, and both are read off a value about to move.
+        let (binary, usage) = (self.binary, self.usage());
+        let Configured {
+            view,
+            source,
+            host,
+            repo,
+            config,
+        } = self.configure()?;
         match acquire::acquire(view, &source, &host, repo.as_deref()) {
             Ok(loaded) => {
                 clock.stage("acquired");
@@ -347,15 +396,11 @@ impl Startup {
                     source,
                     host,
                     loaded,
-                    config: path,
+                    config,
                     repo,
                 })
             }
-            Err(e) => Err(Exit::Failed(format!(
-                "{}: {e}\n\n{}",
-                self.binary,
-                self.usage()
-            ))),
+            Err(e) => Err(Exit::Failed(format!("{binary}: {e}\n\n{usage}"))),
         }
     }
 }
@@ -368,6 +413,12 @@ mod tests {
     use std::sync::Arc;
 
     fn start(line: &str) -> Result<Started, Exit> {
+        // Hermetic on purpose: `config::path` honours `GITTEN_CONFIG`, and a
+        // developer's real file must not decide what a startup test asserts —
+        // a `[diff]` table in it prints "applies on the next launch" warnings
+        // these tests have never been about. Every call pins the same
+        // non-path, so the file is simply absent and the defaults stand.
+        std::env::set_var("GITTEN_CONFIG", "/nonexistent/gitten-test.toml");
         Startup::new("gitten-test", View::Commits)
             .args(line.split_whitespace().map(String::from).collect())
             .go()
