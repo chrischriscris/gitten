@@ -6248,8 +6248,13 @@ fn open_main_window(launch: Launch, cx: &mut App) {
             // render path is not the place to find one.
             let path = path.canonicalize().unwrap_or_else(|_| path.clone());
             // Every launch is a visit: the project menu reads this file, and
-            // a repository opened any way at all belongs in it.
-            gitten_app::projects::record(&path);
+            // a repository opened any way at all belongs in it. Recorded from
+            // the executor rather than inline — a read-plus-write of the
+            // recents file is nothing the first frame waits for, and the
+            // menu reads it only when it opens.
+            let visit = path.clone();
+            cx.spawn(async move |_| gitten_app::projects::record(&visit))
+                .detach();
             (Some(rediff), Some((path, repo)))
         }
         _ => (None, None),

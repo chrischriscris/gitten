@@ -177,15 +177,25 @@ actually bound because the help panel is a pure function of the registry. See
 [clients.md](clients.md) for the seam.
 
 **Startup draws a skeleton, then fills it.** The list the launch asked for is
-acquired before the terminal is taken, as always. The sidebars — stashes, files,
-branches — and the first commit's preview diff are not: `App::new` registers
-them in their loading shape (`Files::unavailable()`, header label `STARTUP_LOADING`),
-so the first frame is a fast one, and `App::load_startup` runs the deferred
-reads in one `thread::scope` wave once it is flushed, followed immediately by a
-second frame — the list, the sidebars and the preview arrive together, and the
-tick does not decide when. Once the wave runs it is synchronous, like every
-refresh. `GITTEN_START_LOG` names the stages: `first frame flushed`, `startup
-reads joined`, `startup loads applied`, `startup frame flushed`.
+acquired before the terminal is taken, as always — and for a repository commits
+launch, only its first records: `git log --topo-order` streams, and the list
+draws off the first screenful while the tail is still in git's stdout buffer.
+The sidebars — stashes, files, branches — and the first commit's preview diff
+are not acquired at all: `App::new` registers them in their loading shape
+(`Files::unavailable()`, header label `STARTUP_LOADING`), so the first frame is
+a fast one, and `App::load_startup` runs the deferred reads in one
+`thread::scope` wave once it is flushed, followed immediately by a second
+frame — the sidebars and the preview arrive together, and the tick does not
+decide when. Once the wave runs it is synchronous, like every refresh. The
+log's tail arrives between frames on a 16 ms poll (`STREAM_TICK`, one 60 Hz
+frame) and is appended through the same `replace` a refresh rides, which keeps
+the cursor and viewport; the status line's total grows with it, which is
+honest — those rows are there. Soundness rests on one property, pinned by a
+test in `core`: lane assignment is a single forward pass, so the lanes of a
+prefix are the lanes of the whole, and appending a tail never re-lanes a row
+already on screen. `GITTEN_START_LOG` names the stages: `first frame flushed`,
+`startup reads joined`, `startup loads applied`, `startup frame flushed`,
+`log streamed`.
 
 **Help is a viewport, not a second screen.** It is capped at three quarters of
 the body and 30 rows, grows horizontally to keep descriptions whole, and uses

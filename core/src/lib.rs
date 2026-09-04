@@ -149,6 +149,113 @@ pub fn parse_log(raw: &str) -> Vec<Commit> {
     out
 }
 
+/// The incremental twin of [`parse_log`]: bytes go in as `git log` emits
+/// them, complete records come out as [`Commit`]s.
+///
+/// Exists for the progressive log — the list draws off the first streamed
+/// records while the tail is still in git's stdout buffer, and [`parse_log`]
+/// wants the whole text at once. The two agree byte for byte on every
+/// complete record: the same `\x1e`-terminated, `\x1f`-separated record
+/// parse, the same trim, the same skip of a record with too few fields, the
+/// same interning of one buffer per distinct author. Duplicated deliberately
+/// rather than shared: [`parse_log`] interns through keys borrowed from a
+/// buffer that never grows, and this one cannot — its buffer grows as bytes
+/// arrive, so its intern keys are owned. The equivalence test pins the
+/// agreement, because two record parsers beside each other are one drift
+/// waiting to happen.
+///
+/// Records are ASCII-delimited, so a record boundary is always a character
+/// boundary: the lossy UTF-8 conversion happens per complete record and is
+/// identical to [`parse_log`]'s whole-buffer one even when a multi-byte
+/// author name arrives split across two pushes.
+pub struct LogParser {
+    /// Bytes not yet part of a complete record. Consumed from the front as
+    /// records complete, so the buffer's resident cost is one record plus
+    /// whatever arrived between drains.
+    buf: Vec<u8>,
+    /// One shared buffer per distinct author. Keys are owned — see the
+    /// struct comment — and `Arc` on both sides of the pair, so the commit
+    /// and the key share one allocation and the lookup still hashes the
+    /// `&str` the record carries.
+    authors: FxHashMap<Arc<str>, Arc<str>>,
+}
+
+impl Default for LogParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LogParser {
+    pub fn new() -> Self {
+        Self {
+            buf: Vec::new(),
+            authors: FxHashMap::with_capacity_and_hasher(64, BuildHasherDefault::default()),
+        }
+    }
+
+    /// Bytes as they arrived — a read of any size, a split anywhere,
+    /// including through the middle of a multi-byte character.
+    pub fn push(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+    }
+
+    /// Every record completed so far, in arrival order. Records still
+    /// waiting on their `\x1e` stay in the buffer; a final flush is never
+    /// needed — git ends every record with the separator, so an unterminated
+    /// tail is a truncated stream and truncation is not something to invent
+    /// commits for.
+    pub fn drain(&mut self, out: &mut Vec<Commit>) {
+        while let Some(end) = self.buf.iter().position(|b| *b == b'\x1e') {
+            {
+                // Borrowed out of the buffer, parsed, owned before the
+                // buffer is touched again — the Commit the fields build
+                // shares no byte of it. The same field walk parse_log runs:
+                // fewer than six fields is nothing to build and is skipped,
+                // and a subject that itself contains \x1f still reads as
+                // field five because everything after it is never asked for.
+                let text = String::from_utf8_lossy(&self.buf[..end]);
+                let rec = text.trim();
+                if !rec.is_empty() {
+                    let mut fields = rec.split('\u{1f}');
+                    if let (
+                        Some(sha),
+                        Some(short),
+                        Some(parents),
+                        Some(author),
+                        Some(ts),
+                        Some(subject),
+                    ) = (
+                        fields.next(),
+                        fields.next(),
+                        fields.next(),
+                        fields.next(),
+                        fields.next(),
+                        fields.next(),
+                    ) {
+                        out.push(Commit {
+                            sha: sha.to_string(),
+                            short: short.to_string(),
+                            parents: parents.split_whitespace().map(str::to_string).collect(),
+                            author: match self.authors.get(author) {
+                                Some(seen) => Arc::clone(seen),
+                                None => {
+                                    let seen: Arc<str> = Arc::from(author);
+                                    self.authors.insert(Arc::clone(&seen), Arc::clone(&seen));
+                                    seen
+                                }
+                            },
+                            timestamp: ts.parse().unwrap_or(0),
+                            subject: subject.to_string(),
+                        });
+                    }
+                }
+            }
+            self.buf.drain(..=end);
+        }
+    }
+}
+
 // ----------------------------------------------------------------- the graph
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -706,6 +813,41 @@ mod tests {
         }
     }
 
+    /// Lanes of a prefix are the lanes of the whole.
+    ///
+    /// The property the progressive log stands on: `git log --topo-order`
+    /// streams, and the list draws off the first chunk while the tail is still
+    /// in flight — which is only sound if appending commits never re-lanes the
+    /// rows already on screen. [`assign_lanes`] is a single forward pass whose
+    /// state at commit *k* is built from commits `[0..k)` alone, so this holds
+    /// by construction; the test holds it by checking it, over a history with
+    /// the shapes that could break it — merges, octopus merges, long-lived
+    /// lanes crossing, and a tail that converges lanes opened early.
+    #[test]
+    fn lanes_of_a_prefix_are_the_lanes_of_the_whole() {
+        // newest first, `git log --topo-order` order: a main line with two
+        // branches off it, one merging back through an octopus.
+        let commits = vec![
+            commit("m0", &["a1", "b1", "c1"]),
+            commit("a1", &["a0"]),
+            commit("b1", &["b0"]),
+            commit("c1", &["c0"]),
+            commit("a0", &["r1"]),
+            commit("r1", &["r0"]),
+            commit("b0", &["r0"]),
+            commit("c0", &["r0"]),
+            commit("r0", &[]),
+        ];
+        let whole = assign_lanes(&commits);
+        for k in 1..=commits.len() {
+            assert_eq!(
+                &whole[..k],
+                assign_lanes(&commits[..k]),
+                "row {k} moved when the tail arrived"
+            );
+        }
+    }
+
     /// The text of every line of a parsed patch, in order.
     fn texts(files: &[FileDiff]) -> Vec<String> {
         files
@@ -785,6 +927,50 @@ mod tests {
         assert_eq!(c[0].parents.to_vec(), vec!["def", "ghi"]);
         assert_eq!(c[0].subject, "Fix the thing");
         assert!(c[1].parents.is_empty());
+    }
+
+    /// The incremental parser and the whole-buffer one agree, whatever the
+    /// chunk boundaries. This is the test that keeps the duplicated record
+    /// parse honest — the two exist side by side because their interning
+    /// maps cannot share, and this is what says they have not drifted.
+    #[test]
+    fn the_incremental_parser_agrees_with_the_whole_buffer_one() {
+        // A record with a multi-byte author, a record whose subject carries
+        // a \x1f, a leading header line like the one --format= leaks, and a
+        // pair of records sharing an author across what will be a chunk
+        // boundary.
+        let raw = "commit header leaked\n\
+                   abc\u{1f}abc\u{1f}def ghi\u{1f}A\u{308}da\u{1f}1700000000\u{1f}Fix the thing\u{1e}\
+                   def\u{1f}def\u{1f}\u{1f}A\u{308}da\u{1f}1699999999\u{1f}re: \u{1f}what\u{1e}\
+                   ghi\u{1f}ghi\u{1f}\u{1f}Bo\u{1f}1699999900\u{1f}Initial commit\u{1e}";
+        let whole = parse_log(raw);
+        assert_eq!(whole.len(), 3);
+        for size in [1, 2, 3, 7, 13, 4096] {
+            let mut parser = LogParser::new();
+            let mut got = Vec::new();
+            for chunk in raw.as_bytes().chunks(size) {
+                parser.push(chunk);
+                parser.drain(&mut got);
+            }
+            assert_eq!(got, whole, "chunk size {size} drifted");
+        }
+    }
+
+    /// One buffer per distinct author across chunk boundaries — the same
+    /// interning parse_log does, kept alive by the incremental parser.
+    #[test]
+    fn authors_intern_across_chunks() {
+        let raw = "a\u{1f}a\u{1f}\u{1f}Ada\u{1f}1\u{1f}one\u{1e}b\u{1f}b\u{1f}\u{1f}Ada\u{1f}2\u{1f}two\u{1e}";
+        let mut parser = LogParser::new();
+        let mut got = Vec::new();
+        // First record only; the second arrives split in two, its author
+        // re-keyed against the intern map the first record seeded.
+        parser.push(&raw.as_bytes()[..raw.len() / 2]);
+        parser.drain(&mut got);
+        parser.push(&raw.as_bytes()[raw.len() / 2..]);
+        parser.drain(&mut got);
+        assert_eq!(got.len(), 2);
+        assert!(Arc::ptr_eq(&got[0].author, &got[1].author));
     }
 
     #[test]

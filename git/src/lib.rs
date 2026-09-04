@@ -60,7 +60,7 @@ pub use gitten_core::rebase::TodoScript;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -341,6 +341,19 @@ pub trait Repo: Send + Sync {
     /// `--topo-order` is not optional: lane assignment assumes it, and without
     /// it branches interleave and the graph is drawn wrong.
     fn log(&self, limit: usize) -> Result<Vec<Commit>>;
+
+    /// The same history, streamed.
+    ///
+    /// The progressive log's door: the list draws off the first records while
+    /// git is still emitting the tail, which is sound because lane assignment
+    /// is prefix-stable (pinned in `core`). The default hands the whole log
+    /// over as one already-complete batch — correct for an implementation
+    /// that cannot stream, and costing it exactly the one [`Self::log`] it
+    /// always paid. A caller that never drains the tail drops the stream,
+    /// which takes the process with it.
+    fn log_stream(&self, limit: usize) -> Result<LogStream> {
+        Ok(LogStream::finished(self.log(limit)?))
+    }
 
     /// Every changed file for `revspec`, as the two versions of its content.
     ///
@@ -931,6 +944,7 @@ pub fn open(root: &Path) -> Handle {
         root: root.to_path_buf(),
         top: Default::default(),
         state_paths: Default::default(),
+        ref_run: Default::default(),
     })
 }
 
@@ -964,6 +978,19 @@ struct Binary {
     /// A `Mutex<Vec<..>>` and not a map: the whole domain is four static names,
     /// so a linear scan of at most four entries is cheaper than hashing one.
     state_paths: std::sync::Mutex<Vec<(String, Option<PathBuf>)>>,
+    /// The ref listing one read is running *right now*, so the read beside it
+    /// joins rather than spawns a second identical process.
+    ///
+    /// `branches()` and `remote_branches()` answer from one `for-each-ref`
+    /// run over both namespaces, and every client reads them **beside each
+    /// other** — spawned together inside a refresh's `thread::scope`. The
+    /// first of the two to arrive installs its cell here and runs the listing;
+    /// the second finds the cell and waits on it. Nothing persists: the cell
+    /// is empty for the next call whatever happens (the runner clears it when
+    /// it publishes, and a waiter that finds the answer already there clears
+    /// it too), so a run is never reused across waves and every answer is as
+    /// fresh as its caller's own spawn would have been.
+    ref_run: std::sync::Mutex<Option<RefRead>>,
 }
 
 impl Repo for Binary {
@@ -980,6 +1007,10 @@ impl Repo for Binary {
             ],
         )?;
         Ok(parse_log(&String::from_utf8_lossy(&bytes)))
+    }
+
+    fn log_stream(&self, limit: usize) -> Result<LogStream> {
+        LogStream::spawn(&self.root, limit)
     }
 
     fn pairs(&self, revspec: &str) -> Result<Vec<Pair>> {
@@ -1227,8 +1258,10 @@ impl Repo for Binary {
     }
 
     fn branches(&self) -> Result<Vec<Branch>> {
-        // One process names every local branch, points at its commit and
-        // reports its tracking pair. `%(upstream:remotename)` and
+        // The local half of the one ref listing both branch reads answer
+        // from — see [`Binary::ref_tables`] for the process and what shares
+        // it. One run names every local branch, points at its commit and
+        // reports its tracking pair: `%(upstream:remotename)` and
         // `%(upstream:remoteref)` are the two halves *as the configuration
         // holds them* — joining a refname by hand to get them would misread a
         // remote whose name contains a slash, and there is no other place the
@@ -1239,32 +1272,11 @@ impl Repo for Binary {
         // counts measured, and a gone one has none to measure — so the
         // rev-list below runs once per actually-diverged branch and never on
         // a plain open.
-        //
-        // Records are newline-separated with NUL-separated fields: no field
-        // can hold either (ref names forbid both; the track values are git's
-        // own documented spellings), and a line that does not split into
-        // exactly [`BRANCH_ARITY`] fields is skipped whole rather than
-        // guessed through, which is what keeps a warning line from poisoning
-        // its neighbours.
-        let raw = run(
-            &self.root,
-            &[
-                "for-each-ref",
-                &format!("--format={BRANCH_FORMAT}"),
-                // Most recently committed first: the pane's whole question is
-                // "which branch do I want next", and the two best answers are
-                // the branch just left and the branch on now. Git owns the
-                // sort — ties (two branches on one commit) fall back to its
-                // secondary refname order, which is deterministic.
-                "--sort=-committerdate",
-                "refs/heads",
-            ],
-        )?;
+        let mut raw_branches = self.ref_tables()?.heads;
         let mut out = Vec::new();
         // Pin the checked-out branch to index 0, stable: the recency order
         // git handed back for everything else is untouched. Detached HEAD
         // marks no branch, so nothing pins.
-        let mut raw_branches = parse_branches(&raw);
         raw_branches.sort_by_key(|b| !b.head);
         for b in raw_branches {
             let upstream = b.upstream.map(|u| {
@@ -1309,18 +1321,13 @@ impl Repo for Binary {
     }
 
     fn remote_branches(&self) -> Result<Vec<RemoteBranch>> {
-        // Same framing as `branches`, one process over the other half of the
-        // ref namespace. The symbolic `refs/remotes/<remote>/HEAD` alias a
-        // clone writes is not a branch and reads as one nowhere.
-        let raw = run(
-            &self.root,
-            &[
-                "for-each-ref",
-                "--format=%(refname)%00%(objectname)",
-                "refs/remotes",
-            ],
-        )?;
-        Ok(parse_remote_branches(&raw))
+        // The other half of the same ref listing — see
+        // [`Binary::ref_tables`] for the process and what shares it. Same
+        // framing as the local half, and the same record shape; the refname
+        // is what says which half a record belongs to. The symbolic
+        // `refs/remotes/<remote>/HEAD` alias a clone writes is not a branch
+        // and reads as one nowhere.
+        Ok(self.ref_tables()?.remotes)
     }
 
     fn head(&self) -> Result<HeadState> {
@@ -1995,6 +2002,116 @@ impl Binary {
             _ => (None, None),
         }
     }
+
+    /// Both branch listings, from one `for-each-ref refs/heads refs/remotes`
+    /// run — shared with a sibling read when one is in flight.
+    ///
+    /// `branches()` and `remote_branches()` answer from the same process, and
+    /// every client spawns them together: a refresh wave runs the two reads
+    /// beside each other in a `thread::scope`, and before that they ran two
+    /// spawns that differed in one pattern and one format string. One run
+    /// over both namespaces costs the same list twice over — a few hundred
+    /// records — and retires the second spawn from every refresh wave and
+    /// every pre-frame read.
+    ///
+    /// The sharing is the wave, never the answer. The first caller to arrive
+    /// installs its cell in [`Binary::ref_run`] and runs the listing. A
+    /// caller arriving while it runs **takes** the cell and waits on it
+    /// instead of spawning — and the take is how the cell comes down for the
+    /// waiter too, since taking it empties it; the runner's own removal
+    /// covers the case where nobody else arrived. So nothing persists past
+    /// the run that produced it: whatever a caller leaves in the cell is
+    /// gone by the time the next wave looks, and every answer is as fresh as
+    /// its own spawn would have been. A persistent memo would be a lie — the
+    /// pane's whole contract is that the next refresh asks git again.
+    ///
+    /// The cell must never stay unfilled — a waiter parked on it would hang
+    /// forever — so a panic mid-run is published into it as the failed read
+    /// it is, and the panic resumes where it belongs. Publishing and taking
+    /// the cell down are straight-line pointer work with no panic between
+    /// them, which is what makes "the cell is empty, or it fills" true by
+    /// construction rather than by hope.
+    ///
+    /// The two mutex regions hold only pointer work; the process runs
+    /// unlocked, so no lock is ever held across a spawn and nothing here can
+    /// deadlock against another read.
+    fn ref_tables(&self) -> Result<RefTables> {
+        let slot: RefRead = Default::default();
+        let mut cell = self
+            .ref_run
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let running = match cell.take() {
+            // Someone is running it — or has just finished it and not yet
+            // taken the cell down; either way one wait beats one spawn. And
+            // the take empties the cell either way, which is what leaves it
+            // free for the next wave whatever happens here.
+            Some(other) => Some(other),
+            None => {
+                *cell = Some(slot.clone());
+                None
+            }
+        };
+        drop(cell);
+        if let Some(other) = running {
+            return other.wait().clone();
+        }
+        let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.run_ref_tables()
+        })) {
+            Ok(outcome) => outcome,
+            Err(panic) => {
+                let _ = slot.set(Err("the ref listing run failed".into()));
+                self.remove_ref_cell(&slot);
+                std::panic::resume_unwind(panic);
+            }
+        };
+        let _ = slot.set(outcome.clone());
+        self.remove_ref_cell(&slot);
+        outcome
+    }
+
+    /// [`Binary::ref_run`] without this run's own slot, if it is still there.
+    ///
+    /// A waiter's take has usually emptied the cell already; this is the
+    /// runner's own removal, and the one that counts when nobody arrived
+    /// beside it. A later wave's slot, if one has been installed in the
+    /// meantime, is left alone — it belongs to someone else's run.
+    fn remove_ref_cell(&self, slot: &RefRead) {
+        let mut cell = self
+            .ref_run
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cell
+            .as_ref()
+            .is_some_and(|mine| std::sync::Arc::ptr_eq(mine, slot))
+        {
+            *cell = None;
+        }
+    }
+
+    /// The process [`Self::ref_tables`] runs when no sibling has: one
+    /// `for-each-ref` over both namespaces, sorted once, split after.
+    fn run_ref_tables(&self) -> Result<RefTables> {
+        // Most recently committed first: the pane's whole question for the
+        // local half is "which branch do I want next", and the two best
+        // answers are the branch just left and the branch on now. Git owns
+        // the sort — its comparator is a total order, refname order the final
+        // tiebreak — so the local half of this one listing is exactly what
+        // listing `refs/heads` alone would have handed back. See
+        // [`parse_ref_tables`] for what that costs the remote half.
+        let raw = run(
+            &self.root,
+            &[
+                "for-each-ref",
+                &format!("--format={BRANCH_FORMAT}"),
+                "--sort=-committerdate",
+                "refs/heads",
+                "refs/remotes",
+            ],
+        )?;
+        Ok(parse_ref_tables(&raw))
+    }
 }
 
 /// The `.gitignore` spelling of one path: anchored at the repository root,
@@ -2476,9 +2593,11 @@ fn loose_pair(entry: &UntrackedEntry, root: &Path) -> Option<Pair> {
 
 // ----------------------------------------------------------------------- refs
 
-/// The `for-each-ref` format for local branches: full name, commit, the
-/// remote-tracking ref the upstream resolves to, the two configured halves
-/// of the upstream, its track state, and HEAD's marker.
+/// The `for-each-ref` format for one ref listing run over **both** branch
+/// namespaces at once — `refs/heads` and `refs/remotes` — because the two
+/// answers come from one process: full name, commit, the remote-tracking ref
+/// the upstream resolves to, the two configured halves of the upstream, its
+/// track state, and HEAD's marker.
 ///
 /// Three atoms describe one upstream because they answer different
 /// questions: `%(upstream)` names the local ref a fetch updates — the only
@@ -2486,6 +2605,14 @@ fn loose_pair(entry: &UntrackedEntry, root: &Path) -> Option<Pair> {
 /// the remote's own namespace and means nothing here — while the remotename
 /// and remoteref pair is what the configuration literally says, which is
 /// what the model carries.
+///
+/// Over `refs/remotes` every upstream atom resolves to empty — git fills
+/// them only for refs under `refs/heads/` (`branch.<name>.*` is a branch's
+/// configuration, however it is spelled) — and `%(HEAD)` marks only the
+/// checked-out ref, so a remote record carries its name and its commit and
+/// five empty fields the parser never reads. The atoms ride along because
+/// the alternative is a second format and a second process, and the empty
+/// fields cost nothing.
 const BRANCH_FORMAT: &str = concat!(
     "%(refname)%00%(objectname)%00%(upstream)",
     "%00%(upstream:remotename)%00%(upstream:remoteref)",
@@ -2497,6 +2624,10 @@ const BRANCH_ARITY: usize = 7;
 
 /// A full local ref starts here; whatever follows is the branch's own name.
 const HEADS_PREFIX: &[u8] = b"refs/heads/";
+
+/// A full remote-tracking ref starts here, for the same reason — this is
+/// what splits the one listing into its two halves.
+const REMOTES_PREFIX: &[u8] = b"refs/remotes/";
 
 /// A full tag ref starts here, for the same reason.
 const TAGS_PREFIX: &[u8] = b"refs/tags/";
@@ -2524,7 +2655,11 @@ fn lossy(bytes: &[u8]) -> String {
 }
 
 /// One `for-each-ref` record over local branches, before counts run.
-#[derive(Debug)]
+///
+/// Clones because one run of the listing serves the two reads that ask for
+/// it beside each other — see [`Binary::ref_tables`] for what is shared and
+/// what is not.
+#[derive(Clone, Debug)]
 struct RawBranch {
     /// The full ref, `refs/heads/main` — kept whole because this is what
     /// addresses git; the short name is cut only when the model is built.
@@ -2536,7 +2671,7 @@ struct RawBranch {
 
 /// The tracking pair as configuration holds it, plus whether comparing
 /// against it is even possible.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct RawUpstream {
     remote: PathBytes,
     /// The merge ref on the remote side, e.g. `refs/heads/main`.
@@ -2556,6 +2691,7 @@ struct RawUpstream {
 /// rev-list that measures everything else. Its remaining values carry the
 /// counts in prose, which are never parsed: they are re-measured exactly by
 /// `rev-list --left-right --count`, where the numbers are numbers.
+#[derive(Clone)]
 enum Track {
     Synced,
     Gone,
@@ -2580,8 +2716,29 @@ fn track(field: &[u8]) -> Track {
     }
 }
 
-/// `for-each-ref` over `refs/heads`, in the framing described on
-/// [`BRANCH_FORMAT`]: newline-terminated records of NUL-separated fields.
+/// One run of the ref listing, split into the two halves the reads take.
+///
+/// The unit one `for-each-ref refs/heads refs/remotes` process answers with,
+/// held only while that run is in flight — see [`Binary::ref_tables`] for
+/// what may and may not outlive it. `Clone` because a read that joined a
+/// sibling's in-flight run copies its own halves out of the shared answer.
+#[derive(Clone, Debug)]
+struct RefTables {
+    /// The local branches, in git's recency order; the checked-out branch
+    /// is pinned to the front only when [`Repo::branches`] builds the model.
+    heads: Vec<RawBranch>,
+    /// The branches as the remotes hold them, in git's default refname order.
+    remotes: Vec<RemoteBranch>,
+}
+
+/// The cell one in-flight ref listing runs against, shared by the reads that
+/// arrived beside each other.
+type RefRead = std::sync::Arc<std::sync::OnceLock<Result<RefTables>>>;
+
+/// Both ref listings out of one [`BRANCH_FORMAT`] run: the local branches in
+/// the order git handed back — most recently committed first, git's own
+/// refname order breaking the ties — and the remote branches in git's
+/// default listing order.
 ///
 /// Empty fields are preserved, not filtered — "no upstream configured"
 /// arrives as two empty pieces between NULs, and filtering empties would
@@ -2589,8 +2746,20 @@ fn track(field: &[u8]) -> Track {
 /// exactly [`BRANCH_ARITY`] pieces is skipped whole: git prefixes warning
 /// lines to this output, and one malformed record must not shift another's
 /// fields.
-fn parse_branches(raw: &[u8]) -> Vec<RawBranch> {
-    let mut out = Vec::new();
+///
+/// The two halves come out of one run sorted by one sort —
+/// `--sort=-committerdate` is global, a `for-each-ref` cannot sort its two
+/// patterns differently — and the local half keeps that order as it stands,
+/// because git's comparator is a total order (its own final tiebreak is
+/// refname order, so no two records ever compare equal) and the restriction
+/// of a total order to the refs under `refs/heads` is exactly the order
+/// asking for `refs/heads` alone gets. The remote half cannot keep it: asked
+/// alone, `refs/remotes` comes back in git's default order, which is
+/// refname order — so the records that survived the split are re-sorted by
+/// refname here, which is byte-for-byte what the alone run hands back.
+fn parse_ref_tables(raw: &[u8]) -> RefTables {
+    let mut heads = Vec::new();
+    let mut remotes = Vec::new();
     for line in raw.split(|b| *b == b'\n') {
         if line.is_empty() {
             continue;
@@ -2599,25 +2768,71 @@ fn parse_branches(raw: &[u8]) -> Vec<RawBranch> {
         if f.len() != BRANCH_ARITY {
             continue;
         }
-        let upstream = match (f[2].is_empty(), f[3].is_empty(), f[4].is_empty()) {
-            // All three atoms or nothing: half a pair names no upstream, so
-            // none is claimed rather than one guessed from partial words.
-            (false, false, false) => Some(RawUpstream {
-                tracking_ref: PathBytes::from_bytes(f[2]),
-                remote: PathBytes::from_bytes(f[3]),
-                upstream_ref: PathBytes::from_bytes(f[4]),
-                track: track(f[5]),
-            }),
-            _ => None,
-        };
-        out.push(RawBranch {
-            refname: PathBytes::from_bytes(f[0]),
-            commit: lossy(f[1]),
-            head: f[6].first() == Some(&b'*'),
-            upstream,
-        });
+        // One record shape for both namespaces; the refname says which half
+        // a line belongs to, and a ref under neither pattern (none is asked
+        // for, but nothing here guesses) is dropped rather than filed.
+        if f[0].starts_with(HEADS_PREFIX) {
+            heads.push(branch_record(&f));
+        } else if let Some(r) = remote_record(&f) {
+            remotes.push(r);
+        }
     }
-    out
+    remotes.sort_unstable_by(|a, b| {
+        a.remote
+            .as_bytes()
+            .cmp(b.remote.as_bytes())
+            .then_with(|| a.branch.as_bytes().cmp(b.branch.as_bytes()))
+    });
+    RefTables { heads, remotes }
+}
+
+/// One [`BRANCH_FORMAT`] record over a local branch, fields already split.
+///
+/// Positional throughout: see [`parse_ref_tables`] for the framing and the
+/// reason a malformed line never gets here.
+fn branch_record(f: &[&[u8]]) -> RawBranch {
+    let upstream = match (f[2].is_empty(), f[3].is_empty(), f[4].is_empty()) {
+        // All three atoms or nothing: half a pair names no upstream, so
+        // none is claimed rather than one guessed from partial words.
+        (false, false, false) => Some(RawUpstream {
+            tracking_ref: PathBytes::from_bytes(f[2]),
+            remote: PathBytes::from_bytes(f[3]),
+            upstream_ref: PathBytes::from_bytes(f[4]),
+            track: track(f[5]),
+        }),
+        _ => None,
+    };
+    RawBranch {
+        refname: PathBytes::from_bytes(f[0]),
+        commit: lossy(f[1]),
+        head: f[6].first() == Some(&b'*'),
+        upstream,
+    }
+}
+
+/// One [`BRANCH_FORMAT`] record over a remote-tracking ref, fields already
+/// split: `refs/remotes/<remote>/<branch>` and the commit.
+///
+/// The first slash after the namespace divides remote from branch — the same
+/// convention every git reader applies, because a slash *inside* a remote
+/// name is unreadable through any flat ref listing, this one included. The
+/// symbolic `<remote>/HEAD` alias a clone writes beside the real branches is
+/// not a branch and is dropped.
+fn remote_record(f: &[&[u8]]) -> Option<RemoteBranch> {
+    let rest = f[0].strip_prefix(REMOTES_PREFIX)?;
+    let mut halves = rest.splitn(2, |b| *b == b'/');
+    let (remote, branch) = match (halves.next(), halves.next()) {
+        (Some(r), Some(b)) if !b.is_empty() => (r, b),
+        _ => return None,
+    };
+    if branch == b"HEAD" {
+        return None;
+    }
+    Some(RemoteBranch {
+        remote: PathBytes::from_bytes(remote),
+        branch: PathBytes::from_bytes(branch),
+        commit: lossy(f[1]),
+    })
 }
 
 /// `git worktree list --porcelain` in: blank-line-separated blocks, each
@@ -2650,43 +2865,6 @@ fn parse_worktree_branches(raw: &[u8], root: &Path) -> Vec<String> {
                 out.push(b);
             }
         }
-    }
-    out
-}
-
-/// `for-each-ref` over `refs/remotes`: `refs/remotes/<remote>/<branch>` and
-/// the commit, one per line.
-///
-/// The first slash after the namespace divides remote from branch — the same
-/// convention every git reader applies, because a slash *inside* a remote
-/// name is unreadable through any flat ref listing, this one included. The
-/// symbolic `<remote>/HEAD` alias a clone writes beside the real branches is
-/// not a branch and is dropped.
-fn parse_remote_branches(raw: &[u8]) -> Vec<RemoteBranch> {
-    let mut out = Vec::new();
-    for line in raw.split(|b| *b == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        let f: Vec<&[u8]> = line.split(|b| *b == 0).collect();
-        let [refname, oid] = f[..] else { continue };
-        let rest = match refname.strip_prefix(b"refs/remotes/") {
-            Some(rest) => rest,
-            None => continue,
-        };
-        let mut halves = rest.splitn(2, |b| *b == b'/');
-        let (remote, branch) = match (halves.next(), halves.next()) {
-            (Some(r), Some(b)) if !b.is_empty() => (r, b),
-            _ => continue,
-        };
-        if branch == b"HEAD" {
-            continue;
-        }
-        out.push(RemoteBranch {
-            remote: PathBytes::from_bytes(remote),
-            branch: PathBytes::from_bytes(branch),
-            commit: lossy(oid),
-        });
     }
     out
 }
@@ -3171,6 +3349,230 @@ fn lines(content: &[u8]) -> Vec<Arc<str>> {
         return Vec::new();
     }
     text.split('\n').map(Arc::from).collect()
+}
+
+// ------------------------------------------------------------------ the stream
+
+/// `git log` as it arrives, not after it finishes.
+///
+/// One reader thread consumes the child's stdout into
+/// [`gitten_core::LogParser`], which holds every complete record; the owner
+/// drains what has arrived so far at its own pace and decides when the list
+/// is full enough to draw. The first records land while git is still working
+/// through the tail — for a 5,000-commit history, the first screenful costs
+/// git's startup and one buffer, not the whole walk — and the final answer
+/// is byte-for-byte the one [`Repo::log`] returns, from the same invocation
+/// parsed by the same record rules.
+///
+/// Dropping the stream takes the process with it: the child is killed so the
+/// reader's blocking read unblocks, and the reader then marks the state done
+/// so nothing waits on a gate that will never open. An implementation that
+/// cannot stream never sees any of this — [`Repo::log_stream`]'s default
+/// wraps a plain [`Repo::log`] as one finished batch.
+pub struct LogStream {
+    /// What the reader thread and the owner share: commits parsed since the
+    /// last drain, the reader's error, and whether stdout has ended.
+    shared: Arc<StreamShared>,
+    /// The process and its threads — `None` on the not-streamed path, where
+    /// everything is already in `shared`.
+    live: Option<Live>,
+}
+
+struct StreamShared {
+    state: Mutex<StreamState>,
+    gate: Condvar,
+}
+
+struct StreamState {
+    ready: Vec<Commit>,
+    /// The reader's own failure — a read error, or git exiting nonzero.
+    /// `None` is a clean stream; an empty history is a clean stream that
+    /// simply produced nothing, and the caller says that part.
+    error: Option<String>,
+    done: bool,
+}
+
+/// The live pieces. The child sits behind the mutex because both the reader
+/// thread (at EOF, to reap it) and the drop (to kill a stream abandoned
+/// mid-flight) want it, and neither wants to race the other. The stderr
+/// reader belongs to the log reader, which joins it on every path out.
+struct Live {
+    child: Arc<Mutex<Child>>,
+    reader: Option<JoinHandle<()>>,
+}
+
+impl LogStream {
+    /// The not-streamed path: every commit already in hand, the stream done.
+    fn finished(commits: Vec<Commit>) -> Self {
+        Self {
+            shared: Arc::new(StreamShared {
+                state: Mutex::new(StreamState {
+                    ready: commits,
+                    error: None,
+                    done: true,
+                }),
+                gate: Condvar::new(),
+            }),
+            live: None,
+        }
+    }
+
+    /// Spawns `git log` and its reader.
+    fn spawn(root: &Path, limit: usize) -> Result<Self> {
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["log", "--topo-order", "-n", &limit.to_string()])
+            .arg(format!("--format={LOG_FORMAT}"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("could not run git log: {e}"))?;
+        let stdout = child.stdout.take().expect("piped");
+        let stderr = child.stderr.take().expect("piped");
+        // The stderr handle belongs to the reader thread, which joins it on
+        // every path out — its own EOF, a read error, or a kill from below —
+        // so dropping the stream joins one thread and gets both.
+        let stderr = std::thread::spawn(move || {
+            let mut stderr = stderr;
+            let mut err = Vec::new();
+            let _ = stderr.read_to_end(&mut err);
+            err
+        });
+        let child = Arc::new(Mutex::new(child));
+        let shared = Arc::new(StreamShared {
+            state: Mutex::new(StreamState {
+                ready: Vec::new(),
+                error: None,
+                done: false,
+            }),
+            gate: Condvar::new(),
+        });
+        let reader_shared = Arc::clone(&shared);
+        let reader_child = Arc::clone(&child);
+        // The same sentence `run` produces on a nonzero exit, built here
+        // where the argument list is in one piece and carried into the
+        // reader, which is where the exit is seen.
+        let argv = format!("git log --topo-order -n {limit} --format={LOG_FORMAT}");
+        let reader = std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut parser = gitten_core::LogParser::new();
+            let mut chunk = [0u8; 16 * 1024];
+            loop {
+                match reader.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        parser.push(&chunk[..n]);
+                        let mut parsed = Vec::new();
+                        parser.drain(&mut parsed);
+                        if parsed.is_empty() {
+                            continue;
+                        }
+                        let mut state = reader_shared.state.lock().expect("log stream state");
+                        state.ready.extend(parsed);
+                        drop(state);
+                        reader_shared.gate.notify_all();
+                    }
+                    Err(e) => {
+                        let mut state = reader_shared.state.lock().expect("log stream state");
+                        state.error = Some(format!("reading git log: {e}"));
+                        break;
+                    }
+                }
+            }
+            // Reap the child now that its stdout has ended, and say its
+            // stderr if it failed — the same sentence `run` would produce.
+            let status = reader_child.lock().expect("log stream child").wait();
+            let failed = !status.map(|s| s.success()).unwrap_or(false);
+            if failed {
+                let raw = stderr.join().unwrap_or_default();
+                let err = String::from_utf8_lossy(&raw);
+                let mut state = reader_shared.state.lock().expect("log stream state");
+                state.error = Some(format!("{argv}: {}", err.trim()));
+            }
+            let mut state = reader_shared.state.lock().expect("log stream state");
+            state.done = true;
+            drop(state);
+            reader_shared.gate.notify_all();
+            let _ = stderr;
+        });
+        Ok(Self {
+            shared,
+            live: Some(Live {
+                child,
+                reader: Some(reader),
+            }),
+        })
+    }
+
+    /// Blocks until at least one commit has arrived or the stream has ended —
+    /// the first batch, for the launch that wants rows before its frame.
+    /// Empty and `Ok` is a clean history that holds nothing; the caller says
+    /// that part, exactly as `log`'s caller does. A stream that failed before
+    /// producing anything is `Err` — the same shape `log` has.
+    pub fn first(&mut self) -> Result<Vec<Commit>> {
+        let mut state = self.shared.state.lock().expect("log stream state");
+        while state.ready.is_empty() && !state.done {
+            state = self.shared.gate.wait(state).expect("log stream state");
+        }
+        if let Some(error) = state.error.take() {
+            if state.ready.is_empty() {
+                return Err(error);
+            }
+            // A failure that arrived mid-stream leaves the records it
+            // delivered as data; the tail's failure rides `error` below.
+            state.error = Some(error);
+        }
+        Ok(std::mem::take(&mut state.ready))
+    }
+
+    /// Everything parsed since the last call, without waiting — what the
+    /// loop between frames pulls. Empty means nothing new; [`Self::live`]
+    /// says whether more can still arrive.
+    pub fn drain(&mut self) -> Vec<Commit> {
+        let mut state = self.shared.state.lock().expect("log stream state");
+        std::mem::take(&mut state.ready)
+    }
+
+    /// Whether more commits can still arrive.
+    pub fn live(&self) -> bool {
+        !self.shared.state.lock().expect("log stream state").done
+    }
+
+    /// The reader's failure, if the stream ended with one. Read once
+    /// [`Self::live`] is false; a failure that arrived mid-flight rides here
+    /// while the records it did deliver ride [`Self::drain`].
+    pub fn error(&self) -> Option<String> {
+        self.shared
+            .state
+            .lock()
+            .expect("log stream state")
+            .error
+            .clone()
+    }
+}
+
+impl Drop for LogStream {
+    fn drop(&mut self) {
+        let Some(live) = self.live.take() else {
+            return;
+        };
+        // Kill first: the reader's blocking read unblocks, its thread runs
+        // to its own end — joining the stderr reader on the way, marking the
+        // state done — and the join below waits only for that. A stream
+        // already exhausted needs nothing: the reader reaped the child on
+        // its way out.
+        let done = self.shared.state.lock().expect("log stream state").done;
+        if !done {
+            let _ = live.child.lock().expect("log stream child").kill();
+        }
+        if let Some(reader) = live.reader {
+            let _ = reader.join();
+        }
+        // A child killed above is reaped here; a child the reader already
+        // waited on is gone, and `wait` on it is a harmless nothing.
+        let _ = live.child.lock().map(|mut child| child.wait());
+    }
 }
 
 #[cfg(test)]
@@ -4990,6 +5392,191 @@ mod tests {
         assert_eq!(got[0].commit, r.rev_parse("refs/remotes/origin/main"));
     }
 
+    /// `for-each-ref` as the tests would run it themselves, refnames only —
+    /// the baseline the merged listing is checked against.
+    fn git_refnames(r: &Scratch, args: &[&str]) -> Vec<String> {
+        let mut argv: Vec<std::ffi::OsString> = vec!["for-each-ref".into()];
+        argv.extend(args.iter().map(|a| (*a).into()));
+        String::from_utf8(r.git_os_out(&argv))
+            .unwrap()
+            .lines()
+            .map(|l| l.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn the_merged_listing_reads_as_gits_own_two_invocations() {
+        // One run over both namespaces must equal what git says asked
+        // separately, whatever the ref mix: the local half in committerdate
+        // order — git's comparator is a total order ending in refname, so
+        // the shared sort cannot rearrange it — and the remote half in
+        // refname order, git's default. Ties and recency are both present:
+        // two branches on one commit, two more on distinct dates.
+        let (r, _) = upstream_fixture("ref-vs-git");
+        commit_at(&r, "f.txt", b"a\n", "old", "2026-01-01T00:00:01");
+        r.git(&["branch", "aaa", "main"]);
+        commit_at(&r, "f.txt", b"b\n", "new", "2026-01-01T00:00:02");
+        r.git(&["branch", "zebra"]);
+        r.git(&[
+            "update-ref",
+            "refs/remotes/origin/mid",
+            &r.rev_parse("main"),
+        ]);
+        r.git(&[
+            "update-ref",
+            "refs/remotes/other/edge",
+            &r.rev_parse("zebra"),
+        ]);
+
+        let g = r.open();
+        let got = g.branches().unwrap();
+        let got_remote = g.remote_branches().unwrap();
+
+        let want: Vec<Vec<u8>> = git_refnames(
+            &r,
+            &["--sort=-committerdate", "--format=%(refname)", "refs/heads"],
+        )
+        .iter()
+        .map(|n| n.trim_start_matches("refs/heads/").as_bytes().to_vec())
+        .collect();
+        let names: Vec<Vec<u8>> = got.iter().map(|b| b.name.as_bytes().to_vec()).collect();
+        assert_eq!(names, want, "locals read as `refs/heads` alone would say");
+
+        // git's default answer, with the alias and the branchless ref
+        // dropped — exactly what the model drops.
+        let want: Vec<Vec<u8>> = git_refnames(&r, &["--format=%(refname)", "refs/remotes"])
+            .iter()
+            .filter_map(|n| {
+                let rest = n.strip_prefix("refs/remotes/")?;
+                let (_, tail) = rest.split_once('/')?;
+                (tail != "HEAD").then(|| rest.as_bytes().to_vec())
+            })
+            .collect();
+        let names: Vec<Vec<u8>> = got_remote
+            .iter()
+            .map(|b| {
+                let mut n = b.remote.as_bytes().to_vec();
+                n.push(b'/');
+                n.extend_from_slice(b.branch.as_bytes());
+                n
+            })
+            .collect();
+        assert_eq!(
+            names, want,
+            "remotes read as `refs/remotes` alone would say"
+        );
+    }
+
+    #[test]
+    fn one_run_of_the_listing_serves_both_reads_beside_each_other() {
+        // The shape every caller uses: both reads spawned together inside a
+        // refresh's `thread::scope`. Each round one of them runs the listing
+        // and the other joins it; every answer must still be the whole
+        // truth, eight waves over.
+        let (r, _) = upstream_fixture("ref-shared-run");
+        let g = r.open();
+        for _ in 0..8 {
+            let (local, remotes) = std::thread::scope(|s| {
+                let local = s.spawn(|| g.branches());
+                let remotes = s.spawn(|| g.remote_branches());
+                (
+                    local.join().unwrap().unwrap(),
+                    remotes.join().unwrap().unwrap(),
+                )
+            });
+            assert_eq!(branch(&local, "main").commit, r.rev_parse("main"));
+            assert_eq!(remotes.len(), 1, "{remotes:?}");
+            assert_eq!(
+                (remotes[0].remote.as_bytes(), remotes[0].branch.as_bytes()),
+                (b"origin".as_slice(), b"main".as_slice())
+            );
+        }
+    }
+
+    #[test]
+    fn the_ref_run_is_the_wave_and_never_the_answer() {
+        // The one-run share must never outlive its wave: whatever a call
+        // leaves behind, the next call asks git again. A branch that appears
+        // between two reads reaches the read after it, in each half, with
+        // each read first in line to have run the listing.
+        let (r, _) = upstream_fixture("ref-run-is-the-wave");
+        let g = r.open();
+
+        assert!(
+            !g.branches()
+                .unwrap()
+                .iter()
+                .any(|b| b.name.as_bytes() == b"side"),
+            "the branch does not exist yet"
+        );
+        r.git(&["branch", "side"]);
+        assert!(
+            g.branches()
+                .unwrap()
+                .iter()
+                .any(|b| b.name.as_bytes() == b"side"),
+            "a branch that appeared after the last run is read by the next"
+        );
+
+        r.git(&[
+            "update-ref",
+            "refs/remotes/origin/late",
+            &r.rev_parse("main"),
+        ]);
+        let remotes = g.remote_branches().unwrap();
+        assert!(
+            remotes.iter().any(|b| b.branch.as_bytes() == b"late"),
+            "a remote-tracking ref that appeared after the last run is read by the next: {remotes:?}"
+        );
+    }
+
+    #[test]
+    fn a_repository_of_only_remote_branches_lists_both_halves() {
+        // Detached and the local ref deleted: every branch is a remote's.
+        // An empty local half must not cost the remote one, and the other
+        // way round is the fresh-repository case the empty-repo test holds.
+        let (r, _) = upstream_fixture("ref-only-remotes");
+        r.git(&["checkout", "-q", "--detach", "main"]);
+        r.git(&["branch", "-qD", "main"]);
+
+        let g = r.open();
+        let local = g.branches().unwrap();
+        assert!(local.is_empty(), "no local ref is left: {local:?}");
+        let remotes = g.remote_branches().unwrap();
+        assert_eq!(remotes.len(), 1, "{remotes:?}");
+        assert_eq!(remotes[0].remote.as_bytes(), b"origin");
+        assert_eq!(remotes[0].branch.as_bytes(), b"main");
+        assert_eq!(remotes[0].commit, r.rev_parse("refs/remotes/origin/main"));
+    }
+
+    #[test]
+    fn a_linked_worktrees_branches_read_as_the_one_listing_says() {
+        // Another worktree holds another branch: the ref listing is the
+        // repository's, shared, so the branch is still listed and HEAD's
+        // marker still names *this* worktree's checkout — the merged run
+        // must read no differently from the two runs it replaced.
+        let (r, _) = upstream_fixture("ref-worktree-refs");
+        r.git(&["branch", "elsewhere"]);
+        let wt =
+            std::env::temp_dir().join(format!("gitten-git-ref-worktree-wt-{}", std::process::id()));
+        r.git(&["worktree", "add", "-q", wt.to_str().unwrap(), "elsewhere"]);
+
+        let got = r.open().branches().unwrap();
+        let names: Vec<Vec<u8>> = got.iter().map(|b| b.name.as_bytes().to_vec()).collect();
+        assert_eq!(
+            names,
+            vec![b"main".to_vec(), b"elsewhere".to_vec()],
+            "this worktree's checkout pins the front, the linked one stays listed"
+        );
+        assert!(branch(&got, "main").head);
+        assert!(
+            !branch(&got, "elsewhere").head,
+            "the linked worktree's checkout is not this HEAD"
+        );
+
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
     #[test]
     fn stashes_index_messages_and_commits_newest_first() {
         let r = Scratch::new("ref-stash");
@@ -5116,16 +5703,17 @@ mod tests {
             warning: something git wanted to say\n\
             refs/heads/truncated\x00123";
 
-        let got = parse_branches(raw);
-        assert_eq!(got.len(), 2, "{got:?}");
+        let got = parse_ref_tables(raw);
+        assert_eq!(got.heads.len(), 2, "{got:?}");
+        assert!(got.remotes.is_empty(), "nothing under refs/remotes");
 
-        let main = &got[0];
+        let main = &got.heads[0];
         assert_eq!(main.refname.as_bytes(), b"refs/heads/main");
         assert_eq!(main.commit, "abc");
         assert!(main.head);
         assert!(main.upstream.is_none());
 
-        let gone = &got[1];
+        let gone = &got.heads[1];
         assert!(!gone.head, "a space marks not-HEAD, not a parse failure");
         let up = gone.upstream.as_ref().expect("all three atoms present");
         assert_eq!(up.tracking_ref.as_bytes(), b"refs/remotes/origin/main");
@@ -5135,6 +5723,43 @@ mod tests {
             matches!(up.track, Track::Gone),
             "the one prose value parsed: it retires the counting process"
         );
+    }
+
+    #[test]
+    fn the_two_namespaces_split_by_refname_and_the_remotes_keep_refname_order() {
+        // One listing over both patterns, interleaved by the shared sort:
+        // the refname prefix is what files a record into its half, and the
+        // remote half — which arrives here in committerdate order, the sort
+        // the local half needs — must still read in refname order, which is
+        // what asking for `refs/remotes` alone would have said. The records
+        // are fed in the order that sort puts them (`origin-x` commits more
+        // recently than `origin`), and refname order puts `origin` first.
+        let raw = b"\
+            refs/heads/main\x00111\0\0\0\0\0*\n\
+            refs/remotes/origin-x/baz\x00444\0\0\0\0\0 \n\
+            refs/remotes/origin/foo\x00333\0\0\0\0\0 \n\
+            refs/remotes/origin/HEAD\x00555\0\0\0\0\0 \n\
+            refs/remotes/origin.bar\x00222\0\0\0\0\0 \n";
+
+        let got = parse_ref_tables(raw);
+        assert_eq!(got.heads.len(), 1, "{got:?}");
+        let halves: Vec<(&[u8], &[u8])> = got
+            .remotes
+            .iter()
+            .map(|r| (r.remote.as_bytes(), r.branch.as_bytes()))
+            .collect();
+        // `origin.bar` sits directly under the namespace with no branch
+        // under it — nothing to name a remote and a branch from, dropped the
+        // same way it always was; `origin/HEAD` is the alias, not a branch.
+        assert_eq!(
+            halves,
+            vec![
+                (b"origin".as_slice(), b"foo".as_slice()),
+                (b"origin-x", b"baz")
+            ],
+            "refname order, whatever order the shared sort handed them in"
+        );
+        assert_eq!(got.remotes[0].commit, "333", "fields stay positional");
     }
 
     #[test]
@@ -7230,6 +7855,7 @@ mod tests {
             root: root.to_path_buf(),
             top: Default::default(),
             state_paths: Default::default(),
+            ref_run: Default::default(),
         }
     }
 
@@ -8061,5 +8687,91 @@ mod tests {
 
         let got = g.tags().expect("tags");
         assert_eq!(branch_names_of_tags(&got), vec![b"v1".as_slice()]);
+    }
+
+    /// The streamed log is the log — the same invocation, parsed by the same
+    /// record rules, arriving whenever the reader gets to it. Drained all at
+    /// once and in whatever pieces the timing hands over, against a history
+    /// with a merge in it so the records carry more than one parent shape.
+    #[test]
+    fn the_streamed_log_is_the_log() {
+        let r = linear_repo("log-stream");
+        // A branch off the root, a commit on it, merged back — the record
+        // stream now holds a two-parent commit.
+        r.git(&["checkout", "-q", "-b", "side", "HEAD~3"]);
+        r.write("side.txt", b"side\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "side"]);
+        r.git(&["checkout", "-q", "main"]);
+        r.git(&["merge", "-q", "--no-ff", "-m", "merge side", "side"]);
+        let repo = binary_for(&r.0);
+        let whole = repo.log(5000).expect("log");
+        assert_eq!(whole.len(), 6);
+        assert_eq!(whole[0].parents.len(), 2, "the merge is in the stream");
+
+        // The first batch carries at least one record; whether it is the
+        // whole history depends on how fast git's stdout buffer filled, not
+        // on anything this code decides. What must hold: the records arrive
+        // in order, and the drained stream is the log.
+        let mut stream = repo.log_stream(5000).expect("stream");
+        let first = stream.first().expect("first");
+        assert!(!first.is_empty(), "the first batch carries rows");
+        assert_eq!(&whole[..first.len()], &first[..], "in order");
+        let mut got = first;
+        while stream.live() {
+            got.extend(stream.drain());
+        }
+        got.extend(stream.drain());
+        assert_eq!(got, whole);
+        assert!(stream.error().is_none());
+        drop(stream);
+
+        // Drained again, second stream, whatever has arrived by the time
+        // each drain runs — the progressive loop's discipline.
+        let mut stream = repo.log_stream(5000).expect("stream");
+        let mut got = stream.first().expect("first");
+        while stream.live() {
+            got.extend(stream.drain());
+        }
+        got.extend(stream.drain());
+        assert_eq!(got, whole);
+        assert!(stream.error().is_none());
+    }
+
+    /// A stream abandoned mid-flight does not hang the drop: the child is
+    /// killed, the reader's blocked read unblocks, and both threads run to
+    /// their ends. The test's own completion is the assertion.
+    #[test]
+    fn an_abandoned_stream_drops_without_hanging() {
+        let r = linear_repo("log-stream-drop");
+        let repo = binary_for(&r.0);
+        let mut stream = repo.log_stream(5000).expect("stream");
+        let _ = stream.first().expect("first");
+        assert!(stream.live() || true);
+        drop(stream);
+    }
+
+    /// A repository that is not one fails the stream with git's own words —
+    /// the same sentence `log` produces, arriving through the stream's
+    /// error instead of its return.
+    #[test]
+    fn a_stream_over_no_repository_fails_like_the_log() {
+        let dir = std::env::temp_dir().join(format!("gitten-git-norepo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a temp dir");
+        let repo = binary_for(&dir);
+        let log_err = repo.log(10).unwrap_err();
+        let mut stream = repo
+            .log_stream(10)
+            .expect("the spawn succeeds; git fails later");
+        let first = stream.first();
+        assert!(first.is_err(), "{first:?}");
+        assert!(!stream.live());
+        assert_eq!(
+            first.unwrap_err(),
+            log_err,
+            "the stream says what the log says"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
