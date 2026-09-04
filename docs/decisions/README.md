@@ -53,6 +53,7 @@ rather than nine.
 | [0026](0026-line-text-is-not-the-memory-to-save.md) | Line text is not the memory to save |
 | [0027](0027-the-scrollbar-is-an-indicator.md) | The scrollbar is an indicator, and the mouse cannot have it |
 | [0028](0028-settings-live-in-a-panel.md) | The settings live in a panel, not in the title strip |
+| [0029](0029-settings-live-in-a-window.md) | The settings live in a window, not in a panel |
 
 **0011 is deliberately absent.** It was a rendered-Markdown reader that was built,
 looked at, judged broken and parked in a `git stash` rather than deleted. The

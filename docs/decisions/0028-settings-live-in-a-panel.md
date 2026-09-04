@@ -1,6 +1,7 @@
 # 0028 — The settings live in a panel, not in the title strip
 
-**Status** accepted
+**Status** accepted; implementation superseded by
+[0029](0029-settings-live-in-a-window.md)
 **Date** 2026-09
 
 ## Context

@@ -18,7 +18,7 @@ bun run build    # typecheck + static dist/
   banners: `tokens.css` (`theme.rs` vars + themes), `guide-chrome.css`,
   `desktop.css`, `modals.css`, `docs.css`, `tui.css`.
 - `src/views/` — one `?raw` HTML partial per tab: `mockup`, `blueprint`,
-  `tokens`, `keyboard`, `architecture`. Big static chunks stay plain HTML.
+  `tokens`, `keyboard`, `architecture`, `settings-study`. Big static chunks stay plain HTML.
 - `src/components/` — `modals.html` today; string-template `(data) => string`
   functions for repeated markup next (see its README).
 - `src/interactions/` — one module per behavior: `tabs`, `annotations`,

@@ -5,9 +5,11 @@ mod graph;
 mod help;
 mod input;
 mod menu;
+mod modal;
 mod panes;
 mod session;
 mod settings;
+mod settings_window;
 mod stats;
 mod views;
 
@@ -1535,13 +1537,6 @@ struct DevShell {
     /// a different projection every time — the active modes' — and an offset
     /// the last reading left is a promise about rows that no longer exist.
     help_scroll: ScrollHandle,
-    /// Whether the settings panel stands, which row its selection is on, and
-    /// the panel's row scroll. The selection is the shell's and not the
-    /// panel's for the same reason the help scroll is: the panel is a pure
-    /// element. Reset when the panel opens.
-    settings: bool,
-    settings_sel: usize,
-    settings_scroll: ScrollHandle,
     /// The window's one focusable element: this shell itself. Key events reach a
     /// listener through the focus path, so something has to hold focus, and one
     /// handle owned here means the views never have to know input exists.
@@ -1838,9 +1833,6 @@ impl DevShell {
         }
         if self.help {
             modes.push(help::MODE);
-        }
-        if self.settings {
-            modes.push(settings::MODE);
         }
         if self.show_message && self.error.is_some() {
             modes.push(MESSAGE_MODE);
@@ -3450,7 +3442,7 @@ impl DevShell {
         self.set_theme(next, cx);
     }
 
-    /// The settings panel's rows, spelled from the live state: the view's own
+    /// The settings window's rows, spelled from the live state: the view's own
     /// layout and wrap lists with their current indices, the *effective*
     /// algorithm and whitespace — the live override where there is one, the
     /// configured default otherwise — and everything else off the host. The
@@ -3485,51 +3477,11 @@ impl DevShell {
         )
     }
 
-    /// Moves the panel's selection, clamping at both ends — a list that wraps
-    /// from the last knob to the first loses your place by the whole panel.
-    fn settings_move(&mut self, by: isize, cx: &mut Context<Self>) {
-        let count = settings::len(&self.settings_sections(cx));
-        if count == 0 {
-            return;
-        }
-        let sel = (self.settings_sel as isize + by).clamp(0, count as isize - 1) as usize;
-        if sel != self.settings_sel {
-            self.settings_sel = sel;
-            cx.notify();
-        }
-    }
-
-    /// The first or the last row — what `g`/`G` run while the panel stands.
-    fn settings_jump(&mut self, bottom: bool, cx: &mut Context<Self>) {
-        let count = settings::len(&self.settings_sections(cx));
-        if count == 0 {
-            return;
-        }
-        self.settings_sel = match bottom {
-            true => count - 1,
-            false => 0,
-        };
-        cx.notify();
-    }
-
-    /// Turns the selected row's value by `dir`: the next or previous choice,
-    /// one step on a number, a flip on a switch. Choosing is doing — the
-    /// change applies now — and it is also written back to `gitten.toml` as
-    /// the new default, so a relaunch opens where the panel left off.
-    fn settings_adjust(&mut self, dir: i32, cx: &mut Context<Self>) {
-        let sections = self.settings_sections(cx);
-        let Some((s, r)) = settings::at(&sections, self.settings_sel) else {
-            return;
-        };
-        if !sections[s].rows[r].enabled {
-            return;
-        }
-        self.settings_apply(sections[s].rows[r].setting, dir, cx);
-    }
-
     /// One knob, turned. Every arm ends in the same two halves: the live
     /// change through the route the old strip controls took, and the file
-    /// write that makes it the default — [`DevShell::save_default`].
+    /// write that makes it the default — [`DevShell::save_default`]. The
+    /// settings window calls this per row, so the selection lives there and
+    /// the knob logic lives here, once.
     fn settings_apply(&mut self, setting: settings::Setting, dir: i32, cx: &mut Context<Self>) {
         use settings::Setting as S;
         let host = config::host(cx);
@@ -3703,6 +3655,23 @@ impl DevShell {
             self.set_notice(warning);
             cx.notify();
         }
+    }
+
+    /// Opens `gitten.toml` in `$EDITOR`, detached — the settings window's
+    /// file-fallback row. Portable on purpose: no platform branch, just the
+    /// environment the shell already inherits. `$EDITOR` unset is a sentence
+    /// for the window's footer, not a guess about which editor was meant.
+    fn open_config_in_editor(&self) -> std::io::Result<()> {
+        let editor = std::env::var("EDITOR").map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "$EDITOR is not set — nothing to open gitten.toml with",
+            )
+        })?;
+        std::process::Command::new(editor)
+            .arg(&self.config)
+            .spawn()
+            .map(|_| ())
     }
 
     /// [`DevShell::save_default`] plus a live-host patch for a knob whose
@@ -4149,35 +4118,16 @@ impl DevShell {
                 // longer exist.
                 if self.help {
                     help::scroll_to_end(&self.help_scroll, false);
-                    // One panel at a time: the settings one stood over the
-                    // same keyboard.
-                    self.settings = false;
                 }
                 self.sync_modes(cx);
             }
+            // Settings stand in their own window now, not over this one: the
+            // command opens (or activates) it, and the window owns its own
+            // keyboard from there. Every door — `,`, the gear, the menu,
+            // `cmd-,` — arrives here, so this stays the one opener.
             "settings" => {
-                self.settings = !self.settings;
-                if self.settings {
-                    self.settings_sel = 0;
-                    help::scroll_to_end(&self.settings_scroll, false);
-                    // One panel at a time.
-                    self.help = false;
-                }
-                self.sync_modes(cx);
+                settings_window::open(cx.entity(), cx);
             }
-            // While the settings panel stands, the movement verbs are the
-            // panel's: up and down move the selection, left and right (or
-            // enter/space) turn the value. The names are the map's — bound
-            // in the settings mode in `core` — so the routing here is the
-            // only client-side half of it, the way the help panel's scroll
-            // routing is.
-            "view.down" if self.settings => self.settings_move(1, cx),
-            "view.up" if self.settings => self.settings_move(-1, cx),
-            "view.left" if self.settings => self.settings_adjust(-1, cx),
-            "view.right" if self.settings => self.settings_adjust(1, cx),
-            "view.top" if self.settings => self.settings_jump(false, cx),
-            "view.bottom" if self.settings => self.settings_jump(true, cx),
-            "settings.apply" if self.settings => self.settings_adjust(1, cx),
             // While the panel stands, the movement verbs are the panel's: the
             // rows under it are occluded, and one of these keys moving the list
             // underneath instead would scroll something the reader cannot see.
@@ -4367,11 +4317,6 @@ impl DevShell {
         }
         if self.help {
             self.help = false;
-            self.sync_modes(cx);
-            return;
-        }
-        if self.settings {
-            self.settings = false;
             self.sync_modes(cx);
             return;
         }
@@ -4797,9 +4742,6 @@ impl DevShell {
             // reads as "not bound" instead of arming a discard behind a screen
             // that is only describing it. `Resolve::None` below says so.
             false if self.help => host.keys.resolve_mode_any(help::MODE, &typed),
-            // While the settings panel stands it owns the keyboard the same
-            // way the help panel does: resolved against its mode *alone*.
-            false if self.settings => host.keys.resolve_mode_any(settings::MODE, &typed),
             false => host.keys.resolve_any(&self.modes, &typed),
         };
         match resolved {
@@ -4931,7 +4873,7 @@ impl DevShell {
         // interceptor stands aside so a handler on the visible panel can
         // still see the event. Stopping propagation here would prevent that
         // bubble handler.
-        if self.help || self.settings || self.open.is_some() || self.context.is_some() {
+        if self.help || self.open.is_some() || self.context.is_some() {
             return;
         }
         // Over one region's rows or the other's, and not over the title bar
@@ -5676,12 +5618,13 @@ impl Render for DevShell {
         });
 
         // The settings button, right-aligned: one gear where five pickers
-        // stood. `,` and the menu open the same panel; this is the
+        // stood. `,` and the menu open the same window; this is the
         // discoverable third door, wearing the same chrome the branch chip
-        // does so the strip stays one surface.
+        // does so the strip stays one surface. Unhighlighted by design: the
+        // window is its own surface with its own keyboard, not a mode of
+        // this one, so this strip says nothing about whether it stands.
         let settings_button = {
             let me = me.clone();
-            let open = self.settings;
             div()
                 .id("settings-button")
                 .debug_selector(|| "settings-button".to_string())
@@ -5693,14 +5636,8 @@ impl Render for DevShell {
                 .w(px(CHIP_H))
                 .rounded(px(chrome::RADIUS))
                 .border_1()
-                .border_color(rgb(match open {
-                    true => c.faint,
-                    false => c.border,
-                }))
-                .bg(rgb(match open {
-                    true => c.selection_bg,
-                    false => c.raised,
-                }))
+                .border_color(rgb(c.border))
+                .bg(rgb(c.raised))
                 .cursor_pointer()
                 .hover(|s| s.bg(rgb(c.keycap)).border_color(rgb(c.faint)))
                 .child(
@@ -6106,55 +6043,6 @@ impl Render for DevShell {
                 self.help
                     .then(|| help::overlay(&config::host(cx), &self.modes, &self.help_scroll)),
             )
-            // The settings panel, beside the help one: one panel at a time
-            // stands, and this one carries every knob the title strip used
-            // to. Built from the live state per frame — see
-            // [`DevShell::settings_sections`] — so a config reload behind it
-            // rewrites the rows rather than stranding them.
-            .children(self.settings.then(|| {
-                let sections = self.settings_sections(cx);
-                // Clamped, not trusted: the registries moved since the
-                // selection did, and a stale index is an unmoved one.
-                let sel = self
-                    .settings_sel
-                    .min(settings::len(&sections).saturating_sub(1));
-                let me = cx.entity().downgrade();
-                settings::overlay(
-                    &sections,
-                    sel,
-                    &self.settings_scroll,
-                    &config::host(cx),
-                    &self.modes,
-                    {
-                        let me = me.clone();
-                        move |i: usize, _: &mut Window, cx: &mut App| {
-                            _ = me.update(cx, |this, cx| {
-                                this.settings_sel = i;
-                                cx.notify();
-                            });
-                        }
-                    },
-                    {
-                        let me = me.clone();
-                        move |i: usize, dir: i32, _: &mut Window, cx: &mut App| {
-                            _ = me.update(cx, |this, cx| {
-                                this.settings_sel = i;
-                                this.settings_adjust(dir, cx);
-                            });
-                        }
-                    },
-                    {
-                        let me = me.clone();
-                        move |_: &mut Window, cx: &mut App| {
-                            _ = me.update(cx, |this, cx| {
-                                this.settings = false;
-                                this.sync_modes(cx);
-                                cx.notify();
-                            });
-                        }
-                    },
-                )
-            }))
             // The message overlay, over even the help: it exists because the
             // band's one truncated line was not the whole of git's answer, so
             // the whole of the answer is the one thing it must show.
@@ -6174,34 +6062,23 @@ impl Render for DevShell {
 /// the reading. No `whitespace_nowrap`: a long answer wraps, because a panel
 /// that clips its tail is the band with more room.
 fn message_overlay(error: &GitError, host: &Host) -> AnyElement {
-    let c = &host.theme.chrome;
-    div()
-        .occlude()
-        .absolute()
-        .inset_0()
-        .flex()
-        .items_center()
-        .justify_center()
-        .child(
+    // The box around the answer — scrim, border, paint order — is the shared
+    // centered panel's, the way the help panel's is. What is here is only the
+    // glance and the record.
+    modal::centered(
+        host,
+        modal::Width::Max(720.0),
+        vec![
+            // The glance, then the record. No `whitespace_nowrap`: a long
+            // answer wraps, because a panel that clips its tail is the
+            // band with more room.
             div()
-                .max_w(px(720.0))
-                .max_h_full()
-                .overflow_hidden()
-                .bg(rgb(c.title_bg))
-                .border_1()
-                .border_color(rgb(c.faint))
-                .rounded(px(4.))
-                .p(px(16.0))
-                .text_size(px(host.font.size))
-                .font_family(host.font.family.clone())
-                .text_color(rgb(c.dim))
-                // The glance, then the record. No `whitespace_nowrap`: a long
-                // answer wraps, because a panel that clips its tail is the
-                // band with more room.
-                .child(div().text_color(rgb(c.error)).child(error.summary.clone()))
-                .child(error.full.clone()),
-        )
-        .into_any_element()
+                .text_color(rgb(host.theme.chrome.error))
+                .child(error.summary.clone())
+                .into_any_element(),
+            error.full.clone().into_any_element(),
+        ],
+    )
 }
 
 fn main() {
@@ -6308,6 +6185,9 @@ fn open_main_window(started: Started, cx: &mut App) {
     cx.set_global(config::Active(host.clone()));
     // Nothing picked yet: the file's theme is the one on screen.
     cx.set_global(config::Chosen(None));
+    // No settings window until one is asked for: the opener reads this to
+    // activate instead of duplicating.
+    cx.set_global(settings_window::Open::default());
     // After `gpui_component::init`, which sets its own theme to Light — see
     // `config::sync_widgets`, which is the only thing standing between that
     // and a pair of light scrollbars over a near-black diff.
@@ -6661,9 +6541,6 @@ fn open_main_window(started: Started, cx: &mut App) {
                 pending: Vec::new(),
                 help: false,
                 help_scroll: ScrollHandle::default(),
-                settings: false,
-                settings_sel: 0,
-                settings_scroll: ScrollHandle::default(),
                 focus,
                 focused: None,
                 seen_host: None,
@@ -6962,8 +6839,8 @@ fn window_options(title: SharedString) -> WindowOptions {
 #[cfg(test)]
 mod tests {
     use super::{
-        bare_launch_view, config, files_header_count, input, open_recent, panes, ContextMenu,
-        DevShell, GitError, Notice, Open, Pane, Refresh, Screen, Writes,
+        bare_launch_view, config, files_header_count, input, open_recent, panes, settings_window,
+        ContextMenu, DevShell, GitError, Notice, Open, Pane, Refresh, Screen, Writes,
     };
     use crate::views::commits::Commits;
     use gitten_app::cli::{Source, View};
@@ -7287,9 +7164,6 @@ mod tests {
                 pending: vec![vec![Key::char('g')]],
                 help: false,
                 help_scroll: ScrollHandle::default(),
-                settings: false,
-                settings_sel: 0,
-                settings_scroll: ScrollHandle::default(),
                 focus: cx.focus_handle(),
                 focused: None,
                 seen_host: None,
@@ -7426,9 +7300,6 @@ mod tests {
                 pending: Vec::new(),
                 help: false,
                 help_scroll: ScrollHandle::default(),
-                settings: false,
-                settings_sel: 0,
-                settings_scroll: ScrollHandle::default(),
                 focus: cx.focus_handle(),
                 focused: None,
                 seen_host: None,
@@ -7554,75 +7425,50 @@ mod tests {
             assert!(s.pending.is_empty(), "the half-typed chord survived");
             assert_eq!(s.panes.len(), 1, "esc closed the pane too");
             assert!(!s.help, "esc reached past the menu");
-            assert!(!s.settings, "esc reached past the menu");
         });
     }
 
     #[gpui::test]
-    fn the_settings_panel_stands_over_the_window(cx: &mut TestAppContext) {
+    fn the_settings_command_opens_one_window(cx: &mut TestAppContext) {
         let shell = shell(None, cx);
         let observed = shell.clone();
-        let handle = cx.update(|cx| {
+        cx.update(|cx| {
             gpui_component::init(cx);
             cx.set_global(config::Active(Rc::new(Host::new())));
-            cx.open_window(
-                gpui::WindowOptions {
-                    window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds {
-                        origin: Default::default(),
-                        size: gpui::size(gpui::px(800.0), gpui::px(600.0)),
-                    })),
-                    ..Default::default()
-                },
-                move |_, _| shell,
-            )
-            .unwrap()
+            cx.set_global(settings_window::Open::default());
+            assert_eq!(cx.windows().len(), 0, "a window stood before it was asked");
         });
-        let mut cx = gpui::VisualTestContext::from_window(handle.into(), cx);
-        cx.run_until_parked();
-        assert!(
-            cx.debug_bounds("settings-button").is_some(),
-            "the strip's one control was not drawn"
-        );
-        assert!(
-            cx.debug_bounds("settings-panel").is_none(),
-            "the panel stood before it was asked"
-        );
         // `,` is the keymap's name for it — the same dispatch a press runs.
-        observed.update(&mut cx, |s, cx| s.run_command("settings", cx));
-        cx.run_until_parked();
-        let panel = cx
-            .debug_bounds("settings-panel")
-            .expect("the panel was not drawn");
-        assert!(panel.size.width > gpui::px(0.0));
-        // `esc` is the way out, and the panel does not outlive it.
-        observed.update(&mut cx, |s, cx| s.run_command("back", cx));
-        cx.run_until_parked();
-        assert!(
-            cx.debug_bounds("settings-panel").is_none(),
-            "the panel outlived its dismissal"
-        );
+        observed.update(&mut *cx, |s, cx| s.run_command("settings", cx));
+        cx.update(|cx| {
+            assert_eq!(
+                cx.windows().len(),
+                1,
+                "settings opened anywhere but a new window"
+            );
+        });
+        // A second open activates instead of duplicating.
+        observed.update(&mut *cx, |s, cx| s.run_command("settings", cx));
+        cx.update(|cx| {
+            assert_eq!(
+                cx.windows().len(),
+                1,
+                "the second open duplicated the window"
+            );
+        });
     }
 
     #[gpui::test]
-    fn esc_closes_the_settings_panel_before_anything_under_it(cx: &mut TestAppContext) {
+    fn esc_with_nothing_open_returns_from_diff_to_list(cx: &mut TestAppContext) {
         let shell = shell(None, cx);
-        shell.update(cx, |s, _| {
-            s.settings = true;
-        });
-        shell.update(cx, |s, cx| s.back(cx));
-        shell.read_with(cx, |s, _| {
-            assert!(!s.settings, "the panel stayed open");
-            assert!(s.pending.is_empty(), "the half-typed chord survived");
-            assert_eq!(s.panes.len(), 1, "esc closed the pane too");
-        });
-        // And with nothing stacked above, `esc` hands the keyboard back from
-        // the diff to the stack — the panel did not swallow the key.
+        // With nothing stacked above, `esc` hands the keyboard back from
+        // the diff to the stack.
         shell.update(cx, |s, cx| {
             s.set_spot(super::Spot::Main, cx);
             s.back(cx);
         });
         shell.read_with(cx, |s, _| {
-            assert_eq!(s.spot, super::Spot::List, "esc stopped at the panel");
+            assert_eq!(s.spot, super::Spot::List, "esc did not return to the list");
         });
     }
 
