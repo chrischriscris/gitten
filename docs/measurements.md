@@ -1008,7 +1008,106 @@ Dice coefficient over tokens, `2·LCS / (len_a + len_b)`, for every pair
 pair measured, above the junk. A test pins the 0.60 case so tightening the floor
 cannot silently stop highlighting real renames.
 
+### The exec→`main` gap, attributed
+
+Every TTI number above has an unattributed slice at the bottom: the wall the
+process spends before `main`, which no stage clock can see. Measured with a
+throwaway harness outside the workspace (`/tmp/tti-attribution`): a hello-world
+probe that prints at its first statement and exits — and, for a second mode,
+calls `libc::_exit` to skip runtime teardown — plus a Python driver that spawns
+each target over `os.posix_spawn` with stderr to a pipe and stamps every event
+from one clock, the parent's monotonic. No cross-domain assumption; as a check,
+the probe also prints realtime at its first statement, which agrees with the
+monotonic reading within 0.5 ms. `exec→first line` below is the reading taken
+just after the spawn syscall returns to the arrival of the target's first
+stderr byte, so it is loader work plus one pipe write and nothing of the
+driver. Five kinds of run, ABBA-interleaved with 1.0 s settles, medians of
+eleven rounds a side.
+
+```
+python3 /tmp/tti-attribution/harness2.py 11 min hexit help tui shell
+python3 /tmp/tti-attribution/analyze2.py                 # per-run attribution
+```
+
+The `tui` row is `GITTEN_START_LOG=1 ./target/release/gitten-tui commits .` on a
+non-tty stdin — it exits at `could not take the terminal` after printing its
+`gitten-start:` stages, so wall minus the printed stage sum is everything its
+clock cannot see. The `shell` row is
+`GITTEN_START_LOG=1 GITTEN_START_QUIT=1 ./target/release/gitten-shell commits .`
+— a window appears and closes, as in [the desktop section](#the-desktop-opens-its-window-before-it-acquires).
+Release binaries as of `27e15a0`, toolchain 1.97.1: `gitten-tui` 2.4 MB,
+`gitten-shell` 16.1 MB, probe 0.43 MB. The machine was **not idle** — another
+session was building in this tree during part of the sitting — so SDs are
+quoted and the minima are the honest floors.
+
+| target | exec→first stderr line | sd | best | realtime check |
+|---|---|---|---|---|
+| probe, 0.43 MB, full runtime | 4.7 | 7.7 | 2.0 | 4.3 |
+| probe, `libc::_exit` | 3.6 | 1.6 | 2.0 | 2.9 |
+| `gitten-tui`, 2.4 MB | 6.1 | 9.9 | 4.2 | — |
+| `gitten-shell`, 16.1 MB | 7.1 | 4.8 | 6.0 | — |
+
+Paired within the same round: tui − probe **+2.3 ms**, shell − probe **+5.0 ms**,
+`_exit` − probe −0.3 ms (noise), so the probe is a fair floor. The tui row is
+the first `gitten-start:` mark; the shell row is the `[start] main enter` mark,
+which is the literal first statement of its `main`, so it *is* exec→`main`.
+
+The TUI run, same eleven rounds, attributed (medians):
+
+| slice | ms |
+|---|---|
+| spawn→exit wall | 47.9 |
+| — exec→first mark | 6.1 |
+| — marked stages, `args parsed`→`views built` | 41.9 |
+| — tail: failure path, `exit(1)`, teardown | 0.6 |
+
+So exec→`main` is **~5–6 ms** — the 6.1 less the unmarked head between `main`
+and the first mark (`Startup::new`, two flag switches, the config-watcher
+thread, sub-millisecond) — of which ~2.3 ms is dyld of the 2.4 MB binary over
+the 0.43 MB floor, and ~2.5–3.5 ms is the fork/exec + libc start any process
+pays. Teardown is **0.6 ms** on this path (`process::exit(1)` runs no
+destructors; the probe's own full-runtime-minus-`_exit` difference, 1.2 ms,
+bounds what runtime teardown could add). The wall the stage clock cannot see
+here is 5.8 ms — **not** the 35–38 ms a TTI-vs-stage-sum comparison suggests.
+That comparison's residue is not loader work: the non-tty run exits before the
+frame, and on a real run the road between `views built` and the first frame is
+itself marked (`first frame flushed`), i.e. app work the clock does see. The
+non-tty wall also exceeds the 39.2 ms first-frame TTI above because this path
+still acquires — 35–50 ms of `git` subprocess inside the stage sum under load.
+
+The desktop run, same eleven rounds, attributed (medians; single-run minima in
+brackets):
+
+| slice | ms |
+|---|---|
+| spawn→exit wall (`GITTEN_START_QUIT`) | 325.5 [283.8] |
+| — exec→`main enter` | 7.1 [6.0] |
+| — `main enter`→`gpui application up` | 71.0 [58.1] |
+| — gpui up→`first rows drawn` | 225.7 [191.3] |
+| — quit + teardown after the last mark | 26.2 [21.3] |
+
+exec→`main` is **7.1 ms** — 2.4 ms of it dyld over the probe floor, the rest
+the common fork/exec cost. The 71 ms after `main enter` is almost entirely
+GPUI's `application()` init: the shared startup before it is sub-millisecond
+(`gitten-start: config loaded in 0.1–0.3 ms` on the same runs), and the mark's
+low end, 64.6 ms, is where the ~64 ms quoted in the desktop section sits. The
+26 ms after `first rows drawn` — the quit poll reaching process exit — is
+measured as a gap, not decomposed.
+
+**Is the shell's binary worth attacking for TTI? No.** Halving 16.1 MB saves at
+most ~1.2 ms of the 2.4 ms dyld premium — under half a per cent of a 282 ms
+TTI, and far under the ±14.5 % identical-binary noise this file already
+records. The numbers point elsewhere: ~71 ms of GPUI init before the window
+can exist and ~226 ms to first rows are 98 % of the road. The TUI's exec→first
+is ~6 ms against a 39.2 ms first frame, and only ~2.3 ms of it is
+size-dependent — a slimming pass buys less there too. What remains
+unattributed in both clients is inside the marked stages (acquisition, the
+window road) and the shell's 26 ms exit gap, which a future pass should
+decompose before anyone optimizes it.
+
 ## Fixtures
+
+
 
 `fixtures/dump.sh <repo> [count]` for real history, `fixtures/gen.sh <n> <m>` for
 synthetic at any scale. Use both — synthetic tests scale, real tests *shape*, and
