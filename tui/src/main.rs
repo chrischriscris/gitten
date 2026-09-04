@@ -78,6 +78,12 @@ const EXTRA: &str = "  --ascii        draw the graph and the scrollbar without b
 /// same reason. It costs one `poll` syscall per interval and no redraw.
 const TICK: Duration = Duration::from_millis(150);
 
+/// The poll while the log's tail is still streaming: how long a tail batch
+/// may wait for the frame after its bytes. 16 ms is one 60 Hz frame — the
+/// tail fills imperceptibly, and the input that lands inside the window is
+/// never held longer than that.
+const STREAM_TICK: Duration = Duration::from_millis(16);
+
 /// The most input one frame takes from the queue.
 ///
 /// A wheel burst arrives as dozens of notches, and a frame per notch is the
@@ -134,13 +140,96 @@ fn main() {
         rx
     };
 
-    let started = match start.go() {
+    // Which door: a repository commits launch streams its log — the list
+    // draws off the first records and the tail lands behind the frame, sound
+    // because lane assignment is prefix-stable (pinned in `core`). Everything
+    // else keeps the synchronous road: fixtures and patches are in-process
+    // reads with no stream to hurry, and a diff launch has no log at all.
+    let progressive = matches!(
+        cli::parse(start.take(), View::Commits),
+        cli::Request::Open {
+            view: View::Commits,
+            source: Source::Repo { .. },
+        }
+    );
+    // Captured before the startup moves: the failure line names the binary
+    // and the usage, in the same words the synchronous road produces.
+    let usage = start.usage();
+    let (started, stream) = if progressive {
+        match start.configure() {
+            Ok(configured) => {
+                let gitten_app::Configured {
+                    view,
+                    source,
+                    host,
+                    repo,
+                    config,
+                } = configured;
+                let repo = repo.expect("a repository launch carries its handle");
+                let (limit, path) = match &source {
+                    Source::Repo { path, arg } => (arg.parse().unwrap_or(5000), path.clone()),
+                    _ => unreachable!("checked above"),
+                };
+                // The describe beside the first batch — the same overlap the
+                // synchronous acquisition runs, one spawn floor for both.
+                let outcome = std::thread::scope(|s| {
+                    let title = s.spawn(|| repo.describe());
+                    let mut stream = gitten_git::Repo::log_stream(repo.as_ref(), limit)?;
+                    let first = stream.first()?;
+                    if first.is_empty() && !stream.live() {
+                        return Err(format!("no commits in {}", path.display()));
+                    }
+                    Ok::<_, String>((
+                        gitten_app::acquire::Loaded {
+                            label: title.join().unwrap_or_default(),
+                            data: Data::Commits(first.clone()),
+                        },
+                        first,
+                        stream,
+                    ))
+                });
+                match outcome {
+                    Ok((loaded, first, stream)) => {
+                        let mut clock = StartClock::new();
+                        clock.stage("acquired (first batch)");
+                        (
+                            Ok(gitten_app::Started {
+                                view,
+                                source,
+                                host,
+                                loaded,
+                                config,
+                                repo: Some(repo),
+                            }),
+                            Some((stream, first)),
+                        )
+                    }
+                    Err(e) => (
+                        Err(gitten_app::Exit::Failed(format!(
+                            "gitten-tui: {e}\n\n{usage}"
+                        ))),
+                        None,
+                    ),
+                }
+            }
+            Err(exit) => (Err(exit), None),
+        }
+    } else {
+        match start.go() {
+            Ok(started) => (Ok(started), None),
+            Err(exit) => (Err(exit), None),
+        }
+    };
+    let started = match started {
         Ok(started) => started,
         Err(exit) => exit.finish(),
     };
     let mut clock = StartClock::new();
     let config_path = started.config.clone();
     let mut app = App::new(started, glyphs);
+    if let Some((stream, first)) = stream {
+        app.set_tail(stream, first);
+    }
     clock.stage("views built");
 
     // The panic hook before the terminal is touched: a panic between the two
@@ -941,6 +1030,13 @@ struct App {
     /// after the first frame. Cleared by the load itself; a fixture or a patch
     /// has no repository and never carries it.
     startup_pending: bool,
+    /// The log's unstreamed tail, and every commit it has delivered so far —
+    /// the first batch drew with the first frame; the rest arrives between
+    /// frames, appended to the list through the same `replace` a refresh
+    /// rides. `None` for a launch that has no tail: a fixture, a patch, a
+    /// diff, or a history that ended with its first batch.
+    tail: Option<gitten_git::LogStream>,
+    tail_commits: Vec<gitten_core::Commit>,
 }
 
 impl App {
@@ -1132,10 +1228,20 @@ impl App {
             clicks: 0,
             focus_keys: Vec::new(),
             startup_pending,
+            tail: None,
+            tail_commits: Vec::new(),
         };
         app.sync_header_keys();
         app.sync_modes();
         app
+    }
+
+    /// Hands the app the log's unstreamed tail, seeded with the first batch
+    /// the launch already drew. `main` calls this once, between construction
+    /// and the loop; every batch after arrives through [`App::run`].
+    fn set_tail(&mut self, stream: gitten_git::LogStream, commits: Vec<gitten_core::Commit>) {
+        self.tail = Some(stream);
+        self.tail_commits = commits;
     }
 
     /// The startup loads the skeleton deferred: the sidebars' first reads and
@@ -1434,8 +1540,15 @@ impl App {
             // The first frame draws before anything waits, so its poll does not
             // block; every later frame blocks here for the first event, or the
             // tick, which is the only thing that bounds how soon a saved config
-            // is noticed.
-            match Term::poll(if first { Duration::ZERO } else { TICK })? {
+            // is noticed. While the log's tail is streaming, the tick is short:
+            // its rows land on the frame after the bytes arrive, and a full
+            // tick would hold them back for nothing — the same shortness bounds
+            // input latency, which is what makes it harmless.
+            let tick = match self.tail.is_some() {
+                true => STREAM_TICK,
+                false => TICK,
+            };
+            match Term::poll(if first { Duration::ZERO } else { tick })? {
                 // A resize stays in the loop, which keeps the size it compares
                 // against; every other event routes through [`App::input`].
                 Some(Input::Resize(w, h)) => {
@@ -1494,6 +1607,27 @@ impl App {
             // never the refresh itself, which is the `Screens::refresh`
             // call below and is as long as the re-acquisition takes.
             self.drain_jobs();
+            // The log's tail, whatever has arrived since the last frame —
+            // appended to the list the launch asked for, which keeps its
+            // cursor and viewport through the same `replace` a refresh rides.
+            // When the stream ends, its one stage is said and a mid-flight
+            // failure goes to the status line.
+            if let Some(stream) = self.tail.as_mut() {
+                let batch = stream.drain();
+                if !batch.is_empty() {
+                    self.tail_commits.extend(batch);
+                    if let Some(Screens::Commits { view, .. }) = self.panes.get_mut("commits") {
+                        view.replace(self.tail_commits.clone());
+                    }
+                }
+                if !stream.live() {
+                    let stream = self.tail.take().expect("checked above");
+                    if let Some(e) = stream.error() {
+                        self.message = e;
+                    }
+                    clock.stage("log streamed");
+                }
+            }
             let t = Instant::now();
             self.draw();
             let cells = self.screen.flush(term.out())?;
