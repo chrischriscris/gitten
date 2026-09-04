@@ -706,6 +706,41 @@ mod tests {
         }
     }
 
+    /// Lanes of a prefix are the lanes of the whole.
+    ///
+    /// The property the progressive log stands on: `git log --topo-order`
+    /// streams, and the list draws off the first chunk while the tail is still
+    /// in flight — which is only sound if appending commits never re-lanes the
+    /// rows already on screen. [`assign_lanes`] is a single forward pass whose
+    /// state at commit *k* is built from commits `[0..k)` alone, so this holds
+    /// by construction; the test holds it by checking it, over a history with
+    /// the shapes that could break it — merges, octopus merges, long-lived
+    /// lanes crossing, and a tail that converges lanes opened early.
+    #[test]
+    fn lanes_of_a_prefix_are_the_lanes_of_the_whole() {
+        // newest first, `git log --topo-order` order: a main line with two
+        // branches off it, one merging back through an octopus.
+        let commits = vec![
+            commit("m0", &["a1", "b1", "c1"]),
+            commit("a1", &["a0"]),
+            commit("b1", &["b0"]),
+            commit("c1", &["c0"]),
+            commit("a0", &["r1"]),
+            commit("r1", &["r0"]),
+            commit("b0", &["r0"]),
+            commit("c0", &["r0"]),
+            commit("r0", &[]),
+        ];
+        let whole = assign_lanes(&commits);
+        for k in 1..=commits.len() {
+            assert_eq!(
+                &whole[..k],
+                assign_lanes(&commits[..k]),
+                "row {k} moved when the tail arrived"
+            );
+        }
+    }
+
     /// The text of every line of a parsed patch, in order.
     fn texts(files: &[FileDiff]) -> Vec<String> {
         files
