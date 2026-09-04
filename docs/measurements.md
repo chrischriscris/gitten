@@ -409,6 +409,48 @@ exercises it; its win (window-before-acquisition) is structural rather than a
 number here. The stage clock also only exists after the pass, so no per-stage
 baseline against `main` is possible by construction.
 
+Since then the tui's startup has split into two frames: the list frame
+(`first frame flushed`) draws with the sidebars and the preview diff in their
+loading shape, and one wave of deferred reads fills them before a second frame
+(`startup frame flushed`) is flushed. "First fully-presented frame" now means
+the second. The desktop's time-to-interactive is now reproducible headlessly —
+`GITTEN_START_QUIT=1 GITTEN_START_LOG=1 ./target/release/gitten-shell commits .`
+quits the moment its first rows are drawn, so a wall clock around the process
+*is* the number (a window still appears) — recorded in
+[the desktop section below](#the-desktop-opens-its-window-before-it-acquires).
+
+### Time to interactive, as recorded
+
+```sh
+cargo run -q -p gitten-tui --example tti --release .            # one side, medians
+GITTEN_BASELINE=<old>/gitten-tui \
+  cargo run -q -p gitten-tui --example tti --release . --json   # ABBA + deltaPct
+```
+
+Both clients, this repository, release, the same M1 Pro, 7 rounds a side
+ABBA-interleaved (warmup discarded, medians), September 2026. **This is the
+baseline the next optimization pass measures against** — and the harness is the
+tool to measure it with: point `GITTEN_BASELINE` at today's binary before
+touching anything, and the `deltaPct` it prints is the whole conclusion. Noise
+between *identical* binaries measures ±14.5 % with this discipline, so a delta
+smaller than that is not a result.
+
+| | previous vintage¹ | current | Δ |
+|---|---|---|---|
+| tui spawn → first frame (the list, interactive) | 110.5 ms | **39.2 ms** | −64.5 % |
+| tui spawn → filled frame (sidebars + preview) | — | 67.2 ms | deferred work lands 28 ms after the list is usable |
+
+¹ The binary before the startup split into two frames: its single frame was
+the filled frame, so it has no separate list-frame figure.
+
+The desktop's number lives in its own table below (~282 ms; the previous
+vintage measured ~357 ms the same way), because it needs a window and the
+harness gets it from `GITTEN_START_QUIT` rather than the pty. Two structural
+tests in `tui/src/main.rs` pin the deferral itself — the startup loads run in
+`load_startup` after the first frame, not in `App::new` before it, and a
+fixture launch defers nothing — so moving work back onto the road to frame one
+breaks `cargo test`, not just the timing.
+
 ### The August 2026 memory pass
 
 One commit on top of [the allocation and startup pass above](#the-august-2026-allocation-and-startup-pass):
@@ -681,6 +723,57 @@ already had.
 The side-by-side row count is *higher* than unified's here, which looks wrong and
 is not: `pr30683` is near-pure deletion, so almost every row has one side, and the
 column is half the width so more of them wrap.
+
+### The desktop opens its window before it acquires
+
+Startup used to acquire, then open the window; an explicit repository launch
+(`gitten commits .`, `gitten diff .`) now opens it first. `shell/src/main.rs`
+takes `Startup::configure` — everything `go()` does but the acquisition, which
+lives in `app/src/lib.rs` — and registers empty screens one generation below the
+shell's, the sidebar panes in a loading shape (header label `STARTUP_LOADING`,
+drawn as "loading"), the saved session row riding `pending_restore`. One
+background wave — the same `refresh_stale` a repository switch rides, through the
+existing per-pane `Refresh { load, apply }` machinery — acquires and fills
+everything, and `finish_refresh` applies the restored scroll and schedules the
+preview diff exactly as it does after a switch. A skeleton's sidebar panes draw
+empty rows under that header for one frame (~100 ms); the honest-emptiness
+convention — a read that has not landed must not draw as a clean tree — is
+carried by the label, the same way the TUI's loading shapes work. Fixtures and
+patches keep the synchronous `go()` road: in-process reads with no spawn floor to
+defer against, and failures still print to stderr and exit.
+
+```sh
+GITTEN_START_QUIT=1 GITTEN_START_LOG=1 ./target/release/gitten-shell commits .
+```
+
+Quits the moment its first rows are drawn — a window appears and closes — so a
+wall clock around the process is the GUI time-to-interactive. This repository,
+release, the same M1 Pro, medians of 12 ABBA-interleaved runs a side (the two
+coldest new-binary runs, ~440 ms, were post-rebuild dyld outliers):
+
+| | previous binary | window first | Δ |
+|---|---|---|---|
+| GUI time-to-interactive | ~357 ms | ~282 ms | ≈ −21 % |
+
+The `GITTEN_START_LOG` marks, same runs:
+
+| mark | was | is |
+|---|---|---|
+| startup done | 107 ms | 80 ms |
+| window callback | ~65 ms | 0.9 ms |
+| first render | 213 ms | 147 ms |
+| first rows drawn | 308–357 ms across runs | 278 ms |
+
+The trade, because it changed behaviour: a repository that will not open — a bad
+revspec, a path that is not a repository — used to `exit(1)` with a message on
+stderr; now the window opens and the wave's failure lands in the window's
+existing error band (`error_is_load`), and the process stays up. Scripting
+against the GUI binary was never the supported door — the headless `cli` harness
+and the TUI are. The bare launch (Finder, `open`, no arguments) keeps its old
+shape: one cheap `git status` probe on the cwd decides, a repository opens —
+now skeleton-first — and with none, recents or the picker open with the same
+stderr as before. See
+[decisions/0030](decisions/0030-window-before-acquisition.md).
 
 ## Not reproducible from this repo
 

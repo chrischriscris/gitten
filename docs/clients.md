@@ -70,6 +70,19 @@ warnings, answered `--help` and `gitten config`, chosen the differ the file aske
 for, and acquired the data. What comes back is a `Host`, a `View`, a `Source` and
 a `Loaded`.
 
+A client with something to draw before its data exists — the desktop — takes
+`Startup::configure` instead: everything `go` does except the acquisition, which
+the client schedules itself through the same `acquire::acquire`.
+
+```rust
+let configured = Startup::new("gitten-shell", View::Commits)
+    .configure()?;   // args parsed, gitten.toml read and warned about; no repository read yet
+```
+
+The window opens on empty screens and one background wave fills them. A client
+without anything to draw first takes `go()` and never sees the `Configured` that
+returns. What is shared is the chain, not the ordering.
+
 A client with its own flags takes them out first, so they may appear anywhere on
 the line rather than only where a positional parser looks:
 
