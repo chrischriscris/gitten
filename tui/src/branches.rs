@@ -719,6 +719,10 @@ impl Branches {
                     let at = self.cols.saturating_sub(1 + width(tracking)).max(pen.col());
                     let mut body = pen.take(at - pen.col());
                     body.put(&l.text, name);
+                    // The name rarely fills its reservation: wash the rest of
+                    // the slice, or the cursor bar splits into two islands
+                    // around an unwritten gap.
+                    body.wash(name);
                     let tracking_ink = match armed {
                         true => Ink::new(c.error, bg),
                         false => Ink::new(
