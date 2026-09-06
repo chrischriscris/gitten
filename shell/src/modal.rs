@@ -41,7 +41,10 @@ pub const PANEL_PAD: f32 = 16.0;
 /// and the clicks around the box, the box claims its own. The dim is
 /// load-bearing, not decorative: a faint border clears ~1.35:1 against the
 /// row tints bare and ~1.7:1 dimmed, so a panel without it dissolves into
-/// the diff.
+/// the diff. The dim is deep for the same reason — the border's contrast is
+/// read against the scrimmed rows behind it, and a scrim that merely tinted
+/// them would leave the border the only thing separating a panel from the
+/// text it covers.
 ///
 /// One child per panel section — heading, scrolling rows, footer — laid as
 /// the box's own column, so a scrolling middle keeps its flex like it did
@@ -69,7 +72,12 @@ pub fn centered(host: &Host, width: Width, children: Vec<AnyElement>) -> AnyElem
     div()
         .absolute()
         .inset_0()
-        .bg(rgb(c.bg).alpha(0.5))
+        // Deeper than half: the panel's edge is a hairline, and a hairline
+        // over a near-black palette carries an edge only against rows that
+        // have actually been pushed back. Five eighths dims the diff to the
+        // point the border and the fill both clear it, without going so far
+        // the window behind stops reading as this window.
+        .bg(rgb(c.bg).alpha(0.62))
         .occlude()
         .flex()
         .items_center()
