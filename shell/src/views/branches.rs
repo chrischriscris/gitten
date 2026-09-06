@@ -291,9 +291,15 @@ pub struct HeadInfo {
     pub ahead: Option<u32>,
     /// Commits to pull. `None` under the same conditions as [`HeadInfo::ahead`].
     pub behind: Option<u32>,
-    /// ` main` or `detached · 01234567` — the chip's bright half, spelled
-    /// once here so the title strip clones a refcount per frame.
+    /// `main` or `detached · 01234567` — the chip's bright half, spelled
+    /// once here so the title strip clones a refcount per frame. The branch
+    /// mark beside it is geometry, not part of this string: it lives in the
+    /// renderer, where it can be drawn the way the list's own markers are,
+    /// instead of as a codepoint the configured face may not carry.
     pub chip: SharedString,
+    /// Whether the chip names a branch at all — the mark beside it is
+    /// HEAD-on-a-branch's, and `detached` draws bare.
+    pub branch: bool,
     /// How far HEAD has drifted from its upstream, for the title chip —
     /// [`drift`] run once; `None` when there is nothing to say. Arrows
     /// spelled, not numbers, so the strip paints each in its own ink
@@ -333,6 +339,7 @@ fn head_info(head: Option<&HeadState>, local: &[Branch]) -> Option<HeadInfo> {
             let label: SharedString = format!("detached · {short}").into();
             Some(HeadInfo {
                 chip: label.clone(),
+                branch: false,
                 drift: None,
                 label,
                 ahead: None,
@@ -344,7 +351,8 @@ fn head_info(head: Option<&HeadState>, local: &[Branch]) -> Option<HeadInfo> {
             let ahead = b.upstream.as_ref().and_then(|u| u.ahead);
             let behind = b.upstream.as_ref().and_then(|u| u.behind);
             HeadInfo {
-                chip: format!(" {label}").into(),
+                chip: label.clone(),
+                branch: true,
                 drift: drift(ahead, behind),
                 label,
                 ahead,
@@ -1670,7 +1678,8 @@ mod tests {
                 label: "main".into(),
                 ahead: Some(1),
                 behind: Some(2),
-                chip: " main".into(),
+                chip: "main".into(),
+                branch: true,
                 drift: Some(Drift {
                     up: "↑1".into(),
                     down: "↓2".into(),

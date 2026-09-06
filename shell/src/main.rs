@@ -5807,9 +5807,15 @@ impl Render for DevShell {
                             .text_ellipsis_start()
                             .child(title),
                     )
-                    // The branch chip, the design's ` main · ↑2 ↓0` —
-                    // drawn from the head read above the strip, so the
-                    // budget and the pixels come from one read.
+                    // The branch chip: HEAD's mark, then the name the head
+                    // read above the strip spelled. The mark is geometry and
+                    // not a glyph — the design's branch icon was a Nerd Font
+                    // codepoint, and a codepoint the *configured* face does
+                    // not carry draws as the platform's missing-glyph box,
+                    // which Menlo rendered as `[?] ux-polish`. The list's
+                    // own markers went through geometry for the same
+                    // reason; this one is HEAD's dot, in the same accent
+                    // the list gives HEAD's row.
                     .children(head_chip.map(|info| {
                         div()
                             .flex_none()
@@ -5826,6 +5832,14 @@ impl Render for DevShell {
                             .whitespace_nowrap()
                             // Both halves were spelled at prepare; a
                             // frame clones two refcounts.
+                            .children(info.branch.then(|| {
+                                div()
+                                    .flex_none()
+                                    .w(px(6.0))
+                                    .h(px(6.0))
+                                    .rounded(px(3.0))
+                                    .bg(rgb(c.accent))
+                            }))
                             .child(div().flex_none().text_color(rgb(c.fg)).child(info.chip))
                             .children(info.drift.map(|drift| {
                                 // Each arrow in its own ink — ↑ outgoing in the
