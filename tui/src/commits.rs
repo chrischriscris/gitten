@@ -338,15 +338,11 @@ impl Commits {
             .map(|c| c.sha.clone());
 
         self.query = next.map(str::to_string);
-        self.visible = match &self.query {
-            Some(q) => self.search.indices(q),
-            None => Vec::from_iter(0..self.commits.len()),
-        };
+        self.refilter();
         self.sel = None;
         self.dragging = false;
-        // `set_len` clamps the cursor onto the surviving rows; the anchor, where
-        // it survived, is put back by name.
-        self.view.set_len(self.visible.len());
+        // `set_len` clamped the cursor onto the surviving rows; the anchor,
+        // where it survived, is put back by name.
         let cursor = anchored
             .as_deref()
             .and_then(|sha| {
@@ -356,6 +352,19 @@ impl Commits {
             })
             .unwrap_or_else(|| self.view.cursor());
         self.view.go_to(cursor);
+    }
+
+    /// Rebuilds the visible table against the standing query and re-clamps the
+    /// viewport to it. `apply_query` lands here on every keystroke and
+    /// `replace` on every streamed batch — the table is built here and read
+    /// everywhere else, and a list that grew without it leaves the viewport
+    /// addressing rows the table cannot name.
+    fn refilter(&mut self) {
+        self.visible = match &self.query {
+            Some(q) => self.search.indices(q),
+            None => Vec::from_iter(0..self.commits.len()),
+        };
+        self.view.set_len(self.visible.len());
     }
 
     pub fn move_by(&mut self, by: isize) {
@@ -431,14 +440,21 @@ impl Commits {
             .map(|d| d.lanes * LANE_W)
             .max()
             .unwrap_or(0);
+        // The streamed tail grew the list: the search index and the visible
+        // table were built against the batch the pane was constructed with,
+        // and a viewport sized off `commits` alone would address rows the
+        // table cannot name.
+        self.search = Index::new(&self.commits);
+        self.refilter();
         // The old scroll position first, then the anchor: `go_to` drags the
         // viewport after the cursor, and the surviving sha's row must be the
         // one on screen when it survives — restoring the top last could drag
         // the cursor off the very row it was kept for.
-        self.view.set_len(self.commits.len());
         self.view.scroll_to(top);
+        // Named by sha through the *visible* table — the cursor is a row of
+        // the filtered list, and the sha's engine index means nothing there.
         let at = sha
-            .and_then(|s| self.commits.iter().position(|c| c.sha == s))
+            .and_then(|s| self.visible.iter().position(|&i| self.commits[i].sha == s))
             .unwrap_or(cursor);
         self.view.go_to(at);
     }
@@ -767,13 +783,24 @@ impl Commits {
     /// drawn. Position is counted over the *visible* rows — what the cursor
     /// addresses — while `filter_note` is what says the list is narrower than
     /// what was loaded.
+    ///
+    /// A standing filter spells both numbers: `1/1 of 141`, because a bare
+    /// `1/1` over a narrowed list reads as a repository with one commit in
+    /// it, and that is the one lie a status line must not tell. The prompt
+    /// carries the live count while it stands; this carries it after — the
+    /// filter outlives the prompt, so its count does too.
     pub fn status(&self) -> String {
-        let mut out = format!(
-            "{}/{} · {} lanes",
-            (self.view.cursor() + 1).min(self.visible.len()),
-            self.visible.len(),
-            self.lanes,
-        );
+        let hits = self.visible.len();
+        let position = match self.query.as_deref() {
+            Some(_) => format!(
+                "{}/{} of {}",
+                (self.view.cursor() + 1).min(hits),
+                hits,
+                self.commits.len()
+            ),
+            None => format!("{}/{}", (self.view.cursor() + 1).min(hits), hits),
+        };
+        let mut out = format!("{position} · {} lanes", self.lanes);
         if self.lanes > MAX_LANES {
             out.push_str(&format!(" · {MAX_LANES} drawn"));
         }
@@ -1429,6 +1456,20 @@ r\x1fr\x1f\x1fA\x1f1\x1froot\x1e";
     }
 
     #[test]
+    fn a_standing_filter_spells_what_it_stands_on() {
+        // The prompt's live count dies with the prompt; the status line
+        // carries the same numbers after — `1/2 of 4`, and never a bare pair
+        // that reads as a repository with one commit in it.
+        let (mut c, _) = view(LOG, 60, 10);
+        assert_eq!(c.status(), "1/4 · 2 lanes");
+        c.apply_query("branch");
+        assert_eq!(c.status(), "1/2 of 4 · 2 lanes");
+        // Clearing restores the bare pair.
+        c.apply_query("   ");
+        assert_eq!(c.status(), "1/4 · 2 lanes");
+    }
+
+    #[test]
     fn an_empty_log_draws_nothing_and_panics_nowhere() {
         let (mut c, host) = view("", 40, 6);
         assert!(c.is_empty());
@@ -1579,6 +1620,48 @@ cafe3333\x1fcafe333\x1f4444dddd\x1fÉmile Zola\x1f3\x1fa compiler pass\x1e\
             "clearing moved the cursor off its commit"
         );
         assert_eq!(c.copy_text(), "00000004 engine note 4");
+    }
+
+    #[test]
+    fn a_streamed_replace_rebuilds_the_visible_table_it_grew() {
+        // The launch hands the pane its first batch and the tail streams the
+        // rest through `replace`. The old `replace` sized the viewport off
+        // `commits` and left the visible table (and the search index) built
+        // against the first batch: the header counted the whole list, the pane
+        // drew one row, and a copy with the cursor below the batch sliced the
+        // table past its end — "range start index 404 out of range for slice
+        // of length 1".
+        let (mut c, host) = view(&mixed(1), 60, 10);
+        c.replace(parse_log(&mixed(30)));
+        assert_eq!(c.len(), 30);
+        assert_eq!(c.view.len(), 30, "the viewport outgrew the table");
+
+        // Every streamed row paints, not just the first batch's.
+        let rows = painted(&c, &host);
+        assert!(rows[0].contains("engine note 0"), "{:?}", rows[0]);
+        assert!(rows[9].contains("compiler pass 9"), "{:?}", rows[9]);
+
+        // The old crash: cursor at the bottom of the grown list, `y` to copy.
+        for _ in 0..29 {
+            c.down();
+        }
+        assert_eq!(
+            c.copy_text(),
+            "00000029 compiler pass 29",
+            "the copy named a row the table could not"
+        );
+
+        // A query typed before the tail arrived keeps filtering what the tail
+        // streamed in — the search index is rebuilt with the list.
+        let (mut c, _host) = view(&mixed(1), 60, 10);
+        c.apply_query("engine");
+        c.replace(parse_log(&mixed(30)));
+        assert_eq!(
+            c.filter_note().as_deref(),
+            Some("15/30"),
+            "the streamed half of the list escaped its own filter"
+        );
+        assert_eq!(c.copy_text(), "00000000 engine note 0");
     }
 
     #[test]

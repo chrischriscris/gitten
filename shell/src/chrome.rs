@@ -231,8 +231,28 @@ pub fn path_spans(
 /// pane where no row ever sits. Shared here because three sidebar panes had
 /// drifted into near-identical copies of the same twelve lines, and one blank
 /// pane must not mean three different things.
+///
+/// The sentence ends with the one verb a blank pane can always advertise: the
+/// key that opens the keymap. Key and word both come from the registries —
+/// `?` is the help command's binding, "keys" its footer hint — so a
+/// rebinding rewrites the sentence and an unbound help draws no suffix. A
+/// keyboard-first app spends its idle panes naming the nearest live key, and
+/// a blank pane's nearest key is the one that shows the rest.
+/// The sentence's tail: ` · ? keys` — the help command's live binding and
+/// its own hint word, both from the registries, so a rebinding rewrites the
+/// sentence and an unbound help leaves the sentence alone.
+fn empty_suffix(host: &Host, text: &str) -> SharedString {
+    host.keys
+        .keys_for("help")
+        .first()
+        .zip(host.commands.hint("help"))
+        .map(|(key, hint)| SharedString::from(format!("{text} · {key} {hint}")))
+        .unwrap_or_else(|| SharedString::from(text.to_string()))
+}
+
 pub fn empty_line(host: &Host, text: SharedString) -> AnyElement {
     let c = host.theme.chrome;
+    let text = empty_suffix(host, &text);
     div()
         .size_full()
         .pl(px(ROW_PAD))
@@ -460,6 +480,10 @@ pub fn status_bar(
 /// focused pane's mode before globals. Stops when `max_px` is spent and reports
 /// whether anything was omitted. A prompt holding the keyboard has no hints
 /// here because its field draws its own exits.
+/// One mode's hinted rows: the mode's name, then each command's name — what
+/// picks the pinned pairs out — beside the `(key, label)` pair it draws.
+type ModeHints = Vec<(String, Vec<(String, SharedString, SharedString)>)>;
+
 pub fn hints(
     host: &Host,
     modes: &Modes,
@@ -468,10 +492,13 @@ pub fn hints(
 ) -> (Vec<(SharedString, SharedString)>, bool) {
     let rows = host.keys.help(&host.commands, modes);
     let ch = host.font.char_width() * STATUS_TEXT_SCALE;
+
     // One pass collects each mode's hinted rows in registry order, so the
     // bar's left-to-right order is the registry's — the order `[keys]` and
-    // the help panel already agree on.
-    let mut per_mode: Vec<(String, Vec<(SharedString, SharedString)>)> = Vec::new();
+    // the help panel already agree on. The command's name rides along: two
+    // names are held back to the bar's end, and the name is what picks them
+    // out — a label is display, a name is identity.
+    let mut per_mode: ModeHints = Vec::new();
     for row in rows {
         match row {
             HelpRow::Mode(name) => per_mode.push((name, Vec::new())),
@@ -480,6 +507,7 @@ pub fn hints(
                     continue;
                 };
                 let entry = (
+                    name,
                     SharedString::from(keys),
                     SharedString::from(hint.to_string()),
                 );
@@ -493,23 +521,56 @@ pub fn hints(
     // The focused pane's mode first, then the globals a repository answers
     // from anywhere — push and pull ride with every pane.
     let order = [active, "global"];
-    let mut out = Vec::new();
-    let mut spent = 0.0;
+    // The two keys that answer from anywhere — `q quit`, `? keys` — draw
+    // last and are never given up: a bar that runs out of room spends the
+    // middle's budget before theirs, so the ways out survive every squeeze.
+    // The first of each name wins, which is the walk's own precedence — a
+    // focused mode's key for a command outranks the global one. Drawn even
+    // into a budget nothing else fit into: two pairs a keyboard-first app
+    // does not trade away.
+    let mut middle: Vec<(SharedString, SharedString)> = Vec::new();
+    let mut pinned: Vec<(SharedString, SharedString)> = Vec::new();
+    let mut pinned_quit = false;
+    let mut pinned_help = false;
     for mode in order {
         let Some((_, list)) = per_mode.iter().find(|(m, _)| m == mode) else {
             continue;
         };
-        for (key, label) in list {
-            // Compact text plus the same two gaps the bar renders.
-            let w =
-                (key.chars().count() + label.chars().count()) as f32 * ch + hint_air(&host.font);
-            if spent + w > max_px {
-                return (out, true);
+        for (name, key, label) in list {
+            match (name.as_str(), pinned_quit, pinned_help) {
+                ("quit", false, _) => {
+                    pinned_quit = true;
+                    pinned.push((key.clone(), label.clone()));
+                }
+                ("help", _, false) => {
+                    pinned_help = true;
+                    pinned.push((key.clone(), label.clone()));
+                }
+                _ => middle.push((key.clone(), label.clone())),
             }
-            spent += w;
-            out.push((key.clone(), label.clone()));
         }
     }
+    // Their width, set aside before the middle spends a pixel: the room the
+    // pinned pairs were reserved, whether or not the middle reaches them.
+    let reserved: f32 = pinned
+        .iter()
+        .map(|(key, label)| {
+            (key.chars().count() + label.chars().count()) as f32 * ch + hint_air(&host.font)
+        })
+        .sum();
+    let mut out = Vec::new();
+    let mut spent = 0.0;
+    for (key, label) in middle {
+        // Compact text plus the same two gaps the bar renders.
+        let w = (key.chars().count() + label.chars().count()) as f32 * ch + hint_air(&host.font);
+        if spent + w > max_px - reserved {
+            out.extend(pinned);
+            return (out, true);
+        }
+        spent += w;
+        out.push((key, label));
+    }
+    out.extend(pinned);
     (out, false)
 }
 
@@ -538,10 +599,10 @@ pub fn hints_budget(host: &Host, bar_px: f32, badge: &str) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{gap_l, gap_m, gap_s, gap_xl, gap_xxl, hint_air, hints};
+    use super::{empty_suffix, gap_l, gap_m, gap_s, gap_xl, gap_xxl, hints};
     use gitten_core::command::{Commands, Keymap, Modes};
     use gitten_core::font::Font;
-    use gpui::px;
+    use gpui::{px, SharedString};
 
     #[test]
     fn hints_come_from_the_registry_and_prefer_the_active_mode() {
@@ -560,36 +621,60 @@ mod tests {
     }
 
     #[test]
-    fn a_tiny_budget_returns_only_what_fits() {
+    fn a_one_pixel_bar_still_says_how_to_leave() {
         let host = gitten_core::host::Host::new();
         let mut modes = Modes::new();
         modes.push("files");
         let (out, truncated) = hints(&host, &modes, "files", 1.0);
-        assert!(out.len() <= 1, "a one-pixel bar held {} hints", out.len());
-        assert!(truncated, "a bar that stopped at one pixel said nothing");
+        // The middle gave everything up; the two keys that answer from
+        // anywhere did not. A bar with no room still names `q quit` and
+        // `? keys` — the last two pairs a keyboard-first app gives up.
+        assert_eq!(out.len(), 2, "a one-pixel bar held {out:?}");
+        assert!(out.iter().any(|(_, l)| l.as_ref() == "quit"));
+        assert!(out.iter().any(|(_, l)| l.as_ref() == "keys"));
+        assert!(truncated, "a bar that dropped every middle hint said so");
     }
 
     #[test]
-    fn a_bar_that_stopped_with_hints_left_says_so() {
-        // Exactly wide enough for the first pair: the second does not fit,
-        // the walk stops, and the flag has to say the bar was cut — this is
-        // the difference between "these are your keys" and "these are all
-        // your keys", and only one of them is true.
+    fn the_ways_out_get_their_room_before_the_middle_does() {
+        // Exactly the room the pinned pairs need plus one middle pair: the
+        // first middle hint fits beside them, the second does not, and the
+        // flag has to say the bar was cut — this is the difference between
+        // "these are your keys" and "these are all your keys", and only one
+        // of them is true.
         let host = gitten_core::host::Host::new();
         let mut modes = Modes::new();
         modes.push("files");
         let (all, _) = hints(&host, &modes, "files", 4000.0);
         assert!(
-            all.len() > 1,
-            "the files map had more than one hint to give"
+            all.len() > 3,
+            "the files map had more than a middle pair and the pinned two"
         );
-        let (key, label) = &all[0];
-        let ch = host.font.char_width();
-        let one_pair =
-            (key.chars().count() + label.chars().count()) as f32 * ch * super::STATUS_TEXT_SCALE
-                + hint_air(&host.font);
-        let (some, truncated) = hints(&host, &modes, "files", one_pair);
-        assert_eq!(some.len(), 1, "the budget held exactly one pair");
+        let ch = host.font.char_width() * super::STATUS_TEXT_SCALE;
+        let pair_w = |(k, l): &(SharedString, SharedString)| {
+            (k.chars().count() + l.chars().count()) as f32 * ch + super::hint_air(&host.font)
+        };
+        let pinned: Vec<_> = all
+            .iter()
+            .filter(|(_, l)| l.as_ref() == "quit" || l.as_ref() == "keys")
+            .collect();
+        assert_eq!(pinned.len(), 2, "quit and help were both pinned: {all:?}");
+        let reserved: f32 = pinned.iter().map(|p| pair_w(p)).sum();
+        let middle = all
+            .iter()
+            .find(|(_, l)| l.as_ref() != "quit" && l.as_ref() != "keys")
+            .expect("a middle hint to pin beside");
+        // Half a pixel of slack: the budget is subtracted from the reserve
+        // in f32 inside the walk, and one ulp of rounding must not decide
+        // whether the pair fits.
+        let (out, truncated) = hints(&host, &modes, "files", reserved + pair_w(middle) + 0.5);
+        assert_eq!(out.len(), 3, "one middle pair and the pinned two: {out:?}");
+        assert_eq!(
+            &out[0], middle,
+            "the middle pair the budget fit drew first: {out:?}"
+        );
+        assert_eq!(&out[1], pinned[0], "the pinned pairs drew last: {out:?}");
+        assert_eq!(&out[2], pinned[1], "the pinned pairs drew last: {out:?}");
         assert!(truncated, "a bar that stopped with hints left said nothing");
     }
 
@@ -620,6 +705,25 @@ mod tests {
                 "{name} is hinted but unbound"
             );
         }
+    }
+
+    #[test]
+    fn an_empty_pane_advertises_the_way_to_the_keys() {
+        let host = gitten_core::host::Host::new();
+        // The suffix is the help command's binding and its own hint word,
+        // both from the registries — a rebinding rewrites the sentence, an
+        // unbound command leaves it alone.
+        let key = host
+            .keys
+            .keys_for("help")
+            .first()
+            .cloned()
+            .expect("help is bound");
+        let hint = host.commands.hint("help").expect("help carries a hint");
+        assert_eq!(
+            &*empty_suffix(&host, "working tree clean"),
+            format!("working tree clean · {key} {hint}")
+        );
     }
 
     #[test]

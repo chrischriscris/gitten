@@ -148,6 +148,28 @@ fn section_basis(rows: usize, focused: bool) -> f32 {
 fn quantized(content_h: f32) -> f32 {
     (content_h / graph::ROW_H).floor() * graph::ROW_H
 }
+
+/// How many of a pane's rows its section's height leaves undrawn. Every drawn
+/// row is one [`graph::ROW_H`] and the content is quantized to whole rows, so
+/// the subtraction against the pane's own row count is exact — the same rows
+/// counted on both sides, headings included.
+fn hidden_rows(rows: usize, height: f32) -> usize {
+    let visible = ((height - chrome::HEADER_H) / graph::ROW_H).floor() as usize;
+    rows.saturating_sub(visible)
+}
+
+/// The count a section header draws: the pane's own number and — when its
+/// height leaves rows off — a `+N` beside it saying how many. A count that
+/// sits beside eight visible rows while the pane holds fifty-six reads as a
+/// claim that everything is on screen; `56 · +48` does not make that claim.
+/// The suffix stays off a filter note: `1/3` already says the pane is
+/// narrowed, and two sentences in one corner is one too many.
+fn with_hidden(count: SharedString, hidden: usize) -> SharedString {
+    match hidden {
+        0 => count,
+        n => SharedString::from(format!("{count} · +{n}")),
+    }
+}
 /// The share a session copy of the sidebar's width is written inside: the
 /// band the config parser promises ([`gitten_core::host::SIDEBAR_MIN`]..
 /// [`gitten_core::host::SIDEBAR_MAX`]) and the drag's rails. The parser
@@ -3290,6 +3312,20 @@ impl DevShell {
             if let Some(top) = self.pending_restore.take() {
                 self.restore_session_top(top, cx);
             }
+            // The wave is a fresh load, and the overlay was built on the
+            // skeleton's: an empty list's "0 commits" and a zero total,
+            // which nothing else ever replaces — `reloaded` rides the
+            // rediff and layout paths, and neither runs here. The last
+            // apply has landed by now, so the refreshed view's own
+            // numbers are the ones the overlay should carry.
+            if let Some(Screen::Commits { view, .. }) = self.panes.get("commits") {
+                let v = view.read(cx);
+                let (load, total) = (v.load.clone(), v.total());
+                if let Some(stats) = &mut self.stats {
+                    stats.reloaded(load);
+                    stats.total_rows.set(total);
+                }
+            }
         }
         // A refresh may have re-anchored the commits cursor — the list it was
         // on changed under it — which is a selection change as far as the
@@ -5256,24 +5292,32 @@ impl Render for DevShell {
                     continue;
                 };
                 let focused = self.spot == Spot::List && focused_name == name;
+                // The height first: the count below it is what the height
+                // leaves visible, and the two must be read in that order.
+                let height = heights[height_at];
+                height_at += 1;
                 let count = match screen {
                     Screen::Files { view, .. } => {
                         let v = view.read(cx);
-                        v.filter_note()
-                            .map(SharedString::from)
-                            .or_else(|| files_header_count(view, cx))
+                        v.filter_note().map(SharedString::from).or_else(|| {
+                            files_header_count(view, cx)
+                                .map(|c| with_hidden(c, hidden_rows(v.rows(), height)))
+                        })
                     }
                     Screen::Branches { view, .. } => {
                         let v = view.read(cx);
                         v.filter_note().map(SharedString::from).or_else(|| {
                             let n = v.count();
-                            (n > 0).then(|| SharedString::from(n.to_string()))
+                            (n > 0).then(|| {
+                                with_hidden(
+                                    SharedString::from(n.to_string()),
+                                    hidden_rows(v.rows(), height),
+                                )
+                            })
                         })
                     }
                     _ => None,
                 };
-                let height = heights[height_at];
-                height_at += 1;
                 sections.push(
                     div()
                         .id(id)
@@ -5313,17 +5357,24 @@ impl Render for DevShell {
                     continue;
                 };
                 let focused = self.spot == Spot::List && focused_name == name;
+                // The height first: the count below it is what the height
+                // leaves visible, and the two must be read in that order.
+                let height = heights[height_at];
                 let count: Option<SharedString> = match screen {
                     Screen::Stashes { view, .. } => {
                         let v = view.read(cx);
                         v.filter_note().map(SharedString::from).or_else(|| {
                             let n = v.rows();
-                            (n > 0).then(|| SharedString::from(n.to_string()))
+                            (n > 0).then(|| {
+                                with_hidden(
+                                    SharedString::from(n.to_string()),
+                                    hidden_rows(n, height),
+                                )
+                            })
                         })
                     }
                     _ => None,
                 };
-                let height = heights[height_at];
                 sections.push(
                     div()
                         .id(id)
@@ -5770,9 +5821,15 @@ impl Render for DevShell {
                             .text_ellipsis_start()
                             .child(title),
                     )
-                    // The branch chip, the design's ` main · ↑2 ↓0` —
-                    // drawn from the head read above the strip, so the
-                    // budget and the pixels come from one read.
+                    // The branch chip: HEAD's mark, then the name the head
+                    // read above the strip spelled. The mark is geometry and
+                    // not a glyph — the design's branch icon was a Nerd Font
+                    // codepoint, and a codepoint the *configured* face does
+                    // not carry draws as the platform's missing-glyph box,
+                    // which Menlo rendered as `[?] ux-polish`. The list's
+                    // own markers went through geometry for the same
+                    // reason; this one is HEAD's dot, in the same accent
+                    // the list gives HEAD's row.
                     .children(head_chip.map(|info| {
                         div()
                             .flex_none()
@@ -5789,6 +5846,14 @@ impl Render for DevShell {
                             .whitespace_nowrap()
                             // Both halves were spelled at prepare; a
                             // frame clones two refcounts.
+                            .children(info.branch.then(|| {
+                                div()
+                                    .flex_none()
+                                    .w(px(6.0))
+                                    .h(px(6.0))
+                                    .rounded(px(3.0))
+                                    .bg(rgb(c.accent))
+                            }))
                             .child(div().flex_none().text_color(rgb(c.fg)).child(info.chip))
                             .children(info.drift.map(|drift| {
                                 // Each arrow in its own ink — ↑ outgoing in the
@@ -6423,7 +6488,12 @@ fn open_main_window(launch: Launch, cx: &mut App) {
                             v.top.clone(),
                             Rc::new(Cell::new(0)),
                             Rc::new(std::cell::RefCell::new(SharedString::default())),
-                            String::new(),
+                            // The view's own load — the empty list measured
+                            // honestly, "0 commits · 0 lanes" — and not a
+                            // bare empty string: the overlay's second row
+                            // renders whatever lands here, and an empty
+                            // string is a row of nothing.
+                            v.load.clone(),
                         )
                     }
                     View::Diff => {
@@ -11892,10 +11962,31 @@ diff --git a/added.txt b/added.txt
 mod title_tests {
     use super::{
         clamped_stack_splits, expand_project_path, fitted_stack_heights, heights_from_splits,
-        quantized, repo_title, same_project_path, section_basis, section_height,
-        splits_from_heights, SECTION_MAX_ROWS, SECTION_MIN_H,
+        hidden_rows, quantized, repo_title, same_project_path, section_basis, section_height,
+        splits_from_heights, with_hidden, SECTION_MAX_ROWS, SECTION_MIN_H,
     };
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn a_capped_section_counts_what_it_leaves_off() {
+        // Eight rows' worth of section under a nine-row pane: one hidden.
+        // The two helpers share one row arithmetic — a drawn row is one
+        // [`graph::ROW_H`] and the section's height is whole rows of it —
+        // so the subtraction is the same rows on both sides.
+        assert_eq!(hidden_rows(9, section_height(8)), 1);
+        // A pane that fits says nothing: no suffix on a count that is whole.
+        assert_eq!(
+            &*with_hidden("7".into(), hidden_rows(7, section_height(8))),
+            "7"
+        );
+        // A capped pane says how much its height left off.
+        assert_eq!(
+            &*with_hidden("56".into(), hidden_rows(56, section_height(8))),
+            "56 · +48"
+        );
+        // An empty pane's floor of one row never owes a suffix.
+        assert_eq!(hidden_rows(0, section_height(0)), 0);
+    }
 
     #[test]
     fn a_repository_under_home_is_spelled_from_tilde_and_cut_at_its_name() {
