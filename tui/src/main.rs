@@ -42,7 +42,7 @@ use gitten_app::cli::{self, Source, View};
 use gitten_app::jobs::{Event as JobEvent, Generation, Job, Runner, Submitter};
 use gitten_app::verbs::Write;
 use gitten_app::{StartClock, Startup};
-use gitten_core::command::{chord_string, Code, Key, Modes, Resolve};
+use gitten_core::command::{chord_string, Availability, Code, Key, Modes, Resolve, Usable};
 use gitten_core::differ::Overrides;
 use gitten_core::host::Host;
 use gitten_core::runs::Run;
@@ -976,6 +976,13 @@ struct App {
     /// The generation the queue has advanced to, and so the one every pane
     /// was last refreshed against.
     generation: Generation,
+    /// What this client runs, beside the shared registry — the one contract
+    /// the help panel and the dispatch refusal both read. Built once from
+    /// the launch: a fixture view has no repository behind it, and that is
+    /// the one thing here that varies between two instances of the same
+    /// binary. A config reload rebuilds the host and never this — what the
+    /// client can run is not the file's to say.
+    availability: Availability,
     help: bool,
     /// First key row visible in the help modal. Independent of every pane's
     /// cursor and viewport, as a modal's reading position must be.
@@ -1202,6 +1209,7 @@ impl App {
         let mut app = Self {
             host,
             repo,
+            availability: tui_availability(startup_pending),
             panes,
             layout: Box::new(panes::BuiltinLayout),
             geometry: None,
@@ -2435,6 +2443,25 @@ impl App {
     /// A wheel supplies its hit-tested pane, while app-wide commands keep their
     /// ordinary meaning regardless of where their binding originated.
     fn dispatch_to(&mut self, command: &str, target: Option<&str>) {
+        // The client's word, before any routing: a name this binary has no
+        // handler for is refused here — said, and never routed to a pane to
+        // be told so again — and a name the launch turned away says the
+        // reason. The same [`Availability`] the help panel read when it
+        // drew the row, so what `?` shows and what a press does cannot
+        // disagree. Extension commands a client does not answer are
+        // unsupported by exactly this word too, which is what keeps the
+        // panel from advertising them.
+        match self.availability.state(command) {
+            Usable::Available => {}
+            Usable::Disabled(reason) => {
+                self.message = format!("{command}: {reason}");
+                return;
+            }
+            Usable::Unsupported => {
+                self.message = format!("{command} is not supported by this client");
+                return;
+            }
+        }
         if self.help && self.scroll_help(command) {
             return;
         }
@@ -2485,6 +2512,13 @@ impl App {
             "commits.search" => self.begin_search(),
             "files.commit" => self.begin_commit_message(),
             "files.amend" => self.begin_amend_message(),
+            // lazygit's global R, on the same wave a finished write runs:
+            // every registered repository-backed pane re-acquires, hidden
+            // ones included, and a read that fails leaves the last good
+            // rows standing and says so. Nothing here decides what the
+            // panes re-read — [`Screens::refresh`] does, exactly as for the
+            // queue's own finish.
+            "repo.refresh" => self.manual_refresh(),
             "input.accept" => self.finish_prompt(true),
             "input.cancel" => self.finish_prompt(false),
             // The hunk verbs act on the *repository*, not the pane: they
@@ -2585,7 +2619,7 @@ impl App {
     fn scroll_help(&mut self, command: &str) -> bool {
         let (_, h) = self.screen.size();
         let body = h.saturating_sub(2);
-        let (page, max) = help::scroll_bounds(body, &self.host, &self.modes);
+        let (page, max) = help::scroll_bounds(body, &self.host, &self.availability, &self.modes);
         let by = match command {
             "view.down" => 1,
             "view.up" => -1,
@@ -3018,6 +3052,25 @@ impl App {
         first.map_or(Ok(()), Err)
     }
 
+    /// `repo.refresh`, lazygit's capital R: the re-acquisition wave a
+    /// finished write runs, asked for by hand.
+    ///
+    /// One generation advance, one wave, every registered repository-backed
+    /// pane — the hidden ones included — and the fixtures left alone, which
+    /// is the whole of [`Screens::refresh`]'s own story. A read that fails
+    /// leaves the last good rows standing at their old generation and the
+    /// error on the status line, exactly as for the queue's own finish; a
+    /// clean one is its own evidence and says nothing. Reached only when
+    /// [`tui_availability`] said so — a fixture view is turned away with
+    /// its reason before this runs.
+    fn manual_refresh(&mut self) {
+        let target = self.generation.advance();
+        self.generation = target;
+        if let Err(e) = self.refresh_stale(target) {
+            self.message = e;
+        }
+    }
+
     /// A title row, the panes, a status row.
     ///
     /// Row 0 is the title and row `h - 1` the status or search prompt; the
@@ -3211,12 +3264,98 @@ impl App {
                 1,
                 body,
                 &self.host,
+                &self.availability,
                 &self.modes,
                 self.help_scroll,
                 self.bar,
             );
         }
     }
+}
+
+/// What this client runs, beside the shared registry — the one contract the
+/// help panel and the dispatch refusal both read, so they cannot disagree.
+///
+/// Strict, deliberately: a name with no entry here is refused before it is
+/// routed, and the help panel drops its row — a key that resolves to
+/// nothing is not advertised as if it ran. What is listed is exactly what
+/// [`App::dispatch_to`] answers by name plus what every pane's `run`
+/// answers; the registry's remaining built-ins — sync, history surgery,
+/// the project switcher, the settings panel — are this client's named
+/// gaps, and a compiled-in extension's commands are unsupported by the
+/// same word until a handler exists to answer them.
+///
+/// The launch is the one variable: `repo.refresh` has a handler, but a
+/// fixture view has no repository behind it, so there it is supported-but-
+/// turned-away with the reason instead of advertised as if it ran.
+fn tui_availability(repo: bool) -> Availability {
+    let mut a = Availability::strict();
+    a.available([
+        // Dispatched by name, ahead of any pane.
+        "quit",
+        "help",
+        "back",
+        "theme.cycle",
+        "pane.left",
+        "pane.right",
+        "pane.next",
+        "pane.prev",
+        "files.focus",
+        "branches.focus",
+        "commits.focus",
+        "stashes.focus",
+        "diff.focus",
+        "status.focus",
+        "commits.open-diff",
+        "commits.search",
+        "files.commit",
+        "files.amend",
+        "input.accept",
+        "input.cancel",
+        "diff.stage-hunk",
+        "diff.unstage-hunk",
+        "stashes.apply",
+        "stashes.pop",
+        "stashes.drop",
+        "files.stash",
+        "files.stage",
+        "files.stage-all",
+        "files.discard",
+        "files.ignore",
+        "branches.checkout",
+        "branches.new",
+        "branches.rename",
+        "branches.delete",
+        "branches.new-tag",
+        "copy.selection",
+        "select.all",
+        "select.none",
+        // Answered by every pane's `run`, and by the diff pane alone where
+        // they are particular to it.
+        "view.down",
+        "view.up",
+        "view.page-down",
+        "view.page-up",
+        "view.scroll-down",
+        "view.scroll-up",
+        "view.top",
+        "view.bottom",
+        "view.left",
+        "view.right",
+        "diff.next-file",
+        "diff.prev-file",
+        "diff.cycle-layout",
+        "diff.cycle-wrap",
+    ]);
+    match repo {
+        true => {
+            a.available(["repo.refresh"]);
+        }
+        false => {
+            a.disabled("repo.refresh", "a fixture has no repository to refresh");
+        }
+    }
+    a
 }
 
 fn action_file_section(section: files::Section) -> gitten_app::act::FileSection {
@@ -4286,7 +4425,7 @@ mod tests {
         let mut app = app(30);
         app.screen = Screen::new(140, 40);
         app.dispatch("help");
-        let (_, max) = help::scroll_bounds(38, &app.host, &app.modes);
+        let (_, max) = help::scroll_bounds(38, &app.host, &app.availability, &app.modes);
         assert!(max > 0, "the help fixture unexpectedly fits");
 
         app.press(Key::char('j'));
@@ -6419,9 +6558,13 @@ diff --git a/tracked.txt b/tracked.txt
         assert_eq!(writes, vec!["amend rewritten subject body"]);
 
         // No confirmation mode rides the path, and no extra command exists:
-        // a confirm-looking name is simply nobody's command.
+        // a confirm-looking name is nobody's command, refused by the same
+        // availability contract the help panel reads.
         app.dispatch("files.amend-confirm");
-        assert_eq!(app.message, "files.amend-confirm does nothing here");
+        assert_eq!(
+            app.message,
+            "files.amend-confirm is not supported by this client"
+        );
 
         // The wrong focus is said, the same as commit's.
         app.dispatch("commits.focus");
@@ -9097,13 +9240,14 @@ diff --git a/tracked.txt b/tracked.txt
         assert_eq!(app.copy.as_deref(), Some("origin/feat/ure"));
 
         // The help panel lists the five included verbs straight out of the
-        // shared registry — and the rebase row core binds in this mode,
-        // which this pass deliberately leaves unhandled: the gap is visible
-        // in the one place that exists for it, not hidden. The panel is
-        // capped at thirty rows, so no single viewport holds the whole
-        // registry any more: the top shows the globals out of the live
-        // keymap — the pane-focus digits and, since the desktop's recent
-        // menu, the two project rows — and the bottom the focused mode's
+        // shared registry — and only those. The rebase row core binds in
+        // this mode and the two project rows the desktop owns have no
+        // handler here, so the availability contract takes their rows out
+        // of the panel and says why on a press instead: the gap moved from
+        // "a key that does nothing" to a sentence. The panel is capped at
+        // thirty rows, so no single viewport holds the whole registry any
+        // more: the top shows the globals out of the live keymap — the
+        // pane-focus digits among them — and the bottom the focused mode's
         // own bindings.
         app.screen = Screen::new(120, 50);
         app.press(Key::char('?'));
@@ -9113,13 +9257,25 @@ diff --git a/tracked.txt b/tracked.txt
             .map(|y| app.screen.row_text(y))
             .collect::<Vec<_>>()
             .join("\n");
+        assert!(
+            help.contains("focus the branches pane"),
+            "help is missing the runnable rows: {help:?}"
+        );
         for doc in [
-            "focus the branches pane",
             "switch to another recent repository",
             "open a repository by typing its path",
         ] {
-            assert!(help.contains(doc), "help is missing {doc:?}: {help:?}");
+            assert!(
+                !help.contains(doc),
+                "help advertised an unrunnable command: {doc:?}: {help:?}"
+            );
         }
+        // The press, not the panel, is where the gap is said now.
+        app.dispatch("project.switch");
+        assert_eq!(
+            app.message,
+            "project.switch is not supported by this client"
+        );
         app.press(Key::plain(Code::End));
         app.draw();
         let help = (0..50)
@@ -9134,36 +9290,47 @@ diff --git a/tracked.txt b/tracked.txt
             // truncate; each marker below survives its own truncation.
             "delete the selected branch",
             "name the selected branch's",
-            "move the current branch onto",
         ] {
             assert!(help.contains(doc), "help is missing {doc:?}: {help:?}");
         }
+        // The rebase row is bound in this mode and unhandled here, so its
+        // row is not on the panel any more — the press says why instead.
+        assert!(!help.contains("move the current branch onto"), "{help:?}");
     }
 
     #[test]
     fn rebase_commands_remain_explicitly_deferred() {
         // The scope fence for the named lifecycle follow-up — rebase-onto,
         // conflict state, abort and continue — not the desired final
-        // product: the keys keep saying they do nothing here, and no job is
-        // ever submitted.
+        // product: the availability contract marks them unsupported, the
+        // keys say so, and no job is ever submitted.
         let (handle, state) = fake(&[]);
         branch_world(&state);
         let mut app = commits_app(&handle);
         app.press(Key::plain(Code::Char('3')));
 
         // The key resolves through core's branches mode — lowercase `r` —
-        // and lands on the same unimplemented name.
+        // and lands on the same unsupported name.
         app.press(Key::char('r'));
-        assert_eq!(app.message, "commits.rebase-onto does nothing here");
+        assert_eq!(
+            app.message,
+            "commits.rebase-onto is not supported by this client"
+        );
         app.dispatch("commits.rebase-onto");
-        assert_eq!(app.message, "commits.rebase-onto does nothing here");
+        assert_eq!(
+            app.message,
+            "commits.rebase-onto is not supported by this client"
+        );
 
         // From the commits pane, the two exits say the same thing.
         app.press(Key::plain(Code::Char('4')));
         app.dispatch("rebase.abort");
-        assert_eq!(app.message, "rebase.abort does nothing here");
+        assert_eq!(app.message, "rebase.abort is not supported by this client");
         app.dispatch("rebase.continue");
-        assert_eq!(app.message, "rebase.continue does nothing here");
+        assert_eq!(
+            app.message,
+            "rebase.continue is not supported by this client"
+        );
 
         app.drain_jobs();
         let s = state.lock().unwrap();
@@ -9426,5 +9593,372 @@ diff --git a/tracked.txt b/tracked.txt
                 "the {name} pane is on a fixture launch"
             );
         }
+    }
+
+    // ------------------------------------------------- tui_parity_: W0
+
+    /// Which registered pane a command's own family names, for routing a
+    /// dispatch the way its binding would have reached it. Only a display
+    /// concern: whether the command runs is [`tui_availability`]'s word, and
+    /// this table never second-guesses it.
+    fn home_pane(command: &str) -> Option<&'static str> {
+        ["files", "branches", "stashes", "diff", "commits"]
+            .iter()
+            .find(|pane| command.starts_with(&format!("{pane}.")))
+            .copied()
+    }
+
+    #[test]
+    fn tui_parity_refresh_rereads_externally_changed_fake_state() {
+        // R is the queue's own finish wave, asked for by hand: state nobody
+        // here changed — another process's edit, a fetch, a stash from a
+        // second terminal — must still arrive, in every pane, the focused
+        // one and the hidden ones alike.
+        let (_handle, state) = fake(&[]);
+        // The launch's list is the same one the fake's log answers, so the
+        // re-read replaces like with like and the selection's identity is
+        // what the assertion can pin — the same shape the staging tests
+        // build on.
+        let started = gitten_app::Started {
+            view: View::Commits,
+            source: Source::Repo {
+                path: std::path::PathBuf::from("/fake"),
+                arg: String::new(),
+            },
+            host: Host::new(),
+            loaded: acquire::Loaded {
+                label: "fake".into(),
+                data: Data::Commits(three_commits()),
+            },
+            config: std::path::PathBuf::from("/nonexistent/gitten.toml"),
+            repo: Some(Arc::new(FakeRepo(Arc::clone(&state)))),
+        };
+        let mut app = App::new(started, Glyphs::default());
+        app.load_startup(&mut StartClock::new());
+        app.screen = Screen::new(120, 24);
+        app.dispatch("commits.open-diff");
+        app.dispatch("commits.focus");
+
+        let (open_log, open_status, open_stash, open_pairs) = {
+            let s = state.lock().unwrap();
+            (s.log_reads, s.status_reads, s.stash_reads, s.pairs_reads)
+        };
+        // The world changes behind the back: a file staged, a stash
+        // parked, a line edited under the diff it is previewing.
+        {
+            let mut s = state.lock().unwrap();
+            s.status = Status {
+                unstaged: vec![UnstagedEntry {
+                    path: PathBytes::from("work.rs"),
+                    change: Change::Modified,
+                    kind: Kind::File,
+                    submodule: Submodule::default(),
+                }],
+                ..Default::default()
+            };
+            let parked = s.stashes[0].clone();
+            s.stashes.push(parked);
+            s.before = vec![pair("f.txt", side(0), side(5))];
+        }
+
+        let sha_before = app.current_commit_sha();
+        let gen_before = app.generation;
+        app.dispatch("repo.refresh");
+
+        // Every read ran again, exactly once — commits, files, stashes,
+        // branches, and the diff preview too.
+        let s = state.lock().unwrap();
+        assert_eq!(s.log_reads, open_log + 1, "the commit list did not re-read");
+        assert_eq!(
+            s.status_reads,
+            open_status + 1,
+            "the files pane did not re-read"
+        );
+        assert_eq!(s.stash_reads, open_stash + 1, "the stack did not re-read");
+        assert_eq!(s.pairs_reads, open_pairs + 1, "the preview did not re-read");
+        drop(s);
+
+        // What changed behind the back is what the screen shows now: the
+        // working tree gained a row, the stack gained a stash.
+        assert_ne!(
+            files_of(&app).status(),
+            "clean",
+            "the staged edit did not arrive"
+        );
+        let stashes = match app.panes.get("stashes") {
+            Some(Screens::Stashes { view, .. }) => view.status(),
+            _ => panic!("the stack is registered"),
+        };
+        assert!(
+            stashes.contains("3"),
+            "the parked stash did not arrive: {stashes}"
+        );
+        // The selection rode through the re-read: same commit, same row.
+        assert_eq!(app.current_commit_sha(), sha_before);
+        assert!(
+            app.generation > gen_before,
+            "the manual wave did not advance"
+        );
+        // A clean refresh is its own evidence: the refreshed screen, and no
+        // word claiming otherwise.
+        assert!(app.message.is_empty(), "{}", app.message);
+    }
+
+    #[test]
+    fn tui_parity_refresh_failure_keeps_the_last_good_rows_and_says_so() {
+        let (handle, state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        app.dispatch("commits.open-diff");
+        app.dispatch("commits.focus");
+
+        let files_before = files_of(&app).status();
+        let files_gen = app
+            .panes
+            .get("files")
+            .map(|p| p.generation())
+            .expect("the files pane is registered");
+        let gen_before = app.generation;
+        let (open_log, open_status) = {
+            let s = state.lock().unwrap();
+            (s.log_reads, s.status_reads)
+        };
+
+        // The status read breaks on the next wave — the error the wave
+        // exists to surface.
+        state.lock().unwrap().fail_status = Some("fatal: bad status".into());
+        app.dispatch("repo.refresh");
+
+        assert_eq!(
+            app.message, "fatal: bad status",
+            "the error was not surfaced"
+        );
+        // The last good rows stand, at their own generation: no fabricated
+        // emptiness, no false advance, and a later wave retries.
+        assert_eq!(
+            files_of(&app).status(),
+            files_before,
+            "the rows were replaced"
+        );
+        assert_eq!(
+            app.panes.get("files").map(|p| p.generation()),
+            Some(files_gen),
+            "a failed refresh advanced the tenant"
+        );
+        assert!(app.generation > gen_before, "the wave did not advance");
+        // And every pane was still *tried* — the failure did not stop the
+        // wave: commits re-read ahead of files, and branches after it.
+        let s = state.lock().unwrap();
+        assert_eq!(s.log_reads, open_log + 1);
+        assert_eq!(s.status_reads, open_status + 1);
+    }
+
+    #[test]
+    fn tui_parity_no_advertised_command_is_a_hidden_no_op() {
+        // The whole point of the contract, checked in both directions, on
+        // both shapes of launch: what the client says it runs, dispatch can
+        // route without the contract refusing; what it refuses, the help
+        // panel never advertised.
+        for (shape, build) in [("repository-backed", 0usize), ("fixture", 1)] {
+            let mut app = match build {
+                0 => commits_app(&fake(&[]).0),
+                _ => app_on_diff(Source::Fixtures, None),
+            };
+            app.screen = Screen::new(120, 40);
+            for command in gitten_core::command::Commands::builtin().all() {
+                let name = &command.name;
+                if let Some(pane) = home_pane(name) {
+                    if app.panes.get(pane).is_some() {
+                        app.dispatch(&format!("{pane}.focus"));
+                    }
+                }
+                app.help = false;
+                app.message.clear();
+                app.dispatch(name);
+                let refused = app.message.contains("is not supported by this client");
+                match app.availability.state(name) {
+                    Usable::Available => assert!(
+                        !refused,
+                        "{shape}: {name} is advertised and the contract refused it: {}",
+                        app.message
+                    ),
+                    Usable::Disabled(reason) => assert!(
+                        app.message.contains(reason.as_str()),
+                        "{shape}: {name} is disabled without its reason: {}",
+                        app.message
+                    ),
+                    Usable::Unsupported => assert!(
+                        refused,
+                        "{shape}: {name} is unsupported and dispatch ran it: {}",
+                        app.message
+                    ),
+                }
+                // Reset what a single dispatch may have left standing; the
+                // next command opens onto a clean app.
+                app.quit = false;
+                app.prompt = None;
+            }
+
+            // The panel agrees with the press, in every mode the shipped
+            // keymap binds: no row names an unsupported command, and the
+            // disabled one says its reason where its description was.
+            for mode in [
+                "global", "files", "branches", "commits", "stashes", "diff", "help", "input",
+                "settings", "reset", "panes",
+            ] {
+                let mut modes = Modes::new();
+                if mode != "global" {
+                    modes.push(mode);
+                }
+                for row in
+                    app.host
+                        .keys
+                        .help_supported(&app.host.commands, &modes, &app.availability)
+                {
+                    if let gitten_core::command::HelpRow::Command { name, doc, .. } = row {
+                        match app.availability.state(&name) {
+                            Usable::Available => {}
+                            Usable::Disabled(reason) => {
+                                assert_eq!(doc.as_str(), reason.as_str(), "{mode}: {name}");
+                            }
+                            Usable::Unsupported => {
+                                panic!("{mode}: the panel advertised {name}")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tui_parity_a_disabled_command_says_why_in_help_and_on_press() {
+        // The launch is the one thing that turns a supported command away:
+        // a fixture view has no repository behind it, and `repo.refresh` —
+        // handler and all — is said so, on the panel and on the press,
+        // rather than advertised as if it ran.
+        let mut app = app_on_diff(Source::Fixtures, None);
+        app.screen = Screen::new(120, 40);
+        let (commits_gen, diff_gen) = (
+            app.panes.get("commits").map(|p| p.generation()),
+            app.panes.get("diff").map(|p| p.generation()),
+        );
+
+        app.dispatch("repo.refresh");
+        assert_eq!(
+            app.message,
+            "repo.refresh: a fixture has no repository to refresh"
+        );
+        // And nothing ran: the wave's generations did not move.
+        assert_eq!(
+            app.panes.get("commits").map(|p| p.generation()),
+            commits_gen
+        );
+        assert_eq!(app.panes.get("diff").map(|p| p.generation()), diff_gen);
+
+        // The panel keeps the key and swaps the description for the reason.
+        let rows =
+            app.host
+                .keys
+                .help_supported(&app.host.commands, &Modes::new(), &app.availability);
+        let row = rows
+            .iter()
+            .find(|r| matches!(r, gitten_core::command::HelpRow::Command { name, .. } if name == "repo.refresh"))
+            .expect("the disabled row keeps its place on the panel");
+        match row {
+            gitten_core::command::HelpRow::Command { keys, doc, .. } => {
+                assert_eq!(keys, "R");
+                assert_eq!(doc, "a fixture has no repository to refresh");
+            }
+            _ => unreachable!("found a non-command row"),
+        }
+    }
+
+    #[test]
+    fn tui_parity_fixtures_reject_repository_operations() {
+        // A fixture launch has no repository behind any of it: every
+        // repository verb is refused with its reason, said before anything
+        // is queued — and the well-known guard messages are the assertion,
+        // not a success-shaped shrug.
+        let mut app = app_on_diff(Source::Fixtures, None);
+        app.screen = Screen::new(120, 40);
+        for (command, refusal) in [
+            ("files.stage", "files.stage is not supported here"),
+            ("files.stage-all", "files.stage-all is not supported here"),
+            ("files.discard", "files.discard is not supported here"),
+            ("files.ignore", "files.ignore is not supported here"),
+            ("files.commit", "files.commit is not supported here"),
+            (
+                "branches.checkout",
+                "branches.checkout is not supported here",
+            ),
+            ("branches.new", "branches.new is not supported here"),
+            ("stashes.apply", "stashes.apply is not supported here"),
+            ("files.stash", "a fixture has no working tree to park"),
+            ("diff.stage-hunk", "a fixture has no repository behind it"),
+            ("diff.unstage-hunk", "a fixture has no repository behind it"),
+        ] {
+            app.dispatch(command);
+            assert_eq!(app.message, refusal, "{command} was not refused");
+        }
+    }
+
+    #[test]
+    fn tui_parity_remapped_keys_help_and_dispatch_agree() {
+        // A config file's move: `files.stage` leaves space for an unclaimed
+        // key in the same mode. The panel must show the new spelling and
+        // not the old one, the new key must run the command, and the old
+        // one must be unbound rather than silently still armed.
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().status = Status {
+            unstaged: vec![UnstagedEntry {
+                path: PathBytes::from("work.rs"),
+                change: Change::Modified,
+                kind: Kind::File,
+                submodule: Submodule::default(),
+            }],
+            ..Default::default()
+        };
+        let mut app = commits_app(&handle);
+        assert!(
+            app.host.keys.unbind("files", "space"),
+            "space was not moved"
+        );
+        app.host.keys.bind("files", ".", "files.stage").unwrap();
+
+        let mut modes = Modes::new();
+        modes.push("files");
+        let rows = app
+            .host
+            .keys
+            .help_supported(&app.host.commands, &modes, &app.availability);
+        assert!(
+            rows.iter().any(
+                |r| matches!(r, gitten_core::command::HelpRow::Command { keys, doc, .. }
+                if keys == "." && doc == "stage or unstage the selected file")
+            ),
+            "{rows:?}"
+        );
+        assert!(rows.iter().all(
+            |r| !matches!(r, gitten_core::command::HelpRow::Command { keys, .. } if keys.contains("space"))
+        ));
+
+        // The new key runs it: one stage write, from the pane's own row.
+        app.dispatch("files.focus");
+        app.press(Key::char('.'));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.drain_jobs();
+                !state.lock().unwrap().paths_written.is_empty()
+            }),
+            "the remapped key never reached the repository"
+        );
+        assert_eq!(
+            state.lock().unwrap().paths_written,
+            vec![b"work.rs".to_vec()]
+        );
+
+        // The old spelling is gone, not armed: unbound, and said.
+        app.press(Key::char(' '));
+        assert_eq!(app.message, "space is not bound — ? for the keys");
     }
 }

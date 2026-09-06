@@ -14,7 +14,7 @@ use crate::{
     screen::{Ink, Screen},
     scrollbar::{self, Bar},
 };
-use gitten_core::command::{Commands, HelpRow, Keymap, Modes};
+use gitten_core::command::{Availability, Commands, HelpRow, Keymap, Modes};
 use gitten_core::theme::Theme;
 use gitten_core::view::Viewport;
 
@@ -42,9 +42,10 @@ fn panel_height(row_count: usize, available: usize) -> usize {
 pub fn scroll_bounds(
     height: usize,
     host: &gitten_core::host::Host,
+    availability: &Availability,
     modes: &Modes,
 ) -> (usize, usize) {
-    let len = rows(&host.keys, &host.commands, modes).len();
+    let len = rows(&host.keys, &host.commands, modes, availability).len();
     let visible = panel_height(len, height).saturating_sub(2);
     (visible, len.saturating_sub(visible))
 }
@@ -52,8 +53,18 @@ pub fn scroll_bounds(
 /// The rows, straight out of [`Keymap::help`] — `core`'s projection of what the
 /// active modes resolve to, which is the part two clients must not say
 /// differently. What is left here is only how wide to draw it and in which ink.
-fn rows(keys: &Keymap, commands: &Commands, modes: &Modes) -> Vec<Row> {
-    keys.help(commands, modes)
+fn rows(
+    keys: &Keymap,
+    commands: &Commands,
+    modes: &Modes,
+    availability: &Availability,
+) -> Vec<Row> {
+    // The supported projection, not the raw one: a command this client has
+    // no handler for takes its row out here, and one it cannot run right now
+    // says why where the description was — the same word the status line
+    // says when the key is pressed, because both read the client's one
+    // [`Availability`] and cannot disagree.
+    keys.help_supported(commands, modes, availability)
         .into_iter()
         .map(|row| match row {
             HelpRow::Mode(name) => Row::Mode(name),
@@ -65,17 +76,19 @@ fn rows(keys: &Keymap, commands: &Commands, modes: &Modes) -> Vec<Row> {
 
 /// Draws the panel, centred in the rows `top..top + height`.
 ///
+#[allow(clippy::too_many_arguments)] // a view helper, per 0025's precedent
 pub fn paint(
     screen: &mut Screen,
     top: usize,
     height: usize,
     host: &gitten_core::host::Host,
+    availability: &Availability,
     modes: &Modes,
     offset: usize,
     bar: Bar,
 ) {
     let theme: &Theme = &host.theme;
-    let rows = rows(&host.keys, &host.commands, modes);
+    let rows = rows(&host.keys, &host.commands, modes, availability);
     let key_w = rows
         .iter()
         .filter_map(|r| match r {
@@ -182,9 +195,27 @@ mod tests {
     }
 
     fn shown_at(host: &Host, modes: &Modes, offset: usize) -> Vec<String> {
+        shown_with(host, &Availability::lenient(), modes, offset)
+    }
+
+    fn shown_with(
+        host: &Host,
+        availability: &Availability,
+        modes: &Modes,
+        offset: usize,
+    ) -> Vec<String> {
         let mut screen = Screen::new(90, 40);
         screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
-        paint(&mut screen, 0, 40, host, modes, offset, Bar::block());
+        paint(
+            &mut screen,
+            0,
+            40,
+            host,
+            availability,
+            modes,
+            offset,
+            Bar::block(),
+        );
         (0..40).map(|y| screen.row_text(y)).collect()
     }
 
@@ -269,7 +300,16 @@ mod tests {
         host.view.scrollbar = false;
         let mut screen = Screen::new(140, 50);
         screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
-        paint(&mut screen, 0, 50, &host, &Modes::new(), 0, Bar::block());
+        paint(
+            &mut screen,
+            0,
+            50,
+            &host,
+            &Availability::lenient(),
+            &Modes::new(),
+            0,
+            Bar::block(),
+        );
         let rows: Vec<String> = (0..50).map(|y| screen.row_text(y)).collect();
         let first = rows
             .iter()
@@ -301,7 +341,7 @@ mod tests {
         let host = Host::new();
         let mut modes = Modes::new();
         modes.push("commits");
-        let (_, max) = scroll_bounds(40, &host, &modes);
+        let (_, max) = scroll_bounds(40, &host, &Availability::lenient(), &modes);
         assert!(max > 0, "the fixture unexpectedly fits in one page");
 
         let first = shown_at(&host, &modes, 0).join("\n");
@@ -312,12 +352,59 @@ mod tests {
     }
 
     #[test]
+    fn a_command_the_client_cannot_run_leaves_the_panel_and_a_disabled_one_says_why() {
+        // The supported projection: an unsupported name takes its row out —
+        // a panel of keys that do nothing is the lie the panel exists to
+        // stop — and a disabled name keeps its keys and swaps the
+        // description for the reason, the same word the dispatch refusal
+        // says.
+        let mut host = Host::new();
+        host.commands
+            .register("blame.toggle", "show blame beside the diff");
+        host.keys.bind("diff", "b", "blame.toggle").unwrap();
+        let mut modes = Modes::new();
+        modes.push("diff");
+
+        assert!(contains(
+            &shown_with(&host, &Availability::lenient(), &modes, usize::MAX),
+            "show blame beside the diff"
+        ));
+
+        let mut availability = Availability::strict();
+        availability.available(["view.down", "view.up"]);
+        let rows = shown_with(&host, &availability, &modes, usize::MAX);
+        assert!(!contains(&rows, "show blame beside the diff"), "{rows:?}");
+
+        availability.disabled("blame.toggle", "needs a blame source beside the diff");
+        let rows = shown_with(&host, &availability, &modes, usize::MAX);
+        assert!(
+            contains(&rows, "needs a blame source beside the diff"),
+            "the disabled row lost its reason: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains('│')
+                && r.contains(" b ")
+                && r.contains("needs a blame source")),
+            "the disabled row lost its key or its reason: {rows:?}"
+        );
+    }
+
+    #[test]
     fn a_terminal_too_small_clips_rather_than_panicking() {
         let host = Host::new();
         for (w, h) in [(1, 1), (10, 3), (20, 8), (200, 2)] {
             let mut screen = Screen::new(w, h);
             screen.clear(Ink::new(0, 0));
-            paint(&mut screen, 0, h, &host, &Modes::new(), 0, Bar::block());
+            paint(
+                &mut screen,
+                0,
+                h,
+                &host,
+                &Availability::lenient(),
+                &Modes::new(),
+                0,
+                Bar::block(),
+            );
         }
     }
 }

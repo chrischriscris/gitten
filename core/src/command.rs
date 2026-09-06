@@ -37,6 +37,7 @@
 //! enough for a help screen, and enough for the config layer to say "no such
 //! command" instead of binding a key to nothing.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 /// Which physical key, ignoring modifiers.
@@ -790,6 +791,34 @@ impl Keymap {
         out
     }
 
+    /// [`help_supported`](Self::help_supported) with no client word taken:
+    /// every advertised name is treated as runnable. What a client that has
+    /// not built an [`Availability`] projects — and what the window's panel
+    /// reads today.
+    pub fn help(&self, commands: &Commands, modes: &Modes) -> Vec<HelpRow> {
+        self.help_rows(commands, modes, None)
+    }
+
+    /// What the help screen shows with `modes` active, filtered through what
+    /// one client can actually run.
+    ///
+    /// The same projection [`help`](Self::help) makes, with one more input:
+    /// the client's [`Availability`]. A name it marks
+    /// [`Usable::Unsupported`] takes its row and its keys out entirely — a
+    /// panel of keys that do nothing is the lie this screen exists to stop —
+    /// and a name it marks [`Usable::Disabled`] stays, but says *why* where
+    /// the description was, because "here is a key" without "and here is
+    /// why it will not run" is the same lie with a footnote. Mode order,
+    /// shadowing and grouping are the unchanged walk both callers share.
+    pub fn help_supported(
+        &self,
+        commands: &Commands,
+        modes: &Modes,
+        availability: &Availability,
+    ) -> Vec<HelpRow> {
+        self.help_rows(commands, modes, Some(availability))
+    }
+
     /// What the help screen shows with `modes` active: which key runs what,
     /// **now**.
     ///
@@ -801,7 +830,12 @@ impl Keymap {
     /// screen: which bindings are live is decided by [`Keymap::resolve`]'s same
     /// innermost-first walk, so a key listed here is a key that would actually
     /// fire.
-    pub fn help(&self, commands: &Commands, modes: &Modes) -> Vec<HelpRow> {
+    fn help_rows(
+        &self,
+        commands: &Commands,
+        modes: &Modes,
+        availability: Option<&Availability>,
+    ) -> Vec<HelpRow> {
         let active = modes.as_slice();
         let mut out = Vec::new();
         for (at, mode) in active.iter().enumerate() {
@@ -832,10 +866,17 @@ impl Keymap {
                 if all.is_empty() {
                     continue;
                 }
-                let doc = commands
-                    .get(&b.command)
-                    .map(|c| c.doc.clone())
-                    .unwrap_or_default();
+                // One consult per command, where its description would have
+                // been read: unsupported takes the row away, disabled keeps
+                // it and swaps the description for the reason.
+                let doc = match availability.map(|a| a.state(&b.command)) {
+                    Some(Usable::Unsupported) => continue,
+                    Some(Usable::Disabled(reason)) => reason.clone(),
+                    _ => commands
+                        .get(&b.command)
+                        .map(|c| c.doc.clone())
+                        .unwrap_or_default(),
+                };
                 rows.push(HelpRow::Command {
                     name: b.command.clone(),
                     keys: all,
@@ -872,6 +913,115 @@ pub enum HelpRow {
     },
     /// Air between two modes.
     Blank,
+}
+
+/// Whether a client can run a command its keymap resolved, and what it says
+/// when it cannot.
+///
+/// [`Commands`] knows a name exists; only the client asked to run it knows
+/// whether anything answers behind the name. A help screen that lists what
+/// cannot run is a lie in the one place that exists to stop you guessing,
+/// and a dispatch that runs nothing while claiming a handler is its twin —
+/// so both read the client's one word per name, [`Availability`], and
+/// cannot disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Usable {
+    /// The client runs it. What a name with no entry in a lenient
+    /// [`Availability`] means, and the only answer either the help
+    /// projection or the dispatch acts on.
+    Available,
+    /// The client has a handler, but the way this instance was opened turns
+    /// it away — a fixture view with no repository behind it, say. The
+    /// reason is what the help row says where the description was, and what
+    /// the status line says when the key is pressed.
+    Disabled(String),
+    /// The client has no handler for the name at all: no help row, and a
+    /// refusal on dispatch. The honest spelling of a key that does nothing.
+    Unsupported,
+}
+
+static AVAILABLE: Usable = Usable::Available;
+static UNSUPPORTED: Usable = Usable::Unsupported;
+
+/// The client-supplied half of the command registry: which of the names a
+/// keymap can resolve, this client actually runs.
+///
+/// `Commands` is shared — one registry, every client, one help projection —
+/// but what a name *does* is per client: a browser tab has no `quit`, and a
+/// terminal that has not grown a rebase yet must not advertise one. So the
+/// registry stays shared and each client says, beside it, what it can do
+/// with the names. [`Keymap::help_supported`] and the client's dispatch
+/// both read this, which is the whole point: one word per name, read twice.
+/// The mode stack and the shadowing rules live on the keymap and are
+/// untouched — this says *which* names run, never *when*.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Availability {
+    states: BTreeMap<String, Usable>,
+    /// What a name with no entry of its own means. `true` for a client that
+    /// has described only its exceptions and promises the rest — the honest
+    /// default while the map is empty; `false` for one that has enumerated
+    /// what it runs and refuses the rest on their behalf.
+    unlisted_runnable: bool,
+}
+
+impl Availability {
+    /// Every name not named here is runnable — the client that has described
+    /// only its exceptions.
+    pub fn lenient() -> Self {
+        Self {
+            unlisted_runnable: true,
+            ..Self::default()
+        }
+    }
+
+    /// Every name not named here is unsupported — the client that has
+    /// enumerated what it runs.
+    pub fn strict() -> Self {
+        Self {
+            unlisted_runnable: false,
+            ..Self::default()
+        }
+    }
+
+    /// Marks names runnable.
+    pub fn available(&mut self, names: impl IntoIterator<Item = impl Into<String>>) -> &mut Self {
+        for name in names {
+            self.states.insert(name.into(), Usable::Available);
+        }
+        self
+    }
+
+    /// Marks names unsupported — the handler-less names a strict client
+    /// refuses on behalf of every key bound to them.
+    pub fn unsupported(&mut self, names: impl IntoIterator<Item = impl Into<String>>) -> &mut Self {
+        for name in names {
+            self.states.insert(name.into(), Usable::Unsupported);
+        }
+        self
+    }
+
+    /// Marks one name runnable-but-turned-away, with the reason the help row
+    /// and the refusal both say.
+    pub fn disabled(&mut self, name: impl Into<String>, reason: impl Into<String>) -> &mut Self {
+        self.states
+            .insert(name.into(), Usable::Disabled(reason.into()));
+        self
+    }
+
+    /// The client's word on one name.
+    pub fn state(&self, name: &str) -> &Usable {
+        self.states
+            .get(name)
+            .unwrap_or(match self.unlisted_runnable {
+                true => &AVAILABLE,
+                false => &UNSUPPORTED,
+            })
+    }
+
+    /// Whether the client runs it — what a dispatch reads before routing.
+    pub fn runnable(&self, name: &str) -> bool {
+        matches!(self.state(name), Usable::Available)
+    }
 }
 
 /// One command a client can be asked to run.
