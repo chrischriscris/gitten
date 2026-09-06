@@ -767,13 +767,24 @@ impl Commits {
     /// drawn. Position is counted over the *visible* rows — what the cursor
     /// addresses — while `filter_note` is what says the list is narrower than
     /// what was loaded.
+    ///
+    /// A standing filter spells both numbers: `1/1 of 141`, because a bare
+    /// `1/1` over a narrowed list reads as a repository with one commit in
+    /// it, and that is the one lie a status line must not tell. The prompt
+    /// carries the live count while it stands; this carries it after — the
+    /// filter outlives the prompt, so its count does too.
     pub fn status(&self) -> String {
-        let mut out = format!(
-            "{}/{} · {} lanes",
-            (self.view.cursor() + 1).min(self.visible.len()),
-            self.visible.len(),
-            self.lanes,
-        );
+        let hits = self.visible.len();
+        let position = match self.query.as_deref() {
+            Some(_) => format!(
+                "{}/{} of {}",
+                (self.view.cursor() + 1).min(hits),
+                hits,
+                self.commits.len()
+            ),
+            None => format!("{}/{}", (self.view.cursor() + 1).min(hits), hits),
+        };
+        let mut out = format!("{position} · {} lanes", self.lanes);
         if self.lanes > MAX_LANES {
             out.push_str(&format!(" · {MAX_LANES} drawn"));
         }
@@ -1426,6 +1437,20 @@ r\x1fr\x1f\x1fA\x1f1\x1froot\x1e";
         let (c, host) = view(&many(50), 60, 10);
         let rows = painted(&c, &host);
         assert!(rows[0].starts_with("c000000 AL "), "{:?}", rows[0]);
+    }
+
+    #[test]
+    fn a_standing_filter_spells_what_it_stands_on() {
+        // The prompt's live count dies with the prompt; the status line
+        // carries the same numbers after — `1/2 of 4`, and never a bare pair
+        // that reads as a repository with one commit in it.
+        let (mut c, _) = view(LOG, 60, 10);
+        assert_eq!(c.status(), "1/4 · 2 lanes");
+        c.apply_query("branch");
+        assert_eq!(c.status(), "1/2 of 4 · 2 lanes");
+        // Clearing restores the bare pair.
+        c.apply_query("   ");
+        assert_eq!(c.status(), "1/4 · 2 lanes");
     }
 
     #[test]
