@@ -16,3 +16,6 @@
 # tuning are not the repository's business:
 #   gitten config > gitten.toml
 /gitten.toml
+
+# The agent harness's session artifacts — task output, never the repository's:
+/.pi/
