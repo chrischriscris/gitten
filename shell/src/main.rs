@@ -3312,6 +3312,20 @@ impl DevShell {
             if let Some(top) = self.pending_restore.take() {
                 self.restore_session_top(top, cx);
             }
+            // The wave is a fresh load, and the overlay was built on the
+            // skeleton's: an empty list's "0 commits" and a zero total,
+            // which nothing else ever replaces — `reloaded` rides the
+            // rediff and layout paths, and neither runs here. The last
+            // apply has landed by now, so the refreshed view's own
+            // numbers are the ones the overlay should carry.
+            if let Some(Screen::Commits { view, .. }) = self.panes.get("commits") {
+                let v = view.read(cx);
+                let (load, total) = (v.load.clone(), v.total());
+                if let Some(stats) = &mut self.stats {
+                    stats.reloaded(load);
+                    stats.total_rows.set(total);
+                }
+            }
         }
         // A refresh may have re-anchored the commits cursor — the list it was
         // on changed under it — which is a selection change as far as the
@@ -6474,7 +6488,12 @@ fn open_main_window(launch: Launch, cx: &mut App) {
                             v.top.clone(),
                             Rc::new(Cell::new(0)),
                             Rc::new(std::cell::RefCell::new(SharedString::default())),
-                            String::new(),
+                            // The view's own load — the empty list measured
+                            // honestly, "0 commits · 0 lanes" — and not a
+                            // bare empty string: the overlay's second row
+                            // renders whatever lands here, and an empty
+                            // string is a row of nothing.
+                            v.load.clone(),
                         )
                     }
                     View::Diff => {
