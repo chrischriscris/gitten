@@ -24,6 +24,11 @@
 # still worth watching; the frame time is not a number to quote. Use
 # `--release` before believing anything, and see docs/measurements.md.
 #
+# Release builds are incremental — a save costs 2.3 s instead of 9.2 s —
+# because the loop you iterate in matters more than the last 1% of codegen.
+# It lives in `[profile.release]` in Cargo.toml, so `bundle` and ./export share
+# the same artifacts instead of dirtying them by dropping the flag.
+#
 # `desktop` and `web` rebuild and relaunch on every save. `tui` does not, and
 # cannot: it owns the terminal's stdin, so it cannot be backgrounded for a
 # watcher to sit in front of. Quit it with `q` and press up-enter — the rebuild

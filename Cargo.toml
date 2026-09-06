@@ -8,6 +8,10 @@ members = ["app", "cli", "core", "git", "shell", "tui", "web"]
 # long rebuild the first time; after that `cargo run` is usable.
 [profile.dev.package."*"]
 opt-level = 3
+# No debug info for dependencies: line tables for six hundred units cost
+# codegen time, link time and gigabytes of target/ for backtraces nobody
+# reads outside our own crates. Workspace members keep debug = 1 below.
+debug = false
 
 # Our own crates too, lightly. The hot loop in a renderer *is* our code —
 # graph.rs paints every frame — so leaving it at opt-level 0 keeps dev builds
@@ -15,9 +19,23 @@ opt-level = 3
 # speed for a small hit to build time and still debuggable.
 [profile.dev]
 opt-level = 1
+# Unpacked dsym on macOS: the link leaves debug info in the object files
+# instead of packing a .dSYM bundle on every save. Same backtraces, less link.
+split-debuginfo = "unpacked"
 # Line tables, not full DWARF: backtraces keep their file:line, six hundred
 # units stop emitting debug info nothing reads outside a debugger.
 debug = 1
+
+# Release is incremental. `[profile.release]` ships without it, and the
+# `./dev --release` loop paid for that on every save. It is on for every
+# release build — `bundle`, `dump` and ./export share the cache — because
+# cargo fingerprints incremental and whole-program builds identically: the
+# flag is not in the freshness hash, so scoping it to the dev loop could not
+# keep a shipped binary out of the incremental cache anyway, only add
+# plumbing to hide that. Measured steady-state on a shell save, warm cache:
+# see docs/measurements.md.
+[profile.release]
+incremental = true
 
 # Cargo's own default is to leave compile-time-only code unoptimized; the
 # blanket above defeated that for every crate in the tree. These run only

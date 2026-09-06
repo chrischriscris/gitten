@@ -1105,6 +1105,57 @@ unattributed in both clients is inside the marked stages (acquisition, the
 window road) and the shell's 26 ms exit gap, which a future pass should
 decompose before anyone optimizes it.
 
+### Build times
+
+Wall clock around `cargo build`. A *save* is a one-line content change to
+`shell/src/graph.rs` on a current tree; the debug-loop rows are the dev loop,
+not runtime numbers — the warning about debug builds is about frame times.
+Incremental for release is on (`[profile.release]` in Cargo.toml) and the
+before/after was measured on the same tree, same protocol.
+
+| what | time |
+|---|---|
+| no-op `cargo build -p gitten-shell` | 0.7 s |
+| save, dev loop (debug) | 4.4 s |
+| save, `--release`, incremental off (the old default) | 9.2 s |
+| save, `--release`, first build after the flag turns on | 11.5 s |
+| save, `--release`, warm incremental cache | **2.3 s** |
+| link only (bin codegen + link, debug) | 0.5 s |
+| gpui alone, cold rebuild | 77 s |
+| `cargo test -p gitten-shell --no-run`, cold | 87 s |
+| cold release build, from an empty target dir | 143.8 s (797 s CPU, ~5.5 cores) |
+
+The cold release build, by unit (37 % of CPU sits in the top 25):
+
+| unit | CPU |
+|---|---|
+| `gpui` (normal dep + Zed's build-dep copy) | 58 s |
+| `objc2-app-kit` | 39 s |
+| `image` | 45 s |
+| `gpui-component` | 25 s |
+| `objc2-foundation` | 19 s |
+| our four crates, combined | ~33 s |
+
+Frontend and codegen split evenly (432 s / 418 s CPU). Everything heavy is the
+GPUI tree — its features (`objc2-app-kit` bindings, `image` codecs) come from
+upstream manifests and cannot be slimmed from our side, and the second `gpui`
+unit is `gpui_apple` reaching it through a build-dependency edge, so cargo
+compiles it for both purposes. The duplicate-version stacks are smaller than
+the lockfile suggests: `resvg@0.45`, `kurbo@0.11` and `rustix@0.38` have no
+reverse deps on macOS and never compile here; what does compile twice
+(`thiserror` 1+2, `syn` 2+3, `objc2` 0.5+0.6) is seconds, not minutes.
+
+Two dead ends, so nobody retries them blind:
+
+- **lld** — `rust-lld` as `ld64.lld` linked the same binary in 9.0 s where
+  Apple's ld takes 0.5 s; Mach-O lld is single-threaded and the newer Apple
+  linker is not.
+- **Scoping incremental to the dev loop by env var** (`dev` setting
+  `CARGO_PROFILE_RELEASE_INCREMENTAL=true`, `bundle` clearing it) measured the
+  same 2.3 s but was reverted: cargo does not put the flag in the freshness
+  hash, so the "scoped" build reuses the incremental cache's codegen anyway —
+  the scoping hid what actually happened rather than changing it.
+
 ## Fixtures
 
 
