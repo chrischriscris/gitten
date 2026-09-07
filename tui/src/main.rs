@@ -3274,6 +3274,19 @@ impl App {
         let Target::Local(name) = target else {
             unreachable!("remotes and detached answer above");
         };
+        // A branch held by another worktree is git's refusal, said first:
+        // checking it out here would move the other tree's HEAD under it.
+        if repo
+            .worktree_branches()
+            .iter()
+            .any(|b| b.as_bytes() == name.as_bytes())
+        {
+            self.message = format!(
+                "{} is checked out in another worktree",
+                name.to_string_lossy()
+            );
+            return;
+        }
         let job = Write::checkout(repo, name.as_bytes().to_vec());
         self.submit(Box::new(job));
     }

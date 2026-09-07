@@ -10,9 +10,10 @@
 //!
 //! State files, all resolved through `rev-parse --git-path` so linked
 //! worktrees answer for themselves: `BISECT_LOG` exists exactly while a
-//! bisection stands; `BISECT_EXPECTED_REV` names the commit under test;
-//! `BISECT_HEAD` names the revision the bisection started from; each line
-//! of `BISECT_ANCESTORS_OK` names a commit already judged good.
+//! bisection stands; `BISECT_EXPECTED_REV` names the commit under test
+//! once the first judgement has checked one out; `BISECT_START` names
+//! what the bisection started from — the branch `reset` returns to; each
+//! line of `BISECT_ANCESTORS_OK` names a commit already judged good.
 
 /// A bisection standing right now, as the state files report it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,7 +23,7 @@ pub struct BisectState {
     /// moved while the question stood, and the verbs say so rather than
     /// marking the wrong commit.
     pub current: String,
-    /// The revision the bisection started from — what `BISECT_HEAD` names.
+    /// The revision the bisection started from — what `BISECT_START` names.
     /// `reset` returns here, which is why the banner names it: the way
     /// back is part of the question.
     pub original: String,
@@ -49,7 +50,7 @@ fn short(sha: &str) -> String {
 pub fn parse_bisect_state(
     log_present: bool,
     expected_rev: Option<&[u8]>,
-    head: Option<&[u8]>,
+    start: Option<&[u8]>,
     ancestors_ok: Option<&[u8]>,
 ) -> Option<BisectState> {
     if !log_present {
@@ -72,7 +73,7 @@ pub fn parse_bisect_state(
         .unwrap_or_default();
     Some(BisectState {
         current: word(expected_rev),
-        original: word(head),
+        original: word(start),
         goods,
     })
 }

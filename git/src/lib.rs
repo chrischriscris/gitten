@@ -445,6 +445,35 @@ pub trait Repo: Send + Sync {
         Vec::new()
     }
 
+    /// Every checkout of this repository, this one included, as porcelain reports it.
+    ///
+    /// The main worktree is always first — git's own ordering — so a caller
+    /// that wants "the others" skips one row rather than comparing paths.
+    fn worktrees(&self) -> Result<Vec<gitten_core::worktrees::Worktree>> {
+        Err(unserved("worktrees"))
+    }
+
+    /// Checks out `base` into a new worktree at `path`: `git worktree add`.
+    ///
+    /// `base` names what the new checkout holds — a branch, a commit, any
+    /// revspec — and `branch` names a *new* branch to create there instead
+    /// of checking the base out detached. An empty base checks out HEAD's
+    /// branch in the new tree, which git refuses when this tree already
+    /// holds it — the refusal arrives in git's own words. Paths and revs
+    /// ride argv as bytes; a path beginning with `-` is refused first.
+    fn worktree_add(&self, _path: &[u8], _base: &[u8], _branch: Option<&[u8]>) -> Result<()> {
+        Err(unserved("adding a worktree"))
+    }
+
+    /// Forgets the worktree at `path`: `git worktree remove`.
+    ///
+    /// A dirty tree or a lock refuses without `force` — git's own words —
+    /// and a prunable entry removes the metadata. `force` is the second
+    /// press's spelling, never the first's.
+    fn worktree_remove(&self, _path: &[u8], _force: bool) -> Result<()> {
+        Err(unserved("removing a worktree"))
+    }
+
     /// Where `HEAD` points — a branch, or a commit it detached onto, or
     /// nothing at all in a repository with no commits yet. Detached is a
     /// state here and never an error; see [`HeadState`].
@@ -1307,6 +1336,49 @@ pub trait Repo: Send + Sync {
         Some(Operation { kind, conflicts })
     }
 
+    /// A bisection standing right now, if any — read from git's own state
+    /// files (`BISECT_LOG` standing means standing), resolved through
+    /// `--git-path` so linked worktrees answer for themselves. `None` is
+    /// no bisection, the same posture as [`operation`](Self::operation).
+    fn bisect_state(&self) -> Option<gitten_core::bisect::BisectState> {
+        None
+    }
+
+    /// Starts a bisection: `git bisect start <bad> <goods...>`. The bad
+    /// revision is where the bug is; the goods are where it is not. git
+    /// refuses a nonsense pair in its own words, and a standing bisection
+    /// refuses before any process runs — one question at a time.
+    fn bisect_start(&self, _bad: &[u8], _goods: &[Vec<u8>]) -> Result<()> {
+        Err(unserved("starting a bisect"))
+    }
+
+    /// Marks the checked-out commit good and checks out the next one to
+    /// judge: `git bisect good`. `rev` names a commit other than HEAD when
+    /// given; empty judges the checkout. Refuses outside a bisection in
+    /// git's own words.
+    fn bisect_good(&self, _rev: &[u8]) -> Result<()> {
+        Err(unserved("marking a bisect good"))
+    }
+
+    /// Marks the checked-out commit bad and checks out the next one:
+    /// `git bisect bad`. Same shape as [`bisect_good`](Self::bisect_good).
+    fn bisect_bad(&self, _rev: &[u8]) -> Result<()> {
+        Err(unserved("marking a bisect bad"))
+    }
+
+    /// Skips the checked-out commit — untestable, not good, not bad:
+    /// `git bisect skip`. Same shape as [`bisect_good`](Self::bisect_good).
+    fn bisect_skip(&self, _rev: &[u8]) -> Result<()> {
+        Err(unserved("skipping a bisect commit"))
+    }
+
+    /// Ends the bisection and returns to where it started:
+    /// `git bisect reset`. Outside a bisection git answers a quiet no-op,
+    /// and so does this.
+    fn bisect_reset(&self) -> Result<()> {
+        Err(unserved("resetting a bisect"))
+    }
+
     /// Names `target` with a tag: annotated (`-a`) carrying `message` when
     /// one is given, lightweight otherwise.
     ///
@@ -1862,6 +1934,115 @@ impl Repo for Binary {
             &run(&self.root, &["worktree", "list", "--porcelain"]).unwrap_or_default(),
             &root,
         )
+    }
+
+    fn worktrees(&self) -> Result<Vec<gitten_core::worktrees::Worktree>> {
+        // One process, `--porcelain`: the stable machine spelling, and the
+        // same single-list read every other pane does. The parse lives in
+        // core beside the model, so a second client never re-derives it.
+        let raw = run(&self.root, &["worktree", "list", "--porcelain"])?;
+        Ok(gitten_core::worktrees::parse_worktrees(&raw))
+    }
+
+    fn worktree_add(&self, path: &[u8], base: &[u8], branch: Option<&[u8]>) -> Result<()> {
+        refuse_dashes(path)?;
+        // `add <path>`: no rev means HEAD's branch in the new tree — which
+        // git refuses when this tree holds it — so an empty base stays
+        // empty and git's own sentence does the explaining.
+        let mut argv: Vec<&[u8]> = vec![b"worktree", b"add"];
+        let mut held: Vec<Vec<u8>> = Vec::new();
+        if let Some(name) = branch {
+            refuse_dashes(name)?;
+            argv.push(b"-b");
+            held.push(name.to_vec());
+            argv.push(&held[0]);
+        }
+        argv.push(path);
+        if !base.is_empty() {
+            refuse_dashes(base)?;
+            argv.push(base);
+        }
+        run_bytes(&self.root, &argv).map(|_| ())
+    }
+
+    fn worktree_remove(&self, path: &[u8], force: bool) -> Result<()> {
+        refuse_dashes(path)?;
+        // `remove` refuses a dirty tree, untracked files, and locks; the
+        // force spelling is the second press's, and only ever that.
+        if force {
+            run_bytes(&self.root, &[b"worktree", b"remove", b"--force", path]).map(|_| ())
+        } else {
+            run_bytes(&self.root, &[b"worktree", b"remove", path]).map(|_| ())
+        }
+    }
+
+    fn bisect_state(&self) -> Option<gitten_core::bisect::BisectState> {
+        // The log's existence is the bisection: git writes BISECT_LOG on
+        // `start` and deletes it on `reset`. The revs degrade to empty
+        // words when a file is missing rather than failing the read.
+        let log = self.git_state_path("BISECT_LOG")?;
+        let present = log.exists();
+        let read = |name: &str| {
+            self.git_state_path(name)
+                .and_then(|at| std::fs::read(at).ok())
+        };
+        let expected = read("BISECT_EXPECTED_REV");
+        let start = read("BISECT_START");
+        let goods = read("BISECT_ANCESTORS_OK");
+        gitten_core::bisect::parse_bisect_state(
+            present,
+            expected.as_deref(),
+            start.as_deref(),
+            goods.as_deref(),
+        )
+    }
+
+    fn bisect_start(&self, bad: &[u8], goods: &[Vec<u8>]) -> Result<()> {
+        if self.bisect_state().is_some() {
+            return Err("a bisect is already in progress — reset it first".into());
+        }
+        refuse_dashes(bad)?;
+        let mut argv: Vec<&[u8]> = vec![b"bisect", b"start", bad];
+        for good in goods {
+            refuse_dashes(good)?;
+            argv.push(good);
+        }
+        run_bytes(&self.root, &argv).map(|_| ())
+    }
+
+    fn bisect_good(&self, rev: &[u8]) -> Result<()> {
+        // Empty judges the checkout — git's own default — so a caller
+        // passes what the keyboard named or nothing at all.
+        if rev.is_empty() {
+            run_bytes(&self.root, &[b"bisect", b"good"]).map(|_| ())
+        } else {
+            refuse_dashes(rev)?;
+            run_bytes(&self.root, &[b"bisect", b"good", rev]).map(|_| ())
+        }
+    }
+
+    fn bisect_bad(&self, rev: &[u8]) -> Result<()> {
+        if rev.is_empty() {
+            run_bytes(&self.root, &[b"bisect", b"bad"]).map(|_| ())
+        } else {
+            refuse_dashes(rev)?;
+            run_bytes(&self.root, &[b"bisect", b"bad", rev]).map(|_| ())
+        }
+    }
+
+    fn bisect_skip(&self, rev: &[u8]) -> Result<()> {
+        if rev.is_empty() {
+            run_bytes(&self.root, &[b"bisect", b"skip"]).map(|_| ())
+        } else {
+            refuse_dashes(rev)?;
+            run_bytes(&self.root, &[b"bisect", b"skip", rev]).map(|_| ())
+        }
+    }
+
+    fn bisect_reset(&self) -> Result<()> {
+        // Outside a bisection this is git's quiet no-op, and ours too —
+        // ending nothing is not an error.
+        run_bytes(&self.root, &[b"bisect", b"reset"]).map(|_| ())
     }
 
     fn remote_branches(&self) -> Result<Vec<RemoteBranch>> {
@@ -7699,6 +7880,219 @@ mod tests {
         );
         assert_eq!(got[0].commit, r.rev_parse("stash@{0}"));
         assert_eq!(got[1].commit, r.rev_parse("stash@{1}"));
+    }
+
+    fn worktree_sibling(name: &str) -> std::path::PathBuf {
+        // A sibling of the scratch root, not inside it: a worktree is a
+        // second checkout, and nesting it would make the parent's own
+        // status and cleanup lie. Owned by the test, not by the Scratch's
+        // Drop — every test below removes its own.
+        let dir = std::env::temp_dir().join(format!("gitten-git-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn seed(r: &Scratch) {
+        r.write("f.txt", b"one\n");
+        r.git(&["add", "."]);
+        r.git(&["commit", "-qm", "base"]);
+    }
+
+    #[test]
+    fn worktrees_list_names_each_checkout_and_what_it_holds() {
+        let r = Scratch::new("wt-list");
+        seed(&r);
+        r.git(&["branch", "feature"]);
+        let wt = worktree_sibling("wt-list-wt");
+        r.git(&["worktree", "add", "-q", wt.to_str().unwrap(), "feature"]);
+
+        let got = r.open().worktrees().unwrap();
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[0].branch.as_deref(), Some(b"main".as_slice()));
+        assert!(!got[0].bare);
+        // Porcelain prints symlink-resolved paths (`/private/var` on
+        // macOS), so the expectation is canonicalized the same way.
+        let wt_canon = std::fs::canonicalize(&wt).unwrap();
+        assert_eq!(got[1].path, wt_canon.as_os_str().as_encoded_bytes());
+        assert_eq!(got[1].branch.as_deref(), Some(b"feature".as_slice()));
+        assert_eq!(got[1].head, r.rev_parse("feature"));
+
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn worktree_add_and_remove_round_trip_through_the_verbs() {
+        let r = Scratch::new("wt-verbs");
+        seed(&r);
+        r.git(&["branch", "feature"]);
+        let g = r.open();
+        let wt = worktree_sibling("wt-verbs-wt");
+        let path = wt.as_os_str().as_encoded_bytes().to_vec();
+
+        g.worktree_add(&path, b"feature", None).unwrap();
+        let got = g.worktrees().unwrap();
+        assert_eq!(got.len(), 2, "{got:?}");
+        let wt_canon = std::fs::canonicalize(&wt).unwrap();
+        assert_eq!(got[1].path, wt_canon.as_os_str().as_encoded_bytes());
+        assert_eq!(got[1].branch.as_deref(), Some(b"feature".as_slice()));
+        assert!(wt.join("f.txt").exists(), "a real checkout landed");
+
+        g.worktree_remove(&path, false).unwrap();
+        assert_eq!(g.worktrees().unwrap().len(), 1);
+        assert!(!wt.exists(), "the directory went with the metadata");
+    }
+
+    #[test]
+    fn worktree_add_at_a_commit_checks_out_detached() {
+        let r = Scratch::new("wt-detached");
+        seed(&r);
+        let sha = r.rev_parse("HEAD");
+        r.git(&["branch", "elsewhere"]);
+        let g = r.open();
+        let wt = worktree_sibling("wt-detached-wt");
+        let path = wt.as_os_str().as_encoded_bytes().to_vec();
+
+        g.worktree_add(&path, sha.as_bytes(), None).unwrap();
+        let got = g.worktrees().unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[1].branch, None, "no branch was named");
+        assert_eq!(got[1].head, sha);
+
+        g.worktree_remove(&path, false).unwrap();
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    #[test]
+    fn worktree_remove_refuses_a_dirty_tree_until_forced() {
+        let r = Scratch::new("wt-dirty");
+        seed(&r);
+        r.git(&["branch", "feature"]);
+        let g = r.open();
+        let wt = worktree_sibling("wt-dirty-wt");
+        let path = wt.as_os_str().as_encoded_bytes().to_vec();
+        g.worktree_add(&path, b"feature", None).unwrap();
+        std::fs::write(wt.join("dirty.txt"), b"uncommitted\n").unwrap();
+
+        let err = g.worktree_remove(&path, false).unwrap_err();
+        assert!(err.contains("force"), "git names the force spelling: {err}");
+        assert!(wt.exists(), "the refusal changed nothing");
+
+        g.worktree_remove(&path, true).unwrap();
+        assert_eq!(g.worktrees().unwrap().len(), 1);
+        assert!(!wt.exists());
+    }
+
+    #[test]
+    fn worktree_add_refuses_a_dash_path_before_any_process() {
+        let r = Scratch::new("wt-dash");
+        seed(&r);
+        let err = r.open().worktree_add(b"-oops", b"main", None).unwrap_err();
+        assert!(err.contains("'-'"), "our refusal, not git's: {err}");
+    }
+
+    #[test]
+    fn bisect_reaches_the_introduced_commit_and_reset_restores() {
+        let r = Scratch::new("bisect-trip");
+        // Eight commits; the file turns bad at the fourth. The test drives
+        // like a human: it reads the file, never the commit list.
+        let mut shas = Vec::new();
+        for i in 0..8 {
+            // Unique bodies — an unchanged file is nothing to commit —
+            // with the verdict in the first word, which is what the
+            // driver below reads, the way a human reads the file.
+            let body = if i < 3 {
+                format!("good {i}\n")
+            } else {
+                format!("bad {i}\n")
+            };
+            r.write("f.txt", body.as_bytes());
+            r.git(&["add", "."]);
+            r.git(&["commit", "-qm", &format!("c{i}")]);
+            shas.push(r.rev_parse("HEAD"));
+        }
+        let g = r.open();
+        assert_eq!(g.bisect_state(), None, "no bisection standing");
+
+        g.bisect_start(shas[7].as_bytes(), &[shas[0].as_bytes().to_vec()])
+            .unwrap();
+        let state = g.bisect_state().expect("the log stands");
+        assert_eq!(
+            state.original, "main",
+            "reset returns to the starting branch"
+        );
+
+        let mut found = false;
+        for _ in 0..12 {
+            let body = std::fs::read(r.0.join("f.txt")).unwrap();
+            if body.starts_with(b"bad") {
+                g.bisect_bad(b"").unwrap();
+            } else {
+                g.bisect_good(b"").unwrap();
+            }
+            // The announcement is git's, replayed by `bisect log`:
+            // `# first 'bad' commit: [<sha>]`. Quoted — an unquoted
+            // grep misses it, as an earlier draft of this test proved.
+            let log = r.git_os_out(&["bisect".into(), "log".into()]);
+            if String::from_utf8_lossy(&log).contains("first 'bad' commit") {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "the bisection converged");
+        let log = r.git_os_out(&["bisect".into(), "log".into()]);
+        let announced = String::from_utf8_lossy(&log)
+            .lines()
+            .filter_map(|line| {
+                let (_, rest) = line.split_once("first 'bad' commit: [")?;
+                rest.split(']').next()
+            })
+            .next_back()
+            .expect("the announcement names the commit")
+            .to_string();
+        assert_eq!(announced, shas[3], "the commit that introduced it");
+
+        g.bisect_reset().unwrap();
+        assert_eq!(g.bisect_state(), None, "the log is gone");
+        assert_eq!(r.rev_parse("HEAD"), shas[7], "back on main");
+        assert_eq!(
+            std::fs::read(r.0.join("f.txt")).unwrap()[..3],
+            b"bad"[..],
+            "the tree came back too"
+        );
+    }
+
+    #[test]
+    fn bisect_marks_outside_a_bisection_are_gits_refusal() {
+        let r = Scratch::new("bisect-idle");
+        seed(&r);
+        let g = r.open();
+        let err = g.bisect_good(b"").unwrap_err();
+        assert!(err.contains("bisect"), "git's own words: {err}");
+        // And reset outside one is the quiet no-op, not an error.
+        g.bisect_reset().unwrap();
+    }
+
+    #[test]
+    fn bisect_start_twice_refuses_before_git_runs() {
+        let r = Scratch::new("bisect-twice");
+        seed(&r);
+        let sha = r.rev_parse("HEAD");
+        let g = r.open();
+        // A one-commit history cannot bisect, so borrow a second commit.
+        r.write("f.txt", b"two\n");
+        r.git(&["commit", "-qam", "second"]);
+        let tip = r.rev_parse("HEAD");
+        g.bisect_start(tip.as_bytes(), &[sha.as_bytes().to_vec()])
+            .unwrap();
+        let err = g
+            .bisect_start(tip.as_bytes(), &[sha.as_bytes().to_vec()])
+            .unwrap_err();
+        assert!(
+            err.contains("already in progress"),
+            "our refusal, not git's: {err}"
+        );
+        g.bisect_reset().unwrap();
+        assert_eq!(g.bisect_state(), None);
     }
 
     #[test]
