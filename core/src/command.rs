@@ -428,6 +428,11 @@ impl Keymap {
         // query and every edit narrows the list in place — the same verb
         // every list pane answers to, on the key lazygit keeps free here.
         bind("files", "/", "files.search");
+        // Enter previews the row's own side — the door the commits list's
+        // enter already opens, one pane over — and tab flips the previewed
+        // side for the same file, the only file-side key left free here.
+        bind("files", "enter", "files.open-diff");
+        bind("files", "tab", "files.toggle-side");
 
         // The stash stack, on lazygit's own three: space applies and keeps,
         // g pops — apply, then drop only when the apply was clean — and d
@@ -441,6 +446,9 @@ impl Keymap {
         // The live filter again, over the stash stack — the messages are
         // what a query matches, the addresses what the rows are for.
         bind("stashes", "/", "stashes.search");
+        // Enter previews the entry's diff — the parked work, seen before
+        // anything is applied to the working tree.
+        bind("stashes", "enter", "stashes.open-diff");
 
         // The branches panel, on lazygit's own letters: space checks out the
         // branch under the keyboard, n names a new one, r rebases the
@@ -457,6 +465,8 @@ impl Keymap {
         // The live filter over the ref list — the pane where sixteen
         // machine-named worktree branches are exactly why a query exists.
         bind("branches", "/", "branches.search");
+        // Enter drills down: the branch's own history, in the main pane.
+        bind("branches", "enter", "branches.open-log");
 
         bind("diff", "s", "diff.cycle-layout");
         bind("diff", "w", "diff.cycle-wrap");
@@ -1230,6 +1240,16 @@ impl Commands {
                 Some("ignore"),
             ),
             ("files.search", "search the working tree", Some("search")),
+            (
+                "files.open-diff",
+                "show the diff pane, loaded with this file's side",
+                Some("diff"),
+            ),
+            (
+                "files.toggle-side",
+                "switch the previewed file between its staged and unstaged side",
+                Some("toggle side"),
+            ),
             ("branches.focus", "focus the branches pane", None),
             (
                 "branches.checkout",
@@ -1253,6 +1273,11 @@ impl Commands {
                 Some("tag"),
             ),
             ("branches.search", "search the branches", Some("search")),
+            (
+                "branches.open-log",
+                "show this branch's history in the main pane",
+                Some("log"),
+            ),
             ("stashes.focus", "focus the stash list", None),
             ("commits.focus", "focus the commit list", None),
             (
@@ -1272,6 +1297,11 @@ impl Commands {
             ),
             ("stashes.drop", "drop this stash, asked twice", Some("drop")),
             ("stashes.search", "search the stash stack", Some("search")),
+            (
+                "stashes.open-diff",
+                "show the diff pane, loaded with this stash's changes",
+                Some("diff"),
+            ),
             (
                 "repo.push",
                 "send the current branch to its remote, setting the upstream if needed",

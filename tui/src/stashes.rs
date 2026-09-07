@@ -168,6 +168,27 @@ impl Stashes {
     /// The row the keyboard is on, as the verbs address it: the stack index,
     /// the `n` of `stash@{n}`. `None` on an empty stack — and on an
     /// unavailable one, which exposes no row to act on at all.
+    /// The entry the keyboard is on, as its two identities: the place on
+    /// the stack the verbs address, and the commit that survives a drop —
+    /// what a preview of this entry is anchored by.
+    pub fn current_entry(&self) -> Option<(usize, String)> {
+        let index = self.current()?;
+        self.rows
+            .iter()
+            .find(|row| row.index == index)
+            .map(|row| (row.index, row.commit.clone()))
+    }
+
+    /// What a stash entry says about itself, by its commit — the display
+    /// half of a preview's label, addressed by the identity that does not
+    /// renumber.
+    pub fn message_of(&self, commit: &str) -> Option<&str> {
+        self.rows
+            .iter()
+            .find(|row| row.commit == commit)
+            .map(|row| row.message.as_str())
+    }
+
     pub fn current(&self) -> Option<usize> {
         if !self.available {
             return None;

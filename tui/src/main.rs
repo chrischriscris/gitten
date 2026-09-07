@@ -45,7 +45,9 @@ use gitten_app::{StartClock, Startup};
 use gitten_core::command::{chord_string, Availability, Code, Key, Modes, Resolve, Usable};
 use gitten_core::differ::Overrides;
 use gitten_core::host::Host;
+use gitten_core::refs::RefName;
 use gitten_core::runs::Run;
+use gitten_core::source::DiffSource;
 use gitten_core::Hunk;
 use gitten_tui::branches::{self, Branches, Marks, Target};
 use gitten_tui::commits::{Commits, Glyphs};
@@ -287,12 +289,22 @@ enum Screens {
     Commits {
         view: Commits,
         source: Source,
+        /// The ref this list is the history *of*, when it is not HEAD's — a
+        /// branch drilldown's own answer. `None` is the ordinary list, which
+        /// a refresh re-reads from HEAD; `Some` re-reads from the ref, so a
+        /// drilldown stays that branch's history instead of quietly becoming
+        /// the checked-out one.
+        log_of: Option<RefName>,
         label: String,
         generation: Generation,
     },
     Diff {
         view: Diff,
-        source: Option<Source>,
+        /// What this diff is between — the source it was acquired from, and
+        /// the one thing a verb consults before it acts. A commit's preview,
+        /// a file's side, a stash's parked work; `None` for the empty pane
+        /// nothing was ever acquired for.
+        origin: Option<DiffSource>,
         label: String,
         generation: Generation,
     },
@@ -480,43 +492,67 @@ impl Screens {
             Screens::Commits {
                 view,
                 source,
+                log_of,
                 label,
                 generation,
-            } => match source {
-                Source::Repo { .. } => {
-                    let loaded = match acquire::reacquire(
-                        View::Commits,
-                        source,
-                        host,
-                        Some(repo),
-                        &Overrides::default(),
-                    ) {
-                        Ok(loaded) => loaded,
-                        Err(e) => return Some(Err(e)),
-                    };
-                    let Data::Commits(commits) = loaded.data else {
-                        return Some(Err("re-acquisition returned the wrong view".into()));
-                    };
-                    view.replace(commits);
-                    *label = loaded.label;
-                    *generation = target;
-                    Some(Ok(()))
-                }
-                Source::Fixtures | Source::Patch { .. } => None,
-            },
+            } => {
+                let loaded = match log_of {
+                    Some(name) => {
+                        // A drilldown re-reads the branch it was opened for,
+                        // not HEAD: the ref it was asked about is the whole
+                        // of what this pane is, and a refresh that answered
+                        // with the checked-out history would be a refresh
+                        // that lied.
+                        let limit = match source {
+                            Source::Repo { arg, .. } => arg.parse().unwrap_or(5000),
+                            _ => 5000,
+                        };
+                        match repo.log_at(name.as_bytes(), limit) {
+                            Ok(commits) => {
+                                view.replace(commits);
+                                *generation = target;
+                                return Some(Ok(()));
+                            }
+                            Err(e) => return Some(Err(e)),
+                        }
+                    }
+                    None => match source {
+                        Source::Repo { .. } => {
+                            match acquire::reacquire(
+                                View::Commits,
+                                source,
+                                host,
+                                Some(repo),
+                                &Overrides::default(),
+                            ) {
+                                Ok(loaded) => loaded,
+                                Err(e) => return Some(Err(e)),
+                            }
+                        }
+                        Source::Fixtures | Source::Patch { .. } => return None,
+                    },
+                };
+                let Data::Commits(commits) = loaded.data else {
+                    return Some(Err("re-acquisition returned the wrong view".into()));
+                };
+                view.replace(commits);
+                *label = loaded.label;
+                *generation = target;
+                Some(Ok(()))
+            }
             Screens::Diff {
                 view,
-                source,
+                origin,
                 label,
                 generation,
-            } => match source {
-                Some(source @ Source::Repo { .. }) => {
-                    let loaded = match acquire::reacquire(
-                        View::Diff,
-                        source,
-                        host,
-                        Some(repo),
+            } => match origin {
+                Some(origin) => {
+                    let loaded = match acquire::diff_source(
+                        origin,
+                        &host.differ,
                         &Overrides::default(),
+                        repo,
+                        true,
                     ) {
                         Ok(loaded) => loaded,
                         Err(e) => return Some(Err(e)),
@@ -529,9 +565,9 @@ impl Screens {
                     *generation = target;
                     Some(Ok(()))
                 }
-                // A fixture, a patch — or the empty pane, which was never
-                // acquired from anywhere and has nothing to re-read.
-                Some(Source::Fixtures) | Some(Source::Patch { .. }) | None => None,
+                // The empty pane was never acquired from anywhere and has
+                // nothing to re-read.
+                None => None,
             },
             Screens::Stashes {
                 view,
@@ -920,6 +956,17 @@ fn apply_edit(text: &mut String, edit: Edit) {
     }
 }
 
+/// One preview answer, off the lane. `seq` is the request it answers and
+/// the only thing that decides whether it installs; `root` is the repository
+/// it was read from and the only repository it may install into.
+struct PreviewOutcome {
+    seq: u64,
+    root: std::path::PathBuf,
+    origin: DiffSource,
+    focus: bool,
+    outcome: Result<Vec<gitten_core::FileDiff>, String>,
+}
+
 struct App {
     host: Host,
     /// Where to acquire more from, for opening a commit's diff: the path the
@@ -1044,6 +1091,20 @@ struct App {
     /// diff, or a history that ended with its first batch.
     tail: Option<gitten_git::LogStream>,
     tail_commits: Vec<gitten_core::Commit>,
+    /// The preview lane: one channel its readers answer on, the sequence
+    /// number the next request will carry, and what is in flight. The
+    /// sequence is the whole of the staleness contract — an answer installs
+    /// only while it is still the newest request issued — and the pane's
+    /// own `origin` is what a later request deduplicates against.
+    preview_tx: std::sync::mpsc::Sender<PreviewOutcome>,
+    preview_rx: std::sync::mpsc::Receiver<PreviewOutcome>,
+    preview_seq: u64,
+    /// Requests issued whose answer has not come back yet — every answer,
+    /// installed or dropped as stale, counts one down. `pump_quiet` waits
+    /// on it, which is what makes a background preview deterministic in a
+    /// test: the fake answers in microseconds, and zero pending means every
+    /// answer has had its turn.
+    preview_pending: usize,
 }
 
 impl App {
@@ -1074,6 +1135,10 @@ impl App {
         // difference. A read that fails says so and the launch goes on —
         // the exact error is kept for the status line, and the next refresh
         // re-reads the stack.
+        // The preview lane, before anything can ask for a preview: one
+        // channel, reader end on the app, writer end cloned into whatever
+        // thread a request spawns.
+        let (preview_tx, preview_rx) = std::sync::mpsc::channel();
         let stash_tenant = repo.is_some().then(|| {
             let mut view = Stashes::unavailable();
             view.set_bar(bar);
@@ -1095,6 +1160,7 @@ impl App {
                     Screens::Commits {
                         view: list,
                         source,
+                        log_of: None,
                         label,
                         generation: Generation::default(),
                     },
@@ -1116,7 +1182,7 @@ impl App {
                     panes::Placement::Main,
                     Screens::Diff {
                         view: Diff::new(Vec::new(), &host),
-                        source: None,
+                        origin: None,
                         label: EMPTY_DIFF_LABEL.to_string(),
                         generation: Generation::default(),
                     },
@@ -1140,7 +1206,11 @@ impl App {
                     panes::Placement::Main,
                     Screens::Diff {
                         view: diff,
-                        source: Some(source),
+                        // The launch's own read: a repository diff is the
+                        // aggregate view its revspec names (empty meaning the
+                        // combined HEAD→worktree read, as always); a patch
+                        // and the fixtures are their own detached content.
+                        origin: Some(DiffSource::from(&source)),
                         label,
                         generation: Generation::default(),
                     },
@@ -1238,6 +1308,13 @@ impl App {
             startup_pending,
             tail: None,
             tail_commits: Vec::new(),
+            // The preview lane: created once, before the first frame — a
+            // request is one clone and one thread away from the very first
+            // keypress that needs it.
+            preview_tx,
+            preview_rx,
+            preview_seq: 0,
+            preview_pending: 0,
         };
         app.sync_header_keys();
         app.sync_modes();
@@ -1390,7 +1467,19 @@ impl App {
             match diff_read {
                 Some(Ok(loaded)) => match loaded.data {
                     Data::Diff(files) => {
-                        self.install_main_diff(&commit, files, false);
+                        let label = format!(
+                            "{} {}",
+                            &commit.sha[..commit.sha.len().min(8)],
+                            commit.subject
+                        );
+                        self.install_diff(
+                            DiffSource::Commit {
+                                sha: commit.sha.clone(),
+                            },
+                            label,
+                            files,
+                            false,
+                        );
                     }
                     Data::Commits(_) => {}
                 },
@@ -1401,28 +1490,24 @@ impl App {
         clock.stage("startup loads applied");
     }
 
-    /// Puts an acquired diff behind the main pane as row zero's preview —
-    /// the registration, geometry and focus restoration both
-    /// [`App::sync_main_diff`] and [`App::load_startup`] share.
-    fn install_main_diff(
+    /// Puts an acquired diff behind the main pane — the registration,
+    /// geometry and focus restoration every preview install shares, and the
+    /// one place a diff tenant is ever built. The origin rides with it: it
+    /// is what a refresh re-reads, what a hunk verb consults before it
+    /// acts, and what a later request compares itself against so the same
+    /// source is never read twice.
+    ///
+    /// The caller owns the label: a commit's preview names its subject, a
+    /// file's side names the side, a stash names its entry — and startup
+    /// names the launch's own read.
+    fn install_diff(
         &mut self,
-        commit: &gitten_core::Commit,
+        origin: DiffSource,
+        label: String,
         files: Vec<gitten_core::FileDiff>,
         focus: bool,
     ) {
-        let Some((path, _)) = self.repo.clone() else {
-            if focus {
-                self.message = "a fixture has no repository to diff against".into();
-            }
-            return;
-        };
-        let sha = commit.sha.clone();
-        let subject = commit.subject.clone();
         let old_focus = self.panes.focused_name().to_string();
-        let source = Source::Repo {
-            path,
-            arg: sha.clone(),
-        };
         let mut diff = Diff::new(files, &self.host);
         diff.set_bar(self.bar);
         self.ensure_geometry();
@@ -1435,8 +1520,8 @@ impl App {
             panes::Placement::Main,
             Screens::Diff {
                 view: diff,
-                source: Some(source),
-                label: format!("{} {subject}", &sha[..sha.len().min(8)]),
+                origin: Some(origin),
+                label,
                 // Acquired this instant, so it is as current as the queue's
                 // last finish — not a generation older.
                 generation: self.generation,
@@ -1454,6 +1539,38 @@ impl App {
         };
         self.panes.focus_named(target);
         self.sync_modes();
+    }
+
+    /// What the main pane calls a preview, once it is installed: the
+    /// person-readable half, looked up from the pane the selection came
+    /// from so a commit names its subject and a stash its message.
+    fn preview_label(&self, origin: &DiffSource) -> String {
+        match origin {
+            DiffSource::Commit { sha } => {
+                let subject = self.panes.get("commits").and_then(|pane| match pane {
+                    Screens::Commits { view, .. } => view.with_sha(sha).map(|c| c.subject.clone()),
+                    _ => None,
+                });
+                match subject {
+                    Some(subject) => format!("{} {subject}", &sha[..sha.len().min(8)]),
+                    None => origin.label(),
+                }
+            }
+            DiffSource::Stash { index, commit } => {
+                let message = self.panes.get("stashes").and_then(|pane| match pane {
+                    Screens::Stashes { view, .. } => view.message_of(commit).map(str::to_string),
+                    _ => None,
+                });
+                match message {
+                    Some(message) => format!("stash@{{{index}}} {message}"),
+                    None => origin.label(),
+                }
+            }
+            // The file-side sources label themselves; a drilldown names its
+            // branch. Detached content is never installed here — startup
+            // owns its own labels.
+            other => other.label(),
+        }
     }
 
     /// The mode stack follows the keyboard. Rebuilt rather than pushed and
@@ -1614,7 +1731,7 @@ impl App {
             // is noticed within one TICK — the tick bounds notice latency,
             // never the refresh itself, which is the `Screens::refresh`
             // call below and is as long as the re-acquisition takes.
-            self.drain_jobs();
+            self.pump();
             // The log's tail, whatever has arrived since the last frame —
             // appended to the list the launch asked for, which keeps its
             // cursor and viewport through the same `replace` a refresh rides.
@@ -2233,7 +2350,7 @@ impl App {
             list.apply_query(query);
         }
         if self.current_commit_sha() != before {
-            self.sync_main_diff(false);
+            self.request_commit_preview(false);
         }
     }
 
@@ -2336,7 +2453,7 @@ impl App {
                 if !was_focused {
                     self.focus_named(&name);
                 } else if name == "commits" && self.current_commit_sha() != before {
-                    self.sync_main_diff(false);
+                    self.request_commit_preview(false);
                 }
                 // Two clicks on a commit open it, which is the one gesture a
                 // terminal has for "go in" besides the key that already does.
@@ -2503,6 +2620,14 @@ impl App {
                 self.message = format!("theme: {}", self.host.theme.name);
             }
             "commits.open-diff" => self.open_diff(),
+            // The preview doors of the other lists, the same shape one pane
+            // over: enter previews and focuses the row's own content, and —
+            // for the working tree — tab flips the previewed side when the
+            // file has one on the other side of the index.
+            "files.open-diff" => self.open_file_diff(),
+            "files.toggle-side" => self.toggle_file_side(),
+            "stashes.open-diff" => self.open_stash_diff(),
+            "branches.open-log" => self.open_branch_log(),
             // The prompt's names, and the whole of what they gather: open a
             // query or a message field, accept it, cancel it. Each resolves
             // through the live keymap — `commits.search` and the files
@@ -2586,9 +2711,15 @@ impl App {
                 let routed = target
                     .unwrap_or_else(|| self.panes.focused_name())
                     .to_string();
-                let before = (routed == "commits")
-                    .then(|| self.current_commit_sha())
-                    .flatten();
+                // What the keyboard's pane is looking at before the command
+                // runs. The main preview follows the selection, pane by pane:
+                // the commits list previews its commit, the working tree its
+                // file's side, the stack its entry — whatever the keyboard is
+                // on is what the eye is on. The branches list is the
+                // exception: its drilldown is a log install, which only Enter
+                // asks for, because a read per cursor step buys nothing a
+                // cursor step can use.
+                let before = self.eye_of(&routed);
                 let known = match target {
                     Some(name) => self
                         .panes
@@ -2599,12 +2730,12 @@ impl App {
                         .focused_mut()
                         .is_some_and(|pane| pane.run(command, &self.host)),
                 };
-                if known
-                    && routed == "commits"
-                    && self.panes.focused_name() == "commits"
-                    && self.current_commit_sha() != before
-                {
-                    self.sync_main_diff(false);
+                if known && self.panes.focused_name() == routed {
+                    if let Some(after) = self.eye_of(&routed) {
+                        if Some(&after) != before.as_ref() {
+                            self.request_preview(after, false);
+                        }
+                    }
                 }
                 if !known {
                     self.message = format!("{command} does nothing here");
@@ -2675,7 +2806,7 @@ impl App {
                 // focus arrives, that same highlighted row is still the main
                 // preview's source.
                 if name == "commits" {
-                    self.sync_main_diff(false);
+                    self.request_commit_preview(false);
                 }
             }
             None => self.message = format!("no {name} pane"),
@@ -2736,27 +2867,28 @@ impl App {
         self.sync_modes();
     }
 
-    /// Gives the main pane focus after synchronising it to the highlighted
-    /// commit. Moving the highlight already loaded the preview; Enter merely
+    /// Gives the main pane focus after asking for the highlighted commit's
+    /// preview. Moving the highlight already asked for it; Enter merely
     /// flushes a missing or failed load and transfers the keyboard.
     fn open_diff(&mut self) {
-        self.sync_main_diff(true);
+        self.request_commit_preview(true);
     }
 
-    /// Keeps the main diff on the commit highlighted in the commits pane.
+    /// Keeps the main pane on the commit highlighted in the commits pane —
+    /// asked for, read off the input path, installed when it arrives.
     ///
     /// The I/O is here and not in the view, which is the same rule the GPUI
-    /// client follows: a view takes already-loaded data and never learns what a
-    /// repository is. A bare revision is "what did this commit change" to
+    /// client follows: a view takes already-loaded data and never learns what
+    /// a repository is. A bare revision is "what did this commit change" to
     /// [`gitten_git::Repo::pairs`], merges included.
     ///
-    /// The pane named `commits` is read by that name and not by focus. On
-    /// success the diff tenant is replaced in place and the old focus is
-    /// restored unless `focus` asks Enter's one extra action. A preview already
-    /// naming this sha costs no acquisition.
-    fn sync_main_diff(&mut self, focus: bool) {
-        let commit = match self.panes.get("commits") {
-            Some(Screens::Commits { view, .. }) => view.current().cloned(),
+    /// The pane named `commits` is read by that name and not by focus. A
+    /// preview already naming this commit costs no acquisition; anything else
+    /// becomes one request on [`App::request_preview`]'s lane, and the
+    /// answer installs only while it is still the newest one asked for.
+    fn request_commit_preview(&mut self, focus: bool) {
+        let sha = match self.panes.get("commits") {
+            Some(Screens::Commits { view, .. }) => view.current().map(|c| c.sha.clone()),
             _ => {
                 if focus {
                     self.message = "no commit selected".into();
@@ -2764,37 +2896,343 @@ impl App {
                 return;
             }
         };
-        let Some(commit) = commit else { return };
-        let sha = commit.sha.clone();
-        let shown = matches!(
-            self.panes.get("diff"),
-            Some(Screens::Diff {
-                source: Some(Source::Repo { arg, .. }),
-                ..
-            }) if arg == &sha
-        );
-        if shown {
+        let Some(sha) = sha else {
+            if focus {
+                self.message = "no commit selected".into();
+            }
+            return;
+        };
+        self.request_preview(DiffSource::Commit { sha }, focus);
+    }
+
+    /// Asks for a preview, on the lane that keeps the keyboard live while
+    /// the read runs.
+    ///
+    /// The request carries a sequence number and the repository it was made
+    /// against; the answer is installed only while it is still the newest
+    /// sequence issued and the repository is still the one held — which is
+    /// the whole of the staleness contract. Everything slower than the next
+    /// keypress simply never installs: a newer selection's read is already
+    /// on its way, and the pane is not asked about the old answer any more.
+    /// While the read runs, the pane's header says what is coming and its
+    /// last good rows stay drawn.
+    ///
+    /// One more honest shortcut: a request for what is already shown costs
+    /// nothing, and — like every read here — the [`Differs`] clone the
+    /// thread takes shares the answer cache, so a re-read of the same
+    /// content is remembered work.
+    fn request_preview(&mut self, origin: DiffSource, focus: bool) {
+        let Some((root, repo)) = self.repo.clone() else {
+            if focus {
+                self.message = "a fixture has no repository to preview".into();
+            }
+            return;
+        };
+        if self.shown_origin().is_some_and(|shown| shown == origin) {
             if focus {
                 self.focus_named("diff");
             }
             return;
         }
-        let Some((path, repo)) = self.repo.clone() else {
-            if focus {
-                self.message = "a fixture has no repository to diff against".into();
-            }
+        self.preview_seq += 1;
+        self.preview_pending += 1;
+        let seq = self.preview_seq;
+        if let Some(Screens::Diff { label, .. }) = self.panes.get_mut("diff") {
+            *label = format!("loading {}", origin.label());
+        }
+        let differs = self.host.differ.clone();
+        let over = Overrides::default();
+        let tx = self.preview_tx.clone();
+        let started = std::thread::Builder::new()
+            .name("gitten-preview".into())
+            .spawn(move || {
+                let outcome =
+                    match acquire::diff_source(&origin, &differs, &over, repo.as_ref(), false) {
+                        Ok(loaded) => match loaded.data {
+                            Data::Diff(files) => Ok(files),
+                            Data::Commits(_) => {
+                                Err("the preview answered with the wrong view".into())
+                            }
+                        },
+                        Err(e) => Err(e),
+                    };
+                let _ = tx.send(PreviewOutcome {
+                    seq,
+                    root,
+                    origin,
+                    focus,
+                    outcome,
+                });
+            });
+        if started.is_err() {
+            self.preview_pending -= 1;
+            self.message = "could not start the preview reader".into();
+        }
+    }
+
+    /// What the main pane is currently previewing, if anything — the same
+    /// source a later request compares itself against.
+    fn shown_origin(&self) -> Option<DiffSource> {
+        match self.panes.get("diff") {
+            Some(Screens::Diff {
+                origin: Some(origin),
+                ..
+            }) => Some(origin.clone()),
+            _ => None,
+        }
+    }
+
+    /// Drains both background lanes — the write queue and the preview
+    /// readers. Called before each frame, so the frame this iteration draws
+    /// is the one the finished jobs and the arrived previews produced.
+    fn pump(&mut self) {
+        self.drain_jobs();
+        self.drain_previews();
+    }
+
+    /// Drains until nothing is in flight — the deterministic turn a test
+    /// gives a background preview. The fakes answer in microseconds; the
+    /// deadline exists so a genuinely stuck read fails the test instead of
+    /// hanging it.
+    #[cfg(test)]
+    fn pump_quiet(&mut self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while self.preview_pending > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a preview answer never came back: {} pending",
+                self.preview_pending
+            );
+            self.drain_previews();
+            std::thread::yield_now();
+        }
+        self.pump();
+    }
+
+    /// Drains the preview lane, beside the job queue. Called before each
+    /// frame, so the frame this iteration draws is the one the answers
+    /// produced.
+    fn drain_previews(&mut self) {
+        while let Some(answer) = self.next_preview_answer() {
+            self.install_preview(answer);
+        }
+    }
+
+    /// One answer off the lane, if one has arrived — a method so the
+    /// receiver's borrow ends before the install borrows the app.
+    fn next_preview_answer(&mut self) -> Option<PreviewOutcome> {
+        self.preview_rx.try_recv().ok()
+    }
+
+    /// What the pane named `pane` is looking at, as a preview source — the
+    /// eye that follows the selection. The branches list answers `None` on
+    /// purpose: its drilldown is an install, not a preview, and only Enter
+    /// asks for one.
+    fn eye_of(&self, pane: &str) -> Option<DiffSource> {
+        match pane {
+            "commits" => match self.panes.get(pane) {
+                Some(Screens::Commits { view, .. }) => view
+                    .current()
+                    .map(|c| DiffSource::Commit { sha: c.sha.clone() }),
+                _ => None,
+            },
+            "files" => match self.panes.get(pane) {
+                Some(Screens::Files { view, .. }) => view.current_file().and_then(|file| {
+                    match file.section {
+                        files::Section::Staged => Some(DiffSource::Staged {
+                            path: file.path.clone(),
+                        }),
+                        files::Section::Unstaged => Some(DiffSource::Unstaged {
+                            path: file.path.clone(),
+                        }),
+                        files::Section::Untracked => Some(DiffSource::Untracked {
+                            path: file.path.clone(),
+                        }),
+                        // A conflicted file has no side of the index to
+                        // preview; its resolution views are their own packet.
+                        files::Section::Conflicts => None,
+                    }
+                }),
+                _ => None,
+            },
+            "stashes" => match self.panes.get(pane) {
+                Some(Screens::Stashes { view, .. }) => view
+                    .current_entry()
+                    .map(|(index, commit)| DiffSource::Stash { index, commit }),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// `files.open-diff`: preview the file the keyboard is on, and put the
+    /// keyboard on the preview. A row that is a heading, or a conflicted
+    /// file with no side to preview, says so and does nothing.
+    fn open_file_diff(&mut self) {
+        match self.eye_of("files") {
+            Some(origin) => self.request_preview(origin, true),
+            None => self.message = "the keyboard is not on a file".into(),
+        }
+    }
+
+    /// `files.toggle-side`: the same file, the other side of the index —
+    /// staged to unstaged and back, only when the other side actually has
+    /// the file. A switch to a side that is not there is said, not shown as
+    /// an empty diff: "nothing unstaged for f.txt" is the honest answer to
+    /// a file that exists only in the index.
+    fn toggle_file_side(&mut self) {
+        let selected = match self.panes.get("files") {
+            Some(Screens::Files { view, .. }) => view
+                .current_file()
+                .map(|file| (file.section, file.path.clone())),
+            _ => None,
+        };
+        let Some((section, path)) = selected else {
+            self.message = "the keyboard is not on a file".into();
             return;
         };
-        let source = Source::Repo {
-            path,
-            arg: sha.clone(),
+        let (other, other_section) = match section {
+            files::Section::Staged => (
+                Some(DiffSource::Unstaged { path: path.clone() }),
+                files::Section::Unstaged,
+            ),
+            files::Section::Unstaged | files::Section::Untracked => (
+                Some(DiffSource::Staged { path: path.clone() }),
+                files::Section::Staged,
+            ),
+            // A conflict is not two sides; it is three stages of one file,
+            // and what to show of it is the resolution packet's question.
+            files::Section::Conflicts => (None, files::Section::Conflicts),
         };
-        match acquire::acquire(View::Diff, &source, &self.host, Some(repo.as_ref())) {
-            Ok(loaded) => match loaded.data {
-                Data::Diff(files) => self.install_main_diff(&commit, files, focus),
-                Data::Commits(_) => {}
+        let Some(origin) = other else {
+            self.message = "a conflicted file has no other side to preview".into();
+            return;
+        };
+        let exists = match self.panes.get("files") {
+            Some(Screens::Files { view, .. }) => view.has_row(other_section, &path),
+            _ => false,
+        };
+        if !exists {
+            let side = match other_section {
+                files::Section::Staged => "staged",
+                _ => "unstaged",
+            };
+            self.message = format!("nothing {side} for {path}");
+            return;
+        }
+        self.request_preview(origin, true);
+    }
+
+    /// `stashes.open-diff`: the parked work, seen before anything is
+    /// applied. The entry the keyboard is on, addressed by its commit —
+    /// the identity a drop does not renumber.
+    fn open_stash_diff(&mut self) {
+        match self.eye_of("stashes") {
+            Some(origin) => self.request_preview(origin, true),
+            None => self.message = "the keyboard is not on a stash".into(),
+        }
+    }
+
+    /// `branches.open-log`: the branch's own history, installed as the main
+    /// pane. A drilldown, not a preview — it replaces what the main pane
+    /// holds, the way a commit's preview does, and a later selection
+    /// elsewhere replaces it in turn. The keyboard follows it in, the way
+    /// Enter follows a commit's preview in.
+    ///
+    /// Only a local branch drills down: a remote-tracking row has no local
+    /// history to name and the detached row is a place, not a branch — both
+    /// say so rather than guessing which history was meant.
+    fn open_branch_log(&mut self) {
+        let target = match self.panes.get("branches") {
+            Some(Screens::Branches { view, .. }) => view.current(),
+            _ => None,
+        };
+        let Some(Target::Local(name)) = target else {
+            self.message = "the keyboard is not on a local branch".into();
+            return;
+        };
+        let Some((path, repo)) = self.repo.clone() else {
+            self.message = "a fixture has no history to open".into();
+            return;
+        };
+        let commits = match repo.log_at(name.as_bytes(), 5000) {
+            Ok(commits) => commits,
+            Err(e) => {
+                self.message = e;
+                return;
+            }
+        };
+        let mut list = Commits::new(commits);
+        list.set_bar(self.bar);
+        self.ensure_geometry();
+        if let Some(rect) = self.pane_content("diff") {
+            list.set_scrolloff(self.host.view.scrolloff);
+            list.resize(rect.width, rect.height);
+        }
+        let display = name.to_string_lossy().into_owned();
+        let described = repo.describe();
+        let gesture_was = self.gesture.as_deref() == Some("diff");
+        self.panes.register(
+            "diff",
+            panes::Placement::Main,
+            Screens::Commits {
+                view: list,
+                source: Source::Repo {
+                    path,
+                    arg: "5000".into(),
+                },
+                log_of: Some(name),
+                label: format!("{display} · {described}"),
+                generation: self.generation,
             },
-            Err(e) => self.message = e,
+        );
+        // The same gesture rule every install keeps: only a gesture captured
+        // in the tenant just replaced became stale, and a click must still
+        // receive its release.
+        if gesture_was {
+            self.gesture = None;
+        }
+        self.panes.focus_named("diff");
+        self.sync_modes();
+    }
+
+    /// Installs one preview answer — the guarded half of
+    /// [`App::request_preview`].
+    ///
+    /// Two guards, both absolute. A stale sequence — anything but the newest
+    /// request issued — is dropped without a word: something newer was asked
+    /// for and its answer is either here or on its way. An answer read from
+    /// another repository is dropped the same way: one repository's content
+    /// never becomes another one's preview. A read that failed keeps the
+    /// last good rows and says why on the status line, the same shape a
+    /// failed refresh leaves.
+    fn install_preview(&mut self, answer: PreviewOutcome) {
+        // Every answer counts one down, stale or not: the counter answers
+        // "is anything still being read", not "was anything installed".
+        self.preview_pending = self.preview_pending.saturating_sub(1);
+        // A request's sequence starts at one; zero is no request's answer,
+        // and it installs the same way an older one would — never.
+        if answer.seq == 0 || answer.seq != self.preview_seq {
+            return;
+        }
+        if self
+            .repo
+            .as_ref()
+            .is_some_and(|(root, _)| *root != answer.root)
+        {
+            return;
+        }
+        match answer.outcome {
+            Ok(files) => {
+                let label = self.preview_label(&answer.origin);
+                self.install_diff(answer.origin, label, files, answer.focus);
+            }
+            Err(e) => {
+                self.message = e;
+                if let Some(Screens::Diff { label, .. }) = self.panes.get_mut("diff") {
+                    *label = answer.origin.label();
+                }
+            }
         }
     }
 
@@ -2818,13 +3256,13 @@ impl App {
     /// rather than pretending — no fake source, no fake generation, no patch
     /// against nothing.
     fn hunk_verb(&mut self, command: &str) {
-        let (source, hunk) = match self.panes.focused() {
+        let (origin, hunk) = match self.panes.focused() {
             Some(Screens::Diff {
                 view,
-                source: Some(source),
+                origin: Some(origin),
                 ..
-            }) => (Some(source.clone()), view.current_hunk()),
-            Some(Screens::Diff { source: None, .. }) => {
+            }) => (Some(origin.clone()), view.current_hunk()),
+            Some(Screens::Diff { origin: None, .. }) => {
                 self.message = "no diff is open".into();
                 return;
             }
@@ -2838,7 +3276,7 @@ impl App {
         let handle = self.repo.as_ref().map(|(_, handle)| handle);
         match hunk_action(
             command,
-            source.as_ref().expect("a diff with a source"),
+            origin.as_ref().expect("a diff with an origin"),
             handle,
             hunk,
         ) {
@@ -3349,10 +3787,20 @@ fn tui_availability(repo: bool) -> Availability {
     ]);
     match repo {
         true => {
-            a.available(["repo.refresh"]);
+            a.available([
+                "repo.refresh",
+                "files.open-diff",
+                "files.toggle-side",
+                "stashes.open-diff",
+                "branches.open-log",
+            ]);
         }
         false => {
             a.disabled("repo.refresh", "a fixture has no repository to refresh");
+            a.disabled("files.open-diff", "a fixture has no file to preview");
+            a.disabled("files.toggle-side", "a fixture has no file to preview");
+            a.disabled("stashes.open-diff", "a fixture has no stash to preview");
+            a.disabled("branches.open-log", "a fixture has no history to open");
         }
     }
     a
@@ -3469,19 +3917,35 @@ impl gitten_app::act::FileClient for App {
 /// refusal (an empty patch) comes back as an error and is said, not queued.
 fn hunk_action(
     command: &str,
-    source: &Source,
+    origin: &DiffSource,
     repo: Option<&gitten_git::Handle>,
     hunk: Option<(String, Hunk)>,
 ) -> Result<Box<dyn Job>, String> {
-    match source {
-        Source::Repo { arg, .. } if arg.is_empty() => {}
-        Source::Repo { .. } => {
+    match origin {
+        // The combined HEAD→worktree read is the one source the hunk verbs
+        // act on tonight: its hunks are reverse-appliable to the working
+        // tree as it stands. The inference lives on [`DiffSource
+        // ::combined_worktree`]; the partial-staging packet replaces it
+        // with per-side sources.
+        DiffSource::Revspec { arg } if arg.is_empty() => {}
+        DiffSource::Revspec { .. } | DiffSource::Commit { .. } | DiffSource::Stash { .. } => {
             return Err(
                 "only the working-tree diff can act on hunks — this one is between commits".into(),
             )
         }
-        Source::Fixtures => return Err("a fixture has no repository behind it".into()),
-        Source::Patch { .. } => return Err("a patch file has no repository behind it".into()),
+        DiffSource::Fixture => return Err("a fixture has no repository behind it".into()),
+        DiffSource::Patch => return Err("a patch file has no repository behind it".into()),
+        // A file's own side is where per-hunk staging belongs, and that is
+        // the partial-staging packet's work. Until it lands, the files pane
+        // is the whole-file door, and this says so instead of guessing at
+        // which half of the index a hunk belongs to.
+        DiffSource::Staged { .. }
+        | DiffSource::Unstaged { .. }
+        | DiffSource::Untracked { .. } => {
+            return Err(
+                "hunk verbs are not wired to a file's preview yet — stage the file whole from the working-tree pane".into(),
+            )
+        }
     }
     let repo = repo.ok_or_else(|| "no repository is open".to_string())?;
     let Some((path, hunk)) = hunk else {
@@ -4140,7 +4604,7 @@ mod tests {
             panes::Placement::Main,
             Screens::Diff {
                 view: diff,
-                source: Some(Source::Patch { file: None }),
+                origin: Some(DiffSource::Patch),
                 label: "md.diff".into(),
                 generation: app.generation,
             },
@@ -4249,7 +4713,7 @@ mod tests {
             panes::Placement::Main,
             Screens::Diff {
                 view: diff,
-                source: Some(Source::Patch { file: None }),
+                origin: Some(DiffSource::Patch),
                 label: "md.diff".into(),
                 generation: app.generation,
             },
@@ -4565,6 +5029,22 @@ mod staging {
             .collect()
     }
 
+    /// A fake's side answer, narrowed the way git's own pathspec narrows:
+    /// a record matches the path asked for, or either of a rename's two.
+    fn filter_pairs(pairs: &[Pair], path: Option<&[u8]>) -> Vec<Pair> {
+        match path {
+            None => pairs.to_vec(),
+            Some(p) => pairs
+                .iter()
+                .filter(|pair| {
+                    pair.path.as_bytes() == p
+                        || pair.old_path.as_deref().is_some_and(|o| o.as_bytes() == p)
+                })
+                .cloned()
+                .collect(),
+        }
+    }
+
     fn pair(path: &str, old: Vec<Arc<str>>, new: Vec<Arc<str>>) -> Pair {
         Pair {
             path: path.to_string(),
@@ -4671,6 +5151,31 @@ diff --git a/tracked.txt b/tracked.txt
         /// message and changes nothing: git's refusal, verbatim.
         refuse_branch: Option<String>,
         refuse_tag: Option<String>,
+        /// The two sides of the index, as the side reads answer them — the
+        /// staged side (HEAD→index) and the unstaged one (index→worktree).
+        /// `fakes_staged`/`fakes_unstaged` filter by the path a caller
+        /// named, the way git's own pathspec would.
+        staged: Vec<Pair>,
+        unstaged: Vec<Pair>,
+        staged_reads: usize,
+        unstaged_reads: usize,
+        /// The untracked files' contents, as the pairs the preview asks
+        /// for, and how often they were asked.
+        untracked_pairs: Vec<Pair>,
+        untracked_reads: usize,
+        /// The third-parent untracked content a stash read answers with.
+        stash_untracked: Vec<Pair>,
+        stash_untracked_reads: usize,
+        /// Per-ref log answers, keyed by the raw ref bytes — a branch
+        /// drilldown's read, and the only way a test can prove the
+        /// drilldown read *that* branch and not HEAD.
+        log_at_answers: Vec<(Vec<u8>, Vec<Commit>)>,
+        log_at_reads: usize,
+        /// When set, every staged-side read blocks until the pair is opened.
+        /// The one honest way to test that a slow preview keeps the
+        /// keyboard live: the read really is slow, and the test really
+        /// types while it runs.
+        gate: Option<Arc<(Mutex<bool>, std::sync::Condvar)>>,
     }
 
     /// A repository that exists only as this struct. Reads answer what the
@@ -4713,6 +5218,54 @@ diff --git a/tracked.txt b/tracked.txt
                 0 => s.before.clone(),
                 _ => s.after.clone(),
             })
+        }
+
+        fn pairs_staged(&self, path: Option<&[u8]>) -> gitten_git::Result<Vec<Pair>> {
+            let gate = self.0.lock().unwrap().gate.clone();
+            if let Some(gate) = gate {
+                // The read is slow for as long as the test holds the gate
+                // shut — a real blocking read, on a real thread.
+                let (open, arrived) = &*gate;
+                let mut is_open = open.lock().unwrap();
+                while !*is_open {
+                    is_open = arrived.wait(is_open).unwrap();
+                }
+            }
+            let mut s = self.0.lock().unwrap();
+            s.staged_reads += 1;
+            Ok(filter_pairs(&s.staged, path))
+        }
+
+        fn pairs_unstaged(&self, path: Option<&[u8]>) -> gitten_git::Result<Vec<Pair>> {
+            let mut s = self.0.lock().unwrap();
+            s.unstaged_reads += 1;
+            Ok(filter_pairs(&s.unstaged, path))
+        }
+
+        fn pair_untracked(&self, path: &[u8]) -> gitten_git::Result<Option<Pair>> {
+            let mut s = self.0.lock().unwrap();
+            s.untracked_reads += 1;
+            Ok(s.untracked_pairs
+                .iter()
+                .find(|p| p.path.as_bytes() == path)
+                .cloned())
+        }
+
+        fn pairs_stash_untracked(&self, _commit: &str) -> gitten_git::Result<Vec<Pair>> {
+            let mut s = self.0.lock().unwrap();
+            s.stash_untracked_reads += 1;
+            Ok(s.stash_untracked.clone())
+        }
+
+        fn log_at(&self, revspec: &[u8], _limit: usize) -> gitten_git::Result<Vec<Commit>> {
+            let mut s = self.0.lock().unwrap();
+            s.log_at_reads += 1;
+            match s.log_at_answers.iter().find(|(name, _)| name == revspec) {
+                Some((_, commits)) => Ok(commits.clone()),
+                // An unscripted ref reads like HEAD's: the tests that care
+                // script the ref they drill into.
+                None => Ok(three_commits()),
+            }
         }
 
         fn status(&self) -> gitten_git::Result<Status> {
@@ -5299,6 +5852,14 @@ diff --git a/tracked.txt b/tracked.txt
         }
     }
 
+    /// The diff tenant's header — the label install put there.
+    fn diff_label_of(app: &App) -> String {
+        match app.panes.get("diff") {
+            Some(Screens::Diff { label, .. }) => label.clone(),
+            _ => panic!("the diff pane is not registered"),
+        }
+    }
+
     fn diff_of(app: &App) -> &Diff {
         match app.panes.get("diff") {
             Some(Screens::Diff { view, .. }) => view,
@@ -5390,7 +5951,7 @@ diff --git a/tracked.txt b/tracked.txt
         assert!(app.submitter.submit(Box::new(Dead)).is_ok(), "queued");
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 files_of(&app).is_available()
             }),
             "the failed pane was never stood up"
@@ -5611,7 +6172,7 @@ diff --git a/tracked.txt b/tracked.txt
             app.dispatch("files.stage");
             assert!(
                 until(Duration::from_secs(2), || {
-                    app.drain_jobs();
+                    app.pump_quiet();
                     state.lock().unwrap().writes.len() > expected.len()
                 }),
                 "{written} never reached the repository"
@@ -5714,7 +6275,7 @@ diff --git a/tracked.txt b/tracked.txt
         app.dispatch("files.stage-all");
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 !state.lock().unwrap().writes.is_empty()
             }),
             "the bulk unstage never reached the repository"
@@ -5739,7 +6300,7 @@ diff --git a/tracked.txt b/tracked.txt
         app.dispatch("files.stage-all");
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 state.lock().unwrap().writes.len() > writes
             }),
             "the bulk stage never reached the repository"
@@ -5827,7 +6388,7 @@ diff --git a/tracked.txt b/tracked.txt
         app.dispatch("files.discard");
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 !state.lock().unwrap().writes.is_empty()
             }),
             "the confirmed discard never reached the repository"
@@ -5848,7 +6409,7 @@ diff --git a/tracked.txt b/tracked.txt
         app.dispatch("files.discard");
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 state.lock().unwrap().writes.len() > written
             }),
             "the confirmed delete never reached the repository"
@@ -5939,7 +6500,7 @@ diff --git a/tracked.txt b/tracked.txt
         app.dispatch("files.discard");
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 state.lock().unwrap().writes.len() > written
             }),
             "the same-row press did not keep the arm confirmable"
@@ -5956,7 +6517,7 @@ diff --git a/tracked.txt b/tracked.txt
         assert!(app.submitter.submit(Box::new(Dead)).is_ok(), "queued");
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 app.generation > Generation::default()
             }),
             "the finish was never drained"
@@ -5971,7 +6532,7 @@ diff --git a/tracked.txt b/tracked.txt
         app.dispatch("files.discard");
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 state.lock().unwrap().writes.len() > written
             }),
             "focus away and back dropped the arm"
@@ -5994,7 +6555,7 @@ diff --git a/tracked.txt b/tracked.txt
         app.dispatch("files.ignore");
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 !state.lock().unwrap().writes.is_empty()
             }),
             "the ignore never reached the repository"
@@ -6049,7 +6610,7 @@ diff --git a/tracked.txt b/tracked.txt
         app.dispatch("files.stash");
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 !state.lock().unwrap().stash_writes.is_empty()
             }),
             "the stash never reached the repository"
@@ -6062,7 +6623,7 @@ diff --git a/tracked.txt b/tracked.txt
         app.dispatch("files.stash");
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 state.lock().unwrap().stash_writes.len() == 2
             }),
             "the second stash never reached the repository"
@@ -6078,7 +6639,7 @@ diff --git a/tracked.txt b/tracked.txt
         app.dispatch("files.stash");
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 !state.lock().unwrap().stash_writes.is_empty()
             }),
             "the clean-tree stash never ran"
@@ -6130,7 +6691,7 @@ diff --git a/tracked.txt b/tracked.txt
         assert!(app.submitter.submit(Box::new(second)).is_ok(), "queued");
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 state.lock().unwrap().status_reads >= started + 2
                     && state.lock().unwrap().pairs_reads >= opens + 2
                     && state.lock().unwrap().log_reads >= 2
@@ -6175,7 +6736,7 @@ diff --git a/tracked.txt b/tracked.txt
         assert!(app.submitter.submit(Box::new(Dead)).is_ok(), "queued");
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 app.generation > Generation::default()
             }),
             "the finish was never drained"
@@ -6197,7 +6758,7 @@ diff --git a/tracked.txt b/tracked.txt
         assert!(app.submitter.submit(Box::new(Dead)).is_ok(), "queued");
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 app.generation > Generation::default()
             }),
             "the finish was never drained"
@@ -6228,7 +6789,7 @@ diff --git a/tracked.txt b/tracked.txt
         assert!(matches!(
             app.panes.get("diff"),
             Some(Screens::Diff {
-                source: Some(_),
+                origin: Some(_),
                 ..
             })
         ));
@@ -6250,7 +6811,7 @@ diff --git a/tracked.txt b/tracked.txt
             matches!(
                 app.panes.get("diff"),
                 Some(Screens::Diff {
-                    source: Some(_),
+                    origin: Some(_),
                     ..
                 })
             ),
@@ -6267,14 +6828,15 @@ diff --git a/tracked.txt b/tracked.txt
         // moving focus. Enter after that is only the focus transfer.
         let reads = state.lock().unwrap().pairs_reads;
         app.dispatch("view.down");
+        app.pump_quiet();
         assert_eq!(app.panes.focused_name(), "commits");
         assert_eq!(state.lock().unwrap().pairs_reads, reads + 1);
         assert!(matches!(
             app.panes.get("diff"),
             Some(Screens::Diff {
-                source: Some(Source::Repo { arg, .. }),
+                origin: Some(DiffSource::Commit { sha }),
                 ..
-            }) if arg == "00000001"
+            }) if sha == "00000001"
         ));
 
         // Enter on that already-shown commit does no acquisition.
@@ -6328,7 +6890,7 @@ diff --git a/tracked.txt b/tracked.txt
         assert!(matches!(
             app.panes.get("diff"),
             Some(Screens::Diff {
-                source: Some(_),
+                origin: Some(_),
                 ..
             })
         ));
@@ -6479,7 +7041,7 @@ diff --git a/tracked.txt b/tracked.txt
         assert!(app.prompt.is_none());
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 !state.lock().unwrap().writes.is_empty()
             }),
             "the commit never reached the repository"
@@ -6549,7 +7111,7 @@ diff --git a/tracked.txt b/tracked.txt
         assert!(app.prompt.is_none());
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 !state.lock().unwrap().writes.is_empty()
             }),
             "the amend never reached the repository"
@@ -6686,13 +7248,18 @@ diff --git a/tracked.txt b/tracked.txt
         let mut app = commits_app(&handle);
         app.draw();
         app.dispatch("commits.open-diff");
+        // The read rides the preview lane; the install is what every later
+        // dedupe and assertion counts against.
+        app.pump_quiet();
         app.dispatch("commits.focus");
+        app.pump_quiet();
         app.draw();
 
         // Down in the commits rectangle presses it, in its own coordinates.
         // The sidebar splits four ways now, so the commits slice is the
         // third of them: local row 2 is three content rows down.
         app.mouse(click(MouseKind::Down, 5, 16));
+        app.pump_quiet();
         assert_eq!(app.panes.focused_name(), "commits");
         assert_eq!(
             commits_of(&app).cursor(),
@@ -6741,7 +7308,12 @@ diff --git a/tracked.txt b/tracked.txt
         let reads = state.lock().unwrap().pairs_reads;
         app.mouse(click(MouseKind::Down, 10, 15));
         app.mouse(click(MouseKind::Up, 10, 15));
+        // The click's own preview is on the lane; let it land before the
+        // second press, so the double click meets a shown commit and
+        // deduplicates — the count below is the click's read, not the open's.
+        app.pump_quiet();
         app.mouse(click(MouseKind::Down, 10, 15));
+        app.pump_quiet();
         assert_eq!(
             app.panes.focused_name(),
             "diff",
@@ -6999,6 +7571,9 @@ diff --git a/tracked.txt b/tracked.txt
         // list is the focused pane and the diff is the registered one the
         // refresh must not forget — hidden by the narrow layout or not.
         app.dispatch("commits.open-diff");
+        // The read is on the preview lane now; the install is what the next
+        // dispatch deduplicates against, so give it its turn.
+        app.pump_quiet();
         assert_eq!(app.panes.names().count(), 5, "open-diff appended a pane");
         assert!(matches!(app.panes.get("diff"), Some(Screens::Diff { .. })));
         app.dispatch("commits.focus");
@@ -7014,7 +7589,7 @@ diff --git a/tracked.txt b/tracked.txt
         let open_stash_reads = state.lock().unwrap().stash_reads;
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 let s = state.lock().unwrap();
                 s.log_reads >= 2
                     && s.pairs_reads >= open_reads + 2
@@ -7064,7 +7639,7 @@ diff --git a/tracked.txt b/tracked.txt
         assert!(app.submitter.submit(Box::new(Dead)).is_ok(), "queued");
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 app.generation > Generation::default()
             }),
             "the finish was never drained"
@@ -7106,14 +7681,14 @@ diff --git a/tracked.txt b/tracked.txt
         app.dispatch("diff.stage-hunk");
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 !state.lock().unwrap().writes.is_empty()
             }),
             "the staged hunk never reached the repository"
         );
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 app.generation > Generation::default()
             }),
             "the finish was never drained"
@@ -7468,7 +8043,7 @@ diff --git a/tracked.txt b/tracked.txt
         assert!(app.submitter.submit(Box::new(job)).is_ok(), "queued");
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 state.lock().unwrap().log_reads > reads
             }),
             "the hidden tenants were not refreshed"
@@ -7499,7 +8074,7 @@ diff --git a/tracked.txt b/tracked.txt
         // same drain pass the assertions below read.
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 app.generation > Generation::default()
             }),
             "the apply never reached the repository"
@@ -7542,7 +8117,7 @@ diff --git a/tracked.txt b/tracked.txt
         let gen = app.generation;
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 app.generation > gen
             }),
             "the refused apply never finished"
@@ -7565,7 +8140,7 @@ diff --git a/tracked.txt b/tracked.txt
         app.dispatch("stashes.pop");
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 app.generation > Generation::default()
             }),
             "the pop never queued"
@@ -7600,7 +8175,7 @@ diff --git a/tracked.txt b/tracked.txt
         let reads = state.lock().unwrap().stash_reads;
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 state.lock().unwrap().stash_reads > reads
             }),
             "the refused pop never finished"
@@ -7636,7 +8211,7 @@ diff --git a/tracked.txt b/tracked.txt
         app.press(Key::char('d'));
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 app.generation > Generation::default()
             }),
             "the confirmed drop never queued"
@@ -7690,7 +8265,7 @@ diff --git a/tracked.txt b/tracked.txt
         let reads = state.lock().unwrap().stash_reads;
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 state.lock().unwrap().stash_reads > reads
             }),
             "the refused drop never finished"
@@ -7712,7 +8287,7 @@ diff --git a/tracked.txt b/tracked.txt
         app.dispatch("files.stash");
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 app.generation > Generation::default()
             }),
             "the push never queued"
@@ -7740,7 +8315,7 @@ diff --git a/tracked.txt b/tracked.txt
         let reads = state.lock().unwrap().stash_reads;
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 state.lock().unwrap().stash_reads > reads
             }),
             "the refused push never finished"
@@ -7778,7 +8353,7 @@ diff --git a/tracked.txt b/tracked.txt
         app.dispatch("stashes.apply");
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 let s = state.lock().unwrap();
                 s.log_reads > open.0 && s.pairs_reads > open.1 && s.stash_reads > open.2
             }),
@@ -7804,7 +8379,7 @@ diff --git a/tracked.txt b/tracked.txt
         app.dispatch("stashes.pop");
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 state.lock().unwrap().stash_reads > open.2 + 1
             }),
             "the refused finish never refreshed every tenant"
@@ -7894,7 +8469,7 @@ diff --git a/tracked.txt b/tracked.txt
         assert!(app.submitter.submit(Box::new(job)).is_ok(), "queued");
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 app.generation > Generation::default()
             }),
             "the finish was never drained"
@@ -8140,7 +8715,7 @@ diff --git a/tracked.txt b/tracked.txt
         assert!(app.submitter.submit(Box::new(job)).is_ok(), "queued");
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 app.generation > gen
             }),
             "the recovery never re-read the refs"
@@ -8163,7 +8738,7 @@ diff --git a/tracked.txt b/tracked.txt
         assert!(app.submitter.submit(Box::new(job)).is_ok(), "queued");
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 app.generation > gen
             }),
             "the failed wave never finished"
@@ -8206,7 +8781,7 @@ diff --git a/tracked.txt b/tracked.txt
         assert!(app.submitter.submit(Box::new(job)).is_ok(), "queued");
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 app.generation > gen
             }),
             "the head re-read never happened"
@@ -8232,7 +8807,7 @@ diff --git a/tracked.txt b/tracked.txt
         app.press(Key::plain(Code::Char(' ')));
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 app.generation > gen
             }),
             "the checkout never queued"
@@ -8246,7 +8821,7 @@ diff --git a/tracked.txt b/tracked.txt
         app.press(Key::plain(Code::Char(' ')));
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 app.generation > gen
             }),
             "the second checkout never queued"
@@ -8264,7 +8839,7 @@ diff --git a/tracked.txt b/tracked.txt
         app.press(Key::plain(Code::Char(' ')));
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 app.generation > gen
             }),
             "the remote checkout never queued"
@@ -8284,7 +8859,7 @@ diff --git a/tracked.txt b/tracked.txt
             Some(Target::Detached)
         ));
         app.press(Key::plain(Code::Char(' ')));
-        app.drain_jobs();
+        app.pump_quiet();
         assert_eq!(app.message, "HEAD is already detached here");
         assert_eq!(
             state.lock().unwrap().branch_writes.len(),
@@ -8301,7 +8876,7 @@ diff --git a/tracked.txt b/tracked.txt
         let gen = app.generation;
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 app.generation > gen
             }),
             "the refused checkout never finished"
@@ -8367,7 +8942,7 @@ diff --git a/tracked.txt b/tracked.txt
         app.press(Key::plain(Code::Enter));
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 app.generation > gen
             }),
             "the create never queued"
@@ -8400,7 +8975,7 @@ diff --git a/tracked.txt b/tracked.txt
         type_(&mut app, "ghost");
         app.press(Key::plain(Code::Esc));
         assert!(app.prompt.is_none());
-        app.drain_jobs();
+        app.pump_quiet();
         assert_eq!(state.lock().unwrap().branch_writes.len(), 1);
 
         // An empty (unborn) repository's pane still answers `n`: creating
@@ -8425,7 +9000,7 @@ diff --git a/tracked.txt b/tracked.txt
         app.press(Key::plain(Code::Enter));
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 app.generation > gen
             }),
             "the unborn-repository create never queued"
@@ -8470,7 +9045,7 @@ diff --git a/tracked.txt b/tracked.txt
         app.press(Key::plain(Code::Enter));
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 app.generation > gen
             }),
             "the unchanged rename never queued"
@@ -8495,7 +9070,7 @@ diff --git a/tracked.txt b/tracked.txt
         app.press(Key::plain(Code::Enter));
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 app.generation > gen
             }),
             "the byte-preserving rename never queued"
@@ -8566,7 +9141,7 @@ diff --git a/tracked.txt b/tracked.txt
         app.press(Key::plain(Code::Enter));
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 !state.lock().unwrap().tags_written.is_empty()
             }),
             "the tag never queued"
@@ -8590,7 +9165,7 @@ diff --git a/tracked.txt b/tracked.txt
         app.press(Key::plain(Code::Enter));
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 state.lock().unwrap().tags_written.len() == 2
             }),
             "the second tag never queued"
@@ -8608,7 +9183,7 @@ diff --git a/tracked.txt b/tracked.txt
         let gen = app.generation;
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 app.generation > gen
             }),
             "the refused tag never finished"
@@ -8697,7 +9272,7 @@ diff --git a/tracked.txt b/tracked.txt
             cursor,
             "the field moved the cursor"
         );
-        app.drain_jobs();
+        app.pump_quiet();
         assert!(state.lock().unwrap().branch_writes.is_empty());
 
         // While any field stands the keyboard is input's: a digit does not
@@ -8742,7 +9317,7 @@ diff --git a/tracked.txt b/tracked.txt
         app.press(Key::plain(Code::Enter));
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 app.generation > gen
             }),
             "the create never queued"
@@ -8818,7 +9393,7 @@ diff --git a/tracked.txt b/tracked.txt
         app.press(Key::char('d'));
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 app.generation > gen
             }),
             "the confirmed delete never queued"
@@ -8938,7 +9513,7 @@ diff --git a/tracked.txt b/tracked.txt
         app.press(Key::char('d'));
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 app.generation > gen
             }),
             "the round-tripped arm never submitted"
@@ -8982,7 +9557,7 @@ diff --git a/tracked.txt b/tracked.txt
         let gen = app.generation;
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 app.generation > gen
             }),
             "the refused delete never finished"
@@ -9042,7 +9617,7 @@ diff --git a/tracked.txt b/tracked.txt
             let gen = app.generation;
             assert!(
                 until(Duration::from_secs(2), || {
-                    app.drain_jobs();
+                    app.pump_quiet();
                     app.generation > gen
                 }),
                 "{verb}: the write never finished"
@@ -9123,7 +9698,7 @@ diff --git a/tracked.txt b/tracked.txt
         let gen = app.generation;
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 app.generation > gen
             }),
             "the hidden tenant was not refreshed"
@@ -9150,7 +9725,7 @@ diff --git a/tracked.txt b/tracked.txt
         let gen = app.generation;
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 app.generation > gen
             }),
             "the wave with a failing tenant never finished"
@@ -9183,7 +9758,7 @@ diff --git a/tracked.txt b/tracked.txt
         let gen = app.generation;
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 app.generation > gen && state.lock().unwrap().branch_reads > reads
             }),
             "the refused write did not trigger the refresh"
@@ -9332,7 +9907,7 @@ diff --git a/tracked.txt b/tracked.txt
             "rebase.continue is not supported by this client"
         );
 
-        app.drain_jobs();
+        app.pump_quiet();
         let s = state.lock().unwrap();
         assert!(
             s.branch_writes.is_empty() && s.writes.is_empty(),
@@ -9473,7 +10048,7 @@ diff --git a/tracked.txt b/tracked.txt
         let gen = app.generation;
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 app.generation > gen
             }),
             "the hidden tenants were not refreshed"
@@ -9947,7 +10522,7 @@ diff --git a/tracked.txt b/tracked.txt
         app.press(Key::char('.'));
         assert!(
             until(Duration::from_secs(2), || {
-                app.drain_jobs();
+                app.pump_quiet();
                 !state.lock().unwrap().paths_written.is_empty()
             }),
             "the remapped key never reached the repository"
@@ -9960,5 +10535,517 @@ diff --git a/tracked.txt b/tracked.txt
         // The old spelling is gone, not armed: unbound, and said.
         app.press(Key::char(' '));
         assert_eq!(app.message, "space is not bound — ? for the keys");
+    }
+
+    // ------------------------------------------------------------------
+    // W1: explicit diff sources, previews that follow the selection, and
+    // the staleness contract on the preview lane.
+
+    /// An app whose working tree holds one file on both sides of the
+    /// index: staged f.txt (HEAD→index) and unstaged f.txt (index→worktree),
+    /// with the sides' contents scripted apart — the A/B/C shape, one
+    /// file, at the App level.
+    fn both_sides_app(state: &Arc<Mutex<FakeState>>, handle: &Handle) -> App {
+        {
+            let mut s = state.lock().unwrap();
+            s.status = Status {
+                staged: vec![StagedEntry {
+                    path: PathBytes::from("f.txt"),
+                    change: Change::Modified,
+                    old_path: None,
+                    kind: Kind::File,
+                    submodule: Submodule::default(),
+                }],
+                unstaged: vec![UnstagedEntry {
+                    path: PathBytes::from("f.txt"),
+                    change: Change::Modified,
+                    kind: Kind::File,
+                    submodule: Submodule::default(),
+                }],
+                ..Default::default()
+            };
+            // HEAD says A, the index says B, the worktree says C: one edit
+            // each side, distinct, so the answer can be told from the wrong
+            // one. `side(0)` is the plain text; `side(1)` adds EDIT ONE; a
+            // pair built (side(0), side(1)) is HEAD→index; (side(1), side(2))
+            // is index→worktree.
+            s.staged = vec![pair("f.txt", side(0), side(1))];
+            s.unstaged = vec![pair("f.txt", side(1), side(2))];
+        }
+        let started = gitten_app::Started {
+            view: View::Commits,
+            source: Source::Repo {
+                path: std::path::PathBuf::from("/fake"),
+                arg: String::new(),
+            },
+            host: Host::new(),
+            loaded: acquire::Loaded {
+                label: "fake".into(),
+                data: Data::Commits(three_commits()),
+            },
+            config: std::path::PathBuf::from("/nonexistent/gitten.toml"),
+            repo: Some(handle.clone()),
+        };
+        let mut app = App::new(started, Glyphs::default());
+        app.load_startup(&mut StartClock::new());
+        app.screen = Screen::new(120, 24);
+        app
+    }
+
+    /// The diff pane's origin, and what it is between.
+    fn origin_of(app: &App) -> Option<DiffSource> {
+        match app.panes.get("diff") {
+            Some(Screens::Diff {
+                origin: Some(origin),
+                ..
+            }) => Some(origin.clone()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn tui_parity_file_selection_previews_its_own_side_and_tab_toggles_it() {
+        let (handle, state) = fake(&[]);
+        let mut app = both_sides_app(&state, &handle);
+        app.draw();
+
+        // The keyboard lands on the files pane; its cursor sits on the
+        // staged row. One step down previews the unstaged side of the same
+        // file, one step up the staged side — the selection drives the
+        // preview, no enter needed, and each read rides the lane.
+        app.dispatch("files.focus");
+        assert!(
+            files_of(&app).current_file().is_some(),
+            "the cursor is on a file"
+        );
+        app.dispatch("view.down");
+        app.pump_quiet();
+        assert_eq!(
+            origin_of(&app),
+            Some(DiffSource::Unstaged {
+                path: PathBytes::from("f.txt"),
+            }),
+            "the unstaged row previewed its own side"
+        );
+        app.dispatch("view.up");
+        app.pump_quiet();
+        assert_eq!(
+            origin_of(&app),
+            Some(DiffSource::Staged {
+                path: PathBytes::from("f.txt"),
+            }),
+            "the staged row previewed its own side"
+        );
+        assert_eq!(
+            state.lock().unwrap().staged_reads,
+            1,
+            "the staged read ran exactly once"
+        );
+        assert_eq!(
+            state.lock().unwrap().unstaged_reads,
+            1,
+            "the unstaged read ran exactly once — no aggregate read substitutes"
+        );
+
+        // Tab is the other side of the same file, when the other side has
+        // it — and the pane carries the source, so a later verb or refresh
+        // reads the side that is shown, not the one that was.
+        app.dispatch("files.toggle-side");
+        app.pump_quiet();
+        assert_eq!(
+            origin_of(&app),
+            Some(DiffSource::Unstaged {
+                path: PathBytes::from("f.txt"),
+            }),
+            "tab switched to the unstaged side"
+        );
+        assert_eq!(state.lock().unwrap().unstaged_reads, 2);
+        assert_eq!(
+            app.panes.focused_name(),
+            "diff",
+            "toggle transfers the keyboard"
+        );
+        assert!(
+            diff_label_of(&app).contains("unstaged"),
+            "the pane says which side it shows: {}",
+            diff_label_of(&app)
+        );
+
+        // Back to the files pane and down, then up: the selection drives
+        // the preview both ways, and the second visit to the staged side
+        // reads nothing.
+        app.dispatch("files.focus");
+        app.dispatch("view.down");
+        app.pump_quiet();
+        assert_eq!(
+            origin_of(&app),
+            Some(DiffSource::Unstaged {
+                path: PathBytes::from("f.txt"),
+            }),
+            "the selection drove the preview to the unstaged side"
+        );
+        app.dispatch("view.up");
+        app.pump_quiet();
+        assert_eq!(
+            origin_of(&app),
+            Some(DiffSource::Staged {
+                path: PathBytes::from("f.txt"),
+            }),
+            "the selection drove the preview back to the staged side"
+        );
+        // Enter on the source already shown reads nothing: the pane's own
+        // origin is what the request deduplicates against.
+        app.dispatch("files.open-diff");
+        app.pump_quiet();
+        assert_eq!(app.panes.focused_name(), "diff");
+        assert_eq!(
+            state.lock().unwrap().staged_reads,
+            2,
+            "the two up-crossings, and no third read for the shown source"
+        );
+    }
+
+    #[test]
+    fn tui_parity_a_side_with_no_other_side_says_so_and_shows_nothing() {
+        let (handle, state) = fake(&[]);
+        let mut app = both_sides_app(&state, &handle);
+        // A second file the index holds and the worktree does not touch:
+        // staged-only, so its other side does not exist.
+        {
+            let mut s = state.lock().unwrap();
+            s.status.staged.push(StagedEntry {
+                path: PathBytes::from("g.txt"),
+                change: Change::Added,
+                old_path: None,
+                kind: Kind::File,
+                submodule: Submodule::default(),
+            });
+            s.staged.push(pair("g.txt", Vec::new(), side(3)));
+        }
+        app.load_startup(&mut StartClock::new());
+        app.draw();
+        app.dispatch("files.focus");
+        // Walk to g.txt — the last staged row — bounded, because a pane
+        // that lost the row must fail the test, not hang it.
+        for _ in 0..10 {
+            if files_of(&app)
+                .current_file()
+                .is_some_and(|f| f.path.as_bytes() == b"g.txt")
+            {
+                break;
+            }
+            app.dispatch("view.down");
+        }
+        app.pump_quiet();
+        assert_eq!(
+            origin_of(&app),
+            Some(DiffSource::Staged {
+                path: PathBytes::from("g.txt"),
+            }),
+            "the walk reached the staged-only file"
+        );
+        app.dispatch("files.toggle-side");
+        assert_eq!(
+            app.message, "nothing unstaged for g.txt",
+            "a side that is not there is said, not drawn empty"
+        );
+        assert_eq!(
+            origin_of(&app),
+            Some(DiffSource::Staged {
+                path: PathBytes::from("g.txt"),
+            }),
+            "the refused toggle changed nothing"
+        );
+    }
+
+    #[test]
+    fn tui_parity_stash_selection_previews_the_parked_diff_and_enter_focuses_it() {
+        let (handle, state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        app.draw();
+        app.dispatch("stashes.focus");
+        // One step down moves the selection off the startup preview's
+        // commit and onto the second stack entry; the preview follows it,
+        // addressed by the commit that a drop does not renumber.
+        app.dispatch("view.down");
+        app.pump_quiet();
+        let parked = state.lock().unwrap().stashes[1].clone();
+        assert_eq!(
+            origin_of(&app),
+            Some(DiffSource::Stash {
+                index: parked.index,
+                commit: parked.commit.clone(),
+            }),
+            "the selection previews the entry under it"
+        );
+        // The tracked half is the bare-revision read the commit preview
+        // uses; the untracked half is the stash's own answer.
+        assert_eq!(
+            state.lock().unwrap().pairs_reads,
+            2,
+            "startup's commit preview plus the stash's tracked half"
+        );
+        assert_eq!(
+            state.lock().unwrap().stash_untracked_reads,
+            1,
+            "the stash's untracked half was asked, once"
+        );
+        app.dispatch("stashes.open-diff");
+        app.pump_quiet();
+        assert_eq!(app.panes.focused_name(), "diff");
+        assert!(
+            diff_label_of(&app).contains("stash@{1}"),
+            "the pane names the entry: {}",
+            diff_label_of(&app)
+        );
+        assert!(
+            diff_label_of(&app).contains("other work"),
+            "the pane names the message: {}",
+            diff_label_of(&app)
+        );
+    }
+
+    #[test]
+    fn tui_parity_branch_enter_drills_into_that_branchs_log_and_stays_there() {
+        let (handle, state) = fake(&[]);
+        {
+            let mut s = state.lock().unwrap();
+            let other = ["x", "y"].map(|sha| Commit {
+                sha: sha.into(),
+                short: sha.into(),
+                parents: Box::from(&[][..]),
+                author: "Ada Lovelace".into(),
+                timestamp: 2,
+                subject: format!("on feat {sha}"),
+            });
+            s.log_at_answers = vec![(b"feat".to_vec(), other.to_vec())];
+            s.locals = vec![
+                Branch {
+                    name: RefName::from("main"),
+                    commit: "f00d".into(),
+                    upstream: None,
+                    head: true,
+                },
+                Branch {
+                    name: RefName::from("feat"),
+                    commit: "beef".into(),
+                    upstream: None,
+                    head: false,
+                },
+            ];
+            s.head = Some(HeadState::Branch {
+                name: RefName::from("main"),
+                commit: Some("f00d".into()),
+            });
+            s.remotes = vec![RemoteBranch {
+                remote: RefName::from("origin"),
+                branch: RefName::from("feat"),
+                commit: "beef".into(),
+            }];
+        }
+        let mut app = commits_app(&handle);
+        app.draw();
+        app.dispatch("branches.focus");
+        // Walk to the branch that is not HEAD's, and open it — bounded,
+        // because a pane that lost the row must fail the test, not hang it.
+        for _ in 0..6 {
+            let on_feat = match app.panes.get("branches") {
+                Some(Screens::Branches { view, .. }) => matches!(
+                    view.current(),
+                    Some(Target::Local(name)) if name.as_bytes() == b"feat"
+                ),
+                _ => false,
+            };
+            if on_feat {
+                break;
+            }
+            app.dispatch("view.down");
+        }
+        app.dispatch("branches.open-log");
+        assert_eq!(
+            app.panes.focused_name(),
+            "diff",
+            "the drilldown takes the keyboard"
+        );
+        // The main pane is the branch's history — its own commits, its own
+        // refresh source, not HEAD's.
+        match app.panes.get("diff") {
+            Some(Screens::Commits {
+                log_of: Some(name),
+                label,
+                ..
+            }) => {
+                assert_eq!(name.as_bytes(), b"feat");
+                assert!(label.contains("feat"), "{label}");
+            }
+            _ => panic!("the main pane is not a branch log"),
+        }
+        assert_eq!(
+            commits_of_main(&app)
+                .map(|c| c.sha.to_string())
+                .unwrap_or_default(),
+            "x",
+            "the log is the drilled branch's, not HEAD's"
+        );
+        // A refresh re-reads the branch it was opened for, exactly once.
+        let before = state.lock().unwrap().log_at_reads;
+        app.dispatch("repo.refresh");
+        app.pump_quiet();
+        assert_eq!(
+            state.lock().unwrap().log_at_reads,
+            before + 1,
+            "the drilldown refreshed from its own ref"
+        );
+        assert_eq!(
+            commits_of_main(&app)
+                .map(|c| c.sha.to_string())
+                .unwrap_or_default(),
+            "x",
+            "the refresh did not quietly become HEAD's history"
+        );
+        // A remote row has no local history to name, and says so. It is the
+        // next row down: walk to it, bounded.
+        app.dispatch("branches.focus");
+        for _ in 0..6 {
+            let on_remote = match app.panes.get("branches") {
+                Some(Screens::Branches { view, .. }) => {
+                    !matches!(view.current(), Some(Target::Local(_)))
+                }
+                _ => false,
+            };
+            if on_remote {
+                break;
+            }
+            app.dispatch("view.down");
+        }
+        app.dispatch("branches.open-log");
+        assert_eq!(app.message, "the keyboard is not on a local branch");
+    }
+
+    /// The main pane's commits list, when the drilldown installed one.
+    fn commits_of_main(app: &App) -> Option<&Commit> {
+        match app.panes.get("diff") {
+            Some(Screens::Commits { view, .. }) => view.current(),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn tui_parity_stale_preview_never_installs() {
+        let (handle, state) = fake(&[]);
+        let mut app = both_sides_app(&state, &handle);
+        app.dispatch("files.focus");
+        // Two real requests, so the lane's counter is where a real session's
+        // would be: down to the unstaged side, back up to the staged one.
+        app.dispatch("view.down");
+        app.pump_quiet();
+        app.dispatch("view.up");
+        app.pump_quiet();
+        let shown = origin_of(&app).expect("a preview is shown");
+        let reads = state.lock().unwrap().staged_reads;
+        let newest = app.preview_seq;
+
+        // Two answers the lane must refuse, by the two guards: an older
+        // sequence — something newer was asked for already — and another
+        // repository's content. Neither installs, neither is said: a newer
+        // request covers the pane, and the stale answer is simply not asked
+        // about any more.
+        app.install_preview(PreviewOutcome {
+            seq: newest - 1,
+            root: std::path::PathBuf::from("/fake"),
+            origin: DiffSource::Unstaged {
+                path: PathBytes::from("f.txt"),
+            },
+            focus: false,
+            outcome: Ok(vec![gitten_core::FileDiff {
+                path: "wrong.txt".into(),
+                hunks: Vec::new(),
+            }]),
+        });
+        app.install_preview(PreviewOutcome {
+            seq: newest,
+            root: std::path::PathBuf::from("/elsewhere"),
+            origin: shown.clone(),
+            focus: false,
+            outcome: Ok(vec![gitten_core::FileDiff {
+                path: "other-repo.txt".into(),
+                hunks: Vec::new(),
+            }]),
+        });
+        app.pump_quiet();
+        assert_eq!(
+            origin_of(&app),
+            Some(shown),
+            "a stale answer replaced the preview"
+        );
+        assert_eq!(
+            state.lock().unwrap().staged_reads,
+            reads,
+            "a stale answer caused another read"
+        );
+        assert_eq!(
+            app.message, "",
+            "a dropped answer said something the pane is not asked about"
+        );
+    }
+
+    #[test]
+    fn tui_parity_a_slow_preview_keeps_the_keyboard_live() {
+        let (handle, state) = fake(&[]);
+        // The staged side is slow for as long as the gate is shut: a real
+        // read, on a real thread, that the test types while it runs.
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        state.lock().unwrap().gate = Some(Arc::clone(&gate));
+        let mut app = both_sides_app(&state, &handle);
+        app.draw();
+        app.dispatch("files.focus");
+        // Land on the unstaged row: its read answers at once and installs.
+        app.dispatch("view.down");
+        app.pump_quiet();
+        // Back up to the staged row: that read is parked behind the gate.
+        app.dispatch("view.up");
+        assert!(
+            app.preview_pending > 0,
+            "the slow read is in flight, unanswered"
+        );
+        // The keyboard is not parked with it: a key is processed, and the
+        // pane's answer arrives whenever it arrives — never in the way.
+        app.dispatch("files.toggle-side");
+        assert_eq!(
+            app.panes.focused_name(),
+            "diff",
+            "the keyboard moved while the preview was still being read"
+        );
+        // Now the parked read finishes — the newest request issued, so it
+        // installs — and the pane carries its source.
+        {
+            let (open, arrived) = &*gate;
+            *open.lock().unwrap() = true;
+            arrived.notify_all();
+        }
+        app.pump_quiet();
+        assert_eq!(
+            origin_of(&app),
+            Some(DiffSource::Staged {
+                path: PathBytes::from("f.txt"),
+            }),
+            "the gated answer installed once it was the newest"
+        );
+        assert_eq!(app.preview_pending, 0, "every answer had its turn");
+    }
+
+    #[test]
+    fn tui_parity_a_fixture_refuses_the_preview_doors_with_their_reason() {
+        let mut app = app_on_diff(Source::Fixtures, None);
+        app.dispatch("files.open-diff");
+        assert_eq!(
+            app.message, "files.open-diff: a fixture has no file to preview",
+            "the launch's refusal is the reason, said once"
+        );
+        app.dispatch("branches.open-log");
+        assert_eq!(
+            app.message,
+            "branches.open-log: a fixture has no history to open",
+        );
     }
 }

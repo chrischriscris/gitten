@@ -17,6 +17,7 @@ use crate::cli::{Source, View};
 use gitten_core::differ::Overrides;
 use gitten_core::host::Host;
 use gitten_core::refs::Stash;
+use gitten_core::source::DiffSource;
 use gitten_core::{Commit, FileDiff};
 use gitten_git::Repo;
 use std::path::Path;
@@ -123,6 +124,105 @@ pub fn reacquire(
     overrides: &Overrides,
 ) -> Result<Loaded, String> {
     acquire_with(view, source, host, repo, overrides, true)
+}
+
+/// Acquires one diff by **source**, not by revspec — the preview door.
+///
+/// [`acquire`](crate::acquire::acquire) answers "what does this view say",
+/// from the command line's own grammar; this one answers "what does this
+/// file, this side, this commit, this stash say", from
+/// [`DiffSource`]'s. Same pipeline behind both — [`Repo`] acquires the
+/// content, the host's own `Differs` decides which lines correspond, and
+/// nothing here invents text a read did not answer with.
+///
+/// The [`Differs`] and the overrides come in separately from a whole
+/// [`Host`] on purpose: a client that previews off the input path (as the
+/// terminal does) runs this on a thread, and a thread takes what it needs.
+/// `Differs` is `Clone`, and a clone shares the answer cache — the diff a
+/// preview computes is the diff a refresh would otherwise compute again.
+///
+/// `allow_empty` is the same distinction [`reacquire`](crate::acquire::reacquire)
+/// draws: a preview refuses to install an empty answer that says the side
+/// moved under the selection, while a refresh of an already-open source may
+/// honestly land empty.
+pub fn diff_source(
+    source: &DiffSource,
+    differs: &gitten_core::differ::Differs,
+    over: &Overrides,
+    repo: &dyn Repo,
+    allow_empty: bool,
+) -> Result<Loaded, String> {
+    use gitten_git::diff_pairs;
+    let pairs = match source {
+        DiffSource::Staged { path } => repo.pairs_staged(Some(path.as_bytes()))?,
+        DiffSource::Unstaged { path } => repo.pairs_unstaged(Some(path.as_bytes()))?,
+        DiffSource::Untracked { path } => match repo.pair_untracked(path.as_bytes())? {
+            Some(pair) => vec![pair],
+            // An unreadable file — deleted between the list and the
+            // preview, a broken symlink — is not an empty diff and not a
+            // crash: it is nothing to show, said plainly.
+            None => {
+                return Err(format!(
+                    "{} is not readable — deleted, or not a file",
+                    path.to_string_lossy()
+                ))
+            }
+        },
+        // A bare revision is "what did this commit change" to
+        // [`Repo::pairs`], merges included — and a stash commit is one, so
+        // its tracked half is the same read. The untracked half is the
+        // third parent's own answer, and goes first, exactly as the
+        // aggregate read puts creations before modifications.
+        DiffSource::Commit { sha } => repo.pairs(sha)?,
+        DiffSource::Stash { commit, .. } => {
+            let tracked = repo.pairs(commit)?;
+            let untracked = repo
+                .pairs_stash_untracked(commit)
+                .map_err(|e| format!("the stash's untracked files: {e}"))?;
+            let mut pairs = Vec::with_capacity(tracked.len() + untracked.len());
+            pairs.extend(untracked);
+            pairs.extend(tracked);
+            pairs
+        }
+        DiffSource::Revspec { arg } => repo.pairs(arg)?,
+        // Detached content has no repository behind it and no read to run:
+        // a caller asking is the bug, and the message is the usage.
+        DiffSource::Fixture | DiffSource::Patch => {
+            return Err("this diff has no repository behind it".into())
+        }
+    };
+    if pairs.is_empty() && !allow_empty {
+        let what = match source {
+            DiffSource::Staged { path } => format!("nothing staged for {}", path),
+            DiffSource::Unstaged { path } => format!("nothing unstaged for {}", path),
+            DiffSource::Untracked { path } => format!("nothing untracked named {}", path),
+            DiffSource::Commit { sha } => format!("{sha} changed nothing"),
+            DiffSource::Stash { index, .. } => format!("stash@{{{index}}} holds no changes"),
+            DiffSource::Revspec { arg } if arg.is_empty() => {
+                "no changes for (working tree)".to_string()
+            }
+            DiffSource::Revspec { arg } => format!("no changes for {arg}"),
+            DiffSource::Fixture | DiffSource::Patch => unreachable!("refused above"),
+        };
+        return Err(what);
+    }
+    Ok(Loaded {
+        label: source.label(),
+        data: Data::Diff(diff_pairs(&pairs, differs, over)),
+    })
+}
+
+/// The command line's own source, as an explicit diff source — what a
+/// launch's diff pane was acquired from. An empty revspec keeps meaning the
+/// combined HEAD→worktree read; the model just says so by name.
+impl From<&Source> for DiffSource {
+    fn from(source: &Source) -> Self {
+        match source {
+            Source::Repo { arg, .. } => DiffSource::Revspec { arg: arg.clone() },
+            Source::Fixtures => DiffSource::Fixture,
+            Source::Patch { .. } => DiffSource::Patch,
+        }
+    }
 }
 
 fn acquire_with(
@@ -287,6 +387,7 @@ fn describe(repo: &dyn Repo, revspec: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gitten_core::source::DiffSource;
     use gitten_core::status::Status;
     use gitten_git::{Handle, Pair};
     use std::path::PathBuf;
@@ -488,6 +589,182 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// **One file, two sides, three contents.** The acceptance shape the
+    /// preview contract is built on: a scratch file with HEAD=A, index=B,
+    /// worktree=C yields precisely A→B from the staged source and B→C from
+    /// the unstaged source — and neither answer is the aggregate read's,
+    /// which is the defect this packet exists to remove. A real repository,
+    /// because the claim is about what git answers, not what a fake was told.
+    #[test]
+    fn a_file_previews_as_head_to_index_and_index_to_worktree() {
+        let repo = Scratch::new("sides");
+        repo.commit(b"alpha\nshared\nomega\n"); // HEAD: A
+        std::fs::write(repo.0.join("f.txt"), b"ALPHA\nshared\nomega\n").expect("index");
+        repo.git(&["add", "f.txt"]); // index: B
+        std::fs::write(repo.0.join("f.txt"), b"ALPHA\nSHARED\nOMEGA\n").expect("worktree"); // C
+        let handle = gitten_git::open(&repo.0);
+        let differ = Host::new().differ;
+
+        let staged = diff_source(
+            &DiffSource::Staged {
+                path: "f.txt".into(),
+            },
+            &differ,
+            &Overrides::default(),
+            handle.as_ref(),
+            false,
+        )
+        .expect("the staged side has the change");
+        let unstaged = diff_source(
+            &DiffSource::Unstaged {
+                path: "f.txt".into(),
+            },
+            &differ,
+            &Overrides::default(),
+            handle.as_ref(),
+            false,
+        )
+        .expect("the unstaged side has the change");
+
+        // A→B, byte for byte, and B→C likewise.
+        let changed = |l: &Loaded| {
+            let Data::Diff(files) = &l.data else {
+                panic!("a preview loads a diff");
+            };
+            assert_eq!(files.len(), 1);
+            files[0]
+                .hunks
+                .iter()
+                .flat_map(|h| &h.lines)
+                .filter(|l| l.kind != gitten_core::LineKind::Context)
+                .map(|l| (l.kind, l.text.to_string()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            changed(&staged),
+            vec![
+                (gitten_core::LineKind::Removed, "alpha".to_string()),
+                (gitten_core::LineKind::Added, "ALPHA".to_string()),
+            ],
+            "the staged side is HEAD\u{2192}index, not HEAD\u{2192}worktree"
+        );
+        assert_eq!(
+            changed(&unstaged),
+            vec![
+                (gitten_core::LineKind::Removed, "shared".to_string()),
+                (gitten_core::LineKind::Removed, "omega".to_string()),
+                (gitten_core::LineKind::Added, "SHARED".to_string()),
+                (gitten_core::LineKind::Added, "OMEGA".to_string()),
+            ],
+            "the unstaged side is index\u{2192}worktree, not HEAD\u{2192}worktree"
+        );
+    }
+
+    /// A file known to no part of git previews from disk alone, through the
+    /// same pipeline: empty old side, the file's own lines as the new one.
+    #[test]
+    fn an_untracked_file_previews_from_disk_and_nowhere_else() {
+        let repo = Scratch::new("loose");
+        repo.commit(b"seed\n");
+        std::fs::write(repo.0.join("g.txt"), b"brand new\nlines\n").expect("untracked");
+        let handle = gitten_git::open(&repo.0);
+        let loaded = diff_source(
+            &DiffSource::Untracked {
+                path: "g.txt".into(),
+            },
+            &Host::new().differ,
+            &Overrides::default(),
+            handle.as_ref(),
+            false,
+        )
+        .expect("the file is readable");
+        let Data::Diff(files) = loaded.data else {
+            panic!("a preview loads a diff");
+        };
+        assert_eq!(files[0].path, "g.txt");
+        assert_eq!(
+            files[0]
+                .hunks
+                .iter()
+                .flat_map(|h| &h.lines)
+                .map(|l| (l.kind, l.text.to_string()))
+                .collect::<Vec<_>>(),
+            vec![
+                (gitten_core::LineKind::Added, "brand new".to_string()),
+                (gitten_core::LineKind::Added, "lines".to_string()),
+            ]
+        );
+    }
+
+    /// **Unborn and empty are states, not crashes.** An index that holds a
+    /// file on a branch with no commits previews against the empty tree; a
+    /// side with nothing in it says what is missing; a file that is not on
+    /// disk says so; and no path anywhere panics.
+    #[test]
+    fn an_unborn_repository_previews_its_index_and_says_what_is_missing() {
+        let repo = Scratch::new("unborn");
+        std::fs::write(repo.0.join("f.txt"), b"only the index holds me\n").expect("staged");
+        repo.git(&["add", "f.txt"]);
+        let handle = gitten_git::open(&repo.0);
+        let differ = Host::new().differ;
+
+        let staged = diff_source(
+            &DiffSource::Staged {
+                path: "f.txt".into(),
+            },
+            &differ,
+            &Overrides::default(),
+            handle.as_ref(),
+            false,
+        )
+        .expect("an unborn branch's index reads against the empty tree");
+        let Data::Diff(files) = staged.data else {
+            panic!("a preview loads a diff");
+        };
+        assert_eq!(
+            files[0]
+                .hunks
+                .iter()
+                .flat_map(|h| &h.lines)
+                .map(|l| (l.kind, l.text.to_string()))
+                .collect::<Vec<_>>(),
+            vec![(
+                gitten_core::LineKind::Added,
+                "only the index holds me".to_string()
+            )]
+        );
+
+        // A side with nothing in it is a message, not an empty success and
+        // not a git refusal about a revision that does not exist.
+        let unstaged = diff_source(
+            &DiffSource::Unstaged {
+                path: "f.txt".into(),
+            },
+            &differ,
+            &Overrides::default(),
+            handle.as_ref(),
+            false,
+        );
+        assert_eq!(
+            unstaged.unwrap_err(),
+            "nothing unstaged for f.txt",
+            "the empty side names itself"
+        );
+        let missing = diff_source(
+            &DiffSource::Untracked {
+                path: "ghost.txt".into(),
+            },
+            &differ,
+            &Overrides::default(),
+            handle.as_ref(),
+            false,
+        );
+        assert!(
+            missing.unwrap_err().contains("not readable"),
+            "a file that is not on disk says so"
+        );
     }
 
     fn lines_of(loaded: &Loaded) -> Vec<(gitten_core::LineKind, String)> {

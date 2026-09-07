@@ -493,6 +493,17 @@ impl Files {
     /// together, which is what a stage verb needs to know where its work
     /// goes. `None` only on an empty or unavailable tree, since the cursor
     /// never rests on a heading.
+    /// Whether a section holds a path — what a side toggle consults before
+    /// it switches: a file that exists only on one side of the index has no
+    /// other side to switch to, and the row list is the one place that
+    /// answer lives.
+    pub fn has_row(&self, section: Section, path: &PathBytes) -> bool {
+        self.rows.iter().any(|row| match row {
+            Entry::File(file) => file.section == section && &file.path == path,
+            _ => false,
+        })
+    }
+
     pub fn current_file(&self) -> Option<&FileRow> {
         match self.rows.get(self.view.cursor()) {
             Some(Entry::File(f)) => Some(f),

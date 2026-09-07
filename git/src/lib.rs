@@ -68,6 +68,11 @@ pub type Result<T> = std::result::Result<T, String>;
 /// Must match `gitten_core::parse_log`.
 const LOG_FORMAT: &str = "%H%x1f%h%x1f%P%x1f%an%x1f%at%x1f%s%x1e";
 
+/// [`RAW`](Self::pairs)'s argument list, spelled in bytes for the side reads
+/// whose pathspec is a raw name. Keep the two lists the same: one spell of
+/// `--raw -z -M --abbrev=64 --no-ext-diff`, whatever calls it.
+const RAW_B: [&[u8]; 5] = [b"--raw", b"-z", b"-M", b"--abbrev=64", b"--no-ext-diff"];
+
 /// An OID of all zeros is git's "not in the object database", which on the new
 /// side of a `git diff` means "look in the working tree".
 ///
@@ -362,6 +367,49 @@ pub trait Repo: Send + Sync {
     /// untracked files included; a revspec compares two commits, and neither
     /// has untracked files in it.
     fn pairs(&self, revspec: &str) -> Result<Vec<Pair>>;
+
+    /// `HEAD`'s tree → the index: the staged side, for one path or the
+    /// whole side.
+    ///
+    /// The path is raw bytes, matched byte for byte — a lossy decode here
+    /// would rename somebody's file on the way to the answer. A rename
+    /// record names either of its two paths. A repository with no commits
+    /// yet is not a failure: the index reads against the empty tree, which
+    /// is what every staged file on an unborn branch actually is.
+    fn pairs_staged(&self, _path: Option<&[u8]>) -> Result<Vec<Pair>> {
+        Err(unserved("the staged side"))
+    }
+
+    /// The index → the working tree: the unstaged side, for one path or the
+    /// whole side. Untracked files are not here — they are in no tree and
+    /// no index, and [`Self::pair_untracked`] is their door.
+    fn pairs_unstaged(&self, _path: Option<&[u8]>) -> Result<Vec<Pair>> {
+        Err(unserved("the unstaged side"))
+    }
+
+    /// One untracked file's contents, as a pair with nothing opposite it.
+    ///
+    /// `None` is an honest answer, not an error: an unreadable file — a
+    /// broken symlink, a file deleted between the status read and this
+    /// one — has no contents to show.
+    fn pair_untracked(&self, _path: &[u8]) -> Result<Option<Pair>> {
+        Err(unserved("the untracked file"))
+    }
+
+    /// The untracked files one stash parked, as pairs with nothing opposite
+    /// them. `git stash push -u` keeps them in a third parent commit; a
+    /// stash without one answers empty, which is the ordinary case.
+    fn pairs_stash_untracked(&self, _commit: &str) -> Result<Vec<Pair>> {
+        Err(unserved("a stash's untracked files"))
+    }
+
+    /// Commit history from a ref other than HEAD, newest first — a branch
+    /// drilldown's read. Same [`Self::log`] rules: `--topo-order`, newest
+    /// first, and the revspec is raw bytes, because branch names carry no
+    /// encoding guarantee.
+    fn log_at(&self, _revspec: &[u8], _limit: usize) -> Result<Vec<Commit>> {
+        Err(unserved("a ref's log"))
+    }
 
     /// The working tree against HEAD and the index: staged, unstaged,
     /// untracked and conflicted, each list its own answer. See
@@ -1014,184 +1062,171 @@ impl Repo for Binary {
     }
 
     fn pairs(&self, revspec: &str) -> Result<Vec<Pair>> {
-        // `-z` for NUL-separated paths, because a path may contain anything a
-        // filesystem allows and git otherwise quotes and escapes it. `-M` so a
-        // rename arrives as one file with two names instead of a delete and an
-        // add of an identical blob.
-        //
-        // `--abbrev=64` is load-bearing and looks like a no-op: `--raw` abbreviates
-        // OIDs by default, and `cat-file --batch` echoes back the *full* OID in its
-        // response header, so an abbreviated request cannot be matched to its
-        // answer. 64 is clamped to whatever the repository's hash length actually
-        // is, which makes this right for SHA-256 repositories too.
-        const RAW: [&str; 5] = ["--raw", "-z", "-M", "--abbrev=64", "--no-ext-diff"];
-        let raw = if revspec.is_empty() {
-            run(&self.root, &[&["diff"], &RAW[..], &["HEAD"]].concat())?
-        } else if revspec.contains("..") {
-            run(
-                &self.root,
-                &[&["diff"], &RAW[..], &["--end-of-options", revspec]].concat(),
-            )?
-        } else {
-            // A bare revision means "what did this commit change".
-            //
-            // Merges included. Modern git emits no diff at all for a merge unless
-            // asked — `git show --raw` prints zero records for one — so a merge
-            // commit selected in the log would render as an empty diff, silently.
-            // First-parent asks for the ordinary single-old/single-new records
-            // this parser already handles. Nothing else reaches this parser: the
-            // refusal of two-colon combined records in `parse_raw` below is
-            // belt-and-braces against future or unknown shapes, not a
-            // currently-reachable input. The flag needs git >= 2.31 (March 2021);
-            // older gits reject it and every bare-revision open fails wholesale
-            // rather than silently.
-            run(
-                &self.root,
-                &[
-                    &["show"],
-                    &RAW[..],
-                    &[
-                        "--format=",
-                        "--diff-merges=first-parent",
-                        "--end-of-options",
-                        revspec,
-                    ],
-                ]
-                .concat(),
-            )?
-        };
-
-        let changes = parse_raw(&raw);
-
-        // `--raw` and `--porcelain` paths are relative to the repository's top
-        // level, while `root` may be any subdirectory of it (the CLI default is
-        // the cwd) — so every working-tree read below joins onto the top level,
-        // never onto `root` itself. Object reads do not care: `-C` finds the
-        // objects from anywhere inside.
-        let top = self.top.get_or_init(|| top_level(&self.root));
-
-        // Every blob the whole diff needs, fetched by one `cat-file --batch` —
-        // but held one file at a time. The batch answers strictly in request
-        // order (it reads one OID and writes one answer before reading the
-        // next), and requests go out in pair order, old side then new, so the
-        // answers can be pulled back per file as each [`Pair`] is built instead
-        // of parking every old+new blob of the diff in a map until the last one.
-        // On a thousand-file diff that map was tens of MB of pure peak overlap.
-        // A duplicate OID costs a second read rather than a second copy, which is
-        // the trade the map made implicitly.
-        let mut wanted: Vec<&str> = Vec::with_capacity(changes.len() * 2);
-        for c in &changes {
-            for (mode, oid) in [(&c.old_mode, &c.old_oid), (&c.new_mode, &c.new_oid)] {
-                if fetchable(mode, oid) {
-                    wanted.push(oid);
-                }
-            }
+        let raw = self.raw_for(revspec)?;
+        if !revspec.is_empty() {
+            let top = self.top.get_or_init(|| top_level(&self.root));
+            return self.assemble(parse_raw(&raw), top, false);
         }
-
-        // The working-tree pair wants blobs *and* a status, and the two are
-        // independent — status reads the index and the working tree, the batch
-        // fetches OIDs the diff has already named — so they run side by side and
-        // an open of uncommitted work pays one spawn floor instead of two. Nothing
-        // is shared between them but this handle's root, and neither touches what
-        // the other reads. The stream's errors surface first, as `cat-file`'s did
-        // when both ran in sequence: a failure to start comes back before any
-        // answer is read, and the first failed answer below comes back before
-        // status is asked for. A panic in either is resumed rather than swallowed
-        // because both calls used to be inline.
-        let (blobs, loose) = if revspec.is_empty() {
-            std::thread::scope(|s| {
-                let loose = s.spawn(|| self.status());
-                let blobs = BlobStream::start(&self.root, &wanted);
-                (
-                    blobs,
-                    loose
-                        .join()
-                        .unwrap_or_else(|p| std::panic::resume_unwind(p)),
-                )
-            })
-        } else {
-            (
-                BlobStream::start(&self.root, &wanted),
-                Ok(Status::default()),
-            )
-        };
-        let mut blobs = blobs?;
-
-        let mut out = Vec::with_capacity(changes.len());
-        // Untracked files first, so they read as new before the modifications —
-        // `git status` lists them last and that is the wrong way round for a diff,
+        // The aggregate read is the one that wants untracked files in it, and
+        // untracked files come from the status pass — so the status read runs
+        // beside the whole blob-and-assembly road, not behind it: an open of
+        // uncommitted work pays one spawn floor, not two. The untracked pairs
+        // go first, so they read as new before the modifications — `git
+        // status` lists them last and that is the wrong way round for a diff,
         // where the thing you just created is the thing you are looking for.
-        // Fetching them early changed when they arrive, not where they land.
-        out.extend(loose?.untracked.iter().filter_map(|e| loose_pair(e, top)));
-        for c in changes {
-            // Both sides pull in request order — old, then new — which is what
-            // keeps this loop aligned with the stream.
-            //
-            // The two sides also read a null OID differently, and conflating them
-            // is a silent, plausible-looking bug: an added file whose old side
-            // falls back to the working tree diffs against itself and shows no
-            // change at all. The old side has no fallback: a null OID there means
-            // the file did not exist, and reading the tree for it would diff an
-            // added file against itself. On the new side a null OID is the
-            // ordinary case of a working-tree diff — what the file says now is on
-            // disk and nowhere else.
-            let fetched_old = if fetchable(&c.old_mode, &c.old_oid) {
-                blobs.answer()?
-            } else {
-                None
+        let top = self.top.get_or_init(|| top_level(&self.root));
+        let changes = parse_raw(&raw);
+        std::thread::scope(|s| {
+            let loose = s.spawn(|| self.status());
+            let built = self.assemble(changes, top, true);
+            let loose = loose
+                .join()
+                .unwrap_or_else(|p| std::panic::resume_unwind(p))?;
+            let built = built?;
+            let mut out = Vec::with_capacity(built.len() + loose.untracked.len());
+            out.extend(loose.untracked.iter().filter_map(|e| loose_pair(e, top)));
+            out.extend(built);
+            Ok(out)
+        })
+    }
+
+    fn pairs_staged(&self, path: Option<&[u8]>) -> Result<Vec<Pair>> {
+        // `HEAD`'s tree against the index. On an unborn branch there is no
+        // tree to name, and the honest answer is the empty tree: everything
+        // in the index is an addition, which is what `git init` + `add` +
+        // nothing else actually means. The empty tree's own oid — computed
+        // here, once per call, because the hash length is this repository's
+        // and not sha-1's — keeps the same `--raw` shape every other read
+        // below parses.
+        let raw = match self.head_commit()? {
+            Some(_) => {
+                let mut args: Vec<&[u8]> = vec![b"diff", b"--cached"];
+                args.extend(RAW_B);
+                self.side_raw(args, path)?
+            }
+            None => {
+                let empty = run(&self.root, &["hash-object", "-t", "tree", "/dev/null"])?;
+                let empty = String::from_utf8_lossy(&empty).trim_end().to_string();
+                let mut args: Vec<&[u8]> = vec![b"diff", b"--cached"];
+                args.extend(RAW_B);
+                args.push(b"--end-of-options");
+                args.push(empty.as_bytes());
+                self.side_raw(args, path)?
+            }
+        };
+        self.side_pairs(raw, path, false)
+    }
+
+    fn pairs_unstaged(&self, path: Option<&[u8]>) -> Result<Vec<Pair>> {
+        // Index against the working tree, with no tree named: the index is
+        // always there, so an unborn branch costs this read nothing.
+        let mut args: Vec<&[u8]> = vec![b"diff"];
+        args.extend(RAW_B);
+        let raw = self.side_raw(args, path)?;
+        self.side_pairs(raw, path, true)
+    }
+
+    fn pair_untracked(&self, path: &[u8]) -> Result<Option<Pair>> {
+        // The same door the aggregate read sources its untracked pairs
+        // through: the file read off the top level, bytes in, `None` for an
+        // unreadable one. The entry is built, not read — the caller names
+        // the file, so no status pass pays for it.
+        let top = self.top.get_or_init(|| top_level(&self.root));
+        let entry = UntrackedEntry {
+            path: PathBytes::from_bytes(path),
+        };
+        Ok(loose_pair(&entry, top))
+    }
+
+    fn pairs_stash_untracked(&self, commit: &str) -> Result<Vec<Pair>> {
+        // `git stash push -u` parks untracked files in a third parent. A
+        // stash without one — the ordinary case — answers empty here: the
+        // `--verify --quiet` read refuses and that is the whole story, not
+        // an error to surface. The expression is our own oid; a corrupt
+        // object answers the same empty and is found on the next read.
+        let third = match run(
+            &self.root,
+            &["rev-parse", "--verify", "--quiet", &format!("{commit}^3")],
+        ) {
+            Ok(bytes) if !bytes.iter().all(|b| b.is_ascii_whitespace()) => {
+                String::from_utf8_lossy(&bytes).trim().to_string()
+            }
+            _ => return Ok(Vec::new()),
+        };
+        // `ls-tree -rz` answers `<mode> <type> <oid>\t<path>\0` per entry,
+        // NUL-framed like every other read here. Only blobs are content:
+        // a gitlink parked by `-u` is a borrowed commit with nothing to
+        // read, and it is skipped rather than shown as empty text.
+        let listed = run(&self.root, &["ls-tree", "-rz", &third])?;
+        let mut wanted: Vec<&str> = Vec::new();
+        let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+        for record in listed.split(|b| *b == 0) {
+            if record.is_empty() {
+                continue;
+            }
+            // `<mode> <type> <oid>\t<path>` — the tab is the one separator
+            // the path itself cannot contain, because `ls-tree -z` NUL-frames
+            // the records. (`slice::split_once` is still unstable; the find is
+            // the same answer.)
+            let Some(at) = record.iter().position(|b| *b == b'\t') else {
+                continue;
             };
-            let fetched_new = if fetchable(&c.new_mode, &c.new_oid) {
-                blobs.answer()?
-            } else {
-                None
+            let (meta, path) = (&record[..at], &record[at + 1..]);
+            let mut fields = meta.split(|b| *b == b' ').filter(|f| !f.is_empty());
+            let (Some(mode), Some(kind), Some(oid)) = (fields.next(), fields.next(), fields.next())
+            else {
+                continue;
             };
-            let old = RawChange::synthetic(&c.old_mode, &c.old_oid).or(fetched_old);
-            let new = RawChange::synthetic(&c.new_mode, &c.new_oid)
-                .or(fetched_new)
-                .or_else(|| {
-                    // Only a working-tree diff can have content outside the
-                    // object database. A historical deletion has the same null
-                    // new OID, but reading a later recreation from disk would
-                    // put bytes into a revision where the file did not exist.
-                    revspec
-                        .is_empty()
-                        .then(|| new_side(&c.new_oid, top, c.path.as_bytes()))
-                        .flatten()
-                });
-            let binary = old.as_ref().is_some_and(|b| is_binary(b))
-                || new.as_ref().is_some_and(|b| is_binary(b));
-            // The lossy decode happens here and only here: everything above —
-            // the record, the batch alignment, the working-tree read — went
-            // through the raw bytes, so what reaches a frontend is the display
-            // form of the path git actually named.
-            //
-            // The OIDs ride along under exactly [`fetchable`]'s rule, which is
-            // also how they were chosen for the request list: a side with no
-            // blob behind it has no identity worth keying anything on.
+            if kind != b"blob" || mode == GITLINK.as_bytes() {
+                continue;
+            }
+            wanted.push(std::str::from_utf8(oid).unwrap_or_default());
+            entries.push((String::from_utf8_lossy(oid).into_owned(), path.to_vec()));
+        }
+        let mut blobs = BlobStream::start(&self.root, &wanted)?;
+        let mut out = Vec::with_capacity(entries.len());
+        for (oid, path) in entries {
+            // The parked blob is the whole of the new side; there is no old
+            // side to fall back to and none to invent — an untracked file
+            // existed nowhere before the stash took it.
+            let content = blobs.answer()?;
+            let binary = content.as_ref().is_some_and(|b| is_binary(b));
             out.push(Pair {
-                path: c.path.to_string_lossy().into_owned(),
-                old_path: c
-                    .old_path
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().into_owned()),
-                status: c.status,
-                old: if binary {
-                    Vec::new()
-                } else {
-                    lines(old.as_deref().unwrap_or_default())
+                path: String::from_utf8_lossy(&path).into_owned(),
+                old_path: None,
+                status: 'A',
+                old: Vec::new(),
+                new: match (&content, binary) {
+                    (Some(bytes), false) => lines(bytes),
+                    _ => Vec::new(),
                 },
-                new: if binary {
-                    Vec::new()
-                } else {
-                    lines(new.as_deref().unwrap_or_default())
-                },
-                old_oid: fetchable(&c.old_mode, &c.old_oid).then(|| c.old_oid.clone()),
-                new_oid: fetchable(&c.new_mode, &c.new_oid).then(|| c.new_oid.clone()),
+                old_oid: None,
+                new_oid: Some(oid),
                 binary,
             });
         }
         blobs.finish()?;
         Ok(out)
+    }
+
+    fn log_at(&self, revspec: &[u8], limit: usize) -> Result<Vec<Commit>> {
+        // The same read [`Self::log`] makes, aimed at a named ref: the same
+        // `--topo-order` lane assignment assumes, the same format, the rev
+        // as raw bytes behind `--end-of-options`.
+        let n = limit.to_string();
+        let bytes = run_bytes(
+            &self.root,
+            &[
+                b"log",
+                b"--topo-order",
+                b"-n",
+                n.as_bytes(),
+                LOG_FORMAT.as_bytes(),
+                b"--end-of-options",
+                revspec,
+            ],
+        )?;
+        Ok(parse_log(&String::from_utf8_lossy(&bytes)))
     }
 
     fn status(&self) -> Result<Status> {
@@ -1861,6 +1896,211 @@ impl Repo for Binary {
 }
 
 impl Binary {
+    /// Whether `HEAD` names a commit, and which.
+    ///
+    /// `--verify --quiet` answers empty and nonzero when it does not — the
+    /// unborn branch every fresh `git init` produces, and a repository whose
+    /// HEAD is broken read the same way. Both are, for the readers below,
+    /// the same state: there is no tree here to compare anything against.
+    fn head_commit(&self) -> Result<Option<String>> {
+        let text = match run(&self.root, &["rev-parse", "--verify", "--quiet", "HEAD"]) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).trim().to_string(),
+            // The nonzero answer is the point of `--quiet`: no commit to name.
+            Err(_) => String::new(),
+        };
+        Ok((!text.is_empty()).then_some(text))
+    }
+
+    /// The three `git` invocations behind [`Self::pairs`], split only so the
+    /// side reads below can share the argument shape.
+    fn raw_for(&self, revspec: &str) -> Result<Vec<u8>> {
+        // `-z` for NUL-separated paths, because a path may contain anything a
+        // filesystem allows and git otherwise quotes and escapes it. `-M` so a
+        // rename arrives as one file with two names instead of a delete and an
+        // add of an identical blob.
+        //
+        // `--abbrev=64` is load-bearing and looks like a no-op: `--raw` abbreviates
+        // OIDs by default, and `cat-file --batch` echoes back the *full* OID in its
+        // response header, so an abbreviated request cannot be matched to its
+        // answer. 64 is clamped to whatever the repository's hash length actually
+        // is, which makes this right for SHA-256 repositories too.
+        const RAW: [&str; 5] = ["--raw", "-z", "-M", "--abbrev=64", "--no-ext-diff"];
+        if revspec.is_empty() {
+            run(&self.root, &[&["diff"], &RAW[..], &["HEAD"]].concat())
+        } else if revspec.contains("..") {
+            run(
+                &self.root,
+                &[&["diff"], &RAW[..], &["--end-of-options", revspec]].concat(),
+            )
+        } else {
+            // A bare revision means "what did this commit change".
+            //
+            // Merges included. Modern git emits no diff at all for a merge unless
+            // asked — `git show --raw` prints zero records for one — so a merge
+            // commit selected in the log would render as an empty diff, silently.
+            // First-parent asks for the ordinary single-old/single-new records
+            // this parser already handles. Nothing else reaches this parser: the
+            // refusal of two-colon combined records in `parse_raw` below is
+            // belt-and-braces against future or unknown shapes, not a
+            // currently-reachable input. The flag needs git >= 2.31 (March 2021);
+            // older gits reject it and every bare-revision open fails wholesale
+            // rather than silently.
+            run(
+                &self.root,
+                &[
+                    &["show"],
+                    &RAW[..],
+                    &[
+                        "--format=",
+                        "--diff-merges=first-parent",
+                        "--end-of-options",
+                        revspec,
+                    ],
+                ]
+                .concat(),
+            )
+        }
+    }
+
+    /// One diff's blob road: the batch fetch and the per-file assembly, from
+    /// the records `parse_raw` produced. Shared by the aggregate read and
+    /// both side reads; `worktree` is whether the *new* side may hold
+    /// content that lives on disk and nowhere else.
+    ///
+    /// Every blob the whole diff needs, fetched by one `cat-file --batch` —
+    /// but held one file at a time. The batch answers strictly in request
+    /// order (it reads one OID and writes one answer before reading the
+    /// next), and requests go out in pair order, old side then new, so the
+    /// answers can be pulled back per file as each [`Pair`] is built instead
+    /// of parking every old+new blob of the diff in a map until the last one.
+    /// On a thousand-file diff that map was tens of MB of pure peak overlap.
+    /// A duplicate OID costs a second read rather than a second copy, which is
+    /// the trade the map made implicitly.
+    fn assemble(
+        &self,
+        changes: Vec<RawChange>,
+        top: &std::path::Path,
+        worktree: bool,
+    ) -> Result<Vec<Pair>> {
+        let mut wanted: Vec<&str> = Vec::with_capacity(changes.len() * 2);
+        for c in &changes {
+            for (mode, oid) in [(&c.old_mode, &c.old_oid), (&c.new_mode, &c.new_oid)] {
+                if fetchable(mode, oid) {
+                    wanted.push(oid);
+                }
+            }
+        }
+        let mut blobs = BlobStream::start(&self.root, &wanted)?;
+
+        let mut out = Vec::with_capacity(changes.len());
+        for c in changes {
+            // Both sides pull in request order — old, then new — which is what
+            // keeps this loop aligned with the stream.
+            //
+            // The two sides also read a null OID differently, and conflating them
+            // is a silent, plausible-looking bug: an added file whose old side
+            // falls back to the working tree diffs against itself and shows no
+            // change at all. The old side has no fallback: a null OID there means
+            // the file did not exist, and reading the tree for it would diff an
+            // added file against itself. On the new side a null OID is the
+            // ordinary case of a working-tree diff — what the file says now is on
+            // disk and nowhere else.
+            let fetched_old = if fetchable(&c.old_mode, &c.old_oid) {
+                blobs.answer()?
+            } else {
+                None
+            };
+            let fetched_new = if fetchable(&c.new_mode, &c.new_oid) {
+                blobs.answer()?
+            } else {
+                None
+            };
+            let old = RawChange::synthetic(&c.old_mode, &c.old_oid).or(fetched_old);
+            let new = RawChange::synthetic(&c.new_mode, &c.new_oid)
+                .or(fetched_new)
+                .or_else(|| {
+                    // Only a diff whose *new* side is the working tree can have
+                    // content outside the object database — the aggregate
+                    // HEAD→worktree read and the index→worktree side both. A
+                    // historical deletion has the same null new OID, but reading
+                    // a later recreation from disk would put bytes into a
+                    // revision where the file did not exist.
+                    worktree
+                        .then(|| new_side(&c.new_oid, top, c.path.as_bytes()))
+                        .flatten()
+                });
+            let binary = old.as_ref().is_some_and(|b| is_binary(b))
+                || new.as_ref().is_some_and(|b| is_binary(b));
+            // The lossy decode happens here and only here: everything above —
+            // the record, the batch alignment, the working-tree read — went
+            // through the raw bytes, so what reaches a frontend is the display
+            // form of the path git actually named.
+            //
+            // The OIDs ride along under exactly [`fetchable`]'s rule, which is
+            // also how they were chosen for the request list: a side with no
+            // blob behind it has no identity worth keying anything on.
+            out.push(Pair {
+                path: c.path.to_string_lossy().into_owned(),
+                old_path: c
+                    .old_path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned()),
+                status: c.status,
+                old: if binary {
+                    Vec::new()
+                } else {
+                    lines(old.as_deref().unwrap_or_default())
+                },
+                new: if binary {
+                    Vec::new()
+                } else {
+                    lines(new.as_deref().unwrap_or_default())
+                },
+                old_oid: fetchable(&c.old_mode, &c.old_oid).then(|| c.old_oid.clone()),
+                new_oid: fetchable(&c.new_mode, &c.new_oid).then(|| c.new_oid.clone()),
+                binary,
+            });
+        }
+        blobs.finish()?;
+        Ok(out)
+    }
+
+    /// One `git diff` read for a side: the arguments above, plus the
+    /// pathspec when one was asked for. The path travels as raw bytes —
+    /// [`run_bytes`], never a lossy spelling — and git does the matching,
+    /// which keeps rename records (whose record names either of its two
+    /// paths) and non-UTF-8 names exact.
+    fn side_raw(&self, args: Vec<&[u8]>, path: Option<&[u8]>) -> Result<Vec<u8>> {
+        match path {
+            None => run_bytes(&self.root, &args),
+            Some(p) => {
+                let mut args = args;
+                args.push(b"--");
+                args.push(p);
+                run_bytes(&self.root, &args)
+            }
+        }
+    }
+
+    /// A side read's records, narrowed to the path asked for when there was
+    /// one, then assembled. The narrowing is byte-exact on both names — a
+    /// rename's record matches either — so nothing is fetched for a file
+    /// nobody is looking at.
+    fn side_pairs(&self, raw: Vec<u8>, path: Option<&[u8]>, worktree: bool) -> Result<Vec<Pair>> {
+        let changes = parse_raw(&raw);
+        let changes = match path {
+            None => changes,
+            Some(p) => changes
+                .into_iter()
+                .filter(|c| {
+                    c.path.as_bytes() == p || c.old_path.as_ref().is_some_and(|o| o.as_bytes() == p)
+                })
+                .collect(),
+        };
+        let top = self.top.get_or_init(|| top_level(&self.root));
+        self.assemble(changes, top, worktree)
+    }
+
     /// Runs `head ++ paths` through [`run_bytes`], in as many processes as
     /// [`ARGV_BUDGET`] demands — one for every list a person actually
     /// stages, several only for the fresh-repository trees bulk exists for.
@@ -2266,8 +2506,14 @@ pub fn diff(
     differs: &Differs,
     over: &Overrides,
 ) -> Result<Vec<FileDiff>> {
-    Ok(repo
-        .pairs(revspec)?
+    Ok(diff_pairs(&repo.pairs(revspec)?, differs, over))
+}
+
+/// The differ pipeline over already-acquired pairs — [`diff`]'s second half,
+/// for the caller that acquired its pairs some other way: a single side, a
+/// file, a stash's untracked half.
+pub fn diff_pairs(pairs: &[Pair], differs: &Differs, over: &Overrides) -> Vec<FileDiff> {
+    pairs
         .iter()
         .map(|p| match p.binary {
             // Modelled as a file with no hunks rather than skipped: the diff
@@ -2286,7 +2532,7 @@ pub fn diff(
                 ..differs.file_using(over, &p.path, &p.old, &p.new, p.blobs())
             },
         })
-        .collect())
+        .collect()
 }
 
 // -------------------------------------------------------------------- status

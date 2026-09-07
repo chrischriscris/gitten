@@ -8,6 +8,8 @@ use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 
+pub use crate::source::DiffSource;
+
 pub mod align;
 pub mod command;
 pub mod differ;
@@ -24,6 +26,7 @@ pub mod rows;
 pub mod runs;
 pub mod search;
 pub mod select;
+pub mod source;
 pub mod status;
 pub mod syntax;
 pub mod theme;

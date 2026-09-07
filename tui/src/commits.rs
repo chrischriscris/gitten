@@ -287,6 +287,13 @@ impl Commits {
     /// of the *filtered* list, and under a query those are not the same
     /// position. Everything that acts on "this commit" — open-diff, copy —
     /// reads through here, which is why filtering cannot desync them.
+    /// The commit an object id names, from the rows this pane holds — the
+    /// subject a preview's label borrows. `None` when the pane does not
+    /// hold it: a filtered list, a history the drilldown replaced.
+    pub fn with_sha(&self, sha: &str) -> Option<&Commit> {
+        self.commits.iter().find(|c| c.sha == sha)
+    }
+
     pub fn current(&self) -> Option<&Commit> {
         self.commits.get(*self.visible.get(self.view.cursor())?)
     }
