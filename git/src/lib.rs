@@ -508,6 +508,20 @@ pub trait Repo: Send + Sync {
         Err(unserved("discarding"))
     }
 
+    /// Restores one path to the version a commit holds —
+    /// `git checkout <sha> -- <path>`, worktree and index together.
+    ///
+    /// [`discard`](Self::discard)'s older sibling: same mechanics, an
+    /// older source. The sha rides argv as bytes behind [`refuse_dashes`],
+    /// the path behind the `--` that stops a leading dash reading as a
+    /// flag — the two guards face opposite directions and both stand.
+    /// Worktree and index both move, which is git's semantic and is said
+    /// as such wherever this is offered: staged work on this path is
+    /// replaced, not kept.
+    fn checkout_file_from(&self, _sha: &[u8], _path: &[u8]) -> Result<()> {
+        Err(unserved("checking out a file from a commit"))
+    }
+
     /// Deletes one untracked file from the working tree.
     ///
     /// A separate word and not a branch of [`discard`](Self::discard)
@@ -1947,6 +1961,11 @@ impl Repo for Binary {
         // The index is the source, so a staged version survives; see the
         // trait method for where that line sits.
         run_bytes(&self.root, &[b"checkout", b"--", path]).map(|_| ())
+    }
+
+    fn checkout_file_from(&self, sha: &[u8], path: &[u8]) -> Result<()> {
+        refuse_dashes(sha)?;
+        run_bytes(&self.root, &[b"checkout", sha, b"--", path]).map(|_| ())
     }
 
     fn remove_untracked(&self, path: &[u8]) -> Result<()> {

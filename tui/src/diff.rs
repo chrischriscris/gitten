@@ -1009,6 +1009,16 @@ impl Diff {
         Some((path, loaded.hunks.get(hunk)?.clone()))
     }
 
+    /// The file under the keyboard with every hunk the diff drew for it —
+    /// what whole-file verbs aim at. `None` when the keyboard sits on no
+    /// hunk at all: headers and empty stretches name no file, and a verb
+    /// that guessed from the nearest one would aim where nobody pointed.
+    pub fn current_file_hunks(&self) -> Option<(String, Vec<gitten_core::Hunk>)> {
+        let (path, _) = self.current_hunk()?;
+        let loaded = self.files.iter().find(|f| f.path == path)?;
+        Some((path, loaded.hunks.clone()))
+    }
+
     /// What the hunk verbs aim at, in the terms the shared hunk job reads:
     /// the whole hunk under the keyboard, or the marked lines grouped per
     /// hunk. In line mode with no mark standing, the one line under the

@@ -223,8 +223,8 @@ impl Write {
         ))
     }
 
-    /// Carries `patches` onto `branch`, creating it at HEAD first when
-    /// asked: checkout (a dirty tree it cannot carry is git's own
+    /// Carries `patches` onto `branch`, creating it at HEAD first when it
+    /// does not exist yet: checkout (a dirty tree it cannot carry is git's own
     /// refusal), then each patch onto the worktree in order, uncommitted —
     /// the commit is the reader's next keypress, not this job's last
     /// step. When creation was requested and the checkout fails, the new

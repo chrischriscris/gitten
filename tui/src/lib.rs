@@ -58,6 +58,7 @@ pub mod files;
 pub mod help;
 pub mod markdown;
 pub mod merging;
+pub mod patch;
 pub mod reflog;
 pub mod remotes;
 pub mod rows;

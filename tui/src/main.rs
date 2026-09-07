@@ -41,6 +41,9 @@ use gitten_app::acquire::{self, Data};
 use gitten_app::act::{hunk_job, verb_refusal, HunkAsk, HunkSelection, HunkSide};
 use gitten_app::cli::{self, Source, View};
 use gitten_app::jobs::{Event as JobEvent, Generation, Job, Runner, Submitter};
+use gitten_app::patchwork::{
+    self, CommitFileTarget, DiffPick, GraftScope, GraftTarget, PatchClient, PickOrigin,
+};
 use gitten_app::verbs::Write;
 use gitten_app::{StartClock, Startup};
 use gitten_core::command::{chord_string, Availability, Code, Key, Modes, Resolve, Usable};
@@ -59,6 +62,7 @@ use gitten_tui::diff::PatchSelection;
 use gitten_tui::files::{self, Files};
 use gitten_tui::help;
 use gitten_tui::merging;
+use gitten_tui::patch::PatchBuilder;
 use gitten_tui::reflog::Reflog;
 use gitten_tui::remotes::Remotes;
 use gitten_tui::screen::{Ink, Pen, Screen};
@@ -403,6 +407,11 @@ const INPUT: &str = "input";
 /// nothing underneath, so a chord cannot arm a discard behind a modal.
 const PICKER: &str = "picker";
 
+/// The mode the patch builder owns the keyboard in, on exactly the
+/// rebase plan's terms: a press it does not name runs nothing underneath,
+/// because the clipboard it edits is one keypress from landing somewhere.
+const BUILDER: &str = "builder";
+
 /// The mode the rebase plan owns the keyboard in, on exactly the picker's
 /// terms and rather more urgently: the keys underneath it rewrite history.
 const TODO: &str = "todo";
@@ -488,6 +497,13 @@ enum Prompt {
     /// `branches.checkout-name`'s field: whatever it names, git aims at.
     /// Empty is refused beside the field that just closed.
     BranchCheckoutName {
+        field: Field,
+    },
+    /// `patch.move-to-branch`'s field: the branch the clipboard lands on,
+    /// created at HEAD when no such branch exists. Empty is refused
+    /// beside the field that just closed — moving onto no branch is not
+    /// a move.
+    MovePatch {
         field: Field,
     },
     /// `commits.new-branch`'s field. `at` is the selected commit's full sha,
@@ -583,6 +599,7 @@ impl Prompt {
             | Prompt::TagMessage { field, .. }
             | Prompt::TagPush { field, .. }
             | Prompt::BranchCheckoutName { field }
+            | Prompt::MovePatch { field }
             | Prompt::BranchNewAt { field, .. }
             | Prompt::CheckoutNew { field, .. }
             | Prompt::ProjectOpen { field }
@@ -609,6 +626,7 @@ impl Prompt {
             | Prompt::TagMessage { field, .. }
             | Prompt::TagPush { field, .. }
             | Prompt::BranchCheckoutName { field }
+            | Prompt::MovePatch { field }
             | Prompt::BranchNewAt { field, .. }
             | Prompt::CheckoutNew { field, .. }
             | Prompt::ProjectOpen { field }
@@ -673,6 +691,7 @@ impl Prompt {
             Prompt::TagMessage { .. } => "tag message (empty = lightweight): ",
             Prompt::TagPush { .. } => "push tag to: ",
             Prompt::BranchCheckoutName { .. } => "checkout: ",
+            Prompt::MovePatch { .. } => "move patch onto branch: ",
             Prompt::BranchNewAt { .. } => "branch: ",
             Prompt::CheckoutNew { .. } => "",
             Prompt::ProjectOpen { .. } => "open: ",
@@ -1605,6 +1624,12 @@ struct App {
     /// until `todo.run` is confirmed, so closing it with esc costs exactly
     /// the editing — which is what makes a plan safe to open and look at.
     todo: Option<Todo>,
+    /// The patch builder, while it is open: a modal list over the body,
+    /// owning the keyboard the way the plan does. The clipboard stays on
+    /// the app beside it — this holds the cursor only — so a builder
+    /// opened over an empty clipboard draws one honest row, and closing
+    /// it with esc costs nothing at all.
+    patch: Option<PatchBuilder>,
     /// The commit marked as the base a `--onto` rebase counts from, and
     /// the row it was marked on. Held here rather than in the commits pane
     /// for the reason the clipboard is: the mark is made in one pane and
@@ -1647,6 +1672,12 @@ struct App {
     /// branch switch is exactly the copy a paste onto the new branch wants;
     /// only `commits.clear-copies` empties it.
     clipboard: gitten_core::clipboard::CherryClipboard,
+    /// The hunks kept for a later apply, as content — the patch clipboard
+    /// beside the cherry-pick clipboard. Outlives every press and every
+    /// refresh, because a pick made before a branch switch is exactly the
+    /// patch a move onto the new branch wants; only `patch.clear`
+    /// empties it.
+    patch_clip: gitten_core::patchclip::PatchClipboard,
     /// The armed (command, commit) a destructive history verb asked about —
     /// spent only by the same command naming the same commit, which is what
     /// keeps a soft reset from ever spending a hard one's question. `None`
@@ -1958,6 +1989,8 @@ impl App {
             availability: tui_availability(startup_pending, None),
             operation: None,
             clipboard: gitten_core::clipboard::CherryClipboard::new(),
+            patch_clip: gitten_core::patchclip::PatchClipboard::new(),
+            patch: None,
             history_arm: None,
             panes,
             layout: Box::new(panes::BuiltinLayout),
@@ -2350,6 +2383,9 @@ impl App {
         if self.todo.is_some() {
             self.modes.push(TODO);
         }
+        if self.patch.is_some() {
+            self.modes.push(BUILDER);
+        }
         if self.help {
             self.modes.push("help");
         }
@@ -2675,7 +2711,7 @@ impl App {
             // *next* press out of the question's mode.
             if !matches!(
                 command.as_str(),
-                "commits.reset-menu" | "files.reset-menu" | "files.stash-menu"
+                "commits.reset-menu" | "files.reset-menu" | "files.stash-menu" | "patch.menu"
             ) {
                 self.close_question();
             }
@@ -2928,6 +2964,74 @@ impl App {
         self.open_prompt(Prompt::AmendMessage {
             field: Field::with(subject),
         });
+    }
+
+    // -------------------------------------------------- the patch builder
+
+    /// Takes the builder down, costing nothing: toggles already ran on
+    /// the clipboard and applies are jobs of their own.
+    fn close_patch_builder(&mut self) {
+        self.patch = None;
+        self.sync_modes();
+    }
+
+    /// The builder's verbs, answered while it stands: moves over its
+    /// rows, toggles on the clipboard, applies off it. Anything else
+    /// falls through to the match below, which is where the clipboard
+    /// verbs live whether the builder stands or not.
+    fn patch_verb(&mut self, command: &str) -> bool {
+        if self.patch.is_none() {
+            return false;
+        }
+        match command {
+            "view.down" => {
+                if let Some(builder) = self.patch.as_mut() {
+                    builder.down(&self.patch_clip);
+                }
+                return true;
+            }
+            "view.up" => {
+                if let Some(builder) = self.patch.as_mut() {
+                    builder.up(&self.patch_clip);
+                }
+                return true;
+            }
+            "view.top" => {
+                if let Some(builder) = self.patch.as_mut() {
+                    builder.to_top(&self.patch_clip);
+                }
+                return true;
+            }
+            "view.bottom" => {
+                if let Some(builder) = self.patch.as_mut() {
+                    builder.to_bottom(&self.patch_clip);
+                }
+                return true;
+            }
+            "back" | "input.cancel" => {
+                self.close_patch_builder();
+                self.message = "the builder is closed — the patch stands".into();
+                return true;
+            }
+            _ => {}
+        }
+        // Toggles edit the clipboard in place and answer where the press
+        // happened; every other builder key is a clipboard verb, run
+        // through the shared actions below.
+        let said = match self.patch.as_mut() {
+            Some(builder) => match command {
+                "patch.toggle-hunk" => Some(builder.toggle(&mut self.patch_clip)),
+                "patch.toggle-file" => Some(builder.toggle_file_here(&mut self.patch_clip)),
+                "patch.drop-file" => Some(builder.drop_file_here(&mut self.patch_clip)),
+                _ => None,
+            },
+            None => None,
+        };
+        if let Some(said) = said {
+            self.message = said;
+            return true;
+        }
+        false
     }
 
     // -------------------------------------------------- the rebase plan
@@ -4011,6 +4115,14 @@ impl App {
             Prompt::BranchCheckoutName { field } if accept => {
                 gitten_app::act::checkout_by_name(self, field.take())
             }
+            Prompt::MovePatch { field } if accept => {
+                let name = field.take();
+                if name.trim().is_empty() {
+                    self.message = "moving onto no branch is not a move".into();
+                } else {
+                    gitten_app::patchwork::move_patch_to_branch(self, name.into_bytes());
+                }
+            }
             Prompt::BranchNewAt { at, field } if accept => {
                 self.submit_branch_new_at(at, field.take())
             }
@@ -4320,6 +4432,9 @@ impl App {
                 _ => {}
             }
         }
+        if self.patch.is_some() && !self.help && self.patch_verb(command) {
+            return;
+        }
         if self.help && self.scroll_help(command) {
             return;
         }
@@ -4437,6 +4552,44 @@ impl App {
             "diff.stage-hunk" | "diff.unstage-hunk" | "diff.discard-hunk" => {
                 self.hunk_verb(command)
             }
+            // The patch verbs act on the *repository* and the clipboard,
+            // not the pane: the focus names the read, the shared actions
+            // take it from there. Routed ahead of the focused pane like
+            // the hunk verbs — and `patch.menu` is global, because the
+            // menu's answers name their own targets.
+            "patch.pick" => {
+                let differs = self.host.differ.clone();
+                patchwork::patch_pick(self, &differs, &gitten_core::differ::Overrides::default());
+            }
+            "patch.menu" => {
+                if patchwork::patch_menu(self) {
+                    self.question = Some("patch");
+                    self.sync_modes();
+                }
+            }
+            "patch.show" => patchwork::patch_show(self),
+            "patch.apply-worktree" => {
+                patchwork::patch_apply(self, command, patchwork::PatchTarget::Worktree)
+            }
+            "patch.apply-index" => {
+                patchwork::patch_apply(self, command, patchwork::PatchTarget::Index)
+            }
+            "patch.reverse-worktree" => {
+                patchwork::patch_reverse(self, command, patchwork::PatchTarget::Worktree)
+            }
+            "patch.reverse-index" => {
+                patchwork::patch_reverse(self, command, patchwork::PatchTarget::Index)
+            }
+            "patch.clear" => patchwork::patch_clear(self),
+            "patch.remove-from-commit" => {
+                patchwork::graft_remove(self, command, patchwork::GraftScope::Hunk)
+            }
+            "patch.discard-file" => {
+                patchwork::graft_remove(self, command, patchwork::GraftScope::File)
+            }
+            "patch.amend-commit" => patchwork::graft_amend(self, command),
+            "patch.checkout-file" => patchwork::commit_file_checkout(self, command),
+            "patch.move-to-branch" => self.begin_move_patch(),
             // The stash verbs act on the *repository*, not the pane: the
             // pane answers "which row", the queue takes it from there.
             // Routed ahead of the focused pane for the same reason the hunk
@@ -5642,6 +5795,24 @@ impl App {
     /// `stashes.new-branch`: the field, then git's own three-in-one — a
     /// branch at the commit the stash was *made on*, the entry applied with
     /// its index intact, and the entry dropped only if that apply was clean.
+    /// `patch.move-to-branch`'s field, naming the branch the clipboard
+    /// lands on. The repository and a non-empty clipboard are checked
+    /// before it opens, because a field that opens over nothing is a
+    /// question nobody can answer.
+    fn begin_move_patch(&mut self) {
+        if self.repo.is_none() {
+            self.message = "a fixture has no branches to move onto".into();
+            return;
+        }
+        if self.patch_clip.is_empty() {
+            self.message = "the patch clipboard is empty — pick hunks first".into();
+            return;
+        }
+        self.open_prompt(Prompt::MovePatch {
+            field: Field::new(),
+        });
+    }
+
     fn begin_stash_branch(&mut self) {
         let Some(at) = self.focused_stash() else {
             return;
@@ -6272,6 +6443,24 @@ impl App {
         if let Some(todo) = self.todo.as_mut() {
             todo.paint(&mut self.screen, 1, body, &self.host, &self.availability);
         }
+        // The builder floats over everything the panes drew, beside the
+        // plan and under the help panel: it owns the keyboard, so it owns
+        // the rows it covers, and the clipboard it draws is read live off
+        // the app — no copy, nothing to stale.
+        if self.patch.is_some() {
+            let (builder, clip) = match (self.patch.as_mut(), Some(&self.patch_clip)) {
+                (Some(builder), Some(clip)) => (builder, clip),
+                _ => unreachable!("the builder stands, so both stand"),
+            };
+            builder.paint(
+                &mut self.screen,
+                1,
+                body,
+                &self.host,
+                &self.availability,
+                clip,
+            );
+        }
         if self.help {
             help::paint(
                 &mut self.screen,
@@ -6404,6 +6593,26 @@ fn tui_availability(repo: bool, operation: Option<&Operation>) -> Availability {
         "todo.move-down",
         "todo.autosquash",
         "todo.run",
+        // The patch clipboard's own verbs. The builder's moves are live
+        // whenever the client is — a press with no builder open is refused
+        // by name where it is answered — and the clipboard verbs refuse
+        // theirs the same way; the wrong-selection refusals are dispatch's.
+        "patch.menu",
+        "patch.pick",
+        "patch.show",
+        "patch.toggle-hunk",
+        "patch.toggle-file",
+        "patch.drop-file",
+        "patch.apply-worktree",
+        "patch.apply-index",
+        "patch.reverse-worktree",
+        "patch.reverse-index",
+        "patch.move-to-branch",
+        "patch.clear",
+        "patch.remove-from-commit",
+        "patch.discard-file",
+        "patch.checkout-file",
+        "patch.amend-commit",
         "remotes.focus",
         "remotes.fetch",
         "remotes.new",
@@ -6597,6 +6806,26 @@ fn tui_availability(repo: bool, operation: Option<&Operation>) -> Availability {
             ] {
                 a.disabled(name, "a fixture has no repository to rewrite in");
             }
+            for name in [
+                "patch.menu",
+                "patch.pick",
+                "patch.show",
+                "patch.toggle-hunk",
+                "patch.toggle-file",
+                "patch.drop-file",
+                "patch.apply-worktree",
+                "patch.apply-index",
+                "patch.reverse-worktree",
+                "patch.reverse-index",
+                "patch.move-to-branch",
+                "patch.clear",
+                "patch.remove-from-commit",
+                "patch.discard-file",
+                "patch.checkout-file",
+                "patch.amend-commit",
+            ] {
+                a.disabled(name, "a fixture has no repository to patch in");
+            }
             a.disabled(
                 "commits.mark-base",
                 "a fixture has no repository to rebase in",
@@ -6789,6 +7018,186 @@ impl gitten_app::act::Client for App {
         view.current_file()
             .filter(|file| file.section == files::Section::Conflicts)
             .map(|file| file.path.clone())
+    }
+}
+
+impl PatchClient for App {
+    fn patch_clipboard(&mut self) -> &mut gitten_core::patchclip::PatchClipboard {
+        &mut self.patch_clip
+    }
+
+    fn patch_pick(&mut self) -> Option<DiffPick> {
+        // Owned out first: the focus borrow ends before any sentence,
+        // because a refusal said while borrowed is a borrow error and a
+        // refusal said after is a status line.
+        let found = match self.panes.focused() {
+            Some(Screens::Diff {
+                view,
+                origin: Some(origin),
+                ..
+            }) => Some((view.patch_selection(), origin.clone())),
+            _ => None,
+        };
+        let (selection, origin) = match found {
+            Some(found) => found,
+            None => {
+                self.message = "the keyboard is not on a diff".into();
+                return None;
+            }
+        };
+        let origin = match origin {
+            DiffSource::Staged { .. } => PickOrigin::Staged,
+            DiffSource::Unstaged { .. } => PickOrigin::Unstaged,
+            DiffSource::Untracked { .. } => PickOrigin::Untracked,
+            DiffSource::Commit { sha } => PickOrigin::Commit {
+                sha: sha.into_bytes(),
+            },
+            DiffSource::Stash { commit, .. } => PickOrigin::Stash {
+                commit: commit.into_bytes(),
+            },
+            _ => {
+                self.message = "nothing to pick here — open the file's own side".into();
+                return None;
+            }
+        };
+        let (path, selection) = match selection {
+            Ok(PatchSelection::Whole { path, hunk }) => (path, HunkSelection::Whole(hunk)),
+            Ok(PatchSelection::Lines { path, parts }) => (path, HunkSelection::Lines(parts)),
+            Err(e) => {
+                self.message = e;
+                return None;
+            }
+        };
+        Some(DiffPick {
+            path,
+            selection,
+            origin,
+        })
+    }
+
+    fn graft_target(&mut self, scope: GraftScope) -> Option<GraftTarget> {
+        let found = match self.panes.focused() {
+            Some(Screens::Diff {
+                view,
+                origin: Some(DiffSource::Commit { sha }),
+                ..
+            }) => Some((
+                sha.clone(),
+                view.current_file_hunks(),
+                view.current_hunk(),
+                view.patch_selection().ok(),
+            )),
+            _ => None,
+        };
+        let (sha, file, one, marks) = match found {
+            Some(found) => found,
+            None => {
+                self.message = "open the commit's diff first".into();
+                return None;
+            }
+        };
+        let (path, all) = match file {
+            Some(file) => file,
+            None => {
+                self.message = "the keyboard is not on a hunk".into();
+                return None;
+            }
+        };
+        // Marked lines narrow the hunk scope to the ranges they cover —
+        // but only when every mark sits in this file. A mark spanning
+        // files is the selection's own refusal, said where it was made.
+        let (hunks, parts) = match scope {
+            GraftScope::File => (all, None),
+            GraftScope::Hunk => match marks {
+                Some(PatchSelection::Lines { path: p, parts }) if p == path => {
+                    let hunks = parts.iter().map(|(h, _, _)| h.clone()).collect();
+                    (hunks, Some(parts))
+                }
+                _ => match one {
+                    Some((_, hunk)) => (vec![hunk], None),
+                    None => {
+                        self.message = "the keyboard is not on a hunk".into();
+                        return None;
+                    }
+                },
+            },
+        };
+        // A rename grafts whole or not at all: the file's letter in the
+        // commit's own listing, read now — one read at keypress, and the
+        // commit is immutable so it cannot stale.
+        let renamed = match self.repo.as_ref() {
+            Some((_, repo)) => match repo.commit_files(sha.as_bytes()) {
+                Ok(files) => files
+                    .iter()
+                    .any(|(status, name)| *status == 'R' && name == path.as_bytes()),
+                Err(e) => {
+                    self.message = e;
+                    return None;
+                }
+            },
+            None => {
+                self.message = "a fixture has no history to rewrite".into();
+                return None;
+            }
+        };
+        Some(GraftTarget {
+            sha: sha.into_bytes(),
+            path,
+            hunks,
+            parts,
+            renamed,
+            // Binary commit diffs draw no hunks, so the keyboard cannot
+            // be on one: this is unreachable through the views above and
+            // stands as the other clients' guard.
+            binary: false,
+        })
+    }
+
+    fn amend_target(&mut self) -> Option<Vec<u8>> {
+        match self.panes.focused() {
+            Some(Screens::Diff {
+                origin: Some(DiffSource::Commit { sha }),
+                ..
+            }) => Some(sha.clone().into_bytes()),
+            _ => {
+                self.message = "open the commit's diff first".into();
+                None
+            }
+        }
+    }
+
+    fn commit_file_target(&mut self) -> Option<CommitFileTarget> {
+        let found = match self.panes.focused() {
+            Some(Screens::Diff {
+                view,
+                origin: Some(DiffSource::Commit { sha }),
+                ..
+            }) => Some((sha.clone(), view.current_file_hunks())),
+            _ => None,
+        };
+        match found {
+            Some((sha, Some((path, _)))) => Some(CommitFileTarget {
+                sha: sha.into_bytes(),
+                path: path.into_bytes(),
+            }),
+            Some((_, None)) => {
+                self.message = "the keyboard is not on a hunk".into();
+                None
+            }
+            None => {
+                self.message = "open the commit's diff first".into();
+                None
+            }
+        }
+    }
+
+    fn open_patch_builder(&mut self) {
+        self.patch = Some(PatchBuilder::new());
+        self.message = format!(
+            "{} — space toggles, enter applies",
+            self.patch_clip.status()
+        );
+        self.sync_modes();
     }
 }
 
@@ -14673,7 +15082,7 @@ diff --git a/tracked.txt b/tracked.txt
             // disabled one says its reason where its description was.
             for mode in [
                 "global", "files", "branches", "commits", "stashes", "diff", "help", "input",
-                "settings", "reset", "upstream", "stash", "todo", "panes",
+                "settings", "reset", "upstream", "stash", "patch", "builder", "todo", "panes",
             ] {
                 let mut modes = Modes::new();
                 if mode != "global" {

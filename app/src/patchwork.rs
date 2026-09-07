@@ -62,6 +62,15 @@ pub struct GraftTarget {
     pub binary: bool,
 }
 
+/// How much of the file a graft takes: the hunk under the keyboard, or
+/// the file whole. The keyboard's scope is the client's to read — the
+/// command names which one it wants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GraftScope {
+    Hunk,
+    File,
+}
+
 /// The file under the keyboard in a focused commit diff, for the verbs
 /// that act on a whole file from a commit.
 #[derive(Clone, Debug)]
@@ -87,13 +96,18 @@ pub trait PatchClient: Client {
     /// What the keyboard picked in the focused diff, or `None` when the
     /// focus names no pickable read. A combined or fixture diff is `None`
     /// with its own sentence, said by the client that knows the focus.
-    fn patch_pick(&self) -> Option<DiffPick>;
+    fn patch_pick(&mut self) -> Option<DiffPick>;
     /// What a graft aims at in a focused commit diff, or `None` with the
-    /// client's own sentence when the focus is not one.
-    fn graft_target(&self) -> Option<GraftTarget>;
+    /// client's own sentence when the focus is not one. `scope` is the
+    /// command's: a removal takes the hunk, a discard the file whole.
+    fn graft_target(&mut self, scope: GraftScope) -> Option<GraftTarget>;
+    /// The commit a graft would amend: the focused commit diff's sha,
+    /// wherever in it the keyboard sits. Amending names a commit, not a
+    /// hunk, so the cursor's row is nobody's business here.
+    fn amend_target(&mut self) -> Option<Vec<u8>>;
     /// The file under the keyboard in a focused commit diff, or `None`
     /// with the client's own sentence.
-    fn commit_file_target(&self) -> Option<CommitFileTarget>;
+    fn commit_file_target(&mut self) -> Option<CommitFileTarget>;
     /// Opens the builder over the clipboard. Required rather than
     /// defaulted: a client that offers the key and forgets the answer is
     /// the silent no-op this trait exists to make impossible.
@@ -427,7 +441,7 @@ pub fn patch_show(client: &mut impl PatchClient) {
 /// commit is the graft target standing under the keyboard. Asked twice,
 /// because history moves and the replay that follows moves with it.
 pub fn graft_amend(client: &mut impl PatchClient, command: &str) {
-    let Some(target) = client.graft_target() else {
+    let Some(sha) = client.amend_target() else {
         return;
     };
     let Some(repo) = client.repo() else {
@@ -444,7 +458,7 @@ pub fn graft_amend(client: &mut impl PatchClient, command: &str) {
         client.say("nothing on the patch is included — pick hunks first".into());
         return;
     }
-    let armed = [target.sha.clone()]
+    let armed = [sha.clone()]
         .into_iter()
         .chain(live.iter().map(|(p, _)| p.clone()))
         .collect::<Vec<_>>()
@@ -452,11 +466,11 @@ pub fn graft_amend(client: &mut impl PatchClient, command: &str) {
     if !client.confirm_or_arm(command, &armed) {
         client.ask(format!(
             "amend {} with the patch? press again to confirm",
-            short(&target.sha)
+            short(&sha)
         ));
         return;
     }
-    match Write::graft_files(&repo, target.sha, live, false) {
+    match Write::graft_files(&repo, sha, live, false) {
         Ok(job) => {
             if !client.submit(Box::new(job)) {
                 client.say("the job queue is shutting down".into());
@@ -470,8 +484,8 @@ pub fn graft_amend(client: &mut impl PatchClient, command: &str) {
 /// of grafting. `parts` windows the hunks with the reverse keep; whole
 /// hunks emit as drawn. Asked twice: the commit moves and its children
 /// move with it.
-pub fn graft_remove(client: &mut impl PatchClient, command: &str) {
-    let Some(target) = client.graft_target() else {
+pub fn graft_remove(client: &mut impl PatchClient, command: &str, scope: GraftScope) {
+    let Some(target) = client.graft_target(scope) else {
         return;
     };
     if target.binary {
@@ -551,10 +565,10 @@ pub fn graft_remove(client: &mut impl PatchClient, command: &str) {
 }
 
 /// `patch.move-to-branch`: carries the clipboard onto `branch`, creating
-/// it at HEAD first when asked. The work lands uncommitted — the commit
-/// is the reader's next keypress. A checkout the dirty tree cannot carry
-/// is git's own refusal, in its own words.
-pub fn move_patch_to_branch(client: &mut impl PatchClient, branch: Vec<u8>, create: bool) {
+/// it at HEAD first when no such branch exists. The work lands
+/// uncommitted — the commit is the reader's next keypress. A checkout the
+/// dirty tree cannot carry is git's own refusal, in its own words.
+pub fn move_patch_to_branch(client: &mut impl PatchClient, branch: Vec<u8>) {
     let Some(repo) = client.repo() else {
         client.say("a fixture has no branches to move onto".into());
         return;
@@ -569,6 +583,16 @@ pub fn move_patch_to_branch(client: &mut impl PatchClient, branch: Vec<u8>, crea
         client.say("nothing on the patch is included — pick hunks first".into());
         return;
     }
+    // Create-if-missing, decided here and not asked twice: the name was
+    // just typed, so asking whether it should exist would be the field
+    // asking about itself.
+    let create = match repo.branches() {
+        Ok(branches) => !branches.iter().any(|b| b.name.as_bytes() == branch),
+        Err(e) => {
+            client.say(e);
+            return;
+        }
+    };
     match Write::move_patch_to_branch(&repo, branch, create, live) {
         Ok(job) => {
             if !client.submit(Box::new(job)) {
