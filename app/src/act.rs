@@ -9,6 +9,7 @@
 
 use crate::jobs::Job;
 use crate::verbs::Write;
+use gitten_core::operation::{Operation, Side};
 use gitten_core::refs::Target;
 use gitten_core::status::PathBytes;
 use gitten_core::Hunk;
@@ -25,6 +26,20 @@ pub trait Client {
     fn repo(&self) -> Option<Handle>;
     /// Queues the job. `false` means the queue is shutting down.
     fn submit(&mut self, job: Box<dyn Job>) -> bool;
+
+    /// The operation standing in the repository, as the client last
+    /// acquired it — the lifecycle verbs gate on this instead of asking
+    /// the repository again. The honest default for a client that tracks
+    /// no operations: none.
+    fn operation(&self) -> Option<Operation> {
+        None
+    }
+
+    /// The conflicted path the keyboard is on, when there is one. The
+    /// honest default for a client with no conflict selection: none.
+    fn selected_conflict(&self) -> Option<PathBytes> {
+        None
+    }
 }
 
 /// The client-owned selection and confirmation state needed by branch actions.
@@ -286,6 +301,107 @@ pub fn sync_fetch(client: &mut impl Client) {
         return;
     };
     if !client.submit(Box::new(Write::fetch(&repo, None))) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+// ------------------------------------------------------------- operations
+
+/// One index, one sequencer: git refuses a second start, and the words it
+/// would answer with name a state rather than the way out. The shared
+/// pre-check names both instead — the same sentence
+/// [`Write::merge`](crate::verbs::Write::merge) arrives at if it ran first.
+fn refuse_while_operating(client: &mut impl Client) -> bool {
+    if let Some(operation) = client.operation() {
+        client.say(format!(
+            "a {} is in progress; finish or abort it before starting another",
+            operation.kind.word()
+        ));
+        return true;
+    }
+    false
+}
+
+/// `branches.merge` / `branches.merge-squash`: merge the selected branch
+/// into the branch the reader is on. Nothing confirms — a merge grows
+/// history and nothing existing moves, and a conflicted one stops with its
+/// question standing rather than guessing.
+pub fn merge_selected(client: &mut impl Client, target: Vec<u8>, squash: bool) {
+    let Some(repo) = client.repo() else {
+        client.say("a fixture has no repository to merge into".into());
+        return;
+    };
+    if refuse_while_operating(client) {
+        return;
+    }
+    if !client.submit(Box::new(Write::merge(&repo, target, squash))) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+/// Every lifecycle verb, one door: `operation.abort` / `.continue` /
+/// `.skip` act on whichever write stands, and the per-kind names already
+/// bound (`rebase.abort`, `commits.cherry-pick-abort`, …) reach the same
+/// place and are checked against the same standing operation. Availability
+/// gates these with the live operation state, so a mismatched press is
+/// refused before this runs; this arm is the backstop that says so anyway.
+pub fn operation_verb(client: &mut impl Client, command: &str) {
+    let Some(repo) = client.repo() else {
+        client.say("a fixture has no repository to operate on".into());
+        return;
+    };
+    use gitten_core::operation::Kind;
+    let Some(operation) = client.operation() else {
+        client.say(format!(
+            "{command} needs a merge, rebase, cherry-pick or revert in progress"
+        ));
+        return;
+    };
+    let job = match (command, operation.kind) {
+        ("operation.abort" | "rebase.abort", Kind::Rebase) => Write::rebase_abort(&repo),
+        ("operation.continue" | "rebase.continue", Kind::Rebase) => Write::rebase_continue(&repo),
+        ("operation.skip", Kind::Rebase) => Write::rebase_skip(&repo),
+        ("operation.abort" | "commits.cherry-pick-abort", Kind::CherryPick) => {
+            Write::cherry_pick_abort(&repo)
+        }
+        ("operation.continue" | "commits.cherry-pick-continue", Kind::CherryPick) => {
+            Write::cherry_pick_continue(&repo)
+        }
+        ("operation.abort", Kind::Merge) => Write::merge_abort(&repo),
+        ("operation.continue", Kind::Merge) => Write::merge_continue(&repo),
+        ("operation.abort", Kind::Revert) => Write::revert_abort(&repo),
+        ("operation.continue", Kind::Revert) => Write::revert_continue(&repo),
+        _ => {
+            client.say(format!(
+                "{command} is for a different operation; a {} is in progress",
+                operation.kind.word()
+            ));
+            return;
+        }
+    };
+    if !client.submit(Box::new(job)) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+/// `files.resolve-ours` / `-theirs` / `-both` / `-keep`: record the
+/// selected conflicted path as resolved, taking one side's answer. The
+/// resolution is a job like any other write, so the finish wave re-reads
+/// the operation and the conflicts it has left.
+pub fn resolve_conflict(client: &mut impl Client, side: Side) {
+    let Some(repo) = client.repo() else {
+        client.say("a fixture has no repository to resolve in".into());
+        return;
+    };
+    let Some(path) = client.selected_conflict() else {
+        client.say("the selected file is not a conflict".into());
+        return;
+    };
+    if !client.submit(Box::new(Write::resolve(
+        &repo,
+        path.as_bytes().to_vec(),
+        side,
+    ))) {
         client.say("the job queue is shutting down".into());
     }
 }

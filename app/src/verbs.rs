@@ -10,6 +10,7 @@
 //! the same queue — without a line changing here.
 
 use crate::jobs::Job;
+use gitten_core::operation::Side;
 use gitten_core::rebase::TodoScript;
 use gitten_core::refs::{HeadState, Remote, ResetMode};
 use gitten_git::{Handle, Repo};
@@ -258,6 +259,77 @@ impl Write {
             r.cherry_pick_continue()
         })
         .announcing("cherry-pick continued")
+    }
+
+    /// Merges `target` into the current branch — regular (`--no-edit`,
+    /// fast-forwarding when git can) or squash (`--squash`, staging the
+    /// collision and committing nothing, which is why a squash's finish
+    /// names the commit the reader still owes). A conflict comes back
+    /// refused in git's words with its question standing for
+    /// [`Write::merge_abort`] or [`Write::merge_continue`].
+    pub fn merge(repo: &Handle, target: Vec<u8>, squash: bool) -> Self {
+        let shown = String::from_utf8_lossy(&target).into_owned();
+        let (name, done) = match squash {
+            false => (format!("merge {shown}"), format!("merged {shown}")),
+            true => (
+                format!("squash-merge {shown}"),
+                format!("squash-merged {shown}; commit to finish"),
+            ),
+        };
+        Self::named(name, repo, move |r| r.merge(&target, squash)).announcing(done)
+    }
+
+    /// Abandons an in-progress merge — branch, index and working tree back
+    /// where the merge started, git's own guarantee.
+    pub fn merge_abort(repo: &Handle) -> Self {
+        Self::named("merge abort".into(), repo, |r| r.merge_abort()).announcing("merge aborted")
+    }
+
+    /// Finishes an in-progress regular merge once the conflicts are
+    /// resolved; the message editor is answered `true` by the trait. A
+    /// squash merge has no merge state to continue and nothing offers this
+    /// for one.
+    pub fn merge_continue(repo: &Handle) -> Self {
+        Self::named("merge continue".into(), repo, |r| r.merge_continue())
+            .announcing("merge continued")
+    }
+
+    /// Steps over the commit a rebase stopped on — that commit's changes
+    /// leave the branch. The one lifecycle verb that destroys work rather
+    /// than restoring it, which is why only a rebase ever offers it.
+    pub fn rebase_skip(repo: &Handle) -> Self {
+        Self::named("rebase skip".into(), repo, |r| r.rebase_skip())
+            .announcing("rebase skipped the commit")
+    }
+
+    /// Abandons an in-progress revert — the tree back where the revert
+    /// started, git's own guarantee.
+    pub fn revert_abort(repo: &Handle) -> Self {
+        Self::named("revert abort".into(), repo, |r| r.revert_abort()).announcing("revert aborted")
+    }
+
+    /// Finishes an in-progress revert once the conflicts are resolved.
+    pub fn revert_continue(repo: &Handle) -> Self {
+        Self::named("revert continue".into(), repo, |r| r.revert_continue())
+            .announcing("revert continued")
+    }
+
+    /// Records one conflicted path as resolved, taking `side`'s answer —
+    /// the acquisition layer owns the how; this names it for the status
+    /// line and announces the choice, since a resolution that came from a
+    /// keypress should say which one it took.
+    pub fn resolve(repo: &Handle, path: Vec<u8>, side: Side) -> Self {
+        let shown = String::from_utf8_lossy(&path).into_owned();
+        let label = match side {
+            Side::Ours => "ours",
+            Side::Theirs => "theirs",
+            Side::Both => "both",
+            Side::Keep => "kept",
+        };
+        Self::named(format!("resolve {shown} ({label})"), repo, move |r| {
+            r.resolve(&path, side)
+        })
+        .announcing(format!("resolved {shown} ({label})"))
     }
 
     /// Moves the current branch onto `target`, taking as much of the index
