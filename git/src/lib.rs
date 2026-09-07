@@ -779,6 +779,19 @@ pub trait Repo: Send + Sync {
         Err(unserved("amending"))
     }
 
+    /// Resets HEAD's author to the current user —
+    /// `git commit --amend --no-edit --reset-author`. The tree and the
+    /// message stand exactly still; only the authorship moves, which is
+    /// what makes this the narrow sibling of [`amend`](Self::amend) rather
+    /// than a second spelling of it. The standing tree is left alone: staged
+    /// work stays staged, unstaged work stays unstaged, and an unborn branch
+    /// is refused before any process runs — there is no commit to re-author.
+    /// HEAD only: a deeper commit's author is a rebase, and the todo UI for
+    /// one is a later slice, so the caller aims this at HEAD and says so.
+    fn reset_author(&self) -> Result<()> {
+        Err(unserved("resetting the author"))
+    }
+
     /// Rewrites history by handing git a plan: `git rebase -i <upstream>`
     /// with the sequencer editor replaced by a command that installs
     /// [`script`](gitten_core::rebase::TodoScript).
@@ -869,6 +882,18 @@ pub trait Repo: Send + Sync {
     /// rather than the reason.
     fn cherry_pick(&self, _sha: &[u8]) -> Result<()> {
         Err(unserved("cherry-picking"))
+    }
+
+    /// Replays several commits onto the current branch in order — one
+    /// `git cherry-pick` over the clipboard's shas, oldest first as the
+    /// caller arranged them. One invocation rather than one per commit, so
+    /// a conflict stops the sequence exactly where git stopped it and the
+    /// lifecycle finds the whole remainder standing, not half a paste
+    /// scattered across jobs. An empty list is refused here: git would read
+    /// a bare `cherry-pick` as "continue the standing one", which is a
+    /// different verb wearing this one's argv.
+    fn cherry_pick_range(&self, _shas: &[Vec<u8>]) -> Result<()> {
+        Err(unserved("cherry-picking a range"))
     }
 
     /// Abandons an in-progress cherry-pick and puts everything back:
@@ -1960,6 +1985,28 @@ impl Repo for Binary {
         self.commit_via(&[b"commit", b"--amend", b"-q", b"--file=-"], message)
     }
 
+    fn reset_author(&self) -> Result<()> {
+        // The amend's own guard, minus the message: an unborn branch has no
+        // commit to re-author, and git's answer there names nothing a person
+        // can act on. `--no-edit` keeps the message byte-identical; the
+        // tree is untouched by construction — amending never stages — so a
+        // dirty working tree is git's ordinary business, not a refusal.
+        if let HeadState::Branch { commit: None, .. } = self.head()? {
+            return Err("nothing to re-author: this branch has no commits yet".into());
+        }
+        run_bytes(
+            &self.root,
+            &[
+                b"commit",
+                b"--amend",
+                b"-q",
+                b"--no-edit",
+                b"--reset-author",
+            ],
+        )
+        .map(|_| ())
+    }
+
     fn rebase_todo(&self, upstream: &[u8], script: &TodoScript) -> Result<()> {
         // The plan is checked before anything runs: a refusal that names the
         // action beats a background job hung on an editor nobody can see.
@@ -2039,6 +2086,29 @@ impl Repo for Binary {
         // see [`refuse_dashes`] for what stands guard.
         refuse_dashes(sha)?;
         run_bytes(&self.root, &[b"cherry-pick", sha]).map(|_| ())
+    }
+
+    fn cherry_pick_range(&self, shas: &[Vec<u8>]) -> Result<()> {
+        // The single pick's guard, then every sha's: a second start inside
+        // a standing pick would disturb the first, and a bare `cherry-pick`
+        // with no shas means "continue" in git's argv — a different verb
+        // wearing this one's shape, refused here rather than run by
+        // accident. Each sha is a revspec under the same dash guard.
+        if self.cherry_pick_in_progress() {
+            return Err("a cherry-pick is already in progress; finish or abort it \
+                 before starting another"
+                .into());
+        }
+        if shas.is_empty() {
+            return Err("nothing copied to cherry-pick".into());
+        }
+        for sha in shas {
+            refuse_dashes(sha)?;
+        }
+        let mut argv: Vec<&[u8]> = Vec::with_capacity(shas.len() + 1);
+        argv.push(b"cherry-pick");
+        argv.extend(shas.iter().map(Vec::as_slice));
+        run_bytes(&self.root, &argv).map(|_| ())
     }
 
     fn cherry_pick_abort(&self) -> Result<()> {
@@ -8789,6 +8859,308 @@ mod tests {
         assert!(e.contains("could not revert"), "{e}");
         assert!(!g.status().unwrap().conflicts.is_empty(), "left conflicted");
         assert_eq!(g.log(5).unwrap().len(), 3, "nothing landed");
+    }
+
+    /// A side branch with three file-adding commits, checked back out to
+    /// main: the shape every cherry-pick test below replays from.
+    fn side_three(name: &str) -> (Scratch, String, String, String) {
+        let r = Scratch::new(name);
+        r.write("base.txt", b"base\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        r.git(&["checkout", "-qb", "side"]);
+        for (file, msg) in [
+            ("one.txt", "one"),
+            ("two.txt", "two"),
+            ("three.txt", "three"),
+        ] {
+            r.write(file, format!("{msg}\n").as_bytes());
+            r.git(&["add", "-A"]);
+            r.git(&["commit", "-qm", msg]);
+        }
+        let (one, two, three) = (
+            r.rev_parse("side~2"),
+            r.rev_parse("side~1"),
+            r.rev_parse("side"),
+        );
+        r.git(&["checkout", "-q", "main"]);
+        (r, one, two, three)
+    }
+
+    #[test]
+    fn a_cherry_pick_replays_the_commit_onto_head() {
+        let (r, one, _, _) = side_three("pick-single");
+        let g = r.open();
+        let base = r.rev_parse("main");
+
+        g.cherry_pick(one.as_bytes()).expect("picks");
+        assert_eq!(r.rev_parse("HEAD~1"), base, "the pick lands on top");
+        let log = g.log(5).unwrap();
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0].subject, "one", "git keeps the message");
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"one.txt")).unwrap(),
+            b"one\n",
+            "and the tree rode along"
+        );
+        let tree = g.status().unwrap();
+        assert_eq!(
+            tree.staged.len() + tree.unstaged.len(),
+            0,
+            "the pick committed itself"
+        );
+    }
+
+    #[test]
+    fn a_cherry_pick_range_lands_in_clipboard_order() {
+        // Oldest first, as the clipboard arranges a marked range: the log
+        // reads newest-first, so the replay order is the log reversed.
+        let (r, one, two, three) = side_three("pick-range");
+        let g = r.open();
+
+        g.cherry_pick_range(&[one.into_bytes(), two.into_bytes(), three.into_bytes()])
+            .expect("picks");
+        let log = g.log(5).unwrap();
+        assert_eq!(log.len(), 4, "base plus three replays");
+        assert_eq!(
+            [&log[0].subject, &log[1].subject, &log[2].subject],
+            [&"three".to_string(), &"two".to_string(), &"one".to_string()],
+            "newest first, replay order preserved"
+        );
+        for (file, want) in [
+            ("one.txt", &b"one\n"[..]),
+            ("two.txt", &b"two\n"[..]),
+            ("three.txt", &b"three\n"[..]),
+        ] {
+            assert_eq!(
+                std::fs::read(join_raw(&r.0, file.as_bytes())).unwrap(),
+                want,
+                "{file} rode along"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cherry_pick_range_stops_mid_sequence_on_conflict() {
+        let r = Scratch::new("pick-range-conflict");
+        r.write("f.txt", b"base\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        r.git(&["checkout", "-qb", "side"]);
+        r.write("g.txt", b"clean\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "clean"]);
+        r.write("f.txt", b"side\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "clash"]);
+        let (clean, clash) = (r.rev_parse("side~1"), r.rev_parse("side"));
+        r.git(&["checkout", "-q", "main"]);
+        r.write("f.txt", b"main\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "main-side"]);
+        let g = r.open();
+
+        // The clean pick lands; the clashing one stops the sequence with
+        // git's own words and the sequencer standing for abort/continue.
+        let e = g
+            .cherry_pick_range(&[clean.into_bytes(), clash.into_bytes()])
+            .unwrap_err();
+        assert!(e.contains("could not apply"), "{e}");
+        assert!(g.cherry_pick_in_progress(), "the remainder stands");
+        let log = g.log(5).unwrap();
+        assert_eq!(log.len(), 3, "base, main-side, and the clean pick");
+        assert_eq!(log[0].subject, "clean");
+        g.cherry_pick_abort().expect("aborts");
+        assert!(!g.cherry_pick_in_progress());
+    }
+
+    #[test]
+    fn cherry_picking_nothing_is_refused_before_git() {
+        let r = two_commits("pick-empty-range");
+        let before = r.rev_parse("HEAD");
+        let e = r.open().cherry_pick_range(&[]).unwrap_err();
+        assert!(e.contains("nothing copied"), "{e}");
+        assert_eq!(r.rev_parse("HEAD"), before, "nothing ran");
+    }
+
+    #[test]
+    fn cherry_picking_an_empty_commit_is_gits_refusal() {
+        // An empty commit has no change to replay: git stops rather than
+        // landing a duplicate, and the branch stands still. No `--allow-empty`
+        // here — inventing an empty twin is not a pick. Unlike the merge
+        // refusal below, this one *is* a state: git leaves CHERRY_PICK_HEAD
+        // standing and asks for `--skip` or `--abort`, so the W5 lifecycle
+        // finds a pick in progress with a clean tree and nothing to commit.
+        let r = Scratch::new("pick-empty-commit");
+        r.write("f.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        r.git(&["commit", "-q", "--allow-empty", "-m", "empty"]);
+        let empty = r.rev_parse("HEAD");
+        r.git(&["checkout", "-q", "HEAD~1"]);
+        r.git(&["checkout", "-qb", "elsewhere"]);
+        let g = r.open();
+
+        let e = g.cherry_pick(empty.as_bytes()).unwrap_err();
+        assert!(e.contains("empty"), "{e}");
+        assert_eq!(g.log(5).unwrap().len(), 1, "nothing landed");
+        assert!(
+            g.cherry_pick_in_progress(),
+            "the pick stands for the lifecycle to skip or abort"
+        );
+        let tree = g.status().unwrap();
+        assert_eq!(
+            tree.staged.len() + tree.unstaged.len(),
+            0,
+            "and there is nothing to resolve"
+        );
+        g.cherry_pick_abort().expect("aborts");
+        assert!(!g.cherry_pick_in_progress());
+        assert_eq!(g.log(5).unwrap().len(), 1, "still nothing landed");
+    }
+
+    #[test]
+    fn a_cherry_pick_leaves_unrelated_dirty_work_alone() {
+        // A dirty tree git's pick does not touch is not a reason to stop:
+        // the pick lands and the dirty bytes are exactly what they were.
+        let (r, one, _, _) = side_three("pick-dirty");
+        r.write("dirty.txt", b"unsaved\n");
+        let g = r.open();
+
+        g.cherry_pick(one.as_bytes()).expect("picks past the dirt");
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"dirty.txt")).unwrap(),
+            b"unsaved\n",
+            "untouched and uncommitted"
+        );
+        assert_eq!(g.log(5).unwrap()[0].subject, "one");
+    }
+
+    #[test]
+    fn a_detached_checkout_of_a_commit_sha_moves_head_alone() {
+        // The shape `commits.checkout` aims: a full sha, not a branch name —
+        // HEAD detaches onto it while the branch tip stands still.
+        let r = two_commits("checkout-detached");
+        let g = r.open();
+        let (tip, target) = (r.rev_parse("HEAD"), r.rev_parse("HEAD~1"));
+
+        g.checkout(target.as_bytes()).expect("checks out");
+        match g.head().unwrap() {
+            HeadState::Detached { commit } => assert_eq!(commit, target),
+            other => panic!("detached expected, got {other:?}"),
+        };
+        assert_eq!(
+            r.git_os_out(&["rev-parse".into(), "main".into()]),
+            format!("{tip}\n").into_bytes(),
+            "the branch never moved"
+        );
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"first\n",
+            "the working tree went with HEAD"
+        );
+    }
+
+    #[test]
+    fn reset_author_hands_head_a_new_author_and_nothing_else() {
+        // Committed under a foreign hand, re-authored to the current user:
+        // `--reset-author` takes the committer, which the scratch config
+        // fixed as gitten-test before the commit ever ran.
+        let r = Scratch::new("reset-author");
+        r.write("f.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&[
+            "commit",
+            "-qm",
+            "mine",
+            "--author=Someone Else <else@example.com>",
+        ]);
+        let g = r.open();
+        let before = r.rev_parse("HEAD");
+
+        g.reset_author().expect("re-authors");
+        let after = r.rev_parse("HEAD");
+        assert_ne!(after, before, "the commit was replaced");
+        let who = String::from_utf8(r.git_os_out(&[
+            "log".into(),
+            "-1".into(),
+            "--format=%an <%ae>".into(),
+        ]))
+        .unwrap();
+        assert_eq!(who.trim(), "gitten-test <test@gitten.local>");
+        let what =
+            String::from_utf8(r.git_os_out(&["log".into(), "-1".into(), "--format=%s".into()]))
+                .unwrap();
+        assert_eq!(what.trim(), "mine", "the message stood still");
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"x\n",
+            "and so did the tree"
+        );
+    }
+
+    #[test]
+    fn reset_author_on_an_unborn_branch_is_refused() {
+        let r = Scratch::new("reset-author-unborn");
+        r.write("f.txt", b"x\n");
+        let e = r.open().reset_author().unwrap_err();
+        assert!(e.contains("no commits yet"), "{e}");
+    }
+
+    #[test]
+    fn reverting_the_root_commit_leaves_an_empty_tree() {
+        // The root has no parent to diff against, but its inverse is still
+        // well-defined: everything it added, removed.
+        let r = Scratch::new("revert-root");
+        r.write("f.txt", b"only\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "root"]);
+        let g = r.open();
+
+        g.revert(b"HEAD").expect("reverts the root");
+        let log = g.log(5).unwrap();
+        assert_eq!(log.len(), 2);
+        assert!(!join_raw(&r.0, b"f.txt").exists(), "the file is gone");
+        let tree = g.status().unwrap();
+        assert_eq!(
+            tree.staged.len() + tree.unstaged.len(),
+            0,
+            "the undo committed itself"
+        );
+    }
+
+    #[test]
+    fn a_merge_commit_is_not_reverted_or_picked_without_a_parent() {
+        // `-m` names which parent the inverse is taken against; these verbs
+        // do not take one — a merge through them is git's refusal, verbatim,
+        // and the history it would have rewritten stands still. The
+        // mainline-aware variants are a later slice's work, said here so the
+        // refusal is a documented gap and not a mystery.
+        let r = Scratch::new("merge-no-mainline");
+        r.write("f.txt", b"base\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        r.git(&["checkout", "-qb", "side"]);
+        r.write("f.txt", b"side\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "side"]);
+        r.git(&["checkout", "-q", "main"]);
+        r.write("g.txt", b"main\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "main"]);
+        r.git(&["merge", "--no-ff", "-qm", "merge", "side"]);
+        let g = r.open();
+        let merge = r.rev_parse("HEAD");
+        assert_eq!(g.log(5).unwrap().len(), 4);
+
+        let e = g.revert(merge.as_bytes()).unwrap_err();
+        assert!(e.contains("-m"), "{e}");
+        let e = g.cherry_pick(merge.as_bytes()).unwrap_err();
+        assert!(!e.is_empty(), "git refused the pick too");
+        // The failed pick leaves no sequencer behind: a refusal is not a
+        // state, and the lifecycle has nothing to carry.
+        assert!(!g.cherry_pick_in_progress());
+        assert_eq!(r.rev_parse("HEAD"), merge, "history stood still");
     }
 
     #[test]
