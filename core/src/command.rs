@@ -2180,9 +2180,9 @@ mod tests {
         let k = Keymap::builtin();
         let mut found = k.keys_for("view.down");
         found.sort();
-        // `view.down` is also how the settings panel moves its selection —
-        // the same verb, intercepted while the panel stands.
-        assert_eq!(found, vec!["down", "down", "j", "j"]);
+        // `view.down` is also how the settings panel and the remotes picker
+        // move their selection — the same verb, intercepted while each stands.
+        assert_eq!(found, vec!["down", "down", "down", "j", "j", "j"]);
         assert!(k.keys_for("nothing.at.all").is_empty());
     }
 

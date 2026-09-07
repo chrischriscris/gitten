@@ -606,6 +606,7 @@ fn paint_picker(screen: &mut Screen, y: usize, height: usize, picker: &RecentPic
         return;
     }
     let c = &host.theme.chrome;
+    const TITLE: &str = " recent repositories ";
     let bg = Ink::new(c.dim, c.bg);
     let shown = height.saturating_sub(3).max(1).min(picker.rows.len());
     let text_width = picker
@@ -614,7 +615,10 @@ fn paint_picker(screen: &mut Screen, y: usize, height: usize, picker: &RecentPic
         .map(|r| gitten_tui::screen::width(r.to_string_lossy().as_ref()))
         .max()
         .unwrap_or(0);
+    // The box fits its widest row — or its own title, whichever is longer:
+    // a short list never clips the name of the thing being listed.
     let width = (text_width + 2)
+        .max(TITLE.len())
         .min(screen.width().saturating_sub(2))
         .max(14);
     // The keyboard's row is on screen: the window scrolls only when it
@@ -626,7 +630,7 @@ fn paint_picker(screen: &mut Screen, y: usize, height: usize, picker: &RecentPic
         let at = y + 1 + i;
         let mut pen = screen.span(at, 1, width);
         if i == 0 {
-            pen.put(" recent repositories ", Ink::new(c.accent, c.status_bg));
+            pen.put(TITLE, Ink::new(c.accent, c.status_bg));
             pen.wash(Ink::new(c.dim, c.status_bg));
         } else {
             let source = top + (i - 1);
@@ -3418,7 +3422,7 @@ impl App {
             "pane.next" => self.cycle_pane(1),
             "pane.prev" => self.cycle_pane(-1),
             "status.focus" | "files.focus" | "branches.focus" | "commits.focus"
-            | "stashes.focus" | "diff.focus" => {
+            | "stashes.focus" | "remotes.focus" | "diff.focus" => {
                 let name = command.strip_suffix(".focus").unwrap_or(command);
                 self.focus_named(name);
             }
@@ -6565,7 +6569,10 @@ diff --git a/tracked.txt b/tracked.txt
         // ------------------------------------------------------ the sync
 
         fn remotes(&self) -> gitten_git::Result<Vec<gitten_core::refs::Remote>> {
-            self.net()?;
+            // A config read, not a network verb: `git remote -v` never
+            // touches the wire, and a job built from it (push_current names
+            // its carrier this way) runs on the caller's thread — a net gate
+            // here would block dispatch itself, not just the job.
             let mut s = self.0.lock().unwrap();
             s.server_reads += 1;
             Ok(s.servers.clone())
@@ -13629,14 +13636,19 @@ diff --git a/tracked.txt b/tracked.txt
         );
 
         // --- a rejected push says git's words and moves nothing
+        // The tracking checkout above moved HEAD to feature; the divergence
+        // dance is main's, so main takes the keyboard back first.
+        b.git(&["checkout", "-q", "main"]);
         b.git(&["commit", "-q", "--amend", "-m", "divergent"]);
         b_app.dispatch("repo.push");
         assert!(
-            until(Duration::from_secs(5), || {
+            until(Duration::from_secs(10), || {
                 b_app.pump();
-                !b_app.message.is_empty() && !b_app.message.starts_with("running")
+                b_app.message.contains("rejected")
+                    || b_app.message.contains("fetch first")
+                    || b_app.message.contains("non-fast-forward")
             }),
-            "the rejected push never finished: {:?}",
+            "the rejected push never said so: {:?}",
             b_app.message
         );
         let refusal = b_app.message.clone();
@@ -13669,14 +13681,25 @@ diff --git a/tracked.txt b/tracked.txt
     #[test]
     fn tui_parity_a_blocking_sync_job_keeps_the_keyboard_live() {
         let (handle, state) = fake(&[]);
-        let mut app = commits_app(&handle);
         let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
-        state.lock().unwrap().net_gate = Some(Arc::clone(&gate));
-        state.lock().unwrap().refuse_net = Some("rejected: non-fast-forward".into());
-
+        {
+            let mut s = state.lock().unwrap();
+            s.net_gate = Some(Arc::clone(&gate));
+            s.refuse_net = Some("rejected: non-fast-forward".into());
+            // push_current names its carrier from the config remotes.
+            s.servers = vec![remote_ref("origin", &["one.example"])];
+        }
+        let mut app = commits_app(&handle);
         app.dispatch("repo.push");
         app.draw();
-        assert_eq!(app.message, "running push origin main");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.pump();
+                app.message == "running push origin main"
+            }),
+            "the push never started: {:?}",
+            app.message
+        );
 
         // The keyboard is live: the list moves under a job that has not
         // come back.
@@ -13709,6 +13732,9 @@ diff --git a/tracked.txt b/tracked.txt
         let (a_handle, a_state) = fake(&[]);
         a_state.lock().unwrap().net_gate =
             Some(Arc::new((Mutex::new(false), std::sync::Condvar::new())));
+        // A push needs a carrier to name: origin in the config remotes —
+        // what push_current reads to build the job.
+        a_state.lock().unwrap().servers = vec![remote_ref("origin", &["one.example"])];
         let (b_handle, b_state) = fake(&[]);
         b_state.lock().unwrap().status = Status {
             untracked: vec![gitten_core::status::UntrackedEntry {
@@ -13729,7 +13755,14 @@ diff --git a/tracked.txt b/tracked.txt
             // The push is asked of /a and blocks in the worker.
             app.dispatch("repo.push");
             app.draw();
-            assert_eq!(app.message, "running push origin main");
+            assert!(
+                until(Duration::from_secs(2), || {
+                    app.pump();
+                    app.message == "running push origin main"
+                }),
+                "the push never started: {:?}",
+                app.message
+            );
 
             // The switch happens under it: /b opens, and every pane the app
             // holds is now /b's — the label names the read that stands.
@@ -13878,14 +13911,16 @@ diff --git a/tracked.txt b/tracked.txt
         app.dispatch("view.top");
         app.dispatch("remotes.remove");
         app.dispatch("remotes.remove");
-        app.pump();
         assert!(
-            state
-                .lock()
-                .unwrap()
-                .branch_writes
-                .iter()
-                .any(|w| w == "remote remove origin"),
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                state
+                    .lock()
+                    .unwrap()
+                    .branch_writes
+                    .iter()
+                    .any(|w| w == "remote remove origin")
+            }),
             "the removal never landed: {:?}",
             state.lock().unwrap().branch_writes
         );
@@ -13917,27 +13952,31 @@ diff --git a/tracked.txt b/tracked.txt
         app.press(Key::plain(Code::Enter));
         type_(&mut app, "git@example.com:fork.git");
         app.press(Key::plain(Code::Enter));
-        app.pump();
         assert!(
-            state
-                .lock()
-                .unwrap()
-                .branch_writes
-                .iter()
-                .any(|w| w == "remote add fork git@example.com:fork.git"),
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                state
+                    .lock()
+                    .unwrap()
+                    .branch_writes
+                    .iter()
+                    .any(|w| w == "remote add fork git@example.com:fork.git")
+            }),
             "the add never landed: {:?}",
             state.lock().unwrap().branch_writes
         );
 
-        // Empty answers are refused before anything is queued.
+        // Empty answers are refused before anything is queued, and the
+        // refusal stands beside the field that closed — reopen and answer.
         app.dispatch("remotes.new");
         app.press(Key::plain(Code::Enter));
         assert_eq!(app.message, "a remote needs a name");
+        app.press(Key::plain(Code::Esc));
+        app.dispatch("remotes.new");
         type_(&mut app, "x");
         app.press(Key::plain(Code::Enter));
         app.press(Key::plain(Code::Enter));
         assert_eq!(app.message, "a remote needs a URL");
-        app.press(Key::plain(Code::Esc));
         app.press(Key::plain(Code::Esc));
 
         // The edit field arrives holding the remote's own URL.
@@ -13952,15 +13991,20 @@ diff --git a/tracked.txt b/tracked.txt
         // Accept unchanged: git answers "unchanged" in its own words; the
         // verb queued is still exactly one set-url.
         app.press(Key::plain(Code::Enter));
-        app.pump();
-        let writes = state.lock().unwrap().branch_writes.clone();
-        assert_eq!(
-            writes
-                .iter()
-                .filter(|w| w.starts_with("remote set-url"))
-                .count(),
-            1,
-            "{writes:?}"
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                state
+                    .lock()
+                    .unwrap()
+                    .branch_writes
+                    .iter()
+                    .filter(|w| w.starts_with("remote set-url"))
+                    .count()
+                    == 1
+            }),
+            "the edit never landed: {:?}",
+            state.lock().unwrap().branch_writes
         );
     }
 
@@ -13973,17 +14017,29 @@ diff --git a/tracked.txt b/tracked.txt
         let mut app = commits_app(&handle);
         app.dispatch("remotes.focus");
         app.dispatch("remotes.fetch");
-        app.pump();
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                state.lock().unwrap().writes.len() == 1
+            }),
+            "the fetch did not aim at the row: {:?}",
+            state.lock().unwrap().writes
+        );
         assert_eq!(
             state.lock().unwrap().writes,
-            vec!["fetch origin".to_string()],
-            "the fetch did not aim at the row"
+            vec!["fetch origin".to_string()]
         );
 
         // An empty list has nothing to aim at, before the queue.
         state.lock().unwrap().servers.clear();
         app.dispatch("repo.refresh");
-        app.pump();
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                remotes_status(&app) == "0 remotes"
+            }),
+            "the refresh never emptied the pane"
+        );
         app.dispatch("remotes.fetch");
         app.pump();
         assert_eq!(app.message, "nothing selected to fetch");
@@ -14015,28 +14071,32 @@ diff --git a/tracked.txt b/tracked.txt
         // `u` on main: both remotes carry main, and origin is the one that
         // stands out.
         app.dispatch("branches.set-upstream");
-        app.pump();
         assert!(
-            state
-                .lock()
-                .unwrap()
-                .branch_writes
-                .iter()
-                .any(|w| w == "track main origin main"),
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                state
+                    .lock()
+                    .unwrap()
+                    .branch_writes
+                    .iter()
+                    .any(|w| w == "track main origin main")
+            }),
             "the set never landed: {:?}",
             state.lock().unwrap().branch_writes
         );
 
         // `U` severs the link and nothing else.
         app.dispatch("branches.unset-upstream");
-        app.pump();
         assert!(
-            state
-                .lock()
-                .unwrap()
-                .branch_writes
-                .iter()
-                .any(|w| w == "untrack main"),
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                state
+                    .lock()
+                    .unwrap()
+                    .branch_writes
+                    .iter()
+                    .any(|w| w == "untrack main")
+            }),
             "the unset never landed"
         );
 
@@ -14100,6 +14160,9 @@ diff --git a/tracked.txt b/tracked.txt
         {
             let mut s = state.lock().unwrap();
             s.servers = vec![remote_ref("origin", &["one.example"])];
+            // The parked branch is feat/ure: the refspec shape aims at the
+            // remote-tracking branch of the same name.
+            s.locals[1].name = RefName::from("feat/ure");
         }
         let mut app = commits_app(&handle);
         app.dispatch("branches.focus");
@@ -14107,14 +14170,16 @@ diff --git a/tracked.txt b/tracked.txt
 
         // main is HEAD: merge --ff-only from origin/main.
         app.dispatch("branches.fast-forward");
-        app.pump();
         assert!(
-            state
-                .lock()
-                .unwrap()
-                .branch_writes
-                .iter()
-                .any(|w| w.contains("merge --ff-only") && w.contains("origin/main")),
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                state
+                    .lock()
+                    .unwrap()
+                    .branch_writes
+                    .iter()
+                    .any(|w| w.contains("merge --ff-only") && w.contains("origin/main"))
+            }),
             "the checked-out branch took the wrong shape: {:?}",
             state.lock().unwrap().branch_writes
         );
@@ -14122,14 +14187,16 @@ diff --git a/tracked.txt b/tracked.txt
         // A branch that is not HEAD: the fetch refspec.
         app.dispatch("view.down");
         app.dispatch("branches.fast-forward");
-        app.pump();
         assert!(
-            state
-                .lock()
-                .unwrap()
-                .branch_writes
-                .iter()
-                .any(|w| w.contains("fetch refspec") && w.contains("origin/feat/ure")),
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                state
+                    .lock()
+                    .unwrap()
+                    .branch_writes
+                    .iter()
+                    .any(|w| w.contains("fetch refspec") && w.contains("origin/feat/ure"))
+            }),
             "the parked branch took the wrong shape: {:?}",
             state.lock().unwrap().branch_writes
         );
@@ -14162,14 +14229,16 @@ diff --git a/tracked.txt b/tracked.txt
             "discard local changes and check out main? press again to confirm"
         );
         app.dispatch("branches.force-checkout");
-        app.pump();
         assert!(
-            state
-                .lock()
-                .unwrap()
-                .branch_writes
-                .iter()
-                .any(|w| w == "force-checkout main"),
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                state
+                    .lock()
+                    .unwrap()
+                    .branch_writes
+                    .iter()
+                    .any(|w| w == "force-checkout main")
+            }),
             "the confirmed force never landed"
         );
         assert!(
@@ -14205,27 +14274,31 @@ diff --git a/tracked.txt b/tracked.txt
         app.dispatch("branches.checkout-name");
         type_(&mut app, "f\u{e9}ature");
         app.press(Key::plain(Code::Enter));
-        app.pump();
         assert!(
-            state
-                .lock()
-                .unwrap()
-                .branch_bytes
-                .iter()
-                .any(|b| b == b"f\xe9ature"),
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                state
+                    .lock()
+                    .unwrap()
+                    .branch_bytes
+                    .iter()
+                    .any(|b| b == "f\u{e9}ature".as_bytes())
+            }),
             "the name did not arrive as bytes: {:?}",
             state.lock().unwrap().branch_bytes
         );
 
         app.dispatch("branches.checkout-previous");
-        app.pump();
         assert!(
-            state
-                .lock()
-                .unwrap()
-                .branch_writes
-                .iter()
-                .any(|w| w == "checkout -"),
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                state
+                    .lock()
+                    .unwrap()
+                    .branch_writes
+                    .iter()
+                    .any(|w| w == "checkout -")
+            }),
             "the previous branch never moved HEAD: {:?}",
             state.lock().unwrap().branch_writes
         );
@@ -14248,14 +14321,16 @@ diff --git a/tracked.txt b/tracked.txt
         app.press(Key::char('n'));
         type_(&mut app, "feature");
         app.press(Key::plain(Code::Enter));
-        app.pump();
         assert!(
-            state
-                .lock()
-                .unwrap()
-                .branch_writes
-                .iter()
-                .any(|w| w == "branch feature at 00000001"),
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                state
+                    .lock()
+                    .unwrap()
+                    .branch_writes
+                    .iter()
+                    .any(|w| w == "branch feature at 00000001")
+            }),
             "the branch did not grow from the selected commit: {:?}",
             state.lock().unwrap().branch_writes
         );
@@ -14270,7 +14345,7 @@ diff --git a/tracked.txt b/tracked.txt
         );
         // esc is a no: nothing checked out, the question closed.
         app.press(Key::plain(Code::Esc));
-        app.pump();
+        app.pump_quiet();
         assert!(
             !state
                 .lock()
@@ -14286,12 +14361,20 @@ diff --git a/tracked.txt b/tracked.txt
         type_(&mut app, "second");
         app.press(Key::plain(Code::Enter));
         app.press(Key::plain(Code::Enter));
-        app.pump();
-        let writes = state.lock().unwrap().branch_writes.clone();
-        assert_eq!(
-            writes.iter().filter(|w| w.starts_with("checkout ")).count(),
-            1,
-            "{writes:?}"
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                state
+                    .lock()
+                    .unwrap()
+                    .branch_writes
+                    .iter()
+                    .filter(|w| w.starts_with("checkout "))
+                    .count()
+                    == 1
+            }),
+            "the offered checkout never landed: {:?}",
+            state.lock().unwrap().branch_writes
         );
     }
 
@@ -14335,14 +14418,18 @@ diff --git a/tracked.txt b/tracked.txt
             // on it.
             app.press(Key::plain(Code::Enter));
             app.pump_quiet();
-            assert_eq!(app.message, "switched to /a");
+            // /a is already open: the honest answer names it, it does not
+            // pretend to switch.
+            assert_eq!(app.message, "already showing /a");
+        });
 
-            // Empty is said, not shown.
-            with_mru("picker-empty", &[], || {
-                let mut app = commits_app(&a_handle);
-                app.dispatch("project.switch");
-                assert_eq!(app.message, "no recent repositories — O to open one");
-            });
+        // Empty is said, not shown — a sibling, not a nested case: env_lock
+        // is not reentrant, and a with_mru inside a with_mru asks the same
+        // thread for the same mutex twice.
+        with_mru("picker-empty", &[], || {
+            let mut app = commits_app(&a_handle);
+            app.dispatch("project.switch");
+            assert_eq!(app.message, "no recent repositories — O to open one");
         });
     }
 
@@ -14357,8 +14444,13 @@ diff --git a/tracked.txt b/tracked.txt
             let label = files_label(&app).to_string();
             let cursor = commits_of(&app).cursor();
 
+            // An existing directory that is not a repository: git's own
+            // "not a git repository" is the refusal, not a missing path.
+            let scratch =
+                std::env::temp_dir().join(format!("gitten-tui-not-a-repo-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&scratch);
             app.press(Key::char('O'));
-            type_(&mut app, "/definitely/not/a/repository");
+            type_(&mut app, scratch.to_str().unwrap());
             app.press(Key::plain(Code::Enter));
             assert!(
                 app.message.contains("not a git repository"),
@@ -14372,6 +14464,7 @@ diff --git a/tracked.txt b/tracked.txt
                 "a failed open wrote the MRU: {:?}",
                 gitten_app::projects::load()
             );
+            let _ = std::fs::remove_dir(&scratch);
         });
     }
 }
