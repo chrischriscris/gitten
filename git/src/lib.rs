@@ -801,6 +801,18 @@ pub trait Repo: Send + Sync {
         Err(unserved("resetting the author"))
     }
 
+    /// Replaces HEAD's message and nothing else —
+    /// `git commit --amend --only --file=-`.
+    ///
+    /// The narrow sibling of [`amend`](Self::amend), and narrow on purpose:
+    /// `--only` with no pathspec keeps the index exactly where it is, so a
+    /// keypress that said *reword* cannot commit somebody's staged work in
+    /// progress. Deeper than HEAD the same move is a rebase, and
+    /// [`rebase_plan`](Self::rebase_plan) carries it.
+    fn reword_head(&self, _message: &str) -> Result<()> {
+        Err(unserved("rewording"))
+    }
+
     /// Rewrites history by handing git a plan: `git rebase -i <upstream>`
     /// with the sequencer editor replaced by a command that installs
     /// [`script`](gitten_core::rebase::TodoScript).
@@ -2075,6 +2087,20 @@ impl Repo for Binary {
                 b"--reset-author",
                 b"--only",
             ],
+        )
+        .map(|_| ())
+    }
+
+    fn reword_head(&self, message: &str) -> Result<()> {
+        if message.trim().is_empty() {
+            return Err("a commit needs a message".into());
+        }
+        if let HeadState::Branch { commit: None, .. } = self.head()? {
+            return Err("nothing to reword: this branch has no commits yet".into());
+        }
+        self.commit_via(
+            &[b"commit", b"--amend", b"-q", b"--only", b"--file=-"],
+            message,
         )
         .map(|_| ())
     }

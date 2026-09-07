@@ -11,7 +11,7 @@
 
 use crate::jobs::Job;
 use gitten_core::operation::Side;
-use gitten_core::rebase::TodoScript;
+use gitten_core::rebase::{Plan, TodoScript};
 use gitten_core::refs::{HeadState, Remote, ResetMode};
 use gitten_git::{Handle, Repo};
 
@@ -32,6 +32,14 @@ pub struct Write {
     /// somewhere the eye is not. `None` for everything whose result shows
     /// itself in the pane it changed — a staged file needs no announcer.
     done: Option<String>,
+}
+
+/// The band's count of commits, said the way a person says it.
+fn many_commits(n: usize) -> String {
+    match n {
+        1 => "1 commit".into(),
+        n => format!("{n} commits"),
+    }
 }
 
 /// The band's count of paths, said the way a person says it.
@@ -197,6 +205,89 @@ impl Write {
             r.rebase_todo(&upstream, &script)
         })
         .announcing(format!("rebased onto {shown}"))
+    }
+
+    /// Replaces HEAD's message and nothing else. The narrow sibling of
+    /// [`Write::amend`], and narrow on purpose: a keypress that said
+    /// *reword* must not commit whatever happens to be staged, which is
+    /// what a bare amend would do.
+    pub fn reword_head(repo: &Handle, message: String) -> Self {
+        Self::named("reword HEAD".into(), repo, move |r| r.reword_head(&message))
+            .announcing("reworded HEAD")
+    }
+
+    /// Rewrites this branch from an editable [`Plan`] — the todo UI's own
+    /// verb, and the only one that can carry a reworded message or an
+    /// amendment down to the layer with a filesystem to put them in. The
+    /// plan refuses every shape git would before any process runs; a
+    /// conflict, or an `edit` the plan asked for, hands back a standing
+    /// rebase for the lifecycle keys to carry on from.
+    /// DESTRUCTIVE: the caller confirms before this job is ever built.
+    pub fn rebase_plan(repo: &Handle, plan: Plan) -> Self {
+        let shown = String::from_utf8_lossy(plan.upstream()).into_owned();
+        let count = plan.len();
+        Self::named(format!("rebase {count} onto {shown}"), repo, move |r| {
+            r.rebase_plan(&plan)
+        })
+        .announcing(format!("rewrote {} from {shown}", many_commits(count)))
+    }
+
+    /// Replays everything after `base` onto `onto` — `git rebase --onto`,
+    /// with the marked commit left exactly where it is and its children
+    /// moved. DESTRUCTIVE: the caller confirms before this job is ever
+    /// built, and names both ends of it, because a base that is not an
+    /// ancestor of HEAD replays a range nobody meant.
+    pub fn rebase_onto_base(repo: &Handle, onto: Vec<u8>, base: Vec<u8>) -> Self {
+        let target = String::from_utf8_lossy(&onto).into_owned();
+        let from = String::from_utf8_lossy(&base).into_owned();
+        Self::named(
+            format!("rebase onto {target} from {from}"),
+            repo,
+            move |r| r.rebase_onto_base(&onto, &base),
+        )
+        .announcing(format!("rebased onto {target}, from {from} up"))
+    }
+
+    /// Throws the whole working tree away — every uncommitted byte, tracked
+    /// and untracked, with no stash and no reflog behind it. Ignored files
+    /// stay. DESTRUCTIVE, the most so here: the caller confirms.
+    pub fn nuke_worktree(repo: &Handle) -> Self {
+        Self::named("nuke the working tree".into(), repo, |r| r.nuke_worktree())
+            .announcing("the working tree is back at HEAD")
+    }
+
+    /// Moves the current branch onto whatever its upstream holds, at the
+    /// strength given — the files pane's reset, aimed past every row at the
+    /// remote-tracking ref this branch is configured against.
+    ///
+    /// The aim is *read*, never assumed: the branch under HEAD, then its
+    /// configured upstream, and each way that can be missing refuses here
+    /// with a sentence instead of queueing a job git would answer with a
+    /// revspec error. The ref is named in full (`origin/main`, not
+    /// `@{upstream}`) so what a confirmation says and what git resolves are
+    /// the same string.
+    pub fn reset_upstream(repo: &Handle, mode: ResetMode) -> Result<Self, String> {
+        let branch = match repo.head()? {
+            HeadState::Branch { name, .. } => name,
+            HeadState::Detached { .. } => {
+                return Err("detached HEAD has no branch, so it has no upstream".into())
+            }
+        };
+        let upstream = repo
+            .branches()?
+            .iter()
+            .find(|b| b.name.as_bytes() == branch.as_bytes())
+            .and_then(|b| b.upstream.clone())
+            .ok_or_else(|| {
+                format!(
+                    "{} tracks no upstream to reset to",
+                    branch.to_string_lossy()
+                )
+            })?;
+        let mut target = upstream.remote.as_bytes().to_vec();
+        target.push(b'/');
+        target.extend_from_slice(upstream.branch.as_bytes());
+        Ok(Self::reset(repo, mode, target))
     }
 
     /// Moves the current branch onto `upstream`, replaying its own commits:
@@ -1583,6 +1674,35 @@ mod tests {
                 Some("fetched or\u{FFFD}gin".into()),
             ]
         );
+    }
+
+    #[test]
+    fn reset_upstream_names_the_tracking_ref_in_full() {
+        // The aim is read, and named the way git resolves it: `up/main`,
+        // not `@{upstream}`, so the question a reader confirms and the
+        // revspec git is handed are the same string.
+        let fake = Arc::new(SyncFake::tracked(Some("up"), &["up"]));
+        let repo: Handle = fake.clone();
+        let job = Write::reset_upstream(&repo, ResetMode::Hard).expect("an aim");
+        assert_eq!(job.name(), "reset --hard up/main");
+        assert_eq!(fake.said(), Vec::<String>::new(), "nothing ran yet");
+
+        // No upstream configured: a sentence, not a job git would answer
+        // with a revspec error.
+        let fake = Arc::new(SyncFake::tracked(None, &["origin"]));
+        let repo: Handle = fake.clone();
+        let err = Write::reset_upstream(&repo, ResetMode::Mixed)
+            .err()
+            .expect("refused");
+        assert!(err.contains("no upstream"), "{err}");
+
+        // Detached HEAD is not a branch, so it tracks nothing.
+        let fake = Arc::new(SyncFake::detached());
+        let repo: Handle = fake.clone();
+        let err = Write::reset_upstream(&repo, ResetMode::Soft)
+            .err()
+            .expect("refused");
+        assert!(err.contains("detached"), "{err}");
     }
 
     #[test]

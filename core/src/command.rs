@@ -424,6 +424,22 @@ impl Keymap {
         // lazygit's shift-stash: park what the working tree holds and start
         // again from HEAD.
         bind("files", "s", "files.stash");
+        // lazygit's files-panel reset menu, on its own `g`: the strengths
+        // aim at the *upstream* rather than at a row, and the nuke throws
+        // the working tree away. It shadows the global `view.top` inside
+        // this pane, the trade [stashes] already makes for its own `g`, and
+        // `home` still reaches the top. The answers live in a mode of their
+        // own — pushed only while the question stands — because `s`, `h`
+        // and `D` all mean something else in this pane the rest of the time,
+        // which is the menu doing its job rather than stealing three keys.
+        bind("files", "g", "files.reset-menu");
+        bind("upstream", "s", "files.reset-upstream-soft");
+        bind("upstream", "m", "files.reset-upstream-mixed");
+        bind("upstream", "h", "files.reset-upstream-hard");
+        // lazygit's own letter for the nuke, reachable here rather than on
+        // the pane itself: `D` on a row discards *that file*, and the two
+        // are a keypress and a catastrophe apart.
+        bind("upstream", "D", "files.nuke");
         // A conflict row's four answers. Lazygit reaches them through a
         // main-view merging UI; here they are file-level and live beside the
         // rows that name the conflict — ours/theirs take the two stages,
@@ -581,6 +597,23 @@ impl Keymap {
         bind("commits", "s", "commits.squash-up");
         bind("commits", "f", "commits.fixup-up");
         bind("commits", "d", "commits.drop-commit");
+        // The rest of lazygit's history editing, on lazygit's own letters:
+        // `i` opens the plan for the window from HEAD down to this row, `e`
+        // stops a rebase *at* this commit so it can be amended, `r` gives it
+        // a new message, and `B` marks it as the base a `--onto` rebase
+        // counts from. All four are particular to this pane, so none is a
+        // global; `r` and `e` are free here, and `B` is nobody's.
+        bind("commits", "i", "commits.interactive-rebase");
+        bind("commits", "e", "commits.edit-commit");
+        bind("commits", "r", "commits.reword");
+        bind("commits", "B", "commits.mark-base");
+        // Moving a commit through its neighbours. lazygit spells this
+        // ctrl+j/ctrl+k *and* alt+↓/alt+↑; the chords are the pane cycle
+        // here and would have to be taken from every list to free them, so
+        // the alias is the binding and the difference is deliberate. Up is
+        // towards HEAD, which is what the list draws above the row.
+        bind("commits", "alt-up", "commits.move-up");
+        bind("commits", "alt-down", "commits.move-down");
         // The way out of a stranded rebase — one that stopped mid-flight on
         // a conflict or a refusal and left its state standing. lazygit
         // offers these through a menu that appears during a rebase; here
@@ -703,6 +736,36 @@ impl Keymap {
         bind("picker", "home", "view.top");
         bind("picker", "G", "view.bottom");
         bind("picker", "end", "view.bottom");
+
+        // The rebase plan owns the keyboard for as long as it is open, on
+        // the same terms the picker does: a press it does not name runs
+        // nothing underneath, because the keys underneath rewrite history.
+        // The action letters are git's own todo words — p, r, e, s, f, d —
+        // which are also lazygit's, and `S` is the autosquash beside them.
+        // The chords are free inside a modal, so the reorder takes both of
+        // lazygit's spellings here even though the pane outside can only
+        // afford the alias.
+        bind("todo", "p", "todo.pick");
+        bind("todo", "r", "todo.reword");
+        bind("todo", "e", "todo.edit");
+        bind("todo", "s", "todo.squash");
+        bind("todo", "f", "todo.fixup");
+        bind("todo", "d", "todo.drop");
+        bind("todo", "S", "todo.autosquash");
+        bind("todo", "alt-up", "todo.move-up");
+        bind("todo", "alt-down", "todo.move-down");
+        bind("todo", "ctrl-k", "todo.move-up");
+        bind("todo", "ctrl-j", "todo.move-down");
+        bind("todo", "enter", "todo.run");
+        bind("todo", "esc", "back");
+        bind("todo", "j", "view.down");
+        bind("todo", "down", "view.down");
+        bind("todo", "k", "view.up");
+        bind("todo", "up", "view.up");
+        bind("todo", "g", "view.top");
+        bind("todo", "home", "view.top");
+        bind("todo", "G", "view.bottom");
+        bind("todo", "end", "view.bottom");
 
         // The settings panel owns the keyboard for as long as it stands, for
         // the same reason the help overlay does: a press it does not name must
@@ -1318,6 +1381,95 @@ impl Commands {
                 "commits.drop-commit",
                 "remove this commit from the branch, asked twice",
                 Some("drop"),
+            ),
+            (
+                "commits.interactive-rebase",
+                "open this branch's rebase plan, from this commit up",
+                Some("rebase"),
+            ),
+            (
+                "commits.edit-commit",
+                "replay up to this commit and stop, so it can be amended",
+                Some("edit"),
+            ),
+            (
+                "commits.reword",
+                "give this commit a new message",
+                Some("reword"),
+            ),
+            (
+                "commits.mark-base",
+                "mark this commit as the base a rebase counts from",
+                Some("base"),
+            ),
+            (
+                "commits.move-up",
+                "move this commit one closer to HEAD",
+                Some("move up"),
+            ),
+            (
+                "commits.move-down",
+                "move this commit one further from HEAD",
+                Some("move down"),
+            ),
+            ("todo.pick", "replay this commit unchanged", Some("pick")),
+            (
+                "todo.reword",
+                "replay it under a message you type now",
+                Some("reword"),
+            ),
+            (
+                "todo.edit",
+                "replay it, then stop so it can be amended",
+                Some("edit"),
+            ),
+            (
+                "todo.squash",
+                "fold it into the commit below, keeping both messages",
+                Some("squash"),
+            ),
+            (
+                "todo.fixup",
+                "fold it into the commit below, dropping its message",
+                Some("fixup"),
+            ),
+            (
+                "todo.drop",
+                "leave this commit out of the branch",
+                Some("drop"),
+            ),
+            ("todo.move-up", "move this row one closer to HEAD", None),
+            ("todo.move-down", "move this row one further from HEAD", None),
+            (
+                "todo.autosquash",
+                "land every fixup! and squash! on the commit it names",
+                Some("autosquash"),
+            ),
+            ("todo.run", "rewrite history the way this plan says", Some("run")),
+            (
+                "files.reset-menu",
+                "choose a strength to reset toward the upstream",
+                Some("reset"),
+            ),
+            (
+                "files.reset-upstream-soft",
+                "move this branch onto its upstream, keeping every change staged",
+                Some("reset soft"),
+            ),
+            (
+                "files.reset-upstream-mixed",
+                "move this branch onto its upstream, unstaging what it holds",
+                Some("reset mixed"),
+            ),
+            (
+                "files.reset-upstream-hard",
+                "move this branch onto its upstream and discard the changes, asked twice",
+                Some("reset hard"),
+            ),
+            (
+                "files.nuke",
+                "throw every uncommitted change away, asked twice",
+                Some("nuke"),
             ),
             (
                 "commits.rebase-onto",
@@ -2342,9 +2494,13 @@ mod tests {
         let k = Keymap::builtin();
         let mut found = k.keys_for("view.down");
         found.sort();
-        // `view.down` is also how the settings panel and the remotes picker
-        // move their selection — the same verb, intercepted while each stands.
-        assert_eq!(found, vec!["down", "down", "down", "j", "j", "j"]);
+        // `view.down` is also how the settings panel, the remotes picker and
+        // the rebase plan move their selection — the same verb, intercepted
+        // while each of them stands.
+        assert_eq!(
+            found,
+            vec!["down", "down", "down", "down", "j", "j", "j", "j"]
+        );
         assert!(k.keys_for("nothing.at.all").is_empty());
     }
 

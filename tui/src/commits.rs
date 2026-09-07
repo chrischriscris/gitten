@@ -240,6 +240,10 @@ pub struct Commits {
     /// a walk of at most a handful of strings, which is why this is a `Vec`
     /// and not a set — the clipboard is a keyboard's worth of commits.
     copied: Vec<String>,
+    /// The short sha of the commit marked as a rebase base, when one is —
+    /// display only, said on the status line. The mark itself is the
+    /// client's, because it outlives this pane's every refresh.
+    base: Option<String>,
 }
 
 impl Commits {
@@ -284,6 +288,7 @@ impl Commits {
             dragging: false,
             marks: None,
             copied: Vec::new(),
+            base: None,
             marking: false,
         }
     }
@@ -327,6 +332,13 @@ impl Commits {
             shas.iter()
                 .map(|sha| String::from_utf8_lossy(sha).into_owned()),
         );
+    }
+
+    /// Tells the pane which commit is the marked rebase base, so the status
+    /// line can say so. Called by the client whenever the mark changes and
+    /// never on the render path.
+    pub fn set_base(&mut self, short: Option<String>) {
+        self.base = short;
     }
 
     /// Whether the commit at a *source* index is on the clipboard.
@@ -970,6 +982,12 @@ impl Commits {
         }
         if let Some(note) = self.mark_note() {
             out.push_str(&format!(" · {note}"));
+        }
+        // A marked base is carried into a rebase the reader may run from
+        // another pane entirely, so the list that holds it says so for as
+        // long as it stands.
+        if let Some(base) = &self.base {
+            out.push_str(&format!(" · base {base}"));
         }
         out
     }

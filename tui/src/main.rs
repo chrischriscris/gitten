@@ -63,6 +63,7 @@ use gitten_tui::screen::{Ink, Pen, Screen};
 use gitten_tui::scrollbar::Bar;
 use gitten_tui::stashes::{drop_question, Stashes};
 use gitten_tui::term::{Input, Mouse, MouseKind, Term};
+use gitten_tui::todo::Todo;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -382,6 +383,10 @@ const INPUT: &str = "input";
 /// nothing underneath, so a chord cannot arm a discard behind a modal.
 const PICKER: &str = "picker";
 
+/// The mode the rebase plan owns the keyboard in, on exactly the picker's
+/// terms and rather more urgently: the keys underneath it rewrite history.
+const TODO: &str = "todo";
+
 /// What an unresolved key means to the modal that holds the keyboard.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ModalKind {
@@ -484,6 +489,23 @@ enum Prompt {
         name: RefName,
         field: Field,
     },
+    /// `commits.reword`'s field, prefilled with the commit's own subject —
+    /// a reword is an edit of what is standing, not a retyping of it.
+    /// `at` is the commit captured when the field opened, so nothing a
+    /// cursor does while the field holds the keyboard can re-aim it, and
+    /// the shared action checks it is still in the window before writing.
+    /// Multiline, because a commit message is a message.
+    Reword {
+        at: gitten_app::act::SelectedCommit,
+        field: Field,
+    },
+    /// `todo.reword`'s field: the same message, typed into an *open plan*
+    /// instead of at the repository. Nothing is written when it is accepted
+    /// — the row simply says what it will land under, and the plan still
+    /// has to be run.
+    TodoReword {
+        field: Field,
+    },
 }
 
 impl Prompt {
@@ -503,7 +525,9 @@ impl Prompt {
             | Prompt::ProjectOpen { field }
             | Prompt::RemoteName { field }
             | Prompt::RemoteUrl { field, .. }
-            | Prompt::RemoteEdit { field, .. } => field,
+            | Prompt::RemoteEdit { field, .. }
+            | Prompt::Reword { field, .. }
+            | Prompt::TodoReword { field } => field,
         }
     }
 
@@ -522,7 +546,9 @@ impl Prompt {
             | Prompt::ProjectOpen { field }
             | Prompt::RemoteName { field }
             | Prompt::RemoteUrl { field, .. }
-            | Prompt::RemoteEdit { field, .. } => field,
+            | Prompt::RemoteEdit { field, .. }
+            | Prompt::Reword { field, .. }
+            | Prompt::TodoReword { field } => field,
         }
     }
 
@@ -534,7 +560,10 @@ impl Prompt {
     fn multiline(&self) -> bool {
         matches!(
             self,
-            Prompt::CommitMessage { .. } | Prompt::AmendMessage { .. }
+            Prompt::CommitMessage { .. }
+                | Prompt::AmendMessage { .. }
+                | Prompt::Reword { .. }
+                | Prompt::TodoReword { .. }
         )
     }
 
@@ -566,6 +595,7 @@ impl Prompt {
             Prompt::Search { .. } => "/",
             Prompt::CommitMessage { .. } => "commit: ",
             Prompt::AmendMessage { .. } => "amend: ",
+            Prompt::Reword { .. } | Prompt::TodoReword { .. } => "reword: ",
             Prompt::BranchNew { .. } => "branch: ",
             Prompt::BranchRename { .. } => "rename: ",
             Prompt::TagNew { .. } => "tag: ",
@@ -1368,6 +1398,23 @@ struct App {
     /// runs nothing underneath. `None` while the keyboard belongs to the
     /// panes or a prompt.
     picker: Option<RecentPicker>,
+    /// The rebase plan, while it is open: a modal list over the body,
+    /// owning the keyboard the way the picker does. Nothing is written
+    /// until `todo.run` is confirmed, so closing it with esc costs exactly
+    /// the editing — which is what makes a plan safe to open and look at.
+    todo: Option<Todo>,
+    /// The commit marked as the base a `--onto` rebase counts from, and
+    /// the row it was marked on. Held here rather than in the commits pane
+    /// for the reason the clipboard is: the mark is made in one pane and
+    /// spent in another, and it has to outlive both panes' refreshes.
+    rebase_base: Option<gitten_app::act::SelectedCommit>,
+    /// The mode a standing menu question pushed — `reset`, `upstream` —
+    /// for as long as the question stands. Above the pane's own bindings
+    /// and not instead of them: `s` means the strength while the question
+    /// is up and goes back to meaning the pane's verb the moment anything
+    /// else is pressed, which is the menu doing its job rather than
+    /// stealing three keys from the pane forever.
+    question: Option<&'static str>,
     /// Where a switched-to handle comes from. The binary opener unless a
     /// test injects its own — the same seam [`gitten_app::Startup`] holds,
     /// and for the same reason: a fake behind a real window.
@@ -1686,6 +1733,9 @@ impl App {
             message: String::new(),
             prompt: None,
             picker: None,
+            todo: None,
+            rebase_base: None,
+            question: None,
             opener: Arc::new(gitten_app::GitOpener),
             jobs,
             submitter,
@@ -2014,10 +2064,19 @@ impl App {
                 self.modes.push("search");
             }
         }
+        // A standing menu question is the pane's innermost mode while it
+        // stands: `s` is a strength here and the pane's own verb everywhere
+        // else, which is what a menu is for.
+        if let Some(question) = self.question {
+            self.modes.push(question);
+        }
         if self.picker.is_some() {
             // The recent-repositories list owns the keyboard like help does:
             // a press it does not name runs nothing underneath.
             self.modes.push(PICKER);
+        }
+        if self.todo.is_some() {
+            self.modes.push(TODO);
         }
         if self.help {
             self.modes.push("help");
@@ -2295,6 +2354,13 @@ impl App {
     /// One keypress.
     fn press(&mut self, key: Key) {
         self.message.clear();
+        // While the plan is open it owns the keyboard the way help does:
+        // resolved against exactly its one mode, so nothing underneath runs
+        // — and what is underneath a rebase plan is the history verbs.
+        if self.todo.is_some() && self.prompt.is_none() {
+            self.press_modal(TODO, key, ModalKind::List);
+            return;
+        }
         // While the picker stands it owns the keyboard the way help does:
         // resolved against exactly its one mode, so nothing underneath runs.
         if self.picker.is_some() {
@@ -2317,6 +2383,11 @@ impl App {
             Resolve::None => {
                 let unknown = gitten_core::command::chord_string(&self.pending);
                 self.pending.clear();
+                // An unbound key answers a standing question by dismissing
+                // it: the reader reached for something that is not one of
+                // the answers, and leaving the menu up would have the next
+                // press mean a strength they have stopped asking about.
+                self.close_question();
                 // Said, not swallowed: a key that does nothing and a key that
                 // is not bound look identical, and only one of them is worth
                 // opening `?` about.
@@ -2326,7 +2397,23 @@ impl App {
         };
         self.pending.clear();
         if let Some(command) = resolved {
+            // The question closes before the command it resolved runs —
+            // unless that command is a menu opening one, which is what
+            // pressing `g` twice means. Closing first is what keeps the
+            // *next* press out of the question's mode.
+            if !matches!(command.as_str(), "commits.reset-menu" | "files.reset-menu") {
+                self.close_question();
+            }
             self.dispatch(&command);
+        }
+    }
+
+    /// Takes a standing menu question down, and puts the keymap back the
+    /// way it was. Cheap and idempotent: called on every press that is not
+    /// one of the question's own answers.
+    fn close_question(&mut self) {
+        if self.question.take().is_some() {
+            self.sync_modes();
         }
     }
 
@@ -2566,6 +2653,137 @@ impl App {
         });
     }
 
+    // -------------------------------------------------- the rebase plan
+
+    /// Opens the plan over the body, and says what it holds. Nothing is
+    /// written by opening one — the plan is every commit picked until
+    /// somebody edits it — which is what makes it safe to open and read.
+    fn open_todo(&mut self, plan: gitten_core::rebase::Plan) {
+        let todo = Todo::new(plan);
+        self.message = format!("{} — enter runs it, esc leaves", todo.summary());
+        self.todo = Some(todo);
+        self.gesture = None;
+        self.pending.clear();
+        self.sync_modes();
+    }
+
+    /// Takes the plan down. Whatever was edited dies with it: nothing
+    /// reached the repository, which is the whole contract of a cancelled
+    /// todo edit.
+    fn close_todo(&mut self) {
+        self.todo = None;
+        self.pending.clear();
+        self.sync_modes();
+    }
+
+    /// The open plan's verbs: every one edits the model and writes nothing.
+    /// `todo.run` is the single door to the queue, and it asks first.
+    fn todo_verb(&mut self, command: &str) {
+        if self.todo.is_none() {
+            self.message = format!("{command} needs an open rebase plan");
+            return;
+        }
+        use gitten_core::rebase::Action;
+        let action = match command {
+            "todo.pick" => Some(Action::Pick),
+            "todo.edit" => Some(Action::Edit),
+            "todo.squash" => Some(Action::Squash),
+            "todo.fixup" => Some(Action::Fixup),
+            "todo.drop" => Some(Action::Drop),
+            _ => None,
+        };
+        if let Some(action) = action {
+            let said = match self.todo.as_mut() {
+                Some(todo) => match todo.set_action(action) {
+                    Ok(()) => todo.summary(),
+                    Err(e) => e,
+                },
+                None => return,
+            };
+            self.message = said;
+            return;
+        }
+        match command {
+            "todo.reword" => {
+                let subject = match self.todo.as_ref() {
+                    Some(todo) => todo.selected_subject(),
+                    None => return,
+                };
+                self.open_prompt(Prompt::TodoReword {
+                    field: Field::with(subject),
+                });
+            }
+            "todo.move-up" | "todo.move-down" => {
+                let up = command.ends_with("up");
+                let said = match self.todo.as_mut() {
+                    Some(todo) => match todo.move_by(up) {
+                        Ok(()) => todo.summary(),
+                        Err(e) => e,
+                    },
+                    None => return,
+                };
+                self.message = said;
+            }
+            "todo.autosquash" => {
+                let said = match self.todo.as_mut() {
+                    Some(todo) => todo.autosquash(),
+                    None => return,
+                };
+                self.message = said;
+            }
+            "todo.run" => {
+                let Some(plan) = self.todo.as_ref().map(|todo| todo.plan().clone()) else {
+                    return;
+                };
+                // The plan is *cloned* out and the screen stays open until
+                // the queue has it: a refusal — an unconfirmed first press,
+                // a standing operation — must leave the editing exactly
+                // where the reader left it.
+                if gitten_app::act::run_plan(self, command, plan) {
+                    self.close_todo();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `commits.reword`'s field, prefilled with the commit's own subject.
+    /// The commit is captured here, so nothing a cursor does while the
+    /// field holds the keyboard can re-aim the rewrite.
+    fn begin_reword(&mut self) {
+        use gitten_app::act::HistoryClient;
+        let Some(target) = self.commit_target() else {
+            self.message = "nothing selected to reword".into();
+            return;
+        };
+        if self.repo.is_none() {
+            self.message = "a fixture has no repository to rewrite in".into();
+            return;
+        }
+        let subject = match self.panes.focused() {
+            Some(Screens::Commits { view, .. }) => view
+                .current()
+                .map(|c| c.subject.clone())
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        self.open_prompt(Prompt::Reword {
+            at: target,
+            field: Field::with(subject),
+        });
+    }
+
+    /// Tells the commits pane which commit is the marked rebase base, so
+    /// its status line can say so. Called after every press that changes
+    /// the mark and nowhere else — the same shape the clipboard's own
+    /// [`App::sync_copied`] has, and for the same reason.
+    fn sync_marked_base(&mut self) {
+        let shown = self.rebase_base.as_ref().map(|b| b.short.clone());
+        if let Some(Screens::Commits { view, .. }) = self.panes.get_mut("commits") {
+            view.set_base(shown);
+        }
+    }
+
     // ------------------------------------------------------- the branch verbs
 
     /// The focused branches pane's target — what the keyboard is on, as
@@ -2595,6 +2813,19 @@ impl App {
     fn commits_focused(&mut self, command: &str) -> bool {
         match self.panes.focused() {
             Some(Screens::Commits { .. }) => true,
+            _ => {
+                self.message = format!("{command} is not supported here");
+                false
+            }
+        }
+    }
+
+    /// Whether the keyboard is on the working-tree pane — the guard the
+    /// pane's repository-wide questions open with, said the way every
+    /// wrong-focus refusal here is said.
+    fn files_focused(&mut self, command: &str) -> bool {
+        match self.panes.focused() {
+            Some(Screens::Files { .. }) => true,
             _ => {
                 self.message = format!("{command} is not supported here");
                 false
@@ -3322,6 +3553,21 @@ impl App {
             Prompt::RemoteEdit { name, field } if accept => {
                 gitten_app::act::remote_edit(self, name.as_bytes().to_vec(), field.take())
             }
+            Prompt::Reword { at, field } if accept => {
+                gitten_app::act::reword_commit(self, at, field.take())
+            }
+            Prompt::TodoReword { field } if accept => {
+                let message = field.take();
+                match self.todo.as_mut() {
+                    // The plan is edited and nothing is written: what a
+                    // reworded row means is still a plan until it is run.
+                    Some(todo) => match todo.set_message(message.into_bytes()) {
+                        Ok(()) => self.message = "reworded in the plan — enter runs it".into(),
+                        Err(e) => self.message = e,
+                    },
+                    None => self.message = "the plan closed while the message was open".into(),
+                }
+            }
             // Cancelled: the text was the prompt's and dies with it.
             _ => {}
         }
@@ -3555,6 +3801,30 @@ impl App {
             }
             return;
         }
+        // While the plan is open it owns the moves and the way out, exactly
+        // as the picker does — and its own verbs fall through to the match
+        // below, which is where the model is edited.
+        if self.todo.is_some() {
+            match command {
+                "view.down" | "view.up" | "view.top" | "view.bottom" => {
+                    if let Some(todo) = self.todo.as_mut() {
+                        match command {
+                            "view.down" => todo.down(),
+                            "view.up" => todo.up(),
+                            "view.top" => todo.to_top(),
+                            _ => todo.to_bottom(),
+                        }
+                    }
+                    return;
+                }
+                "back" | "input.cancel" => {
+                    self.close_todo();
+                    self.message = "the plan is closed — nothing was rewritten".into();
+                    return;
+                }
+                _ => {}
+            }
+        }
         if self.help && self.scroll_help(command) {
             return;
         }
@@ -3723,6 +3993,11 @@ impl App {
             "commits.reset-menu" => {
                 if self.commits_focused("commits.reset-menu") {
                     gitten_app::act::reset_menu(self);
+                    // The strengths are this question's mode, above the
+                    // pane's own bindings and only while it stands: `s` is
+                    // the soft reset here and the squash everywhere else.
+                    self.question = Some("reset");
+                    self.sync_modes();
                 }
             }
             "commits.reset-soft" => {
@@ -3782,6 +4057,90 @@ impl App {
                     gitten_app::act::reset_commit_author(self);
                 }
             }
+            // History *editing*: the plan the todo screen opens on, the
+            // stop-here rebase, the reword field, the base mark and the two
+            // reorders. Each reads the row the keyboard is on and the
+            // window under it; the refusals are the shared actions'.
+            "commits.interactive-rebase" => {
+                if self.commits_focused(command) {
+                    if let Some(plan) = gitten_app::act::interactive_plan(self, command) {
+                        self.open_todo(plan);
+                    }
+                }
+            }
+            "commits.edit-commit" => {
+                if self.commits_focused(command) {
+                    gitten_app::act::edit_commit(self);
+                }
+            }
+            "commits.reword" => {
+                if self.commits_focused(command) {
+                    self.begin_reword();
+                }
+            }
+            "commits.mark-base" => {
+                if self.commits_focused(command) {
+                    gitten_app::act::mark_rebase_base(self);
+                    self.sync_marked_base();
+                }
+            }
+            "commits.move-up" | "commits.move-down" => {
+                if self.commits_focused(command) {
+                    gitten_app::act::move_commit(self, command, command.ends_with("up"));
+                }
+            }
+            // The branch pane's rebase: this branch onto the row the
+            // keyboard is on, from the marked base when one stands.
+            "commits.rebase-onto" => {
+                if self.branches_focused(command) {
+                    match self.branch_target() {
+                        Some(Target::Local(name)) => {
+                            let shown = name.to_string_lossy().into_owned();
+                            gitten_app::act::rebase_onto(self, name.as_bytes().to_vec(), shown)
+                        }
+                        Some(Target::Remote { remote, branch }) => {
+                            let shown = format!(
+                                "{}/{}",
+                                remote.to_string_lossy(),
+                                branch.to_string_lossy()
+                            );
+                            let mut onto = remote.as_bytes().to_vec();
+                            onto.push(b'/');
+                            onto.extend_from_slice(branch.as_bytes());
+                            gitten_app::act::rebase_onto(self, onto, shown)
+                        }
+                        Some(Target::Detached) | None => {
+                            self.message = format!("{command} has no branch to rebase onto")
+                        }
+                    }
+                }
+            }
+            // The open plan's own verbs. Every one of them edits the model
+            // and writes nothing; `todo.run` is the single door to the
+            // queue, and it asks first.
+            "todo.pick" | "todo.reword" | "todo.edit" | "todo.squash" | "todo.fixup"
+            | "todo.drop" | "todo.move-up" | "todo.move-down" | "todo.autosquash" | "todo.run" => {
+                self.todo_verb(command)
+            }
+            // The files pane's reset menu: the question, then the strengths
+            // aimed at the upstream, and the nuke behind the same door.
+            "files.reset-menu" => {
+                if self.files_focused(command) {
+                    gitten_app::act::upstream_reset_menu(self);
+                    self.question = Some("upstream");
+                    self.sync_modes();
+                }
+            }
+            "files.reset-upstream-soft" => {
+                gitten_app::act::reset_to_upstream(self, command, ResetMode::Soft)
+            }
+            "files.reset-upstream-mixed" => {
+                gitten_app::act::reset_to_upstream(self, command, ResetMode::Mixed)
+            }
+            "files.reset-upstream-hard" => {
+                gitten_app::act::reset_to_upstream(self, command, ResetMode::Hard)
+            }
+            "files.nuke" => gitten_app::act::nuke_worktree(self),
             // The merge verbs: the local branch the keyboard is on, brought
             // into the branch HEAD sits on. A remote row says so and stops —
             // merging a tracking ref is a checkout question first — and the
@@ -5247,6 +5606,11 @@ impl App {
         if let Some(picker) = self.picker.as_ref() {
             paint_picker(&mut self.screen, 1, body, picker, &self.host);
         }
+        // The plan floats over everything the panes drew, on the picker's
+        // own terms — it owns the keyboard, so it owns the rows it covers.
+        if let Some(todo) = self.todo.as_mut() {
+            todo.paint(&mut self.screen, 1, body, &self.host, &self.availability);
+        }
     }
 }
 
@@ -5337,6 +5701,32 @@ fn tui_availability(repo: bool, operation: Option<&Operation>) -> Availability {
         "commits.paste",
         "commits.clear-copies",
         "commits.reset-author",
+        // History editing: the plan, the stop-here rebase, the reword
+        // field, the base mark and the two reorders — each answered by
+        // dispatch, each refusing its own wrong selection there.
+        "commits.interactive-rebase",
+        "commits.edit-commit",
+        "commits.reword",
+        "commits.mark-base",
+        "commits.move-up",
+        "commits.move-down",
+        "commits.rebase-onto",
+        "commits.squash-up",
+        "commits.fixup-up",
+        "commits.drop-commit",
+        // The open plan's own verbs. Live whenever the client is: a press
+        // with no plan open is refused by name where it is answered, which
+        // is a sentence about the plan rather than about the client.
+        "todo.pick",
+        "todo.reword",
+        "todo.edit",
+        "todo.squash",
+        "todo.fixup",
+        "todo.drop",
+        "todo.move-up",
+        "todo.move-down",
+        "todo.autosquash",
+        "todo.run",
         "remotes.focus",
         "remotes.fetch",
         "remotes.new",
@@ -5403,6 +5793,14 @@ fn tui_availability(repo: bool, operation: Option<&Operation>) -> Availability {
                 "files.toggle-side",
                 "stashes.open-diff",
                 "branches.open-log",
+                // The working tree's own repository-wide questions: the
+                // upstream a reset aims at and the tree a nuke empties are
+                // both things only a repository has.
+                "files.reset-menu",
+                "files.reset-upstream-soft",
+                "files.reset-upstream-mixed",
+                "files.reset-upstream-hard",
+                "files.nuke",
             ]);
         }
         false => {
@@ -5458,6 +5856,47 @@ fn tui_availability(repo: bool, operation: Option<&Operation>) -> Availability {
                 "commits.reset-author",
                 "a fixture has no repository to rewrite in",
             );
+            for name in [
+                "commits.interactive-rebase",
+                "commits.edit-commit",
+                "commits.reword",
+                "commits.move-up",
+                "commits.move-down",
+                "commits.rebase-onto",
+                "commits.squash-up",
+                "commits.fixup-up",
+                "commits.drop-commit",
+                "todo.pick",
+                "todo.reword",
+                "todo.edit",
+                "todo.squash",
+                "todo.fixup",
+                "todo.drop",
+                "todo.move-up",
+                "todo.move-down",
+                "todo.autosquash",
+                "todo.run",
+            ] {
+                a.disabled(name, "a fixture has no repository to rewrite in");
+            }
+            a.disabled(
+                "commits.mark-base",
+                "a fixture has no repository to rebase in",
+            );
+            a.disabled("files.reset-menu", "a fixture has no repository to reset");
+            a.disabled(
+                "files.reset-upstream-soft",
+                "a fixture has no repository to reset",
+            );
+            a.disabled(
+                "files.reset-upstream-mixed",
+                "a fixture has no repository to reset",
+            );
+            a.disabled(
+                "files.reset-upstream-hard",
+                "a fixture has no repository to reset",
+            );
+            a.disabled("files.nuke", "a fixture has no working tree to nuke");
             a.disabled(
                 "merge.take-side",
                 "a fixture has no repository to resolve in",
@@ -5591,6 +6030,10 @@ impl gitten_app::act::Client for App {
         self.operation
     }
 
+    fn rebase_base(&self) -> Option<gitten_app::act::SelectedCommit> {
+        self.rebase_base.clone()
+    }
+
     fn selected_conflict(&self) -> Option<gitten_core::status::PathBytes> {
         let Some(Screens::Files { view, .. }) = self.panes.focused() else {
             return None;
@@ -5652,6 +6095,21 @@ impl gitten_app::act::FileClient for App {
             _ => false,
         }
     }
+
+    fn confirm_or_arm_command(&mut self, command: &str) -> bool {
+        // The same arm the history questions use, with no commit to name —
+        // which is what a repository-wide question has instead of a row,
+        // and which buys it the same death on a refresh or a repository
+        // switch that every other armed question here dies of.
+        let armed = (command.to_string(), Vec::new());
+        if self.history_arm.as_ref() == Some(&armed) {
+            self.history_arm = None;
+            true
+        } else {
+            self.history_arm = Some(armed);
+            false
+        }
+    }
 }
 
 impl gitten_app::act::RemoteClient for App {
@@ -5699,6 +6157,10 @@ impl gitten_app::act::HistoryClient for App {
             | Ok(HeadState::Detached { commit: sha }) => Some(sha.into_bytes()),
             _ => None,
         }
+    }
+
+    fn mark_rebase_base(&mut self, base: Option<gitten_app::act::SelectedCommit>) {
+        self.rebase_base = base;
     }
 
     fn commit_range(&self) -> Option<Vec<gitten_app::act::SelectedCommit>> {
@@ -6740,9 +7202,13 @@ mod tests {
         app.draw();
         let rows = body(&app);
         // The panel shows keys and what they do, not command names — the
-        // commits binding's own description is the marker.
+        // commits binding's own description is the marker. Read from the
+        // *end* of the mode's rows, because that is where the scroll is:
+        // the commits mode is long enough now that its first bindings are
+        // above the window when the panel is at the bottom.
         assert!(
-            rows.iter().any(|r| r.contains("show the diff pane")),
+            rows.iter()
+                .any(|r| r.contains("grow a new branch from this commit")),
             "help did not follow the commits mode: {rows:?}"
         );
         assert!(
@@ -7022,6 +7488,10 @@ diff --git a/tracked.txt b/tracked.txt
         conflict_stages: Vec<gitten_git::UnmergedStage>,
         hunk_answers: Vec<Vec<(usize, gitten_core::conflict::Answer)>>,
         restores: Vec<Vec<u8>>,
+        /// When set, the next rebase write fails with exactly this message
+        /// and leaves a rebase standing — git's own shape for a conflict
+        /// mid-rewrite, which is the state the lifecycle keys carry on from.
+        refuse_rebase: Option<String>,
         /// The operation the history reads answer — `None` is a clean tree.
         /// Set directly by history tests, exactly like `status` and the
         /// stash stack: the next `sync_operation` sees the world they built.
@@ -7058,6 +7528,27 @@ diff --git a/tracked.txt b/tracked.txt
                 None => Ok(()),
             }
         }
+    }
+
+    /// A todo script as one line a test can hold: `pick aaa; fixup bbb`.
+    /// Actions and arguments only — the subjects git writes beside them are
+    /// for a human reading the file, and asserting on them would be
+    /// asserting on git's own prose.
+    fn shown_script(script: &gitten_git::TodoScript) -> String {
+        use gitten_core::rebase::Line;
+        script
+            .lines()
+            .iter()
+            .map(|line| match line {
+                Line::Step(step) => format!(
+                    "{} {}",
+                    step.action.word(),
+                    String::from_utf8_lossy(&step.arg)
+                ),
+                Line::Verbatim(raw) => String::from_utf8_lossy(raw).into_owned(),
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
     }
 
     fn three_commits() -> Vec<Commit> {
@@ -7289,6 +7780,83 @@ diff --git a/tracked.txt b/tracked.txt
                 .map(|sha| String::from_utf8_lossy(sha).into_owned())
                 .collect();
             s.writes.push(format!("cherry-pick {}", shown.join(" ")));
+            Ok(())
+        }
+
+        fn rebase_todo(
+            &self,
+            upstream: &[u8],
+            script: &gitten_git::TodoScript,
+        ) -> gitten_git::Result<()> {
+            script.validate()?;
+            let mut s = self.0.lock().unwrap();
+            s.writes.push(format!(
+                "rebase-todo {} | {}",
+                String::from_utf8_lossy(upstream),
+                shown_script(script)
+            ));
+            Ok(())
+        }
+
+        fn rebase_plan(&self, plan: &gitten_git::Plan) -> gitten_git::Result<()> {
+            // The plan is rendered exactly as the acquisition layer renders
+            // it — same ordering, same reword-as-pick-and-exec — with the
+            // one thing a fake has no filesystem for standing in for
+            // itself: the message rides in the recorded line instead of in
+            // a file the line would name.
+            let script = plan.script(&mut |entry| {
+                let mut out: Vec<Vec<u8>> = Vec::new();
+                if let Some(message) = &entry.message {
+                    out.push([b"amend -F ".as_slice(), message].concat());
+                }
+                if entry.amend == Some(gitten_core::rebase::Amend::ResetAuthor) {
+                    out.push(b"amend --reset-author".to_vec());
+                }
+                Ok(out)
+            })?;
+            let mut s = self.0.lock().unwrap();
+            if let Some(e) = s.refuse_rebase.clone() {
+                // git's own shape for a conflict mid-rewrite: nonzero, and
+                // the rebase left standing for a human to drive.
+                s.standing = Some(Operation {
+                    kind: gitten_core::operation::Kind::Rebase,
+                    conflicts: 1,
+                });
+                return Err(e);
+            }
+            s.writes.push(format!(
+                "rebase-plan {} | {}",
+                String::from_utf8_lossy(plan.upstream()),
+                shown_script(&script)
+            ));
+            Ok(())
+        }
+
+        fn rebase_onto(&self, upstream: &[u8]) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            s.writes
+                .push(format!("rebase-onto {}", String::from_utf8_lossy(upstream)));
+            Ok(())
+        }
+
+        fn rebase_onto_base(&self, onto: &[u8], base: &[u8]) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            s.writes.push(format!(
+                "rebase-onto {} from {}",
+                String::from_utf8_lossy(onto),
+                String::from_utf8_lossy(base)
+            ));
+            Ok(())
+        }
+
+        fn nuke_worktree(&self) -> gitten_git::Result<()> {
+            self.0.lock().unwrap().writes.push("nuke".into());
+            Ok(())
+        }
+
+        fn reword_head(&self, message: &str) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            s.writes.push(format!("reword-head {message}"));
             Ok(())
         }
 
@@ -12528,32 +13096,28 @@ diff --git a/tracked.txt b/tracked.txt
         ] {
             assert!(help.contains(doc), "help is missing {doc:?}: {help:?}");
         }
-        // The rebase row is bound in this mode and unhandled here, so its
-        // row is not on the panel any more — the press says why instead.
-        assert!(!help.contains("move the current branch onto"), "{help:?}");
+        // The rebase row is bound in this mode and answered here now, so
+        // the panel lists it like every other runnable branch verb.
+        assert!(help.contains("move the current branch onto"), "{help:?}");
     }
 
     #[test]
     fn lifecycle_commands_gate_on_the_standing_operation() {
-        // One fence survives from the deferred test, on purpose:
-        // `commits.rebase-onto` is history *editing* — W6's packet, not the
-        // lifecycle slice's — and stays unsupported. Everything below it
-        // changed when the lifecycle landed: the exit keys are live, and
-        // with a clean tree the honest word is why not, said through the
-        // availability contract's reason, not a refusal that claims the
-        // client cannot run them at all.
+        // The last fence is down: `commits.rebase-onto` was W6's to answer
+        // and now does, so the key that used to name an unsupported command
+        // asks about a rewrite instead. Everything below it changed when the
+        // lifecycle landed: the exit keys are live, and with a clean tree the
+        // honest word is why not, said through the availability contract's
+        // reason, not a refusal that claims the client cannot run them at all.
         let (handle, state) = fake(&[]);
         branch_world(&state);
         let mut app = commits_app(&handle);
         app.press(Key::plain(Code::Char('3')));
 
         // The key resolves through core's branches mode — lowercase `r` —
-        // and lands on the same unsupported name it always did.
+        // and lands on the rewrite, which asks before it runs.
         app.press(Key::char('r'));
-        assert_eq!(
-            app.message,
-            "commits.rebase-onto is not supported by this client"
-        );
+        assert_eq!(app.message, "rebase onto main? press again to confirm");
 
         // From the commits pane: gated, not unsupported — and no job ever
         // submitted, which is what the empty write log proves.
@@ -16397,13 +16961,12 @@ shared tail
         );
     }
 
-    /// LG-061. HEAD's author, asked twice, and nothing older: a deeper row
-    /// refuses by name and says which verb it would need. The commit is
+    /// LG-061. HEAD's author is one amend, asked twice: the commit is
     /// replaced but the message and the tree stand still, which
     /// `gitten-git`'s `reset_author_hands_head_a_new_author_and_nothing_else`
     /// holds against a real repository.
     #[test]
-    fn tui_parity_commit_author_resets_head_and_nothing_deeper() {
+    fn tui_parity_commit_author_resets_head_on_one_amend() {
         let (handle, state) = fake(&[]);
         let mut app = history_app(&handle);
         let head = row_sha(&app);
@@ -16414,29 +16977,6 @@ shared tail
             commit: Some(head.clone()),
         });
 
-        // One row down is history, and re-authoring that is a rebase —
-        // asserted first, because the confirmed write below re-reads the
-        // window and moves HEAD out from under the row.
-        app.dispatch("view.down");
-        let deeper = row_sha(&app);
-        app.dispatch("commits.reset-author");
-        assert_eq!(
-            app.message,
-            format!(
-                "only HEAD's author resets here — {deeper} is deeper history, \
-                 which is a rebase"
-            ),
-            "{:?}",
-            app.message
-        );
-        app.pump_quiet();
-        assert!(
-            state.lock().unwrap().writes.is_empty(),
-            "a deeper row was re-authored: {:?}",
-            state.lock().unwrap().writes
-        );
-
-        app.dispatch("view.top");
         app.dispatch("commits.reset-author");
         assert_eq!(
             app.message,
@@ -16450,6 +16990,60 @@ shared tail
         assert!(
             wrote(&mut app, &state, "reset-author"),
             "the confirmed re-author never landed: {:?}",
+            state.lock().unwrap().writes
+        );
+    }
+
+    /// LG-061's other half, and the gap slice 1 left behind: a commit
+    /// deeper than HEAD used to refuse by name because re-authoring one is
+    /// a rebase. It is now that rebase — the plan replays the window with
+    /// `--reset-author` hung on the one commit — so the question names the
+    /// plan rather than the row, and what reaches the queue is a pick, an
+    /// exec and a pick. `gitten-git`'s
+    /// `a_commit_deeper_than_head_is_reauthored_through_the_plan` holds the
+    /// same rewrite against a real repository.
+    #[test]
+    fn tui_parity_a_commit_deeper_than_head_is_reauthored_by_the_plan() {
+        let (handle, state) = fake(&[]);
+        let mut app = history_app(&handle);
+        let head = row_sha(&app);
+        state.lock().unwrap().head = Some(HeadState::Branch {
+            name: RefName::from("main"),
+            commit: Some(head.clone()),
+        });
+
+        app.dispatch("view.down");
+        let deeper = row_sha(&app);
+        app.dispatch("commits.reset-author");
+        assert_eq!(
+            app.message,
+            format!("rewrite 2 commits from {deeper}? press again to confirm"),
+            "{:?}",
+            app.message
+        );
+        app.pump_quiet();
+        assert!(
+            state.lock().unwrap().writes.is_empty(),
+            "an unconfirmed re-author ran: {:?}",
+            state.lock().unwrap().writes
+        );
+
+        // Confirmed: the amendment rides the pick that replayed it, and
+        // everything above is replayed plain. The plan sits on the deep
+        // commit's own parent, which is what "and move nothing else" means
+        // once a rewrite is a rebase.
+        app.dispatch("commits.reset-author");
+        let parent = format!("{:08}", 2);
+        assert!(
+            wrote(
+                &mut app,
+                &state,
+                &format!(
+                    "rebase-plan {parent} | pick {deeper}; \
+                     exec amend --reset-author; pick {head}"
+                )
+            ),
+            "the deep re-author never landed: {:?}",
             state.lock().unwrap().writes
         );
     }

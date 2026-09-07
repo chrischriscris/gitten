@@ -11,7 +11,7 @@ use crate::jobs::Job;
 use crate::verbs::Write;
 use gitten_core::clipboard::CherryClipboard;
 use gitten_core::operation::{Operation, Side};
-use gitten_core::rebase::{compose, Rewrite};
+use gitten_core::rebase::{compose, Amend, Plan, Rewrite};
 use gitten_core::refs::{ResetMode, Target};
 use gitten_core::status::PathBytes;
 use gitten_core::{Commit, Hunk};
@@ -40,6 +40,14 @@ pub trait Client {
     /// The conflicted path the keyboard is on, when there is one. The
     /// honest default for a client with no conflict selection: none.
     fn selected_conflict(&self) -> Option<PathBytes> {
+        None
+    }
+
+    /// The commit marked as a rebase base, when one is. Read from the base
+    /// trait because the mark is *made* in a history pane and *spent* in a
+    /// branch one, and neither should have to know about the other's
+    /// selection. The honest default for a client that marks nothing: none.
+    fn rebase_base(&self) -> Option<SelectedCommit> {
         None
     }
 }
@@ -86,6 +94,19 @@ pub trait FileClient: Client {
     fn paths_in(&self, section: FileSection) -> Vec<PathBytes>;
     /// Arms this file target, or spends an identical arm already standing.
     fn confirm_or_arm_file(&mut self, target: &SelectedFile) -> bool;
+    /// Arms a question this pane asks about the *repository* rather than a
+    /// row — a reset toward the upstream, a nuke — or spends the arm
+    /// standing on that same command. Keyed on the command alone, because
+    /// that is all such a question has to name.
+    ///
+    /// The default never confirms, which is the honest answer for a client
+    /// that keeps no such arm: the question stands, the write never runs,
+    /// and nothing is destroyed by a client that cannot ask twice. A client
+    /// that binds these commands implements it; one that does not, does not
+    /// reach here at all.
+    fn confirm_or_arm_command(&mut self, _command: &str) -> bool {
+        false
+    }
 }
 
 /// `branches.delete`, for every client.
@@ -422,6 +443,11 @@ pub trait HistoryClient: Client {
     /// pane is drilled into another branch's log, so the question is asked
     /// of HEAD directly rather than inferred from a row's position.
     fn head_sha(&self) -> Option<Vec<u8>>;
+    /// Marks (or, with `None`, unmarks) the commit a `--onto` rebase would
+    /// count from. Required rather than defaulted: a pane that offers the
+    /// key and forgets the answer is the silent no-op this trait exists to
+    /// make impossible.
+    fn mark_rebase_base(&mut self, base: Option<SelectedCommit>);
     /// The marked range of commit rows, newest first as a commits list
     /// reads. `None` when nothing is marked — the honest default for a
     /// client with no range marking, whose copy then takes the row alone.
@@ -580,6 +606,387 @@ pub fn rewrite_commit(client: &mut impl HistoryClient, command: &str, kind: Rewr
     }
 }
 
+// -------------------------------------------------------------- the todo plan
+
+/// The window a rewrite composes over, cloned out before anything borrows
+/// the client mutably — a plan is built from owned commits, so a standing
+/// operation or a missing repository can still refuse in its own words with
+/// the window already in hand.
+fn plan_window(client: &mut impl HistoryClient, command: &str) -> Option<(Vec<Commit>, usize)> {
+    match client.history_window().map(|(w, i)| (w.to_vec(), i)) {
+        Some(window) => Some(window),
+        None => {
+            client.say(format!(
+                "{command} needs the whole loaded window — clear the search first"
+            ));
+            None
+        }
+    }
+}
+
+/// The plan a todo UI opens on: every commit from HEAD down to the row the
+/// keyboard is on, each one a `pick` — which is git's own starting plan, and
+/// a rebase that changes nothing until somebody edits it.
+///
+/// `commits.interactive-rebase`. Nothing is written here and nothing is
+/// confirmed: the confirmation belongs to the press that *runs* the edited
+/// plan, and a UI that asked before it opened would be asking about a
+/// rewrite nobody had described yet. The refusals are the plan's own — a
+/// merge in the window, a root beneath it, a filtered list — plus the two
+/// this module makes everywhere: a fixture has no repository, and a standing
+/// operation is git's first write, which a second must not start inside.
+pub fn interactive_plan(client: &mut impl HistoryClient, command: &str) -> Option<Plan> {
+    // The standing operation refuses first, everywhere in this file: a
+    // second rewrite inside git's first is never the move, and the sentence
+    // that says so must not be pre-empted by one about the window.
+    history_repo(client, command)?;
+    let (window, index) = plan_window(client, command)?;
+    match Plan::over(&window, index) {
+        Ok(plan) => Some(plan),
+        Err(e) => {
+            client.say(e);
+            None
+        }
+    }
+}
+
+/// Runs an edited plan, once the reader has confirmed it.
+///
+/// The arm names the command and the plan's deepest commit, exactly as
+/// every other rewrite here arms: a plan edited, abandoned and re-opened
+/// asks again, because the second plan is not the one the first press was
+/// about. The count and the base are in the question, because "rewrite 4
+/// commits from a1b2c3d" is the only sentence that says what is at stake.
+pub fn run_plan(client: &mut impl HistoryClient, command: &str, plan: Plan) -> bool {
+    let Some(repo) = history_repo(client, command) else {
+        return false;
+    };
+    if let Err(e) = plan.validate() {
+        client.say(e);
+        return false;
+    }
+    let target = SelectedCommit {
+        sha: plan.upstream().to_vec(),
+        short: plan.base().to_string(),
+    };
+    if !client.confirm_or_arm_commit(command, &target) {
+        client.ask(format!(
+            "rewrite {} from {}? press again to confirm",
+            commits_count(plan.len()),
+            plan.base()
+        ));
+        return false;
+    }
+    let job = Write::rebase_plan(&repo, plan);
+    if !client.submit(Box::new(job)) {
+        client.say("the job queue is shutting down".into());
+        return false;
+    }
+    true
+}
+
+/// `commits.edit-commit`: stop the rebase *at* the commit under the
+/// keyboard, so the reader can amend it and carry on.
+///
+/// The one plan that is expected to hand back a standing rebase rather than
+/// a finished one — `edit` opens no editor, it stops, and the state it stops
+/// in is the state the lifecycle keys were built for. Confirmed like every
+/// rewrite, because everything above the stop is replayed either way.
+pub fn edit_commit(client: &mut impl HistoryClient) {
+    const COMMAND: &str = "commits.edit-commit";
+    if history_repo(client, COMMAND).is_none() {
+        return;
+    }
+    let Some((window, index)) = plan_window(client, COMMAND) else {
+        return;
+    };
+    let mut plan = match Plan::over(&window, index) {
+        Ok(plan) => plan,
+        Err(e) => {
+            client.say(e);
+            return;
+        }
+    };
+    if let Err(e) = plan.set_action(index, gitten_core::rebase::Action::Edit) {
+        client.say(e);
+        return;
+    }
+    if run_plan(client, COMMAND, plan) {
+        client.say(format!(
+            "stopping at {} — amend, then continue the rebase",
+            window[index].short
+        ));
+    }
+}
+
+/// `commits.move-up` / `commits.move-down`: swap the commit under the
+/// keyboard with its neighbour.
+///
+/// Up is towards HEAD, which is *later* in git's own file — the plan holds
+/// the same order the list draws, so the two words mean one thing. The
+/// window reaches one commit deeper than the pair for a move down, because a
+/// plan that does not replay the commit being swapped past cannot swap past
+/// it.
+pub fn move_commit(client: &mut impl HistoryClient, command: &str, up: bool) {
+    if history_repo(client, command).is_none() {
+        return;
+    }
+    let Some((window, index)) = plan_window(client, command) else {
+        return;
+    };
+    // Refused before the window is even built: the edges of the list are
+    // not a plan's to refuse, because a deeper window would move HEAD's
+    // neighbour and there is no such thing above HEAD.
+    if up && index == 0 {
+        client.say("that commit is already the newest — nothing above it to swap with".into());
+        return;
+    }
+    let base = match up {
+        true => index,
+        false => index + 1,
+    };
+    if base >= window.len() {
+        client.say(
+            "that commit sits at the edge of the loaded history, so the plan \
+             cannot say what lies beneath it"
+                .into(),
+        );
+        return;
+    }
+    let mut plan = match Plan::over(&window, base) {
+        Ok(plan) => plan,
+        Err(e) => {
+            client.say(e);
+            return;
+        }
+    };
+    let moved = match up {
+        true => plan.move_up(index),
+        false => plan.move_down(index),
+    };
+    if let Err(e) = moved {
+        client.say(e);
+        return;
+    }
+    run_plan(client, command, plan);
+}
+
+/// `commits.reword`: replace one commit's message with the bytes a reader
+/// typed, and move nothing else.
+///
+/// Two paths and one sentence. HEAD is `git commit --amend --only`, which
+/// keeps the index exactly where it is and works on a root commit. Anything
+/// deeper is a rebase carrying the message down as a plan — the same
+/// rewrite, arriving where a bare amend cannot reach.
+///
+/// The target is revalidated before either: the message was typed into a
+/// field, and a repository can move under an open field. A row that is no
+/// longer in the window refuses rather than rewording whatever now sits at
+/// its index.
+pub fn reword_commit(client: &mut impl HistoryClient, target: SelectedCommit, message: String) {
+    const COMMAND: &str = "commits.reword";
+    if message.trim().is_empty() {
+        client.say("a commit needs a message".into());
+        return;
+    }
+    if history_repo(client, COMMAND).is_none() {
+        return;
+    }
+    let head = client.head_sha();
+    if head.as_deref() == Some(target.sha.as_slice()) {
+        let Some(repo) = history_repo(client, COMMAND) else {
+            return;
+        };
+        let job = Write::reword_head(&repo, message);
+        if !client.submit(Box::new(job)) {
+            client.say("the job queue is shutting down".into());
+        }
+        return;
+    }
+    let Some((window, _)) = plan_window(client, COMMAND) else {
+        return;
+    };
+    let Some(index) = window
+        .iter()
+        .position(|c| c.sha.as_bytes() == target.sha.as_slice())
+    else {
+        client.say(format!(
+            "{} is no longer in the loaded history — nothing was reworded",
+            target.short
+        ));
+        return;
+    };
+    let mut plan = match Plan::over(&window, index) {
+        Ok(plan) => plan,
+        Err(e) => {
+            client.say(e);
+            return;
+        }
+    };
+    if let Err(e) = plan.set_message(index, message.into_bytes()) {
+        client.say(e);
+        return;
+    }
+    run_plan(client, COMMAND, plan);
+}
+
+/// `commits.mark-base`: mark the commit under the keyboard as the base a
+/// `--onto` rebase counts from, or clear the mark by pressing it again on
+/// the same row.
+///
+/// Pure state, like the cherry-pick clipboard, and said either way: a mark
+/// nothing announces is a mark nobody knows they are carrying into the next
+/// rebase.
+pub fn mark_rebase_base(client: &mut impl HistoryClient) {
+    let Some(target) = client.commit_target() else {
+        client.say("nothing selected to mark".into());
+        return;
+    };
+    if client.repo().is_none() {
+        client.say("a fixture has no repository to rebase in".into());
+        return;
+    }
+    if client.rebase_base().as_ref() == Some(&target) {
+        client.mark_rebase_base(None);
+        client.say(format!("{} is no longer the rebase base", target.short));
+        return;
+    }
+    let shown = target.short.clone();
+    client.mark_rebase_base(Some(target));
+    client.say(format!(
+        "{shown} is the rebase base — everything after it moves"
+    ));
+}
+
+/// `commits.rebase-onto`: move the branch HEAD sits on onto the branch the
+/// keyboard is on, replaying this branch's own commits.
+///
+/// With a base marked, git's `--onto` instead: the marked commit stays where
+/// it is and only its children move. That is the whole reason marking one is
+/// worth a key, and it is also why the question names both ends — a base
+/// that is not an ancestor of HEAD replays a range nobody meant.
+///
+/// Asked twice, because it rewrites this branch's own history. A dirty tree
+/// and a conflict are git's own sentences, coming back verbatim with
+/// whatever state git left standing.
+pub fn rebase_onto(client: &mut impl BranchClient, onto: Vec<u8>, shown: String) {
+    let Some(repo) = client.repo() else {
+        client.say("a fixture has no repository to rebase in".into());
+        return;
+    };
+    if refuse_while_operating(client) {
+        return;
+    }
+    let base = client.rebase_base();
+    let target = Target::Local(gitten_core::refs::RefName::from_bytes(&onto));
+    if !client.confirm_or_arm_branch(&target) {
+        client.ask(match &base {
+            Some(base) => format!(
+                "rebase onto {shown}, from {} up? press again to confirm",
+                base.short
+            ),
+            None => format!("rebase onto {shown}? press again to confirm"),
+        });
+        return;
+    }
+    let job = match base {
+        Some(base) => Write::rebase_onto_base(&repo, onto, base.sha),
+        None => Write::rebase_onto(&repo, onto),
+    };
+    if !client.submit(Box::new(job)) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+/// `files.reset-menu`: the question, not the write — which strength, or the
+/// nuke. The answers are separate commands so each arms and spends its own,
+/// exactly as the commit list's reset strengths do.
+pub fn upstream_reset_menu(client: &mut impl FileClient) {
+    if client.repo().is_none() {
+        client.say("a fixture has no repository to reset".into());
+        return;
+    }
+    client.ask(
+        "reset to the upstream? soft, mixed or hard — s, m, h — or D to nuke the working tree"
+            .into(),
+    );
+}
+
+/// `files.reset-upstream-soft` / `-mixed` / `-hard`: move this branch onto
+/// whatever its upstream holds, taking as much of the index and working tree
+/// along as the strength says.
+///
+/// The aim is read from the repository — the branch under HEAD, then its
+/// configured upstream — so a detached HEAD and an untracked branch each
+/// refuse with a sentence rather than a revspec error. Asked twice, armed on
+/// the command, because a hard one discards work no reflog holds.
+pub fn reset_to_upstream(client: &mut impl FileClient, command: &str, mode: ResetMode) {
+    let Some(repo) = client.repo() else {
+        client.say("a fixture has no repository to reset".into());
+        return;
+    };
+    if refuse_while_operating(client) {
+        return;
+    }
+    // Built before the arm is spent: an aim that cannot resolve must not
+    // consume a question the reader would then have to ask again.
+    let job = match Write::reset_upstream(&repo, mode) {
+        Ok(job) => job,
+        Err(e) => {
+            client.say(e);
+            return;
+        }
+    };
+    if !client.confirm_or_arm_command(command) {
+        client.ask(format!(
+            "reset {} to the upstream? press again to confirm",
+            mode.flag()
+        ));
+        return;
+    }
+    if !client.submit(Box::new(job)) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+/// `files.nuke`: throw the whole working tree away — every uncommitted byte,
+/// tracked and untracked alike.
+///
+/// The most destructive key in the client, and the only one whose question
+/// says what cannot be undone: there is no stash behind it and no reflog
+/// entry for a file that was never committed. Ignored files stay, which the
+/// question says too, because "everything" would be a lie about the build
+/// directory it leaves alone.
+pub fn nuke_worktree(client: &mut impl FileClient) {
+    const COMMAND: &str = "files.nuke";
+    let Some(repo) = client.repo() else {
+        client.say("a fixture has no working tree to nuke".into());
+        return;
+    };
+    if refuse_while_operating(client) {
+        return;
+    }
+    if !client.confirm_or_arm_command(COMMAND) {
+        client.ask(
+            "nuke the working tree? every uncommitted change goes, tracked and \
+             untracked — ignored files stay. press again to confirm"
+                .into(),
+        );
+        return;
+    }
+    if !client.submit(Box::new(Write::nuke_worktree(&repo))) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+/// `n` commits, said the way a person says it.
+fn commits_count(n: usize) -> String {
+    match n {
+        1 => "1 commit".into(),
+        n => format!("{n} commits"),
+    }
+}
+
 /// `commits.copy`: puts the marked range — or the row alone when nothing is
 /// marked — onto the cherry-pick clipboard. Pure state, no write, so no
 /// confirmation and no operation gate: a copy under a standing merge is
@@ -651,34 +1058,62 @@ pub fn clear_copies(client: &mut impl HistoryClient) {
     client.say(format!("cleared {held} copied commit{}", plural(held)));
 }
 
-/// `commits.reset-author`: hands HEAD's authorship to the current user and
-/// moves nothing else. HEAD only, measured against HEAD's own sha rather
-/// than the newest row — a drilled-into branch log's first row is somebody
-/// else's tip — and a deeper commit refuses by name, because re-authoring
-/// one is a rebase and that UI is a later slice. A rewrite all the same, so
-/// it asks twice, armed on (command, commit) like every other one here.
+/// `commits.reset-author`: hands a commit's authorship to the current user
+/// and moves nothing else.
+///
+/// HEAD is one amend and is measured against HEAD's own sha rather than the
+/// newest row — a drilled-into branch log's first row is somebody else's
+/// tip. Anything deeper is the same rewrite arriving by rebase: the plan
+/// replays the window with `--reset-author` hung on the one commit, which is
+/// the todo path doing what a bare amend cannot reach. Either way it asks
+/// twice, armed on (command, commit) like every other rewrite here.
 pub fn reset_commit_author(client: &mut impl HistoryClient) {
     const COMMAND: &str = "commits.reset-author";
     let Some(target) = client.commit_target() else {
         client.say("nothing selected to re-author".into());
         return;
     };
+    // The repository and the standing operation refuse ahead of every
+    // question about *which* commit: a rewrite inside git's own is refused
+    // whether it would have been an amend or a rebase.
     let Some(repo) = history_repo(client, COMMAND) else {
         return;
     };
-    match client.head_sha() {
-        Some(head) if head == target.sha => {}
-        Some(_) => {
-            client.say(format!(
-                "only HEAD's author resets here — {} is deeper history, which is a rebase",
-                target.short
-            ));
-            return;
-        }
+    let deep = match client.head_sha() {
+        Some(head) if head == target.sha => false,
+        Some(_) => true,
         None => {
             client.say("there is no HEAD commit to re-author".into());
             return;
         }
+    };
+    if deep {
+        let Some((window, _)) = plan_window(client, COMMAND) else {
+            return;
+        };
+        let Some(index) = window
+            .iter()
+            .position(|c| c.sha.as_bytes() == target.sha.as_slice())
+        else {
+            client.say(format!(
+                "{} is not in the loaded history — nothing was re-authored",
+                target.short
+            ));
+            return;
+        };
+        let mut plan = match Plan::over(&window, index) {
+            Ok(plan) => plan,
+            Err(e) => {
+                client.say(e);
+                return;
+            }
+        };
+        if let Err(e) = plan.set_amend(index, Amend::ResetAuthor) {
+            client.say(e);
+            return;
+        }
+        run_plan(client, COMMAND, plan);
+        return;
     }
     if !client.confirm_or_arm_commit(COMMAND, &target) {
         client.ask(format!(
@@ -1637,6 +2072,11 @@ mod tests {
         }
 
         fn confirm_or_arm_file(&mut self, _: &SelectedFile) -> bool {
+            self.confirm_calls += 1;
+            self.confirmations.pop_front().unwrap_or(false)
+        }
+
+        fn confirm_or_arm_command(&mut self, _: &str) -> bool {
             self.confirm_calls += 1;
             self.confirmations.pop_front().unwrap_or(false)
         }
