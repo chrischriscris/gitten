@@ -12,7 +12,7 @@ use crate::verbs::Write;
 use gitten_core::clipboard::CherryClipboard;
 use gitten_core::operation::{Operation, Side};
 use gitten_core::rebase::{compose, Amend, Plan, Rewrite};
-use gitten_core::refs::{ResetMode, Target};
+use gitten_core::refs::{ResetMode, StashId, StashScope, Target};
 use gitten_core::status::PathBytes;
 use gitten_core::{Commit, Hunk};
 use gitten_git::Handle;
@@ -87,6 +87,21 @@ pub trait RemoteClient: Client {
     fn remote_target(&self) -> Option<gitten_core::refs::RefName>;
     /// Arms this remote target, or spends an arm already standing on it.
     fn confirm_or_arm_remote(&mut self, name: &gitten_core::refs::RefName) -> bool;
+}
+
+/// The client-owned selection and confirmation state needed by stash actions.
+pub trait StashClient: Client {
+    /// The stack entry the keyboard is on, as both its identities — the
+    /// commit that survives churn and the position it was at. `None` on an
+    /// empty stack, and on one whose read failed: a pane that could not read
+    /// the stack exposes no row to act on, which is a different thing from
+    /// a stack read as empty.
+    fn selected_stash(&self) -> Option<StashId>;
+    /// Arms this entry, or spends an arm already standing on it. Keyed on
+    /// the identity and not the number, for the reason the identity exists:
+    /// a yes addressed to `stash@{1}` must not be spent on whatever
+    /// `stash@{1}` became.
+    fn confirm_or_arm_stash(&mut self, id: &StashId) -> bool;
 }
 
 /// Which presentation section a working-tree path occupies.
@@ -286,6 +301,153 @@ pub fn stash_working_tree(client: &mut impl Client) {
         return;
     };
     if !client.submit(Box::new(Write::stash_push(&repo, None))) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+/// The scoped pushes: `files.stash-named`, `-staged`, `-unstaged`,
+/// `-untracked` and `-file`, all of them one [`StashScope`] apart.
+///
+/// Nothing confirms. A stash is the *reversible* half of the working tree's
+/// verbs — the work is on the stack a keypress later, which is the whole
+/// difference between this and `files.discard` — so the question a discard
+/// asks would be a question about nothing here. What is refused is the two
+/// things that would fail anyway: a fixture, which has no working tree; and
+/// nothing at all to park, which the repository answers with a sentence
+/// naming the scope rather than a success badge over a no-op.
+///
+/// A standing operation is deliberately *not* refused, on exactly the terms
+/// [`stash_working_tree`] does not refuse it either — the whole family has
+/// to answer the same way, and there is nothing left for a guard here to
+/// catch. The one mid-operation state with work to park is a conflicted one,
+/// and git refuses that itself ("needs merge") because it cannot write an
+/// index holding unmerged stages. A rebase stopped at an `edit` has a clean
+/// tree until the reader changes something, and parking what they changed is
+/// then the thing they asked for rather than an accident.
+pub fn stash_scoped(client: &mut impl Client, message: Option<String>, scope: StashScope) {
+    let Some(repo) = client.repo() else {
+        client.say("a fixture has no working tree to park".into());
+        return;
+    };
+    let job = Write::stash_push_scoped(&repo, message, scope);
+    if !client.submit(Box::new(job)) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+/// `stashes.apply`: restore the selected entry, keeping it on the stack.
+///
+/// Aimed by the entry's commit, so the write survives a stack that churned
+/// between the keypress and the queue's turn — and refuses honestly when the
+/// entry left it entirely. Nothing confirms: an apply adds work to the
+/// working tree and takes nothing away, and a conflicted one is git's
+/// refusal with everything still standing.
+pub fn apply_stash(client: &mut impl StashClient) {
+    let Some((repo, id)) = stash_target(client, "apply") else {
+        return;
+    };
+    submit_stash(client, Write::stash_apply_entry(&repo, id));
+}
+
+/// `stashes.pop`: restore the selected entry and drop it — but only if the
+/// restore was clean, which git decides and nothing here second-guesses.
+///
+/// No confirmation, and that is deliberate rather than an omission: a pop
+/// whose apply fails keeps the entry, so the destructive half never happens
+/// without the constructive one. See [`Repo::stash_pop`](gitten_git::Repo::stash_pop).
+pub fn pop_stash(client: &mut impl StashClient) {
+    let Some((repo, id)) = stash_target(client, "pop") else {
+        return;
+    };
+    submit_stash(client, Write::stash_pop_entry(&repo, id));
+}
+
+/// `stashes.drop`: delete the selected entry off the stack.
+///
+/// The one destructive verb on this pane, so it asks twice — armed on the
+/// entry's *identity*, because a yes addressed to `stash@{1}` must never be
+/// spent on whatever `stash@{1}` became. The arm is spent only after the
+/// repository is known to exist, so a fixture cannot consume a question it
+/// can never answer.
+pub fn drop_stash(client: &mut impl StashClient) {
+    let Some((repo, id)) = stash_target(client, "drop") else {
+        return;
+    };
+    if !client.confirm_or_arm_stash(&id) {
+        client.ask(format!(
+            "drop stash@{{{}}}? press again to confirm",
+            id.index
+        ));
+        return;
+    }
+    submit_stash(client, Write::stash_drop_entry(&repo, id));
+}
+
+/// `stashes.rename`: give the selected entry a new message.
+///
+/// The text arrives already gathered by the client's own field. Empty is
+/// refused here rather than sent to git, so the sentence names the field
+/// that just closed; the repository refuses whitespace again for the callers
+/// that never came through here.
+pub fn rename_stash(client: &mut impl StashClient, id: StashId, message: String) {
+    if message.trim().is_empty() {
+        client.say("a stash needs a message".into());
+        return;
+    }
+    let Some(repo) = client.repo() else {
+        client.say("a fixture has no stash to rename".into());
+        return;
+    };
+    submit_stash(client, Write::stash_rename(&repo, id, message));
+}
+
+/// `stashes.new-branch`: start a branch where the selected entry was made,
+/// and apply the entry onto it.
+///
+/// A standing operation refuses: this checks out, and a checkout inside
+/// git's own first write is never the move. The name is the client's field
+/// again, empty refused here; a dirty tree the checkout would overwrite is
+/// git's refusal, and it leaves the stash exactly where it is.
+pub fn branch_from_stash(client: &mut impl StashClient, id: StashId, name: String) {
+    if name.trim().is_empty() {
+        client.say("a branch needs a name".into());
+        return;
+    }
+    let Some(repo) = client.repo() else {
+        client.say("a fixture has no stash to branch from".into());
+        return;
+    };
+    if refuse_while_operating(client) {
+        return;
+    }
+    submit_stash(
+        client,
+        Write::stash_branch(&repo, id, name.trim().as_bytes().to_vec()),
+    );
+}
+
+/// The two things every stash verb needs and the two ways it can be refused
+/// before one is built: a repository, and a row to aim at.
+///
+/// The order is the same one this module keeps everywhere — the repository
+/// first, because "a fixture has no stack" is truer than "nothing selected"
+/// about a pane that has no rows because it has no repository.
+fn stash_target(client: &mut impl StashClient, verb: &str) -> Option<(Handle, StashId)> {
+    let Some(repo) = client.repo() else {
+        client.say(format!("a fixture has no stash to {verb}"));
+        return None;
+    };
+    let Some(id) = client.selected_stash() else {
+        client.say("nothing selected on the stash stack".into());
+        return None;
+    };
+    Some((repo, id))
+}
+
+/// One submission, one sentence when the queue is gone — said once here
+/// rather than five times above.
+fn submit_stash(client: &mut impl StashClient, job: Write) {
+    if !client.submit(Box::new(job)) {
         client.say("the job queue is shutting down".into());
     }
 }
@@ -1971,6 +2133,11 @@ mod tests {
 
     struct Fake {
         target: Option<Target>,
+        /// The stack entry the keyboard is on, for the stash verbs.
+        stash: Option<StashId>,
+        /// The operation the client last acquired, for the verbs that refuse
+        /// to start a second write inside git's first.
+        standing: Option<Operation>,
         selected: Option<SelectedFile>,
         cursor: Option<FileSection>,
         paths: [Vec<PathBytes>; 4],
@@ -1991,6 +2158,8 @@ mod tests {
             let (record, records) = mpsc::channel();
             Self {
                 target,
+                stash: None,
+                standing: None,
                 selected: None,
                 cursor: None,
                 paths: Default::default(),
@@ -2033,6 +2202,10 @@ mod tests {
     }
 
     impl Client for Fake {
+        fn operation(&self) -> Option<Operation> {
+            self.standing
+        }
+
         fn confirm_or_arm(&mut self, _: &str, _: &[u8]) -> bool {
             self.confirm_calls += 1;
             self.confirmations.pop_front().unwrap_or(false)
@@ -2089,6 +2262,176 @@ mod tests {
         fn confirm_or_arm_file(&mut self, _: &SelectedFile) -> bool {
             self.confirm_calls += 1;
             self.confirmations.pop_front().unwrap_or(false)
+        }
+    }
+
+    impl StashClient for Fake {
+        fn selected_stash(&self) -> Option<StashId> {
+            self.stash.clone()
+        }
+
+        fn confirm_or_arm_stash(&mut self, _: &StashId) -> bool {
+            self.confirm_calls += 1;
+            self.confirmations.pop_front().unwrap_or(false)
+        }
+    }
+
+    fn entry(index: usize, commit: &str) -> StashId {
+        StashId {
+            index,
+            commit: commit.into(),
+        }
+    }
+
+    #[test]
+    fn every_stash_scope_builds_a_job_that_names_what_it_takes() {
+        for (scope, named) in [
+            (StashScope::Tracked, "stash the working tree"),
+            (
+                StashScope::WithUntracked,
+                "stash the working tree and its new files",
+            ),
+            (StashScope::Staged, "stash the staged side"),
+            (StashScope::Unstaged, "stash the unstaged side"),
+            (
+                StashScope::Path {
+                    path: "src/x.rs".into(),
+                    untracked: false,
+                },
+                "stash src/x.rs",
+            ),
+        ] {
+            let mut client = Fake::with(None);
+            stash_scoped(&mut client, Some("wip".into()), scope);
+            assert_eq!(client.jobs, [named]);
+            assert!(client.said.is_empty(), "{:?}", client.said);
+        }
+    }
+
+    #[test]
+    fn a_scoped_stash_over_a_fixture_refuses_and_queues_nothing() {
+        let mut client = Fake::with(None);
+        client.repo = None;
+        stash_scoped(&mut client, None, StashScope::Staged);
+        assert_eq!(client.said, ["a fixture has no working tree to park"]);
+        assert!(client.jobs.is_empty());
+    }
+
+    #[test]
+    fn a_scoped_stash_does_not_refuse_a_standing_operation() {
+        // The whole family answers the same way, and files.stash does not
+        // guard: the one mid-operation state with work to park is a
+        // conflicted one, and git refuses that itself.
+        let mut client = Fake::with(None);
+        client.standing = Some(Operation {
+            kind: gitten_core::operation::Kind::Rebase,
+            conflicts: 0,
+        });
+        stash_scoped(&mut client, None, StashScope::Tracked);
+        assert_eq!(client.jobs, ["stash the working tree"]);
+    }
+
+    #[test]
+    fn the_stash_verbs_refuse_a_fixture_before_a_missing_row() {
+        // The repository first, because "a fixture has no stack" is truer
+        // about a pane with no rows than "nothing selected" is.
+        for (name, run) in [
+            ("apply", apply_stash as fn(&mut Fake)),
+            ("pop", pop_stash as fn(&mut Fake)),
+            ("drop", drop_stash as fn(&mut Fake)),
+        ] {
+            let mut client = Fake::with(None);
+            client.repo = None;
+            client.stash = Some(entry(0, "abc"));
+            client.confirmations.push_back(true);
+            run(&mut client);
+            assert_eq!(client.said, [format!("a fixture has no stash to {name}")]);
+            assert_eq!(client.confirm_calls, 0, "the arm was not spent");
+            assert!(client.jobs.is_empty());
+
+            let mut empty = Fake::with(None);
+            run(&mut empty);
+            assert_eq!(empty.said, ["nothing selected on the stash stack"]);
+            assert!(empty.jobs.is_empty());
+        }
+    }
+
+    #[test]
+    fn apply_and_pop_act_on_the_first_press_and_drop_asks_twice() {
+        let mut client = Fake::with(None);
+        client.stash = Some(entry(2, "cafe"));
+        apply_stash(&mut client);
+        pop_stash(&mut client);
+        assert_eq!(
+            client.jobs,
+            ["stash apply stash@{2}", "stash pop stash@{2}"]
+        );
+        assert!(client.asked.is_empty(), "neither destroys anything");
+
+        let mut dropping = Fake::with(None);
+        dropping.stash = Some(entry(2, "cafe"));
+        dropping.confirmations = [false, true].into();
+        drop_stash(&mut dropping);
+        assert_eq!(dropping.asked, ["drop stash@{2}? press again to confirm"]);
+        assert!(dropping.jobs.is_empty());
+        drop_stash(&mut dropping);
+        assert_eq!(dropping.asked.len(), 1);
+        assert_eq!(dropping.jobs, ["stash drop stash@{2}"]);
+    }
+
+    #[test]
+    fn a_rename_refuses_an_empty_message_before_it_reaches_git() {
+        let mut client = Fake::with(None);
+        for blank in ["", "   ", "\n"] {
+            rename_stash(&mut client, entry(0, "abc"), blank.into());
+        }
+        assert_eq!(client.said.len(), 3, "{:?}", client.said);
+        assert!(client.said.iter().all(|s| s == "a stash needs a message"));
+        assert!(client.jobs.is_empty());
+
+        rename_stash(&mut client, entry(1, "abc"), "the parser one".into());
+        assert_eq!(client.jobs, ["rename stash@{1}"]);
+    }
+
+    #[test]
+    fn a_branch_from_a_stash_refuses_an_empty_name_and_a_standing_operation() {
+        let mut blank = Fake::with(None);
+        branch_from_stash(&mut blank, entry(0, "abc"), "  ".into());
+        assert_eq!(blank.said, ["a branch needs a name"]);
+        assert!(blank.jobs.is_empty());
+
+        // It checks out, so it waits for git's own first write like every
+        // other checkout here does.
+        let mut operating = Fake::with(None);
+        operating.standing = Some(Operation {
+            kind: gitten_core::operation::Kind::Rebase,
+            conflicts: 0,
+        });
+        branch_from_stash(&mut operating, entry(0, "abc"), "wip".into());
+        assert_eq!(
+            operating.said,
+            ["a rebase is in progress; finish or abort it before starting another"]
+        );
+        assert!(operating.jobs.is_empty());
+
+        let mut client = Fake::with(None);
+        branch_from_stash(&mut client, entry(3, "abc"), " wip ".into());
+        assert_eq!(client.jobs, ["branch wip from stash@{3}"]);
+    }
+
+    #[test]
+    fn a_stash_verb_says_so_when_the_queue_is_gone() {
+        for run in [
+            apply_stash as fn(&mut Fake),
+            pop_stash as fn(&mut Fake),
+            drop_stash as fn(&mut Fake),
+        ] {
+            let mut client = Fake::with(None);
+            client.stash = Some(entry(0, "abc"));
+            client.submit_ok = false;
+            client.confirmations.push_back(true);
+            run(&mut client);
+            assert_eq!(client.said, ["the job queue is shutting down"]);
         }
     }
 

@@ -12,7 +12,7 @@
 use crate::jobs::Job;
 use gitten_core::operation::Side;
 use gitten_core::rebase::{Plan, TodoScript};
-use gitten_core::refs::{HeadState, Remote, ResetMode};
+use gitten_core::refs::{HeadState, Remote, ResetMode, StashId, StashScope};
 use gitten_git::{Handle, Repo};
 
 /// The write itself: a closure over the trait, so an extension's verb and a
@@ -672,6 +672,79 @@ impl Write {
         })
     }
 
+    /// Parks a chosen part of the working tree — [`StashScope`] says which,
+    /// and which part is left standing.
+    ///
+    /// The band names the scope rather than the flag: a reader watching a
+    /// job run wants to know *what went*, and `--keep-index` is a fact about
+    /// git's command line.
+    pub fn stash_push_scoped(repo: &Handle, message: Option<String>, scope: StashScope) -> Self {
+        let shown = scope.label();
+        Self::named(format!("stash {shown}"), repo, move |r| {
+            r.stash_push_scoped(message.as_deref(), &scope).map(|_| ())
+        })
+    }
+
+    /// Restores the entry `id` names, keeping it — [`Write::stash_apply`]
+    /// aimed by commit, so a stack that churned between the keypress and the
+    /// queue's turn cannot retarget it. The band says the number the reader
+    /// saw; the write resolves the commit again for itself.
+    pub fn stash_apply_entry(repo: &Handle, id: StashId) -> Self {
+        Self::named(
+            format!("stash apply stash@{{{}}}", id.index),
+            repo,
+            move |r| r.stash_apply_id(&id),
+        )
+    }
+
+    /// [`Write::stash_pop`] aimed by commit. A conflicted restore is git's
+    /// refusal with the entry kept — see [`Repo::stash_pop`].
+    pub fn stash_pop_entry(repo: &Handle, id: StashId) -> Self {
+        Self::named(
+            format!("stash pop stash@{{{}}}", id.index),
+            repo,
+            move |r| r.stash_pop_id(&id),
+        )
+    }
+
+    /// [`Write::stash_drop`] aimed by commit — the verb the identity matters
+    /// most for, because a drop aimed at a stale number destroys work nobody
+    /// chose. DESTRUCTIVE: the caller confirms before this is ever built.
+    pub fn stash_drop_entry(repo: &Handle, id: StashId) -> Self {
+        Self::named(
+            format!("stash drop stash@{{{}}}", id.index),
+            repo,
+            move |r| r.stash_drop_id(&id),
+        )
+    }
+
+    /// Gives a stash entry a new message, keeping its commit. Announces,
+    /// because a rename re-files the entry at the top of the stack — see
+    /// [`Repo::stash_rename`] for why git leaves no other shape — and a row
+    /// that moved without a word looks like a different entry.
+    pub fn stash_rename(repo: &Handle, id: StashId, message: String) -> Self {
+        let shown = message.clone();
+        Self::named(format!("rename stash@{{{}}}", id.index), repo, move |r| {
+            r.stash_rename(&id, &message)
+        })
+        .announcing(format!("renamed to {shown}, now at the top of the stack"))
+    }
+
+    /// Starts a branch from a stash entry: the stash's own base commit,
+    /// checked out under `name`, with the entry applied and its index
+    /// intact. Announces — the effect is a checkout the eye may be nowhere
+    /// near.
+    pub fn stash_branch(repo: &Handle, id: StashId, name: Vec<u8>) -> Self {
+        let shown = String::from_utf8_lossy(&name).into_owned();
+        let at = id.index;
+        Self::named(
+            format!("branch {shown} from stash@{{{at}}}"),
+            repo,
+            move |r| r.stash_branch(&id, &name),
+        )
+        .announcing(format!("{shown} starts where stash@{{{at}}} was made"))
+    }
+
     // ------------------------------------------------------------ the sync
 
     /// Sends `branch` to `remote` — `git push -q`, adding `--set-upstream`
@@ -1039,6 +1112,55 @@ mod tests {
                 .push(format!("stash drop stash@{index}"));
             Ok(())
         }
+        fn stash_push_scoped(
+            &self,
+            message: Option<&str>,
+            scope: &StashScope,
+        ) -> gitten_git::Result<usize> {
+            self.0.lock().unwrap().push(format!(
+                "stash push {:?} {:?} [{}]",
+                message,
+                scope.label(),
+                scope.flags().join(" ")
+            ));
+            Ok(0)
+        }
+        fn stash_apply_id(&self, id: &StashId) -> gitten_git::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("stash apply {}", id.commit));
+            Ok(())
+        }
+        fn stash_pop_id(&self, id: &StashId) -> gitten_git::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("stash pop {}", id.commit));
+            Ok(())
+        }
+        fn stash_drop_id(&self, id: &StashId) -> gitten_git::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("stash drop {}", id.commit));
+            Ok(())
+        }
+        fn stash_rename(&self, id: &StashId, message: &str) -> gitten_git::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("stash rename {} {message}", id.commit));
+            Ok(())
+        }
+        fn stash_branch(&self, id: &StashId, name: &[u8]) -> gitten_git::Result<()> {
+            self.0.lock().unwrap().push(format!(
+                "stash branch {} {}",
+                String::from_utf8_lossy(name),
+                id.commit
+            ));
+            Ok(())
+        }
     }
 
     fn recorded(calls: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
@@ -1351,6 +1473,99 @@ mod tests {
             std::thread::yield_now();
         }
         assert_eq!(recorded(&calls), vec!["rebase_plan"]);
+    }
+
+    #[test]
+    fn the_scoped_and_identified_stash_verbs_reach_the_trait_by_commit() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let repo: Handle = Arc::new(Recording(Arc::clone(&calls)));
+        let runner = Runner::new();
+        let submit = runner.submitter();
+        let id = StashId {
+            index: 1,
+            commit: "cafebabe".into(),
+        };
+
+        let jobs: Vec<Box<dyn Job>> = vec![
+            Box::new(Write::stash_push_scoped(
+                &repo,
+                Some("index only".into()),
+                StashScope::Staged,
+            )),
+            Box::new(Write::stash_push_scoped(
+                &repo,
+                None,
+                StashScope::Path {
+                    path: "notes.md".into(),
+                    untracked: true,
+                },
+            )),
+            Box::new(Write::stash_apply_entry(&repo, id.clone())),
+            Box::new(Write::stash_pop_entry(&repo, id.clone())),
+            Box::new(Write::stash_drop_entry(&repo, id.clone())),
+            Box::new(Write::stash_rename(
+                &repo,
+                id.clone(),
+                "the parser one".into(),
+            )),
+            Box::new(Write::stash_branch(&repo, id.clone(), b"wip".to_vec())),
+        ];
+        for job in jobs {
+            assert!(submit.submit(job).is_ok());
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while recorded(&calls).len() < 7 {
+            assert!(
+                Instant::now() < deadline,
+                "jobs did not run: {:?}",
+                recorded(&calls)
+            );
+            std::thread::yield_now();
+        }
+        // The scope travels as the concept and spells its own flags where
+        // git is called; the entry travels as its **commit**, so nothing a
+        // renumbering does between the keypress and here can retarget it.
+        assert_eq!(
+            recorded(&calls),
+            vec![
+                "stash push Some(\"index only\") \"the staged side\" [--staged]",
+                "stash push None \"notes.md\" [-u]",
+                "stash apply cafebabe",
+                "stash pop cafebabe",
+                "stash drop cafebabe",
+                "stash rename cafebabe the parser one",
+                "stash branch wip cafebabe",
+            ]
+        );
+
+        let mut band = Vec::new();
+        while let Some(event) = runner.try_next() {
+            match event {
+                Event::Started { name } => band.push(name),
+                Event::Finished { done, .. } => {
+                    if let Some(done) = done {
+                        band.push(format!("done: {done}"));
+                    }
+                }
+            }
+        }
+        // The band names the scope rather than the flag, and the number the
+        // reader saw rather than the commit they did not.
+        assert_eq!(
+            band,
+            vec![
+                "stash the staged side",
+                "stash notes.md",
+                "stash apply stash@{1}",
+                "stash pop stash@{1}",
+                "stash drop stash@{1}",
+                "rename stash@{1}",
+                "done: renamed to the parser one, now at the top of the stack",
+                "branch wip from stash@{1}",
+                "done: wip starts where stash@{1} was made",
+            ]
+        );
     }
 
     #[test]
