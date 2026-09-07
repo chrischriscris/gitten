@@ -10738,6 +10738,63 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_commit_in_the_window_survives_the_rewrite_around_it() {
+        // A commit with no changes is still somebody's commit — a marker, a
+        // trigger, an `--allow-empty` on purpose — and a rewrite that
+        // quietly swallowed one would be a rewrite that dropped a commit
+        // nobody asked it to.
+        let r = Scratch::new("plan-empty-commit");
+        r.write("base.txt", b"base\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        r.git(&["commit", "-q", "--allow-empty", "-m", "nothing"]);
+        r.write("tip.txt", b"tip\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "tip"]);
+
+        let g = r.open();
+        let commits = window(&r);
+        let mut plan = Plan::over(&commits, 1).expect("a window");
+        plan.set_message(0, b"tip, reworded\n".to_vec())
+            .expect("a message");
+        g.rebase_plan(&plan).expect("the plan runs");
+
+        assert_eq!(
+            subjects(&r),
+            vec!["tip, reworded", "nothing", "base"],
+            "the empty commit was swallowed by the rewrite"
+        );
+        assert!(!g.rebase_in_progress());
+    }
+
+    #[test]
+    fn a_dirty_tree_refuses_the_rewrite_in_gits_own_words() {
+        // No autostash, deliberately: stashing work behind a keypress that
+        // said *rebase* hides exactly the state the reader should decide
+        // about. git's own sentence comes back, and nothing moves.
+        let r = linear_repo("plan-dirty");
+        let g = r.open();
+        let before = r.rev_parse("HEAD");
+        r.write("one.txt", b"edited, uncommitted\n");
+
+        let commits = window(&r);
+        let mut plan = Plan::over(&commits, 1).expect("a window");
+        plan.set_action(0, Action::Drop).expect("a drop");
+        let err = g.rebase_plan(&plan).unwrap_err();
+        assert!(
+            err.contains("unstaged") || err.contains("cannot rebase"),
+            "git's own refusal did not come back: {err}"
+        );
+        assert_eq!(r.rev_parse("HEAD"), before, "a refused rebase moved HEAD");
+        assert!(!g.rebase_in_progress(), "a refusal left state standing");
+        assert_eq!(
+            std::fs::read(r.0.join("one.txt")).expect("still there"),
+            b"edited, uncommitted\n",
+            "the uncommitted work was touched"
+        );
+    }
+
+    #[test]
     fn a_plan_git_would_refuse_is_refused_before_any_process_runs() {
         let r = linear_repo("plan-refused");
         let g = r.open();

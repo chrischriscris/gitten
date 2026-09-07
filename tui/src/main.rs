@@ -13648,7 +13648,7 @@ diff --git a/tracked.txt b/tracked.txt
             // disabled one says its reason where its description was.
             for mode in [
                 "global", "files", "branches", "commits", "stashes", "diff", "help", "input",
-                "settings", "reset", "panes",
+                "settings", "reset", "upstream", "todo", "panes",
             ] {
                 let mut modes = Modes::new();
                 if mode != "global" {
@@ -17746,6 +17746,54 @@ shared tail
             }),
             "the abort never ran: {:?}",
             state.lock().unwrap().writes
+        );
+    }
+
+    /// A menu question owns its letters for exactly as long as it stands,
+    /// and not one press longer. That is the whole of what makes a menu
+    /// affordable in a pane whose letters are already spoken for: `s` after
+    /// `g` is a reset strength, and `s` after anything else is the squash
+    /// it has always been. Without the mode the commit list's own reset
+    /// menu was unreachable by key at all — `g` asked, and `s` folded.
+    #[test]
+    fn tui_parity_a_menu_question_owns_its_letters_only_while_it_stands() {
+        let (handle, state) = fake(&[]);
+        let mut app = history_app(&handle);
+        app.dispatch("view.down");
+        let row = row_sha(&app);
+
+        app.press(Key::char('g'));
+        assert!(
+            app.message.contains("soft, mixed or hard"),
+            "{:?}",
+            app.message
+        );
+        app.press(Key::char('s'));
+        assert_eq!(
+            app.message,
+            format!("reset --soft to {row}? press again to confirm"),
+            "`s` under the menu was not the strength"
+        );
+
+        // The menu is down now: the same letter is the pane's own verb.
+        app.press(Key::char('s'));
+        assert_eq!(
+            app.message,
+            format!("squash {row}? press again to confirm"),
+            "the menu outlived its answer"
+        );
+        app.pump_quiet();
+        assert!(state.lock().unwrap().writes.is_empty());
+
+        // A press the menu does not name takes it down rather than leaving
+        // it to catch the next one.
+        app.press(Key::char('g'));
+        app.press(Key::plain(Code::Down));
+        app.press(Key::char('s'));
+        assert!(
+            app.message.starts_with("squash"),
+            "the menu caught a press it did not name: {:?}",
+            app.message
         );
     }
 
