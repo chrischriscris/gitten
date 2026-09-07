@@ -658,8 +658,34 @@ impl Write {
     /// Points HEAD's ref at `target` with `message` as the reflog sentence —
     /// undo's and redo's verb. The label names the direction, so the queue
     /// and the status line read as prose rather than as a git invocation.
+    ///
+    /// **Where HEAD was when this was built is part of the job.** `target`
+    /// is a positional selector — `HEAD@{1}` names whatever the reflog held
+    /// when it was read, not a sha — so a branch switch in a terminal
+    /// between dispatch and execution retargets the undo onto the other
+    /// branch's walk. HEAD is read here — at the confirmation, which is
+    /// where this is built — and read again in the job, and a difference
+    /// refuses before git runs. Same binding as
+    /// [`Write::rebase_plan`](Self::rebase_plan); undo and redo both
+    /// re-derive their selector from a fresh reflog read, so the recovery
+    /// is simply trying again.
     pub fn move_head(repo: &Handle, label: String, message: &'static str, target: Vec<u8>) -> Self {
-        Self::named(label, repo, move |r| r.move_head(&target, message))
+        let confirmed_at = head_sha(repo.as_ref());
+        Self::named(label, repo, move |r| {
+            if let Some(was) = confirmed_at.as_deref() {
+                let now = head_sha(r);
+                if now.as_deref() != Some(was) {
+                    return Err(format!(
+                        "HEAD was {} when this undo was confirmed and is {} now — \
+                         something outside this queue moved it; \
+                         try again for a fresh reading",
+                        abbreviated(was),
+                        now.as_deref().map(abbreviated).unwrap_or("nowhere"),
+                    ));
+                }
+            }
+            r.move_head(&target, message)
+        })
     }
 
     /// Parks the tracked working tree on the stash stack — `git stash push`.
@@ -1408,6 +1434,10 @@ mod tests {
             self.calls.lock().unwrap().push("rebase_plan".into());
             Ok(())
         }
+        fn move_head(&self, _target: &[u8], _message: &str) -> gitten_git::Result<()> {
+            self.calls.lock().unwrap().push("move_head".into());
+            Ok(())
+        }
     }
 
     /// Three commits, newest first, as a loaded window reads.
@@ -1496,6 +1526,82 @@ mod tests {
             std::thread::yield_now();
         }
         assert_eq!(recorded(&calls), vec!["rebase_plan"]);
+    }
+
+    #[test]
+    fn a_confirmed_undo_refuses_a_head_that_moved_outside_the_queue() {
+        // The undo job is built against a HEAD, then somebody switches
+        // branches in a terminal before the queue runs it: `HEAD@{1}`
+        // would now name the other branch's walk. The job must refuse
+        // rather than move a ref the reader never meant.
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let repo: Handle = Arc::new(Moving {
+            before: "head-sha".into(),
+            after: "somebody-elses-sha".into(),
+            reads: Arc::new(Mutex::new(0)),
+            calls: Arc::clone(&calls),
+        });
+        let runner = Runner::new();
+        assert!(runner
+            .submitter()
+            .submit(Box::new(Write::move_head(
+                &repo,
+                "undo (commit)".into(),
+                gitten_core::refs::UNDO_MESSAGE,
+                b"HEAD@{1}".to_vec()
+            )))
+            .is_ok());
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let refusal = loop {
+            assert!(Instant::now() < deadline, "the job never finished");
+            if let Some(Event::Finished { outcome, .. }) = runner.try_next() {
+                break outcome;
+            }
+            std::thread::yield_now();
+        };
+        let Err(said) = refusal else {
+            panic!("an undo confirmed at a sha HEAD no longer holds was replayed");
+        };
+        assert!(
+            said.contains("head-sha") && said.contains("somebody"),
+            "the refusal names both shas: {said}"
+        );
+        assert!(
+            recorded(&calls).is_empty(),
+            "git was reached anyway: {:?}",
+            recorded(&calls)
+        );
+    }
+
+    #[test]
+    fn a_confirmed_undo_runs_when_head_is_where_it_was_left() {
+        // The same job against a HEAD that did not move: the comparison
+        // must not become a refusal every undo trips over.
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let repo: Handle = Arc::new(Moving {
+            before: "head-sha".into(),
+            after: "head-sha".into(),
+            reads: Arc::new(Mutex::new(0)),
+            calls: Arc::clone(&calls),
+        });
+        let runner = Runner::new();
+        assert!(runner
+            .submitter()
+            .submit(Box::new(Write::move_head(
+                &repo,
+                "undo (commit)".into(),
+                gitten_core::refs::UNDO_MESSAGE,
+                b"HEAD@{1}".to_vec()
+            )))
+            .is_ok());
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while recorded(&calls).is_empty() {
+            assert!(Instant::now() < deadline, "the undo never ran");
+            std::thread::yield_now();
+        }
+        assert_eq!(recorded(&calls), vec!["move_head"]);
     }
 
     #[test]
