@@ -11,6 +11,7 @@ use std::sync::Arc;
 pub use crate::source::DiffSource;
 
 pub mod align;
+pub mod bisect;
 pub mod clipboard;
 pub mod command;
 pub mod conflict;
@@ -36,6 +37,7 @@ pub mod status;
 pub mod syntax;
 pub mod theme;
 pub mod view;
+pub mod worktrees;
 pub mod wrap;
 
 // ---------------------------------------------------------------- commit log

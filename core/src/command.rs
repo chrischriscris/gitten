@@ -1578,7 +1578,7 @@ impl Commands {
             ),
             (
                 "commits.apply-fixups",
-                "fold every fixup into the commit it names, asked twice",
+                "fold every fixup into the commit it names (`U`), asked twice",
                 Some("fold fixups"),
             ),
             (
