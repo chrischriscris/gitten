@@ -25,7 +25,7 @@
 use crate::screen::{Ink, Screen};
 use crate::scrollbar::{self, Bar};
 use gitten_core::host::Host;
-use gitten_core::refs::Stash;
+use gitten_core::refs::{Stash, StashId};
 use gitten_core::search::TextIndex;
 use gitten_core::view::Viewport;
 
@@ -48,15 +48,6 @@ struct Row {
 /// Spells the address the way git does, once, at flatten.
 fn title(index: usize) -> String {
     format!("stash@{{{index}}}")
-}
-
-/// What an armed drop asks, once, in the status line: the address, spoken
-/// the way git spells it, because dropping `stash@{0}` means *the top*,
-/// whatever the entry says about itself. The command's own name
-/// (`stashes.drop`) belongs to the keymap and the help panel; the question
-/// speaks the thing being dropped.
-pub fn drop_question(index: usize) -> String {
-    format!("drop stash@{{{index}}}? press again to confirm")
 }
 
 /// The stash list.
@@ -89,12 +80,17 @@ pub struct Stashes {
     view: Viewport,
     cols: usize,
     bar: Bar,
-    /// The drop awaiting its second press: the stack index of the row that
-    /// asked. One slot — arming a different row moves the question, never
-    /// queues two. Killed by any cursor move, any moving scroll, any mouse
-    /// row change and any refresh; a focus round trip alone does not touch
-    /// it, because the question sits on the row it was asked about.
-    armed: Option<usize>,
+    /// The drop awaiting its second press: the *identity* of the row that
+    /// asked — the entry's commit, and the position it was at.
+    ///
+    /// The identity and not the number, because the number is what churns:
+    /// a yes addressed to `stash@{1}` must never be spent on whatever
+    /// `stash@{1}` became. One slot — arming a different row moves the
+    /// question, never queues two. Killed by any cursor move, any moving
+    /// scroll, any mouse row change and any refresh; a focus round trip
+    /// alone does not touch it, because the question sits on the row it was
+    /// asked about.
+    armed: Option<StashId>,
     dragging: bool,
 }
 
@@ -290,15 +286,19 @@ impl Stashes {
         self.row_at(self.view.cursor()).map(|r| r.index)
     }
 
-    /// The entry the keyboard is on, as its two identities: the place on
-    /// the stack the verbs address, and the commit that survives a drop —
-    /// what a preview of this entry is anchored by.
-    pub fn current_entry(&self) -> Option<(usize, String)> {
+    /// The entry the keyboard is on, as both its identities: the commit that
+    /// survives a drop, and the place on the stack it was at — what every
+    /// verb on this pane is aimed with, and what a preview is anchored by.
+    /// See [`StashId`] for why both travel.
+    pub fn current_id(&self) -> Option<StashId> {
         let index = self.current()?;
         self.rows
             .iter()
             .find(|row| row.index == index)
-            .map(|row| (row.index, row.commit.clone()))
+            .map(|row| StashId {
+                index: row.index,
+                commit: row.commit.clone(),
+            })
     }
 
     /// What a stash entry says about itself, by its commit — the display
@@ -409,26 +409,31 @@ impl Stashes {
             .visible
             .get(index)
             .and_then(|&r| self.rows.get(r))
-            .map(|r| r.index);
+            .map(|r| StashId {
+                index: r.index,
+                commit: r.commit.clone(),
+            });
         if self.armed.is_some() && self.armed != at {
             self.armed = None;
         }
     }
 
-    /// Arms — or confirms — a drop of this exact stack index. First call on
-    /// a target stores it and returns false: ask, don't act. Second call on
+    /// Arms — or confirms — a drop of this exact entry. First call on a
+    /// target stores it and returns false: ask, don't act. Second call on
     /// the same target clears the arm and returns true: act. Anything else
     /// re-arms onto the new target and returns false again.
     ///
-    /// The arm holds the **index**, the thing a drop aims at — which is also
-    /// why a refresh disarms unconditionally: after any drop or pop every
-    /// later number shifts, and a yes addressed to yesterday's numbering is
-    /// the accident the double press exists to prevent.
-    pub fn confirm_or_arm_drop(&mut self, index: usize) -> bool {
-        let already = self.armed == Some(index);
+    /// The arm holds the whole [`StashId`], commit included, which is what
+    /// makes a stale yes impossible rather than merely unlikely: after a drop
+    /// or a pop every later number shifts, so an arm keyed on the number
+    /// alone could be spent on the entry that inherited it. A refresh
+    /// disarms unconditionally on top of that — belt and braces, and the
+    /// cheaper of the two to be sure about.
+    pub fn confirm_or_arm_drop(&mut self, id: &StashId) -> bool {
+        let already = self.armed.as_ref() == Some(id);
         self.armed = match already {
             true => None,
-            false => Some(index),
+            false => Some(id.clone()),
         };
         already
     }
@@ -520,7 +525,10 @@ impl Stashes {
                     false => theme.chrome.bg,
                 };
                 let address = Ink::new(theme.chrome.dim, bg);
-                let armed = self.armed == Some(r.index);
+                let armed = self
+                    .armed
+                    .as_ref()
+                    .is_some_and(|id| id.index == r.index && id.commit == r.commit);
                 let body = Ink::new(
                     match armed {
                         true => theme.chrome.error,
@@ -744,6 +752,15 @@ mod tests {
         assert_eq!(v.status(), "0 parked");
     }
 
+    /// The identity of stack row `i` of a twenty-deep stack — what
+    /// [`Stashes::current_id`] would hand a verb standing there.
+    fn tall_id(i: usize) -> StashId {
+        StashId {
+            index: i,
+            commit: format!("c{i:02}"),
+        }
+    }
+
     #[test]
     fn stash_drop_arm_survives_only_the_same_row() {
         let host = Host::new();
@@ -752,45 +769,64 @@ mod tests {
 
         // First press asks; second press on the same row acts, and the act
         // spends the arm.
-        assert!(!v.confirm_or_arm_drop(0));
-        assert_eq!(v.armed, Some(0));
-        assert!(v.confirm_or_arm_drop(0));
+        assert!(!v.confirm_or_arm_drop(&tall_id(0)));
+        assert_eq!(v.armed, Some(tall_id(0)));
+        assert!(v.confirm_or_arm_drop(&tall_id(0)));
         assert_eq!(v.armed, None);
 
         // A different row re-arms rather than inheriting the question.
-        assert!(!v.confirm_or_arm_drop(1));
-        assert_eq!(v.armed, Some(1));
-        assert!(!v.confirm_or_arm_drop(0), "another row asks again");
-        assert_eq!(v.armed, Some(0));
+        assert!(!v.confirm_or_arm_drop(&tall_id(1)));
+        assert_eq!(v.armed, Some(tall_id(1)));
+        assert!(
+            !v.confirm_or_arm_drop(&tall_id(0)),
+            "another row asks again"
+        );
+        assert_eq!(v.armed, Some(tall_id(0)));
+
+        // The same *number* under a different commit is a different entry,
+        // and asks again — which is the whole reason the arm holds the
+        // identity and not the position. The question standing here is
+        // stash@{0}'s, from the line above.
+        let inherited = StashId {
+            index: 0,
+            commit: "somebody-elses".into(),
+        };
+        assert!(
+            !v.confirm_or_arm_drop(&inherited),
+            "a stale yes was not spent on the entry that inherited the number"
+        );
+        assert_eq!(v.armed, Some(inherited));
 
         // A keyboard move disarms: the question was about the row that was
         // under the keyboard.
+        v.confirm_or_arm_drop(&tall_id(0));
         v.down();
         assert_eq!(v.armed, None);
         // ...a wheel that actually moved the list...
-        v.confirm_or_arm_drop(0);
+        v.confirm_or_arm_drop(&tall_id(0));
         v.scroll_y(3);
         assert_eq!(v.armed, None, "a moving scroll disarms");
         // ...a press on another row...
-        v.confirm_or_arm_drop(0);
+        v.confirm_or_arm_drop(&tall_id(0));
         v.press(3, 2, false, &host);
         assert_eq!(v.armed, None, "a mouse row change disarms");
         // ...and a refresh, unconditionally: indices renumber under a drop,
-        // and the arm holds an index.
-        v.confirm_or_arm_drop(0);
+        // and belt beats braces on the one question that destroys work.
+        v.confirm_or_arm_drop(&tall_id(0));
         v.replace(stack());
         assert_eq!(v.armed, None, "a refresh disarms");
+        v.replace(tall_stack());
 
         // A click on the armed row itself is neither an answer nor a re-ask.
-        v.confirm_or_arm_drop(0);
+        v.confirm_or_arm_drop(&tall_id(0));
         v.press(3, 0, false, &host);
-        assert_eq!(v.armed, Some(0));
+        assert_eq!(v.armed, Some(tall_id(0)));
 
         // Merely painting the pane unfocused, then focused — the focus round
         // trip — moves nothing: the question sits on its row.
         let mut screen = Screen::new(44, 6);
         v.paint(&mut screen, 0, 0, false, &host);
-        assert_eq!(v.armed, Some(0));
+        assert_eq!(v.armed, Some(tall_id(0)));
         // The armed row wears the error ink with the keyboard *elsewhere*:
         // the address keeps its furniture ink, the message is the thing
         // being asked about, and neither waits for focus.
@@ -798,10 +834,39 @@ mod tests {
         assert_eq!(screen.ink(0, 0).unwrap().fg, c.dim);
         assert_eq!(screen.ink(11, 0).unwrap().fg, c.error);
         v.paint(&mut screen, 0, 0, true, &host);
-        assert_eq!(v.armed, Some(0), "the focus round trip moved nothing");
+        assert_eq!(
+            v.armed,
+            Some(tall_id(0)),
+            "the focus round trip moved nothing"
+        );
         assert_eq!(screen.ink(11, 0).unwrap().fg, c.error);
+    }
 
-        // And the question is the address, spoken once, exactly.
-        assert_eq!(drop_question(0), "drop stash@{0}? press again to confirm");
+    #[test]
+    fn the_row_the_keyboard_is_on_answers_with_both_its_identities() {
+        // What every verb on this pane is aimed with. The commit is the
+        // identity; the number is what the reader saw and what git's own
+        // pop and drop insist on. Unavailable and empty both answer with no
+        // row at all, which is a different thing from row zero.
+        let mut v = Stashes::new(stack());
+        v.resize(30, 6);
+        assert_eq!(
+            v.current_id(),
+            Some(StashId {
+                index: 0,
+                commit: "aaa".into()
+            })
+        );
+        v.down();
+        assert_eq!(
+            v.current_id(),
+            Some(StashId {
+                index: 1,
+                commit: "bbb".into()
+            })
+        );
+        v.replace(Vec::new());
+        assert_eq!(v.current_id(), None);
+        assert_eq!(Stashes::unavailable().current_id(), None);
     }
 }

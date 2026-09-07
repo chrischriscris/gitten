@@ -49,7 +49,7 @@ use gitten_core::edit::{Edit, Field};
 use gitten_core::host::Host;
 use gitten_core::operation::{Operation, Side};
 use gitten_core::rebase::Rewrite;
-use gitten_core::refs::{HeadState, RefName, ResetMode};
+use gitten_core::refs::{HeadState, RefName, ResetMode, StashId, StashScope};
 use gitten_core::runs::Run;
 use gitten_core::source::DiffSource;
 use gitten_tui::branches::{self, Branches, Marks, Target};
@@ -62,7 +62,7 @@ use gitten_tui::merging;
 use gitten_tui::remotes::Remotes;
 use gitten_tui::screen::{Ink, Pen, Screen};
 use gitten_tui::scrollbar::Bar;
-use gitten_tui::stashes::{drop_question, Stashes};
+use gitten_tui::stashes::Stashes;
 use gitten_tui::term::{Input, Mouse, MouseKind, Term};
 use gitten_tui::todo::Todo;
 use std::io;
@@ -507,6 +507,29 @@ enum Prompt {
     TodoReword {
         field: Field,
     },
+    /// `files.stash-named`'s field: the message the entry is parked under.
+    /// Reads no row — the scope is the whole tracked working tree — so it
+    /// answers on a launch that registered no files tenant, exactly as
+    /// `files.stash` does. One line: git's `-m` takes a message, and a stash
+    /// nobody will ever read a body off is a label.
+    StashMessage {
+        field: Field,
+    },
+    /// `stashes.rename`'s field, prefilled with the entry's own message —
+    /// a rename is an edit of what is standing. `at` is the entry's
+    /// [`StashId`], captured when the field opened, so nothing a cursor does
+    /// while the field holds the keyboard can re-aim it; the write resolves
+    /// that commit again against the live stack.
+    StashRename {
+        at: StashId,
+        field: Field,
+    },
+    /// `stashes.new-branch`'s field: the branch to start where the entry was
+    /// made. `at` is captured at open like every verb's aim.
+    StashBranch {
+        at: StashId,
+        field: Field,
+    },
 }
 
 impl Prompt {
@@ -528,7 +551,10 @@ impl Prompt {
             | Prompt::RemoteUrl { field, .. }
             | Prompt::RemoteEdit { field, .. }
             | Prompt::Reword { field, .. }
-            | Prompt::TodoReword { field } => field,
+            | Prompt::TodoReword { field }
+            | Prompt::StashMessage { field }
+            | Prompt::StashRename { field, .. }
+            | Prompt::StashBranch { field, .. } => field,
         }
     }
 
@@ -549,7 +575,10 @@ impl Prompt {
             | Prompt::RemoteUrl { field, .. }
             | Prompt::RemoteEdit { field, .. }
             | Prompt::Reword { field, .. }
-            | Prompt::TodoReword { field } => field,
+            | Prompt::TodoReword { field }
+            | Prompt::StashMessage { field }
+            | Prompt::StashRename { field, .. }
+            | Prompt::StashBranch { field, .. } => field,
         }
     }
 
@@ -607,6 +636,9 @@ impl Prompt {
             Prompt::RemoteName { .. } => "remote name: ",
             Prompt::RemoteUrl { .. } => "remote url: ",
             Prompt::RemoteEdit { .. } => "url: ",
+            Prompt::StashMessage { .. } => "stash: ",
+            Prompt::StashRename { .. } => "rename stash: ",
+            Prompt::StashBranch { .. } => "branch from stash: ",
         }
     }
 }
@@ -2402,7 +2434,10 @@ impl App {
             // unless that command is a menu opening one, which is what
             // pressing `g` twice means. Closing first is what keeps the
             // *next* press out of the question's mode.
-            if !matches!(command.as_str(), "commits.reset-menu" | "files.reset-menu") {
+            if !matches!(
+                command.as_str(),
+                "commits.reset-menu" | "files.reset-menu" | "files.stash-menu"
+            ) {
                 self.close_question();
             }
             self.dispatch(&command);
@@ -3590,6 +3625,15 @@ impl App {
                     None => self.message = "the plan closed while the message was open".into(),
                 }
             }
+            Prompt::StashMessage { field } if accept => {
+                gitten_app::act::stash_scoped(self, Some(field.take()), StashScope::Tracked)
+            }
+            Prompt::StashRename { at, field } if accept => {
+                gitten_app::act::rename_stash(self, at, field.take())
+            }
+            Prompt::StashBranch { at, field } if accept => {
+                gitten_app::act::branch_from_stash(self, at, field.take())
+            }
             // Cancelled: the text was the prompt's and dies with it.
             _ => {}
         }
@@ -3976,7 +4020,27 @@ impl App {
             // repository, so a files tenant gains its already-configured
             // `s` binding simply by registering.
             "stashes.apply" | "stashes.pop" | "stashes.drop" => self.stash_selected(command),
+            "stashes.rename" => self.begin_stash_rename(),
+            "stashes.new-branch" => self.begin_stash_branch(),
             "files.stash" => self.stash_working_tree(),
+            // The stash choices, behind a menu of their own: the press that
+            // opens it writes nothing and the answers live in a mode that
+            // stands only while the question does.
+            "files.stash-menu" => {
+                if self.files_focused(command) && gitten_app::act::stash_menu(self) {
+                    self.question = Some("stash");
+                    self.sync_modes();
+                }
+            }
+            "files.stash-named" => self.begin_stash_message(),
+            "files.stash-staged" => gitten_app::act::stash_scoped(self, None, StashScope::Staged),
+            "files.stash-unstaged" => {
+                gitten_app::act::stash_scoped(self, None, StashScope::Unstaged)
+            }
+            "files.stash-untracked" => {
+                gitten_app::act::stash_scoped(self, None, StashScope::WithUntracked)
+            }
+            "files.stash-file" => self.stash_selected_file(),
             // The sync verbs act on the *repository* — the branch HEAD sits
             // on, and the remotes the config names — not on any pane. The
             // refusals are the shared actions': no upstream, no remote,
@@ -4666,9 +4730,12 @@ impl App {
                 _ => None,
             },
             "stashes" => match self.panes.get(pane) {
-                Some(Screens::Stashes { view, .. }) => view
-                    .current_entry()
-                    .map(|(index, commit)| DiffSource::Stash { index, commit }),
+                Some(Screens::Stashes { view, .. }) => {
+                    view.current_id().map(|id| DiffSource::Stash {
+                        index: id.index,
+                        commit: id.commit,
+                    })
+                }
                 _ => None,
             },
             _ => None,
@@ -5012,62 +5079,139 @@ impl App {
         }
     }
 
-    /// `stashes.apply` / `stashes.pop` / `stashes.drop`: send the stack
-    /// entry the keyboard is on to the queue. The terminal's share of the
-    /// window's stash verbs — the gates, the arm, the job — and not one
-    /// line more, because every one of those is shared with an extension
-    /// calling the same command through the same name.
+    /// `stashes.apply` / `stashes.pop` / `stashes.drop`: hand the stack entry
+    /// the keyboard is on to the shared action that means it.
     ///
-    /// The verbs reach only a focused stash pane, and only a row: an empty
-    /// or unavailable stack has nothing to address, and is refused before
-    /// the queue rather than sent to git to be told so. Drop alone asks
-    /// twice, on the pane's own arm, *before* any job exists; apply and pop
-    /// act on the first press, exactly as the window does and the command
-    /// descriptions say. Every accepted press builds the exact existing
-    /// [`Write`] and submits it — the repository's own refusal, on a stale
-    /// index or a conflicted restore, comes back from the queue and is the
-    /// status line, never a UI-invented word like `conflict`.
+    /// The one thing decided here is *whose pane* the press belongs to: the
+    /// stash verbs reach only a focused stash list, said the way every
+    /// wrong-focus refusal here is said. Everything after that — the
+    /// repository gate, the missing row, the arm, the job — is
+    /// [`gitten_app::act`]'s, so an extension calling the same command name
+    /// reaches the same sentences, and the entry travels as its **commit**:
+    /// a stack that churned between this press and the queue's turn moves
+    /// the entry, and the write follows the entry rather than the number.
     fn stash_selected(&mut self, command: &str) {
-        let Some((_, handle)) = self.repo.as_ref() else {
-            // A stash pane is registered only behind a repository, so the
-            // keyboard is somewhere else; said the same way that refusal is
-            // always said.
+        if !matches!(self.panes.focused(), Some(Screens::Stashes { .. })) {
             self.message = format!("{command} is not supported here");
             return;
-        };
-        let selected = match self.panes.focused() {
-            Some(Screens::Stashes { view, .. }) => view.current(),
-            _ => {
-                self.message = format!("{command} is not supported here");
-                return;
-            }
-        };
-        let Some(index) = selected else {
-            self.message = "nothing selected on the stash stack".into();
+        }
+        match command {
+            "stashes.apply" => gitten_app::act::apply_stash(self),
+            "stashes.pop" => gitten_app::act::pop_stash(self),
+            "stashes.drop" => gitten_app::act::drop_stash(self),
+            _ => {}
+        }
+    }
+
+    /// `files.stash-named`: gather a message on the status row, then park the
+    /// tracked working tree under it.
+    ///
+    /// Reads no row and needs no pane, exactly as `files.stash` does — the
+    /// scope is the repository's working tree, not a selection — which is
+    /// also why the only refusal before the field opens is the fixture.
+    fn begin_stash_message(&mut self) {
+        if self.repo.is_none() {
+            self.message = "a fixture has no working tree to park".into();
+            return;
+        }
+        self.open_prompt(Prompt::StashMessage {
+            field: Field::new(),
+        });
+    }
+
+    /// `files.stash-file`: park the file the keyboard is on and no other
+    /// path.
+    ///
+    /// The section the row sits in is what says whether git can see the path
+    /// at all: an untracked one needs `-u`, or the pathspec matches nothing
+    /// git tracks and the push stashes nothing. A conflicted row refuses —
+    /// its working-tree side is the merge's open question, and git cannot
+    /// write a stash over unmerged stages anyway.
+    fn stash_selected_file(&mut self) {
+        if !self.files_focused("files.stash-file") {
+            return;
+        }
+        let Some(file) = gitten_app::act::FileClient::selected_file(self) else {
+            self.message = "the keyboard is not on a file".into();
             return;
         };
-        // The arm is spent here, on the pane, before anything is built: a
-        // first press asks and queues nothing, a second press on the same
-        // row acts.
-        if command == "stashes.drop" {
-            let confirmed = match self.panes.focused_mut() {
-                Some(Screens::Stashes { view, .. }) => view.confirm_or_arm_drop(index),
-                _ => return,
-            };
-            if !confirmed {
-                self.message = drop_question(index);
-                return;
-            }
+        if file.section == gitten_app::act::FileSection::Conflicts {
+            self.message = "a conflicted file's merge has to be resolved, not parked".into();
+            return;
         }
-        let job = match command {
-            "stashes.apply" => Write::stash_apply(handle, index),
-            "stashes.pop" => Write::stash_pop(handle, index),
-            "stashes.drop" => Write::stash_drop(handle, index),
-            _ => return,
+        let scope = StashScope::Path {
+            path: file.path.clone(),
+            untracked: file.section == gitten_app::act::FileSection::Untracked,
         };
-        if self.submitter.submit(Box::new(job)).is_err() {
-            self.message = "the job queue is shutting down".into();
+        gitten_app::act::stash_scoped(self, None, scope);
+    }
+
+    /// `stashes.rename`: the field, pre-filled with the entry's own message
+    /// and wholly selected, so the first edit replaces it rather than
+    /// appending to it. `at` is the entry's identity, captured now.
+    ///
+    /// The rename re-files the entry at the top of the stack, which is git's
+    /// shape and not a choice — see
+    /// [`Repo::stash_rename`](gitten_git::Repo::stash_rename) — and the job
+    /// says so when it finishes, because a row that moved without a word
+    /// looks like a different entry.
+    fn begin_stash_rename(&mut self) {
+        let Some(at) = self.focused_stash() else {
+            return;
+        };
+        if self.repo.is_none() {
+            self.message = "a fixture has no stash to rename".into();
+            return;
         }
+        let initial = self
+            .panes
+            .get("stashes")
+            .and_then(|pane| match pane {
+                Screens::Stashes { view, .. } => view.message_of(&at.commit),
+                _ => None,
+            })
+            .unwrap_or_default()
+            .to_string();
+        self.open_prompt(Prompt::StashRename {
+            at,
+            field: Field::with_selected(&initial),
+        });
+    }
+
+    /// `stashes.new-branch`: the field, then git's own three-in-one — a
+    /// branch at the commit the stash was *made on*, the entry applied with
+    /// its index intact, and the entry dropped only if that apply was clean.
+    fn begin_stash_branch(&mut self) {
+        let Some(at) = self.focused_stash() else {
+            return;
+        };
+        if self.repo.is_none() {
+            self.message = "a fixture has no stash to branch from".into();
+            return;
+        }
+        self.open_prompt(Prompt::StashBranch {
+            at,
+            field: Field::new(),
+        });
+    }
+
+    /// The stash entry a field is about to be opened over, with the two
+    /// refusals a wrong press earns said here: the pane the keyboard is on,
+    /// and a row to aim at. Both before any field exists, because a field
+    /// that opens over nothing is a question nobody can answer.
+    fn focused_stash(&mut self) -> Option<StashId> {
+        if !matches!(self.panes.focused(), Some(Screens::Stashes { .. })) {
+            self.message = "the keyboard is not on a stash".into();
+            return None;
+        }
+        let id = match self.panes.focused() {
+            Some(Screens::Stashes { view, .. }) => view.current_id(),
+            _ => None,
+        };
+        if id.is_none() {
+            self.message = "nothing selected on the stash stack".into();
+        }
+        id
     }
 
     /// `files.stage`: act on the row the keyboard is on, by the side of the
@@ -5873,6 +6017,17 @@ fn tui_availability(repo: bool, operation: Option<&Operation>) -> Availability {
                 "files.reset-upstream-mixed",
                 "files.reset-upstream-hard",
                 "files.nuke",
+                // The stash choices and the two verbs on the stack that open
+                // a field. All of them need a repository — a fixture has no
+                // working tree to park and no stack to rename on.
+                "files.stash-menu",
+                "files.stash-named",
+                "files.stash-staged",
+                "files.stash-unstaged",
+                "files.stash-untracked",
+                "files.stash-file",
+                "stashes.rename",
+                "stashes.new-branch",
             ]);
         }
         false => {
@@ -5970,6 +6125,21 @@ fn tui_availability(repo: bool, operation: Option<&Operation>) -> Availability {
                 "a fixture has no repository to reset",
             );
             a.disabled("files.nuke", "a fixture has no working tree to nuke");
+            for name in [
+                "files.stash-menu",
+                "files.stash-named",
+                "files.stash-staged",
+                "files.stash-unstaged",
+                "files.stash-untracked",
+                "files.stash-file",
+            ] {
+                a.disabled(name, "a fixture has no working tree to park");
+            }
+            a.disabled("stashes.rename", "a fixture has no stash to rename");
+            a.disabled(
+                "stashes.new-branch",
+                "a fixture has no stash to branch from",
+            );
             a.disabled(
                 "merge.take-side",
                 "a fixture has no repository to resolve in",
@@ -6180,6 +6350,22 @@ impl gitten_app::act::FileClient for App {
             Some(Screens::Files { view, .. }) => {
                 view.confirm_or_arm_discard(view_file_section(target.section), &target.path)
             }
+            _ => false,
+        }
+    }
+}
+
+impl gitten_app::act::StashClient for App {
+    fn selected_stash(&self) -> Option<StashId> {
+        let Some(Screens::Stashes { view, .. }) = self.panes.focused() else {
+            return None;
+        };
+        view.current_id()
+    }
+
+    fn confirm_or_arm_stash(&mut self, id: &StashId) -> bool {
+        match self.panes.focused_mut() {
+            Some(Screens::Stashes { view, .. }) => view.confirm_or_arm_drop(id),
             _ => false,
         }
     }
@@ -7356,7 +7542,7 @@ mod staging {
     use super::*;
     use gitten_core::command::Code;
     use gitten_core::parse_unified_diff;
-    use gitten_core::refs::{Branch, HeadState, RefName, RemoteBranch, Stash};
+    use gitten_core::refs::{Branch, HeadState, RefName, RemoteBranch, Stash, StashId};
     use gitten_core::status::{
         Change, ConflictEntry, ConflictKind, Kind, PathBytes, StagedEntry, Status, Submodule,
         UnstagedEntry, UntrackedEntry,
@@ -7600,6 +7786,17 @@ diff --git a/tracked.txt b/tracked.txt
                 Some(e) => Err(e),
                 None => Ok(()),
             }
+        }
+
+        /// The stash resolution the binary-backed implementation does:
+        /// the entry's commit against the stack as it stands right now,
+        /// refusing when it is gone or doubled. Mirrored here so a key test
+        /// exercises the identity rule rather than a fake's shortcut — and
+        /// the lock is taken and released before the write that follows
+        /// takes it again.
+        fn stash_position(&self, id: &StashId) -> gitten_git::Result<usize> {
+            let stack = self.0.lock().unwrap().stashes.clone();
+            id.resolve(&stack).position()
         }
     }
 
@@ -8060,6 +8257,14 @@ diff --git a/tracked.txt b/tracked.txt
         }
 
         fn stash_push(&self, message: Option<&str>) -> gitten_git::Result<usize> {
+            self.stash_push_scoped(message, &StashScope::Tracked)
+        }
+
+        fn stash_push_scoped(
+            &self,
+            message: Option<&str>,
+            scope: &StashScope,
+        ) -> gitten_git::Result<usize> {
             let mut s = self.0.lock().unwrap();
             if let Some(e) = s.refuse_stash.clone() {
                 return Err(e);
@@ -8075,13 +8280,101 @@ diff --git a/tracked.txt b/tracked.txt
                 0,
                 Stash {
                     index: 0,
-                    message: "WIP on fake (main)".into(),
+                    message: match message {
+                        Some(m) => format!("On fake: {m}"),
+                        None => "WIP on fake (main)".into(),
+                    },
                     commit: landed,
                 },
             );
-            s.stash_writes
-                .push(format!("push {}", message.unwrap_or("")));
+            // The flags travel so a test can assert git would have been
+            // handed the scope it was asked for — the one thing a fake can
+            // say about a variant it does not implement.
+            s.stash_writes.push(format!(
+                "push{} {}",
+                match scope.flags().is_empty() {
+                    true => String::new(),
+                    false => format!(" [{}]", scope.flags().join(" ")),
+                },
+                match scope.path() {
+                    Some(path) => format!("-- {path}"),
+                    None => message.unwrap_or("").to_string(),
+                }
+            ));
             Ok(0)
+        }
+
+        /// The resolution the binary-backed implementation does, mirrored so
+        /// a key test exercises the identity semantics rather than a fake's
+        /// shortcut: the commit against the live stack, refusing when it is
+        /// gone or doubled.
+        fn stash_apply_id(&self, id: &StashId) -> gitten_git::Result<()> {
+            let at = self.stash_position(id)?;
+            self.stash_apply(at)
+        }
+
+        fn stash_pop_id(&self, id: &StashId) -> gitten_git::Result<()> {
+            let at = self.stash_position(id)?;
+            self.stash_pop(at)
+        }
+
+        fn stash_drop_id(&self, id: &StashId) -> gitten_git::Result<()> {
+            let at = self.stash_position(id)?;
+            self.stash_drop(at)
+        }
+
+        fn stash_rename(&self, id: &StashId, message: &str) -> gitten_git::Result<()> {
+            if message.trim().is_empty() {
+                return Err("a stash needs a message".into());
+            }
+            let at = self.stash_position(id)?;
+            let mut s = self.0.lock().unwrap();
+            if let Some(e) = s.refuse_stash.clone() {
+                return Err(e);
+            }
+            s.stash_writes
+                .push(format!("rename stash@{{{at}}} {message}"));
+            // git's shape: the stash reflog only appends, so the entry is
+            // stored under the new message on top and the old one dropped.
+            let mut moved = s.stashes.remove(at);
+            moved.message = message.to_string();
+            s.stashes.insert(0, moved);
+            for (i, entry) in s.stashes.iter_mut().enumerate() {
+                entry.index = i;
+            }
+            Ok(())
+        }
+
+        fn stash_branch(&self, id: &StashId, name: &[u8]) -> gitten_git::Result<()> {
+            let at = self.stash_position(id)?;
+            let mut s = self.0.lock().unwrap();
+            if let Some(e) = s.refuse_stash.clone() {
+                return Err(e);
+            }
+            s.stash_writes.push(format!(
+                "branch {} from stash@{{{at}}}",
+                String::from_utf8_lossy(name)
+            ));
+            // git's shape again: the branch is checked out, and the entry is
+            // dropped because the apply was clean.
+            for b in &mut s.locals {
+                b.head = false;
+            }
+            s.locals.push(Branch {
+                name: RefName::from_bytes(name),
+                commit: "f00d".into(),
+                upstream: None,
+                head: true,
+            });
+            s.head = Some(HeadState::Branch {
+                name: RefName::from_bytes(name),
+                commit: Some("f00d".into()),
+            });
+            s.stashes.remove(at);
+            for (i, entry) in s.stashes.iter_mut().enumerate() {
+                entry.index = i;
+            }
+            Ok(())
         }
 
         fn stash_apply(&self, index: usize) -> gitten_git::Result<()> {
@@ -13702,7 +13995,7 @@ diff --git a/tracked.txt b/tracked.txt
             // disabled one says its reason where its description was.
             for mode in [
                 "global", "files", "branches", "commits", "stashes", "diff", "help", "input",
-                "settings", "reset", "upstream", "todo", "panes",
+                "settings", "reset", "upstream", "stash", "todo", "panes",
             ] {
                 let mut modes = Modes::new();
                 if mode != "global" {
@@ -14487,7 +14780,7 @@ diff --git a/tracked.txt b/tracked.txt
         assert_eq!(
             app.panes.get("stashes").and_then(|pane| match pane {
                 Screens::Stashes { view, .. } => {
-                    view.current_entry().map(|(_, commit)| commit)
+                    view.current_id().map(|id| id.commit)
                 }
                 _ => None,
             }),

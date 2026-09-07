@@ -305,6 +305,22 @@ pub fn stash_working_tree(client: &mut impl Client) {
     }
 }
 
+/// `files.stash-menu`: the question, not the write. The choices stay the
+/// client's own mode; this is the sentence, and the one refusal a fixture
+/// earns before a menu of verbs it cannot run goes up.
+pub fn stash_menu(client: &mut impl Client) -> bool {
+    if client.repo().is_none() {
+        client.say("a fixture has no working tree to park".into());
+        return false;
+    }
+    client.ask(
+        "park what? m names a message, s the staged side, u the unstaged side, \
+         U the new files too, f this file alone"
+            .into(),
+    );
+    true
+}
+
 /// The scoped pushes: `files.stash-named`, `-staged`, `-unstaged`,
 /// `-untracked` and `-file`, all of them one [`StashScope`] apart.
 ///

@@ -424,6 +424,18 @@ impl Keymap {
         // lazygit's shift-stash: park what the working tree holds and start
         // again from HEAD.
         bind("files", "s", "files.stash");
+        // lazygit's capital beside it: the stash *choices*, behind a menu of
+        // their own for the reason the reset menu is — `m`, `u` and `f` all
+        // mean something somewhere else, and a question's mode borrows them
+        // only while it stands. `s` inside it is the staged side, which is
+        // the same letter the pane's own `s` uses for the whole tree: the
+        // menu is the qualifier.
+        bind("files", "S", "files.stash-menu");
+        bind("stash", "m", "files.stash-named");
+        bind("stash", "s", "files.stash-staged");
+        bind("stash", "u", "files.stash-unstaged");
+        bind("stash", "U", "files.stash-untracked");
+        bind("stash", "f", "files.stash-file");
         // lazygit's files-panel reset menu, on its own `g`: the strengths
         // aim at the *upstream* rather than at a row, and the nuke throws
         // the working tree away. It shadows the global `view.top` inside
@@ -488,6 +500,11 @@ impl Keymap {
         // Enter previews the entry's diff — the parked work, seen before
         // anything is applied to the working tree.
         bind("stashes", "enter", "stashes.open-diff");
+        // lazygit's other two on this pane: r renames the entry, n starts a
+        // branch where it was made. Both open a field, so neither writes on
+        // the press that opens it.
+        bind("stashes", "r", "stashes.rename");
+        bind("stashes", "n", "stashes.new-branch");
 
         // The remotes panel's verbs, on lazygit's keys: f fetches the
         // selected remote's tracking branches, n introduces one (two
@@ -1759,6 +1776,36 @@ impl Commands {
                 Some("stash"),
             ),
             (
+                "files.stash-menu",
+                "choose which part of the working tree to park",
+                Some("stash…"),
+            ),
+            (
+                "files.stash-named",
+                "park the working tree's changes under a message you type",
+                Some("stash named"),
+            ),
+            (
+                "files.stash-staged",
+                "park what the index holds, leaving the unstaged work standing",
+                Some("stash staged"),
+            ),
+            (
+                "files.stash-unstaged",
+                "park the unstaged work, leaving the index as it is",
+                Some("stash unstaged"),
+            ),
+            (
+                "files.stash-untracked",
+                "park the working tree's changes and its new files too",
+                Some("stash untracked"),
+            ),
+            (
+                "files.stash-file",
+                "park the selected file alone, leaving every other path",
+                Some("stash file"),
+            ),
+            (
                 "stashes.apply",
                 "apply this stash, keeping it",
                 Some("apply"),
@@ -1774,6 +1821,16 @@ impl Commands {
                 "stashes.open-diff",
                 "show the diff pane, loaded with this stash's changes",
                 Some("diff"),
+            ),
+            (
+                "stashes.rename",
+                "give this stash a new message — it moves to the top of the stack",
+                Some("rename"),
+            ),
+            (
+                "stashes.new-branch",
+                "start a branch where this stash was made and apply it there",
+                Some("branch"),
             ),
             (
                 "repo.push",
