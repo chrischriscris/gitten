@@ -242,6 +242,39 @@ impl Write {
         .announcing(format!("picked {shown}"))
     }
 
+    /// Replays every copied commit onto the current branch, in the order
+    /// the clipboard arranged them — one `git cherry-pick` over the whole
+    /// slice, so a conflict stops the sequence where git stopped it and the
+    /// remainder stands for [`Write::cherry_pick_abort`] or
+    /// [`Write::cherry_pick_continue`] to carry. Nothing existing moves, so
+    /// no confirmation precedes it; the clipboard survives the paste, since
+    /// the same set is often wanted on a second branch.
+    pub fn cherry_pick_range(repo: &Handle, shas: Vec<Vec<u8>>) -> Self {
+        // The band counts rather than lists: a dozen shas is not a sentence,
+        // and the pane the picks land in shows them by name a frame later.
+        let n = shas.len();
+        let shown = if n == 1 {
+            String::from_utf8_lossy(&shas[0]).into_owned()
+        } else {
+            format!("{n} commits")
+        };
+        Self::named(format!("cherry-pick {shown}"), repo, move |r| {
+            r.cherry_pick_range(&shas)
+        })
+        .announcing(format!("picked {shown}"))
+    }
+
+    /// Hands HEAD's authorship to the current user and moves nothing else —
+    /// the tree and the message stand byte-still. A rewrite all the same, so
+    /// the caller confirms before this job is ever built; and HEAD only,
+    /// because a deeper commit's author is a rebase.
+    pub fn reset_author(repo: &Handle) -> Self {
+        Self::named("reset author".into(), repo, |r| r.reset_author())
+            // The new sha lands in a pane the key may not be over — the
+            // author key lives on the commits list, the band is everywhere.
+            .announcing("reset HEAD's author")
+    }
+
     /// Abandons an in-progress cherry-pick and puts branch, index and
     /// working tree back where the pick started — git's own guarantee.
     /// Nothing here to confirm: it only ever runs after a refusal named the

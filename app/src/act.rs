@@ -9,6 +9,7 @@
 
 use crate::jobs::Job;
 use crate::verbs::Write;
+use gitten_core::clipboard::CherryClipboard;
 use gitten_core::operation::{Operation, Side};
 use gitten_core::rebase::{compose, Rewrite};
 use gitten_core::refs::{ResetMode, Target};
@@ -409,6 +410,24 @@ pub trait HistoryClient: Client {
     /// the pane cannot offer one: a filtered list, an empty list, a
     /// fixture with no history at all.
     fn history_window(&self) -> Option<(&[Commit], usize)>;
+    /// The cherry-pick clipboard the client keeps across presses. Held by
+    /// the client rather than built here because the same clipboard has to
+    /// outlive every action and be drawn beside the rows it holds — the
+    /// *order* in it is [`CherryClipboard`]'s, which is what makes a paste
+    /// mean the same thing in every frontend.
+    fn clipboard(&mut self) -> &mut CherryClipboard;
+    /// HEAD's own commit, when there is one. `None` on an unborn branch and
+    /// without a repository. What `commits.reset-author` measures its target
+    /// against: the newest row of the *loaded window* is not HEAD when the
+    /// pane is drilled into another branch's log, so the question is asked
+    /// of HEAD directly rather than inferred from a row's position.
+    fn head_sha(&self) -> Option<Vec<u8>>;
+    /// The marked range of commit rows, newest first as a commits list
+    /// reads. `None` when nothing is marked — the honest default for a
+    /// client with no range marking, whose copy then takes the row alone.
+    fn commit_range(&self) -> Option<Vec<SelectedCommit>> {
+        None
+    }
 }
 
 /// The guard every history rewrite shares: a repository to write in, and no
@@ -558,6 +577,128 @@ pub fn rewrite_commit(client: &mut impl HistoryClient, command: &str, kind: Rewr
     let job = Write::rebase_todo(&repo, upstream, script);
     if !client.submit(Box::new(job)) {
         client.say("the job queue is shutting down".into());
+    }
+}
+
+/// `commits.copy`: puts the marked range — or the row alone when nothing is
+/// marked — onto the cherry-pick clipboard. Pure state, no write, so no
+/// confirmation and no operation gate: a copy under a standing merge is
+/// harmless, and the paste that is not says so itself. A repository is
+/// still required, because a clipboard filled against a fixture could
+/// never be pasted anywhere.
+pub fn copy_commits(client: &mut impl HistoryClient) {
+    let shas: Vec<Vec<u8>> = match client.commit_range() {
+        Some(range) if !range.is_empty() => range.into_iter().map(|c| c.sha).collect(),
+        _ => match client.commit_target() {
+            Some(target) => vec![target.sha],
+            None => {
+                client.say("nothing selected to copy".into());
+                return;
+            }
+        },
+    };
+    if client.repo().is_none() {
+        client.say("a fixture has no repository to cherry-pick from".into());
+        return;
+    }
+    let added = client.clipboard().copy_newest_first(&shas);
+    let held = client.clipboard().len();
+    // A second press on the same rows is not a failure and not a silence:
+    // the clipboard is unchanged and the count says what is still on it.
+    if added == 0 {
+        client.say(format!(
+            "already copied — {held} commit{} on the clipboard",
+            plural(held)
+        ));
+    } else {
+        client.say(format!(
+            "copied {added} commit{} — {held} on the clipboard",
+            plural(added)
+        ));
+    }
+}
+
+/// `commits.paste`: replays every copied commit onto the current branch, in
+/// the order copied. Nothing existing moves, so nothing is confirmed; the
+/// clipboard survives the paste, because the same set is often wanted on a
+/// second branch and only an explicit clear takes it away.
+pub fn paste_commits(client: &mut impl HistoryClient) {
+    const COMMAND: &str = "commits.paste";
+    if client.clipboard().is_empty() {
+        client.say("nothing copied to cherry-pick — copy commits first".into());
+        return;
+    }
+    let Some(repo) = history_repo(client, COMMAND) else {
+        return;
+    };
+    let shas = client.clipboard().ordered().to_vec();
+    let job = Write::cherry_pick_range(&repo, shas);
+    if !client.submit(Box::new(job)) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+/// `commits.clear-copies`: empties the clipboard. Worth a sentence either
+/// way — a clear that says nothing leaves a reader unsure whether the copy
+/// ever landed.
+pub fn clear_copies(client: &mut impl HistoryClient) {
+    let held = client.clipboard().len();
+    if held == 0 {
+        client.say("the cherry-pick clipboard is already empty".into());
+        return;
+    }
+    client.clipboard().clear();
+    client.say(format!("cleared {held} copied commit{}", plural(held)));
+}
+
+/// `commits.reset-author`: hands HEAD's authorship to the current user and
+/// moves nothing else. HEAD only, measured against HEAD's own sha rather
+/// than the newest row — a drilled-into branch log's first row is somebody
+/// else's tip — and a deeper commit refuses by name, because re-authoring
+/// one is a rebase and that UI is a later slice. A rewrite all the same, so
+/// it asks twice, armed on (command, commit) like every other one here.
+pub fn reset_commit_author(client: &mut impl HistoryClient) {
+    const COMMAND: &str = "commits.reset-author";
+    let Some(target) = client.commit_target() else {
+        client.say("nothing selected to re-author".into());
+        return;
+    };
+    let Some(repo) = history_repo(client, COMMAND) else {
+        return;
+    };
+    match client.head_sha() {
+        Some(head) if head == target.sha => {}
+        Some(_) => {
+            client.say(format!(
+                "only HEAD's author resets here — {} is deeper history, which is a rebase",
+                target.short
+            ));
+            return;
+        }
+        None => {
+            client.say("there is no HEAD commit to re-author".into());
+            return;
+        }
+    }
+    if !client.confirm_or_arm_commit(COMMAND, &target) {
+        client.ask(format!(
+            "reset the author of {} to you? press again to confirm",
+            target.short
+        ));
+        return;
+    }
+    let job = Write::reset_author(&repo);
+    if !client.submit(Box::new(job)) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+/// `s` or nothing, for a count the reader is about to read as a noun.
+fn plural(n: usize) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
     }
 }
 

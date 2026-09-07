@@ -305,6 +305,14 @@ impl Commits {
         self.commits.get(*self.visible.get(self.view.cursor())?)
     }
 
+    /// The commit a *visible* row holds — what a marked range resolves
+    /// through, since the range is rows and a paste needs shas. Out of
+    /// range answers `None`; under a filter the visible table is what the
+    /// eye marked, so this is the only honest way from one to the other.
+    pub fn at(&self, row: usize) -> Option<&Commit> {
+        self.commits.get(*self.visible.get(row)?)
+    }
+
     /// The whole loaded window, newest first, and the source index of
     /// the cursor — what a history rewrite composes its plan over.
     /// `None` under a query or past the list's end: a filtered list is

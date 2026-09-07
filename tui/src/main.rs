@@ -1393,6 +1393,11 @@ struct App {
     /// keys on it, and shared policy (`act`) reads it instead of asking the
     /// repository a second time. Refreshed wherever the panes are.
     operation: Option<Operation>,
+    /// The commits kept for `commits.paste`, as full shas in paste order.
+    /// Outlives every press and every refresh, because a copy made before a
+    /// branch switch is exactly the copy a paste onto the new branch wants;
+    /// only `commits.clear-copies` empties it.
+    clipboard: gitten_core::clipboard::CherryClipboard,
     /// The armed (command, commit) a destructive history verb asked about —
     /// spent only by the same command naming the same commit, which is what
     /// keeps a soft reset from ever spending a hard one's question. `None`
@@ -1669,6 +1674,7 @@ impl App {
             repo,
             availability: tui_availability(startup_pending, None),
             operation: None,
+            clipboard: gitten_core::clipboard::CherryClipboard::new(),
             history_arm: None,
             panes,
             layout: Box::new(panes::BuiltinLayout),
@@ -3731,6 +3737,31 @@ impl App {
                     gitten_app::act::checkout_commit(self);
                 }
             }
+            // The cherry-pick clipboard. A copy takes the marked range when
+            // one stands and the row alone when none does; a paste replays
+            // the whole clipboard in copy order and leaves it standing, so
+            // the same set reaches a second branch; the clear is the only
+            // thing that empties it. `a` re-authors HEAD and nothing older.
+            "commits.copy" => {
+                if self.commits_focused("commits.copy") {
+                    gitten_app::act::copy_commits(self);
+                }
+            }
+            "commits.paste" => {
+                if self.commits_focused("commits.paste") {
+                    gitten_app::act::paste_commits(self);
+                }
+            }
+            "commits.clear-copies" => {
+                if self.commits_focused("commits.clear-copies") {
+                    gitten_app::act::clear_copies(self);
+                }
+            }
+            "commits.reset-author" => {
+                if self.commits_focused("commits.reset-author") {
+                    gitten_app::act::reset_commit_author(self);
+                }
+            }
             // The merge verbs: the local branch the keyboard is on, brought
             // into the branch HEAD sits on. A remote row says so and stops —
             // merging a tracking ref is a checkout question first — and the
@@ -5282,6 +5313,10 @@ fn tui_availability(repo: bool, operation: Option<&Operation>) -> Availability {
         "commits.revert",
         "commits.cherry-pick",
         "commits.checkout",
+        "commits.copy",
+        "commits.paste",
+        "commits.clear-copies",
+        "commits.reset-author",
         "remotes.focus",
         "remotes.fetch",
         "remotes.new",
@@ -5386,6 +5421,22 @@ fn tui_availability(repo: bool, operation: Option<&Operation>) -> Availability {
             a.disabled(
                 "commits.checkout",
                 "a fixture has no repository to check out in",
+            );
+            a.disabled(
+                "commits.copy",
+                "a fixture has no repository to cherry-pick from",
+            );
+            a.disabled(
+                "commits.paste",
+                "a fixture has no repository to cherry-pick into",
+            );
+            a.disabled(
+                "commits.clear-copies",
+                "a fixture has no repository to cherry-pick from",
+            );
+            a.disabled(
+                "commits.reset-author",
+                "a fixture has no repository to rewrite in",
             );
             a.disabled(
                 "merge.take-side",
@@ -5610,6 +5661,41 @@ impl gitten_app::act::HistoryClient for App {
             return None;
         };
         view.history_window()
+    }
+
+    fn clipboard(&mut self) -> &mut gitten_core::clipboard::CherryClipboard {
+        &mut self.clipboard
+    }
+
+    fn head_sha(&self) -> Option<Vec<u8>> {
+        // Asked of the repository rather than read off the newest row: the
+        // pane may be drilled into another branch's log, whose first row is
+        // somebody else's tip. An unborn branch answers `None`.
+        let (_, repo) = self.repo.as_ref()?;
+        match repo.head() {
+            Ok(HeadState::Branch {
+                commit: Some(sha), ..
+            })
+            | Ok(HeadState::Detached { commit: sha }) => Some(sha.into_bytes()),
+            _ => None,
+        }
+    }
+
+    fn commit_range(&self) -> Option<Vec<gitten_app::act::SelectedCommit>> {
+        // lazygit's `v` range, resolved to commits here: the pane holds it
+        // as visible-table rows, and rows are not what a paste can name.
+        let Some(Screens::Commits { view, .. }) = self.panes.focused() else {
+            return None;
+        };
+        let (lo, hi) = view.marks()?;
+        let picked: Vec<_> = (lo..=hi)
+            .filter_map(|row| view.at(row))
+            .map(|commit| gitten_app::act::SelectedCommit {
+                sha: commit.sha.as_bytes().to_vec(),
+                short: commit.short.clone(),
+            })
+            .collect();
+        (!picked.is_empty()).then_some(picked)
     }
 
     fn confirm_or_arm_commit(
@@ -7170,6 +7256,24 @@ diff --git a/tracked.txt b/tracked.txt
             let mut s = self.0.lock().unwrap();
             s.writes
                 .push(format!("cherry-pick {}", String::from_utf8_lossy(sha)));
+            Ok(())
+        }
+
+        fn cherry_pick_range(&self, shas: &[Vec<u8>]) -> gitten_git::Result<()> {
+            // Recorded as one line with the order intact: the order is the
+            // whole contract of a paste, so a test that could not see it
+            // could not hold it.
+            let mut s = self.0.lock().unwrap();
+            let shown: Vec<_> = shas
+                .iter()
+                .map(|sha| String::from_utf8_lossy(sha).into_owned())
+                .collect();
+            s.writes.push(format!("cherry-pick {}", shown.join(" ")));
+            Ok(())
+        }
+
+        fn reset_author(&self) -> gitten_git::Result<()> {
+            self.0.lock().unwrap().writes.push("reset-author".into());
             Ok(())
         }
 
