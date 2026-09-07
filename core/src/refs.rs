@@ -415,14 +415,21 @@ pub struct Remote {
 ///
 /// Annotated tags point at a tag *object* which points at a commit; this is
 /// the commit either way, because that is what showing a tag in history
-/// means. Whether the tag carried a message of its own is deliberately not
-/// modelled — no panel has asked yet.
+/// means. Whether the tag is annotated and the subject line it carries
+/// are modelled beside the commit, because the tags panel shows both —
+/// a tag without a message is lightweight, and deletion asks the same
+/// question either way.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tag {
     /// The tag name, relative to `refs/tags`.
     pub name: RefName,
     /// The commit it ultimately names, full object id.
     pub commit: String,
+    /// Whether git stored a tag object (`-a`), rather than a bare ref.
+    pub annotated: bool,
+    /// The tag message's subject line, decoded lossily for display — `None`
+    /// for lightweight tags, which carry no message at all.
+    pub subject: Option<String>,
 }
 
 // --------------------------------------------------------------------- reflog
@@ -440,6 +447,78 @@ pub struct ReflogEntry {
     pub selector: String,
     /// What moved HEAD — `commit: …`, `checkout: …`, `rebase …`.
     pub message: String,
+}
+
+// ------------------------------------------------------------------ undo/redo
+
+/// The reflog message our own undo writes through `update-ref -m`, so a
+/// later redo can tell our walk-back from the reader's own terminal resets.
+/// A reader's `git reset --soft` in another window reads `reset: moving
+/// to …`; only this exact sentence arms the redo.
+pub const UNDO_MESSAGE: &str = "gitten: undo";
+
+/// The reflog message our own redo writes, for the same reason in reverse:
+/// an undo offered after a redo must see the redo's sentence and stop,
+/// rather than walking the same two entries forever.
+pub const REDO_MESSAGE: &str = "gitten: redo";
+
+/// The last HEAD move, and how to walk it back.
+///
+/// A checkout is walked back by checking out where it came from — a branch
+/// name or a sha, whatever the message names. Every other move (commit,
+/// amend, reset, merge, rebase finish, cherry-pick, revert) left HEAD on
+/// the same ref it started on, so walking back is pointing that ref at the
+/// earlier entry — `update-ref`, never a reset flag, so the index and the
+/// working tree are exactly where the reader left them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UndoKind {
+    /// Check out where the last move came from.
+    Checkout { from: String },
+    /// Point HEAD's ref at the earlier entry's selector, e.g. `HEAD@{1}`.
+    Move { selector: String },
+}
+
+/// Classifies the step from `before` (`HEAD@{1}`) to `after` (`HEAD@{0}`),
+/// or `None` when there is nothing to walk back: the two entries name the
+/// same commit, so the move was a no-op in terms of position (a reset onto
+/// itself) and walking back would append a reflog entry that says nothing.
+/// Abbreviated shas compare as strings because git's abbreviations are
+/// unique prefixes — equal text is the same object.
+pub fn undo_for(before: &ReflogEntry, after: &ReflogEntry) -> Option<UndoKind> {
+    const PREFIX: &str = "checkout: moving from ";
+    if before.commit == after.commit {
+        return None;
+    }
+    if let Some(rest) = after.message.strip_prefix(PREFIX) {
+        // `moving from X to Y`: the target is everything before ` to `.
+        // A branch name never contains it; a sha never does either.
+        let from = rest.split(" to ").next().unwrap_or(rest);
+        return Some(UndoKind::Checkout {
+            from: from.to_string(),
+        });
+    }
+    Some(UndoKind::Move {
+        selector: before.selector.clone(),
+    })
+}
+
+/// The selector a redo should walk forward to, or `None` when redo is not
+/// armed: the newest entry is not our own undo, or HEAD has moved since —
+/// a commit, a checkout, anything — so the forward step no longer names
+/// where the undo came from. `head_sha` is HEAD's full sha; the entry's
+/// abbreviated commit must prefix it, the same unique-prefix comparison
+/// [`undo_for`] relies on.
+pub fn redo_selector(entries: &[ReflogEntry], head_sha: &str) -> Option<String> {
+    let [after, before] = entries else {
+        return None;
+    };
+    if after.message != UNDO_MESSAGE {
+        return None;
+    }
+    if !head_sha.starts_with(after.commit.as_str()) {
+        return None;
+    }
+    Some(before.selector.clone())
 }
 
 #[cfg(test)]
@@ -468,6 +547,97 @@ mod tests {
                 commit: None,
             }
         );
+    }
+
+    fn reflog(commit: &str, selector: &str, message: &str) -> ReflogEntry {
+        ReflogEntry {
+            commit: commit.into(),
+            selector: selector.into(),
+            message: message.into(),
+        }
+    }
+
+    #[test]
+    fn a_commit_is_walked_back_by_pointing_at_the_earlier_entry() {
+        let before = reflog("aaa111", "HEAD@{1}", "commit: second");
+        let after = reflog("bbb222", "HEAD@{0}", "commit: third");
+        assert_eq!(
+            undo_for(&before, &after),
+            Some(UndoKind::Move {
+                selector: "HEAD@{1}".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_checkout_is_walked_back_by_checking_out_where_it_came_from() {
+        let before = reflog("aaa111", "HEAD@{1}", "commit: on main");
+        let after = reflog(
+            "bbb222",
+            "HEAD@{0}",
+            "checkout: moving from main to feature",
+        );
+        assert_eq!(
+            undo_for(&before, &after),
+            Some(UndoKind::Checkout {
+                from: "main".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_checkout_from_a_detached_sha_walks_back_to_the_sha() {
+        let before = reflog("aaa111", "HEAD@{1}", "commit: on main");
+        let after = reflog(
+            "bbb222",
+            "HEAD@{0}",
+            "checkout: moving from aaa111b to main",
+        );
+        assert_eq!(
+            undo_for(&before, &after),
+            Some(UndoKind::Checkout {
+                from: "aaa111b".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_move_onto_itself_has_nothing_to_walk_back() {
+        let entry = reflog("aaa111", "HEAD@{1}", "reset: moving to aaa111");
+        let same = reflog("aaa111", "HEAD@{0}", "reset: moving to aaa111");
+        assert_eq!(undo_for(&entry, &same), None);
+    }
+
+    #[test]
+    fn redo_arms_only_behind_our_own_undo_on_an_unmoved_head() {
+        let undo = reflog("aaa111", "HEAD@{0}", "gitten: undo");
+        let before = reflog("bbb222", "HEAD@{1}", "commit: third");
+        assert_eq!(
+            redo_selector(&[undo.clone(), before.clone()], "aaa1119999"),
+            Some("HEAD@{1}".into())
+        );
+        // Somebody else's reset is not our undo.
+        let foreign = reflog("aaa111", "HEAD@{0}", "reset: moving to aaa111");
+        assert_eq!(
+            redo_selector(&[foreign, before.clone()], "aaa1119999"),
+            None
+        );
+        // HEAD moved on: the forward step no longer names where we came from.
+        assert_eq!(
+            redo_selector(&[undo.clone(), before.clone()], "ccc333"),
+            None
+        );
+        // A redo's own sentence stops the walk instead of looping it.
+        let redo = reflog("bbb222", "HEAD@{0}", "gitten: redo");
+        let older = reflog("aaa111", "HEAD@{1}", "gitten: undo");
+        assert_eq!(redo_selector(&[redo, older], "bbb2220000"), None);
+    }
+
+    #[test]
+    fn redo_needs_two_entries() {
+        let undo = reflog("aaa111", "HEAD@{0}", "gitten: undo");
+        assert_eq!(redo_selector(&[undo], "aaa1119999"), None);
+        assert_eq!(redo_selector(&[], "aaa1119999"), None);
     }
 
     fn stack(commits: &[&str]) -> Vec<Stash> {

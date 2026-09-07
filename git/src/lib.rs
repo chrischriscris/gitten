@@ -1825,7 +1825,7 @@ impl Repo for Binary {
             &self.root,
             &[
                 "for-each-ref",
-                "--format=%(refname)%00%(*objectname)%00%(objectname)",
+                "--format=%(refname)%00%(*objectname)%00%(objectname)%00%(objecttype)%00%(contents:subject)",
                 "refs/tags",
             ],
         )?;
@@ -4279,12 +4279,16 @@ fn parse_tags(raw: &[u8]) -> Vec<Tag> {
             continue;
         }
         let f: Vec<&[u8]> = line.split(|b| *b == 0).collect();
-        let [refname, peeled, object] = f[..] else {
+        let [refname, peeled, object, kind, subject] = f[..] else {
             continue;
         };
         out.push(Tag {
             name: PathBytes::from_bytes(short(refname, TAGS_PREFIX)),
             commit: lossy(if peeled.is_empty() { object } else { peeled }),
+            annotated: kind == b"tag",
+            // `contents:subject` on a lightweight tag is the *commit's*
+            // subject, not a tag message — only an annotated tag carries one.
+            subject: (kind == b"tag" && !subject.is_empty()).then(|| lossy(subject)),
         });
     }
     out
@@ -7523,6 +7527,14 @@ mod tests {
         assert_eq!(
             v2.commit, head,
             "annotated: peeled past the tag object git created for it"
+        );
+        assert!(!v1.annotated, "bare ref is lightweight");
+        assert_eq!(v1.subject, None, "a lightweight tag carries no message");
+        assert!(v2.annotated, "a -a tag stored a tag object");
+        assert_eq!(
+            v2.subject.as_deref(),
+            Some("release two"),
+            "the panel shows the subject, not the whole message"
         );
     }
 
