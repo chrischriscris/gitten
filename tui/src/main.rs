@@ -71,6 +71,7 @@ use gitten_tui::stashes::Stashes;
 use gitten_tui::tags::Tags;
 use gitten_tui::term::{Input, Mouse, MouseKind, Term};
 use gitten_tui::todo::Todo;
+use gitten_tui::worktrees::Worktrees;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -378,6 +379,15 @@ enum Screens {
         label: String,
         generation: Generation,
     },
+    /// The repository's worktrees. No source, like the reflog tenant: a
+    /// refresh is a plain re-read of `worktree list` through the handle
+    /// the app holds, and the generation rail is the whole of its
+    /// staleness story.
+    Worktrees {
+        view: Worktrees,
+        label: String,
+        generation: Generation,
+    },
 }
 
 /// What an empty diff pane's header says instead of a sha it does not have.
@@ -583,6 +593,27 @@ enum Prompt {
         at: StashId,
         field: Field,
     },
+    /// `worktrees.new`'s first field: the starting point — a branch, a
+    /// commit, any revspec — empty for HEAD. Accepting opens the path
+    /// field with this riding along.
+    WorktreeBase {
+        field: Field,
+    },
+    /// `worktrees.new`'s second field and the `w` door's only one: where
+    /// the checkout lands. `base` is the row's rev or the first field's
+    /// answer, captured at open and never re-read from the pane.
+    WorktreePath {
+        base: Vec<u8>,
+        field: Field,
+    },
+    /// `commits.bisect-start`'s field: a revision the bug is not in.
+    /// `bad` is the selected commit's sha, captured when the field
+    /// opened, so nothing a cursor does while the field holds the
+    /// keyboard can re-aim the question.
+    BisectGood {
+        bad: Vec<u8>,
+        field: Field,
+    },
 }
 
 impl Prompt {
@@ -610,7 +641,10 @@ impl Prompt {
             | Prompt::TodoReword { field }
             | Prompt::StashMessage { field }
             | Prompt::StashRename { field, .. }
-            | Prompt::StashBranch { field, .. } => field,
+            | Prompt::StashBranch { field, .. }
+            | Prompt::WorktreeBase { field }
+            | Prompt::WorktreePath { field, .. }
+            | Prompt::BisectGood { field, .. } => field,
         }
     }
 
@@ -637,7 +671,10 @@ impl Prompt {
             | Prompt::TodoReword { field }
             | Prompt::StashMessage { field }
             | Prompt::StashRename { field, .. }
-            | Prompt::StashBranch { field, .. } => field,
+            | Prompt::StashBranch { field, .. }
+            | Prompt::WorktreeBase { field }
+            | Prompt::WorktreePath { field, .. }
+            | Prompt::BisectGood { field, .. } => field,
         }
     }
 
@@ -701,6 +738,9 @@ impl Prompt {
             Prompt::StashMessage { .. } => "stash: ",
             Prompt::StashRename { .. } => "rename stash: ",
             Prompt::StashBranch { .. } => "branch from stash: ",
+            Prompt::WorktreeBase { .. } => "worktree from (empty = HEAD): ",
+            Prompt::WorktreePath { .. } => "worktree path: ",
+            Prompt::BisectGood { .. } => "bisect from (known good): ",
         }
     }
 }
@@ -796,6 +836,7 @@ impl Screens {
             Screens::Remotes { .. } => "remotes",
             Screens::Tags { .. } => "tags",
             Screens::Reflog { .. } => "reflog",
+            Screens::Worktrees { .. } => "worktrees",
         }
     }
 
@@ -808,7 +849,8 @@ impl Screens {
             | Screens::Branches { label, .. }
             | Screens::Remotes { label, .. }
             | Screens::Tags { label, .. }
-            | Screens::Reflog { label, .. } => label,
+            | Screens::Reflog { label, .. }
+            | Screens::Worktrees { label, .. } => label,
             Screens::Files { label, .. } => label,
         }
     }
@@ -822,7 +864,8 @@ impl Screens {
             | Screens::Branches { generation, .. }
             | Screens::Remotes { generation, .. }
             | Screens::Tags { generation, .. }
-            | Screens::Reflog { generation, .. } => *generation,
+            | Screens::Reflog { generation, .. }
+            | Screens::Worktrees { generation, .. } => *generation,
             Screens::Files { generation, .. } => *generation,
         }
     }
@@ -845,6 +888,7 @@ impl Screens {
         target: Generation,
         host: &Host,
         repo: &dyn gitten_git::Repo,
+        here: &[u8],
     ) -> Option<Result<(), String>> {
         if self.generation() >= target {
             return None;
@@ -1090,6 +1134,36 @@ impl Screens {
                 *generation = target;
                 Some(Ok(()))
             }
+            Screens::Worktrees {
+                view,
+                label,
+                generation,
+            } => {
+                // The same two reads: every checkout, and the describe
+                // its label is spelled with. `here` is the canonicalized
+                // root the row guard compares against — the listing spells
+                // paths resolved, so an uncanonicalized root would match
+                // nothing and the guard would fail open to git's refusal.
+                let (loaded, described) = std::thread::scope(|s| {
+                    let worktrees = s.spawn(|| repo.worktrees());
+                    let described = s.spawn(|| repo.describe());
+                    (
+                        worktrees
+                            .join()
+                            .unwrap_or_else(|p| std::panic::resume_unwind(p)),
+                        described.join().unwrap_or_default(),
+                    )
+                });
+                let loaded = match loaded {
+                    Ok(worktrees) => worktrees,
+                    Err(e) => return Some(Err(e)),
+                };
+                let count = loaded.len();
+                view.replace(loaded, here);
+                *label = worktrees_label(&described, count);
+                *generation = target;
+                Some(Ok(()))
+            }
             Screens::Reflog {
                 view,
                 label,
@@ -1167,6 +1241,10 @@ impl Screens {
                 r.set_scrolloff(host.view.scrolloff);
                 r.resize(rect.width, rect.height);
             }
+            Screens::Worktrees { view: w, .. } => {
+                w.set_scrolloff(host.view.scrolloff);
+                w.resize(rect.width, rect.height);
+            }
         }
     }
 
@@ -1193,6 +1271,7 @@ impl Screens {
             Screens::Remotes { view: r, .. } => r.paint(screen, x, y, focused, host),
             Screens::Tags { view: t, .. } => t.paint(screen, x, y, focused, host),
             Screens::Reflog { view: r, .. } => r.paint(screen, x, y, focused, host),
+            Screens::Worktrees { view: w, .. } => w.paint(screen, x, y, focused, host),
         }
     }
 
@@ -1207,6 +1286,7 @@ impl Screens {
             Screens::Remotes { view: r, .. } => r.status(),
             Screens::Tags { view: t, .. } => t.status(),
             Screens::Reflog { view: r, .. } => r.status(),
+            Screens::Worktrees { view: w, .. } => w.status(),
         }
     }
 
@@ -1232,6 +1312,7 @@ impl Screens {
             Screens::Remotes { view: r, .. } => r.paint_bar(screen, x, divider, y, host),
             Screens::Tags { view: t, .. } => t.paint_bar(screen, x, divider, y, host),
             Screens::Reflog { view: r, .. } => r.paint_bar(screen, x, divider, y, host),
+            Screens::Worktrees { view: w, .. } => w.paint_bar(screen, x, divider, y, host),
         }
     }
 
@@ -1252,6 +1333,7 @@ impl Screens {
             Screens::Remotes { view: r, .. } => r.press(col, row, extend, host),
             Screens::Tags { view: t, .. } => t.press(col, row, extend, host),
             Screens::Reflog { view: r, .. } => r.press(col, row, extend, host),
+            Screens::Worktrees { view: w, .. } => w.press(col, row, extend, host),
         }
     }
 
@@ -1269,7 +1351,8 @@ impl Screens {
             | Screens::Branches { .. }
             | Screens::Remotes { .. }
             | Screens::Tags { .. }
-            | Screens::Reflog { .. } => {}
+            | Screens::Reflog { .. }
+            | Screens::Worktrees { .. } => {}
         }
     }
 
@@ -1284,7 +1367,8 @@ impl Screens {
             | Screens::Branches { .. }
             | Screens::Remotes { .. }
             | Screens::Tags { .. }
-            | Screens::Reflog { .. } => {}
+            | Screens::Reflog { .. }
+            | Screens::Worktrees { .. } => {}
         }
     }
 
@@ -1303,6 +1387,7 @@ impl Screens {
             Screens::Remotes { view: r, .. } => r.copy_text(),
             Screens::Tags { view: t, .. } => t.copy_text(),
             Screens::Reflog { view: r, .. } => r.copy_text(),
+            Screens::Worktrees { view: w, .. } => w.copy_text(),
         }
     }
 
@@ -1322,6 +1407,7 @@ impl Screens {
             Screens::Remotes { view: r, .. } => r.selection(),
             Screens::Tags { view: t, .. } => t.selection(),
             Screens::Reflog { view: r, .. } => r.selection(),
+            Screens::Worktrees { view: w, .. } => w.selection(),
         }
     }
 
@@ -1336,6 +1422,7 @@ impl Screens {
             Screens::Remotes { view: r, .. } => r.select_all(),
             Screens::Tags { view: t, .. } => t.select_all(),
             Screens::Reflog { view: r, .. } => r.select_all(),
+            Screens::Worktrees { view: w, .. } => w.select_all(),
         }
     }
 
@@ -1350,6 +1437,7 @@ impl Screens {
             Screens::Remotes { view: r, .. } => r.select_none(),
             Screens::Tags { view: t, .. } => t.select_none(),
             Screens::Reflog { view: r, .. } => r.select_none(),
+            Screens::Worktrees { view: w, .. } => w.select_none(),
         }
     }
 
@@ -1365,6 +1453,7 @@ impl Screens {
             Screens::Remotes { view: r, .. } => r.filter_note(),
             Screens::Tags { view: t, .. } => t.filter_note(),
             Screens::Reflog { view: r, .. } => r.filter_note(),
+            Screens::Worktrees { view: w, .. } => w.filter_note(),
             Screens::Diff { view: d, .. } => d.match_note(),
             // The merging view carries no standing search yet.
             Screens::Merging { .. } => None,
@@ -1383,6 +1472,7 @@ impl Screens {
             Screens::Remotes { view: r, .. } => r.query().is_some(),
             Screens::Tags { view: t, .. } => t.query().is_some(),
             Screens::Reflog { view: r, .. } => r.query().is_some(),
+            Screens::Worktrees { view: w, .. } => w.query().is_some(),
             Screens::Diff { view: d, .. } => d.search_query().is_some(),
             Screens::Merging { .. } => false,
         }
@@ -1535,6 +1625,22 @@ impl Screens {
                 "search.prev" => t.next_match(-1),
                 _ => return false,
             },
+            Screens::Worktrees { view: w, .. } => match command {
+                "view.down" => w.down(),
+                "view.up" => w.up(),
+                "view.page-down" => w.page(1),
+                "view.page-up" => w.page(-1),
+                "view.scroll-down" => w.scroll_y(host.view.rows as isize),
+                "view.scroll-up" => w.scroll_y(-(host.view.rows as isize)),
+                "view.top" => w.to_top(),
+                "view.bottom" => w.to_bottom(),
+                // Nothing off the left edge to reach: paths clip rather
+                // than pan.
+                "view.left" | "view.right" => {}
+                "search.next" => w.next_match(1),
+                "search.prev" => w.next_match(-1),
+                _ => return false,
+            },
             Screens::Reflog { view: r, .. } => match command {
                 "view.down" => r.down(),
                 "view.up" => r.up(),
@@ -1667,6 +1773,11 @@ struct App {
     /// keys on it, and shared policy (`act`) reads it instead of asking the
     /// repository a second time. Refreshed wherever the panes are.
     operation: Option<Operation>,
+    /// The bisection standing in the repository, as the last acquisition
+    /// reported it — read through the repository on open and on every
+    /// refresh, the W5 reopen-recovery pattern, because a bisect started
+    /// in a terminal is a banner this client must show unasked.
+    bisect: Option<gitten_core::bisect::BisectState>,
     /// The commits kept for `commits.paste`, as full shas in paste order.
     /// Outlives every press and every refresh, because a copy made before a
     /// branch switch is exactly the copy a paste onto the new branch wants;
@@ -1986,8 +2097,9 @@ impl App {
         let mut app = Self {
             host,
             repo,
-            availability: tui_availability(startup_pending, None),
+            availability: tui_availability(startup_pending, None, None),
             operation: None,
+            bisect: None,
             clipboard: gitten_core::clipboard::CherryClipboard::new(),
             patch_clip: gitten_core::patchclip::PatchClipboard::new(),
             patch: None,
@@ -2092,6 +2204,7 @@ impl App {
             described,
             branch_reads,
             diff_read,
+            worktrees_read,
         ) = std::thread::scope(|s| {
             // The handle as a stable borrow the `move` spawns copy: an
             // `Arc` would be four refcount bumps for the same answer.
@@ -2100,6 +2213,7 @@ impl App {
             let remotes = s.spawn(|| repo.remotes());
             let tags = s.spawn(|| repo.tags());
             let reflog = s.spawn(|| repo.reflog(REFLOG_ENTRIES));
+            let worktrees = s.spawn(|| repo.worktrees());
             let status = s.spawn(move || repo.status());
             let described = s.spawn(move || repo.describe());
             let branches = s.spawn(move || load_branches(repo.as_ref()));
@@ -2119,6 +2233,7 @@ impl App {
                 join_read(described),
                 join_read(branches),
                 diff.map(join_read),
+                join_read(worktrees),
             )
         });
         clock.stage("startup reads joined");
@@ -2149,6 +2264,26 @@ impl App {
                     let count = tags.len();
                     view.replace(tags);
                     *label = tags_label(&described, count);
+                }
+                Err(e) => {
+                    *label = "unavailable".to_string();
+                    error.get_or_insert(e);
+                }
+            }
+        }
+        if let Some(Screens::Worktrees { view, label, .. }) = self.panes.get_mut("worktrees") {
+            match worktrees_read {
+                Ok(list) => {
+                    let count = list.len();
+                    // The row guard's `here`: canonicalized, because the
+                    // listing spells every path resolved.
+                    let here = std::fs::canonicalize(&path)
+                        .unwrap_or_else(|_| path.clone())
+                        .as_os_str()
+                        .as_encoded_bytes()
+                        .to_vec();
+                    view.replace(list, &here);
+                    *label = worktrees_label(&described, count);
                 }
                 Err(e) => {
                     *label = "unavailable".to_string();
@@ -2227,6 +2362,7 @@ impl App {
         // The operation standing re-read with the same wave that refreshed
         // the panes: an externally started rebase is on the banner before
         // the first real frame draws.
+        self.sync_bisect();
         self.sync_operation();
         self.panes.focus_named(&launch_focus);
         self.sync_header_keys();
@@ -2878,6 +3014,7 @@ impl App {
             Some(Screens::Remotes { view, .. }) => view.query().unwrap_or_default().to_string(),
             Some(Screens::Tags { view, .. }) => view.query().unwrap_or_default().to_string(),
             Some(Screens::Reflog { view, .. }) => view.query().unwrap_or_default().to_string(),
+            Some(Screens::Worktrees { view, .. }) => view.query().unwrap_or_default().to_string(),
             Some(Screens::Diff { view, .. }) => {
                 if !view.has_search_text() {
                     self.message = format!("{command}: the diff has no text to search");
@@ -3544,6 +3681,184 @@ impl App {
         }
     }
 
+    /// Whether the keyboard is on the worktrees pane — the guard every
+    /// worktree verb opens with, said the way every wrong-focus refusal
+    /// here is said.
+    fn worktrees_focused(&mut self, command: &str) -> bool {
+        match self.panes.focused() {
+            Some(Screens::Worktrees { .. }) => true,
+            _ => {
+                self.message = format!("{command} is not supported here");
+                false
+            }
+        }
+    }
+
+    /// The worktree row the keyboard is on — the implementation behind
+    /// [`act::WorktreeClient`].
+    fn worktree_target(&self) -> Option<Vec<u8>> {
+        match self.panes.focused() {
+            Some(Screens::Worktrees { view, .. }) => view.current(),
+            _ => None,
+        }
+    }
+
+    /// Whether the keyboard sits on the checkout this client stands in.
+    fn worktree_is_here(&self, path: &[u8]) -> bool {
+        match self.panes.focused() {
+            Some(Screens::Worktrees { view, .. }) => {
+                view.current().as_deref() == Some(path) && view.current_is_here()
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether the force upgrade stands on this exact path — the third
+    /// press's question, answered by the arm the submitted removal left.
+    fn worktree_armed_force(&self, path: &[u8]) -> bool {
+        match self.panes.focused() {
+            Some(Screens::Worktrees { view, .. }) => {
+                view.armed().as_ref().is_some_and(|(p, f)| p == path && *f)
+            }
+            _ => false,
+        }
+    }
+
+    /// Arms the selected checkout for a confirmed removal, or spends the
+    /// arm — the implementation behind [`act::WorktreeClient`].
+    fn confirm_or_arm_worktree(&mut self, path: &[u8], force: bool) -> bool {
+        match self.panes.focused_mut() {
+            Some(Screens::Worktrees { view, .. }) => view.confirm_or_arm_remove(path, force),
+            _ => false,
+        }
+    }
+
+    /// Stands the force upgrade after a plain removal was submitted — the
+    /// implementation behind [`act::WorktreeClient`].
+    fn upgrade_worktree_force(&mut self, path: &[u8]) {
+        if let Some(Screens::Worktrees { view, .. }) = self.panes.focused_mut() {
+            view.upgrade_to_force(path);
+        }
+    }
+
+    /// `worktrees.switch`: open the selected checkout as a repository —
+    /// the same road `project.open` walks, so the MRU, the generations
+    /// and the refusals all behave as they do there. A row whose directory
+    /// is gone refuses in the open's own words.
+    fn switch_worktree(&mut self) {
+        if !self.worktrees_focused("worktrees.switch") {
+            return;
+        }
+        let Some(path) = self.worktree_target() else {
+            self.message = "nothing selected on the worktree list".into();
+            return;
+        };
+        self.open_repository(&String::from_utf8_lossy(&path));
+    }
+
+    /// `worktrees.new`: gather the starting point first — empty means
+    /// HEAD — then the path, the way `remotes.new` gathers name then URL.
+    fn begin_worktree_base(&mut self) {
+        if self.repo.is_none() {
+            self.message = "a fixture has no repository to branch a worktree from".into();
+            return;
+        }
+        self.open_prompt(Prompt::WorktreeBase {
+            field: Field::new(),
+        });
+    }
+
+    /// The path step of `worktrees.new`: `base` rides along from the row
+    /// or the first field, so nothing a cursor does while the field holds
+    /// the keyboard can re-aim the checkout. An empty base checks out
+    /// HEAD's branch, which git refuses when this tree holds it — the
+    /// refusal arrives in git's own words, and that sentence is the
+    /// branch decision's proper home.
+    fn begin_worktree_path(&mut self, base: Vec<u8>) {
+        self.open_prompt(Prompt::WorktreePath {
+            base,
+            field: Field::new(),
+        });
+    }
+
+    /// A new worktree from the row the keyboard is on — lazygit's `w`.
+    /// The base is the row's own rev, captured here; the path rides the
+    /// prompt. A detached branch row names no branch to start from and
+    /// says so rather than guessing.
+    fn begin_worktree_from_row(&mut self, command: &str) {
+        use gitten_app::act::StashClient;
+        if self.repo.is_none() {
+            self.message = format!("a fixture has no repository for {command}");
+            return;
+        }
+        let base: Option<Vec<u8>> = match self.panes.focused() {
+            Some(Screens::Commits { view, .. }) => {
+                view.current().map(|c| c.sha.clone().into_bytes())
+            }
+            Some(Screens::Branches { .. }) => match self.branch_target() {
+                Some(Target::Local(name)) => Some(name.as_bytes().to_vec()),
+                Some(Target::Remote { remote, branch }) => Some(
+                    format!("{}/{}", remote.to_string_lossy(), branch.to_string_lossy())
+                        .into_bytes(),
+                ),
+                Some(Target::Detached) | None => None,
+            },
+            Some(Screens::Stashes { .. }) => self.selected_stash().map(|id| id.commit.into_bytes()),
+            Some(Screens::Tags { view, .. }) => view.current_commit().map(String::into_bytes),
+            _ => None,
+        };
+        let Some(base) = base else {
+            self.message = format!("{command} has no revision to start from here");
+            return;
+        };
+        self.open_prompt(Prompt::WorktreePath {
+            base,
+            field: Field::new(),
+        });
+    }
+
+    /// `commits.bisect-menu`: the selected commit is where the bug would
+    /// be — but only the menu decides that. With a bisection standing
+    /// this opens the judgement question; with a clean tree, the start
+    /// field aimed at the selected commit.
+    fn bisect_menu(&mut self) {
+        if self.bisect.is_some() {
+            let word = self.bisect.as_ref().map(|b| b.word()).unwrap_or_default();
+            // The reset menu's shape: the options said aloud, the answers
+            // a keypress away in the question's own mode, anything else
+            // closing it. The standing state is re-read, not trusted — a
+            // reset in a terminal since the last refresh closes this into
+            // the start field's refusal rather than a dead question.
+            self.message = format!("{word}: g good · b bad · s skip · r reset");
+            self.question = Some("bisect");
+            self.sync_modes();
+            return;
+        }
+        self.begin_bisect_good();
+    }
+    fn begin_bisect_good(&mut self) {
+        let Some(Screens::Commits { view, .. }) = self.panes.focused() else {
+            self.message = "commits.bisect-menu is not supported here".into();
+            return;
+        };
+        let Some(commit) = view.current() else {
+            self.message = "nothing selected to bisect from".into();
+            return;
+        };
+        if self.repo.is_none() {
+            self.message = "a fixture has no history to bisect".into();
+            return;
+        }
+        if self.bisect.is_some() {
+            self.message = "a bisect is already in progress — reset it first".into();
+            return;
+        }
+        self.open_prompt(Prompt::BisectGood {
+            bad: commit.sha.clone().into_bytes(),
+            field: Field::new(),
+        });
+    }
+
     /// The remote row the keyboard is on, as the verbs address it — the
     /// implementation behind [`act::RemoteClient`].
     fn remote_target(&self) -> Option<RefName> {
@@ -3783,6 +4098,8 @@ impl App {
         tags.set_bar(self.bar);
         let mut reflog = Reflog::unavailable();
         reflog.set_bar(self.bar);
+        let mut worktrees = Worktrees::unavailable();
+        worktrees.set_bar(self.bar);
         let mut files = Files::unavailable();
         files.set_bar(self.bar);
         let mut branches = Branches::with_marks(Vec::new(), marks);
@@ -3836,6 +4153,15 @@ impl App {
             },
         );
         panes.register(
+            "worktrees",
+            panes::Placement::sidebar("worktrees"),
+            Screens::Worktrees {
+                view: worktrees,
+                label: STARTUP_LOADING.to_string(),
+                generation: Generation::default(),
+            },
+        );
+        panes.register(
             "diff",
             panes::Placement::Main,
             Screens::Diff {
@@ -3870,6 +4196,7 @@ impl App {
         // refused the sync keys, and this one answers them. The operation
         // standing travels with it — the new repository may have arrived
         // mid-rebase — and the lifecycle keys gate on the fresh answer.
+        self.sync_bisect();
         self.sync_operation();
         self.startup_pending = true;
         // A clipboard of shas from the repository just left names objects
@@ -4045,6 +4372,7 @@ impl App {
             Some(Screens::Remotes { view, .. }) => view.apply_query(query),
             Some(Screens::Tags { view, .. }) => view.apply_query(query),
             Some(Screens::Reflog { view, .. }) => view.apply_query(query),
+            Some(Screens::Worktrees { view, .. }) => view.apply_query(query),
             Some(Screens::Diff { view, .. }) => view.search_edit(query),
             // The merging view has no filter to apply.
             Some(Screens::Merging { .. }) => {}
@@ -4096,6 +4424,7 @@ impl App {
                     Some(Screens::Remotes { view, .. }) => view.clear_search(),
                     Some(Screens::Tags { view, .. }) => view.clear_search(),
                     Some(Screens::Reflog { view, .. }) => view.clear_search(),
+                    Some(Screens::Worktrees { view, .. }) => view.clear_search(),
                     Some(Screens::Diff { view, .. }) => view.search_clear(),
                     Some(Screens::Merging { .. }) => {}
                     None => {}
@@ -4149,6 +4478,15 @@ impl App {
             }
             Prompt::ProjectOpen { field } if accept => self.open_repository(&field.take()),
             Prompt::RemoteName { field } if accept => self.begin_remote_url(field.take()),
+            Prompt::WorktreeBase { field } if accept => {
+                self.begin_worktree_path(field.take().into_bytes())
+            }
+            Prompt::WorktreePath { base, field } if accept => {
+                gitten_app::act::create_worktree(self, base, field.take(), None)
+            }
+            Prompt::BisectGood { bad, field } if accept => {
+                gitten_app::act::bisect_start(self, bad, field.take())
+            }
             Prompt::RemoteUrl { name, field } if accept => {
                 gitten_app::act::remote_add(self, name, field.take())
             }
@@ -4464,7 +4802,8 @@ impl App {
             "pane.next" => self.cycle_pane(1),
             "pane.prev" => self.cycle_pane(-1),
             "status.focus" | "files.focus" | "branches.focus" | "commits.focus"
-            | "stashes.focus" | "remotes.focus" | "tags.focus" | "reflog.focus" | "diff.focus" => {
+            | "stashes.focus" | "remotes.focus" | "tags.focus" | "reflog.focus"
+            | "worktrees.focus" | "diff.focus" => {
                 let name = command.strip_suffix(".focus").unwrap_or(command);
                 self.focus_named(name);
             }
@@ -4503,9 +4842,8 @@ impl App {
             // modes, the rest in `input` while any prompt stands — so
             // `gitten.toml` moves them the way it moves everything else.
             "commits.search" | "files.search" | "branches.search" | "stashes.search"
-            | "remotes.search" | "tags.search" | "reflog.search" | "diff.search" => {
-                self.begin_search(command)
-            }
+            | "remotes.search" | "tags.search" | "reflog.search" | "worktrees.search"
+            | "diff.search" => self.begin_search(command),
             "files.commit" => self.begin_commit_message(),
             "files.amend" => self.begin_amend_message(),
             // lazygit's global R, on the same wave a finished write runs:
@@ -4550,6 +4888,7 @@ impl App {
                             Screens::Remotes { view, .. } => view.clear_search(),
                             Screens::Tags { view, .. } => view.clear_search(),
                             Screens::Reflog { view, .. } => view.clear_search(),
+                            Screens::Worktrees { view, .. } => view.clear_search(),
                             Screens::Diff { view, .. } => view.search_clear(),
                             Screens::Merging { .. } => {}
                         }
@@ -4980,6 +5319,55 @@ impl App {
                     gitten_app::act::recover_reflog(self);
                 }
             }
+            // The worktree verbs: the checkout the keyboard is on, the
+            // shared `Write` that means it. New opens its fields on the
+            // way through; switch opens the checkout as a repository;
+            // remove goes straight to the shared action, which asks twice
+            // and upgrades past a dirty refusal on the third press.
+            "worktrees.new" => self.begin_worktree_base(),
+            "worktrees.remove" => {
+                if !self.worktrees_focused("worktrees.remove") {
+                    return;
+                }
+                let Some(path) = self.worktree_target() else {
+                    self.message = "nothing selected on the worktree list".into();
+                    return;
+                };
+                if self.worktree_is_here(&path) {
+                    self.message = "cannot remove the checkout this client stands in".into();
+                    return;
+                }
+                // The force upgrade standing means a plain removal was
+                // submitted for this exact path and came back dirty —
+                // this press spends it. Anything else arms or re-arms.
+                let forced = self.worktree_armed_force(&path);
+                gitten_app::act::remove_worktree(self, forced);
+            }
+            "worktrees.switch" => self.switch_worktree(),
+            // The bisect door, on lazygit's commits-pane key: with a
+            // clean tree it opens the start field, aimed at the selected
+            // commit; with a bisection standing it opens the judgement
+            // question instead — one key, like the reset menu's `g`.
+            "commits.bisect-menu" => self.bisect_menu(),
+            "commits.bisect-good" => {
+                gitten_app::act::bisect_mark(self, gitten_app::act::BisectMark::Good)
+            }
+            "commits.bisect-bad" => {
+                gitten_app::act::bisect_mark(self, gitten_app::act::BisectMark::Bad)
+            }
+            "commits.bisect-skip" => {
+                gitten_app::act::bisect_mark(self, gitten_app::act::BisectMark::Skip)
+            }
+            "commits.bisect-reset" => gitten_app::act::bisect_reset(self),
+            // A new worktree from the row the keyboard is on — lazygit's
+            // `w`, one shared implementation behind every ref list. The
+            // base is the row's own rev, captured here; the path rides
+            // the prompt, so nothing a cursor does while the field holds
+            // the keyboard can re-aim it.
+            "commits.new-worktree"
+            | "branches.new-worktree"
+            | "stashes.new-worktree"
+            | "tags.new-worktree" => self.begin_worktree_from_row(command),
             // History's own pair, global because history is not a pane's:
             // the standing operation and the fixture refusals are the
             // shared actions', said where they are decided.
@@ -6122,7 +6510,18 @@ impl App {
             .as_ref()
             .and_then(|(_, repo)| repo.as_ref().operation());
         let repo_backed = self.repo.is_some();
-        self.availability = tui_availability(repo_backed, self.operation.as_ref());
+        self.availability =
+            tui_availability(repo_backed, self.operation.as_ref(), self.bisect.as_ref());
+    }
+
+    /// Re-reads the bisection standing in the repository. Called before
+    /// [`sync_operation`](Self::sync_operation) wherever the panes re-read
+    /// — the availability the latter builds gates the bisect verbs on it.
+    fn sync_bisect(&mut self) {
+        self.bisect = self
+            .repo
+            .as_ref()
+            .and_then(|(_, repo)| repo.as_ref().bisect_state());
     }
 
     /// Drains the job queue. Called before each frame, so the frame this
@@ -6183,6 +6582,7 @@ impl App {
                     // A write may have started, finished or abandoned an
                     // operation; the banner and the lifecycle gates re-read
                     // it with everything else the finish wave refreshes.
+                    self.sync_bisect();
                     self.sync_operation();
                 }
             }
@@ -6205,10 +6605,24 @@ impl App {
             return Ok(());
         };
         let mut first = None;
+        // Canonicalized once per wave: the listing spells every path
+        // resolved, and the worktree row guard compares exact bytes.
+        // Owned, so the pane borrow below never touches the repository.
+        let here = self
+            .repo
+            .as_ref()
+            .map(|(path, _)| {
+                std::fs::canonicalize(path)
+                    .unwrap_or_else(|_| path.clone())
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .to_vec()
+            })
+            .unwrap_or_default();
         {
             let Self { panes, host, .. } = self;
             for pane in panes.iter_mut() {
-                if let Some(result) = pane.refresh(target, host, repo.as_ref()) {
+                if let Some(result) = pane.refresh(target, host, repo.as_ref(), &here) {
                     if result.is_err() {
                         // The *first* failure stands, as the contract above
                         // says: a later pane's error never overwrites an
@@ -6449,6 +6863,29 @@ impl App {
                 }
                 None => status,
             };
+            // The bisection standing beside whatever else stands: the
+            // commit under test, where reset returns, and the keys that
+            // judge it — read from the keymap, like the operation's.
+            let status = match self.bisect.as_ref() {
+                Some(b) => {
+                    let key = |name: &str| {
+                        self.host
+                            .keys
+                            .keys_for(name)
+                            .first()
+                            .map(|k| k.to_string())
+                            .unwrap_or_default()
+                    };
+                    format!(
+                        "{} · back to {} · {} bisect options · {}",
+                        b.word(),
+                        b.original,
+                        key("commits.bisect-menu"),
+                        status
+                    )
+                }
+                None => status,
+            };
             // The previous frame's cost, not this one's — this one has not been
             // drawn yet, and a number measured after the fact would be
             // describing a frame nobody saw.
@@ -6550,7 +6987,11 @@ impl App {
 /// The launch is the one variable: `repo.refresh` has a handler, but a
 /// fixture view has no repository behind it, so there it is supported-but-
 /// turned-away with the reason instead of advertised as if it ran.
-fn tui_availability(repo: bool, operation: Option<&Operation>) -> Availability {
+fn tui_availability(
+    repo: bool,
+    operation: Option<&Operation>,
+    bisect: Option<&gitten_core::bisect::BisectState>,
+) -> Availability {
     let mut a = Availability::strict();
     a.available([
         // Dispatched by name, ahead of any pane.
@@ -6688,6 +7129,16 @@ fn tui_availability(repo: bool, operation: Option<&Operation>) -> Availability {
         "reflog.focus",
         "reflog.recover",
         "reflog.search",
+        "worktrees.focus",
+        "worktrees.new",
+        "worktrees.remove",
+        "worktrees.switch",
+        "worktrees.search",
+        "commits.bisect-menu",
+        "commits.bisect-good",
+        "commits.bisect-bad",
+        "commits.bisect-skip",
+        "commits.bisect-reset",
         "history.undo",
         "history.redo",
         "branches.delete-remote",
@@ -6923,6 +7374,15 @@ fn tui_availability(repo: bool, operation: Option<&Operation>) -> Availability {
                 "stashes.new-branch",
                 "a fixture has no stash to branch from",
             );
+            for name in [
+                "commits.bisect-menu",
+                "commits.bisect-good",
+                "commits.bisect-bad",
+                "commits.bisect-skip",
+                "commits.bisect-reset",
+            ] {
+                a.disabled(name, "a fixture has no history to bisect");
+            }
             a.disabled(
                 "merge.take-side",
                 "a fixture has no repository to resolve in",
@@ -7012,6 +7472,26 @@ fn tui_availability(repo: bool, operation: Option<&Operation>) -> Availability {
             }
         }
     }
+    // The bisect verbs gate on the bisection the same acquisition read —
+    // the one fact that changes between two runs of the same binary, next
+    // to the lifecycle gates above. Judging answers a standing question;
+    // starting answers a clean tree; reset answers either, because ending
+    // nothing is the quiet no-op. Fixtures never reach this: the branch
+    // below turns them away with fixture reasons first.
+    if repo {
+        match bisect {
+            None => {
+                a.disabled("commits.bisect-good", "no bisect is in progress");
+                a.disabled("commits.bisect-bad", "no bisect is in progress");
+                a.disabled("commits.bisect-skip", "no bisect is in progress");
+            }
+            Some(_) => {
+                // Starting is the menu's own answer when the tree is clean
+                // — the `b` door opens the question instead, so there is
+                // no start to advertise while one stands.
+            }
+        }
+    }
     a
 }
 
@@ -7054,6 +7534,10 @@ impl gitten_app::act::Client for App {
 
     fn operation(&self) -> Option<Operation> {
         self.operation
+    }
+
+    fn bisect(&self) -> Option<gitten_core::bisect::BisectState> {
+        self.bisect.clone()
     }
 
     fn rebase_base(&self) -> Option<gitten_app::act::SelectedCommit> {
@@ -7354,6 +7838,20 @@ impl gitten_app::act::TagClient for App {
     }
 }
 
+impl gitten_app::act::WorktreeClient for App {
+    fn worktree_target(&self) -> Option<Vec<u8>> {
+        self.worktree_target()
+    }
+
+    fn confirm_or_arm_worktree(&mut self, path: &[u8], force: bool) -> bool {
+        self.confirm_or_arm_worktree(path, force)
+    }
+
+    fn upgrade_worktree_force(&mut self, path: &[u8]) {
+        self.upgrade_worktree_force(path)
+    }
+}
+
 impl gitten_app::act::ReflogClient for App {
     fn reflog_target(&self) -> Option<gitten_core::refs::ReflogEntry> {
         self.reflog_target()
@@ -7605,6 +8103,15 @@ fn tags_label(describe: &str, count: usize) -> String {
     let word = match count {
         1 => "tag",
         _ => "tags",
+    };
+    format!("{describe} · {count} {word}")
+}
+
+/// The worktrees pane's header label: what repository, how many checkouts.
+fn worktrees_label(describe: &str, count: usize) -> String {
+    let word = match count {
+        1 => "worktree",
+        _ => "worktrees",
     };
     format!("{describe} · {count} {word}")
 }
@@ -12380,7 +12887,7 @@ diff --git a/tracked.txt b/tracked.txt
         // And the availability contract agrees with the dispatch: help
         // lists the three, and the dispatch refuses none of them by
         // availability.
-        let availability = tui_availability(true, None);
+        let availability = tui_availability(true, None, None);
         for name in [
             "diff.toggle-line-selection",
             "diff.discard-hunk",
@@ -15210,8 +15717,24 @@ diff --git a/tracked.txt b/tracked.txt
             // keymap binds: no row names an unsupported command, and the
             // disabled one says its reason where its description was.
             for mode in [
-                "global", "files", "branches", "commits", "stashes", "diff", "help", "input",
-                "settings", "reset", "upstream", "stash", "patch", "builder", "todo", "panes",
+                "global",
+                "files",
+                "branches",
+                "commits",
+                "stashes",
+                "diff",
+                "help",
+                "input",
+                "settings",
+                "reset",
+                "upstream",
+                "stash",
+                "patch",
+                "builder",
+                "todo",
+                "panes",
+                "bisect",
+                "worktrees",
             ] {
                 let mut modes = Modes::new();
                 if mode != "global" {
@@ -20901,7 +21424,7 @@ shared tail
     /// contract, held for this packet's commands.
     #[test]
     fn tui_parity_history_verbs_are_disabled_without_a_repository() {
-        let a = tui_availability(false, None);
+        let a = tui_availability(false, None, None);
         for command in [
             "commits.reset-menu",
             "commits.reset-soft",
@@ -20929,7 +21452,7 @@ shared tail
         }
         // With a repository they are live again — supported, not merely
         // unrefused, which is what separates this from an unhandled name.
-        let a = tui_availability(true, None);
+        let a = tui_availability(true, None, None);
         for command in [
             "commits.reset-hard",
             "commits.paste",
@@ -21630,7 +22153,7 @@ shared tail
     fn tui_parity_the_stash_family_is_disabled_without_a_repository() {
         // Every one of them needs a working tree or a stack, so a fixture
         // says why rather than advertising a key that cannot run.
-        let a = tui_availability(false, None);
+        let a = tui_availability(false, None, None);
         for command in [
             "files.stash-menu",
             "files.stash-named",
@@ -21650,7 +22173,7 @@ shared tail
             }
             assert!(!a.runnable(command));
         }
-        let a = tui_availability(true, None);
+        let a = tui_availability(true, None, None);
         for command in [
             "files.stash-menu",
             "files.stash-file",

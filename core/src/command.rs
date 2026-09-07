@@ -528,6 +528,9 @@ impl Keymap {
         // the press that opens it.
         bind("stashes", "r", "stashes.rename");
         bind("stashes", "n", "stashes.new-branch");
+        // lazygit's `w`: a new checkout starting where the entry was
+        // made — the stash commit itself, which git checks out detached.
+        bind("stashes", "w", "stashes.new-worktree");
 
         // The remotes panel's verbs, on lazygit's keys: f fetches the
         // selected remote's tracking branches, n introduces one (two
@@ -554,6 +557,8 @@ impl Keymap {
         bind("tags", "d", "tags.delete");
         bind("tags", "P", "tags.push");
         bind("tags", "/", "tags.search");
+        // lazygit's `w`: a new checkout at the commit the tag names.
+        bind("tags", "w", "tags.new-worktree");
 
         // The reflog panel's verbs: space puts the current branch back
         // onto the entry (reset --soft — index and worktree untouched) or
@@ -561,6 +566,27 @@ impl Keymap {
         // recovery is one question; the preview names the move.
         bind("reflog", "space", "reflog.recover");
         bind("reflog", "/", "reflog.search");
+
+        // The worktrees panel's verbs, on lazygit's keys: n checks a
+        // starting point out into a new checkout (two prompts — from,
+        // then path), d forgets the row (twice-pressed, upgrading past a
+        // dirty refusal on the third), space opens the checkout as a
+        // repository. No number, like remotes: one more list in the
+        // ctrl-j/ctrl-k cycle.
+        bind("worktrees", "n", "worktrees.new");
+        bind("worktrees", "d", "worktrees.remove");
+        bind("worktrees", "space", "worktrees.switch");
+        bind("worktrees", "/", "worktrees.search");
+
+        // The bisect question's answers, on the reset question's terms:
+        // single letters reused contextually, above the pane's own
+        // bindings and only while the question stands. `b` opens the
+        // question (or the start field when the tree is clean); here `b`
+        // judges bad, `g` good, `s` skips, `r` resets.
+        bind("bisect", "g", "commits.bisect-good");
+        bind("bisect", "b", "commits.bisect-bad");
+        bind("bisect", "s", "commits.bisect-skip");
+        bind("bisect", "r", "commits.bisect-reset");
 
         // The branches panel, on lazygit's own letters: space checks out the
         // branch under the keyboard, n names a new one, r rebases the
@@ -599,6 +625,9 @@ impl Keymap {
         bind("branches", "/", "branches.search");
         // Enter drills down: the branch's own history, in the main pane.
         bind("branches", "enter", "branches.open-log");
+        // lazygit's `w`: a new checkout starting at this row — the branch
+        // itself, or the remote-tracking ref for a remote row.
+        bind("branches", "w", "branches.new-worktree");
 
         bind("diff", "s", "diff.cycle-layout");
         bind("diff", "w", "diff.cycle-wrap");
@@ -790,6 +819,13 @@ impl Keymap {
         // and keeps its own keys: this marks *rows* for *actions*, and the
         // first consumer is the commit list.
         bind("commits", "v", "select.mark");
+        // lazygit's `w`: a new checkout starting at the selected commit —
+        // detached, because a commit is a place and not a branch.
+        bind("commits", "w", "commits.new-worktree");
+        // lazygit's `b`: the bisect door. With a clean tree it opens the
+        // start field, aimed at the selected commit; with a bisection
+        // standing it opens the judgement question instead.
+        bind("commits", "b", "commits.bisect-menu");
 
         // The help overlay owns the keyboard for as long as it stands: a client
         // resolves against this mode *alone* while it is up, so a chord that is
@@ -1966,6 +2002,68 @@ impl Commands {
                 Some("push"),
             ),
             ("tags.search", "search the tags", Some("search")),
+            ("worktrees.focus", "focus the worktrees pane", None),
+            (
+                "worktrees.new",
+                "check a starting point out into a new worktree",
+                Some("new"),
+            ),
+            (
+                "worktrees.remove",
+                "forget the selected checkout, asked twice — force on the third past dirt",
+                Some("remove"),
+            ),
+            (
+                "worktrees.switch",
+                "open the selected checkout as a repository",
+                Some("switch"),
+            ),
+            ("worktrees.search", "search the worktrees", Some("search")),
+            (
+                "commits.new-worktree",
+                "check the selected commit out into a new worktree",
+                Some("worktree"),
+            ),
+            (
+                "branches.new-worktree",
+                "check the selected branch out into a new worktree",
+                Some("worktree"),
+            ),
+            (
+                "stashes.new-worktree",
+                "check the selected entry's commit out into a new worktree",
+                Some("worktree"),
+            ),
+            (
+                "tags.new-worktree",
+                "check the selected tag's commit out into a new worktree",
+                Some("worktree"),
+            ),
+            (
+                "commits.bisect-menu",
+                "judge the bisect, or start one at the selected commit",
+                Some("bisect"),
+            ),
+            (
+                "commits.bisect-good",
+                "mark the bisect checkout good",
+                Some("good"),
+            ),
+            (
+                "commits.bisect-bad",
+                "mark the bisect checkout bad",
+                Some("bad"),
+            ),
+            (
+                "commits.bisect-skip",
+                "skip the bisect checkout as untestable",
+                Some("skip"),
+            ),
+            (
+                "commits.bisect-reset",
+                "end the bisect, back where it started",
+                Some("reset"),
+            ),
             ("reflog.focus", "focus the reflog pane", None),
             (
                 "reflog.recover",
