@@ -391,6 +391,13 @@ impl Keymap {
         // reads, not a fetch. The queue's own finish does the same dance
         // after every write; this is the same wave, asked for by hand.
         bind(GLOBAL, "R", "repo.refresh");
+        // lazygit's undo pair, global because history is not a pane's: z
+        // walks the last HEAD move back, Z walks forward again behind our
+        // own undo. One shadow: [commits] answers Z with the cherry-pick
+        // abort, the older and more urgent door — redo stays a pane away,
+        // on every list but that one.
+        bind(GLOBAL, "z", "history.undo");
+        bind(GLOBAL, "Z", "history.redo");
         // The recent-repositories switcher, global because a repository is
         // what every pane reads from: lowercase opens the list, capital
         // types a path instead. Stepping between recents stays unbound —
@@ -518,6 +525,26 @@ impl Keymap {
         bind("remotes", "e", "remotes.edit");
         bind("remotes", "d", "remotes.remove");
         bind("remotes", "/", "remotes.search");
+
+        // The tags panel's verbs, on lazygit's keys: space checks the tag
+        // out detached, n names a new one (annotated when the message
+        // field comes back nonempty, lightweight when it comes back
+        // empty), d forgets it (twice-pressed — the commits survive), P
+        // pushes it (the remote rides the prompt; tags track nothing, so
+        // there is no upstream to default to). No number, like remotes:
+        // one more list in the ctrl-j/ctrl-k cycle.
+        bind("tags", "space", "tags.checkout");
+        bind("tags", "n", "tags.new");
+        bind("tags", "d", "tags.delete");
+        bind("tags", "P", "tags.push");
+        bind("tags", "/", "tags.search");
+
+        // The reflog panel's verbs: space puts the current branch back
+        // onto the entry (reset --soft — index and worktree untouched) or
+        // checks the entry out when HEAD is detached. One key because
+        // recovery is one question; the preview names the move.
+        bind("reflog", "space", "reflog.recover");
+        bind("reflog", "/", "reflog.search");
 
         // The branches panel, on lazygit's own letters: space checks out the
         // branch under the keyboard, n names a new one, r rebases the
@@ -1763,6 +1790,50 @@ impl Commands {
                 Some("remove"),
             ),
             ("remotes.search", "search the remotes", Some("search")),
+            ("tags.focus", "focus the tags pane", None),
+            (
+                "tags.checkout",
+                "check out the selected tag, detaching HEAD",
+                Some("checkout"),
+            ),
+            (
+                "tags.new",
+                "name a commit with a new tag — annotated when the message field comes back nonempty",
+                Some("tag"),
+            ),
+            (
+                "tags.delete",
+                "forget the selected tag, asked twice — the commits survive",
+                Some("remove"),
+            ),
+            (
+                "tags.push",
+                "push the selected tag to the named remote",
+                Some("push"),
+            ),
+            ("tags.search", "search the tags", Some("search")),
+            ("reflog.focus", "focus the reflog pane", None),
+            (
+                "reflog.recover",
+                "put the current branch back onto the selected entry, asked twice",
+                Some("recover"),
+            ),
+            ("reflog.search", "search the reflog", Some("search")),
+            (
+                "history.undo",
+                "walk the last HEAD move back, keeping index and worktree",
+                Some("undo"),
+            ),
+            (
+                "history.redo",
+                "walk forward again, behind our own undo only",
+                Some("redo"),
+            ),
+            (
+                "branches.delete-remote",
+                "delete the remote-tracking row's branch on its remote, asked twice",
+                Some("remove"),
+            ),
             (
                 "branches.open-log",
                 "show this branch's history in the main pane",
@@ -2012,7 +2083,11 @@ mod tests {
             Resolve::Run("view.page-down")
         );
         assert_eq!(k.resolve(&modes, &keys("G")), Resolve::Run("view.bottom"));
-        assert_eq!(k.resolve(&modes, &keys("z")), Resolve::None);
+        assert_eq!(
+            k.resolve(&modes, &keys("z")),
+            Resolve::Run("history.undo"),
+            "undo is global: history is not a pane's"
+        );
     }
 
     #[test]
