@@ -5227,6 +5227,8 @@ fn tui_availability(repo: bool, operation: Option<&Operation>) -> Availability {
         "merge.take-both",
         "merge.undo",
         "merge.options",
+        "merge.next-conflict",
+        "merge.prev-conflict",
         // A repository is what a switch aims away from and at; both are
         // answerable from a fixture view, which is where a repository
         // gets opened from when the launch had none.
@@ -5278,6 +5280,26 @@ fn tui_availability(repo: bool, operation: Option<&Operation>) -> Availability {
             a.disabled("files.toggle-side", "a fixture has no file to preview");
             a.disabled("stashes.open-diff", "a fixture has no stash to preview");
             a.disabled("branches.open-log", "a fixture has no history to open");
+            a.disabled(
+                "merge.take-side",
+                "a fixture has no repository to resolve in",
+            );
+            a.disabled(
+                "merge.take-ours",
+                "a fixture has no repository to resolve in",
+            );
+            a.disabled(
+                "merge.take-theirs",
+                "a fixture has no repository to resolve in",
+            );
+            a.disabled(
+                "merge.take-both",
+                "a fixture has no repository to resolve in",
+            );
+            a.disabled("merge.undo", "a fixture has no repository to undo in");
+            a.disabled("merge.options", "a fixture has no conflict to answer");
+            a.disabled("merge.next-conflict", "a fixture has no conflict to walk");
+            a.disabled("merge.prev-conflict", "a fixture has no conflict to walk");
         }
     }
     // The lifecycle keys answer whichever operation stands — the one fact
@@ -6741,6 +6763,15 @@ diff --git a/tracked.txt b/tracked.txt
         /// When set, the next sync verb fails with exactly this message and
         /// changes nothing: git's refusal, verbatim.
         refuse_net: Option<String>,
+        /// The conflicted file the merging reads answer: the working-tree
+        /// bytes, the stages git holds for the path, and the record of what
+        /// the region answers and undos aimed at. A `resolve_hunks` really
+        /// applies [`gitten_core::conflict::apply`] here, so a test can
+        /// assert the file's bytes after an answer — not just the request.
+        conflict_bytes: Vec<u8>,
+        conflict_stages: Vec<gitten_git::UnmergedStage>,
+        hunk_answers: Vec<Vec<(usize, gitten_core::conflict::Answer)>>,
+        restores: Vec<Vec<u8>>,
     }
 
     /// A repository that exists only as this struct. Reads answer what the
@@ -6830,6 +6861,59 @@ diff --git a/tracked.txt b/tracked.txt
             let mut s = self.0.lock().unwrap();
             s.unstaged_reads += 1;
             Ok(filter_pairs(&s.unstaged, path))
+        }
+
+        fn unmerged(&self, _path: &[u8]) -> gitten_git::Result<Vec<gitten_git::UnmergedStage>> {
+            let s = self.0.lock().unwrap();
+            Ok(s.conflict_stages.clone())
+        }
+
+        fn conflict_file(
+            &self,
+            path: &[u8],
+        ) -> gitten_git::Result<gitten_core::conflict::ConflictFile> {
+            let s = self.0.lock().unwrap();
+            Ok(gitten_core::conflict::ConflictFile::parse(
+                gitten_core::status::PathBytes::from_bytes(path),
+                s.conflict_bytes.clone(),
+            ))
+        }
+
+        fn resolve_hunks(
+            &self,
+            path: &[u8],
+            choices: &[(usize, gitten_core::conflict::Answer)],
+        ) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            // The same re-parse-and-validate the real repository runs: the
+            // bytes the fake holds are the working tree, and a stale answer
+            // refuses here exactly as it would refuse there.
+            let file = gitten_core::conflict::ConflictFile::parse(
+                gitten_core::status::PathBytes::from_bytes(path),
+                s.conflict_bytes.clone(),
+            );
+            if !file.is_conflicted() {
+                return Err("the file carries no conflict markers now".into());
+            }
+            if choices.iter().any(|(i, _)| *i >= file.regions.len()) {
+                return Err("the conflict moved under the keyboard".into());
+            }
+            s.conflict_bytes = gitten_core::conflict::apply(&file.bytes, &file.regions, choices)?;
+            s.hunk_answers.push(choices.to_vec());
+            Ok(())
+        }
+
+        fn restore_conflict(
+            &self,
+            _path: &[u8],
+            bytes: Vec<u8>,
+            stages: &[gitten_git::UnmergedStage],
+        ) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            s.restores.push(bytes.clone());
+            s.conflict_bytes = bytes;
+            s.conflict_stages = stages.to_vec();
+            Ok(())
         }
 
         fn pair_untracked(&self, path: &[u8]) -> gitten_git::Result<Option<Pair>> {
@@ -12879,6 +12963,9 @@ diff --git a/tracked.txt b/tracked.txt
                 origin: Some(origin),
                 ..
             }) => Some(origin.clone()),
+            Some(Screens::Merging { view, .. }) => Some(DiffSource::Conflict {
+                path: view.path().clone(),
+            }),
             _ => None,
         }
     }
@@ -15192,5 +15279,347 @@ diff --git a/tracked.txt b/tracked.txt
             );
             let _ = std::fs::remove_dir(&scratch);
         });
+    }
+
+    // ------------------------------------------------------- the merging view
+
+    /// The conflicted file a merging view opens on: two regions, exactly
+    /// the bytes `git merge` leaves, the two stages git holds, and a status
+    /// whose conflict section names the path — the world every test below
+    /// walks.
+    fn conflict_world() -> (Handle, Arc<Mutex<FakeState>>) {
+        let bytes = "\
+shared top
+<<<<<<< ours
+ours one
+=======
+theirs one
+>>>>>>> them
+shared middle
+<<<<<<< ours
+ours two
+=======
+theirs two
+>>>>>>> them
+shared tail
+";
+        let mut status = Status::default();
+        status.conflicts.push(ConflictEntry {
+            path: PathBytes::from("f.txt"),
+            state: ConflictKind::BothModified,
+            kind: Kind::File,
+            submodule: Submodule::default(),
+        });
+        let (locals, remotes, head) = one_branch();
+        let state = Arc::new(Mutex::new(FakeState {
+            before: vec![pair("f.txt", side(0), side(1))],
+            after: vec![pair("f.txt", side(0), side(1))],
+            refuses: Vec::new(),
+            stashes: two_stashes(),
+            status,
+            locals,
+            remotes,
+            head: Some(head),
+            conflict_bytes: bytes.as_bytes().to_vec(),
+            conflict_stages: vec![
+                gitten_git::UnmergedStage {
+                    mode: "100644".into(),
+                    oid: "aaaa".repeat(8),
+                    stage: 2,
+                },
+                gitten_git::UnmergedStage {
+                    mode: "100644".into(),
+                    oid: "bbbb".repeat(8),
+                    stage: 3,
+                },
+            ],
+            ..Default::default()
+        }));
+        (Arc::new(FakeRepo(Arc::clone(&state))), state)
+    }
+
+    /// Puts the files pane's keyboard on its conflict row, wherever the
+    /// section headings put it.
+    fn onto_the_conflict(app: &mut App) {
+        app.dispatch("files.focus");
+        for _ in 0..16 {
+            let on_it = matches!(
+                files_of(app).current_file(),
+                Some(file) if file.section == files::Section::Conflicts
+            );
+            if on_it {
+                return;
+            }
+            app.dispatch("view.down");
+        }
+        panic!("the files pane never reached its conflict row");
+    }
+
+    /// Opens the merging view the way a key does — eye on the conflict row
+    /// — and waits for the lane's answer to install.
+    fn open_merging(app: &mut App) {
+        onto_the_conflict(app);
+        app.dispatch("files.open-diff");
+        app.pump_quiet();
+    }
+
+    #[test]
+    fn tui_parity_a_conflict_row_previews_its_merging_view() {
+        let (handle, _state) = conflict_world();
+        let mut app = commits_app(&handle);
+        open_merging(&mut app);
+        assert_eq!(
+            origin_of(&app),
+            Some(DiffSource::Conflict {
+                path: PathBytes::from("f.txt"),
+            }),
+            "the eye on a conflict row asks for the conflict, not a diff"
+        );
+        assert!(
+            matches!(app.panes.get("diff"), Some(Screens::Merging { .. })),
+            "the main pane is the merging view"
+        );
+        // The keyboard rode the install, and the mode with it: the merge
+        // keys resolve now.
+        assert_eq!(app.panes.focused_name(), "diff");
+        // The pane says where it is: the keyboard opens on the file's
+        // first line — context between nothing and the first conflict —
+        // and one row down is inside region 1.
+        let status = app
+            .panes
+            .focused()
+            .map(|p| p.status(&app.host))
+            .unwrap_or_default();
+        assert!(status.contains("between conflicts"), "{status:?}");
+        app.dispatch("view.down");
+        app.dispatch("view.down");
+        let status = app
+            .panes
+            .focused()
+            .map(|p| p.status(&app.host))
+            .unwrap_or_default();
+        assert!(status.contains("conflict 1/2"), "{status:?}");
+    }
+
+    #[test]
+    fn tui_parity_region_answers_write_their_choices_and_the_file() {
+        let (handle, state) = conflict_world();
+        let mut app = commits_app(&handle);
+        open_merging(&mut app);
+
+        // The keyboard opens on the file's first line — context, not a
+        // region — and a named answer there is refused, not guessed.
+        app.dispatch("merge.take-ours");
+        assert_eq!(
+            state.lock().unwrap().hunk_answers,
+            Vec::<Vec<(usize, gitten_core::conflict::Answer)>>::new()
+        );
+        assert!(
+            app.message.contains("not on a conflict"),
+            "{:?}",
+            app.message
+        );
+
+        // Onto region 1's opener: the named answer aims at that region,
+        // whatever half the keyboard happens to sit in.
+        app.dispatch("view.down");
+        app.dispatch("merge.take-ours");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                !state.lock().unwrap().hunk_answers.is_empty()
+            }),
+            "the answer never reached the repository"
+        );
+        assert_eq!(
+            state.lock().unwrap().hunk_answers,
+            vec![vec![(0, gitten_core::conflict::Answer::Ours)]],
+        );
+        // The file really changed, the way the answer said: ours one, and
+        // region 2's markers untouched.
+        assert_eq!(
+            String::from_utf8_lossy(&state.lock().unwrap().conflict_bytes),
+            "shared top\nours one\nshared middle\n<<<<<<< ours\nours two\n=======\ntheirs two\n>>>>>>> them\nshared tail\n",
+        );
+    }
+
+    #[test]
+    fn tui_parity_take_side_reads_the_half_under_the_keyboard() {
+        let (handle, state) = conflict_world();
+        let mut app = commits_app(&handle);
+        open_merging(&mut app);
+
+        // Two rows down is region 1's ours line: take-side takes ours.
+        app.dispatch("view.down");
+        app.dispatch("view.down");
+        app.dispatch("merge.take-side");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                !state.lock().unwrap().hunk_answers.is_empty()
+            }),
+            "the take-side never reached the repository"
+        );
+        assert_eq!(
+            state.lock().unwrap().hunk_answers,
+            vec![vec![(0, gitten_core::conflict::Answer::Ours)]],
+        );
+
+        // The first answer's finish re-read the file: one region left, its
+        // own parse. The conflict jump walks the *current* file, and the
+        // second take-side addresses region 1 of that parse — the answer
+        // the renumbered file can actually validate.
+        app.dispatch("merge.next-conflict");
+        for _ in 0..3 {
+            app.dispatch("view.down");
+        }
+        app.dispatch("merge.take-side");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                state.lock().unwrap().hunk_answers.len() > 1
+            }),
+            "the second take-side never reached the repository"
+        );
+        assert_eq!(
+            state.lock().unwrap().hunk_answers,
+            vec![
+                vec![(0, gitten_core::conflict::Answer::Ours)],
+                vec![(0, gitten_core::conflict::Answer::Theirs)],
+            ],
+        );
+        // Both halves answered in one file: the markers are gone and the
+        // file is what the two answers combine to.
+        assert_eq!(
+            String::from_utf8_lossy(&state.lock().unwrap().conflict_bytes),
+            "shared top\nours one\nshared middle\ntheirs two\nshared tail\n",
+        );
+    }
+
+    #[test]
+    fn tui_parity_the_seam_refuses_a_choice_and_the_base_says_why() {
+        let (handle, state) = conflict_world();
+        let mut app = commits_app(&handle);
+        open_merging(&mut app);
+
+        // Row 1 is the opener: a side asked for there is the seam, not a
+        // half.
+        app.dispatch("view.down");
+        app.dispatch("merge.take-side");
+        assert_eq!(
+            state.lock().unwrap().hunk_answers,
+            Vec::<Vec<(usize, gitten_core::conflict::Answer)>>::new()
+        );
+        assert!(
+            app.message.contains("marker or the base"),
+            "{:?}",
+            app.message
+        );
+    }
+
+    #[test]
+    fn tui_parity_undo_walks_the_session_back_and_says_when_it_is_empty() {
+        let (handle, state) = conflict_world();
+        let mut app = commits_app(&handle);
+        open_merging(&mut app);
+
+        // Two answers: ours into region 1, then the conflict jump and
+        // theirs into region 2.
+        app.dispatch("view.down");
+        app.dispatch("view.down");
+        app.dispatch("merge.take-ours");
+        assert!(until(Duration::from_secs(2), || {
+            app.pump_quiet();
+            !state.lock().unwrap().hunk_answers.is_empty()
+        }));
+        app.dispatch("merge.next-conflict");
+        for _ in 0..3 {
+            app.dispatch("view.down");
+        }
+        app.dispatch("merge.take-theirs");
+        assert!(until(Duration::from_secs(2), || {
+            app.pump_quiet();
+            state.lock().unwrap().hunk_answers.len() > 1
+        }));
+        let both = String::from_utf8_lossy(&state.lock().unwrap().conflict_bytes).to_string();
+
+        // First undo: the last answer leaves, byte for byte.
+        app.dispatch("merge.undo");
+        assert!(until(Duration::from_secs(2), || {
+            app.pump_quiet();
+            !state.lock().unwrap().restores.is_empty()
+        }));
+        let after_one = String::from_utf8_lossy(&state.lock().unwrap().conflict_bytes).to_string();
+        assert_ne!(after_one, both, "the first undo changed the file");
+        assert!(
+            after_one.contains("<<<<<<< ours"),
+            "the file is a conflict again: {after_one:?}"
+        );
+
+        // Second undo: the first answer leaves too, and the file is the
+        // conflict it opened as.
+        app.dispatch("merge.undo");
+        assert!(until(Duration::from_secs(2), || {
+            app.pump_quiet();
+            state.lock().unwrap().restores.len() > 1
+        }));
+        assert_eq!(
+            String::from_utf8_lossy(&state.lock().unwrap().conflict_bytes),
+            "shared top\n<<<<<<< ours\nours one\n=======\ntheirs one\n>>>>>>> them\nshared middle\n<<<<<<< ours\nours two\n=======\ntheirs two\n>>>>>>> them\nshared tail\n",
+        );
+        assert_eq!(
+            state.lock().unwrap().conflict_stages.len(),
+            2,
+            "the stages came back with the bytes"
+        );
+
+        // The session is spent: the third undo says so and writes nothing.
+        let restores = state.lock().unwrap().restores.len();
+        app.dispatch("merge.undo");
+        app.pump_quiet();
+        assert_eq!(state.lock().unwrap().restores.len(), restores);
+        assert!(
+            app.message.contains("nothing left to undo"),
+            "{:?}",
+            app.message
+        );
+    }
+
+    #[test]
+    fn tui_parity_one_answered_region_leaves_the_other_unmerged() {
+        let (handle, state) = conflict_world();
+        let mut app = commits_app(&handle);
+        open_merging(&mut app);
+        app.dispatch("view.down");
+        app.dispatch("view.down");
+        app.dispatch("merge.take-both");
+        assert!(until(Duration::from_secs(2), || {
+            app.pump_quiet();
+            !state.lock().unwrap().hunk_answers.is_empty()
+        }));
+        // Region 1 answered both, ours first; region 2 keeps its markers —
+        // which is what keeps the file unmerged in git's own eyes.
+        assert_eq!(
+            String::from_utf8_lossy(&state.lock().unwrap().conflict_bytes),
+            "shared top\nours one\ntheirs one\nshared middle\n<<<<<<< ours\nours two\n=======\ntheirs two\n>>>>>>> them\nshared tail\n",
+        );
+        assert_eq!(state.lock().unwrap().conflict_stages.len(), 2);
+    }
+
+    #[test]
+    fn tui_parity_merge_options_hands_the_keyboard_back_to_the_row() {
+        let (handle, _state) = conflict_world();
+        let mut app = commits_app(&handle);
+        open_merging(&mut app);
+        app.dispatch("merge.options");
+        assert_eq!(app.panes.focused_name(), "files");
+        // The band names the four keys from the keymap, so a rebind moves
+        // this line the way it moves help.
+        assert!(
+            app.message.contains("whole-file answers"),
+            "{:?}",
+            app.message
+        );
+        assert!(app.message.contains('o'), "{:?}", app.message);
     }
 }

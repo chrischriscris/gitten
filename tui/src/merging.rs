@@ -14,12 +14,11 @@
 //! and `z` restores the last snapshot — bytes to the working tree, stages
 //! back through `update-index --index-info`, so the path is unmerged again
 //! in git's own eyes, not merely marker-fested while the index says
-//! resolved. The stack is this view's own session: it dies with the view,
-//! and it dies when the file stops being conflicted — a stack that promises
-//! to undo yesterday's answer onto today's resolved file is a stack that
-//! lies. An external change *between* an answer and its undo is overwritten
-//! by the undo: the snapshot is what is restored, and that is the
-//! documentation, not an accident.
+//! resolved — including the answer that resolved the file whole, which is
+//! the undo that matters most. The stack is this view's own session: it
+//! dies with the view, and nothing else. An external change *between* an
+//! answer and its undo is overwritten by the undo: the snapshot is what is
+//! restored, and that is the documentation, not an accident.
 
 use crate::screen::{Ink, Screen};
 use crate::scrollbar::{self, Bar};
@@ -127,11 +126,11 @@ impl Merging {
     }
 
     /// Swaps in a re-read of the same path. The keyboard keeps its row and
-    /// clamps; the undo stack survives a refresh of an *unresolved* file —
-    /// the same conflict, re-read, is the session's own file — and dies
-    /// when the file has none left, because there is no honest answer an
-    /// old snapshot gives a resolved one. See the [module
-    /// documentation](self) for the boundary this draws.
+    /// clamps. The undo stack survives: these snapshots are *this session's*
+    /// answers, and an undo that cannot reach the resolution that emptied
+    /// the markers is an undo that lies about `z`. What it restores is the
+    /// snapshot — see the [module documentation](self) for the boundary
+    /// that draws on external changes.
     pub fn replace(&mut self, file: ConflictFile, stages: Vec<UnmergedStage>) {
         self.dragging = false;
         let (cursor, top) = (self.view.cursor(), self.view.top());
@@ -148,9 +147,6 @@ impl Merging {
         self.view.set_len(self.places.len());
         self.view
             .go_to(cursor.min(self.places.len().saturating_sub(1)));
-        if !self.file.is_conflicted() {
-            self.undo.clear();
-        }
     }
 
     /// Whether the file still carries regions — the gate every answer verb
@@ -468,4 +464,128 @@ fn display_lines(bytes: &[u8]) -> Vec<String> {
         .split_inclusive(|b| *b == b'\n')
         .map(|line| String::from_utf8_lossy(line.strip_suffix(b"\n").unwrap_or(line)).into_owned())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::screen::Screen;
+
+    /// Two regions, the shape every assertion below is pinned to.
+    const TWO: &[u8] = b"top\n<<<<<<< ours\nours one\n=======\ntheirs one\n>>>>>>> them\nmid\n\
+<<<<<<< ours\nours two\n=======\ntheirs two\n>>>>>>> them\ntail\n";
+
+    fn stages() -> Vec<UnmergedStage> {
+        vec![
+            UnmergedStage {
+                mode: "100644".into(),
+                oid: "a".repeat(40),
+                stage: 2,
+            },
+            UnmergedStage {
+                mode: "100644".into(),
+                oid: "b".repeat(40),
+                stage: 3,
+            },
+        ]
+    }
+
+    fn view() -> Merging {
+        Merging::new(
+            PathBytes::from("f.txt"),
+            ConflictFile::parse(PathBytes::from("f.txt"), TWO.to_vec()),
+            stages(),
+        )
+    }
+
+    #[test]
+    fn the_rows_say_which_region_and_half_the_keyboard_is_on() {
+        let mut v = view();
+        v.resize(40, 13);
+        assert_eq!(v.status(), "1/13 · between conflicts");
+        v.down();
+        v.down();
+        assert_eq!(
+            v.under_the_keyboard(),
+            Some((0, Answer::Ours)),
+            "row 2 is region 1's ours line"
+        );
+        assert_eq!(v.status(), "3/13 · conflict 1/2");
+        // The seam refuses a side: opener, separator, close, base.
+        v.up();
+        assert_eq!(v.under_the_keyboard(), None);
+    }
+
+    #[test]
+    fn the_conflict_jump_walks_regions_and_stops() {
+        let mut v = view();
+        v.resize(40, 13);
+        v.jump_region(1);
+        assert_eq!(v.current_region(), Some(0));
+        v.jump_region(1);
+        assert_eq!(v.current_region(), Some(1));
+        v.jump_region(1);
+        assert_eq!(v.current_region(), Some(1), "the last region holds");
+        v.jump_region(-1);
+        assert_eq!(v.current_region(), Some(0), "the first region holds");
+    }
+
+    #[test]
+    fn the_undo_stack_is_the_session_and_it_is_honest_about_being_empty() {
+        let mut v = view();
+        v.resize(40, 13);
+        assert_eq!(v.pop_undo(), None, "nothing answered yet");
+        v.push_undo(v.snapshot());
+        let step = v.pop_undo().expect("the snapshot came back");
+        assert_eq!(step.bytes, TWO.to_vec());
+        assert_eq!(step.stages.len(), 2);
+        assert_eq!(v.pop_undo(), None);
+    }
+
+    #[test]
+    fn a_resolved_file_draws_quiet_and_refuses_every_answer() {
+        let mut v = Merging::new(
+            PathBytes::from("f.txt"),
+            ConflictFile::parse(PathBytes::from("f.txt"), b"all settled\n".to_vec()),
+            Vec::new(),
+        );
+        v.resize(40, 3);
+        assert!(v.status().contains("no conflict markers"));
+        assert_eq!(v.under_the_keyboard(), None);
+        assert_eq!(v.current_region(), None);
+
+        // The content is content even with nothing to answer; the state
+        // lives in the status line, which is the one place a reader is
+        // told the markers are gone.
+        let host = Host::new();
+        let mut screen = Screen::new(40, 3);
+        v.paint(&mut screen, 0, 0, true, &host);
+        assert!(
+            screen.row_text(0).contains("all settled"),
+            "{:?}",
+            screen.row_text(0)
+        );
+    }
+
+    #[test]
+    fn ours_wears_the_addition_ink_and_theirs_the_removal_ink() {
+        let host = Host::new();
+        let mut v = view();
+        v.resize(40, 13);
+        let mut screen = Screen::new(40, 13);
+        screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
+        v.paint(&mut screen, 0, 0, false, &host);
+        // Row 2 is ours, row 4 theirs: the diff's two hues, on the pane's
+        // own background — the choice is not yet made, so no row paints an
+        // added or removed background.
+        let ours = screen.ink(0, 2).unwrap();
+        assert_eq!(ours.fg, host.theme.diff.adds_fg);
+        assert_eq!(ours.bg, host.theme.chrome.bg);
+        let theirs = screen.ink(0, 4).unwrap();
+        assert_eq!(theirs.fg, host.theme.diff.dels_fg);
+        // The markers are the gutter's ink.
+        assert_eq!(screen.ink(0, 1).unwrap().fg, host.theme.diff.gutter_fg);
+        // Context is the pane's ordinary text.
+        assert_eq!(screen.ink(0, 0).unwrap().fg, host.theme.chrome.fg);
+    }
 }

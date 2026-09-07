@@ -113,12 +113,11 @@ impl ConflictFile {
     }
 }
 
-/// Is this line a marker run of `c`, at least `run` wide, ending the line or
-/// introducing a label?
-fn is_marker(line: &[u8], c: u8, run: usize) -> bool {
-    line.len() >= run
-        && line[..run].iter().all(|&b| b == c)
-        && line[run..].first().is_none_or(|&b| b == b' ')
+/// Is this line a marker run of `c` — at least `min` wide, ending the line
+/// or introducing a label?
+fn is_marker(line: &[u8], c: u8, min: usize) -> bool {
+    let run = run_of(line, c);
+    run >= min && line[run..].first().is_none_or(|&b| b == b' ')
 }
 
 /// The exact run length of `c` this line opens with.
@@ -439,11 +438,13 @@ theirs
     #[test]
     fn nested_regions_pair_by_run_length() {
         // git grows an outer region's markers when one conflict nests
-        // inside another; pairing on the run length is what tells the inner
-        // region's closer from the outer's.
+        // inside another; pairing on the run length is what tells the
+        // inner region's closer from the outer's. The inner is its own
+        // region — the outer's ours half holds it — and the outer is
+        // found second, when its own close pops it.
         let bytes = file(
             "\
-<<<<<<< outer
+<<<<<<<<< outer
 outer ours
 <<<<<<< inner
 inner ours
@@ -451,15 +452,21 @@ inner ours
 inner theirs
 >>>>>>> inner
 outer theirs
-=======
+=========
 outer theirs side
->>>>>>> outer
+>>>>>>>>> outer
 ",
         );
         let regions = parse(&bytes);
-        assert_eq!(regions.len(), 1, "the inner markers are outer text");
-        assert_eq!(regions[0].start, 0);
-        assert_eq!(regions[0].end, 9);
+        assert_eq!(regions.len(), 2, "inner and outer, each its own region");
+        assert_eq!(regions[0].start, 2, "the inner region, first closed");
+        assert_eq!(regions[0].end, 6);
+        assert_eq!(regions[1].start, 0);
+        assert_eq!(regions[1].end, 10);
+        assert_eq!(regions[1].sep, 8, "the outer separator is its own width");
+        // The outer's ours half spans the nested block; answering it keeps
+        // whatever the inner still holds.
+        assert_eq!(regions[1].ours().count(), 7);
     }
 
     #[test]
@@ -470,6 +477,6 @@ outer theirs side
         let regions = parse(&bytes);
         assert_eq!(regions.len(), 1);
         let out = apply(&bytes, &regions, &[(0, Answer::Ours)]).unwrap();
-        assert_eq!(&out[13..16], &[0xff, 0xfe, b'\n']);
+        assert_eq!(out, vec![0xff, 0xfe, b'\n']);
     }
 }

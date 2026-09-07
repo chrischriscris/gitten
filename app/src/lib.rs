@@ -35,6 +35,7 @@
 //! match start.loaded.data {
 //!     acquire::Data::Diff(files) => { /* draw */ }
 //!     acquire::Data::Commits(commits) => { /* draw */ }
+//!     acquire::Data::Conflict(..) => { /* a launch never opens on one */ }
 //! }
 //! ```
 //!

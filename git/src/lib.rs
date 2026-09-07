@@ -992,12 +992,14 @@ pub trait Repo: Send + Sync {
         Err(unserved("applying region answers"))
     }
 
-    /// Puts a conflicted path back the way a snapshot found it: the bytes
-    /// written as they were, and the unmerged stages restored through
-    /// `update-index --index-info` — the undo of this session's region
-    /// answers. The stages come from [`Repo::unmerged`] read *before* the
-    /// choice they undo; their object ids are already in the store, and
-    /// resolution never rewrote them.
+    /// Puts a conflicted path back the way a snapshot found it — the undo
+    /// of this session's region answers. `git checkout -m` recreates the
+    /// conflict from the same inputs the merge read, with the conflict
+    /// flags every reader agrees on; the snapshot's bytes go over it, so
+    /// the worktree is byte-for-byte what the session answered from. Where
+    /// no merge can be re-run, the captured stages go back by id through
+    /// `update-index --index-info` — read from [`Repo::unmerged`] *before*
+    /// the choice they undo, their object ids unchanged by any resolution.
     fn restore_conflict(
         &self,
         _path: &[u8],
@@ -2159,27 +2161,23 @@ impl Repo for Binary {
                     Side::Ours => 2,
                     _ => 3,
                 };
-                // A stage that exists: its content becomes the answer. One
-                // that does not: that side's answer *is* the deletion, and
-                // only that case reaches `git rm -f` — a checkout that
-                // failed for any other reason comes back as the error it
-                // is, because "the working tree refused" silently turned
+                // The stage decides the verb, before anything runs. A stage
+                // that exists: its content becomes the answer, checkout
+                // then add — and a checkout that fails anyway comes back as
+                // the error it is. One that does not: that side's answer
+                // *is* the deletion, and only that case reaches `git rm
+                // -f` — because "the working tree refused" silently turning
                 // into "the file was deleted" is how a resolution eats a
                 // file nobody asked to remove.
-                if run_bytes(&self.root, &[b"checkout", which, b"--", path]).is_ok() {
-                    run_bytes(&self.root, &[b"add", b"--", path]).map(|_| ())
+                let have = self
+                    .unmerged(path)
+                    .is_ok_and(|stages| stages.iter().any(|stage| stage.stage == want));
+                if !have {
+                    run_bytes(&self.root, &[b"rm", b"-f", b"--", path]).map(|_| ())
                 } else {
-                    let refused = run_bytes(&self.root, &[b"checkout", which, b"--", path]);
-                    let have = self
-                        .unmerged(path)
-                        .is_ok_and(|stages| stages.iter().any(|stage| stage.stage == want));
-                    if have {
-                        // The stage is there and checkout still refused:
-                        // say why, and never guess.
-                        refused.map(|_| ())
-                    } else {
-                        run_bytes(&self.root, &[b"rm", b"-f", b"--", path]).map(|_| ())
-                    }
+                    run_bytes(&self.root, &[b"checkout", which, b"--", path])
+                        .and_then(|_| run_bytes(&self.root, &[b"add", b"--", path]))
+                        .map(|_| ())
                 }
             }
         }
@@ -2277,9 +2275,24 @@ impl Repo for Binary {
     ) -> Result<()> {
         refuse_dashes(path)?;
         let at = join_raw(&self.root, path);
-        // The bytes first, so the worktree and the index agree on which
-        // conflict is standing again; then the stages, by id — the blobs
-        // they name are still in the store, resolution never rewrote them.
+        // git's own machinery first: `checkout -m` recreates the conflict
+        // from the same inputs the original merge read, with the conflict
+        // flags every reader agrees on — `ls-files -u` alone is not that,
+        // and a restore that left status spelling the path as merely
+        // modified would drop it from the conflict list it is supposed to
+        // rejoin.
+        if run_bytes(&self.root, &[b"checkout", b"-m", b"--", path]).is_ok() {
+            // The recreated conflict should be the snapshot byte for byte —
+            // same stages, same inputs — and the snapshot is what the
+            // session answered from, so it is what the worktree shows.
+            std::fs::write(&at, &bytes)
+                .map_err(|e| format!("could not write {}: {e}", at.display()))?;
+            return Ok(());
+        }
+        // No merge to re-run (the operation's refs are gone, or the
+        // conflict outlived them): the captured stages are the fallback —
+        // written by id, the contents never having moved. The index is
+        // exactly as it was; only status's spelling of it is coarser.
         std::fs::write(&at, &bytes)
             .map_err(|e| format!("could not write {}: {e}", at.display()))?;
         if stages.is_empty() {
@@ -9203,6 +9216,173 @@ mod tests {
             std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
             b"main\nside\n"
         );
+    }
+
+    /// A merge that stopped on a two-region conflict in `f.txt` and a
+    /// second conflicted file `other.txt` — the world the region answers
+    /// are aimed at, where answering one file must not resolve the other.
+    fn two_region_conflict(name: &str) -> Scratch {
+        // A five-line gap between the edits: git folds two conflicts whose
+        // unchanged gap is too small into one region, and this fixture is
+        // about two regions.
+        let r = Scratch::new(name);
+        r.write("f.txt", b"top\nmid1\nmid2\nmid3\nmid4\nmid5\ntail\n");
+        r.write("other.txt", b"same on both sides\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        r.git(&["checkout", "-qb", "theirs"]);
+        r.write(
+            "f.txt",
+            b"top\ntheirs one\nmid1\nmid2\nmid3\nmid4\nmid5\ntheirs two\ntail\n",
+        );
+        r.write("other.txt", b"changed by theirs\n");
+        r.git(&["commit", "-aqm", "theirs"]);
+        r.git(&["checkout", "-q", "main"]);
+        r.write(
+            "f.txt",
+            b"top\nours one\nmid1\nmid2\nmid3\nmid4\nmid5\nours two\ntail\n",
+        );
+        r.write("other.txt", b"changed by ours\n");
+        r.git(&["commit", "-aqm", "ours"]);
+        r.git_failing(&["merge", "theirs"]);
+        r
+    }
+
+    #[test]
+    fn region_answers_write_the_combined_file_and_stage_it() {
+        let r = two_region_conflict("merge-hunks-answers");
+        let g = r.open();
+        // The parse is what git wrote, two regions, no base (no diff3).
+        let file = g.conflict_file(b"f.txt").expect("the conflicted file");
+        assert_eq!(file.regions.len(), 2);
+        let stages = g.unmerged(b"f.txt").expect("the stages");
+        assert_eq!(
+            stages.iter().map(|s| s.stage).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "base, ours and theirs are what a merge holds"
+        );
+
+        // Ours in region one; region two keeps its markers.
+        g.resolve_hunks(b"f.txt", &[(0, gitten_core::conflict::Answer::Ours)])
+            .expect("the answer");
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"top\nours one\nmid1\nmid2\nmid3\nmid4\nmid5\n<<<<<<< HEAD\nours two\n=======\ntheirs two\n>>>>>>> theirs\ntail\n",
+        );
+        // Staged, and no longer unmerged: git's own shape for a path whose
+        // stages collapsed under `git add`.
+        let status =
+            String::from_utf8(r.git_os_out(&["status".into(), "--porcelain".into()])).unwrap();
+        assert!(
+            status.contains("M  f.txt"),
+            "the answered file is staged: {status:?}"
+        );
+        assert!(g.unmerged(b"f.txt").unwrap().is_empty());
+
+        // The other conflicted file was not touched by f.txt's answer.
+        assert_eq!(g.unmerged(b"other.txt").unwrap().len(), 3);
+    }
+
+    #[test]
+    fn an_undo_puts_the_bytes_and_the_stages_back() {
+        let r = two_region_conflict("merge-hunks-undo");
+        let g = r.open();
+        let before = g.conflict_file(b"f.txt").unwrap();
+        let stages = g.unmerged(b"f.txt").unwrap();
+
+        g.resolve_hunks(b"f.txt", &[(0, gitten_core::conflict::Answer::Both)])
+            .expect("the answer");
+        assert!(g.unmerged(b"f.txt").unwrap().is_empty());
+
+        g.restore_conflict(b"f.txt", before.bytes.clone(), &stages)
+            .expect("the undo");
+        // The bytes are the conflict again, byte for byte, and the stages
+        // are in the index — the path is unmerged in git's own eyes, which
+        // `git status` spells `UU`.
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            before.bytes,
+        );
+        assert_eq!(g.unmerged(b"f.txt").unwrap().len(), 3);
+        let status =
+            String::from_utf8(r.git_os_out(&["status".into(), "--porcelain".into()])).unwrap();
+        assert!(
+            status.contains("UU f.txt"),
+            "the undo re-merged: {status:?}"
+        );
+    }
+
+    #[test]
+    fn a_stale_region_answer_refuses_before_anything_is_written() {
+        let r = two_region_conflict("merge-hunks-stale");
+        let g = r.open();
+        let before = g.conflict_file(b"f.txt").unwrap();
+        let err = g
+            .resolve_hunks(b"f.txt", &[(5, gitten_core::conflict::Answer::Ours)])
+            .unwrap_err();
+        assert!(
+            err.contains("moved under the keyboard"),
+            "the refusal names the staleness: {err}"
+        );
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            before.bytes,
+            "a refused answer wrote nothing"
+        );
+        assert_eq!(g.unmerged(b"f.txt").unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_file_whose_markers_are_gone_refuses_region_answers() {
+        let r = two_region_conflict("merge-hunks-resolved");
+        let g = r.open();
+        g.resolve_hunks(b"f.txt", &[(0, gitten_core::conflict::Answer::Ours)])
+            .expect("the first answer");
+        g.resolve_hunks(b"f.txt", &[(0, gitten_core::conflict::Answer::Ours)])
+            .expect("the second answer");
+        let err = g
+            .resolve_hunks(b"f.txt", &[(0, gitten_core::conflict::Answer::Ours)])
+            .unwrap_err();
+        assert!(
+            err.contains("no conflict markers"),
+            "the refusal says the file is whole: {err}"
+        );
+    }
+
+    #[test]
+    fn a_delete_modify_side_takes_the_rm_only_where_the_stage_is_gone() {
+        // Theirs deleted the file; ours edited it. `DU` in git's own
+        // spelling: stage 2 exists, stage 3 does not.
+        let r = Scratch::new("merge-hunks-delete-modify");
+        r.write("f.txt", b"base\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        r.git(&["checkout", "-qb", "theirs"]);
+        r.git(&["rm", "-q", "f.txt"]);
+        r.git(&["commit", "-aqm", "theirs deleted it"]);
+        r.git(&["checkout", "-q", "main"]);
+        r.write("f.txt", b"ours kept it\n");
+        r.git(&["commit", "-aqm", "ours edited it"]);
+        r.git_failing(&["merge", "theirs"]);
+
+        let g = r.open();
+        let stages = g.unmerged(b"f.txt").unwrap();
+        assert_eq!(
+            stages.iter().map(|s| s.stage).collect::<Vec<_>>(),
+            vec![1, 2],
+            "base and ours exist; theirs' deletion has no stage"
+        );
+        // Ours' stage exists: checkout answers, and no rm ever runs.
+        g.resolve(b"f.txt", Side::Ours).expect("resolve ours");
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"ours kept it\n",
+        );
+        // Theirs' answer *is* the deletion — and by now the first answer
+        // collapsed the stages, so the rider falls to the rm on a file
+        // that is there to remove.
+        g.resolve(b"f.txt", Side::Theirs).expect("resolve theirs");
+        assert!(!join_raw(&r.0, b"f.txt").exists());
     }
 
     #[test]
