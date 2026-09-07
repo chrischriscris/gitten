@@ -11,6 +11,7 @@ use std::sync::Arc;
 pub use crate::source::DiffSource;
 
 pub mod align;
+pub mod clipboard;
 pub mod command;
 pub mod conflict;
 pub mod differ;

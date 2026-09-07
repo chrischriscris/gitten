@@ -595,6 +595,19 @@ impl Keymap {
         // takes no confirmation dance either: dropping the copy undoes the
         // pick.
         bind("commits", "Y", "commits.cherry-pick");
+        // The cherry-pick clipboard, lazygit's C/V/ctrl+r family on keys
+        // this pane can spare. `C` itself is taken — it continues a rebase —
+        // so the copy is its lowercase twin; `v` marks the range, so the
+        // paste is the capital beside it, and the clear is the chord
+        // lazygit uses. `c` copies the marked range when one stands, else
+        // the row alone; `V` replays the clipboard front to back.
+        bind("commits", "c", "commits.copy");
+        bind("commits", "V", "commits.paste");
+        bind("commits", "ctrl-r", "commits.clear-copies");
+        // lazygit's own `a`: the author of HEAD back to the current user.
+        // HEAD only — a deeper commit's author is a rebase, and that UI is
+        // a later slice — so anything older refuses by name.
+        bind("commits", "a", "commits.reset-author");
         // Tagging the commit under the keyboard, on lazygit's own T. It
         // shadows theme.cycle inside this pane — a tag belongs here and the
         // theme is reachable everywhere else — which is the same
@@ -1340,6 +1353,26 @@ impl Commands {
                 "commits.cherry-pick",
                 "apply this commit onto the current branch as a new commit",
                 Some("cherry-pick"),
+            ),
+            (
+                "commits.copy",
+                "copy this commit — or the marked range — onto the cherry-pick clipboard",
+                Some("copy"),
+            ),
+            (
+                "commits.paste",
+                "cherry-pick every copied commit, in the order copied",
+                Some("paste"),
+            ),
+            (
+                "commits.clear-copies",
+                "empty the cherry-pick clipboard",
+                Some("clear copies"),
+            ),
+            (
+                "commits.reset-author",
+                "reset HEAD's author to the current user, asked twice",
+                Some("reset author"),
             ),
             (
                 "commits.new-tag",
@@ -2147,7 +2180,9 @@ mod tests {
         // d drop, T tag, n new-branch, space checkout — and g opens the
         // reset question rather than any strength firing directly. `f`
         // shadows repo.fetch inside the pane, lazygit's own trade; `h` is
-        // nobody's here, so the pane move keeps it.
+        // nobody's here, so the pane move keeps it. The clipboard answers
+        // on the keys lazygit's C/V chord can spare here — `C` itself
+        // continues a rebase, `v` marks — and the author on lazygit's `a`.
         let mut commits = Modes::new();
         commits.push("commits");
         for (chord, name) in [
@@ -2162,6 +2197,10 @@ mod tests {
             ("space", "commits.checkout"),
             ("Z", "commits.cherry-pick-abort"),
             ("X", "commits.cherry-pick-continue"),
+            ("c", "commits.copy"),
+            ("V", "commits.paste"),
+            ("ctrl-r", "commits.clear-copies"),
+            ("a", "commits.reset-author"),
         ] {
             assert_eq!(
                 k.resolve(&commits, &keys(chord)),
