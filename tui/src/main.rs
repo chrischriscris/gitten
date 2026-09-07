@@ -2426,7 +2426,7 @@ impl App {
     /// to scroll and consumes nothing.
     fn wheel(&mut self, key: Key, col: usize, row: usize) {
         let (_, h) = self.screen.size();
-        if h < 3 || self.prompt.is_some() || self.picker.is_some() {
+        if h < 3 || self.prompt.is_some() || self.picker.is_some() || self.todo.is_some() {
             return;
         }
         if self.help {
@@ -3304,6 +3304,11 @@ impl App {
         // question: it was asked about a commit that is no longer on screen.
         self.clipboard.clear();
         self.history_arm = None;
+        // Both for the same reason the clipboard is cleared: a plan and a
+        // marked base name commits of the repository that just left, and
+        // neither means anything in this one.
+        self.todo = None;
+        self.rebase_base = None;
         self.help = false;
         self.tail = None;
         self.tail_commits.clear();
@@ -3605,10 +3610,16 @@ impl App {
     /// button comes up. One gesture, one pane's selection state.
     fn mouse(&mut self, m: Mouse) {
         let (_, h) = self.screen.size();
-        // The help panel, the picker and any prompt are drawn over the body,
-        // so a click that reached a view through any of them would act on a
-        // row it is hiding. The keyboard gathers the text; the mouse waits.
-        if h < 3 || self.help || self.prompt.is_some() || self.picker.is_some() {
+        // The help panel, the picker, the rebase plan and any prompt are
+        // drawn over the body, so a click that reached a view through any of
+        // them would act on a row it is hiding. The keyboard gathers the
+        // text; the mouse waits.
+        if h < 3
+            || self.help
+            || self.prompt.is_some()
+            || self.picker.is_some()
+            || self.todo.is_some()
+        {
             return;
         }
         match m.kind {
@@ -5286,9 +5297,20 @@ impl App {
                 } => {
                     let write = outcome.err();
                     let mut refresh = None;
+                    // A plan is a window of shas, and the write that just
+                    // landed may have rewritten every one of them. Running
+                    // it afterwards would aim at objects nobody can see any
+                    // more, so the screen closes rather than silently
+                    // retargeting — the editing is cheap to do again, and a
+                    // rewrite aimed at the wrong commits is not.
+                    let mut closed = false;
                     if generation > self.generation {
                         self.generation = generation;
                         refresh = self.refresh_stale(generation).err();
+                        if self.todo.take().is_some() {
+                            self.sync_modes();
+                            closed = true;
+                        }
                     }
                     self.message = match (write, refresh) {
                         (Some(write), Some(refresh)) => format!("{write} · {refresh}"),
@@ -5298,6 +5320,16 @@ impl App {
                         // itself; a job that named its finish gets its word.
                         (None, None) => done.unwrap_or_default(),
                     };
+                    // Said beside whatever the write itself had to say, and
+                    // never instead of it: a job's own refusal is the more
+                    // urgent half of the sentence.
+                    if closed {
+                        const NOTE: &str = "the repository moved — the rebase plan was closed";
+                        self.message = match self.message.is_empty() {
+                            true => NOTE.into(),
+                            false => format!("{} · {NOTE}", self.message),
+                        };
+                    }
                     // A write may have started, finished or abandoned an
                     // operation; the banner and the lifecycle gates re-read
                     // it with everything else the finish wave refreshes.
@@ -17745,6 +17777,49 @@ shared tail
                     .any(|w| w == "rebase abort")
             }),
             "the abort never ran: {:?}",
+            state.lock().unwrap().writes
+        );
+    }
+
+    /// A write landing under an open plan closes it. The plan is a window
+    /// of shas and the write may have rewritten every one of them, so
+    /// running it afterwards would aim at objects nobody can see — the
+    /// editing is cheap to do again, and a rewrite aimed at the wrong
+    /// commits is not.
+    #[test]
+    fn tui_parity_a_plan_closes_when_the_repository_moves_under_it() {
+        let (handle, state) = fake(&[]);
+        let mut app = history_app(&handle);
+        app.dispatch("view.down");
+
+        // A job queued but not yet drained, and the plan opened over the
+        // window it is about to change.
+        app.dispatch("repo.fetch");
+        app.press(Key::char('i'));
+        assert!(app.todo.is_some(), "{:?}", app.message);
+
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                app.todo.is_none()
+            }),
+            "the plan survived the write that landed under it"
+        );
+        assert!(
+            app.message
+                .contains("the repository moved — the rebase plan was closed"),
+            "{:?}",
+            app.message
+        );
+        // And nothing was rewritten on the way: the plan was never run.
+        assert!(
+            !state
+                .lock()
+                .unwrap()
+                .writes
+                .iter()
+                .any(|w| w.starts_with("rebase")),
+            "{:?}",
             state.lock().unwrap().writes
         );
     }
