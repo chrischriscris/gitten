@@ -8692,6 +8692,13 @@ diff --git a/tracked.txt b/tracked.txt
         /// keyboard would.
         index_oids: Vec<(String, String)>,
         head_oids: Vec<(String, String)>,
+        /// What `commit_files` answers for the sha under test: the status
+        /// letters a commit's own listing would report. Tests set it
+        /// directly — a rename here is what the graft refuses on.
+        commit_file_list: Vec<(char, Vec<u8>)>,
+        /// When set, the graft reads its own result as empty: lifting the
+        /// commit's only change, refused with the drop door named.
+        graft_empty: bool,
         /// The remotes `remote -v` answers with, and how often it was read.
         servers: Vec<gitten_core::refs::Remote>,
         server_reads: usize,
@@ -9759,6 +9766,39 @@ diff --git a/tracked.txt b/tracked.txt
             }
             s.applied += 1;
             Ok(())
+        }
+
+        fn apply_patch(&self, patch: &[u8]) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            s.writes
+                .push(format!("apply {}", String::from_utf8_lossy(patch)));
+            if s.refuses.iter().any(|r| patch.starts_with(r)) {
+                return Err("the fake refused".into());
+            }
+            s.applied += 1;
+            Ok(())
+        }
+
+        fn commit_files(&self, _sha: &[u8]) -> gitten_git::Result<Vec<(char, Vec<u8>)>> {
+            Ok(self.0.lock().unwrap().commit_file_list.clone())
+        }
+
+        fn amend_no_edit(&self) -> gitten_git::Result<String> {
+            self.0.lock().unwrap().writes.push("amend-no-edit".into());
+            Ok("amended".into())
+        }
+
+        fn checkout_file_from(&self, sha: &[u8], path: &[u8]) -> gitten_git::Result<()> {
+            self.0.lock().unwrap().writes.push(format!(
+                "checkout-file {} from {}",
+                String::from_utf8_lossy(path),
+                String::from_utf8_lossy(sha)
+            ));
+            Ok(())
+        }
+
+        fn graft_empties(&self, _sha: &[u8]) -> gitten_git::Result<bool> {
+            Ok(self.0.lock().unwrap().graft_empty)
         }
 
         fn index_blob_oid(&self, path: &[u8]) -> gitten_git::Result<Option<String>> {
@@ -17016,6 +17056,438 @@ diff --git a/tracked.txt b/tracked.txt
             "copy did not read the row: {:?}",
             app.copy
         );
+    }
+
+    /// Opens the unstaged side of the fake's file and puts the keyboard on
+    /// a hunk of it — the position every pick test starts from. The cursor
+    /// may land on a header, so it walks until the selection names a hunk.
+    fn open_unstaged_hunk(app: &mut App) {
+        app.dispatch("files.focus");
+        app.dispatch("view.down");
+        app.pump_quiet();
+        app.dispatch("diff.focus");
+        app.pump_quiet();
+        for _ in 0..8 {
+            if diff_of(app).patch_selection().is_ok() {
+                break;
+            }
+            app.dispatch("view.down");
+        }
+        assert!(
+            diff_of(app).patch_selection().is_ok(),
+            "the keyboard never reached a hunk"
+        );
+    }
+
+    /// Opens a commit's diff and puts the keyboard on a hunk of it.
+    fn open_commit_hunk(app: &mut App) {
+        app.dispatch("diff.focus");
+        app.pump_quiet();
+        for _ in 0..8 {
+            if diff_of(app).patch_selection().is_ok() {
+                break;
+            }
+            app.dispatch("view.down");
+        }
+        assert!(
+            diff_of(app).patch_selection().is_ok(),
+            "the keyboard never reached a hunk"
+        );
+    }
+
+    fn writes_of(state: &Arc<Mutex<FakeState>>) -> Vec<String> {
+        state.lock().unwrap().writes.clone()
+    }
+
+    fn branch_writes_of(state: &Arc<Mutex<FakeState>>) -> Vec<String> {
+        state.lock().unwrap().branch_writes.clone()
+    }
+
+    fn until_message(app: &mut App, needle: &str) {
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                app.message.contains(needle)
+            }),
+            "the message never said {needle:?}: {:?}",
+            app.message
+        );
+    }
+
+    fn until_writes(app: &mut App, state: &Arc<Mutex<FakeState>>) {
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                !state.lock().unwrap().writes.is_empty()
+            }),
+            "the job never reached the repository"
+        );
+    }
+
+    #[test]
+    fn tui_parity_patch_options_open_from_ctrl_p_and_name_targets() {
+        let (handle, state) = fake(&[]);
+        let mut app = both_sides_app(&state, &handle);
+        app.dispatch("patch.menu");
+        assert_eq!(app.question, Some("patch"), "the menu never stood");
+        assert!(
+            app.message.contains("applies onto") && app.message.contains("builder"),
+            "the menu did not name its targets: {:?}",
+            app.message
+        );
+        // The builder letter opens the builder; the menu stands down.
+        app.dispatch("patch.show");
+        assert!(app.patch.is_some(), "the builder never opened");
+        app.dispatch("back");
+        assert!(app.patch.is_none(), "esc left the builder standing");
+    }
+
+    #[test]
+    fn tui_parity_pick_keeps_the_hunk_and_names_the_clipboard() {
+        let (handle, state) = fake(&[]);
+        let mut app = both_sides_app(&state, &handle);
+        open_unstaged_hunk(&mut app);
+        app.dispatch("patch.pick");
+        assert_eq!(
+            app.message, "picked 1 hunk — 1 on the patch",
+            "the pick did not say what it kept: {:?}",
+            app.message
+        );
+        assert_eq!(app.patch_clip.files().len(), 1);
+        assert_eq!(app.patch_clip.files()[0].path, "f.txt");
+        // A second press on the same hunk is not a failure and not a
+        // silence: the clipboard is unchanged and the count says so.
+        app.dispatch("patch.pick");
+        assert!(
+            app.message.contains("already on the patch"),
+            "the re-pick did not say so: {:?}",
+            app.message
+        );
+        assert_eq!(app.patch_clip.included_hunks(), 1);
+    }
+
+    #[test]
+    fn tui_parity_pick_from_a_commit_diff_keeps_as_drawn() {
+        let (handle, state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        open_commit_hunk(&mut app);
+        app.dispatch("patch.pick");
+        assert!(
+            app.message.contains("picked 1 hunk"),
+            "the commit pick did not land: {:?}",
+            app.message
+        );
+        let file = &app.patch_clip.files()[0];
+        assert!(
+            matches!(file.anchor, gitten_core::patchclip::Anchor::Commit { .. }),
+            "a commit pick names its commit: {:?}",
+            file.anchor
+        );
+        assert!(file.index_oid.is_none() && file.head_oid.is_none());
+        let _ = state;
+    }
+
+    #[test]
+    fn tui_parity_pick_refuses_where_no_side_stands() {
+        let (handle, state) = fake(&[]);
+        let mut app = both_sides_app(&state, &handle);
+        // The keyboard on the files list names no diff at all.
+        app.dispatch("files.focus");
+        app.dispatch("patch.pick");
+        assert_eq!(app.message, "the keyboard is not on a diff");
+        assert!(app.patch_clip.is_empty());
+        // A fixture names no repository to pick from — said by the
+        // availability gate ahead of any action.
+        let mut app = app_on_diff(Source::Fixtures, None);
+        app.dispatch("patch.pick");
+        assert_eq!(
+            app.message,
+            "patch.pick: a fixture has no repository to patch in"
+        );
+        let _ = state;
+    }
+
+    #[test]
+    fn tui_parity_builder_toggles_then_applies() {
+        let (handle, state) = fake(&[]);
+        let mut app = both_sides_app(&state, &handle);
+        open_unstaged_hunk(&mut app);
+        app.dispatch("patch.pick");
+        app.dispatch("patch.show");
+        app.draw();
+        assert!(
+            app.screen.row_text(2).contains("patch"),
+            "the builder drew no title: {:?}",
+            app.screen.row_text(2)
+        );
+        // Space excludes the hunk; enter then has nothing to carry.
+        app.dispatch("patch.toggle-hunk");
+        assert!(app.message.contains("excluded"), "{:?}", app.message);
+        app.dispatch("patch.apply-worktree");
+        assert_eq!(
+            app.message,
+            "nothing on the patch is included — toggle hunks on in the builder"
+        );
+        assert!(writes_of(&state).is_empty(), "an excluded hunk applied");
+        // Back on, and the apply reaches the repository.
+        app.dispatch("patch.toggle-hunk");
+        app.dispatch("patch.apply-worktree");
+        until_writes(&mut app, &state);
+        assert!(
+            writes_of(&state).iter().any(|w| w.starts_with("apply ")),
+            "no apply write: {:?}",
+            writes_of(&state)
+        );
+        // The clipboard survives its own apply: the same patch is often
+        // wanted on a second target.
+        assert_eq!(app.patch_clip.included_hunks(), 1);
+        app.dispatch("back");
+        assert!(app.patch.is_none());
+    }
+
+    #[test]
+    fn tui_parity_reverse_asks_twice_then_runs() {
+        let (handle, state) = fake(&[]);
+        let mut app = both_sides_app(&state, &handle);
+        open_unstaged_hunk(&mut app);
+        app.dispatch("patch.pick");
+        app.dispatch("patch.reverse-worktree");
+        assert_eq!(
+            app.message,
+            "reverse the patch off the worktree? press again to confirm"
+        );
+        assert!(writes_of(&state).is_empty(), "the question wrote");
+        app.dispatch("patch.reverse-worktree");
+        until_writes(&mut app, &state);
+        assert!(
+            writes_of(&state).iter().any(|w| w.starts_with("discard ")),
+            "no reverse write: {:?}",
+            writes_of(&state)
+        );
+    }
+
+    #[test]
+    fn tui_parity_stale_pick_refuses_before_anything_applies() {
+        let (handle, state) = fake(&[]);
+        let mut app = both_sides_app(&state, &handle);
+        open_unstaged_hunk(&mut app);
+        // The pair carries no OID, so the pick expects none — and the
+        // index gaining one is exactly a repository that moved.
+        state
+            .lock()
+            .unwrap()
+            .index_oids
+            .push(("f.txt".into(), "zzz".into()));
+        app.dispatch("patch.pick");
+        app.dispatch("patch.apply-worktree");
+        until_message(&mut app, "f.txt changed since the patch was read");
+        assert!(writes_of(&state).is_empty(), "a stale patch applied");
+    }
+
+    #[test]
+    fn tui_parity_remove_from_commit_asks_twice_and_grafts() {
+        let (handle, state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        open_commit_hunk(&mut app);
+        app.dispatch("patch.remove-from-commit");
+        assert!(
+            app.message.contains("remove this from")
+                && app.message.contains("press again to confirm"),
+            "the question did not stand: {:?}",
+            app.message
+        );
+        assert!(writes_of(&state).is_empty(), "the question wrote");
+        app.dispatch("patch.remove-from-commit");
+        until_writes(&mut app, &state);
+        let writes = writes_of(&state).join("\n");
+        let branches = branch_writes_of(&state).join("\n");
+        // The detach and the return ride branch_writes; the patch, stage,
+        // amend and replay ride writes — one job, two records.
+        assert!(
+            branches.contains("checkout 00000000"),
+            "never detached at the commit: {branches:?}"
+        );
+        for step in [
+            "discard diff",
+            "stage f.txt",
+            "amend-no-edit",
+            "rebase-onto",
+        ] {
+            assert!(
+                writes.contains(step),
+                "the graft skipped {step}: {writes:?}"
+            );
+        }
+        assert!(
+            branches.contains("checkout main"),
+            "never went home: {branches:?}"
+        );
+    }
+
+    #[test]
+    fn tui_parity_discard_file_takes_the_whole_file() {
+        let (handle, state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        open_commit_hunk(&mut app);
+        app.dispatch("patch.discard-file");
+        assert!(app.message.contains("press again to confirm"));
+        app.dispatch("patch.discard-file");
+        until_writes(&mut app, &state);
+        let discard = writes_of(&state)
+            .into_iter()
+            .find(|w| w.starts_with("discard diff"))
+            .expect("no discard write");
+        assert!(
+            discard.contains("EDIT ONE") && discard.contains("EDIT TWO"),
+            "the file scope carried one hunk, not the file: {discard:?}"
+        );
+    }
+
+    #[test]
+    fn tui_parity_graft_refuses_a_rename_with_the_checkout_door() {
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().commit_file_list = vec![('R', b"f.txt".to_vec())];
+        let mut app = commits_app(&handle);
+        open_commit_hunk(&mut app);
+        app.dispatch("patch.remove-from-commit");
+        assert!(
+            app.message.contains("rename") && app.message.contains("check it out"),
+            "the rename did not name its door: {:?}",
+            app.message
+        );
+        assert!(writes_of(&state).is_empty());
+    }
+
+    #[test]
+    fn tui_parity_graft_names_the_drop_when_it_would_empty() {
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().graft_empty = true;
+        let mut app = commits_app(&handle);
+        open_commit_hunk(&mut app);
+        app.dispatch("patch.remove-from-commit");
+        app.dispatch("patch.remove-from-commit");
+        until_message(&mut app, "would empty");
+        assert!(
+            app.message.contains("drop"),
+            "the refusal did not name the door: {:?}",
+            app.message
+        );
+        assert!(
+            !writes_of(&state).iter().any(|w| w.contains("rebase-onto")),
+            "an emptied commit replayed"
+        );
+    }
+
+    #[test]
+    fn tui_parity_checkout_file_asks_twice_and_restores() {
+        let (handle, state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        open_commit_hunk(&mut app);
+        app.dispatch("patch.checkout-file");
+        assert!(
+            app.message.contains("worktree and index both move"),
+            "the checkout did not say its scope: {:?}",
+            app.message
+        );
+        assert!(writes_of(&state).is_empty(), "the question wrote");
+        app.dispatch("patch.checkout-file");
+        until_writes(&mut app, &state);
+        assert!(
+            writes_of(&state)
+                .iter()
+                .any(|w| w.starts_with("checkout-file f.txt")),
+            "no checkout write: {:?}",
+            writes_of(&state)
+        );
+    }
+
+    #[test]
+    fn tui_parity_amend_commit_carries_the_clipboard() {
+        let (handle, state) = fake(&[]);
+        let mut app = both_sides_app(&state, &handle);
+        open_unstaged_hunk(&mut app);
+        app.dispatch("patch.pick");
+        // The graft needs a clean tree; the pick already resolved, so the
+        // status the job reads is built clean here.
+        state.lock().unwrap().status = Default::default();
+        // The commit's diff, with the keyboard anywhere in it: amending
+        // names a commit, not a hunk.
+        app.dispatch("commits.focus");
+        app.pump_quiet();
+        app.dispatch("diff.focus");
+        app.pump_quiet();
+        app.dispatch("patch.amend-commit");
+        assert!(
+            app.message.contains("amend") && app.message.contains("press again to confirm"),
+            "the question did not stand: {:?}",
+            app.message
+        );
+        app.dispatch("patch.amend-commit");
+        until_writes(&mut app, &state);
+        let writes = writes_of(&state).join("\n");
+        assert!(
+            writes.contains("apply diff"),
+            "no forward patch: {writes:?}"
+        );
+        assert!(writes.contains("amend-no-edit"), "no amend: {writes:?}");
+    }
+
+    #[test]
+    fn tui_parity_amend_with_an_empty_clipboard_says_to_pick_first() {
+        let (handle, _state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        open_commit_hunk(&mut app);
+        app.dispatch("patch.amend-commit");
+        assert_eq!(
+            app.message,
+            "nothing on the patch is included — pick hunks first"
+        );
+    }
+
+    #[test]
+    fn tui_parity_move_to_branch_prompts_and_carries() {
+        let (handle, state) = fake(&[]);
+        let mut app = both_sides_app(&state, &handle);
+        open_unstaged_hunk(&mut app);
+        app.dispatch("patch.pick");
+        app.dispatch("patch.move-to-branch");
+        for c in "feature".chars() {
+            app.press(Key::char(c));
+        }
+        app.dispatch("input.accept");
+        until_writes(&mut app, &state);
+        let writes = writes_of(&state).join("\n");
+        let branches = branch_writes_of(&state).join("\n");
+        assert!(
+            branches.contains("checkout feature"),
+            "never moved: {branches:?}"
+        );
+        assert!(writes.contains("apply diff"), "never applied: {writes:?}");
+        assert!(
+            app.message.contains("uncommitted"),
+            "the landing did not say its state: {:?}",
+            app.message
+        );
+    }
+
+    #[test]
+    fn tui_parity_menu_letters_run_their_targets_and_close_it() {
+        let (handle, state) = fake(&[]);
+        let mut app = both_sides_app(&state, &handle);
+        open_unstaged_hunk(&mut app);
+        app.dispatch("patch.pick");
+        app.dispatch("patch.menu");
+        assert_eq!(app.question, Some("patch"));
+        // Through the keymap, the way a press travels: the answer falls
+        // the question on its way to the dispatch.
+        app.press(Key::plain(Code::Char('i')));
+        until_writes(&mut app, &state);
+        assert!(
+            writes_of(&state).iter().any(|w| w.starts_with("stage ")),
+            "no index apply: {:?}",
+            writes_of(&state)
+        );
+        assert_eq!(app.question, None, "the menu stood past its answer");
     }
 
     /// The tags pane reads the namespace: name ahead of the commit and

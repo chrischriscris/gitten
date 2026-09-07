@@ -640,11 +640,13 @@ impl Keymap {
         bind("diff", "p", "patch.pick");
         // History surgery from a commit's diff, where the staging verbs
         // have nothing to aim at: `d` lifts the hunk out of the commit it
-        // belongs to, `D` the whole file under the keyboard, `c` checks
+        // belongs to, `X` the whole file under the keyboard, `c` checks
         // the file out of the commit, and `A` amends the commit with the
-        // clipboard. Every one rewrites history and asks twice.
+        // clipboard. `D` stays the working-tree discard everywhere — one
+        // key names one command per mode, so the file scope takes the free
+        // capital beside it. Every one rewrites history and asks twice.
         bind("diff", "d", "patch.remove-from-commit");
-        bind("diff", "D", "patch.discard-file");
+        bind("diff", "X", "patch.discard-file");
         bind("diff", "c", "patch.checkout-file");
         bind("diff", "A", "patch.amend-commit");
         bind("commits", "enter", "commits.open-diff");
@@ -2841,7 +2843,7 @@ mod tests {
         for (chord, name) in [
             ("p", "patch.pick"),
             ("d", "patch.remove-from-commit"),
-            ("D", "patch.discard-file"),
+            ("X", "patch.discard-file"),
             ("c", "patch.checkout-file"),
             ("A", "patch.amend-commit"),
         ] {
