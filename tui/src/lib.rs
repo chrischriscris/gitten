@@ -56,6 +56,7 @@ pub mod diff;
 pub mod files;
 pub mod help;
 pub mod markdown;
+pub mod remotes;
 pub mod rows;
 pub mod screen;
 pub mod scrollbar;

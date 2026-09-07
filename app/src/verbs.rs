@@ -446,6 +446,103 @@ impl Write {
         };
         Ok(Self::push(repo, remote, branch.as_bytes().to_vec()))
     }
+
+    /// Checks out the remote-tracking ref `remote/branch` as a local branch
+    /// that tracks it — [`Repo::checkout_tracking`]'s job. The local name is
+    /// git's choice (the branch's own), so it is not an argument here.
+    pub fn checkout_tracking(repo: &Handle, remote: Vec<u8>, branch: Vec<u8>) -> Self {
+        let shown = shown_pair(&remote, &branch);
+        Self::named(format!("checkout {shown} (tracking)"), repo, move |r| {
+            r.checkout_tracking(&remote, &branch)
+        })
+        // HEAD's branch changes and the branches pane may not be focused —
+        // the key lives over a remote row — so this one says what it did.
+        .announcing(format!("checked out {shown} as a tracking branch"))
+    }
+
+    /// Checks out the branch HEAD sat on before this one. Nothing here to
+    /// confirm: it only ever moves HEAD along the reflog, and the tree it
+    /// lands on is whatever that checkout makes of the changes — git's own
+    /// refusals (none recorded, diverged trees) surface verbatim.
+    pub fn checkout_previous(repo: &Handle) -> Self {
+        Self::named("checkout previous".into(), repo, |r| r.checkout_previous())
+            .announcing("checked out the previous branch")
+    }
+
+    /// Checks out `name` over any local changes. DESTRUCTIVE: the caller
+    /// confirms before this job is ever built.
+    pub fn checkout_force(repo: &Handle, name: Vec<u8>) -> Self {
+        let shown = String::from_utf8_lossy(&name).into_owned();
+        Self::named(format!("force-checkout {shown}"), repo, move |r| {
+            r.checkout_force(&name)
+        })
+        .announcing(format!("checked out {shown}, local changes discarded"))
+    }
+
+    /// Makes local branch `local` track `remote/branch` — the link only,
+    /// never a fetch or a merge, which is why no confirmation precedes it.
+    pub fn set_upstream(repo: &Handle, local: Vec<u8>, remote: Vec<u8>, branch: Vec<u8>) -> Self {
+        let shown = shown_pair(&remote, &branch);
+        let local_shown = String::from_utf8_lossy(&local).into_owned();
+        Self::named(format!("track {shown} on {local_shown}"), repo, move |r| {
+            r.set_upstream(&local, &remote, &branch)
+        })
+        .announcing(format!("{local_shown} now tracks {shown}"))
+    }
+
+    /// Severs local branch `local`'s tracking link. Recoverable by setting
+    /// one again, so no confirmation precedes it.
+    pub fn unset_upstream(repo: &Handle, local: Vec<u8>) -> Self {
+        let shown = String::from_utf8_lossy(&local).into_owned();
+        Self::named(format!("untrack {shown}"), repo, move |r| {
+            r.unset_upstream(&local)
+        })
+        .announcing(format!("{shown} no longer tracks an upstream"))
+    }
+
+    /// Fast-forwards local branch `local` onto `remote/branch` — never
+    /// sideways; which git verb the checked-out case needs is the trait's
+    /// decision, read fresh from HEAD. A divergence comes back refused in
+    /// git's words with the branch left standing.
+    pub fn fast_forward(repo: &Handle, local: Vec<u8>, remote: Vec<u8>, branch: Vec<u8>) -> Self {
+        let shown = shown_pair(&remote, &branch);
+        let local_shown = String::from_utf8_lossy(&local).into_owned();
+        Self::named(
+            format!("fast-forward {local_shown} to {shown}"),
+            repo,
+            move |r| r.fast_forward(&local, &remote, &branch),
+        )
+        .announcing(format!("fast-forwarded {local_shown} to {shown}"))
+    }
+
+    /// Introduces a remote by name and URL. A duplicate name is git's own
+    /// refusal, verbatim.
+    pub fn add_remote(repo: &Handle, name: Vec<u8>, url: Vec<u8>) -> Self {
+        let shown = String::from_utf8_lossy(&name).into_owned();
+        Self::named(format!("add remote {shown}"), repo, move |r| {
+            r.add_remote(&name, &url)
+        })
+        .announcing(format!("added remote {shown}"))
+    }
+
+    /// Points remote `name` at `url`.
+    pub fn set_remote_url(repo: &Handle, name: Vec<u8>, url: Vec<u8>) -> Self {
+        let shown = String::from_utf8_lossy(&name).into_owned();
+        Self::named(format!("set-url {shown}"), repo, move |r| {
+            r.set_remote_url(&name, &url)
+        })
+        .announcing(format!("{shown} now points at the new URL"))
+    }
+
+    /// Forgets remote `name`, its remote-tracking branches going with it.
+    /// DESTRUCTIVE: the caller confirms before this job is ever built.
+    pub fn remove_remote(repo: &Handle, name: Vec<u8>) -> Self {
+        let shown = String::from_utf8_lossy(&name).into_owned();
+        Self::named(format!("remove remote {shown}"), repo, move |r| {
+            r.remove_remote(&name)
+        })
+        .announcing(format!("removed remote {shown}"))
+    }
 }
 
 /// Two byte-names as a person reads them, once: the band's words and the

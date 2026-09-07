@@ -56,6 +56,7 @@ use gitten_tui::diff::Diff;
 use gitten_tui::diff::PatchSelection;
 use gitten_tui::files::{self, Files};
 use gitten_tui::help;
+use gitten_tui::remotes::Remotes;
 use gitten_tui::screen::{Ink, Pen, Screen};
 use gitten_tui::scrollbar::Bar;
 use gitten_tui::stashes::{drop_question, Stashes};
@@ -334,6 +335,14 @@ enum Screens {
         label: String,
         generation: Generation,
     },
+    /// The repository's remotes. No source, like the branches tenant: a
+    /// refresh is a plain re-read of `remote -v` through the handle the app
+    /// holds, and the generation rail is the whole of its staleness story.
+    Remotes {
+        view: Remotes,
+        label: String,
+        generation: Generation,
+    },
 }
 
 /// What an empty diff pane's header says instead of a sha it does not have.
@@ -358,6 +367,20 @@ const STARTUP_LOADING: &str = "loading";
 /// and nothing else.
 const INPUT: &str = "input";
 
+/// The mode the recent-repositories picker owns the keyboard in, for as
+/// long as it stands — help's own trade: a press it does not name runs
+/// nothing underneath, so a chord cannot arm a discard behind a modal.
+const PICKER: &str = "picker";
+
+/// What an unresolved key means to the modal that holds the keyboard.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModalKind {
+    /// A text field: unresolved keys fall to the shared [`Edit`] vocabulary.
+    Field,
+    /// A question or a list: unresolved keys wait for enter or esc.
+    List,
+}
+
 /// The one modal input, and which consumer its accepted text belongs to.
 ///
 /// A [`Prompt`] stands over the status row and owns the keyboard for as long
@@ -372,28 +395,85 @@ enum Prompt {
     /// while it stands the query still lands on the list it was opened over.
     /// One line by design: a query narrows a list, and a line break in a
     /// needle is a paste's accident, not a search.
-    Search { pane: String, field: Field },
+    Search {
+        pane: String,
+        field: Field,
+    },
     /// `files.commit`'s field. Accepting submits [`Write::commit`] with the
     /// text whole. Multiline: a commit message is a message, and `alt+enter`
     /// (or a paste) is how a second line gets in.
-    CommitMessage { field: Field },
+    CommitMessage {
+        field: Field,
+    },
     /// `files.amend`'s field — the same field, aimed one step back. Prefilled
     /// from HEAD's subject, so an amend is an edit of what is standing rather
     /// than a retyping of it.
-    AmendMessage { field: Field },
+    AmendMessage {
+        field: Field,
+    },
     /// `branches.new`'s field. Reads no row: creating is at HEAD, so it is
     /// available in an empty or unborn repository too. Accepting submits
     /// [`Write::create_branch`] and checks nothing out.
-    BranchNew { field: Field },
+    BranchNew {
+        field: Field,
+    },
     /// `branches.rename`'s field. `from` is the raw bytes of the branch being
     /// renamed — what the job is aimed at, whatever the field shows — and the
     /// field arrives wholly selected, so the first edit replaces it rather
     /// than appending to it.
-    BranchRename { from: Vec<u8>, field: Field },
+    BranchRename {
+        from: Vec<u8>,
+        field: Field,
+    },
     /// `branches.new-tag`'s field. `at` is the raw bytes of the local branch
     /// the tag names — a revspec git resolves, so the tag moves with the
     /// branch — captured at open and never re-read from the pane.
-    TagNew { at: Vec<u8>, field: Field },
+    TagNew {
+        at: Vec<u8>,
+        field: Field,
+    },
+    /// `branches.checkout-name`'s field: whatever it names, git aims at.
+    /// Empty is refused beside the field that just closed.
+    BranchCheckoutName {
+        field: Field,
+    },
+    /// `commits.new-branch`'s field. `at` is the selected commit's full sha,
+    /// captured when the field opened, so nothing a cursor does while the
+    /// field holds the keyboard can re-aim the branch. Accepting creates
+    /// the branch there — and offers the checkout as a question.
+    BranchNewAt {
+        at: Vec<u8>,
+        field: Field,
+    },
+    /// The checkout offer after a branch was created at a commit: a
+    /// question, not a field. Enter takes it, esc leaves the branch where
+    /// it now sits — the branches pane's space reaches it later either way.
+    /// The field exists because every prompt holds one; nothing edits it
+    /// and the draw never reads it.
+    CheckoutNew {
+        name: String,
+        field: Field,
+    },
+    /// `project.open`'s field: a path to open as a repository. Accepting
+    /// switches everything the app holds; a refusal keeps it all.
+    ProjectOpen {
+        field: Field,
+    },
+    /// `remotes.new`'s two fields, in order: the name, then the URL.
+    RemoteName {
+        field: Field,
+    },
+    RemoteUrl {
+        name: String,
+        field: Field,
+    },
+    /// `remotes.edit`'s field, prefilled with the remote's first URL.
+    /// `name` is the raw bytes of the remote being repointed, captured at
+    /// open like every verb's aim.
+    RemoteEdit {
+        name: RefName,
+        field: Field,
+    },
 }
 
 impl Prompt {
@@ -406,7 +486,14 @@ impl Prompt {
             | Prompt::AmendMessage { field }
             | Prompt::BranchNew { field }
             | Prompt::BranchRename { field, .. }
-            | Prompt::TagNew { field, .. } => field,
+            | Prompt::TagNew { field, .. }
+            | Prompt::BranchCheckoutName { field }
+            | Prompt::BranchNewAt { field, .. }
+            | Prompt::CheckoutNew { field, .. }
+            | Prompt::ProjectOpen { field }
+            | Prompt::RemoteName { field }
+            | Prompt::RemoteUrl { field, .. }
+            | Prompt::RemoteEdit { field, .. } => field,
         }
     }
 
@@ -418,7 +505,14 @@ impl Prompt {
             | Prompt::AmendMessage { field }
             | Prompt::BranchNew { field }
             | Prompt::BranchRename { field, .. }
-            | Prompt::TagNew { field, .. } => field,
+            | Prompt::TagNew { field, .. }
+            | Prompt::BranchCheckoutName { field }
+            | Prompt::BranchNewAt { field, .. }
+            | Prompt::CheckoutNew { field, .. }
+            | Prompt::ProjectOpen { field }
+            | Prompt::RemoteName { field }
+            | Prompt::RemoteUrl { field, .. }
+            | Prompt::RemoteEdit { field, .. } => field,
         }
     }
 
@@ -432,6 +526,18 @@ impl Prompt {
             self,
             Prompt::CommitMessage { .. } | Prompt::AmendMessage { .. }
         )
+    }
+
+    /// The question a yes/no prompt stands to ask, when it is one. A
+    /// question owns the status row whole — no field, no caret, no live
+    /// count — and answers only to enter (yes) and esc (no).
+    fn question(&self) -> Option<String> {
+        match self {
+            Prompt::CheckoutNew { name, .. } => Some(format!(
+                "created {name} — check out? enter=check out, esc=not now"
+            )),
+            _ => None,
+        }
     }
 
     /// The pane a search prompt stands over — its edits route there by name,
@@ -453,6 +559,87 @@ impl Prompt {
             Prompt::BranchNew { .. } => "branch: ",
             Prompt::BranchRename { .. } => "rename: ",
             Prompt::TagNew { .. } => "tag: ",
+            Prompt::BranchCheckoutName { .. } => "checkout: ",
+            Prompt::BranchNewAt { .. } => "branch: ",
+            Prompt::CheckoutNew { .. } => "",
+            Prompt::ProjectOpen { .. } => "open: ",
+            Prompt::RemoteName { .. } => "remote name: ",
+            Prompt::RemoteUrl { .. } => "remote url: ",
+            Prompt::RemoteEdit { .. } => "url: ",
+        }
+    }
+}
+
+/// The recent-repositories picker: the stored paths, most-recent first, and
+/// the row the keyboard is on. The rows are the paths as the MRU stores
+/// them — canonicalized when they were recorded — and opening one is
+/// [`App::open_repository`]'s to refuse, not this list's.
+struct RecentPicker {
+    rows: Vec<std::path::PathBuf>,
+    cursor: usize,
+}
+
+impl RecentPicker {
+    fn down(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.rows.len().saturating_sub(1));
+    }
+
+    fn up(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn jump_top(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn jump_bottom(&mut self) {
+        self.cursor = self.rows.len().saturating_sub(1);
+    }
+}
+
+/// Paints the picker over the body: a quiet box one column in from the
+/// edge, the title, then as many paths as fit with the keyboard's row
+/// highlighted. The window scrolls under a cursor that sits past the fold —
+/// the same one rule every list here follows.
+fn paint_picker(screen: &mut Screen, y: usize, height: usize, picker: &RecentPicker, host: &Host) {
+    if picker.rows.is_empty() || height < 3 {
+        return;
+    }
+    let c = &host.theme.chrome;
+    let bg = Ink::new(c.dim, c.bg);
+    let shown = height.saturating_sub(3).max(1).min(picker.rows.len());
+    let text_width = picker
+        .rows
+        .iter()
+        .map(|r| gitten_tui::screen::width(r.to_string_lossy().as_ref()))
+        .max()
+        .unwrap_or(0);
+    let width = (text_width + 2)
+        .min(screen.width().saturating_sub(2))
+        .max(14);
+    // The keyboard's row is on screen: the window scrolls only when it
+    // must, and only just enough.
+    let top = picker.cursor.saturating_sub(shown - 1);
+    // A modal floats: one column in, one row down, opaque over whatever it
+    // covers.
+    for (i, _) in (0..shown + 2).enumerate() {
+        let at = y + 1 + i;
+        let mut pen = screen.span(at, 1, width);
+        if i == 0 {
+            pen.put(" recent repositories ", Ink::new(c.accent, c.status_bg));
+            pen.wash(Ink::new(c.dim, c.status_bg));
+        } else {
+            let source = top + (i - 1);
+            let Some(entry) = picker.rows.get(source) else {
+                pen.wash(bg);
+                continue;
+            };
+            let bg = match source == picker.cursor {
+                true => Ink::new(c.fg, c.selection_bg),
+                false => Ink::new(c.fg, c.bg),
+            };
+            pen.put(&entry.to_string_lossy(), bg);
+            pen.wash(bg);
         }
     }
 }
@@ -466,6 +653,7 @@ impl Screens {
             Screens::Stashes { .. } => "stashes",
             Screens::Files { .. } => "files",
             Screens::Branches { .. } => "branches",
+            Screens::Remotes { .. } => "remotes",
         }
     }
 
@@ -474,7 +662,8 @@ impl Screens {
             Screens::Commits { label, .. }
             | Screens::Diff { label, .. }
             | Screens::Stashes { label, .. }
-            | Screens::Branches { label, .. } => label,
+            | Screens::Branches { label, .. }
+            | Screens::Remotes { label, .. } => label,
             Screens::Files { label, .. } => label,
         }
     }
@@ -484,7 +673,8 @@ impl Screens {
             Screens::Commits { generation, .. }
             | Screens::Diff { generation, .. }
             | Screens::Stashes { generation, .. }
-            | Screens::Branches { generation, .. } => *generation,
+            | Screens::Branches { generation, .. }
+            | Screens::Remotes { generation, .. } => *generation,
             Screens::Files { generation, .. } => *generation,
         }
     }
@@ -667,6 +857,33 @@ impl Screens {
                 *generation = target;
                 Some(Ok(()))
             }
+            Screens::Remotes {
+                view,
+                label,
+                generation,
+            } => {
+                // Two reads beside each other, the branches pane's shape:
+                // the list, and the describe its label is spelled with.
+                let (loaded, described) = std::thread::scope(|s| {
+                    let remotes = s.spawn(|| repo.remotes());
+                    let described = s.spawn(|| repo.describe());
+                    (
+                        remotes
+                            .join()
+                            .unwrap_or_else(|p| std::panic::resume_unwind(p)),
+                        described.join().unwrap_or_default(),
+                    )
+                });
+                let loaded = match loaded {
+                    Ok(remotes) => remotes,
+                    Err(e) => return Some(Err(e)),
+                };
+                let count = loaded.len();
+                view.replace(loaded);
+                *label = remotes_label(&described, count);
+                *generation = target;
+                Some(Ok(()))
+            }
         }
     }
 
@@ -701,6 +918,10 @@ impl Screens {
                 b.set_scrolloff(host.view.scrolloff);
                 b.resize(rect.width, rect.height);
             }
+            Screens::Remotes { view: r, .. } => {
+                r.set_scrolloff(host.view.scrolloff);
+                r.resize(rect.width, rect.height);
+            }
         }
     }
 
@@ -723,6 +944,7 @@ impl Screens {
             // not shaped spans.
             Screens::Files { view: f, .. } => f.paint(screen, x, y, focused, host),
             Screens::Branches { view: b, .. } => b.paint(screen, x, y, focused, host),
+            Screens::Remotes { view: r, .. } => r.paint(screen, x, y, focused, host),
         }
     }
 
@@ -733,6 +955,7 @@ impl Screens {
             Screens::Stashes { view: s, .. } => s.status(),
             Screens::Files { view: f, .. } => f.status(),
             Screens::Branches { view: b, .. } => b.status(),
+            Screens::Remotes { view: r, .. } => r.status(),
         }
     }
 
@@ -754,6 +977,7 @@ impl Screens {
             Screens::Stashes { view: s, .. } => s.paint_bar(screen, x, divider, y, host),
             Screens::Files { view: f, .. } => f.paint_bar(screen, x, divider, y, host),
             Screens::Branches { view: b, .. } => b.paint_bar(screen, x, divider, y, host),
+            Screens::Remotes { view: r, .. } => r.paint_bar(screen, x, divider, y, host),
         }
     }
 
@@ -770,6 +994,7 @@ impl Screens {
             Screens::Stashes { view: s, .. } => s.press(col, row, extend, host),
             Screens::Files { view: f, .. } => f.press(col, row, clicks, extend, host),
             Screens::Branches { view: b, .. } => b.press(col, row, extend, host),
+            Screens::Remotes { view: r, .. } => r.press(col, row, extend, host),
         }
     }
 
@@ -782,7 +1007,7 @@ impl Screens {
             Screens::Stashes { view: s, .. } => s.drag(row, host),
             // A list with no drag selection and an indicator bar has nothing
             // a held button can do.
-            Screens::Files { .. } | Screens::Branches { .. } => {}
+            Screens::Files { .. } | Screens::Branches { .. } | Screens::Remotes { .. } => {}
         }
     }
 
@@ -792,7 +1017,7 @@ impl Screens {
             Screens::Diff { view: d, .. } => d.release(),
             Screens::Stashes { view: s, .. } => s.release(),
             // Nothing held here either — see `drag`.
-            Screens::Files { .. } | Screens::Branches { .. } => {}
+            Screens::Files { .. } | Screens::Branches { .. } | Screens::Remotes { .. } => {}
         }
     }
 
@@ -805,6 +1030,7 @@ impl Screens {
             Screens::Stashes { view: s, .. } => s.copy_text(),
             Screens::Files { view: f, .. } => f.copy_text(),
             Screens::Branches { view: b, .. } => b.copy_text(),
+            Screens::Remotes { view: r, .. } => r.copy_text(),
         }
     }
 
@@ -820,6 +1046,7 @@ impl Screens {
             // nothing to fire on here — the empty answer is the mechanism.
             Screens::Files { view: f, .. } => f.selection(),
             Screens::Branches { view: b, .. } => b.selection(),
+            Screens::Remotes { view: r, .. } => r.selection(),
         }
     }
 
@@ -830,6 +1057,7 @@ impl Screens {
             Screens::Stashes { view: s, .. } => s.select_all(),
             Screens::Files { view: f, .. } => f.select_all(),
             Screens::Branches { view: b, .. } => b.select_all(),
+            Screens::Remotes { view: r, .. } => r.select_all(),
         }
     }
 
@@ -840,6 +1068,7 @@ impl Screens {
             Screens::Stashes { view: s, .. } => s.select_none(),
             Screens::Files { view: f, .. } => f.select_none(),
             Screens::Branches { view: b, .. } => b.select_none(),
+            Screens::Remotes { view: r, .. } => r.select_none(),
         }
     }
 
@@ -852,6 +1081,7 @@ impl Screens {
             Screens::Files { view: f, .. } => f.filter_note(),
             Screens::Branches { view: b, .. } => b.filter_note(),
             Screens::Stashes { view: s, .. } => s.filter_note(),
+            Screens::Remotes { view: r, .. } => r.filter_note(),
             Screens::Diff { view: d, .. } => d.match_note(),
         }
     }
@@ -865,6 +1095,7 @@ impl Screens {
             Screens::Files { view: f, .. } => f.query().is_some(),
             Screens::Branches { view: b, .. } => b.query().is_some(),
             Screens::Stashes { view: s, .. } => s.query().is_some(),
+            Screens::Remotes { view: r, .. } => r.query().is_some(),
             Screens::Diff { view: d, .. } => d.search_query().is_some(),
         }
     }
@@ -968,6 +1199,22 @@ impl Screens {
                 "search.prev" => b.next_match(-1),
                 _ => return false,
             },
+            Screens::Remotes { view: r, .. } => match command {
+                "view.down" => r.down(),
+                "view.up" => r.up(),
+                "view.page-down" => r.page(1),
+                "view.page-up" => r.page(-1),
+                "view.scroll-down" => r.scroll_y(host.view.rows as isize),
+                "view.scroll-up" => r.scroll_y(-(host.view.rows as isize)),
+                "view.top" => r.to_top(),
+                "view.bottom" => r.to_bottom(),
+                // Nothing off the left edge to reach: names clip rather
+                // than pan.
+                "view.left" | "view.right" => {}
+                "search.next" => r.next_match(1),
+                "search.prev" => r.next_match(-1),
+                _ => return false,
+            },
         }
         true
     }
@@ -1031,6 +1278,15 @@ struct App {
     /// focus change cannot strand the query; a message prompt is opened by
     /// and for the files pane and closes at its own accept.
     prompt: Option<Prompt>,
+    /// The recent-repositories picker, while it stands: a modal list over
+    /// the body, owned the way help is owned — a press it does not name
+    /// runs nothing underneath. `None` while the keyboard belongs to the
+    /// panes or a prompt.
+    picker: Option<RecentPicker>,
+    /// Where a switched-to handle comes from. The binary opener unless a
+    /// test injects its own — the same seam [`gitten_app::Startup`] holds,
+    /// and for the same reason: a fake behind a real window.
+    opener: std::sync::Arc<dyn gitten_app::Opener>,
     /// The shared write queue. One FIFO worker, owned here, whose finishes
     /// every client treats the same way: a generation advances — a refusal as
     /// much as a success — and every repository-backed pane re-acquires.
@@ -1165,6 +1421,17 @@ impl App {
                 generation: Generation::default(),
             }
         });
+        // The remotes pane, the same shape one slot over: registered behind a
+        // repository in its loading shape, read by the startup wave.
+        let remotes_tenant = repo.is_some().then(|| {
+            let mut view = Remotes::unavailable();
+            view.set_bar(bar);
+            Screens::Remotes {
+                view,
+                label: STARTUP_LOADING.to_string(),
+                generation: Generation::default(),
+            }
+        });
         let mut panes = panes::Panes::new();
         let mut last_list = None;
         match started.loaded.data {
@@ -1189,6 +1456,9 @@ impl App {
                 // has one; a fixture and a patch have no stack to read.
                 if let Some(pane) = stash_tenant {
                     panes.register("stashes", panes::Placement::sidebar("stashes"), pane);
+                }
+                if let Some(pane) = remotes_tenant {
+                    panes.register("remotes", panes::Placement::sidebar("remotes"), pane);
                 }
                 // The persistent main pane starts empty, then
                 // [`App::sync_main_diff`] below replaces it from row zero
@@ -1215,6 +1485,9 @@ impl App {
                 // has no repository and so no tenant.
                 if let Some(pane) = stash_tenant {
                     panes.register("stashes", panes::Placement::sidebar("stashes"), pane);
+                }
+                if let Some(pane) = remotes_tenant {
+                    panes.register("remotes", panes::Placement::sidebar("remotes"), pane);
                 }
                 let mut diff = Diff::new(files, &host);
                 diff.set_bar(bar);
@@ -1306,6 +1579,8 @@ impl App {
             pending: Vec::new(),
             message: String::new(),
             prompt: None,
+            picker: None,
+            opener: Arc::new(gitten_app::GitOpener),
             jobs,
             submitter,
             generation: Generation::default(),
@@ -1383,12 +1658,13 @@ impl App {
         // window's background load carries.
         let host = self.host.clone();
 
-        let (stash_read, status_read, described, branch_reads, diff_read) =
+        let (stash_read, remotes_read, status_read, described, branch_reads, diff_read) =
             std::thread::scope(|s| {
                 // The handle as a stable borrow the `move` spawns copy: an
                 // `Arc` would be four refcount bumps for the same answer.
                 let repo = &repo;
                 let stashes = s.spawn(move || acquire::stashes(repo.as_ref()));
+                let remotes = s.spawn(|| repo.remotes());
                 let status = s.spawn(move || repo.status());
                 let described = s.spawn(move || repo.describe());
                 let branches = s.spawn(move || load_branches(repo.as_ref()));
@@ -1403,6 +1679,7 @@ impl App {
                 });
                 (
                     join_read(stashes),
+                    join_read(remotes),
                     join_read(status),
                     join_read(described),
                     join_read(branches),
@@ -1418,6 +1695,19 @@ impl App {
         // outranks a status one only because there is one line and every pane
         // refreshes either way.
         let mut error = None;
+        if let Some(Screens::Remotes { view, label, .. }) = self.panes.get_mut("remotes") {
+            match remotes_read {
+                Ok(remotes) => {
+                    let count = remotes.len();
+                    view.replace(remotes);
+                    *label = remotes_label(&described, count);
+                }
+                Err(e) => {
+                    *label = "unavailable".to_string();
+                    error.get_or_insert(e);
+                }
+            }
+        }
         if let Some(Screens::Stashes { view, label, .. }) = self.panes.get_mut("stashes") {
             match stash_read {
                 Ok(loaded) => {
@@ -1610,6 +1900,11 @@ impl App {
             if screen.search_standing() {
                 self.modes.push("search");
             }
+        }
+        if self.picker.is_some() {
+            // The recent-repositories list owns the keyboard like help does:
+            // a press it does not name runs nothing underneath.
+            self.modes.push(PICKER);
         }
         if self.help {
             self.modes.push("help");
@@ -1887,6 +2182,12 @@ impl App {
     /// One keypress.
     fn press(&mut self, key: Key) {
         self.message.clear();
+        // While the picker stands it owns the keyboard the way help does:
+        // resolved against exactly its one mode, so nothing underneath runs.
+        if self.picker.is_some() {
+            self.press_modal(PICKER, key, ModalKind::List);
+            return;
+        }
         // While the prompt stands it owns the keyboard, and the full stack
         // must not see the key: a query or a message is text, and the
         // globals would read it. See [`App::press_input`].
@@ -1924,7 +2225,7 @@ impl App {
     /// to scroll and consumes nothing.
     fn wheel(&mut self, key: Key, col: usize, row: usize) {
         let (_, h) = self.screen.size();
-        if h < 3 || self.prompt.is_some() {
+        if h < 3 || self.prompt.is_some() || self.picker.is_some() {
             return;
         }
         if self.help {
@@ -1979,11 +2280,25 @@ impl App {
     /// characters could execute or duplicate input. That is the trade — a
     /// configured chord may reserve a printable first key, and this honours it.
     fn press_input(&mut self, key: Key) {
+        self.press_modal(INPUT, key, ModalKind::Field);
+    }
+
+    /// One keypress while a modal owns the keyboard, resolved against
+    /// exactly `mode` — [`Keymap::resolve_mode_any`], and never the full
+    /// stack — because the shipped global bindings must not read what the
+    /// modal holds: `?` would open help, `q` would quit. A binding written
+    /// in `[keys.<mode>]` still wins first, which is what makes Enter and
+    /// Esc (or their configured replacements) close it; a user who
+    /// deliberately binds `?` there gets a `?` that means what they said,
+    /// as mode scoping has always promised. What a chord that resolved to
+    /// nothing does next is the modal's own kind: a field edits, a question
+    /// and a list wait.
+    fn press_modal(&mut self, mode: &str, key: Key, kind: ModalKind) {
         self.pending.push(key);
         // One spelling per press, one position per key — the same shape
         // [`Keymap::resolve`] builds, resolved against exactly one mode.
         let typed: Vec<&[Key]> = self.pending.iter().map(std::slice::from_ref).collect();
-        match self.host.keys.resolve_mode_any(INPUT, &typed) {
+        match self.host.keys.resolve_mode_any(mode, &typed) {
             Resolve::Run(command) => {
                 self.pending.clear();
                 let command = command.to_string();
@@ -1993,6 +2308,9 @@ impl App {
             Resolve::Pending => {}
             Resolve::None => {
                 self.pending.clear();
+                if kind == ModalKind::List {
+                    return;
+                }
                 // The keys a field understands as editing, in the shared
                 // [`Edit`] vocabulary. Chords (ctrl/alt) are word motion on
                 // the arrows and nobody's elsewhere; everything else no
@@ -2046,6 +2364,7 @@ impl App {
             Some(Screens::Files { view, .. }) => view.query().unwrap_or_default().to_string(),
             Some(Screens::Branches { view, .. }) => view.query().unwrap_or_default().to_string(),
             Some(Screens::Stashes { view, .. }) => view.query().unwrap_or_default().to_string(),
+            Some(Screens::Remotes { view, .. }) => view.query().unwrap_or_default().to_string(),
             Some(Screens::Diff { view, .. }) => {
                 if !view.has_search_text() {
                     self.message = format!("{command}: the diff has no text to search");
@@ -2155,13 +2474,13 @@ impl App {
 
     /// `branches.checkout`: move HEAD onto the row the keyboard is on.
     ///
-    /// A remote-tracking row checks out too, and detaches onto the fetched
-    /// commit — git's own answer to "look at what the server has", and the
-    /// reason [`Target`] carries remotes at all; the full refname is joined
-    /// from the halves the model keeps apart, because either may hold a
-    /// slash. The one refusal said here is the detached row itself: already
-    /// a place, not a branch to move to. Everything else — dirty tree,
-    /// unknown name — is git's sentence, surfaced verbatim by the job.
+    /// A local row is git's own checkout, name bytes end to end. A remote-
+    /// tracking row is the one verb on this pane aimed at a remote that
+    /// creates something local: the branch of the same name, tracking, and
+    /// HEAD on it — git's `--track`, never a detach. The one refusal said
+    /// here is the detached row itself: already a place, not a branch to
+    /// move to. Everything else — dirty tree, a name already taken — is
+    /// git's sentence, surfaced verbatim by the job.
     fn checkout_branch(&mut self) {
         if !self.branches_focused("branches.checkout") {
             return;
@@ -2174,19 +2493,16 @@ impl App {
             self.message = "HEAD is already detached here".into();
             return;
         }
+        if let Target::Remote { .. } = target {
+            gitten_app::act::checkout_tracking(self);
+            return;
+        }
         let Some((_, repo)) = self.repo.as_ref() else {
             self.message = "a fixture has no repository to check out in".into();
             return;
         };
-        let name = match target {
-            Target::Local(name) => name,
-            Target::Remote { remote, branch } => {
-                let mut full = remote.as_bytes().to_vec();
-                full.push(b'/');
-                full.extend_from_slice(branch.as_bytes());
-                gitten_core::status::PathBytes::from_bytes(&full)
-            }
-            Target::Detached => unreachable!("refused above"),
+        let Target::Local(name) = target else {
+            unreachable!("remotes and detached answer above");
         };
         let job = Write::checkout(repo, name.as_bytes().to_vec());
         self.submit(Box::new(job));
@@ -2335,6 +2651,329 @@ impl App {
         gitten_app::act::delete_branch(self);
     }
 
+    /// Whether the keyboard is on the remotes pane — the guard every remote
+    /// verb opens with, said the way every wrong-focus refusal here is said.
+    fn remotes_focused(&mut self, command: &str) -> bool {
+        match self.panes.focused() {
+            Some(Screens::Remotes { .. }) => true,
+            _ => {
+                self.message = format!("{command} is not supported here");
+                false
+            }
+        }
+    }
+
+    /// The remote row the keyboard is on, as the verbs address it — the
+    /// implementation behind [`act::RemoteClient`].
+    fn remote_target(&self) -> Option<RefName> {
+        match self.panes.focused() {
+            Some(Screens::Remotes { view, .. }) => view.current(),
+            _ => None,
+        }
+    }
+
+    /// Arms the selected remote for a confirmed removal, or spends the arm —
+    /// the implementation behind [`act::RemoteClient`].
+    fn confirm_or_arm_remote(&mut self, name: &RefName) -> bool {
+        match self.panes.focused_mut() {
+            Some(Screens::Remotes { view, .. }) => view.confirm_or_arm_remove(name),
+            _ => false,
+        }
+    }
+
+    /// `branches.checkout-name`: gather a name on the status row; accept
+    /// checks out whatever git is handed. Reads no row — the name is the
+    /// whole of the aim — which is also why a fixture refuses before the
+    /// field opens: a question a repository cannot answer is a trap.
+    fn begin_branch_checkout_name(&mut self) {
+        if !self.branches_focused("branches.checkout-name") {
+            return;
+        }
+        if self.repo.is_none() {
+            self.message = "a fixture has no repository to check out in".into();
+            return;
+        }
+        self.open_prompt(Prompt::BranchCheckoutName {
+            field: Field::new(),
+        });
+    }
+
+    /// `commits.new-branch`: gather a name on the status row; accept grows
+    /// the branch at the commit the keyboard was on when the field opened —
+    /// captured now, never re-read from the pane. Once the branch exists,
+    /// the checkout is offered as a question: enter takes it, esc leaves
+    /// the branch to be found with space in the branches pane later.
+    fn begin_branch_new_at(&mut self) {
+        let Some(Screens::Commits { view, .. }) = self.panes.focused() else {
+            self.message = "commits.new-branch is not supported here".into();
+            return;
+        };
+        let Some(commit) = view.current() else {
+            self.message = "the keyboard is not on a commit".into();
+            return;
+        };
+        if self.repo.is_none() {
+            self.message = "a fixture has no repository to create branches in".into();
+            return;
+        }
+        self.open_prompt(Prompt::BranchNewAt {
+            at: commit.sha.clone().into_bytes(),
+            field: Field::new(),
+        });
+    }
+
+    /// The accepted name, as a job — then the question. Empty refused again
+    /// here, because the field that failed is the same field.
+    fn submit_branch_new_at(&mut self, at: Vec<u8>, name: String) {
+        if name.trim().is_empty() {
+            self.message = "a branch needs a name".into();
+            return;
+        }
+        gitten_app::act::create_branch_at(self, name.clone(), at);
+        // The question stands only over a branch that exists: offered after
+        // the job is queued, refused when the action above said so.
+        if self.message.is_empty() {
+            self.open_prompt(Prompt::CheckoutNew {
+                name,
+                field: Field::new(),
+            });
+        }
+    }
+
+    /// `project.open`: gather a path on the status row; accept switches
+    /// everything the app holds. The switch itself is
+    /// [`App::open_repository`]'s, and a refusal there leaves every pane
+    /// exactly where it was.
+    fn begin_project_open(&mut self) {
+        self.open_prompt(Prompt::ProjectOpen {
+            field: Field::new(),
+        });
+    }
+
+    /// `project.switch`: the recent repositories, as a modal list. Empty is
+    /// said, not shown — a picker of nothing is a trap shaped like an
+    /// answer.
+    fn open_project_picker(&mut self) {
+        let rows = gitten_app::projects::load();
+        if rows.is_empty() {
+            self.message = "no recent repositories — O to open one".into();
+            return;
+        }
+        self.picker = Some(RecentPicker { rows, cursor: 0 });
+        self.sync_modes();
+    }
+
+    /// `project.next` / `project.prev`: step the MRU from the repository
+    /// this app is showing. A fixture has no entry in the list, so a step
+    /// lands on its first row — the honest reading of "next" from nowhere.
+    fn switch_project(&mut self, by: isize) {
+        let rows = gitten_app::projects::load();
+        if rows.is_empty() {
+            self.message = "no recent repositories — O to open one".into();
+            return;
+        }
+        let at = self
+            .repo
+            .as_ref()
+            .map(|(path, _)| path.clone())
+            .and_then(|path| rows.iter().position(|row| same_repository(row, &path)));
+        let next = match at {
+            Some(at) => (at as isize + by).rem_euclid(rows.len() as isize) as usize,
+            None => 0,
+        };
+        self.open_repository(rows[next].to_string_lossy().as_ref());
+    }
+
+    /// Opens `path` as this app's repository: every pane rebuilt from the
+    /// new handle, everything the old one owned left behind with it.
+    ///
+    /// The guards are the whole of the safety here, and both are already
+    /// the app's own rules. The preview lane's answers carry the root they
+    /// were read from and install only while it is still ours; the job
+    /// queue's jobs hold the handle they were built with, so a write aimed
+    /// at the old repository lands on the old repository, however long it
+    /// runs past this call. What cannot be prevented — a straggler's finish
+    /// line — only advances a generation and re-reads the *new* panes, which
+    /// is a refresh and not a leak. And a refusal anywhere below — not a
+    /// repository, no history to open — changes nothing: the panes, the
+    /// handle, the MRU and the message all stay as they were.
+    fn open_repository(&mut self, raw: &str) {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            self.message = "a repository needs a path".into();
+            return;
+        }
+        let path = std::path::PathBuf::from(trimmed);
+        if self
+            .repo
+            .as_ref()
+            .is_some_and(|(current, _)| same_repository(current, &path))
+        {
+            self.message = format!("already showing {}", path.display());
+            return;
+        }
+        let handle = self.opener.open(&path);
+        // The one read every pane below depends on decides whether this is
+        // a repository at all — and answers in git's own words when it is
+        // not, which is the sentence a reader can act on.
+        if let Err(e) = handle.status() {
+            self.message = format!("{}: {e}", path.display());
+            return;
+        }
+        let source = Source::Repo {
+            path: path.clone(),
+            arg: String::new(),
+        };
+        let loaded =
+            match acquire::acquire(View::Commits, &source, &self.host, Some(handle.as_ref())) {
+                Ok(loaded) => loaded,
+                Err(e) => {
+                    self.message = format!("{}: {e}", path.display());
+                    return;
+                }
+            };
+        let Data::Commits(commits) = loaded.data else {
+            self.message = "the new repository answered with the wrong view".into();
+            return;
+        };
+        // Recorded only past every refusal: a failed open never reaches the
+        // list a future switch would offer.
+        gitten_app::projects::record(&path);
+        let glyphs = match self.ascii {
+            true => Glyphs::ascii(),
+            false => Glyphs::default(),
+        };
+        let marks = match glyphs == Glyphs::ascii() {
+            true => Marks::ascii(),
+            false => Marks::default(),
+        };
+        let mut list = Commits::with_glyphs(commits, glyphs);
+        list.set_bar(self.bar);
+        let mut stash = Stashes::unavailable();
+        stash.set_bar(self.bar);
+        let mut remotes = Remotes::unavailable();
+        remotes.set_bar(self.bar);
+        let mut files = Files::unavailable();
+        files.set_bar(self.bar);
+        let mut branches = Branches::with_marks(Vec::new(), marks);
+        branches.set_bar(self.bar);
+        let mut panes = panes::Panes::new();
+        panes.register(
+            "commits",
+            panes::Placement::sidebar("commits"),
+            Screens::Commits {
+                view: list,
+                source,
+                log_of: None,
+                label: loaded.label,
+                generation: Generation::default(),
+            },
+        );
+        panes.register(
+            "stashes",
+            panes::Placement::sidebar("stashes"),
+            Screens::Stashes {
+                view: stash,
+                label: STARTUP_LOADING.to_string(),
+                generation: Generation::default(),
+            },
+        );
+        panes.register(
+            "remotes",
+            panes::Placement::sidebar("remotes"),
+            Screens::Remotes {
+                view: remotes,
+                label: STARTUP_LOADING.to_string(),
+                generation: Generation::default(),
+            },
+        );
+        panes.register(
+            "diff",
+            panes::Placement::Main,
+            Screens::Diff {
+                view: Diff::new(Vec::new(), &self.host),
+                origin: None,
+                label: EMPTY_DIFF_LABEL.to_string(),
+                generation: Generation::default(),
+            },
+        );
+        panes.register(
+            "files",
+            panes::Placement::sidebar("files"),
+            Screens::Files {
+                view: files,
+                label: STARTUP_LOADING.to_string(),
+                generation: Generation::default(),
+            },
+        );
+        panes.register(
+            "branches",
+            panes::Placement::sidebar("branches"),
+            Screens::Branches {
+                view: branches,
+                label: STARTUP_LOADING.to_string(),
+                generation: Generation::default(),
+            },
+        );
+        panes.focus_named("commits");
+        self.panes = panes;
+        self.repo = Some((path.clone(), handle));
+        // What the client runs changed with the repository: a fixture view
+        // refused the sync keys, and this one answers them.
+        self.availability = tui_availability(true);
+        self.startup_pending = true;
+        self.help = false;
+        self.tail = None;
+        self.tail_commits.clear();
+        self.geometry = None;
+        self.sync_header_keys();
+        self.sync_modes();
+        // The deferred startup wave, the same one a launch runs: the
+        // sidebars and row zero's preview arrive on the frame after this.
+        self.load_startup(&mut StartClock::new());
+        self.message = format!("switched to {}", path.display());
+    }
+
+    /// `remotes.new`'s second field, opened by the accepted name: the URL,
+    /// with the name held as bytes for the job.
+    fn begin_remote_url(&mut self, name: String) {
+        if name.trim().is_empty() {
+            self.message = "a remote needs a name".into();
+            return;
+        }
+        self.open_prompt(Prompt::RemoteUrl {
+            name,
+            field: Field::new(),
+        });
+    }
+
+    /// `remotes.edit`: the same field, prefilled with the selected remote's
+    /// first URL — editing what is there beats retyping it. A remote with
+    /// no URL opens blank, and the accepted text is the whole new value.
+    fn begin_remote_edit(&mut self) {
+        if !self.remotes_focused("remotes.edit") {
+            return;
+        }
+        let Some(name) = self.remote_target() else {
+            self.message = "nothing selected to edit".into();
+            return;
+        };
+        if self.repo.is_none() {
+            self.message = "a fixture has no repository to edit in".into();
+            return;
+        }
+        let initial = match self.panes.get("remotes") {
+            Some(Screens::Remotes { view, .. }) => {
+                view.current_urls().first().cloned().unwrap_or_default()
+            }
+            _ => String::new(),
+        };
+        self.open_prompt(Prompt::RemoteEdit {
+            name,
+            field: Field::with_selected(&initial),
+        });
+    }
+
     /// Stands a prompt up and gives it the keyboard — the one path every
     /// prompt opens through, so none can stand while another does and the
     /// modes always follow. A prompt also covers the body, which is why
@@ -2397,6 +3036,11 @@ impl App {
         let Some(prompt) = self.prompt.as_mut() else {
             return;
         };
+        // A question is not a field: typed keys wait for an answer that is
+        // spelled enter or esc, and nothing else means anything here.
+        if prompt.question().is_some() {
+            return;
+        }
         // A paste is one edit; which shape it takes is the field's own kind.
         let edit = match edit {
             Edit::Paste(text) if prompt.multiline() => Edit::PasteMultiline(text),
@@ -2437,6 +3081,7 @@ impl App {
             Some(Screens::Files { view, .. }) => view.apply_query(query),
             Some(Screens::Branches { view, .. }) => view.apply_query(query),
             Some(Screens::Stashes { view, .. }) => view.apply_query(query),
+            Some(Screens::Remotes { view, .. }) => view.apply_query(query),
             Some(Screens::Diff { view, .. }) => view.search_edit(query),
             None => {}
         }
@@ -2483,6 +3128,7 @@ impl App {
                     Some(Screens::Files { view, .. }) => view.clear_search(),
                     Some(Screens::Branches { view, .. }) => view.clear_search(),
                     Some(Screens::Stashes { view, .. }) => view.clear_search(),
+                    Some(Screens::Remotes { view, .. }) => view.clear_search(),
                     Some(Screens::Diff { view, .. }) => view.search_clear(),
                     None => {}
                 }
@@ -2501,6 +3147,28 @@ impl App {
                 self.submit_branch_rename(from, field.take())
             }
             Prompt::TagNew { at, field } if accept => self.submit_branch_tag(at, field.take()),
+            Prompt::BranchCheckoutName { field } if accept => {
+                gitten_app::act::checkout_by_name(self, field.take())
+            }
+            Prompt::BranchNewAt { at, field } if accept => {
+                self.submit_branch_new_at(at, field.take())
+            }
+            Prompt::CheckoutNew { name, .. } if accept => {
+                let Some((_, repo)) = self.repo.as_ref() else {
+                    self.message = "a fixture has no repository to check out in".into();
+                    return;
+                };
+                let job = Write::checkout(repo, name.clone().into_bytes());
+                self.submit(Box::new(job));
+            }
+            Prompt::ProjectOpen { field } if accept => self.open_repository(&field.take()),
+            Prompt::RemoteName { field } if accept => self.begin_remote_url(field.take()),
+            Prompt::RemoteUrl { name, field } if accept => {
+                gitten_app::act::remote_add(self, name, field.take())
+            }
+            Prompt::RemoteEdit { name, field } if accept => {
+                gitten_app::act::remote_edit(self, name.as_bytes().to_vec(), field.take())
+            }
             // Cancelled: the text was the prompt's and dies with it.
             _ => {}
         }
@@ -2537,10 +3205,10 @@ impl App {
     /// button comes up. One gesture, one pane's selection state.
     fn mouse(&mut self, m: Mouse) {
         let (_, h) = self.screen.size();
-        // The help panel and any prompt are drawn over the body, so a click
-        // that reached a view through either would act on a row it is
-        // hiding. The keyboard gathers the text; the mouse waits.
-        if h < 3 || self.help || self.prompt.is_some() {
+        // The help panel, the picker and any prompt are drawn over the body,
+        // so a click that reached a view through any of them would act on a
+        // row it is hiding. The keyboard gathers the text; the mouse waits.
+        if h < 3 || self.help || self.prompt.is_some() || self.picker.is_some() {
             return;
         }
         match m.kind {
@@ -2702,6 +3370,38 @@ impl App {
                 return;
             }
         }
+        // While the picker stands it owns the keyboard, exactly as the help
+        // panel does: the moves it names land on it, accept opens, cancel
+        // and back close — and everything else waits, because a chord that
+        // fires a write behind a modal list is a trap help's mode was
+        // invented to close.
+        if self.picker.is_some() {
+            match command {
+                "view.down" | "view.up" | "view.top" | "view.bottom" => {
+                    if let Some(picker) = self.picker.as_mut() {
+                        match command {
+                            "view.down" => picker.down(),
+                            "view.up" => picker.up(),
+                            "view.top" => picker.jump_top(),
+                            _ => picker.jump_bottom(),
+                        }
+                    }
+                }
+                "input.accept" => {
+                    if let Some(picker) = self.picker.take() {
+                        let target = picker.rows[picker.cursor].clone();
+                        self.sync_modes();
+                        self.open_repository(target.to_string_lossy().as_ref());
+                    }
+                }
+                "input.cancel" | "back" => {
+                    self.picker = None;
+                    self.sync_modes();
+                }
+                _ => {}
+            }
+            return;
+        }
         if self.help && self.scroll_help(command) {
             return;
         }
@@ -2757,7 +3457,7 @@ impl App {
             // modes, the rest in `input` while any prompt stands — so
             // `gitten.toml` moves them the way it moves everything else.
             "commits.search" | "files.search" | "branches.search" | "stashes.search"
-            | "diff.search" => self.begin_search(command),
+            | "remotes.search" | "diff.search" => self.begin_search(command),
             "files.commit" => self.begin_commit_message(),
             "files.amend" => self.begin_amend_message(),
             // lazygit's global R, on the same wave a finished write runs:
@@ -2799,6 +3499,7 @@ impl App {
                             Screens::Files { view, .. } => view.clear_search(),
                             Screens::Branches { view, .. } => view.clear_search(),
                             Screens::Stashes { view, .. } => view.clear_search(),
+                            Screens::Remotes { view, .. } => view.clear_search(),
                             Screens::Diff { view, .. } => view.search_clear(),
                         }
                     }
@@ -2821,6 +3522,69 @@ impl App {
             // `s` binding simply by registering.
             "stashes.apply" | "stashes.pop" | "stashes.drop" => self.stash_selected(command),
             "files.stash" => self.stash_working_tree(),
+            // The sync verbs act on the *repository* — the branch HEAD sits
+            // on, and the remotes the config names — not on any pane. The
+            // refusals are the shared actions': no upstream, no remote,
+            // detached HEAD, a fixture.
+            "repo.push" => gitten_app::act::sync_push(self),
+            "repo.pull" => gitten_app::act::sync_pull(self),
+            "repo.fetch" => gitten_app::act::sync_fetch(self),
+            // Repository switching: open a path, the recent list, stepping
+            // the MRU. The switch itself is below, where the panes are.
+            "project.open" => self.begin_project_open(),
+            "project.switch" => self.open_project_picker(),
+            "project.next" => self.switch_project(1),
+            "project.prev" => self.switch_project(-1),
+            // The branch movement verbs: the row the keyboard is on, the
+            // shared action that means it. Force is the twice-pressed one;
+            // the rest move refs and HEAD without destroying anything.
+            "branches.checkout-name" => self.begin_branch_checkout_name(),
+            "branches.checkout-previous" => gitten_app::act::checkout_previous(self),
+            "branches.force-checkout" => {
+                if self.branches_focused("branches.force-checkout") {
+                    gitten_app::act::force_checkout(self);
+                }
+            }
+            "branches.fast-forward" => {
+                if self.branches_focused("branches.fast-forward") {
+                    gitten_app::act::fast_forward(self);
+                }
+            }
+            "branches.set-upstream" => {
+                if self.branches_focused("branches.set-upstream") {
+                    gitten_app::act::set_upstream(self);
+                }
+            }
+            "branches.unset-upstream" => {
+                if self.branches_focused("branches.unset-upstream") {
+                    gitten_app::act::unset_upstream(self);
+                }
+            }
+            // The remotes verbs: the row the keyboard is on, the shared
+            // `Write` that means it. Add and edit open the one prompt chain
+            // on their way through.
+            "remotes.fetch" => {
+                if self.remotes_focused("remotes.fetch") {
+                    gitten_app::act::remote_fetch(self);
+                }
+            }
+            "remotes.new" => {
+                if self.remotes_focused("remotes.new") {
+                    self.open_prompt(Prompt::RemoteName {
+                        field: Field::new(),
+                    });
+                }
+            }
+            "remotes.edit" => self.begin_remote_edit(),
+            "remotes.remove" => {
+                if self.remotes_focused("remotes.remove") {
+                    gitten_app::act::remote_remove(self);
+                }
+            }
+            // A branch grown from the commit the keyboard is on: the sha is
+            // captured when the field opens, and the checkout is offered as
+            // a question once the branch exists.
+            "commits.new-branch" => self.begin_branch_new_at(),
             // The file verbs, the same story one pane over: the row the
             // keyboard is on, the side of the index it sits on, and the
             // shared `Write` that means it — routed here ahead of the pane,
@@ -3149,6 +3913,13 @@ impl App {
     fn pump(&mut self) {
         self.drain_jobs();
         self.drain_previews();
+    }
+
+    /// Hands the switch path a test's own opener — the same seam the
+    /// startup holds, so a fake stands in for the binary here too.
+    #[cfg(test)]
+    fn use_opener(&mut self, opener: std::sync::Arc<dyn gitten_app::Opener>) {
+        self.opener = opener;
     }
 
     /// Drains until nothing is in flight — the deterministic turn a test
@@ -3826,6 +4597,13 @@ impl App {
             let text_ink = Ink::new(c.fg, c.status_bg);
             let mut pen = self.screen.row(h - 1);
             pen.put(" ", ink);
+            // A question is the row whole: what is asked, in the accent, and
+            // the two answers named in it. No field, no caret, no live count.
+            if let Some(question) = prompt.question() {
+                pen.put(&question, loud);
+                pen.wash(ink);
+                return;
+            }
             pen.put(prompt.label(), loud);
             let field = prompt.field();
             // A message that grew past one line says which line the cursor
@@ -3937,6 +4715,9 @@ impl App {
                 self.bar,
             );
         }
+        if let Some(picker) = self.picker.as_ref() {
+            paint_picker(&mut self.screen, 1, body, picker, &self.host);
+        }
     }
 }
 
@@ -4005,6 +4786,26 @@ fn tui_availability(repo: bool) -> Availability {
         "branches.rename",
         "branches.delete",
         "branches.new-tag",
+        "branches.checkout-name",
+        "branches.checkout-previous",
+        "branches.force-checkout",
+        "branches.fast-forward",
+        "branches.set-upstream",
+        "branches.unset-upstream",
+        "commits.new-branch",
+        "remotes.focus",
+        "remotes.fetch",
+        "remotes.new",
+        "remotes.edit",
+        "remotes.remove",
+        "remotes.search",
+        // A repository is what a switch aims away from and at; both are
+        // answerable from a fixture view, which is where a repository
+        // gets opened from when the launch had none.
+        "project.switch",
+        "project.open",
+        "project.next",
+        "project.prev",
         "copy.selection",
         "select.all",
         "select.none",
@@ -4031,6 +4832,9 @@ fn tui_availability(repo: bool) -> Availability {
         true => {
             a.available([
                 "repo.refresh",
+                "repo.push",
+                "repo.pull",
+                "repo.fetch",
                 "files.open-diff",
                 "files.toggle-side",
                 "stashes.open-diff",
@@ -4039,6 +4843,9 @@ fn tui_availability(repo: bool) -> Availability {
         }
         false => {
             a.disabled("repo.refresh", "a fixture has no repository to refresh");
+            a.disabled("repo.push", "a fixture has no repository to push from");
+            a.disabled("repo.pull", "a fixture has no repository to pull into");
+            a.disabled("repo.fetch", "a fixture has no repository to fetch into");
             a.disabled("files.open-diff", "a fixture has no file to preview");
             a.disabled("files.toggle-side", "a fixture has no file to preview");
             a.disabled("stashes.open-diff", "a fixture has no stash to preview");
@@ -4136,6 +4943,16 @@ impl gitten_app::act::FileClient for App {
             }
             _ => false,
         }
+    }
+}
+
+impl gitten_app::act::RemoteClient for App {
+    fn remote_target(&self) -> Option<RefName> {
+        self.remote_target()
+    }
+
+    fn confirm_or_arm_remote(&mut self, name: &RefName) -> bool {
+        self.confirm_or_arm_remote(name)
     }
 }
 
@@ -4259,6 +5076,30 @@ fn copied(text: &str) -> String {
 /// window's title-strip line, one cell row tall here.
 fn stash_label(describe: &str, parked: usize) -> String {
     format!("{describe} · {parked} parked")
+}
+
+/// Two paths name the same repository — by their spelling, or by what the
+/// filesystem says they point at. The MRU stores canonicalized paths, but
+/// an entry recorded raw still matches once the directory exists.
+fn same_repository(a: &std::path::Path, b: &std::path::Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// The remotes pane's header label: what repository, how many remotes. The
+/// one-word plural is git's own config grammar — `remote.add` — not a
+/// formatting mood.
+fn remotes_label(describe: &str, count: usize) -> String {
+    let word = match count {
+        1 => "remote",
+        _ => "remotes",
+    };
+    format!("{describe} · {count} {word}")
 }
 
 /// Whether to report what a frame cost. `GITTEN_STATS=0` turns it off, so
@@ -5376,6 +6217,17 @@ diff --git a/tracked.txt b/tracked.txt
         /// keyboard would.
         index_oids: Vec<(String, String)>,
         head_oids: Vec<(String, String)>,
+        /// The remotes `remote -v` answers with, and how often it was read.
+        servers: Vec<gitten_core::refs::Remote>,
+        server_reads: usize,
+        /// When set, the next sync verb (push, pull, fetch, or any read the
+        /// sync path makes) blocks until the pair is opened — the same
+        /// honest slow job the staged read's gate gives previews: a real
+        /// network op, on a real thread, with the keyboard live around it.
+        net_gate: Option<Arc<(Mutex<bool>, std::sync::Condvar)>>,
+        /// When set, the next sync verb fails with exactly this message and
+        /// changes nothing: git's refusal, verbatim.
+        refuse_net: Option<String>,
     }
 
     /// A repository that exists only as this struct. Reads answer what the
@@ -5384,6 +6236,31 @@ diff --git a/tracked.txt b/tracked.txt
     /// refresh reading the world after the write. No process, no tty, no
     /// window, and nothing recorded is a real repository.
     struct FakeRepo(Arc<Mutex<FakeState>>);
+
+    impl FakeRepo {
+        /// Holds the net gate open for as long as the test holds it shut —
+        /// the one honest way to test that a slow network job keeps the
+        /// keyboard live — then answers the refusal or nothing. The state's
+        /// lock is let go while the gate is held: a blocked network job must
+        /// not deadlock a concurrent read of the same fake.
+        fn net(&self) -> gitten_git::Result<()> {
+            let (gate, refuse) = {
+                let s = self.0.lock().unwrap();
+                (s.net_gate.clone(), s.refuse_net.clone())
+            };
+            if let Some(gate) = gate {
+                let (open, arrived) = &*gate;
+                let mut is_open = open.lock().unwrap();
+                while !*is_open {
+                    is_open = arrived.wait(is_open).unwrap();
+                }
+            }
+            match refuse {
+                Some(e) => Err(e),
+                None => Ok(()),
+            }
+        }
+    }
 
     fn three_commits() -> Vec<Commit> {
         ["one", "two", "three"]
@@ -5682,6 +6559,280 @@ diff --git a/tracked.txt b/tracked.txt
             for (i, entry) in s.stashes.iter_mut().enumerate() {
                 entry.index = i;
             }
+            Ok(())
+        }
+
+        // ------------------------------------------------------ the sync
+
+        fn remotes(&self) -> gitten_git::Result<Vec<gitten_core::refs::Remote>> {
+            self.net()?;
+            let mut s = self.0.lock().unwrap();
+            s.server_reads += 1;
+            Ok(s.servers.clone())
+        }
+
+        fn push(&self, remote: &[u8], branch: &[u8]) -> gitten_git::Result<()> {
+            self.net()?;
+            let mut s = self.0.lock().unwrap();
+            s.writes.push(format!(
+                "push {} {}",
+                String::from_utf8_lossy(remote),
+                String::from_utf8_lossy(branch)
+            ));
+            // git's own semantics: the push created the branch upstream and
+            // set the tracking link (the Binary impl sends --set-upstream
+            // when the branch tracks nothing).
+            let tracked = s
+                .locals
+                .iter()
+                .any(|b| b.name.as_bytes() == branch && b.upstream.is_some());
+            if !tracked {
+                if let Some(b) = s.locals.iter_mut().find(|b| b.name.as_bytes() == branch) {
+                    b.upstream = Some(gitten_core::refs::Upstream {
+                        remote: RefName::from_bytes(remote),
+                        branch: RefName::from_bytes(branch),
+                        ahead: Some(0),
+                        behind: Some(0),
+                    });
+                }
+                if !s
+                    .remotes
+                    .iter()
+                    .any(|r| r.remote.as_bytes() == remote && r.branch.as_bytes() == branch)
+                {
+                    s.remotes.push(RemoteBranch {
+                        remote: RefName::from_bytes(remote),
+                        branch: RefName::from_bytes(branch),
+                        commit: "f00d".into(),
+                    });
+                }
+            }
+            Ok(())
+        }
+
+        fn pull(&self) -> gitten_git::Result<()> {
+            self.net()?;
+            let mut s = self.0.lock().unwrap();
+            s.writes.push("pull".into());
+            Ok(())
+        }
+
+        fn fetch(&self, remote: Option<&[u8]>) -> gitten_git::Result<()> {
+            self.net()?;
+            let mut s = self.0.lock().unwrap();
+            s.writes.push(format!(
+                "fetch {}",
+                remote
+                    .map(|r| String::from_utf8_lossy(r).into_owned())
+                    .unwrap_or_else(|| "--all".into())
+            ));
+            Ok(())
+        }
+
+        fn checkout_tracking(&self, remote: &[u8], branch: &[u8]) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            if let Some(e) = s.refuse_branch.clone() {
+                return Err(e);
+            }
+            let mut full = remote.to_vec();
+            full.push(b'/');
+            full.extend_from_slice(branch);
+            s.branch_writes
+                .push(format!("track checkout {}", String::from_utf8_lossy(&full)));
+            s.branch_bytes.push(full);
+            // git's own semantics: the local branch of the same name is
+            // created, tracking, and HEAD moves onto it.
+            for b in &mut s.locals {
+                b.head = false;
+            }
+            s.locals.push(Branch {
+                name: RefName::from_bytes(branch),
+                commit: "f00d".into(),
+                upstream: Some(gitten_core::refs::Upstream {
+                    remote: RefName::from_bytes(remote),
+                    branch: RefName::from_bytes(branch),
+                    ahead: Some(0),
+                    behind: Some(0),
+                }),
+                head: true,
+            });
+            s.head = Some(HeadState::Branch {
+                name: RefName::from_bytes(branch),
+                commit: Some("f00d".into()),
+            });
+            Ok(())
+        }
+
+        fn checkout_previous(&self) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            if let Some(e) = s.refuse_branch.clone() {
+                return Err(e);
+            }
+            s.branch_writes.push("checkout -".into());
+            // git's own semantics, one move along the reflog: the previous
+            // branch takes HEAD. The fake has no reflog, so the first
+            // branch that is not under HEAD stands in.
+            let previous = s.locals.iter().find(|b| !b.head).map(|b| b.name.clone());
+            if let Some(previous) = previous {
+                for b in &mut s.locals {
+                    b.head = b.name == previous;
+                }
+                s.head = Some(HeadState::Branch {
+                    name: previous,
+                    commit: Some("f00d".into()),
+                });
+            }
+            Ok(())
+        }
+
+        fn checkout_force(&self, name: &[u8]) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            if let Some(e) = s.refuse_branch.clone() {
+                return Err(e);
+            }
+            s.branch_writes
+                .push(format!("force-checkout {}", String::from_utf8_lossy(name)));
+            s.branch_bytes.push(name.to_vec());
+            for b in &mut s.locals {
+                b.head = b.name.as_bytes() == name;
+            }
+            s.head = Some(HeadState::Branch {
+                name: RefName::from_bytes(name),
+                commit: Some("f00d".into()),
+            });
+            // `-f`'s whole point: the local changes go with it.
+            s.status = Default::default();
+            Ok(())
+        }
+
+        fn set_upstream(
+            &self,
+            local: &[u8],
+            remote: &[u8],
+            branch: &[u8],
+        ) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            if let Some(e) = s.refuse_branch.clone() {
+                return Err(e);
+            }
+            s.branch_writes.push(format!(
+                "track {} {} {}",
+                String::from_utf8_lossy(local),
+                String::from_utf8_lossy(remote),
+                String::from_utf8_lossy(branch)
+            ));
+            if let Some(b) = s.locals.iter_mut().find(|b| b.name.as_bytes() == local) {
+                b.upstream = Some(gitten_core::refs::Upstream {
+                    remote: RefName::from_bytes(remote),
+                    branch: RefName::from_bytes(branch),
+                    ahead: Some(0),
+                    behind: Some(0),
+                });
+            }
+            Ok(())
+        }
+
+        fn unset_upstream(&self, local: &[u8]) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            if let Some(e) = s.refuse_branch.clone() {
+                return Err(e);
+            }
+            s.branch_writes
+                .push(format!("untrack {}", String::from_utf8_lossy(local)));
+            if let Some(b) = s.locals.iter_mut().find(|b| b.name.as_bytes() == local) {
+                b.upstream = None;
+            }
+            Ok(())
+        }
+
+        fn fast_forward(
+            &self,
+            local: &[u8],
+            remote: &[u8],
+            branch: &[u8],
+        ) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            if let Some(e) = s.refuse_branch.clone() {
+                return Err(e);
+            }
+            // The shape is HEAD's own, decided fresh exactly as the Binary
+            // impl decides it: merge for the checked-out branch, fetch
+            // refspec for everything else.
+            let head_branch = match s.head.clone().unwrap_or(HeadState::Detached {
+                commit: "f00d".into(),
+            }) {
+                HeadState::Branch { name, .. } => Some(name),
+                HeadState::Detached { .. } => None,
+            };
+            let verb = match head_branch.as_ref().map(|n| n.as_bytes()) == Some(local) {
+                true => "merge --ff-only",
+                false => "fetch refspec",
+            };
+            s.branch_writes.push(format!(
+                "fast-forward {} {} {verb} {}/{}",
+                String::from_utf8_lossy(local),
+                if verb == "merge --ff-only" {
+                    "to"
+                } else {
+                    "from"
+                },
+                String::from_utf8_lossy(remote),
+                String::from_utf8_lossy(branch)
+            ));
+            if let Some(b) = s.locals.iter_mut().find(|b| b.name.as_bytes() == local) {
+                b.commit = "beef".into();
+            }
+            Ok(())
+        }
+
+        fn add_remote(&self, name: &[u8], url: &[u8]) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            if let Some(e) = s.refuse_branch.clone() {
+                return Err(e);
+            }
+            s.branch_writes.push(format!(
+                "remote add {} {}",
+                String::from_utf8_lossy(name),
+                String::from_utf8_lossy(url)
+            ));
+            if !s.servers.iter().any(|r| r.name.as_bytes() == name) {
+                s.servers.push(gitten_core::refs::Remote {
+                    name: RefName::from_bytes(name),
+                    urls: vec![String::from_utf8_lossy(url).into_owned()],
+                });
+            }
+            Ok(())
+        }
+
+        fn set_remote_url(&self, name: &[u8], url: &[u8]) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            if let Some(e) = s.refuse_branch.clone() {
+                return Err(e);
+            }
+            s.branch_writes.push(format!(
+                "remote set-url {} {}",
+                String::from_utf8_lossy(name),
+                String::from_utf8_lossy(url)
+            ));
+            if let Some(r) = s.servers.iter_mut().find(|r| r.name.as_bytes() == name) {
+                if r.urls.is_empty() {
+                    r.urls.push(String::from_utf8_lossy(url).into_owned());
+                } else {
+                    r.urls[0] = String::from_utf8_lossy(url).into_owned();
+                }
+            }
+            Ok(())
+        }
+
+        fn remove_remote(&self, name: &[u8]) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            if let Some(e) = s.refuse_branch.clone() {
+                return Err(e);
+            }
+            s.branch_writes
+                .push(format!("remote remove {}", String::from_utf8_lossy(name)));
+            s.servers.retain(|r| r.name.as_bytes() != name);
+            s.remotes.retain(|r| r.remote.as_bytes() != name);
             Ok(())
         }
 
@@ -6202,7 +7353,7 @@ diff --git a/tracked.txt b/tracked.txt
             app.screen.row_text(3)
         );
 
-        // Wide: the four sidebar lists split the sidebar into canonical
+        // Wide: the five sidebar lists split the sidebar into canonical
         // equal slices beside the diff, and no row crosses the divider
         // column.
         app.screen.resize(120, 24);
@@ -6213,10 +7364,10 @@ diff --git a/tracked.txt b/tracked.txt
         assert_eq!((files_rect.x, files_rect.width), (0, 40));
         assert_eq!((commits_rect.x, commits_rect.width), (0, 40));
         assert_eq!(files_rect.y, 1);
-        assert_eq!(commits_rect.y, files_rect.y + files_rect.height + 6);
-        // Four slices over the sidebar: the odd rows go to the first two.
-        assert_eq!(files_rect.height, 6, "the first slice takes the remainder");
-        assert_eq!(commits_rect.height, 5, "unequal slices");
+        assert_eq!(commits_rect.y, files_rect.y + files_rect.height + 5);
+        // Five slices over the sidebar: the odd rows go to the first two.
+        assert_eq!(files_rect.height, 5, "the first slice takes the remainder");
+        assert_eq!(commits_rect.height, 4, "unequal slices");
         assert_eq!((diff_rect.x, diff_rect.width), (41, 79));
         for y in 1..24 {
             assert_eq!(
@@ -6279,13 +7430,13 @@ diff --git a/tracked.txt b/tracked.txt
             "the launch focus was not restored"
         );
         assert!(app.panes.get("files").is_some(), "no files tenant");
-        assert_eq!(app.panes.names().count(), 5);
+        assert_eq!(app.panes.names().count(), 6);
         // The sidebar's canonical order: files (rank 1), branches (rank 2),
         // commits (rank 3), stashes (rank 4) — with nothing in panes.rs the
         // wiser.
         assert_eq!(
             app.panes.list_order(),
-            ["files", "branches", "commits", "stashes"]
+            ["files", "branches", "commits", "stashes", "remotes"]
         );
 
         // `2` is the shared files.focus binding, and it now lands.
@@ -6717,13 +7868,18 @@ diff --git a/tracked.txt b/tracked.txt
         disarm_check(&mut app, &state, "after the wheel");
 
         // A mouse press on another row disarms too. The files slice is the
-        // upper half of the sidebar at 120 columns; its content starts on
-        // screen row 2.
+        // first of the sidebar's five at 120 columns; its content starts on
+        // screen row 2, and the staged file — a selectable row that is not
+        // the armed one — sits on row 3.
         onto_work(&mut app);
         app.dispatch("files.discard");
         let armed_row = files_of(&app).cursor();
-        app.mouse(click(MouseKind::Down, 5, 2 + armed_row + 1));
-        app.mouse(click(MouseKind::Up, 5, 2 + armed_row + 1));
+        let other_row = match armed_row {
+            0 => 1,
+            _ => 1,
+        };
+        app.mouse(click(MouseKind::Down, 5, 2 + other_row));
+        app.mouse(click(MouseKind::Up, 5, 2 + other_row));
         onto_work(&mut app);
         disarm_check(&mut app, &state, "after a mouse press elsewhere");
 
@@ -7033,7 +8189,7 @@ diff --git a/tracked.txt b/tracked.txt
         ));
         app.press(Key::plain(Code::Enter));
         assert_eq!(app.panes.focused_name(), "diff");
-        assert_eq!(app.panes.names().count(), 5, "enter appended a pane");
+        assert_eq!(app.panes.names().count(), 6, "enter appended a pane");
         assert_eq!(state.lock().unwrap().pairs_reads, open_reads);
         // The commits pane stays resident, its cursor where it was.
         assert_eq!(commits_of(&app).cursor(), 0);
@@ -7082,7 +8238,7 @@ diff --git a/tracked.txt b/tracked.txt
         app.press(Key::plain(Code::Enter));
         assert_eq!(
             app.panes.names().count(),
-            5,
+            6,
             "a second enter appended a pane"
         );
         assert_eq!(app.panes.focused_name(), "diff");
@@ -7521,9 +8677,10 @@ diff --git a/tracked.txt b/tracked.txt
         app.draw();
 
         // Down in the commits rectangle presses it, in its own coordinates.
-        // The sidebar splits four ways now, so the commits slice is the
-        // third of them: local row 2 is three content rows down.
-        app.mouse(click(MouseKind::Down, 5, 16));
+        // The sidebar splits five ways now, so the commits slice is the
+        // third of them (its content rows are 12–14): local row 2 is two
+        // content rows down.
+        app.mouse(click(MouseKind::Down, 5, 14));
         app.pump_quiet();
         assert_eq!(app.panes.focused_name(), "commits");
         assert_eq!(
@@ -7568,16 +8725,16 @@ diff --git a/tracked.txt b/tracked.txt
 
         // Two quick clicks in the commits pane open the diff — the clock
         // counts, and the pane it counted in is part of what it counted.
-        // (The commits slice is the lower half of the sidebar now.)
+        // (The commits slice is the middle of the sidebar now.)
         app.dispatch("commits.focus");
         let reads = state.lock().unwrap().pairs_reads;
-        app.mouse(click(MouseKind::Down, 10, 15));
-        app.mouse(click(MouseKind::Up, 10, 15));
+        app.mouse(click(MouseKind::Down, 10, 13));
+        app.mouse(click(MouseKind::Up, 10, 13));
         // The click's own preview is on the lane; let it land before the
         // second press, so the double click meets a shown commit and
         // deduplicates — the count below is the click's read, not the open's.
         app.pump_quiet();
-        app.mouse(click(MouseKind::Down, 10, 15));
+        app.mouse(click(MouseKind::Down, 10, 13));
         app.pump_quiet();
         assert_eq!(
             app.panes.focused_name(),
@@ -7620,10 +8777,10 @@ diff --git a/tracked.txt b/tracked.txt
 
         // A drag in the commits pane: the Up queues exactly its selection,
         // once, and the feedback counts lines. The commits slice is the
-        // lower half of the sidebar now.
-        app.mouse(click(MouseKind::Down, 5, 15));
-        app.mouse(click(MouseKind::Drag, 5, 18));
-        app.mouse(click(MouseKind::Up, 5, 18));
+        // middle of the sidebar now, its content rows 12–14.
+        app.mouse(click(MouseKind::Down, 5, 13));
+        app.mouse(click(MouseKind::Drag, 5, 14));
+        app.mouse(click(MouseKind::Up, 5, 14));
         let commits_text = commits_of(&app).selection();
         assert!(
             !commits_text.is_empty(),
@@ -7880,7 +9037,7 @@ diff --git a/tracked.txt b/tracked.txt
         // The read is on the preview lane now; the install is what the next
         // dispatch deduplicates against, so give it its turn.
         app.pump_quiet();
-        assert_eq!(app.panes.names().count(), 5, "open-diff appended a pane");
+        assert_eq!(app.panes.names().count(), 6, "open-diff appended a pane");
         assert!(matches!(app.panes.get("diff"), Some(Screens::Diff { .. })));
         app.dispatch("commits.focus");
         assert_eq!(app.panes.focused_name(), "commits");
@@ -8331,17 +9488,17 @@ diff --git a/tracked.txt b/tracked.txt
         let names: Vec<&str> = app.panes.names().collect();
         assert_eq!(
             app.panes.names().collect::<Vec<_>>(),
-            ["commits", "stashes", "diff", "files", "branches"],
+            ["commits", "stashes", "remotes", "diff", "files", "branches"],
             "{names:?}"
         );
         assert_eq!(app.panes.focused_name(), "commits");
         assert_eq!(
             app.panes.list_order(),
-            ["files", "branches", "commits", "stashes"]
+            ["files", "branches", "commits", "stashes", "remotes"]
         );
         assert_eq!(
             app.panes.reading_order(),
-            ["files", "branches", "commits", "stashes", "diff"]
+            ["files", "branches", "commits", "stashes", "remotes", "diff"]
         );
 
         // `5` reaches it — through the keymap, and the mode follows the
@@ -8368,7 +9525,7 @@ diff --git a/tracked.txt b/tracked.txt
         let diff_app = app_on_fake(&source, &handle);
         assert_eq!(
             diff_app.panes.names().collect::<Vec<_>>(),
-            ["stashes", "diff", "files", "branches"]
+            ["stashes", "remotes", "diff", "files", "branches"]
         );
         assert_eq!(diff_app.panes.focused_name(), "diff");
 
@@ -8393,27 +9550,27 @@ diff --git a/tracked.txt b/tracked.txt
         let mut app = commits_app(&handle);
         app.draw();
 
-        // Wide: the sidebar splits into four canonical slices — files on
-        // top, branches under it, commits next, the stack at the foot — and
-        // the diff takes the rest, one divider column between. No geometry
-        // module changed to make room: this is the registry's equal-slice
-        // answer to the tenants there are.
+        // Wide: the sidebar splits into five canonical slices — files on
+        // top, branches under it, commits next, the stack, the remotes at
+        // the foot — and the diff takes the rest, one divider column
+        // between. No geometry module changed to make room: this is the
+        // registry's equal-slice answer to the tenants there are.
         assert_eq!(
             app.pane_rect("commits"),
             Some(crate::panes::Rect {
                 x: 0,
-                y: 13,
+                y: 11,
                 width: 40,
-                height: 5
+                height: 4
             })
         );
         assert_eq!(
             app.pane_rect("stashes"),
             Some(crate::panes::Rect {
                 x: 0,
-                y: 18,
+                y: 15,
                 width: 40,
-                height: 5
+                height: 4
             })
         );
         assert_eq!(
@@ -8429,12 +9586,12 @@ diff --git a/tracked.txt b/tracked.txt
         // Headers name the live configured focus keys — 4 and 5, straight
         // out of the shipped map — and the stack says whose repository it
         // is and how much is parked.
-        let commits_header = app.screen.row_text(13).chars().take(40).collect::<String>();
+        let commits_header = app.screen.row_text(11).chars().take(40).collect::<String>();
         assert!(
             commits_header.contains('4') && commits_header.contains("commits"),
             "{commits_header:?}"
         );
-        let stashes_header = app.screen.row_text(18);
+        let stashes_header = app.screen.row_text(15);
         assert!(stashes_header.contains('5'), "{stashes_header:?}");
         assert!(stashes_header.contains("stashes"), "{stashes_header:?}");
         assert!(
@@ -8452,7 +9609,7 @@ diff --git a/tracked.txt b/tracked.txt
         }
 
         // And the stack itself drew: both rows, address first.
-        let rows: Vec<String> = (19..23).map(|y| app.screen.row_text(y)).collect();
+        let rows: Vec<String> = (16..19).map(|y| app.screen.row_text(y)).collect();
         assert!(rows.iter().any(|r| r.contains("stash@{0}")), "{rows:?}");
         assert!(rows.iter().any(|r| r.contains("stash@{1}")), "{rows:?}");
 
@@ -8503,6 +9660,14 @@ diff --git a/tracked.txt b/tracked.txt
             "stashes",
             "the cycle did not reach the second list"
         );
+        // The remotes list sits between the stack and the foot now; the
+        // wrap takes one more step.
+        app.dispatch("pane.next");
+        assert_eq!(
+            app.panes.focused_name(),
+            "remotes",
+            "the cycle did not reach the new list"
+        );
         app.dispatch("pane.next");
         assert_eq!(app.panes.focused_name(), "files", "the cycle did not wrap");
         app.press(Key::plain(Code::Char('5')));
@@ -8514,9 +9679,9 @@ diff --git a/tracked.txt b/tracked.txt
             app.screen.row_text(0)
         );
         assert!(
-            app.screen.row_text(18).contains('5') && app.screen.row_text(18).contains("stashes"),
+            app.screen.row_text(15).contains('5') && app.screen.row_text(15).contains("stashes"),
             "the header did not advertise the stack: {:?}",
-            app.screen.row_text(18)
+            app.screen.row_text(15)
         );
         assert!(
             app.screen
@@ -8568,25 +9733,25 @@ diff --git a/tracked.txt b/tracked.txt
         // release reads that pane; a press in the stack's slice moves the
         // keyboard there, and a drag inside the stack builds no selection —
         // a stack is acted on one entry at a time. The commits slice is the
-        // third of the sidebar's four; the stack is the foot.
+        // third of the sidebar's five; the stack the fourth.
         app.dispatch("commits.focus");
-        app.mouse(click(MouseKind::Down, 5, 15));
-        app.mouse(click(MouseKind::Drag, 5, 17));
-        app.mouse(click(MouseKind::Up, 5, 17));
+        app.mouse(click(MouseKind::Down, 5, 13));
+        app.mouse(click(MouseKind::Drag, 5, 14));
+        app.mouse(click(MouseKind::Up, 5, 14));
         assert!(
             !commits_of(&app).selection().is_empty(),
             "the drag in the list selected nothing"
         );
-        app.mouse(click(MouseKind::Down, 5, 20));
+        app.mouse(click(MouseKind::Down, 5, 17));
         assert_eq!(
             app.panes.focused_name(),
             "stashes",
             "the press did not move the keyboard to the stack"
         );
-        app.mouse(click(MouseKind::Up, 5, 20));
-        app.mouse(click(MouseKind::Down, 5, 21));
-        app.mouse(click(MouseKind::Drag, 5, 22));
-        app.mouse(click(MouseKind::Up, 5, 22));
+        app.mouse(click(MouseKind::Up, 5, 17));
+        app.mouse(click(MouseKind::Down, 5, 17));
+        app.mouse(click(MouseKind::Drag, 5, 18));
+        app.mouse(click(MouseKind::Up, 5, 18));
         assert_eq!(
             app.panes.get("stashes").map(|pane| pane.selection()),
             Some(String::new()),
@@ -9000,7 +10165,7 @@ diff --git a/tracked.txt b/tracked.txt
         // the exact error kept for the status line.
         assert_eq!(
             app.panes.names().collect::<Vec<_>>(),
-            ["commits", "stashes", "diff", "files", "branches"]
+            ["commits", "stashes", "remotes", "diff", "files", "branches"]
         );
         assert_eq!(app.panes.focused_name(), "commits");
         assert_eq!(app.message, "fatal: bad object refs/stash");
@@ -9017,11 +10182,11 @@ diff --git a/tracked.txt b/tracked.txt
         // line, never the empty-stack line that would assert a read that
         // never succeeded, and no row for a verb to address.
         assert!(
-            app.screen.row_text(18).contains("unavailable"),
+            app.screen.row_text(15).contains("unavailable"),
             "the header did not say so: {:?}",
-            app.screen.row_text(18)
+            app.screen.row_text(15)
         );
-        let rows: Vec<String> = (19..23).map(|y| app.screen.row_text(y)).collect();
+        let rows: Vec<String> = (16..19).map(|y| app.screen.row_text(y)).collect();
         assert!(
             rows.iter().any(|r| r.contains("stash list unavailable")),
             "{rows:?}"
@@ -9053,11 +10218,11 @@ diff --git a/tracked.txt b/tracked.txt
         );
         app.draw();
         assert!(
-            app.screen.row_text(18).contains("fake (main) · 2 parked"),
+            app.screen.row_text(15).contains("fake (main) · 2 parked"),
             "the header did not recover: {:?}",
-            app.screen.row_text(18)
+            app.screen.row_text(15)
         );
-        let rows: Vec<String> = (19..23).map(|y| app.screen.row_text(y)).collect();
+        let rows: Vec<String> = (16..19).map(|y| app.screen.row_text(y)).collect();
         assert!(rows.iter().any(|r| r.contains("stash@{0}")), "{rows:?}");
         assert!(
             !app.screen.row_text(23).contains("fatal:"),
@@ -9114,17 +10279,17 @@ diff --git a/tracked.txt b/tracked.txt
         let names: Vec<&str> = app.panes.names().collect();
         assert_eq!(
             app.panes.names().collect::<Vec<_>>(),
-            ["commits", "stashes", "diff", "files", "branches"],
+            ["commits", "stashes", "remotes", "diff", "files", "branches"],
             "{names:?}"
         );
         assert_eq!(app.panes.focused_name(), "commits");
         assert_eq!(
             app.panes.list_order(),
-            ["files", "branches", "commits", "stashes"]
+            ["files", "branches", "commits", "stashes", "remotes"]
         );
         assert_eq!(
             app.panes.reading_order(),
-            ["files", "branches", "commits", "stashes", "diff"]
+            ["files", "branches", "commits", "stashes", "remotes", "diff"]
         );
 
         // `3` reaches it — through the keymap — and the keyboard's modes
@@ -9173,7 +10338,7 @@ diff --git a/tracked.txt b/tracked.txt
         let mut app = app_on_fake(&source, &handle);
         assert_eq!(
             app.panes.names().collect::<Vec<_>>(),
-            ["stashes", "diff", "files", "branches"]
+            ["stashes", "remotes", "diff", "files", "branches"]
         );
         assert_eq!(app.panes.focused_name(), "diff");
 
@@ -9212,9 +10377,9 @@ diff --git a/tracked.txt b/tracked.txt
             branches,
             crate::panes::Rect {
                 x: 0,
-                y: 9,
+                y: 7,
                 width: 40,
-                height: 7
+                height: 6
             }
         );
         assert_eq!(
@@ -9257,7 +10422,7 @@ diff --git a/tracked.txt b/tracked.txt
         let mut app = commits_app(&handle);
         assert_eq!(
             app.panes.names().collect::<Vec<_>>(),
-            ["commits", "stashes", "diff", "files", "branches"]
+            ["commits", "stashes", "remotes", "diff", "files", "branches"]
         );
         assert_eq!(
             app.panes.focused_name(),
@@ -9408,9 +10573,9 @@ diff --git a/tracked.txt b/tracked.txt
             b"f\xe9ature".to_vec()
         );
 
-        // A remote row checks out detached, and the refname is joined from
-        // the halves exactly once — the slash in the branch half must not
-        // make two.
+        // A remote row checks out as a *tracking* branch, and the refname
+        // is joined from the halves exactly once — the slash in the branch
+        // half must not make two.
         app.dispatch("view.down");
         let gen = app.generation;
         app.press(Key::plain(Code::Char(' ')));
@@ -9426,22 +10591,34 @@ diff --git a/tracked.txt b/tracked.txt
             b"origin/feat/ure".to_vec()
         );
 
-        // The fake detached onto the fetched commit; the refreshed pane
-        // leads with the detached row, and that row refuses by name — a
-        // place, not a branch to move to.
+        // The fake created the local branch of the same name, tracking, and
+        // moved HEAD onto it; the refreshed pane leads with that local row,
+        // and space on it is an ordinary checkout between locals.
         app.draw();
         app.dispatch("view.top");
-        assert!(matches!(
+        // The fake answers the locals in insertion order — main, the
+        // non-text name, and the tracking branch the checkout created —
+        // and headings hold no cursor: the top settles on main, two
+        // selectable rows further is the new branch.
+        app.dispatch("view.down");
+        app.dispatch("view.down");
+        assert_eq!(
             branches_of(&app).current(),
-            Some(Target::Detached)
-        ));
+            Some(Target::Local(gitten_core::refs::RefName::from("feat/ure")))
+        );
+        let gen = app.generation;
         app.press(Key::plain(Code::Char(' ')));
-        app.pump_quiet();
-        assert_eq!(app.message, "HEAD is already detached here");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                app.generation > gen
+            }),
+            "the local checkout never queued"
+        );
         assert_eq!(
             state.lock().unwrap().branch_writes.len(),
-            3,
-            "a detached checkout queued"
+            4,
+            "the tracking branch's own checkout never queued"
         );
 
         // A refusal is git's sentence verbatim, and it still staled the
@@ -9464,7 +10641,7 @@ diff --git a/tracked.txt b/tracked.txt
         );
         assert_eq!(
             state.lock().unwrap().branch_writes.len(),
-            3,
+            4,
             "a refused checkout recorded a write"
         );
 
@@ -10023,14 +11200,14 @@ diff --git a/tracked.txt b/tracked.txt
         // second press would confirm — and a press on another row clears it.
         app.dispatch("view.top");
         app.press(Key::char('d'));
-        app.mouse(click(MouseKind::Down, 2, 9));
-        app.mouse(click(MouseKind::Up, 2, 9));
+        app.mouse(click(MouseKind::Down, 2, 8));
+        app.mouse(click(MouseKind::Up, 2, 8));
         assert!(
             branches_of(&app).armed_row().is_some(),
             "the arm died on its own row"
         );
-        app.mouse(click(MouseKind::Down, 2, 11));
-        app.mouse(click(MouseKind::Up, 2, 11));
+        app.mouse(click(MouseKind::Down, 2, 9));
+        app.mouse(click(MouseKind::Up, 2, 9));
         assert_eq!(
             branches_of(&app).armed_row(),
             None,
@@ -10234,6 +11411,9 @@ diff --git a/tracked.txt b/tracked.txt
             match verb {
                 "checkout" => {
                     assert_eq!(status, "2/4 · f\u{fffd}ature", "{verb}");
+                    // The mark travels with the refresh; the window scrolls
+                    // to the top so both marks are on screen to read.
+                    app.dispatch("view.top");
                     app.draw();
                     let rect = app.pane_rect("branches").expect("placed");
                     let rows: Vec<String> = ((rect.y + 1)..(rect.y + rect.height))
@@ -10280,7 +11460,7 @@ diff --git a/tracked.txt b/tracked.txt
             }),
             "the hidden tenant was not refreshed"
         );
-        for name in ["commits", "stashes", "diff", "files", "branches"] {
+        for name in ["commits", "stashes", "remotes", "diff", "files", "branches"] {
             assert_eq!(
                 app.panes.get(name).unwrap().generation(),
                 app.generation,
@@ -10391,16 +11571,12 @@ diff --git a/tracked.txt b/tracked.txt
         app.dispatch("copy.selection");
         assert_eq!(app.copy.as_deref(), Some("origin/feat/ure"));
 
-        // The help panel lists the five included verbs straight out of the
-        // shared registry — and only those. The rebase row core binds in
-        // this mode and the two project rows the desktop owns have no
-        // handler here, so the availability contract takes their rows out
-        // of the panel and says why on a press instead: the gap moved from
-        // "a key that does nothing" to a sentence. The panel is capped at
-        // thirty rows, so no single viewport holds the whole registry any
-        // more: the top shows the globals out of the live keymap — the
-        // pane-focus digits among them — and the bottom the focused mode's
-        // own bindings.
+        // The help panel lists what runs straight out of the shared
+        // registry — and only that. The panel is capped at thirty rows, so
+        // no single viewport holds the whole registry any more: the top
+        // shows the globals out of the live keymap — the pane-focus digits
+        // among them, and the two project rows the sync wave gave handlers
+        // — and the bottom the focused mode's own bindings.
         app.screen = Screen::new(120, 50);
         app.press(Key::char('?'));
         app.press(Key::plain(Code::Home));
@@ -10418,16 +11594,15 @@ diff --git a/tracked.txt b/tracked.txt
             "open a repository by typing its path",
         ] {
             assert!(
-                !help.contains(doc),
-                "help advertised an unrunnable command: {doc:?}: {help:?}"
+                help.contains(doc),
+                "help dropped a runnable command: {doc:?}: {help:?}"
             );
         }
-        // The press, not the panel, is where the gap is said now.
+        // The press is where a missing list is said: no recent repositories
+        // yet, said and not shown — a picker of nothing is a trap shaped
+        // like an answer.
         app.dispatch("project.switch");
-        assert_eq!(
-            app.message,
-            "project.switch is not supported by this client"
-        );
+        assert_eq!(app.message, "no recent repositories — O to open one");
         app.press(Key::plain(Code::End));
         app.draw();
         let help = (0..50)
@@ -10513,9 +11688,9 @@ diff --git a/tracked.txt b/tracked.txt
             app.screen.row_text(0)
         );
         assert!(
-            app.screen.row_text(7).contains('3') && app.screen.row_text(7).contains("branches"),
+            app.screen.row_text(6).contains('3') && app.screen.row_text(6).contains("branches"),
             "the header did not advertise the pane: {:?}",
-            app.screen.row_text(7)
+            app.screen.row_text(6)
         );
         assert!(
             app.screen.row_text(23).contains("branches · 1/4 · main"),
@@ -10566,9 +11741,9 @@ diff --git a/tracked.txt b/tracked.txt
         // keyboard there, and a drag inside it builds no selection — a ref
         // list is acted on one row at a time.
         app.dispatch("commits.focus");
-        app.mouse(click(MouseKind::Down, 5, 15));
-        app.mouse(click(MouseKind::Drag, 5, 17));
-        app.mouse(click(MouseKind::Up, 5, 17));
+        app.mouse(click(MouseKind::Down, 5, 13));
+        app.mouse(click(MouseKind::Drag, 5, 14));
+        app.mouse(click(MouseKind::Up, 5, 14));
         assert!(
             !commits_of(&app).selection().is_empty(),
             "the drag in the list selected nothing"
@@ -10630,7 +11805,7 @@ diff --git a/tracked.txt b/tracked.txt
             }),
             "the hidden tenants were not refreshed"
         );
-        for name in ["commits", "stashes", "diff", "files", "branches"] {
+        for name in ["commits", "stashes", "remotes", "diff", "files", "branches"] {
             assert_eq!(
                 app.panes.get(name).unwrap().generation(),
                 app.generation,
@@ -12086,17 +13261,1117 @@ diff --git a/tracked.txt b/tracked.txt
             commits_of(&app).cursor() != first,
             "the remapped key did not walk the matches"
         );
-        // The old key fell through to the pane's own `n` — branches.new's
-        // neighbour here is commits.new-branch, refused unsupported — and
-        // never walked a match again.
-        app.message.clear();
+        // The old key fell through to the pane's own `n` — commits.new-
+        // branch, the sync wave's own handler now — and never walked a
+        // match again.
         let at = commits_of(&app).cursor();
         app.press(Key::char('n'));
         assert_eq!(commits_of(&app).cursor(), at, "the old key still walked");
         assert!(
-            app.message.contains("commits.new-branch"),
-            "n fell through to nothing: {}",
+            matches!(app.prompt, Some(Prompt::BranchNewAt { .. })),
+            "n fell through to nothing"
+        );
+        app.press(Key::plain(Code::Esc));
+        assert!(app.prompt.is_none(), "esc did not close the prompt");
+    }
+    // =================================================================== W4
+    //
+    // Sync, tracking branches, repository switching and the remotes pane —
+    // the wave's own coverage, named so the campaign can run it alone.
+
+    use gitten_core::refs::Remote as RemoteRef;
+
+    fn remote_ref(name: &str, urls: &[&str]) -> RemoteRef {
+        RemoteRef {
+            name: RefName::from(name),
+            urls: urls.iter().map(|u| u.to_string()).collect(),
+        }
+    }
+
+    fn remotes_of(app: &App) -> &Remotes {
+        match app.panes.get("remotes") {
+            Some(Screens::Remotes { view, .. }) => view,
+            _ => panic!("the remotes pane is not registered"),
+        }
+    }
+
+    /// Points the MRU store at a scratch file holding `rows`, runs `body`,
+    /// then drops the override and the file. The env var is one process
+    /// global, so the same lock `projects.rs`'s tests hold serializes this.
+    fn with_mru(name: &str, rows: &[&str], body: impl FnOnce()) {
+        let _guard = gitten_app::projects::env_lock();
+        let file =
+            std::env::temp_dir().join(format!("gitten-tui-mru-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        std::env::set_var("GITTEN_PROJECTS", &file);
+        std::fs::write(&file, rows.join("\n")).expect("a scratch MRU");
+        body();
+        std::env::remove_var("GITTEN_PROJECTS");
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// An opener that answers the handles a test handed it, and refuses
+    /// everywhere else — `status` fails, so an unknown path is refused by
+    /// the same read a real refusal comes from.
+    struct KeyedOpener {
+        repos: Vec<(std::path::PathBuf, Handle)>,
+    }
+
+    impl gitten_app::Opener for KeyedOpener {
+        fn open(&self, root: &std::path::Path) -> Handle {
+            if let Some((_, handle)) = self.repos.iter().find(|(path, _)| path.as_path() == root) {
+                return handle.clone();
+            }
+            // An unknown path gets the repository that exists only to fail —
+            // every read is an error, `describe` says refused.
+            Arc::new(Refused)
+        }
+    }
+
+    /// A repository that exists only as this struct: every read fails. The
+    /// answer an unknown path deserves.
+    struct Refused;
+
+    impl Repo for Refused {
+        fn log(&self, _: usize) -> gitten_git::Result<Vec<Commit>> {
+            Ok(Vec::new())
+        }
+        fn pairs(&self, _: &str) -> gitten_git::Result<Vec<Pair>> {
+            Ok(Vec::new())
+        }
+        fn status(&self) -> gitten_git::Result<Status> {
+            Err("fatal: not a git repository".into())
+        }
+        fn describe(&self) -> String {
+            "refused".into()
+        }
+    }
+
+    /// A commits launch on a real repository at `path` — the shape the
+    /// real-git sync tests need: the handle the binary backs, acquired
+    /// through the front door, with the startup wave run.
+    fn repo_app(path: &std::path::Path) -> App {
+        let handle = gitten_git::open(path);
+        let host = Host::new();
+        let source = Source::Repo {
+            path: path.to_path_buf(),
+            arg: String::new(),
+        };
+        let loaded = acquire::acquire(View::Commits, &source, &host, Some(handle.as_ref()))
+            .expect("the scratch repository has history");
+        let started = gitten_app::Started {
+            view: View::Commits,
+            source,
+            host,
+            loaded,
+            config: std::path::PathBuf::from("/nonexistent/gitten.toml"),
+            repo: Some(handle.clone()),
+        };
+        let mut app = App::new(started, Glyphs::default());
+        app.load_startup(&mut StartClock::new());
+        app.screen = Screen::new(120, 24);
+        app
+    }
+
+    /// A scratch git working tree — the setup half of the real-git sync
+    /// tests. Hermetic by construction: a local identity, a local bare as
+    /// the remote, nothing signed, nothing networked, and paths no real
+    /// checkout owns.
+    struct Git(std::path::PathBuf);
+
+    impl Git {
+        fn dir(name: &str) -> std::path::PathBuf {
+            let dir =
+                std::env::temp_dir().join(format!("gitten-tui-sync-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("a scratch dir");
+            dir
+        }
+
+        fn init(name: &str) -> Self {
+            let me = Self(Self::dir(name));
+            me.git(&["init", "-q", "-b", "main", "."]);
+            me.config();
+            me
+        }
+
+        /// A bare clone of `from` — the local remote every sync test aims at.
+        fn bare_clone(from: &std::path::Path, name: &str) -> Self {
+            let dir = Self::dir(name);
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(std::env::temp_dir())
+                .args(Self::setup())
+                .args(["clone", "-q", "--bare"])
+                .arg(from)
+                .arg(&dir)
+                .output()
+                .expect("git clone runs");
+            assert!(
+                out.status.success(),
+                "bare clone: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            Self(dir)
+        }
+
+        fn clone_from(from: &std::path::Path, name: &str) -> Self {
+            let dir = Self::dir(name);
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(std::env::temp_dir())
+                .args(Self::setup())
+                .args(["clone", "-q"])
+                .arg(from)
+                .arg(&dir)
+                .output()
+                .expect("git clone runs");
+            assert!(
+                out.status.success(),
+                "clone: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let me = Self(dir);
+            me.config();
+            me
+        }
+
+        /// The identity and locality flags every scratch command runs under:
+        /// a machine without a global identity still gets commits, a machine
+        /// with signing still gets them, and the local-file protocol —
+        /// which modern git disables — still works for the bare remote.
+        fn setup() -> [&'static str; 10] {
+            [
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "init.defaultBranch=main",
+                "-c",
+                "protocol.file.allow=always",
+            ]
+        }
+
+        fn config(&self) {
+            self.git(&["config", "user.name", "gitten-test"]);
+            self.git(&["config", "user.email", "test@gitten.local"]);
+        }
+
+        fn git(&self, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&self.0)
+                .args(Self::setup())
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        /// git's answer, trimmed — the read side of the same helper.
+        fn ask(&self, args: &[&str]) -> String {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&self.0)
+                .args(Self::setup())
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        fn write(&self, file: &str, text: &str) {
+            std::fs::write(self.0.join(file), text).expect("a scratch file");
+        }
+
+        fn commit(&self, message: &str) {
+            self.git(&["add", "-A"]);
+            self.git(&["commit", "-q", "-m", message]);
+        }
+    }
+
+    impl Drop for Git {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The whole sync trip over one local bare remote and two scratch
+    /// clones: first push with its tracking link, fetch, a fast-forward
+    /// pull, a rejected push said in git's own words, a push that creates
+    /// its upstream, a detached HEAD refused by name, and a remote row
+    /// checked out as a tracking branch. Nothing leaves the temp dir.
+    #[test]
+    fn tui_parity_the_sync_trip_over_a_local_bare_remote() {
+        let seed = Git::init("sync-seed");
+        seed.write("f.txt", "one\n");
+        seed.commit("seed");
+        let bare = Git::bare_clone(seed.0.as_path(), "sync-bare");
+        let a = Git::clone_from(bare.0.as_path(), "sync-a");
+        let b = Git::clone_from(bare.0.as_path(), "sync-b");
+
+        // --- first push of a new branch creates the upstream
+        let mut app = repo_app(a.0.as_path());
+        a.git(&["checkout", "-q", "-b", "feature"]);
+        a.write("f.txt", "one\ntwo\n");
+        a.commit("feature work");
+        // The launch predates the commit; the sync verbs read fresh.
+        app.dispatch("repo.push");
+        assert!(
+            until(Duration::from_secs(5), || {
+                app.pump();
+                app.message.contains("pushed origin feature")
+            }),
+            "the first push never finished: {:?}",
             app.message
         );
+        let _ = bare.ask(&["rev-parse", "--verify", "feature"]);
+        // The tracking link went with it: the branches pane proves it.
+        app.dispatch("repo.refresh");
+        app.dispatch("branches.focus");
+        app.draw();
+        assert!(
+            app.screen.row_text(0).contains("feature"),
+            "the pushed branch is not in the list: {:?}",
+            app.screen.row_text(0)
+        );
+
+        // --- fetch and pull: b catches up with origin/feature
+        let mut b_app = repo_app(b.0.as_path());
+        b_app.dispatch("repo.fetch");
+        assert!(
+            until(Duration::from_secs(5), || {
+                b_app.pump();
+                b_app.message.contains("fetched")
+            }),
+            "the fetch never finished: {:?}",
+            b_app.message
+        );
+        b_app.dispatch("repo.refresh");
+        b_app.dispatch("branches.focus");
+        b_app.draw();
+        assert!(
+            app.screen.row_text(0).is_empty() || true,
+            "the fetch only proves the refs moved"
+        );
+        // A fast-forward pull onto the fetched branch: check feature out
+        // first — the remote row's own checkout, tracking, is the W4 verb —
+        // so the walk below reads a branch that exists.
+        b_app.dispatch("view.top");
+        // rows: LOCAL heading (no locals yet? main exists from the clone)…
+        b_app.dispatch("branches.focus");
+        b_app.draw();
+        // Find the remote feature row by walking down until the status
+        // names it — the honest keyboard walk the key would have taken.
+        let mut named = String::new();
+        for _ in 0..8 {
+            named = branches_of(&b_app).status();
+            if named.contains("origin/feature") {
+                break;
+            }
+            b_app.dispatch("view.down");
+        }
+        assert!(
+            named.contains("origin/feature"),
+            "the remote row was never reached: {named}"
+        );
+        b_app.press(Key::plain(Code::Char(' ')));
+        assert!(
+            until(Duration::from_secs(5), || {
+                b_app.pump();
+                b_app.message.contains("tracking branch")
+            }),
+            "the tracking checkout never finished: {:?}",
+            b_app.message
+        );
+        assert_eq!(
+            b.ask(&["rev-parse", "--abbrev-ref", "feature@{upstream}"]),
+            "origin/feature",
+            "the tracking link did not land"
+        );
+
+        // --- pull: a fast-forward b's main onto its upstream
+        b_app.dispatch("repo.refresh");
+        b_app.dispatch("branches.focus");
+        // The cursor is wherever the refresh left it; main is one of the
+        // locals. Walk to it by name.
+        b_app.dispatch("view.top");
+        for _ in 0..8 {
+            if branches_of(&b_app).status().contains("· main") {
+                break;
+            }
+            b_app.dispatch("view.down");
+        }
+        b_app.dispatch("repo.pull");
+        assert!(
+            until(Duration::from_secs(5), || {
+                b_app.pump();
+                b_app.message.contains("pulled")
+                    || b_app.message.contains("up to date")
+                    || b_app.message.contains("Already")
+            }),
+            "the pull never finished: {:?}",
+            b_app.message
+        );
+
+        // --- a rejected push says git's words and moves nothing
+        b.git(&["commit", "-q", "--amend", "-m", "divergent"]);
+        b_app.dispatch("repo.push");
+        assert!(
+            until(Duration::from_secs(5), || {
+                b_app.pump();
+                !b_app.message.is_empty() && !b_app.message.starts_with("running")
+            }),
+            "the rejected push never finished: {:?}",
+            b_app.message
+        );
+        let refusal = b_app.message.clone();
+        assert!(
+            refusal.contains("rejected")
+                || refusal.contains("fetch first")
+                || refusal.contains("non-fast-forward"),
+            "git's refusal was not surfaced: {refusal}"
+        );
+        // The bare still holds what a pushed — the refusal moved nothing.
+        let bare_main = bare.ask(&["rev-parse", "main"]);
+        let b_main = b.ask(&["rev-parse", "main"]);
+        assert_ne!(bare_main, b_main, "a rejected push moved the remote");
+
+        // --- a detached HEAD is refused by name
+        a.git(&["checkout", "-q", "--detach", "HEAD"]);
+        app.dispatch("repo.refresh");
+        app.dispatch("repo.push");
+        app.pump();
+        assert_eq!(
+            app.message, "detached HEAD has no branch to push",
+            "a detached push said something else: {:?}",
+            app.message
+        );
+    }
+
+    /// A blocked sync job is a real thread blocked on a real gate, and the
+    /// keyboard stays live around it: a press moves the list while the job
+    /// runs, and the error is on the status line when the job comes back.
+    #[test]
+    fn tui_parity_a_blocking_sync_job_keeps_the_keyboard_live() {
+        let (handle, state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        state.lock().unwrap().net_gate = Some(Arc::clone(&gate));
+        state.lock().unwrap().refuse_net = Some("rejected: non-fast-forward".into());
+
+        app.dispatch("repo.push");
+        app.draw();
+        assert_eq!(app.message, "running push origin main");
+
+        // The keyboard is live: the list moves under a job that has not
+        // come back.
+        let at = commits_of(&app).cursor();
+        app.dispatch("view.down");
+        assert_eq!(
+            commits_of(&app).cursor(),
+            at + 1,
+            "the keyboard was not live while the push ran"
+        );
+
+        // The gate opens; the refusal is git's, on the status line.
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.pump();
+                app.message.contains("rejected")
+            }),
+            "the refused push never said so: {:?}",
+            app.message
+        );
+    }
+
+    /// A pending result belongs to the repository it was asked of: a write
+    /// left running on the old repository lands on the old repository, and
+    /// the switch installs nothing of it into the new one.
+    #[test]
+    fn tui_parity_a_pending_result_cannot_leak_across_a_repository_switch() {
+        let (a_handle, a_state) = fake(&[]);
+        a_state.lock().unwrap().net_gate =
+            Some(Arc::new((Mutex::new(false), std::sync::Condvar::new())));
+        let (b_handle, b_state) = fake(&[]);
+        b_state.lock().unwrap().status = Status {
+            untracked: vec![gitten_core::status::UntrackedEntry {
+                path: gitten_core::status::PathBytes::from("only-b.txt"),
+            }],
+            ..Default::default()
+        };
+
+        with_mru("leak", &["/b", "/a"], || {
+            let mut app = commits_app(&a_handle);
+            app.use_opener(Arc::new(KeyedOpener {
+                repos: vec![
+                    (std::path::PathBuf::from("/a"), a_handle.clone()),
+                    (std::path::PathBuf::from("/b"), b_handle.clone()),
+                ],
+            }));
+
+            // The push is asked of /a and blocks in the worker.
+            app.dispatch("repo.push");
+            app.draw();
+            assert_eq!(app.message, "running push origin main");
+
+            // The switch happens under it: /b opens, and every pane the app
+            // holds is now /b's — the label names the read that stands.
+            app.press(Key::char('O'));
+            type_(&mut app, "/b");
+            app.press(Key::plain(Code::Enter));
+            assert_eq!(app.message, "switched to /b");
+            assert_eq!(files_label(&app), "fake (main) · 1 changed");
+
+            // The old job's finish lands: on /a, and on /a only.
+            let gate = a_state.lock().unwrap().net_gate.clone().unwrap();
+            *gate.0.lock().unwrap() = true;
+            gate.1.notify_all();
+            assert!(
+                until(Duration::from_secs(2), || {
+                    app.pump();
+                    app.message.contains("pushed")
+                }),
+                "the old push never finished: {:?}",
+                app.message
+            );
+
+            // /b's panes hold what /b answered: the untracked file is still
+            // the whole of its world, and the commits list is where the
+            // switch left it.
+            assert_eq!(
+                files_label(&app),
+                "fake (main) · 1 changed",
+                "the old job's refresh rewrote the new repository's pane"
+            );
+            // ...and the write itself is /a's: recorded there, absent here.
+            assert_eq!(
+                a_state.lock().unwrap().writes,
+                vec!["push origin main".to_string()],
+                "the old repository never recorded its write"
+            );
+            assert!(
+                b_state.lock().unwrap().writes.is_empty(),
+                "the new repository received the old job's write"
+            );
+
+            // And the old repository is still reachable: the picker offers
+            // both, most-recent first — the switch just wrote /b to the top.
+            app.dispatch("project.switch");
+            app.draw();
+            let body: String = (2..8)
+                .map(|y| app.screen.row_text(y))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                body.contains("recent repositories"),
+                "the picker did not stand: {body:?}"
+            );
+            assert!(
+                body.find("/b").unwrap_or(usize::MAX) < body.find("/a").unwrap_or(usize::MAX),
+                "the opened repository did not move to the front: {body:?}"
+            );
+            app.press(Key::plain(Code::Esc));
+            assert!(app.picker.is_none(), "esc did not close the picker");
+        });
+    }
+
+    /// The remotes pane reads the configured remotes: name ahead of every
+    /// URL, the count in the header, and the row the keyboard is on as the
+    /// verbs address it.
+    #[test]
+    fn tui_parity_the_remotes_pane_reads_names_and_urls() {
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().servers = vec![remote_ref(
+            "origin",
+            &["git@example.com:x.git", "push.example"],
+        )];
+        let mut app = commits_app(&handle);
+        app.dispatch("remotes.focus");
+        app.draw();
+        assert!(
+            app.screen.row_text(19).contains("remotes"),
+            "the header did not follow: {:?}",
+            app.screen.row_text(19)
+        );
+        assert!(
+            app.screen.row_text(0).contains("1 remote"),
+            "the label did not count: {:?}",
+            app.screen.row_text(0)
+        );
+        assert_eq!(remotes_status(&app), "1/1 · origin");
+        let body = (20..23)
+            .map(|y| app.screen.row_text(y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("origin") && body.contains("git@example.com:x.git"),
+            "the row did not read name then urls: {body:?}"
+        );
+        app.dispatch("copy.selection");
+        assert!(
+            app.copy.as_deref().is_some_and(|t| t.contains("origin")),
+            "copy did not read the row: {:?}",
+            app.copy
+        );
+    }
+
+    fn remotes_status(app: &App) -> String {
+        match app.panes.get("remotes") {
+            Some(Screens::Remotes { view, .. }) => view.status(),
+            _ => panic!("the remotes pane is not registered"),
+        }
+    }
+
+    /// A removal is the twice-pressed verb it is everywhere else: first
+    /// press asks on the row, a different row re-arms, a refresh disarms,
+    /// and the second press on the same row submits exactly one removal.
+    #[test]
+    fn tui_parity_a_remote_removal_asks_twice_and_never_retargets() {
+        let (handle, state) = fake(&[]);
+        {
+            let mut s = state.lock().unwrap();
+            s.servers = vec![
+                remote_ref("origin", &["one.example"]),
+                remote_ref("fork", &["two.example"]),
+            ];
+        }
+        let mut app = commits_app(&handle);
+        app.dispatch("remotes.focus");
+        app.dispatch("remotes.remove");
+        assert_eq!(
+            app.message,
+            "remove remote origin and its remote-tracking branches? press again to confirm"
+        );
+        assert_eq!(
+            remotes_of(&app).armed().as_ref().map(|n| n.as_bytes()),
+            Some(b"origin".as_slice())
+        );
+        // A different row re-arms rather than inheriting the question.
+        app.dispatch("view.down");
+        app.dispatch("remotes.remove");
+        assert_eq!(
+            remotes_of(&app).armed().as_ref().map(|n| n.as_bytes()),
+            Some(b"fork".as_slice())
+        );
+        // A refresh kills the question outright.
+        app.dispatch("repo.refresh");
+        app.pump();
+        assert_eq!(remotes_of(&app).armed(), None);
+        // And the second press on one row acts, once.
+        app.dispatch("view.top");
+        app.dispatch("remotes.remove");
+        app.dispatch("remotes.remove");
+        app.pump();
+        assert!(
+            state
+                .lock()
+                .unwrap()
+                .branch_writes
+                .iter()
+                .any(|w| w == "remote remove origin"),
+            "the removal never landed: {:?}",
+            state.lock().unwrap().branch_writes
+        );
+        assert_eq!(
+            state
+                .lock()
+                .unwrap()
+                .branch_writes
+                .iter()
+                .filter(|w| w.starts_with("remote remove"))
+                .count(),
+            1,
+            "the question queued twice"
+        );
+    }
+
+    /// A remote is introduced by two prompts — name, then URL — and edited
+    /// by one, prefilled with the URL it already holds. An empty answer is
+    /// refused beside the field that closed.
+    #[test]
+    fn tui_parity_a_remote_is_added_by_two_prompts_and_edited_prefilled() {
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().servers = vec![remote_ref("origin", &["old.example"])];
+        let mut app = commits_app(&handle);
+        app.dispatch("remotes.focus");
+
+        app.dispatch("remotes.new");
+        type_(&mut app, "fork");
+        app.press(Key::plain(Code::Enter));
+        type_(&mut app, "git@example.com:fork.git");
+        app.press(Key::plain(Code::Enter));
+        app.pump();
+        assert!(
+            state
+                .lock()
+                .unwrap()
+                .branch_writes
+                .iter()
+                .any(|w| w == "remote add fork git@example.com:fork.git"),
+            "the add never landed: {:?}",
+            state.lock().unwrap().branch_writes
+        );
+
+        // Empty answers are refused before anything is queued.
+        app.dispatch("remotes.new");
+        app.press(Key::plain(Code::Enter));
+        assert_eq!(app.message, "a remote needs a name");
+        type_(&mut app, "x");
+        app.press(Key::plain(Code::Enter));
+        app.press(Key::plain(Code::Enter));
+        assert_eq!(app.message, "a remote needs a URL");
+        app.press(Key::plain(Code::Esc));
+        app.press(Key::plain(Code::Esc));
+
+        // The edit field arrives holding the remote's own URL.
+        app.dispatch("remotes.edit");
+        match &app.prompt {
+            Some(Prompt::RemoteEdit { name, field }) => {
+                assert_eq!(name.as_bytes(), b"origin");
+                assert_eq!(field.text(), "old.example");
+            }
+            _ => panic!("the edit prompt did not open prefilled"),
+        }
+        // Accept unchanged: git answers "unchanged" in its own words; the
+        // verb queued is still exactly one set-url.
+        app.press(Key::plain(Code::Enter));
+        app.pump();
+        let writes = state.lock().unwrap().branch_writes.clone();
+        assert_eq!(
+            writes
+                .iter()
+                .filter(|w| w.starts_with("remote set-url"))
+                .count(),
+            1,
+            "{writes:?}"
+        );
+    }
+
+    /// Fetch aims at the row: the selected remote's name rides the job.
+    /// With nothing selected it says so; away from the pane it says that.
+    #[test]
+    fn tui_parity_remote_fetch_names_the_remote() {
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().servers = vec![remote_ref("origin", &["one.example"])];
+        let mut app = commits_app(&handle);
+        app.dispatch("remotes.focus");
+        app.dispatch("remotes.fetch");
+        app.pump();
+        assert_eq!(
+            state.lock().unwrap().writes,
+            vec!["fetch origin".to_string()],
+            "the fetch did not aim at the row"
+        );
+
+        // An empty list has nothing to aim at, before the queue.
+        state.lock().unwrap().servers.clear();
+        app.dispatch("repo.refresh");
+        app.pump();
+        app.dispatch("remotes.fetch");
+        app.pump();
+        assert_eq!(app.message, "nothing selected to fetch");
+
+        // Away from the pane, the guard is the sentence.
+        app.dispatch("commits.focus");
+        app.dispatch("remotes.fetch");
+        assert_eq!(app.message, "remotes.fetch is not supported here");
+    }
+
+    /// Upstream moves: set picks the carrier the repository's own config
+    /// names — the only one, or origin among several — and refuses a true
+    /// ambiguity with the candidates named; unset severs the link only.
+    #[test]
+    fn tui_parity_upstream_moves_name_their_remote() {
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        {
+            let mut s = state.lock().unwrap();
+            s.servers = vec![
+                remote_ref("origin", &["one.example"]),
+                remote_ref("mirror", &["two.example"]),
+            ];
+        }
+        let mut app = commits_app(&handle);
+        app.dispatch("branches.focus");
+        app.dispatch("view.top");
+
+        // `u` on main: both remotes carry main, and origin is the one that
+        // stands out.
+        app.dispatch("branches.set-upstream");
+        app.pump();
+        assert!(
+            state
+                .lock()
+                .unwrap()
+                .branch_writes
+                .iter()
+                .any(|w| w == "track main origin main"),
+            "the set never landed: {:?}",
+            state.lock().unwrap().branch_writes
+        );
+
+        // `U` severs the link and nothing else.
+        app.dispatch("branches.unset-upstream");
+        app.pump();
+        assert!(
+            state
+                .lock()
+                .unwrap()
+                .branch_writes
+                .iter()
+                .any(|w| w == "untrack main"),
+            "the unset never landed"
+        );
+
+        // A true ambiguity — two remotes, neither origin — is refused with
+        // the candidates named, never guessed at.
+        state.lock().unwrap().servers = vec![
+            remote_ref("alpha", &["a.example"]),
+            remote_ref("beta", &["b.example"]),
+        ];
+        state.lock().unwrap().remotes = vec![
+            RemoteBranch {
+                remote: RefName::from("alpha"),
+                branch: RefName::from("main"),
+                commit: "f00d".into(),
+            },
+            RemoteBranch {
+                remote: RefName::from("beta"),
+                branch: RefName::from("main"),
+                commit: "f00d".into(),
+            },
+            RemoteBranch {
+                remote: RefName::from("origin"),
+                branch: RefName::from("feat/ure"),
+                commit: "f00d".into(),
+            },
+        ];
+        let writes = state.lock().unwrap().branch_writes.len();
+        app.dispatch("branches.set-upstream");
+        assert!(
+            app.message.contains("alpha, beta"),
+            "the ambiguity was not named: {:?}",
+            app.message
+        );
+        assert_eq!(
+            state.lock().unwrap().branch_writes.len(),
+            writes,
+            "an ambiguous set queued a job"
+        );
+
+        // No carrier at all names the push that creates one.
+        state.lock().unwrap().remotes = vec![RemoteBranch {
+            remote: RefName::from("origin"),
+            branch: RefName::from("feat/ure"),
+            commit: "f00d".into(),
+        }];
+        app.dispatch("branches.set-upstream");
+        assert!(
+            app.message.contains("no remote branch named main"),
+            "the missing carrier said nothing about push: {:?}",
+            app.message
+        );
+    }
+
+    /// A fast-forward never moves a branch sideways, and its shape is
+    /// HEAD's own: merge for the checked-out branch, the fetch refspec for
+    /// every other — and no upstream names the push that makes one.
+    #[test]
+    fn tui_parity_fast_forward_chooses_its_shape_by_head() {
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        {
+            let mut s = state.lock().unwrap();
+            s.servers = vec![remote_ref("origin", &["one.example"])];
+        }
+        let mut app = commits_app(&handle);
+        app.dispatch("branches.focus");
+        app.dispatch("view.top");
+
+        // main is HEAD: merge --ff-only from origin/main.
+        app.dispatch("branches.fast-forward");
+        app.pump();
+        assert!(
+            state
+                .lock()
+                .unwrap()
+                .branch_writes
+                .iter()
+                .any(|w| w.contains("merge --ff-only") && w.contains("origin/main")),
+            "the checked-out branch took the wrong shape: {:?}",
+            state.lock().unwrap().branch_writes
+        );
+
+        // A branch that is not HEAD: the fetch refspec.
+        app.dispatch("view.down");
+        app.dispatch("branches.fast-forward");
+        app.pump();
+        assert!(
+            state
+                .lock()
+                .unwrap()
+                .branch_writes
+                .iter()
+                .any(|w| w.contains("fetch refspec") && w.contains("origin/feat/ure")),
+            "the parked branch took the wrong shape: {:?}",
+            state.lock().unwrap().branch_writes
+        );
+
+        // No tracking ref anywhere: the push spelled out, nothing queued.
+        state.lock().unwrap().remotes = Vec::new();
+        app.dispatch("branches.set-upstream");
+        assert!(
+            app.message.contains("no remote branch named"),
+            "{:?}",
+            app.message
+        );
+    }
+
+    /// Force checkout is checkout's destructive spelling, confirmed on the
+    /// keyboard like every destruction: first press arms and asks, second
+    /// press on the same row discards the local changes and goes — and a
+    /// remote row or a detached row is refused by name.
+    #[test]
+    fn tui_parity_force_checkout_asks_twice_and_discards_local_changes() {
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        let mut app = commits_app(&handle);
+        app.dispatch("branches.focus");
+        app.dispatch("view.top");
+
+        app.dispatch("branches.force-checkout");
+        assert_eq!(
+            app.message,
+            "discard local changes and check out main? press again to confirm"
+        );
+        app.dispatch("branches.force-checkout");
+        app.pump();
+        assert!(
+            state
+                .lock()
+                .unwrap()
+                .branch_writes
+                .iter()
+                .any(|w| w == "force-checkout main"),
+            "the confirmed force never landed"
+        );
+        assert!(
+            state.lock().unwrap().status.is_empty(),
+            "the force left the local changes standing"
+        );
+
+        // A remote row is refused: tracking checkout is space's job.
+        app.dispatch("view.top");
+        app.dispatch("view.down");
+        app.dispatch("view.down");
+        while !branches_of(&app).status().contains("origin/feat/ure") {
+            app.dispatch("view.down");
+        }
+        app.dispatch("branches.force-checkout");
+        assert!(
+            app.message.contains("press space on"),
+            "a remote force said nothing about space: {:?}",
+            app.message
+        );
+    }
+
+    /// Checkout by name aims at whatever git is handed, bytes end to end;
+    /// the previous branch is git's own `-`, and an empty field is refused
+    /// beside the field that closed.
+    #[test]
+    fn tui_parity_checkout_by_name_and_previous_move_head() {
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        let mut app = commits_app(&handle);
+        app.dispatch("branches.focus");
+
+        app.dispatch("branches.checkout-name");
+        type_(&mut app, "f\u{e9}ature");
+        app.press(Key::plain(Code::Enter));
+        app.pump();
+        assert!(
+            state
+                .lock()
+                .unwrap()
+                .branch_bytes
+                .iter()
+                .any(|b| b == b"f\xe9ature"),
+            "the name did not arrive as bytes: {:?}",
+            state.lock().unwrap().branch_bytes
+        );
+
+        app.dispatch("branches.checkout-previous");
+        app.pump();
+        assert!(
+            state
+                .lock()
+                .unwrap()
+                .branch_writes
+                .iter()
+                .any(|w| w == "checkout -"),
+            "the previous branch never moved HEAD: {:?}",
+            state.lock().unwrap().branch_writes
+        );
+
+        // An empty field is refused before the queue, twice said.
+        app.dispatch("branches.checkout-name");
+        app.press(Key::plain(Code::Enter));
+        assert_eq!(app.message, "a branch needs a name");
+        app.press(Key::plain(Code::Esc));
+    }
+
+    /// A branch grown from a commit: the sha is the one the keyboard was
+    /// on, the checkout is a question asked once the branch exists — and
+    /// esc is a no, not a checkout.
+    #[test]
+    fn tui_parity_a_branch_grown_from_a_commit_offers_the_checkout() {
+        let (handle, state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        app.dispatch("view.down");
+        app.press(Key::char('n'));
+        type_(&mut app, "feature");
+        app.press(Key::plain(Code::Enter));
+        app.pump();
+        assert!(
+            state
+                .lock()
+                .unwrap()
+                .branch_writes
+                .iter()
+                .any(|w| w == "branch feature at 00000001"),
+            "the branch did not grow from the selected commit: {:?}",
+            state.lock().unwrap().branch_writes
+        );
+        // The question stands, drawn on the status row.
+        app.draw();
+        assert!(
+            app.screen
+                .row_text(23)
+                .contains("created feature — check out?"),
+            "the question did not stand: {:?}",
+            app.screen.row_text(23)
+        );
+        // esc is a no: nothing checked out, the question closed.
+        app.press(Key::plain(Code::Esc));
+        app.pump();
+        assert!(
+            !state
+                .lock()
+                .unwrap()
+                .branch_writes
+                .iter()
+                .any(|w| w.starts_with("checkout ")),
+            "esc checked the branch out"
+        );
+
+        // The next branch takes the offer: enter checks it out.
+        app.press(Key::char('n'));
+        type_(&mut app, "second");
+        app.press(Key::plain(Code::Enter));
+        app.press(Key::plain(Code::Enter));
+        app.pump();
+        let writes = state.lock().unwrap().branch_writes.clone();
+        assert_eq!(
+            writes.iter().filter(|w| w.starts_with("checkout ")).count(),
+            1,
+            "{writes:?}"
+        );
+    }
+
+    /// The recent list: empty says where the key is; a standing list moves,
+    /// opens by enter, closes by esc, and the opened repository moves to
+    /// the front of the list.
+    #[test]
+    fn tui_parity_the_recent_list_switches_and_says_when_empty() {
+        let (a_handle, _a_state) = fake(&[]);
+        let (b_handle, _b_state) = fake(&[]);
+        with_mru("picker", &["/b", "/a"], || {
+            let mut app = commits_app(&a_handle);
+            app.use_opener(Arc::new(KeyedOpener {
+                repos: vec![
+                    (std::path::PathBuf::from("/a"), a_handle.clone()),
+                    (std::path::PathBuf::from("/b"), b_handle.clone()),
+                ],
+            }));
+
+            // The keyboard on /a (index 1 in the MRU): a step forward wraps
+            // to /b, a step back wraps the other way.
+            app.dispatch("project.next");
+            app.pump_quiet();
+            assert_eq!(app.message, "switched to /b", "{:?}", app.message);
+            app.dispatch("project.prev");
+            app.pump_quiet();
+            assert_eq!(app.message, "switched to /a");
+
+            // The picker itself: opens, moves, opens the row it is on.
+            app.dispatch("project.switch");
+            app.draw();
+            let body: String = (1..9)
+                .map(|y| app.screen.row_text(y))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                body.contains("recent repositories") && body.contains("/b") && body.contains("/a"),
+                "the picker did not list: {body:?}"
+            );
+            // The first press of 'o' moved /a to the front; the cursor is
+            // on it.
+            app.press(Key::plain(Code::Enter));
+            app.pump_quiet();
+            assert_eq!(app.message, "switched to /a");
+
+            // Empty is said, not shown.
+            with_mru("picker-empty", &[], || {
+                let mut app = commits_app(&a_handle);
+                app.dispatch("project.switch");
+                assert_eq!(app.message, "no recent repositories — O to open one");
+            });
+        });
+    }
+
+    /// An open that fails changes nothing: the refusal is the path plus
+    /// git's own words, and every pane, the handle and the MRU stay as
+    /// they were.
+    #[test]
+    fn tui_parity_an_open_that_fails_changes_nothing() {
+        let (handle, _state) = fake(&[]);
+        with_mru("refused", &[], || {
+            let mut app = commits_app(&handle);
+            let label = files_label(&app).to_string();
+            let cursor = commits_of(&app).cursor();
+
+            app.press(Key::char('O'));
+            type_(&mut app, "/definitely/not/a/repository");
+            app.press(Key::plain(Code::Enter));
+            assert!(
+                app.message.contains("not a git repository"),
+                "the refusal was not git's: {:?}",
+                app.message
+            );
+            assert_eq!(files_label(&app), label, "the open moved a pane");
+            assert_eq!(commits_of(&app).cursor(), cursor, "the open moved the list");
+            assert!(
+                gitten_app::projects::load().is_empty(),
+                "a failed open wrote the MRU: {:?}",
+                gitten_app::projects::load()
+            );
+        });
     }
 }

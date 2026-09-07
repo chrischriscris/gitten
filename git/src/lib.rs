@@ -971,6 +971,70 @@ pub trait Repo: Send + Sync {
         Err(unserved("fetching"))
     }
 
+    /// Checks out the remote-tracking ref `remote/branch` as a local branch
+    /// that tracks it — `git checkout --track`. The local branch takes the
+    /// branch's own name; one already existing comes back refused in git's
+    /// own words, never overwritten here.
+    fn checkout_tracking(&self, _remote: &[u8], _branch: &[u8]) -> Result<()> {
+        Err(unserved("tracking checkouts"))
+    }
+
+    /// Checks out HEAD's previous branch — git's own `-`, resolved from the
+    /// reflog, so no name travels argv at all.
+    fn checkout_previous(&self) -> Result<()> {
+        Err(unserved("previous-branch checkouts"))
+    }
+
+    /// Checks out `name` over any local changes — `git checkout -f`. This
+    /// destroys unstaged work, which is why the caller confirms before this
+    /// job is ever built.
+    fn checkout_force(&self, _name: &[u8]) -> Result<()> {
+        Err(unserved("forced checkouts"))
+    }
+
+    /// Makes local branch `local` track `remote/branch` —
+    /// `git branch --set-upstream-to`. Nothing is fetched or merged by it;
+    /// only the tracking link moves.
+    fn set_upstream(&self, _local: &[u8], _remote: &[u8], _branch: &[u8]) -> Result<()> {
+        Err(unserved("upstream setting"))
+    }
+
+    /// Severs local branch `local`'s tracking link —
+    /// `git branch --unset-upstream`. Nothing else moves.
+    fn unset_upstream(&self, _local: &[u8]) -> Result<()> {
+        Err(unserved("upstream unsetting"))
+    }
+
+    /// Fast-forwards local branch `local` onto `remote/branch`, never
+    /// sideways: the checked-out branch merges `--ff-only` from the
+    /// remote-tracking ref, and every other branch is updated by
+    /// `git fetch <remote> <branch>:<local>`, which refuses a non-fast-forward
+    /// on its own. Which shape runs is decided here, fresh from HEAD — the
+    /// same read the branches pane draws HEAD's mark from — so a caller
+    /// cannot aim the wrong verb at a moving HEAD.
+    fn fast_forward(&self, _local: &[u8], _remote: &[u8], _branch: &[u8]) -> Result<()> {
+        Err(unserved("fast-forwards"))
+    }
+
+    /// Introduces a remote by name and URL — `git remote add`.
+    fn add_remote(&self, _name: &[u8], _url: &[u8]) -> Result<()> {
+        Err(unserved("remote creation"))
+    }
+
+    /// Points remote `name` at a new URL — `git remote set-url`. The old
+    /// URL is git's own config, and this verb never reads it back; the
+    /// pane does, on the next refresh.
+    fn set_remote_url(&self, _name: &[u8], _url: &[u8]) -> Result<()> {
+        Err(unserved("remote editing"))
+    }
+
+    /// Forgets remote `name` — `git remote remove`. The remote-tracking
+    /// branches under it go with it, which is why the caller confirms
+    /// before this job is ever built.
+    fn remove_remote(&self, _name: &[u8]) -> Result<()> {
+        Err(unserved("remote removal"))
+    }
+
     /// A short label for the window title.
     ///
     /// Infallible: a repository whose branch cannot be read still has a name.
@@ -1919,6 +1983,107 @@ impl Repo for Binary {
             // should be said, not inherited.
             None => run_bytes(&self.root, &[b"fetch", b"-q", b"--all"]).map(|_| ()),
         }
+    }
+
+    fn checkout_tracking(&self, remote: &[u8], branch: &[u8]) -> Result<()> {
+        refuse_dashes(remote)?;
+        refuse_dashes(branch)?;
+        // One argv token, `remote/branch`, joined here rather than in a
+        // shell: the two halves are the model's because a remote name may
+        // carry a slash, and the joined spelling is what git resolves.
+        let mut full = remote.to_vec();
+        full.push(b'/');
+        full.extend_from_slice(branch);
+        // `--track` creates the local branch of the same name and the
+        // tracking link in one move; a local branch of that name already
+        // existing is git's own refusal, surfaced verbatim.
+        run_bytes(&self.root, &[b"checkout", b"-q", b"--track", &full]).map(|_| ())
+    }
+
+    fn checkout_previous(&self) -> Result<()> {
+        // The `-` is a literal argv token — git's own spelling of "wherever
+        // HEAD was before this", resolved from the reflog — and not a name
+        // of ours, so [`refuse_dashes`] has nothing to guard here.
+        run_bytes(&self.root, &[b"checkout", b"-q", b"-"]).map(|_| ())
+    }
+
+    fn checkout_force(&self, name: &[u8]) -> Result<()> {
+        refuse_dashes(name)?;
+        run_bytes(&self.root, &[b"checkout", b"-q", b"-f", name]).map(|_| ())
+    }
+
+    fn set_upstream(&self, local: &[u8], remote: &[u8], branch: &[u8]) -> Result<()> {
+        refuse_dashes(local)?;
+        refuse_dashes(remote)?;
+        refuse_dashes(branch)?;
+        let mut full = remote.to_vec();
+        full.push(b'/');
+        full.extend_from_slice(branch);
+        run_bytes(&self.root, &[b"branch", b"--set-upstream-to", &full, local]).map(|_| ())
+    }
+
+    fn unset_upstream(&self, local: &[u8]) -> Result<()> {
+        refuse_dashes(local)?;
+        run_bytes(&self.root, &[b"branch", b"--unset-upstream", local]).map(|_| ())
+    }
+
+    fn fast_forward(&self, local: &[u8], remote: &[u8], branch: &[u8]) -> Result<()> {
+        refuse_dashes(local)?;
+        refuse_dashes(remote)?;
+        refuse_dashes(branch)?;
+        let mut full = remote.to_vec();
+        full.push(b'/');
+        full.extend_from_slice(branch);
+        // The shape is HEAD's own: a checked-out branch cannot be updated
+        // through a fetch refspec (git refuses to fetch into it), so it
+        // merges; every other branch takes the fetch spelling, which is
+        // fast-forward-only by construction — a refspec without `+` refuses
+        // to move a branch sideways. HEAD is read here, fresh, rather than
+        // remembered by the caller: the pane's row was drawn a moment ago,
+        // and the branch HEAD sits on is exactly the thing sync keys move.
+        let head_branch = match self.head()? {
+            HeadState::Branch { name, .. } => Some(name.as_bytes().to_vec()),
+            HeadState::Detached { .. } => None,
+        };
+        match head_branch.as_deref() == Some(local) {
+            true => run_bytes(&self.root, &[b"merge", b"--ff-only", &full]).map(|_| ()),
+            false => {
+                let mut spec = branch.to_vec();
+                spec.push(b':');
+                spec.extend_from_slice(local);
+                run_bytes(&self.root, &[b"fetch", b"-q", remote, &spec]).map(|_| ())
+            }
+        }
+    }
+
+    fn add_remote(&self, name: &[u8], url: &[u8]) -> Result<()> {
+        if !nameable(name) {
+            return Err("a remote needs a name".into());
+        }
+        refuse_dashes(name)?;
+        if !nameable(url) {
+            return Err("a remote needs a URL".into());
+        }
+        // The URL is one argv token, guarded like every name: a value
+        // beginning with `-` is an option to git, whatever it says about
+        // itself. Nothing here inspects the scheme — a file path, an ssh
+        // spelling and a `git://` URL are all one word to `remote add`.
+        refuse_dashes(url)?;
+        run_bytes(&self.root, &[b"remote", b"add", b"-q", name, url]).map(|_| ())
+    }
+
+    fn set_remote_url(&self, name: &[u8], url: &[u8]) -> Result<()> {
+        refuse_dashes(name)?;
+        if !nameable(url) {
+            return Err("a remote needs a URL".into());
+        }
+        refuse_dashes(url)?;
+        run_bytes(&self.root, &[b"remote", b"set-url", name, url]).map(|_| ())
+    }
+
+    fn remove_remote(&self, name: &[u8]) -> Result<()> {
+        refuse_dashes(name)?;
+        run_bytes(&self.root, &[b"remote", b"remove", b"-q", name]).map(|_| ())
     }
 }
 

@@ -450,6 +450,19 @@ impl Keymap {
         // anything is applied to the working tree.
         bind("stashes", "enter", "stashes.open-diff");
 
+        // The remotes panel's verbs, on lazygit's keys: f fetches the
+        // selected remote's tracking branches, n introduces one (two
+        // prompts — name, then URL), e repoints it, d forgets it (twice-
+        // pressed — the tracking branches go with it). The pane has no
+        // number by the same trade the status slot makes: it is one more
+        // list in the cycle, on the ctrl-j/ctrl-k keys every sidebar list
+        // shares.
+        bind("remotes", "f", "remotes.fetch");
+        bind("remotes", "n", "remotes.new");
+        bind("remotes", "e", "remotes.edit");
+        bind("remotes", "d", "remotes.remove");
+        bind("remotes", "/", "remotes.search");
+
         // The branches panel, on lazygit's own letters: space checks out the
         // branch under the keyboard, n names a new one, r rebases the
         // checked-out branch onto the row (lazygit's r; it rewrites this
@@ -462,6 +475,20 @@ impl Keymap {
         bind("branches", "R", "branches.rename");
         bind("branches", "d", "branches.delete");
         bind("branches", "T", "branches.new-tag");
+        // lazygit's `c`: check out by typing a name, when the row is not the
+        // one to walk to.
+        bind("branches", "c", "branches.checkout-name");
+        // lazygit's `-`: back to the branch HEAD sat on before this one.
+        bind("branches", "-", "branches.checkout-previous");
+        // Force is checkout's destructive spelling, and takes the capital
+        // beside its quiet sibling — the twice-press is the confirmation.
+        bind("branches", "F", "branches.force-checkout");
+        // Upstream movements. `f` shadows repo.fetch inside this pane —
+        // lazygit makes the same trade, and the fetch stays one pane away —
+        // and `u`/`U` are lazygit's own set/unset letters.
+        bind("branches", "f", "branches.fast-forward");
+        bind("branches", "u", "branches.set-upstream");
+        bind("branches", "U", "branches.unset-upstream");
         // The live filter over the ref list — the pane where sixteen
         // machine-named worktree branches are exactly why a query exists.
         bind("branches", "/", "branches.search");
@@ -611,6 +638,20 @@ impl Keymap {
         bind("help", "home", "view.top");
         bind("help", "G", "view.bottom");
         bind("help", "end", "view.bottom");
+
+        // The recent-repositories picker owns the keyboard for as long as it
+        // stands, on the same terms help does: the moves it names and the
+        // two ways to answer, and nothing underneath.
+        bind("picker", "enter", "input.accept");
+        bind("picker", "esc", "back");
+        bind("picker", "j", "view.down");
+        bind("picker", "down", "view.down");
+        bind("picker", "k", "view.up");
+        bind("picker", "up", "view.up");
+        bind("picker", "g", "view.top");
+        bind("picker", "home", "view.top");
+        bind("picker", "G", "view.bottom");
+        bind("picker", "end", "view.bottom");
 
         // The settings panel owns the keyboard for as long as it stands, for
         // the same reason the help overlay does: a press it does not name must
@@ -1339,6 +1380,54 @@ impl Commands {
             ),
             ("branches.search", "search the branches", Some("search")),
             (
+                "branches.checkout-name",
+                "check out a branch by typing its name",
+                Some("checkout"),
+            ),
+            (
+                "branches.checkout-previous",
+                "check out the branch HEAD was on before this one",
+                Some("previous"),
+            ),
+            (
+                "branches.force-checkout",
+                "check out the selected branch, discarding local changes, asked twice",
+                Some("force checkout"),
+            ),
+            (
+                "branches.fast-forward",
+                "fast-forward the selected branch onto its upstream",
+                Some("fast-forward"),
+            ),
+            (
+                "branches.set-upstream",
+                "make the selected branch track the remote branch of the same name",
+                Some("track"),
+            ),
+            (
+                "branches.unset-upstream",
+                "stop the selected branch tracking its upstream",
+                Some("untrack"),
+            ),
+            ("remotes.focus", "focus the remotes pane", None),
+            (
+                "remotes.fetch",
+                "update the selected remote's tracking branches",
+                Some("fetch"),
+            ),
+            ("remotes.new", "add a remote, by name and URL", Some("add")),
+            (
+                "remotes.edit",
+                "point the selected remote at a new URL",
+                Some("edit"),
+            ),
+            (
+                "remotes.remove",
+                "forget the selected remote, asked twice",
+                Some("remove"),
+            ),
+            ("remotes.search", "search the remotes", Some("search")),
+            (
                 "branches.open-log",
                 "show this branch's history in the main pane",
                 Some("log"),
@@ -1985,10 +2074,20 @@ mod tests {
                 Resolve::Run(name),
                 "{chord} did not reach {name} globally"
             );
-            // Inherited inside a pane too, never re-bound there.
+            // Inherited inside a pane too — except `f`, which the branches
+            // panel's own fast-forward takes over, the same pane-overrides-
+            // global trade the commits panel makes with squash and fixup.
+            // The fetch stays one pane away, on any other list.
             let mut modes = Modes::new();
             modes.push("branches");
-            assert_eq!(k.resolve(&modes, &keys(chord)), Resolve::Run(name));
+            for (chord, name) in [("P", "repo.push"), ("p", "repo.pull")] {
+                assert_eq!(k.resolve(&modes, &keys(chord)), Resolve::Run(name));
+            }
+            assert_eq!(
+                k.resolve(&modes, &keys("f")),
+                Resolve::Run("branches.fast-forward"),
+                "the branches panel's fast-forward owns its own f"
+            );
         }
         // A capital is not its lowercase twin's binding: sending and asking
         // stay two commands on lazygit's pair.

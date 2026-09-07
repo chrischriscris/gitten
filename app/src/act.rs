@@ -36,6 +36,14 @@ pub trait BranchClient: Client {
     fn confirm_or_arm_branch(&mut self, target: &Target) -> bool;
 }
 
+/// The client-owned selection and confirmation state needed by remote actions.
+pub trait RemoteClient: Client {
+    /// The remote row the keyboard is on, by the name verbs address it with.
+    fn remote_target(&self) -> Option<gitten_core::refs::RefName>;
+    /// Arms this remote target, or spends an arm already standing on it.
+    fn confirm_or_arm_remote(&mut self, name: &gitten_core::refs::RefName) -> bool;
+}
+
 /// Which presentation section a working-tree path occupies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FileSection {
@@ -233,6 +241,392 @@ pub fn stash_working_tree(client: &mut impl Client) {
         return;
     };
     if !client.submit(Box::new(Write::stash_push(&repo, None))) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+// ------------------------------------------------------------------ sync
+
+/// `repo.push`: send the current branch to its remote.
+///
+/// The remote choice is [`Write::push_current`]'s — the upstream's remote
+/// when there is one, `origin` or the sole remote when the branch tracks
+/// nothing — and every refusal it names is surfaced here, once, where an
+/// extension asking the same command reads the same sentence.
+pub fn sync_push(client: &mut impl Client) {
+    let Some(repo) = client.repo() else {
+        client.say("a fixture has no repository to push from".into());
+        return;
+    };
+    match Write::push_current(&repo) {
+        Ok(job) => {
+            if !client.submit(Box::new(job)) {
+                client.say("the job queue is shutting down".into());
+            }
+        }
+        Err(reason) => client.say(reason),
+    }
+}
+
+/// `repo.pull`: fast-forward the current branch onto its upstream.
+pub fn sync_pull(client: &mut impl Client) {
+    let Some(repo) = client.repo() else {
+        client.say("a fixture has no repository to pull into".into());
+        return;
+    };
+    if !client.submit(Box::new(Write::pull(&repo))) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+/// `repo.fetch`: update every remote-tracking branch.
+pub fn sync_fetch(client: &mut impl Client) {
+    let Some(repo) = client.repo() else {
+        client.say("a fixture has no repository to fetch into".into());
+        return;
+    };
+    if !client.submit(Box::new(Write::fetch(&repo, None))) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+// ------------------------------------------------------- branch movement
+
+/// `branches.checkout` onto a remote-tracking row: create the local branch
+/// of the same name, tracking, and put HEAD on it. The one verb on this
+/// pane aimed at a remote row that creates something local; a name that is
+/// already taken comes back refused in git's own words, never overwritten.
+pub fn checkout_tracking(client: &mut impl BranchClient) {
+    let Some(Target::Remote { remote, branch }) = client.branch_target() else {
+        client.say("the keyboard is not on a remote branch".into());
+        return;
+    };
+    let Some(repo) = client.repo() else {
+        client.say("a fixture has no repository to check out in".into());
+        return;
+    };
+    let job = Write::checkout_tracking(
+        &repo,
+        remote.as_bytes().to_vec(),
+        branch.as_bytes().to_vec(),
+    );
+    if !client.submit(Box::new(job)) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+/// `branches.checkout-previous`: put HEAD back on the branch it sat on
+/// before this one — git's own `-`, resolved from the reflog.
+pub fn checkout_previous(client: &mut impl Client) {
+    let Some(repo) = client.repo() else {
+        client.say("a fixture has no repository to check out in".into());
+        return;
+    };
+    if !client.submit(Box::new(Write::checkout_previous(&repo))) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+/// `branches.force-checkout`: check out the selected local branch over any
+/// local changes. The destructive spelling of checkout, confirmed on the
+/// keyboard exactly as delete is: first press arms and asks, second press
+/// on the same row discards the changes and goes.
+pub fn force_checkout(client: &mut impl BranchClient) {
+    let Some(target) = client.branch_target() else {
+        client.say("nothing selected to check out".into());
+        return;
+    };
+    let shown = match &target {
+        Target::Local(name) => name.to_string_lossy().into_owned(),
+        Target::Detached => {
+            client.say("a detached HEAD is not a branch".into());
+            return;
+        }
+        Target::Remote { remote, branch } => {
+            client.say(format!(
+                "force-checkout is for local branches — press space on {}/{} to create a tracking branch",
+                remote.to_string_lossy(),
+                branch.to_string_lossy()
+            ));
+            return;
+        }
+    };
+    let Some(repo) = client.repo() else {
+        client.say("a fixture has no repository to check out in".into());
+        return;
+    };
+    if !client.confirm_or_arm_branch(&target) {
+        client.ask(format!(
+            "discard local changes and check out {shown}? press again to confirm"
+        ));
+        return;
+    }
+    let Target::Local(name) = target else {
+        unreachable!("remotes and detached refuse above");
+    };
+    if !client.submit(Box::new(Write::checkout_force(
+        &repo,
+        name.as_bytes().to_vec(),
+    ))) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+/// `branches.checkout-name`: check out whatever the field names, bytes
+/// end to end. Empty refused beside the field that just closed; a name git
+/// does not know comes back in git's words.
+pub fn checkout_by_name(client: &mut impl Client, name: String) {
+    if name.trim().is_empty() {
+        client.say("a branch needs a name".into());
+        return;
+    }
+    let Some(repo) = client.repo() else {
+        client.say("a fixture has no repository to check out in".into());
+        return;
+    };
+    if !client.submit(Box::new(Write::checkout(&repo, name.into_bytes()))) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+/// `branches.fast-forward`: move the selected local branch onto the
+/// remote-tracking ref of the same name, never sideways. The tracking ref
+/// is read fresh — the pane's row is a moment old — and its absence is
+/// refused with the push spelled out, because that is the door to it.
+pub fn fast_forward(client: &mut impl BranchClient) {
+    let Some(Target::Local(name)) = client.branch_target() else {
+        client.say("only a local branch can be fast-forwarded".into());
+        return;
+    };
+    let Some(repo) = client.repo() else {
+        client.say("a fixture has no repository to fast-forward in".into());
+        return;
+    };
+    let tracking = match repo.remote_branches() {
+        Ok(remotes) => remotes
+            .iter()
+            .find(|r| r.branch.as_bytes() == name.as_bytes())
+            .cloned(),
+        Err(e) => {
+            client.say(e);
+            return;
+        }
+    };
+    let Some(tracking) = tracking else {
+        client.say(format!(
+            "no remote branch named {} — push it (P) to create one",
+            name.to_string_lossy()
+        ));
+        return;
+    };
+    let job = Write::fast_forward(
+        &repo,
+        name.as_bytes().to_vec(),
+        tracking.remote.as_bytes().to_vec(),
+        tracking.branch.as_bytes().to_vec(),
+    );
+    if !client.submit(Box::new(job)) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+/// `branches.set-upstream`: make the selected local branch track the
+/// remote-tracking ref of the same name. Which remote stands in is the
+/// repository's own configuration, read fresh: exactly one remote carries
+/// that branch, it is the answer; `origin` carries it among several, it
+/// is the answer, and that much is said. Anything else is a question this
+/// one-line answer cannot carry, so it is refused with the candidates
+/// named rather than guessed at.
+pub fn set_upstream(client: &mut impl BranchClient) {
+    let Some(Target::Local(name)) = client.branch_target() else {
+        client.say("only a local branch can track a remote branch".into());
+        return;
+    };
+    let Some(repo) = client.repo() else {
+        client.say("a fixture has no repository to track in".into());
+        return;
+    };
+    let carriers = match repo.remote_branches() {
+        Ok(remotes) => remotes
+            .iter()
+            .filter(|r| r.branch.as_bytes() == name.as_bytes())
+            .map(|r| r.remote.clone())
+            .collect::<Vec<_>>(),
+        Err(e) => {
+            client.say(e);
+            return;
+        }
+    };
+    let remote = match carriers.len() {
+        0 => {
+            client.say(format!(
+                "no remote branch named {} — push it (P) to create one",
+                name.to_string_lossy()
+            ));
+            return;
+        }
+        1 => carriers[0].clone(),
+        _ => {
+            let origin = carriers.iter().find(|r| r.as_bytes() == b"origin").cloned();
+            match origin {
+                Some(origin) => origin,
+                None => {
+                    let shown = carriers
+                        .iter()
+                        .map(|r| r.to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    client.say(format!(
+                        "{shown} all carry {} — set the upstream from a config file or the command line",
+                        name.to_string_lossy()
+                    ));
+                    return;
+                }
+            }
+        }
+    };
+    let job = Write::set_upstream(
+        &repo,
+        name.as_bytes().to_vec(),
+        remote.as_bytes().to_vec(),
+        name.as_bytes().to_vec(),
+    );
+    if !client.submit(Box::new(job)) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+/// `branches.unset-upstream`: sever the selected local branch's tracking
+/// link. The link only — nothing is fetched, merged or deleted, which is
+/// why no confirmation precedes it.
+pub fn unset_upstream(client: &mut impl BranchClient) {
+    let Some(Target::Local(name)) = client.branch_target() else {
+        client.say("only a local branch can stop tracking".into());
+        return;
+    };
+    let Some(repo) = client.repo() else {
+        client.say("a fixture has no repository to untrack in".into());
+        return;
+    };
+    if !client.submit(Box::new(Write::unset_upstream(
+        &repo,
+        name.as_bytes().to_vec(),
+    ))) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+/// `commits.new-branch`'s accepted name: create the branch at `at` — a
+/// revspec git resolves, captured when the field opened. Nothing is checked
+/// out; the checkout is the client's own question to offer.
+pub fn create_branch_at(client: &mut impl Client, name: String, at: Vec<u8>) {
+    if name.trim().is_empty() {
+        client.say("a branch needs a name".into());
+        return;
+    }
+    let Some(repo) = client.repo() else {
+        client.say("a fixture has no repository to create branches in".into());
+        return;
+    };
+    if !client.submit(Box::new(Write::create_branch(
+        &repo,
+        name.into_bytes(),
+        Some(at),
+    ))) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+// ----------------------------------------------------------------- remotes
+
+/// `remotes.fetch`: update the selected remote's tracking branches.
+pub fn remote_fetch(client: &mut impl RemoteClient) {
+    let Some(name) = client.remote_target() else {
+        client.say("nothing selected to fetch".into());
+        return;
+    };
+    let Some(repo) = client.repo() else {
+        client.say("a fixture has no repository to fetch into".into());
+        return;
+    };
+    if !client.submit(Box::new(Write::fetch(
+        &repo,
+        Some(name.as_bytes().to_vec()),
+    ))) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+/// A remote's accepted name and URL, as one job. Both halves are trimmed —
+/// git would hold the padding as part of either — and emptiness is refused
+/// beside the field that just closed, the same answer every prompt gives.
+pub fn remote_add(client: &mut impl Client, name: String, url: String) {
+    let (name, url) = (name.trim(), url.trim());
+    if name.is_empty() {
+        client.say("a remote needs a name".into());
+        return;
+    }
+    if url.is_empty() {
+        client.say("a remote needs a URL".into());
+        return;
+    }
+    let Some(repo) = client.repo() else {
+        client.say("a fixture has no repository to add a remote to".into());
+        return;
+    };
+    if !client.submit(Box::new(Write::add_remote(
+        &repo,
+        name.as_bytes().to_vec(),
+        url.as_bytes().to_vec(),
+    ))) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+/// `remotes.edit`'s accepted URL, for the remote `name` the pane held onto.
+pub fn remote_edit(client: &mut impl Client, name: Vec<u8>, url: String) {
+    let url = url.trim();
+    if url.is_empty() {
+        client.say("a remote needs a URL".into());
+        return;
+    }
+    let Some(repo) = client.repo() else {
+        client.say("a fixture has no repository to edit in".into());
+        return;
+    };
+    if !client.submit(Box::new(Write::set_remote_url(
+        &repo,
+        name,
+        url.as_bytes().to_vec(),
+    ))) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+/// `remotes.remove`: forget the selected remote. Destructive — its
+/// remote-tracking branches go with it — and confirmed on the keyboard
+/// exactly as branch deletion is: first press arms and asks, second press
+/// on the same row removes.
+pub fn remote_remove(client: &mut impl RemoteClient) {
+    let Some(name) = client.remote_target() else {
+        client.say("nothing selected to remove".into());
+        return;
+    };
+    let Some(repo) = client.repo() else {
+        client.say("a fixture has no repository to remove a remote from".into());
+        return;
+    };
+    if !client.confirm_or_arm_remote(&name) {
+        client.ask(format!(
+            "remove remote {} and its remote-tracking branches? press again to confirm",
+            name.to_string_lossy()
+        ));
+        return;
+    }
+    if !client.submit(Box::new(Write::remove_remote(
+        &repo,
+        name.as_bytes().to_vec(),
+    ))) {
         client.say("the job queue is shutting down".into());
     }
 }

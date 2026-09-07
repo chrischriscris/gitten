@@ -90,21 +90,24 @@ pub fn remove(path: &Path) -> Vec<PathBuf> {
     list
 }
 
+/// Serializes every test that redirects the store through the env override.
+///
+/// `GITTEN_PROJECTS` is one process-global variable, and this crate's own
+/// tests are not the only ones that point it somewhere: a lock shared by
+/// every redirecting test — wherever they live — is what keeps two of them
+/// from holding different overrides at once.
+#[doc(hidden)]
+pub fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    SERIAL
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    /// The store resolves its file through a process-global env var, so every
-    /// test that points it at a scratch file holds this while it runs.
-    static SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
-
-    fn serial() -> std::sync::MutexGuard<'static, ()> {
-        SERIAL
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join("gitten-projects-tests");
@@ -117,7 +120,7 @@ mod tests {
     /// Points `path()` at a fresh scratch file, runs `body`, then unsets the
     /// override and removes the file. Serialized: the env var is global.
     fn with_scratch(name: &str, body: impl FnOnce(&Path)) {
-        let _guard = serial();
+        let _guard = env_lock();
         let file = scratch(name);
         std::env::set_var("GITTEN_PROJECTS", &file);
         body(&file);
@@ -127,7 +130,7 @@ mod tests {
 
     #[test]
     fn the_env_override_names_the_file() {
-        let _guard = serial();
+        let _guard = env_lock();
         let file = scratch("override");
         std::env::set_var("GITTEN_PROJECTS", &file);
         assert_eq!(path(), file);
@@ -136,7 +139,7 @@ mod tests {
 
     #[test]
     fn without_an_override_it_lives_under_target() {
-        let _guard = serial();
+        let _guard = env_lock();
         std::env::remove_var("GITTEN_PROJECTS");
         assert_eq!(path(), PathBuf::from("target/gitten-projects"));
     }
