@@ -7295,8 +7295,12 @@ diff --git a/tracked.txt b/tracked.txt
                     name: RefName::from_bytes(name),
                     commit: Some("f00d".into()),
                 },
+                // Detached onto whatever was handed over, not a fixed sha:
+                // a commit checkout is the one caller that cares *where*
+                // HEAD landed, and a constant here would answer every aim
+                // the same.
                 false => HeadState::Detached {
-                    commit: "f00d".into(),
+                    commit: String::from_utf8_lossy(name).into_owned(),
                 },
             });
             Ok(())
@@ -15939,5 +15943,523 @@ shared tail
             app.message
         );
         assert!(app.message.contains('o'), "{:?}", app.message);
+    }
+
+    // ------------------------------------------------------------ W6 history
+
+    /// The commits pane with the keyboard on it and the cursor on top —
+    /// where every history verb below is pressed from. `hundred_commits`
+    /// is the loaded window, so row 0 is `00000000` and the root is
+    /// `00000099`.
+    fn history_app(handle: &Handle) -> App {
+        let mut app = commits_app(handle);
+        app.dispatch("commits.focus");
+        app.dispatch("view.top");
+        assert_eq!(app.panes.focused_name(), "commits");
+        app
+    }
+
+    /// The full sha of the commits row under the keyboard. Read rather
+    /// than written down: the fake answers a *different* window after a
+    /// refresh than the one startup loaded, which is exactly what a real
+    /// repository does when a write rewrites history, so a test that spelt
+    /// the sha out would be asserting the fixture and not the aim.
+    fn row_sha(app: &App) -> String {
+        commits_of(app)
+            .current()
+            .expect("the commits pane has a row")
+            .sha
+            .clone()
+    }
+
+    /// Waits for `want` to appear in the fake's write log, pumping the
+    /// finish wave meanwhile — the shape every history assertion needs.
+    fn wrote(app: &mut App, state: &Arc<Mutex<FakeState>>, want: &str) -> bool {
+        until(Duration::from_secs(2), || {
+            app.pump_quiet();
+            state.lock().unwrap().writes.iter().any(|w| w == want)
+        })
+    }
+
+    /// LG-058. `g` opens the strength question rather than resetting, and
+    /// the three strengths arm *apart*: a soft reset asked, then hard
+    /// pressed, asks again instead of firing — which is the whole reason
+    /// the arm names the command and not just the commit. What each
+    /// strength then does to the index and the working tree is git's, and
+    /// is held against a real repository in `gitten-git`'s
+    /// `the_three_reset_strengths_leave_different_parts_behind`; here the
+    /// proof is that the flag and the sha reach the queue unchanged.
+    #[test]
+    fn tui_parity_reset_strengths_arm_apart_and_carry_their_own_flag() {
+        let (handle, state) = fake(&[]);
+        let mut app = history_app(&handle);
+        app.dispatch("view.down");
+        let sha = row_sha(&app);
+
+        // The menu asks which strength and writes nothing.
+        app.dispatch("commits.reset-menu");
+        assert_eq!(
+            app.message,
+            format!("reset to {sha}? soft, mixed or hard — s, m, h"),
+            "{:?}",
+            app.message
+        );
+        app.pump_quiet();
+        assert!(state.lock().unwrap().writes.is_empty(), "the menu reset");
+
+        // Soft arms and asks; hard pressed against that arm asks its own
+        // question rather than spending soft's.
+        app.dispatch("commits.reset-soft");
+        assert_eq!(
+            app.message,
+            format!("reset --soft to {sha}? press again to confirm")
+        );
+        app.dispatch("commits.reset-hard");
+        assert_eq!(
+            app.message,
+            format!("reset --hard to {sha}? press again to confirm"),
+            "hard spent the soft question"
+        );
+        app.pump_quiet();
+        assert!(
+            state.lock().unwrap().writes.is_empty(),
+            "an unconfirmed reset ran: {:?}",
+            state.lock().unwrap().writes
+        );
+
+        // The second hard press on the same row is the confirmation.
+        app.dispatch("commits.reset-hard");
+        assert!(
+            wrote(&mut app, &state, &format!("reset --hard {sha}")),
+            "the confirmed hard reset never landed: {:?}",
+            state.lock().unwrap().writes
+        );
+
+        // Each remaining strength, twice, carries git's own flag spelling.
+        // The row is read again: the finish wave re-read the history the
+        // reset rewrote, so the window under the cursor is a new one.
+        for (command, flag) in [
+            ("commits.reset-soft", "--soft"),
+            ("commits.reset-mixed", "--mixed"),
+        ] {
+            let sha = row_sha(&app);
+            app.dispatch(command);
+            app.dispatch(command);
+            assert!(
+                wrote(&mut app, &state, &format!("reset {flag} {sha}")),
+                "{command} never landed: {:?}",
+                state.lock().unwrap().writes
+            );
+        }
+    }
+
+    /// LG-058, the other half of the arm: moving the cursor between the
+    /// question and the answer must not reset the row that was asked
+    /// about. The arm holds a sha, so the second press on a *different*
+    /// commit asks again about that one.
+    #[test]
+    fn tui_parity_a_reset_question_does_not_follow_the_cursor() {
+        let (handle, state) = fake(&[]);
+        let mut app = history_app(&handle);
+
+        let first = row_sha(&app);
+        app.dispatch("commits.reset-hard");
+        assert_eq!(
+            app.message,
+            format!("reset --hard to {first}? press again to confirm")
+        );
+        app.dispatch("view.down");
+        let second = row_sha(&app);
+        assert_ne!(first, second, "the cursor did not move");
+        app.dispatch("commits.reset-hard");
+        assert_eq!(
+            app.message,
+            format!("reset --hard to {second}? press again to confirm"),
+            "the arm followed the cursor"
+        );
+        app.pump_quiet();
+        assert!(
+            state.lock().unwrap().writes.is_empty(),
+            "a reset landed on a row nobody confirmed: {:?}",
+            state.lock().unwrap().writes
+        );
+    }
+
+    /// LG-059. A revert destroys nothing — dropping the result undoes the
+    /// undo — so it runs on the first press, aimed at the row's own sha.
+    /// The root commit is included on purpose: it has no parent, and its
+    /// inverse is still well-defined, which `gitten-git`'s
+    /// `reverting_the_root_commit_leaves_an_empty_tree` holds against a
+    /// real repository.
+    #[test]
+    fn tui_parity_revert_runs_on_one_press_including_the_root() {
+        let (handle, state) = fake(&[]);
+        let mut app = history_app(&handle);
+        let top = row_sha(&app);
+
+        app.dispatch("commits.revert");
+        assert!(
+            wrote(&mut app, &state, &format!("revert {top}")),
+            "the revert never landed: {:?}",
+            state.lock().unwrap().writes
+        );
+
+        // The root: parentless, and its inverse is still well-defined. A
+        // fresh app, because the wave above re-read the window and the root
+        // of *that* history is a different commit.
+        let mut app = history_app(&handle);
+        app.dispatch("view.bottom");
+        let root = commits_of(&app).current().expect("a bottom row").clone();
+        assert!(root.parents.is_empty(), "the last row is not the root");
+        app.dispatch("commits.revert");
+        assert!(
+            wrote(&mut app, &state, &format!("revert {}", root.sha)),
+            "the root's revert never landed: {:?}",
+            state.lock().unwrap().writes
+        );
+    }
+
+    /// LG-056. One commit, replayed onto HEAD on the first press, by the
+    /// full sha the row holds — never a row index, never the short form.
+    #[test]
+    fn tui_parity_cherry_pick_replays_the_row_by_its_full_sha() {
+        let (handle, state) = fake(&[]);
+        let mut app = history_app(&handle);
+        app.dispatch("view.down");
+        app.dispatch("view.down");
+        let commit = commits_of(&app).current().expect("a row").clone();
+        assert_eq!(commit.sha.len(), 8, "the row holds a full sha, not a short");
+
+        app.dispatch("commits.cherry-pick");
+        assert!(
+            wrote(&mut app, &state, &format!("cherry-pick {}", commit.sha)),
+            "the pick never landed: {:?}",
+            state.lock().unwrap().writes
+        );
+    }
+
+    /// LG-060. Space detaches HEAD onto the commit under the keyboard and
+    /// the branch it left stands still — the state the fake records, not
+    /// the sentence the band printed.
+    #[test]
+    fn tui_parity_detached_checkout_moves_head_alone() {
+        let (handle, state) = fake(&[]);
+        let mut app = history_app(&handle);
+        app.dispatch("view.down");
+        let sha = row_sha(&app);
+
+        app.dispatch("commits.checkout");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                matches!(
+                    state.lock().unwrap().head.as_ref(),
+                    Some(HeadState::Detached { commit }) if *commit == sha
+                )
+            }),
+            "HEAD never detached onto the row: {:?}",
+            state.lock().unwrap().head
+        );
+        let s = state.lock().unwrap();
+        assert!(
+            s.locals.iter().all(|b| !b.head),
+            "a branch claimed a detached HEAD"
+        );
+        assert_eq!(s.locals[0].commit, "f00d", "the branch tip moved");
+    }
+
+    /// LG-057. The clipboard: a marked range copies oldest-first, separate
+    /// copies append in press order, a re-copy never reorders, the paste
+    /// hands git one invocation in exactly that order and leaves the
+    /// clipboard standing, and only the clear empties it.
+    #[test]
+    fn tui_parity_multicopy_pastes_in_copy_order() {
+        let (handle, state) = fake(&[]);
+        let mut app = history_app(&handle);
+
+        // `v` opens the mark, two moves extend it over rows 0..=2, and the
+        // copy takes the range newest-first into paste order.
+        app.dispatch("select.mark");
+        app.dispatch("view.down");
+        app.dispatch("view.down");
+        assert_eq!(commits_of(&app).marks(), Some((0, 2)));
+        let range: Vec<String> = (0..=2)
+            .map(|row| commits_of(&app).at(row).expect("a marked row").sha.clone())
+            .collect();
+        app.dispatch("commits.copy");
+        assert_eq!(
+            app.message, "copied 3 commits — 3 on the clipboard",
+            "{:?}",
+            app.message
+        );
+
+        // A second copy of the same rows changes nothing and says so.
+        app.dispatch("commits.copy");
+        assert_eq!(
+            app.message, "already copied — 3 commits on the clipboard",
+            "{:?}",
+            app.message
+        );
+
+        // A separate copy appends behind them, in press order.
+        app.dispatch("select.mark");
+        app.dispatch("view.bottom");
+        let late = row_sha(&app);
+        app.dispatch("commits.copy");
+        assert_eq!(
+            app.message, "copied 1 commit — 4 on the clipboard",
+            "{:?}",
+            app.message
+        );
+
+        // One invocation, oldest-first within the range — the list reads
+        // newest-first, so the replay order is the marked rows reversed —
+        // and the late copy behind them all. The order is the whole
+        // contract of a paste.
+        let want = format!("cherry-pick {} {} {} {late}", range[2], range[1], range[0]);
+        app.dispatch("commits.paste");
+        assert!(
+            wrote(&mut app, &state, &want),
+            "the paste order is wrong: wanted {want:?}, got {:?}",
+            state.lock().unwrap().writes
+        );
+
+        // The paste kept the set — the same commits reach a second branch.
+        app.dispatch("commits.clear-copies");
+        assert_eq!(app.message, "cleared 4 copied commits", "{:?}", app.message);
+        app.dispatch("commits.paste");
+        assert_eq!(
+            app.message, "nothing copied to cherry-pick — copy commits first",
+            "{:?}",
+            app.message
+        );
+        app.dispatch("commits.clear-copies");
+        assert_eq!(app.message, "the cherry-pick clipboard is already empty");
+    }
+
+    /// LG-057, the unmarked press: with no range standing the copy takes
+    /// the row alone, which is what makes the key useful before `v` has
+    /// been touched — and the clipboard holds full shas, so a filter
+    /// between the copy and the paste cannot slide another commit into it.
+    #[test]
+    fn tui_parity_copy_takes_the_row_when_nothing_is_marked() {
+        let (handle, state) = fake(&[]);
+        let mut app = history_app(&handle);
+        app.dispatch("view.down");
+        let copied = row_sha(&app);
+
+        app.dispatch("commits.copy");
+        assert_eq!(app.message, "copied 1 commit — 1 on the clipboard");
+
+        // A search renumbers every row: the row that was copied is not
+        // even in the visible table any more. The clipboard names shas, so
+        // what was copied is still exactly what pastes — which is the
+        // whole point of holding IDs instead of indices.
+        app.dispatch("commits.search");
+        type_(&mut app, "commit 5");
+        app.press(Key::plain(Code::Enter));
+        assert!(commits_of(&app).query().is_some(), "the filter never took");
+        assert_ne!(row_sha(&app), copied, "the filter left the cursor put");
+        app.dispatch("commits.paste");
+        assert!(
+            wrote(&mut app, &state, &format!("cherry-pick {copied}")),
+            "the filter changed what pasted: {:?}",
+            state.lock().unwrap().writes
+        );
+    }
+
+    /// LG-061. HEAD's author, asked twice, and nothing older: a deeper row
+    /// refuses by name and says which verb it would need. The commit is
+    /// replaced but the message and the tree stand still, which
+    /// `gitten-git`'s `reset_author_hands_head_a_new_author_and_nothing_else`
+    /// holds against a real repository.
+    #[test]
+    fn tui_parity_commit_author_resets_head_and_nothing_deeper() {
+        let (handle, state) = fake(&[]);
+        let mut app = history_app(&handle);
+        let head = row_sha(&app);
+        // HEAD is the pane's newest row, so the verb has something to aim
+        // at. Set after the launch read, because startup would overwrite it.
+        state.lock().unwrap().head = Some(HeadState::Branch {
+            name: RefName::from("main"),
+            commit: Some(head.clone()),
+        });
+
+        // One row down is history, and re-authoring that is a rebase —
+        // asserted first, because the confirmed write below re-reads the
+        // window and moves HEAD out from under the row.
+        app.dispatch("view.down");
+        let deeper = row_sha(&app);
+        app.dispatch("commits.reset-author");
+        assert_eq!(
+            app.message,
+            format!(
+                "only HEAD's author resets here — {deeper} is deeper history, \
+                 which is a rebase"
+            ),
+            "{:?}",
+            app.message
+        );
+        app.pump_quiet();
+        assert!(
+            state.lock().unwrap().writes.is_empty(),
+            "a deeper row was re-authored: {:?}",
+            state.lock().unwrap().writes
+        );
+
+        app.dispatch("view.top");
+        app.dispatch("commits.reset-author");
+        assert_eq!(
+            app.message,
+            format!("reset the author of {head} to you? press again to confirm"),
+            "{:?}",
+            app.message
+        );
+        app.pump_quiet();
+        assert!(state.lock().unwrap().writes.is_empty(), "no question stood");
+        app.dispatch("commits.reset-author");
+        assert!(
+            wrote(&mut app, &state, "reset-author"),
+            "the confirmed re-author never landed: {:?}",
+            state.lock().unwrap().writes
+        );
+    }
+
+    /// Every history write waits for a standing operation rather than
+    /// starting a second one inside git's first — the copy excepted, which
+    /// writes nothing at all and so has nothing to wait for.
+    #[test]
+    fn tui_parity_history_verbs_wait_for_a_standing_operation() {
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().standing = Some(Operation {
+            kind: gitten_core::operation::Kind::Merge,
+            conflicts: 0,
+        });
+        let mut app = history_app(&handle);
+        app.dispatch("repo.refresh");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                app.operation.is_some()
+            }),
+            "the standing merge never reached the app"
+        );
+
+        for command in [
+            "commits.reset-hard",
+            "commits.revert",
+            "commits.cherry-pick",
+            "commits.checkout",
+            "commits.reset-author",
+        ] {
+            app.dispatch(command);
+            assert_eq!(
+                app.message,
+                format!("{command} waits for the standing merge — abort it or finish it first"),
+                "{command} did not wait"
+            );
+        }
+
+        // The copy is pure state, so it lands; the paste it enables waits.
+        app.dispatch("commits.copy");
+        assert_eq!(app.message, "copied 1 commit — 1 on the clipboard");
+        app.dispatch("commits.paste");
+        assert_eq!(
+            app.message,
+            "commits.paste waits for the standing merge — abort it or finish it first"
+        );
+
+        app.pump_quiet();
+        assert!(
+            state.lock().unwrap().writes.is_empty(),
+            "a history write ran inside the merge: {:?}",
+            state.lock().unwrap().writes
+        );
+    }
+
+    /// Aimed from the wrong pane, every history verb is refused by name —
+    /// the same sentence the availability contract uses for a command this
+    /// client does not serve, so a rebind cannot smuggle a reset into the
+    /// files list.
+    #[test]
+    fn tui_parity_history_verbs_are_refused_off_the_commits_pane() {
+        let (handle, state) = fake(&[]);
+        let mut app = history_app(&handle);
+        app.dispatch("files.focus");
+
+        for command in [
+            "commits.reset-menu",
+            "commits.reset-soft",
+            "commits.reset-mixed",
+            "commits.reset-hard",
+            "commits.revert",
+            "commits.cherry-pick",
+            "commits.checkout",
+            "commits.copy",
+            "commits.paste",
+            "commits.clear-copies",
+            "commits.reset-author",
+        ] {
+            app.dispatch(command);
+            assert_eq!(
+                app.message,
+                format!("{command} is not supported here"),
+                "{command} ran off its pane"
+            );
+        }
+        app.pump_quiet();
+        assert!(
+            state.lock().unwrap().writes.is_empty(),
+            "a history write ran from the files pane: {:?}",
+            state.lock().unwrap().writes
+        );
+    }
+
+    /// A fixture has no repository, so every history verb is disabled with
+    /// a reason rather than advertised and silently doing nothing — the W0
+    /// contract, held for this packet's commands.
+    #[test]
+    fn tui_parity_history_verbs_are_disabled_without_a_repository() {
+        let a = tui_availability(false, None);
+        for command in [
+            "commits.reset-menu",
+            "commits.reset-soft",
+            "commits.reset-mixed",
+            "commits.reset-hard",
+            "commits.revert",
+            "commits.cherry-pick",
+            "commits.checkout",
+            "commits.copy",
+            "commits.paste",
+            "commits.clear-copies",
+            "commits.reset-author",
+        ] {
+            match a.state(command) {
+                gitten_core::command::Usable::Disabled(why) => assert!(
+                    why.contains("fixture"),
+                    "{command}'s reason names no fixture: {why:?}"
+                ),
+                other => panic!("{command} is advertised against a fixture: {other:?}"),
+            }
+            assert!(
+                !a.runnable(command),
+                "{command} would run against a fixture"
+            );
+        }
+        // With a repository they are live again — supported, not merely
+        // unrefused, which is what separates this from an unhandled name.
+        let a = tui_availability(true, None);
+        for command in [
+            "commits.reset-hard",
+            "commits.paste",
+            "commits.reset-author",
+        ] {
+            assert_eq!(
+                a.state(command),
+                &gitten_core::command::Usable::Available,
+                "{command} stayed disabled"
+            );
+            assert!(a.runnable(command));
+        }
     }
 }
