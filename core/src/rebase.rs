@@ -772,6 +772,15 @@ impl Plan {
             let Some((action, target)) = marker_of(&entry.subject) else {
                 continue;
             };
+            // A bare marker names nothing: `fixup!` with an empty
+            // remainder would otherwise match every older commit, because
+            // every subject starts with the empty string. Left standing
+            // as a pick, exactly like a marker naming nothing in the
+            // window — folding it into the newest guess lands a change
+            // in the wrong commit.
+            if target.is_empty() {
+                continue;
+            }
             let landing = source[..i]
                 .iter()
                 .enumerate()
@@ -1521,6 +1530,24 @@ squash
             planned(&plan),
             vec!["pick under-sha", "pick mid-sha", "fixup head-sha"]
         );
+    }
+
+    #[test]
+    fn a_bare_marker_names_nothing_and_stands_as_a_pick() {
+        // `fixup!` with an empty remainder, and `fixup! fixup!` stacked
+        // to nothing: every subject starts with the empty string, so
+        // without the guard both would fold into the newest older commit.
+        for subject in ["fixup!", "fixup! fixup!", "squash!"] {
+            let mut commits = linear();
+            commits[0].subject = (*subject).into();
+            let mut plan = Plan::over(&commits, 2).expect("a window");
+            assert_eq!(plan.autosquash(), 0, "bare marker {subject:?} moved");
+            assert_eq!(
+                planned(&plan),
+                vec!["pick under-sha", "pick mid-sha", "pick head-sha"],
+                "bare marker {subject:?} did not stand"
+            );
+        }
     }
 
     #[test]
