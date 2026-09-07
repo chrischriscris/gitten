@@ -79,6 +79,10 @@ pub struct Diff {
     /// demand is a scan of `order` per file: 5,953 files against a million rows
     /// is six billion comparisons for a keypress. One scan per reflow instead.
     headers: Vec<usize>,
+    /// Where each hunk's first row landed in `order`, ascending — the hunk
+    /// jump list, built in the same pass as the headers and under the same
+    /// rule: cached because it only moves when the order table does.
+    hunks: Vec<usize>,
     /// The width and wrap the rows were last expanded for. A resize that does
     /// not cross a column boundary compares equal here and stops.
     applied: (usize, &'static str),
@@ -168,6 +172,7 @@ impl Diff {
             order: Vec::new(),
             widest: 0,
             headers: Vec::new(),
+            hunks: Vec::new(),
             applied: (usize::MAX, ""),
             cols: 0,
             view: Viewport::new(),
@@ -298,6 +303,33 @@ impl Diff {
                 self.headers.push(at);
             }
         }
+        self.index_hunks();
+    }
+
+    /// Where every hunk's first row is, in visual rows, ascending — the jump
+    /// list `diff.next-hunk`/`diff.prev-hunk` walk. Built beside the headers
+    /// in the same pass over `order`, and the same honesty applies: a
+    /// presentation whose hunk map answers nothing offers no jumps rather
+    /// than wrong ones, and an extension's presentation needs nothing but a
+    /// [`gitten_core::rows::Flat`] with exact spans.
+    fn index_hunks(&mut self) {
+        self.hunks.clear();
+        let mut standing: Option<(u16, usize, usize)> = None;
+        for (at, r) in self.order.iter().enumerate() {
+            let Some(rows) = self.owners.get(r.owner as usize) else {
+                continue;
+            };
+            let Some((file, hunk)) = rows.hunk_at(r.index as usize) else {
+                continue;
+            };
+            // A hunk begins where its (file, hunk) pair first appears; every
+            // later row of the same hunk is somebody's continuation.
+            let key = (r.owner, file, hunk);
+            if standing != Some(key) {
+                self.hunks.push(at);
+                standing = Some(key);
+            }
+        }
     }
 
     // ----------------------------------------------------------------- commands
@@ -387,6 +419,31 @@ impl Diff {
     /// picker lists.
     pub fn headers(&self) -> &[usize] {
         &self.headers
+    }
+
+    /// Moves the keyboard to the first row of the next — or previous — hunk.
+    ///
+    /// The jump list is the hunk map every presentation carries, so a
+    /// presentation that draws no hunks offers no jumps rather than wrong
+    /// ones, and the edges stop rather than wrap: a jump that left the diff
+    /// would be a jump nobody asked for.
+    pub fn jump_hunk(&mut self, by: isize) {
+        let cursor = self.view.cursor();
+        let target = match by.is_negative() {
+            true => self
+                .hunks
+                .partition_point(|&h| h < cursor)
+                .checked_sub(1)
+                .and_then(|i| self.hunks.get(i))
+                .copied(),
+            false => self
+                .hunks
+                .get(self.hunks.partition_point(|&h| h <= cursor))
+                .copied(),
+        };
+        if let Some(t) = target {
+            self.view.go_to(t);
+        }
     }
 
     // ----------------------------------------------------------------- search

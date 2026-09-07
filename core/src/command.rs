@@ -478,6 +478,13 @@ impl Keymap {
         // to: it walks the keyboard to each match — a filtered diff is not a
         // diff — and `n`/`N` walk on from there, wrapping.
         bind("diff", "/", "diff.search");
+        // lazygit's next/previous hunk. Upstream reaches them with the
+        // arrows and h/l in the staging panel; here the arrows and h/l are
+        // the pane walk and the sideways scroll, so the hunks take the
+        // modified arrows — a deliberate difference, said here and in the
+        // ledger.
+        bind("diff", "alt-down", "diff.next-hunk");
+        bind("diff", "alt-up", "diff.prev-hunk");
         // The keyboard acts on the hunk it sits on, on lazygit's staging key:
         // space sends the hunk to the index, `u` brings it back (one less
         // finger than a shifted key, and nothing else claims it here — the
@@ -1139,6 +1146,16 @@ impl Commands {
                 "diff.prev-file",
                 "the previous file's header",
                 Some("prev file"),
+            ),
+            (
+                "diff.next-hunk",
+                "the next hunk's first row",
+                Some("next hunk"),
+            ),
+            (
+                "diff.prev-hunk",
+                "the previous hunk's first row",
+                Some("prev hunk"),
             ),
             ("diff.cycle-layout", "the next presentation", None),
             ("diff.cycle-wrap", "the next wrap", None),

@@ -912,6 +912,8 @@ impl Screens {
                 "diff.cycle-wrap" => d.cycle_wrap(host),
                 "search.next" => d.search_next(1),
                 "search.prev" => d.search_next(-1),
+                "diff.next-hunk" => d.jump_hunk(1),
+                "diff.prev-hunk" => d.jump_hunk(-1),
                 _ => return false,
             },
             Screens::Stashes { view: s, .. } => match command {
@@ -3957,6 +3959,8 @@ fn tui_availability(repo: bool) -> Availability {
         "view.right",
         "diff.next-file",
         "diff.prev-file",
+        "diff.next-hunk",
+        "diff.prev-hunk",
         "diff.cycle-layout",
         "diff.cycle-wrap",
     ]);
@@ -7315,8 +7319,21 @@ diff --git a/tracked.txt b/tracked.txt
         let (handle, state) = fake_tall(&[]);
         let mut app = commits_app(&handle);
         app.draw();
-        // Both tenants long: the diff loaded, the list a hundred deep.
+        // Both tenants long: the diff loaded, the list a hundred deep. Both
+        // previews are waited for, because a background read does not count
+        // itself into a number captured before its thread ran — the cursor
+        // and read-count assertions below are only stable once they land.
         app.dispatch("commits.open-diff");
+        until(Duration::from_secs(2), || {
+            app.pump_quiet();
+            matches!(
+                app.panes.get("diff"),
+                Some(Screens::Diff {
+                    origin: Some(DiffSource::Commit { sha }),
+                    ..
+                }) if sha == "00000000"
+            )
+        });
         app.dispatch("commits.focus");
         app.draw();
 
@@ -7324,6 +7341,16 @@ diff --git a/tracked.txt b/tracked.txt
         // diff instead, without stealing that focus.
         let (dc, dt) = (diff_of(&app).cursor(), diff_of(&app).top());
         app.dispatch("view.down");
+        until(Duration::from_secs(2), || {
+            app.pump_quiet();
+            matches!(
+                app.panes.get("diff"),
+                Some(Screens::Diff {
+                    origin: Some(DiffSource::Commit { sha }),
+                    ..
+                }) if sha == "00000001"
+            )
+        });
         assert_eq!(commits_of(&app).cursor(), 1);
         assert_eq!((diff_of(&app).cursor(), diff_of(&app).top()), (dc, dt));
         let diff = app.pane_rect("diff").expect("diff placed");
@@ -11470,6 +11497,47 @@ diff --git a/tracked.txt b/tracked.txt
         app.message.clear();
         app.press(Key::char('n'));
         assert_eq!(app.message, "no search standing — / to start one");
+    }
+
+    #[test]
+    fn tui_parity_hunk_jumps_walk_the_hunks_and_stop_at_the_edges() {
+        // The tall fake: one file, an edit every ten lines — twenty hunks,
+        // and a real spread for the jump list to walk.
+        let (handle, _state) = fake_tall(&[]);
+        let mut app = commits_app(&handle);
+        app.dispatch("commits.open-diff");
+        until(Duration::from_secs(2), || {
+            app.pump_quiet();
+            diff_of(&app).rows() > 0
+        });
+        app.dispatch("diff.focus");
+        // From the top, alt-down lands on the first hunk's first row; walking
+        // moves one hunk at a time; the last hunk stops rather than wrapping.
+        app.press(Key::parse("alt-down").unwrap());
+        let first = diff_of(&app).cursor();
+        let mut seen = vec![first];
+        loop {
+            app.press(Key::parse("alt-down").unwrap());
+            let at = diff_of(&app).cursor();
+            if at == *seen.last().unwrap() {
+                break;
+            }
+            seen.push(at);
+            assert!(seen.len() <= 25, "the walk did not stop at the last hunk");
+        }
+        // alt-up walks back the same list, one hunk at a time.
+        for expected in seen.iter().rev().skip(1) {
+            app.press(Key::parse("alt-up").unwrap());
+            assert_eq!(diff_of(&app).cursor(), *expected);
+        }
+        assert_eq!(
+            diff_of(&app).cursor(),
+            first,
+            "the walk back missed the first"
+        );
+        // And above the first hunk there is nothing to reach.
+        app.press(Key::parse("alt-up").unwrap());
+        assert_eq!(diff_of(&app).cursor(), first);
     }
 
     #[test]
