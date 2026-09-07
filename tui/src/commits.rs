@@ -229,6 +229,17 @@ pub struct Commits {
     /// Whether the mark is armed — `v` opened it and the arrows extend it
     /// until `v` says stop. The toggle lazygit's drag-select key has.
     marking: bool,
+    /// The shas on the cherry-pick clipboard, for drawing alone — the
+    /// clipboard itself is [`gitten_core::clipboard::CherryClipboard`] and
+    /// the client owns it, because the *order* in it is a paste's contract
+    /// and a pane has no business holding that.
+    ///
+    /// Shas and not rows, so it survives [`Commits::replace`] the way the
+    /// clipboard survives a refresh: what was copied is still copied after
+    /// a write renumbered every row. A membership test per visible row is
+    /// a walk of at most a handful of strings, which is why this is a `Vec`
+    /// and not a set — the clipboard is a keyboard's worth of commits.
+    copied: Vec<String>,
 }
 
 impl Commits {
@@ -272,6 +283,7 @@ impl Commits {
             sel: None,
             dragging: false,
             marks: None,
+            copied: Vec::new(),
             marking: false,
         }
     }
@@ -303,6 +315,25 @@ impl Commits {
     /// reads through here, which is why filtering cannot desync them.
     pub fn current(&self) -> Option<&Commit> {
         self.commits.get(*self.visible.get(self.view.cursor())?)
+    }
+
+    /// Tells the pane which commits are on the cherry-pick clipboard, so a
+    /// copied row can say so. Called by the client whenever the clipboard
+    /// changes and never on the render path: the set is small and stable,
+    /// and a per-frame rebuild of it would be a rebuild of nothing.
+    pub fn set_copied(&mut self, shas: &[Vec<u8>]) {
+        self.copied.clear();
+        self.copied.extend(
+            shas.iter()
+                .map(|sha| String::from_utf8_lossy(sha).into_owned()),
+        );
+    }
+
+    /// Whether the commit at a *source* index is on the clipboard.
+    pub fn is_copied(&self, index: usize) -> bool {
+        self.commits
+            .get(index)
+            .is_some_and(|c| self.copied.contains(&c.sha))
     }
 
     /// The commit a *visible* row holds — what a marked range resolves
@@ -740,7 +771,17 @@ impl Commits {
         // long the sha or the name is — a fixed column that a long value moves
         // is not a column.
         let dim = Ink::new(theme.chrome.dim, bg);
-        pen.take(SHA_W - 1).put(&c.short, dim);
+        // A copied commit says so in its sha and nowhere else. The column is
+        // pure furniture — it spends its foreground on nothing, unlike the
+        // author's hue or a lane's — so lifting it to the accent costs no
+        // information, takes no cell, and stays invisible while the
+        // clipboard is empty. Not a background: that is the cursor's and the
+        // drag's, and a row can only have one of those.
+        let sha_ink = match self.is_copied(index) {
+            true => Ink::new(theme.chrome.accent, bg),
+            false => dim,
+        };
+        pen.take(SHA_W - 1).put(&c.short, sha_ink);
         pen.put(" ", dim);
         pen.take(WHO_W - 1)
             .put(&d.initials, Ink::new(theme.author(&c.author), bg));
@@ -1299,6 +1340,41 @@ r\x1fr\x1f\x1fA\x1f1\x1froot\x1e";
             "the connector broke a lane: {:?}",
             rows[1]
         );
+    }
+
+    #[test]
+    fn a_copied_commit_lifts_its_sha_to_the_accent_and_moves_nothing() {
+        // The clipboard's one visible claim: the sha column, which spends
+        // its foreground on nothing otherwise. Two rows, one copied, and
+        // the *text* of every row identical either way — an indicator that
+        // took a cell would shift the graph and the subject with it.
+        let (mut c, host) = view(LOG, 60, 4);
+        let before = painted(&c, &host);
+        let dim = host.theme.chrome.dim;
+        let accent = host.theme.chrome.accent;
+        assert_ne!(dim, accent, "the theme cannot tell a copy apart");
+
+        let mut screen = Screen::new(60, 4);
+        screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
+        c.paint(&mut screen, 0, 0, true, &host);
+        assert_eq!(screen.ink(0, 1).unwrap().fg, dim, "quiet while empty");
+
+        // `a` is the second row of `LOG`; the row the cursor is on is the
+        // first, so the ink is not the cursor's doing.
+        c.set_copied(&[b"a".to_vec()]);
+        assert!(c.is_copied(1));
+        assert!(!c.is_copied(0));
+        let mut screen = Screen::new(60, 4);
+        screen.clear(Ink::new(host.theme.chrome.fg, host.theme.chrome.bg));
+        c.paint(&mut screen, 0, 0, true, &host);
+        assert_eq!(screen.ink(0, 1).unwrap().fg, accent, "the copy is unmarked");
+        assert_eq!(screen.ink(0, 0).unwrap().fg, dim, "the ink spread");
+        assert_eq!(painted(&c, &host), before, "the ink moved a column");
+
+        // A refresh renumbers rows and the copy is still the copy: the set
+        // is shas, and `replace` is documented not to change how it draws.
+        c.replace(parse_log(LOG));
+        assert!(c.is_copied(1), "the refresh forgot the clipboard");
     }
 
     #[test]

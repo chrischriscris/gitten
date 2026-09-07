@@ -2578,6 +2578,18 @@ impl App {
         }
     }
 
+    /// Hands the commits pane the clipboard's shas so a copied row can draw
+    /// itself as one. Called after every press that changes the clipboard
+    /// and nowhere else — the pane keeps the set across a refresh, exactly
+    /// as the clipboard does, because a write that renumbers every row does
+    /// not un-copy anything.
+    fn sync_copied(&mut self) {
+        let shas = self.clipboard.ordered().to_vec();
+        if let Some(Screens::Commits { view, .. }) = self.panes.get_mut("commits") {
+            view.set_copied(&shas);
+        }
+    }
+
     /// Whether the keyboard is on the commits pane — the guard every history
     /// verb opens with, said the way every wrong-focus refusal here is said.
     fn commits_focused(&mut self, command: &str) -> bool {
@@ -3745,6 +3757,7 @@ impl App {
             "commits.copy" => {
                 if self.commits_focused("commits.copy") {
                     gitten_app::act::copy_commits(self);
+                    self.sync_copied();
                 }
             }
             "commits.paste" => {
@@ -3755,6 +3768,7 @@ impl App {
             "commits.clear-copies" => {
                 if self.commits_focused("commits.clear-copies") {
                     gitten_app::act::clear_copies(self);
+                    self.sync_copied();
                 }
             }
             "commits.reset-author" => {
@@ -16235,6 +16249,65 @@ shared tail
         );
         app.dispatch("commits.clear-copies");
         assert_eq!(app.message, "the cherry-pick clipboard is already empty");
+    }
+
+    /// LG-057, the part a status line cannot carry: a copied row says so in
+    /// the pane, and keeps saying it after a refresh renumbered every row —
+    /// which is the whole reason the pane holds shas rather than rows. Only
+    /// the clear takes the ink away, because only the clear empties the
+    /// clipboard.
+    #[test]
+    fn tui_parity_a_copied_row_is_drawn_as_copied_until_it_is_cleared() {
+        let (handle, state) = fake(&[]);
+        let mut app = history_app(&handle);
+        app.dispatch("view.down");
+        let copied = row_sha(&app);
+        let elsewhere = {
+            app.dispatch("view.down");
+            let sha = row_sha(&app);
+            app.dispatch("view.up");
+            sha
+        };
+
+        assert!(
+            !commits_of(&app).is_copied(1),
+            "a row was drawn as copied before anything was"
+        );
+        app.dispatch("commits.copy");
+        // `is_copied` addresses the *source* index, so the row is looked up
+        // in the loaded window rather than in the visible table.
+        let source = |app: &App, sha: &str| {
+            let (window, _) = commits_of(app).history_window().expect("unfiltered");
+            window.iter().position(|c| c.sha == sha)
+        };
+        let row = source(&app, &copied).expect("the copied commit is loaded");
+        assert!(commits_of(&app).is_copied(row), "the copy left no ink");
+        assert!(
+            !commits_of(&app).is_copied(source(&app, &elsewhere).unwrap()),
+            "the ink spread to a row nobody copied"
+        );
+
+        // A write refreshes the window; the fake answers a different history
+        // than startup loaded, and the copy is still the copy.
+        app.dispatch("commits.revert");
+        assert!(
+            wrote(&mut app, &state, &format!("revert {copied}")),
+            "{:?}",
+            state.lock().unwrap().writes
+        );
+        app.dispatch("commits.paste");
+        assert!(
+            wrote(&mut app, &state, &format!("cherry-pick {copied}")),
+            "the refresh lost the clipboard: {:?}",
+            state.lock().unwrap().writes
+        );
+
+        // The clear takes the ink with it.
+        app.dispatch("commits.clear-copies");
+        assert!(
+            (0..commits_of(&app).len()).all(|i| !commits_of(&app).is_copied(i)),
+            "the clear left ink behind"
+        );
     }
 
     /// LG-057, the unmarked press: with no range standing the copy takes
