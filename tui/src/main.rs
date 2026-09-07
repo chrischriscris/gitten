@@ -1945,6 +1945,19 @@ impl App {
                 generation: Generation::default(),
             }
         });
+        // The worktrees pane, the same shape a fourth time: registered
+        // behind a repository in its loading shape, read by the startup
+        // wave. A fixture or a patch has no repository and so no pane;
+        // the name stays absent and `worktrees.focus` says so.
+        let worktrees_tenant = repo.is_some().then(|| {
+            let mut view = Worktrees::unavailable();
+            view.set_bar(bar);
+            Screens::Worktrees {
+                view,
+                label: STARTUP_LOADING.to_string(),
+                generation: Generation::default(),
+            }
+        });
         let mut panes = panes::Panes::new();
         let mut last_list = None;
         match started.loaded.data {
@@ -1982,6 +1995,9 @@ impl App {
                 if let Some(pane) = reflog_tenant {
                     panes.register("reflog", panes::Placement::sidebar("reflog"), pane);
                 }
+                if let Some(pane) = worktrees_tenant {
+                    panes.register("worktrees", panes::Placement::sidebar("worktrees"), pane);
+                }
                 // The persistent main pane starts empty, then
                 // [`App::sync_main_diff`] below replaces it from row zero
                 // before construction returns. Keeping the honest empty shape
@@ -2016,6 +2032,9 @@ impl App {
                 }
                 if let Some(pane) = reflog_tenant {
                     panes.register("reflog", panes::Placement::sidebar("reflog"), pane);
+                }
+                if let Some(pane) = worktrees_tenant {
+                    panes.register("worktrees", panes::Placement::sidebar("worktrees"), pane);
                 }
                 let mut diff = Diff::new(files, &host);
                 diff.set_bar(bar);
@@ -7134,6 +7153,10 @@ fn tui_availability(
         "worktrees.remove",
         "worktrees.switch",
         "worktrees.search",
+        "commits.new-worktree",
+        "branches.new-worktree",
+        "stashes.new-worktree",
+        "tags.new-worktree",
         "commits.bisect-menu",
         "commits.bisect-good",
         "commits.bisect-bad",
@@ -7382,6 +7405,17 @@ fn tui_availability(
                 "commits.bisect-reset",
             ] {
                 a.disabled(name, "a fixture has no history to bisect");
+            }
+            for name in [
+                "commits.new-worktree",
+                "branches.new-worktree",
+                "stashes.new-worktree",
+                "tags.new-worktree",
+            ] {
+                a.disabled(
+                    name,
+                    "a fixture has no repository to branch a worktree from",
+                );
             }
             a.disabled(
                 "merge.take-side",
@@ -9230,6 +9264,37 @@ diff --git a/tracked.txt b/tracked.txt
         /// message and changes nothing: git's refusal, verbatim.
         refuse_branch: Option<String>,
         refuse_tag: Option<String>,
+        /// The checkouts `worktrees` answers with, and how often it was
+        /// read. Writes record the path they aimed at and — when they
+        /// land — change what the next read answers, which is what lets a
+        /// test observe a refresh reading the namespace after a removal.
+        worktrees: Vec<gitten_core::worktrees::Worktree>,
+        worktree_reads: usize,
+        /// When set, the next worktree *read* fails with exactly this
+        /// message — the ancillary read that happens at `App::new`, so a
+        /// test can launch into the failed tenant rather than only
+        /// probing it.
+        fail_worktrees: Option<String>,
+        /// Every worktree write that reached the repository, as the
+        /// person-readable line a test asserts against.
+        worktree_writes: Vec<String>,
+        /// When set, the next worktree *verb* fails with exactly this
+        /// message and changes nothing: git's refusal, verbatim.
+        refuse_worktree: Option<String>,
+        /// The bisection the reads answer — `None` is a clean tree. Set
+        /// directly by bisect tests: the next `sync_bisect` sees the
+        /// world they built.
+        bisect: Option<gitten_core::bisect::BisectState>,
+        /// Every bisect verb that reached the repository, as the
+        /// person-readable line a test asserts against.
+        bisect_writes: Vec<String>,
+        /// When set, the next bisect *verb* fails with exactly this
+        /// message and changes nothing.
+        refuse_bisect: Option<String>,
+        /// Local branches held by another worktree — what the real
+        /// `worktree_branches` read answers, and what a checkout here
+        /// refuses for.
+        held_branches: Vec<String>,
         /// The two sides of the index, as the side reads answer them — the
         /// staged side (HEAD→index) and the unstaged one (index→worktree).
         /// `fakes_staged`/`fakes_unstaged` filter by the path a caller
@@ -9823,6 +9888,149 @@ diff --git a/tracked.txt b/tracked.txt
                 .push(format!("untag {}", String::from_utf8_lossy(name)));
             s.branch_bytes.push(name.to_vec());
             s.tags.retain(|t| t.name.as_bytes() != name);
+            Ok(())
+        }
+
+        fn worktrees(&self) -> gitten_git::Result<Vec<gitten_core::worktrees::Worktree>> {
+            let mut s = self.0.lock().unwrap();
+            s.worktree_reads += 1;
+            if let Some(e) = s.fail_worktrees.clone() {
+                return Err(e);
+            }
+            Ok(s.worktrees.clone())
+        }
+
+        fn worktree_add(
+            &self,
+            path: &[u8],
+            base: &[u8],
+            branch: Option<&[u8]>,
+        ) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            if let Some(e) = s.refuse_worktree.clone() {
+                return Err(e);
+            }
+            s.worktree_writes.push(format!(
+                "add {} at {}{}",
+                String::from_utf8_lossy(path),
+                String::from_utf8_lossy(base),
+                branch
+                    .map(|b| format!(" as {}", String::from_utf8_lossy(b)))
+                    .unwrap_or_default()
+            ));
+            // A checkout the next read answers, so a refresh after the
+            // write draws the row the job just made. Detached, because
+            // the fake names no branch for it — the pane reads what the
+            // listing says, not what the verb wished.
+            if !s.worktrees.iter().any(|w| w.path == path) {
+                s.worktrees.push(gitten_core::worktrees::Worktree {
+                    path: path.to_vec(),
+                    head: "fake".into(),
+                    branch: None,
+                    bare: false,
+                    lock: None,
+                    prunable: None,
+                });
+            }
+            Ok(())
+        }
+
+        fn worktree_remove(&self, path: &[u8], force: bool) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            // The refusal models git's dirty refusal, which the force
+            // spelling overrides — a forced remove always lands.
+            if !force {
+                if let Some(e) = s.refuse_worktree.clone() {
+                    return Err(e);
+                }
+            }
+            s.worktree_writes.push(format!(
+                "remove {}{}",
+                String::from_utf8_lossy(path),
+                match force {
+                    true => " forced",
+                    false => "",
+                }
+            ));
+            s.worktrees.retain(|w| w.path != path);
+            Ok(())
+        }
+
+        fn worktree_branches(&self) -> Vec<String> {
+            self.0.lock().unwrap().held_branches.clone()
+        }
+
+        fn bisect_state(&self) -> Option<gitten_core::bisect::BisectState> {
+            self.0.lock().unwrap().bisect.clone()
+        }
+
+        fn bisect_start(&self, bad: &[u8], goods: &[Vec<u8>]) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            if let Some(e) = s.refuse_bisect.clone() {
+                return Err(e);
+            }
+            if s.bisect.is_some() {
+                return Err("a bisect is already in progress — reset it first".into());
+            }
+            s.bisect_writes.push(format!(
+                "start {} {}",
+                String::from_utf8_lossy(bad),
+                goods
+                    .iter()
+                    .map(|g| String::from_utf8_lossy(g).into_owned())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ));
+            // Standing, aimed at the bad revision: the judgements the
+            // test types next land on a question that exists.
+            s.bisect = Some(gitten_core::bisect::BisectState {
+                current: String::from_utf8_lossy(bad).into_owned(),
+                original: "main".into(),
+                goods: goods
+                    .iter()
+                    .map(|g| String::from_utf8_lossy(g).into_owned())
+                    .collect(),
+            });
+            Ok(())
+        }
+
+        fn bisect_good(&self, rev: &[u8]) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            if let Some(e) = s.refuse_bisect.clone() {
+                return Err(e);
+            }
+            s.bisect_writes
+                .push(format!("good {}", String::from_utf8_lossy(rev)));
+            Ok(())
+        }
+
+        fn bisect_bad(&self, rev: &[u8]) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            if let Some(e) = s.refuse_bisect.clone() {
+                return Err(e);
+            }
+            s.bisect_writes
+                .push(format!("bad {}", String::from_utf8_lossy(rev)));
+            Ok(())
+        }
+
+        fn bisect_skip(&self, rev: &[u8]) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            if let Some(e) = s.refuse_bisect.clone() {
+                return Err(e);
+            }
+            s.bisect_writes
+                .push(format!("skip {}", String::from_utf8_lossy(rev)));
+            Ok(())
+        }
+
+        fn bisect_reset(&self) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            if let Some(e) = s.refuse_bisect.clone() {
+                return Err(e);
+            }
+            s.bisect_writes.push("reset".into());
+            s.bisect = None;
             Ok(())
         }
 
@@ -10893,8 +11101,8 @@ diff --git a/tracked.txt b/tracked.txt
         assert_eq!((commits_rect.x, commits_rect.width), (0, 40));
         assert_eq!(files_rect.y, 1);
         assert_eq!(commits_rect.y, files_rect.y + files_rect.height + 3);
-        // Seven slices over the sidebar: the odd rows go to the first.
-        assert_eq!(files_rect.height, 4, "the first slice takes the remainder");
+        // Eight slices over the sidebar: the odd rows go to the first.
+        assert_eq!(files_rect.height, 3, "the first slice takes the remainder");
         assert_eq!(commits_rect.height, 3, "unequal slices");
         assert_eq!((diff_rect.x, diff_rect.width), (41, 79));
         for y in 1..24 {
@@ -10958,14 +11166,23 @@ diff --git a/tracked.txt b/tracked.txt
             "the launch focus was not restored"
         );
         assert!(app.panes.get("files").is_some(), "no files tenant");
-        assert_eq!(app.panes.names().count(), 8);
+        assert_eq!(app.panes.names().count(), 9);
         // The sidebar's canonical order: files (rank 1), branches (rank 2),
         // commits (rank 3), stashes (rank 4) — then the unranked tail in
-        // registration order, remotes before tags before reflog, with
-        // nothing in panes.rs the wiser.
+        // registration order, remotes before tags before reflog before
+        // worktrees, with nothing in panes.rs the wiser.
         assert_eq!(
             app.panes.list_order(),
-            ["files", "branches", "commits", "stashes", "remotes", "tags", "reflog",]
+            [
+                "files",
+                "branches",
+                "commits",
+                "stashes",
+                "remotes",
+                "tags",
+                "reflog",
+                "worktrees",
+            ]
         );
 
         // `2` is the shared files.focus binding, and it now lands.
@@ -11722,7 +11939,7 @@ diff --git a/tracked.txt b/tracked.txt
         ));
         app.press(Key::plain(Code::Enter));
         assert_eq!(app.panes.focused_name(), "diff");
-        assert_eq!(app.panes.names().count(), 8, "enter appended a pane");
+        assert_eq!(app.panes.names().count(), 9, "enter appended a pane");
         assert_eq!(state.lock().unwrap().pairs_reads, open_reads);
         // The commits pane stays resident, its cursor where it was.
         assert_eq!(commits_of(&app).cursor(), 0);
@@ -11771,7 +11988,7 @@ diff --git a/tracked.txt b/tracked.txt
         app.press(Key::plain(Code::Enter));
         assert_eq!(
             app.panes.names().count(),
-            8,
+            9,
             "a second enter appended a pane"
         );
         assert_eq!(app.panes.focused_name(), "diff");
@@ -12210,10 +12427,10 @@ diff --git a/tracked.txt b/tracked.txt
         app.draw();
 
         // Down in the commits rectangle presses it, in its own coordinates.
-        // The sidebar splits seven ways now, so the commits slice is the
-        // third of them (its content rows are 9–10): local row 1 is one
+        // The sidebar splits eight ways now, so the commits slice is the
+        // third of them (its content rows are 8–9): local row 1 is one
         // content row down.
-        app.mouse(click(MouseKind::Down, 5, 10));
+        app.mouse(click(MouseKind::Down, 5, 9));
         app.pump_quiet();
         assert_eq!(app.panes.focused_name(), "commits");
         assert_eq!(
@@ -12261,13 +12478,16 @@ diff --git a/tracked.txt b/tracked.txt
         // (The commits slice is the middle of the sidebar now.)
         app.dispatch("commits.focus");
         let reads = state.lock().unwrap().pairs_reads;
-        app.mouse(click(MouseKind::Down, 10, 9));
-        app.mouse(click(MouseKind::Up, 10, 9));
+        // Row 0, not the row the press above sat on: the first click has
+        // to move the keyboard for its preview read to exist, and the
+        // second meets a shown commit and deduplicates.
+        app.mouse(click(MouseKind::Down, 10, 8));
+        app.mouse(click(MouseKind::Up, 10, 8));
         // The click's own preview is on the lane; let it land before the
         // second press, so the double click meets a shown commit and
         // deduplicates — the count below is the click's read, not the open's.
         app.pump_quiet();
-        app.mouse(click(MouseKind::Down, 10, 9));
+        app.mouse(click(MouseKind::Down, 10, 8));
         app.pump_quiet();
         assert_eq!(
             app.panes.focused_name(),
@@ -12570,7 +12790,7 @@ diff --git a/tracked.txt b/tracked.txt
         // The read is on the preview lane now; the install is what the next
         // dispatch deduplicates against, so give it its turn.
         app.pump_quiet();
-        assert_eq!(app.panes.names().count(), 8, "open-diff appended a pane");
+        assert_eq!(app.panes.names().count(), 9, "open-diff appended a pane");
         assert!(matches!(app.panes.get("diff"), Some(Screens::Diff { .. })));
         app.dispatch("commits.focus");
         assert_eq!(app.panes.focused_name(), "commits");
@@ -13021,17 +13241,46 @@ diff --git a/tracked.txt b/tracked.txt
         let names: Vec<&str> = app.panes.names().collect();
         assert_eq!(
             app.panes.names().collect::<Vec<_>>(),
-            ["commits", "stashes", "remotes", "tags", "reflog", "diff", "files", "branches"],
+            [
+                "commits",
+                "stashes",
+                "remotes",
+                "tags",
+                "reflog",
+                "worktrees",
+                "diff",
+                "files",
+                "branches"
+            ],
             "{names:?}"
         );
         assert_eq!(app.panes.focused_name(), "commits");
         assert_eq!(
             app.panes.list_order(),
-            ["files", "branches", "commits", "stashes", "remotes", "tags", "reflog",]
+            [
+                "files",
+                "branches",
+                "commits",
+                "stashes",
+                "remotes",
+                "tags",
+                "reflog",
+                "worktrees",
+            ]
         );
         assert_eq!(
             app.panes.reading_order(),
-            ["files", "branches", "commits", "stashes", "remotes", "tags", "reflog", "diff"]
+            [
+                "files",
+                "branches",
+                "commits",
+                "stashes",
+                "remotes",
+                "tags",
+                "reflog",
+                "worktrees",
+                "diff"
+            ]
         );
 
         // `5` reaches it — through the keymap, and the mode follows the
@@ -13058,7 +13307,16 @@ diff --git a/tracked.txt b/tracked.txt
         let diff_app = app_on_fake(&source, &handle);
         assert_eq!(
             diff_app.panes.names().collect::<Vec<_>>(),
-            ["stashes", "remotes", "tags", "reflog", "diff", "files", "branches"]
+            [
+                "stashes",
+                "remotes",
+                "tags",
+                "reflog",
+                "worktrees",
+                "diff",
+                "files",
+                "branches"
+            ]
         );
         assert_eq!(diff_app.panes.focused_name(), "diff");
 
@@ -13083,16 +13341,17 @@ diff --git a/tracked.txt b/tracked.txt
         let mut app = commits_app(&handle);
         app.draw();
 
-        // Wide: the sidebar splits into seven canonical slices — files on
+        // Wide: the sidebar splits into eight canonical slices — files on
         // top, branches under it, commits next, the stack, the remotes, the
-        // tags, the reflog at the foot — and the diff takes the rest, one
-        // divider column between. No geometry module changed to make room:
-        // this is the registry's equal-slice answer to the tenants there are.
+        // tags, the reflog, the worktrees at the foot — and the diff takes
+        // the rest, one divider column between. No geometry module changed
+        // to make room: this is the registry's equal-slice answer to the
+        // tenants there are.
         assert_eq!(
             app.pane_rect("commits"),
             Some(crate::panes::Rect {
                 x: 0,
-                y: 8,
+                y: 7,
                 width: 40,
                 height: 3
             })
@@ -13101,7 +13360,7 @@ diff --git a/tracked.txt b/tracked.txt
             app.pane_rect("stashes"),
             Some(crate::panes::Rect {
                 x: 0,
-                y: 11,
+                y: 10,
                 width: 40,
                 height: 3
             })
@@ -13119,12 +13378,12 @@ diff --git a/tracked.txt b/tracked.txt
         // Headers name the live configured focus keys — 4 and 5, straight
         // out of the shipped map — and the stack says whose repository it
         // is and how much is parked.
-        let commits_header = app.screen.row_text(8).chars().take(40).collect::<String>();
+        let commits_header = app.screen.row_text(7).chars().take(40).collect::<String>();
         assert!(
             commits_header.contains('4') && commits_header.contains("commits"),
             "{commits_header:?}"
         );
-        let stashes_header = app.screen.row_text(11);
+        let stashes_header = app.screen.row_text(10);
         assert!(stashes_header.contains('5'), "{stashes_header:?}");
         assert!(stashes_header.contains("stashes"), "{stashes_header:?}");
         assert!(
@@ -13142,7 +13401,7 @@ diff --git a/tracked.txt b/tracked.txt
         }
 
         // And the stack itself drew: both rows, address first.
-        let rows: Vec<String> = (12..14).map(|y| app.screen.row_text(y)).collect();
+        let rows: Vec<String> = (11..13).map(|y| app.screen.row_text(y)).collect();
         assert!(rows.iter().any(|r| r.contains("stash@{0}")), "{rows:?}");
         assert!(rows.iter().any(|r| r.contains("stash@{1}")), "{rows:?}");
 
@@ -13194,8 +13453,8 @@ diff --git a/tracked.txt b/tracked.txt
             "the cycle did not reach the second list"
         );
         // The remotes list sits between the stack and the foot now; the
-        // tags and the reflog sit behind it, and the wrap takes three more
-        // steps.
+        // tags, the reflog and the worktrees sit behind it, and the wrap
+        // takes four more steps.
         app.dispatch("pane.next");
         assert_eq!(
             app.panes.focused_name(),
@@ -13215,6 +13474,12 @@ diff --git a/tracked.txt b/tracked.txt
             "the cycle did not reach the reflog"
         );
         app.dispatch("pane.next");
+        assert_eq!(
+            app.panes.focused_name(),
+            "worktrees",
+            "the cycle did not reach the worktrees"
+        );
+        app.dispatch("pane.next");
         assert_eq!(app.panes.focused_name(), "files", "the cycle did not wrap");
         app.press(Key::plain(Code::Char('5')));
         assert_eq!(app.panes.focused_name(), "stashes");
@@ -13225,9 +13490,9 @@ diff --git a/tracked.txt b/tracked.txt
             app.screen.row_text(0)
         );
         assert!(
-            app.screen.row_text(11).contains('5') && app.screen.row_text(11).contains("stashes"),
+            app.screen.row_text(10).contains('5') && app.screen.row_text(10).contains("stashes"),
             "the header did not advertise the stack: {:?}",
-            app.screen.row_text(15)
+            app.screen.row_text(14)
         );
         assert!(
             app.screen
@@ -13712,7 +13977,17 @@ diff --git a/tracked.txt b/tracked.txt
         // the exact error kept for the status line.
         assert_eq!(
             app.panes.names().collect::<Vec<_>>(),
-            ["commits", "stashes", "remotes", "tags", "reflog", "diff", "files", "branches"]
+            [
+                "commits",
+                "stashes",
+                "remotes",
+                "tags",
+                "reflog",
+                "worktrees",
+                "diff",
+                "files",
+                "branches"
+            ]
         );
         assert_eq!(app.panes.focused_name(), "commits");
         assert_eq!(app.message, "fatal: bad object refs/stash");
@@ -13729,11 +14004,11 @@ diff --git a/tracked.txt b/tracked.txt
         // line, never the empty-stack line that would assert a read that
         // never succeeded, and no row for a verb to address.
         assert!(
-            app.screen.row_text(11).contains("unavailable"),
+            app.screen.row_text(10).contains("unavailable"),
             "the header did not say so: {:?}",
-            app.screen.row_text(15)
+            app.screen.row_text(14)
         );
-        let rows: Vec<String> = (12..14).map(|y| app.screen.row_text(y)).collect();
+        let rows: Vec<String> = (11..13).map(|y| app.screen.row_text(y)).collect();
         assert!(
             rows.iter().any(|r| r.contains("stash list unavailable")),
             "{rows:?}"
@@ -13765,11 +14040,11 @@ diff --git a/tracked.txt b/tracked.txt
         );
         app.draw();
         assert!(
-            app.screen.row_text(11).contains("fake (main) · 2 parked"),
+            app.screen.row_text(10).contains("fake (main) · 2 parked"),
             "the header did not recover: {:?}",
-            app.screen.row_text(15)
+            app.screen.row_text(14)
         );
-        let rows: Vec<String> = (12..14).map(|y| app.screen.row_text(y)).collect();
+        let rows: Vec<String> = (11..13).map(|y| app.screen.row_text(y)).collect();
         assert!(rows.iter().any(|r| r.contains("stash@{0}")), "{rows:?}");
         assert!(
             !app.screen.row_text(23).contains("fatal:"),
@@ -13826,17 +14101,46 @@ diff --git a/tracked.txt b/tracked.txt
         let names: Vec<&str> = app.panes.names().collect();
         assert_eq!(
             app.panes.names().collect::<Vec<_>>(),
-            ["commits", "stashes", "remotes", "tags", "reflog", "diff", "files", "branches"],
+            [
+                "commits",
+                "stashes",
+                "remotes",
+                "tags",
+                "reflog",
+                "worktrees",
+                "diff",
+                "files",
+                "branches"
+            ],
             "{names:?}"
         );
         assert_eq!(app.panes.focused_name(), "commits");
         assert_eq!(
             app.panes.list_order(),
-            ["files", "branches", "commits", "stashes", "remotes", "tags", "reflog",]
+            [
+                "files",
+                "branches",
+                "commits",
+                "stashes",
+                "remotes",
+                "tags",
+                "reflog",
+                "worktrees",
+            ]
         );
         assert_eq!(
             app.panes.reading_order(),
-            ["files", "branches", "commits", "stashes", "remotes", "tags", "reflog", "diff"]
+            [
+                "files",
+                "branches",
+                "commits",
+                "stashes",
+                "remotes",
+                "tags",
+                "reflog",
+                "worktrees",
+                "diff"
+            ]
         );
 
         // `3` reaches it — through the keymap — and the keyboard's modes
@@ -13885,7 +14189,16 @@ diff --git a/tracked.txt b/tracked.txt
         let mut app = app_on_fake(&source, &handle);
         assert_eq!(
             app.panes.names().collect::<Vec<_>>(),
-            ["stashes", "remotes", "tags", "reflog", "diff", "files", "branches"]
+            [
+                "stashes",
+                "remotes",
+                "tags",
+                "reflog",
+                "worktrees",
+                "diff",
+                "files",
+                "branches"
+            ]
         );
         assert_eq!(app.panes.focused_name(), "diff");
 
@@ -13926,7 +14239,7 @@ diff --git a/tracked.txt b/tracked.txt
                 x: 0,
                 y: 5,
                 width: 40,
-                height: 4
+                height: 3
             }
         );
         assert_eq!(
@@ -13969,7 +14282,17 @@ diff --git a/tracked.txt b/tracked.txt
         let mut app = commits_app(&handle);
         assert_eq!(
             app.panes.names().collect::<Vec<_>>(),
-            ["commits", "stashes", "remotes", "tags", "reflog", "diff", "files", "branches"]
+            [
+                "commits",
+                "stashes",
+                "remotes",
+                "tags",
+                "reflog",
+                "worktrees",
+                "diff",
+                "files",
+                "branches"
+            ]
         );
         assert_eq!(
             app.panes.focused_name(),
@@ -15036,7 +15359,15 @@ diff --git a/tracked.txt b/tracked.txt
             "the hidden tenant was not refreshed"
         );
         for name in [
-            "commits", "stashes", "remotes", "tags", "reflog", "diff", "files", "branches",
+            "commits",
+            "stashes",
+            "remotes",
+            "tags",
+            "reflog",
+            "worktrees",
+            "diff",
+            "files",
+            "branches",
         ] {
             assert_eq!(
                 app.panes.get(name).unwrap().generation(),
@@ -15273,9 +15604,9 @@ diff --git a/tracked.txt b/tracked.txt
             app.screen.row_text(0)
         );
         assert!(
-            app.screen.row_text(5).contains('3') && app.screen.row_text(5).contains("branches"),
+            app.screen.row_text(4).contains('3') && app.screen.row_text(4).contains("branches"),
             "the header did not advertise the pane: {:?}",
-            app.screen.row_text(6)
+            app.screen.row_text(5)
         );
         assert!(
             app.screen.row_text(23).contains("branches · 1/4 · main"),
@@ -15392,7 +15723,15 @@ diff --git a/tracked.txt b/tracked.txt
             "the hidden tenants were not refreshed"
         );
         for name in [
-            "commits", "stashes", "remotes", "tags", "reflog", "diff", "files", "branches",
+            "commits",
+            "stashes",
+            "remotes",
+            "tags",
+            "reflog",
+            "worktrees",
+            "diff",
+            "files",
+            "branches",
         ] {
             assert_eq!(
                 app.panes.get(name).unwrap().generation(),
@@ -17644,9 +17983,9 @@ diff --git a/tracked.txt b/tracked.txt
         app.dispatch("remotes.focus");
         app.draw();
         assert!(
-            app.screen.row_text(14).contains("remotes"),
+            app.screen.row_text(13).contains("remotes"),
             "the header did not follow: {:?}",
-            app.screen.row_text(14)
+            app.screen.row_text(13)
         );
         assert!(
             app.screen.row_text(0).contains("1 remote"),
@@ -17654,7 +17993,7 @@ diff --git a/tracked.txt b/tracked.txt
             app.screen.row_text(0)
         );
         assert_eq!(remotes_status(&app), "1/1 · origin");
-        let body = (15..17)
+        let body = (14..16)
             .map(|y| app.screen.row_text(y))
             .collect::<Vec<_>>()
             .join("\n");
@@ -17709,6 +18048,459 @@ diff --git a/tracked.txt b/tracked.txt
 
     fn writes_of(state: &Arc<Mutex<FakeState>>) -> Vec<String> {
         state.lock().unwrap().writes.clone()
+    }
+
+    fn worktrees_of(app: &App) -> &Worktrees {
+        match app.panes.get("worktrees") {
+            Some(Screens::Worktrees { view, .. }) => view,
+            _ => panic!("the worktrees pane is not registered"),
+        }
+    }
+
+    fn worktrees_status(app: &App) -> String {
+        worktrees_of(app).status()
+    }
+
+    fn worktree_row(path: &str, branch: Option<&str>) -> gitten_core::worktrees::Worktree {
+        gitten_core::worktrees::Worktree {
+            path: path.as_bytes().to_vec(),
+            head: "abcdef0123456789".into(),
+            branch: branch.map(|b| b.as_bytes().to_vec()),
+            bare: false,
+            lock: None,
+            prunable: None,
+        }
+    }
+
+    #[test]
+    fn tui_parity_the_worktrees_pane_lists_checkouts_and_states() {
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().worktrees = vec![
+            worktree_row("/fake", Some("main")),
+            worktree_row("/fake-feature", Some("feature")),
+            gitten_core::worktrees::Worktree {
+                lock: Some("held".into()),
+                ..worktree_row("/fake-held", None)
+            },
+        ];
+        let mut app = commits_app(&handle);
+        app.dispatch("worktrees.focus");
+        app.draw();
+        // The pane is one of eight squeezed into the sidebar: rows drawn
+        // depend on the layout, so the test reads the cursor and the
+        // status line rather than fixed rows — both name the checkout
+        // whatever geometry gave it.
+        assert_eq!(worktrees_status(&app), "1/3 · /fake");
+        assert_eq!(worktrees_of(&app).current(), Some(b"/fake".to_vec()));
+        // The cursor's row is the one drawn: the this-checkout marker
+        // arrives wherever the geometry put row zero.
+        let h = app.screen.size().1;
+        let top = (0..h)
+            .map(|y| app.screen.row_text(y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(top.contains("(this checkout)"), "{top:?}");
+        app.dispatch("view.down");
+        app.dispatch("view.down");
+        assert_eq!(worktrees_status(&app), "3/3 · /fake-held");
+        app.draw();
+        let h = app.screen.size().1;
+        let body = (0..h)
+            .map(|y| app.screen.row_text(y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // The cursor's row is the one drawn: the pane narrowed to one
+        // row still shows the path it sits on.
+        assert!(body.contains("/fake-held"), "{body:?}");
+        // The locked marker rides the row's full text even where the
+        // pane clips it — copy reads the text, not the cells.
+        app.dispatch("copy.selection");
+        assert!(
+            app.copy
+                .as_deref()
+                .is_some_and(|t| t.contains("(locked: held)")),
+            "the marker never rode the row: {:?}",
+            app.copy
+        );
+        app.dispatch("view.top");
+        app.dispatch("view.down");
+        app.dispatch("copy.selection");
+        assert!(
+            app.copy
+                .as_deref()
+                .is_some_and(|t| t.contains("/fake-feature")),
+            "copy did not read the row: {:?}",
+            app.copy
+        );
+    }
+
+    #[test]
+    fn tui_parity_worktree_new_asks_from_then_path() {
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().worktrees = vec![worktree_row("/fake", Some("main"))];
+        let mut app = commits_app(&handle);
+        app.dispatch("worktrees.focus");
+        app.press(Key::char('n'));
+        assert!(matches!(app.prompt, Some(Prompt::WorktreeBase { .. })));
+        type_(&mut app, "feature");
+        app.press(Key::plain(Code::Enter));
+        assert!(matches!(app.prompt, Some(Prompt::WorktreePath { .. })));
+        type_(&mut app, "/tmp/new-checkout");
+        app.press(Key::plain(Code::Enter));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                !state.lock().unwrap().worktree_writes.is_empty()
+            }),
+            "the worktree add never queued"
+        );
+        assert_eq!(
+            state.lock().unwrap().worktree_writes,
+            ["add /tmp/new-checkout at feature"],
+        );
+        // And the namespace the next read answers grew the row.
+        app.dispatch("repo.refresh");
+        app.pump_quiet();
+        assert_eq!(worktrees_status(&app), "1/2 · /fake");
+    }
+
+    #[test]
+    fn tui_parity_worktree_from_a_commit_row_starts_there() {
+        let (handle, state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        let sha = commits_of(&app)
+            .current()
+            .expect("a commit row")
+            .sha
+            .clone();
+        app.press(Key::char('w'));
+        assert!(matches!(app.prompt, Some(Prompt::WorktreePath { .. })));
+        type_(&mut app, "/tmp/at-commit");
+        app.press(Key::plain(Code::Enter));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                !state.lock().unwrap().worktree_writes.is_empty()
+            }),
+            "the worktree add never queued"
+        );
+        assert_eq!(
+            state.lock().unwrap().worktree_writes,
+            [format!("add /tmp/at-commit at {sha}")],
+            "the base is the row's sha, not HEAD"
+        );
+    }
+
+    #[test]
+    fn tui_parity_worktree_from_branch_tag_and_stash_rows() {
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        state.lock().unwrap().tags = vec![gitten_core::refs::Tag {
+            name: gitten_core::refs::RefName::from("v1"),
+            commit: "abc123".into(),
+            annotated: false,
+            subject: None,
+        }];
+        let mut app = commits_app(&handle);
+        // A branch row names the branch.
+        app.press(Key::plain(Code::Char('3')));
+        app.press(Key::char('w'));
+        assert!(
+            matches!(app.prompt, Some(Prompt::WorktreePath { .. })),
+            "no path prompt over the branches pane"
+        );
+        app.press(Key::plain(Code::Esc));
+        // A tag row names the commit the tag points at.
+        app.dispatch("tags.focus");
+        app.press(Key::char('w'));
+        assert!(
+            matches!(app.prompt, Some(Prompt::WorktreePath { .. })),
+            "no path prompt over the tags pane"
+        );
+        app.press(Key::plain(Code::Esc));
+        // A stash row names the entry's commit.
+        app.dispatch("stashes.focus");
+        app.press(Key::char('w'));
+        assert!(
+            matches!(app.prompt, Some(Prompt::WorktreePath { .. })),
+            "no path prompt over the stash stack"
+        );
+    }
+
+    #[test]
+    fn tui_parity_worktree_remove_asks_twice_and_forces_past_dirt() {
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().worktrees = vec![
+            worktree_row("/fake", Some("main")),
+            worktree_row("/fake-feature", Some("feature")),
+        ];
+        let mut app = commits_app(&handle);
+        app.dispatch("worktrees.focus");
+        app.dispatch("view.down");
+        // Twice pressed runs the plain removal.
+        app.press(Key::char('d'));
+        app.press(Key::char('d'));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                !state.lock().unwrap().worktree_writes.is_empty()
+            }),
+            "the removal never queued"
+        );
+        assert_eq!(
+            state.lock().unwrap().worktree_writes,
+            ["remove /fake-feature"],
+        );
+
+        // A dirty refusal upgrades the question: the next press forces.
+        state.lock().unwrap().worktrees = vec![
+            worktree_row("/fake", Some("main")),
+            worktree_row("/wt", None),
+        ];
+        state.lock().unwrap().refuse_worktree = Some(
+            "worktree at /wt has uncommitted changes — press d again to force its removal".into(),
+        );
+        app.dispatch("repo.refresh");
+        app.dispatch("view.bottom");
+        app.press(Key::char('d'));
+        app.press(Key::char('d'));
+        until_message(&mut app, "has uncommitted changes");
+        app.press(Key::char('d'));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                state
+                    .lock()
+                    .unwrap()
+                    .worktree_writes
+                    .iter()
+                    .any(|w| w.contains("forced"))
+            }),
+            "the third press never forced: {:?}",
+            state.lock().unwrap().worktree_writes
+        );
+        // And the spent upgrade is gone: the row went with the removal,
+        // so the keyboard sits on this checkout, which refuses first.
+        app.press(Key::char('d'));
+        assert!(
+            app.message.contains("cannot remove the checkout"),
+            "a force leaked past its spending: {:?}",
+            app.message
+        );
+    }
+
+    #[test]
+    fn tui_parity_worktree_remove_refuses_this_checkout() {
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().worktrees = vec![worktree_row("/fake", Some("main"))];
+        let mut app = commits_app(&handle);
+        app.dispatch("worktrees.focus");
+        app.press(Key::char('d'));
+        app.press(Key::char('d'));
+        app.pump_quiet();
+        assert!(
+            app.message.contains("cannot remove the checkout"),
+            "the guard never spoke: {:?}",
+            app.message
+        );
+        assert!(
+            state.lock().unwrap().worktree_writes.is_empty(),
+            "a removal queued against this checkout"
+        );
+    }
+
+    #[test]
+    fn tui_parity_worktree_switch_opens_the_checkout() {
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().worktrees = vec![
+            worktree_row("/fake", Some("main")),
+            worktree_row("/fake-feature", Some("feature")),
+        ];
+        let mut app = commits_app(&handle);
+        app.dispatch("worktrees.focus");
+        // This checkout is already shown — the switch says so.
+        app.dispatch("worktrees.switch");
+        assert!(
+            app.message.contains("already showing"),
+            "{message:?}",
+            message = app.message
+        );
+        // Anywhere else goes through the open, which refuses what the
+        // test never handed it — naming the path, not swallowing it.
+        app.dispatch("view.down");
+        app.dispatch("worktrees.switch");
+        assert!(
+            app.message.contains("/fake-feature"),
+            "the refusal named no path: {:?}",
+            app.message
+        );
+    }
+
+    #[test]
+    fn tui_parity_worktree_read_failure_draws_unavailable() {
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().fail_worktrees = Some("git is gone".into());
+        let mut app = commits_app(&handle);
+        app.dispatch("worktrees.focus");
+        app.draw();
+        let h = app.screen.size().1;
+        let body = (0..h)
+            .map(|y| app.screen.row_text(y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(body.contains("worktrees unavailable"), "{body:?}");
+        assert_eq!(worktrees_of(&app).current(), None);
+    }
+
+    #[test]
+    fn tui_parity_checkout_refuses_a_branch_held_elsewhere() {
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        state.lock().unwrap().held_branches = vec!["feature".into()];
+        let mut app = commits_app(&handle);
+        app.press(Key::plain(Code::Char('3')));
+        // Walk to the held row: the world the helper builds names it.
+        for _ in 0..8 {
+            let target = app.branch_target();
+            if matches!(target, Some(Target::Local(_))) {
+                break;
+            }
+            app.dispatch("view.down");
+        }
+        app.dispatch("branches.checkout");
+        app.pump_quiet();
+        // Either the held row refused, or the cursor never found a local
+        // row to aim at — both are honest, but a checkout write is not.
+        let writes = branch_writes_of(&state);
+        assert!(
+            !writes.iter().any(|w| w.starts_with("checkout feature")),
+            "checked out a held branch: {writes:?}"
+        );
+    }
+
+    #[test]
+    fn tui_parity_bisect_start_judge_reset_round_trip() {
+        let (handle, state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        // Clean tree: `b` opens the start field, aimed at the row.
+        app.press(Key::char('b'));
+        assert!(matches!(app.prompt, Some(Prompt::BisectGood { .. })));
+        type_(&mut app, "v1.0");
+        app.press(Key::plain(Code::Enter));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                state.lock().unwrap().bisect.is_some()
+            }),
+            "the bisect never started"
+        );
+        app.draw();
+        assert!(
+            status(&app).contains("bisecting"),
+            "the banner never named it: {:?}",
+            status(&app)
+        );
+        // Standing: `b` opens the judgement question instead.
+        app.press(Key::char('b'));
+        assert!(
+            app.message.contains("good") && app.message.contains("bad"),
+            "the menu never listed the judgements: {:?}",
+            app.message
+        );
+        app.press(Key::char('g'));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                state
+                    .lock()
+                    .unwrap()
+                    .bisect_writes
+                    .contains(&"good ".into())
+            }),
+            "the judgement never queued: {:?}",
+            state.lock().unwrap().bisect_writes
+        );
+        // Reset ends it; the banner goes with the state.
+        app.dispatch("commits.bisect-reset");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                state.lock().unwrap().bisect.is_none()
+            }),
+            "the reset never landed"
+        );
+        app.draw();
+        assert!(
+            !status(&app).contains("bisecting"),
+            "the banner outlived the reset: {:?}",
+            status(&app)
+        );
+    }
+
+    #[test]
+    fn tui_parity_bisect_judgements_refuse_outside_a_bisection() {
+        let (handle, _state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        app.dispatch("commits.bisect-good");
+        assert!(
+            app.message.contains("no bisect is in progress"),
+            "{message:?}",
+            message = app.message
+        );
+        app.dispatch("commits.bisect-bad");
+        assert!(app.message.contains("no bisect is in progress"));
+        app.dispatch("commits.bisect-skip");
+        assert!(app.message.contains("no bisect is in progress"));
+    }
+
+    #[test]
+    fn tui_parity_bisect_verbs_are_disabled_without_a_repository() {
+        // Every one of them needs a history to bisect, so a fixture
+        // says why rather than advertising a key that cannot run.
+        let a = tui_availability(false, None, None);
+        for command in [
+            "commits.bisect-menu",
+            "commits.bisect-good",
+            "commits.bisect-bad",
+            "commits.bisect-skip",
+            "commits.bisect-reset",
+        ] {
+            match a.state(command) {
+                gitten_core::command::Usable::Disabled(why) => assert!(
+                    why.contains("fixture"),
+                    "{command}'s reason names no fixture: {why:?}"
+                ),
+                other => panic!("{command} is advertised against a fixture: {other:?}"),
+            }
+            assert!(!a.runnable(command));
+        }
+        // With a repository the menu and reset are live; the judgements
+        // wait on a standing bisect.
+        let a = tui_availability(true, None, None);
+        for command in ["commits.bisect-menu", "commits.bisect-reset"] {
+            assert_eq!(
+                a.state(command),
+                &gitten_core::command::Usable::Available,
+                "{command} should run with a repository"
+            );
+        }
+        let standing = gitten_core::bisect::BisectState {
+            current: "abc".into(),
+            original: "main".into(),
+            goods: Vec::new(),
+        };
+        let a = tui_availability(true, None, Some(&standing));
+        for command in [
+            "commits.bisect-good",
+            "commits.bisect-bad",
+            "commits.bisect-skip",
+        ] {
+            assert_eq!(
+                a.state(command),
+                &gitten_core::command::Usable::Available,
+                "{command} should run while bisecting"
+            );
+        }
     }
 
     fn branch_writes_of(state: &Arc<Mutex<FakeState>>) -> Vec<String> {
@@ -18126,9 +18918,9 @@ diff --git a/tracked.txt b/tracked.txt
         app.dispatch("tags.focus");
         app.draw();
         assert!(
-            app.screen.row_text(17).contains("tags"),
+            app.screen.row_text(16).contains("tags"),
             "the header did not follow: {:?}",
-            app.screen.row_text(17)
+            app.screen.row_text(16)
         );
         assert!(
             app.screen.row_text(0).contains("2 tags"),
@@ -18136,7 +18928,7 @@ diff --git a/tracked.txt b/tracked.txt
             app.screen.row_text(0)
         );
         assert_eq!(tags_status(&app), "1/2 · v2.0");
-        let body = (18..20)
+        let body = (17..19)
             .map(|y| app.screen.row_text(y))
             .collect::<Vec<_>>()
             .join("\n");
@@ -18415,9 +19207,9 @@ diff --git a/tracked.txt b/tracked.txt
         app.dispatch("reflog.focus");
         app.draw();
         assert!(
-            app.screen.row_text(20).contains("reflog"),
+            app.screen.row_text(19).contains("reflog"),
             "the header did not follow: {:?}",
-            app.screen.row_text(20)
+            app.screen.row_text(19)
         );
         assert!(
             app.screen.row_text(0).contains("2 entries"),
@@ -18425,7 +19217,7 @@ diff --git a/tracked.txt b/tracked.txt
             app.screen.row_text(0)
         );
         assert_eq!(reflog_status(&app), "1/2 · HEAD@{0}");
-        let body = (21..23)
+        let body = (20..22)
             .map(|y| app.screen.row_text(y))
             .collect::<Vec<_>>()
             .join("\n");

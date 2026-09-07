@@ -219,15 +219,22 @@ impl Worktrees {
     }
 
     /// Swaps in a refreshed list, keeping the keyboard on its checkout by
-    /// path. A refresh is also the worktree namespace saying things moved:
-    /// an armed removal dies here first.
+    /// path. An unforced arm dies here — a refresh is the namespace saying
+    /// things moved — but a force upgrade survives while its row does: the
+    /// upgrade is stood by a submitted removal, and the refusal that
+    /// answers it arrives on this very wave. A removal that landed drops
+    /// the row, and the arm with it, so a force is never spent twice.
     pub fn replace(&mut self, worktrees: Vec<Worktree>, here: &[u8]) {
-        self.armed = None;
+        let rows = flatten(worktrees, here);
+        self.armed = self
+            .armed
+            .take()
+            .filter(|(p, f)| *f && rows.iter().any(|r| r.path == *p));
         self.dragging = false;
         self.available = true;
         let (cursor, top) = (self.view.cursor(), self.view.top());
         let anchored = self.rows.get(cursor).map(|r| r.path.clone());
-        self.rows = flatten(worktrees, here);
+        self.rows = rows;
         self.reindex();
         self.view.scroll_to(top);
         let at = anchored
@@ -379,15 +386,14 @@ impl Worktrees {
         already
     }
 
-    /// Re-arms the standing question with the force spelling after a plain
-    /// removal came back refused — the App's half of the dirty upgrade.
-    /// A no-op unless the arm stands on this exact path without force.
+    /// Stands the force upgrade on this path after the plain removal was
+    /// submitted for it: the refusal it comes back with is what the next
+    /// press spends. Called only right after this path's unforced arm was
+    /// spent, so it sets unconditionally — the spend cleared the arm, and
+    /// a refresh or a cursor move still kills the upgrade like any arm.
     pub fn upgrade_to_force(&mut self, path: &[u8]) {
-        if self.armed.as_ref().is_some_and(|(p, f)| p == path && !f) {
-            self.armed = Some((path.to_vec(), true));
-        }
+        self.armed = Some((path.to_vec(), true));
     }
-
     // ------------------------------------------------------- copy and selection
 
     pub fn copy_text(&self) -> String {
@@ -569,8 +575,8 @@ mod tests {
             Some((b"/repo/feature".to_vec(), true)),
             "the dirty upgrade"
         );
-        assert!(!v.confirm_or_arm_remove(b"/repo/feature", true));
         assert!(v.confirm_or_arm_remove(b"/repo/feature", true));
+        assert_eq!(v.armed(), None, "spending the upgrade clears");
         v.replace(vec![wt("/repo", Some("main"), false)], b"/repo");
         assert_eq!(v.armed(), None, "a refresh disarms");
         assert_eq!(v.status(), "1/1 · /repo");
