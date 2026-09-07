@@ -7746,14 +7746,18 @@ mod tests {
     #[test]
     fn tag_records_peel_only_when_a_peel_arrived() {
         let raw = b"\
-            refs/tags/v1\0\0aa11\n\
-            refs/tags/v2\0bb22\0cc33\n";
+            refs/tags/v1\0\0aa11\0commit\0\n\
+            refs/tags/v2\0bb22\0cc33\0tag\0release two\n";
         let got = parse_tags(raw);
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].name.as_bytes(), b"v1");
         assert_eq!(got[0].commit, "aa11", "lightweight: object is commit");
+        assert!(!got[0].annotated);
+        assert_eq!(got[0].subject, None);
         assert_eq!(got[1].name.as_bytes(), b"v2");
         assert_eq!(got[1].commit, "bb22", "annotated: the peel wins");
+        assert!(got[1].annotated);
+        assert_eq!(got[1].subject.as_deref(), Some("release two"));
     }
 
     // ------------------------------------------------------------------ writes

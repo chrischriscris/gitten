@@ -59,10 +59,12 @@ use gitten_tui::diff::PatchSelection;
 use gitten_tui::files::{self, Files};
 use gitten_tui::help;
 use gitten_tui::merging;
+use gitten_tui::reflog::Reflog;
 use gitten_tui::remotes::Remotes;
 use gitten_tui::screen::{Ink, Pen, Screen};
 use gitten_tui::scrollbar::Bar;
 use gitten_tui::stashes::Stashes;
+use gitten_tui::tags::Tags;
 use gitten_tui::term::{Input, Mouse, MouseKind, Term};
 use gitten_tui::todo::Todo;
 use std::io;
@@ -355,6 +357,23 @@ enum Screens {
         label: String,
         generation: Generation,
     },
+    /// The repository's tags. No source, like the remotes tenant: a refresh
+    /// is a plain re-read of the ref namespace through the handle the app
+    /// holds, and the generation rail is the whole of its staleness story.
+    Tags {
+        view: Tags,
+        label: String,
+        generation: Generation,
+    },
+    /// Where HEAD has been, newest first. No source, like the tags tenant:
+    /// a refresh is a plain re-read of the reflog through the handle the
+    /// app holds, and the generation rail is the whole of its staleness
+    /// story.
+    Reflog {
+        view: Reflog,
+        label: String,
+        generation: Generation,
+    },
 }
 
 /// What an empty diff pane's header says instead of a sha it does not have.
@@ -441,11 +460,29 @@ enum Prompt {
         from: Vec<u8>,
         field: Field,
     },
-    /// `branches.new-tag`'s field. `at` is the raw bytes of the local branch
-    /// the tag names — a revspec git resolves, so the tag moves with the
-    /// branch — captured at open and never re-read from the pane.
+    /// `branches.new-tag`'s and `commits.new-tag`'s field. `at` is the raw
+    /// bytes of what the tag names — a branch's bytes, which move with the
+    /// branch, or a commit's sha — a revspec either way, captured at open
+    /// and never re-read from the pane.
     TagNew {
         at: Vec<u8>,
+        field: Field,
+    },
+    /// The tag name's message, opened by an accepted [`Prompt::TagNew`].
+    /// An empty accept names a lightweight tag; any text names an annotated
+    /// one carrying it. `name` and `at` ride along from the name field, so
+    /// the message answers the same tag the name named.
+    TagMessage {
+        name: String,
+        at: Vec<u8>,
+        field: Field,
+    },
+    /// `tags.push`'s field: the remote to push the selected tag to, prefilled
+    /// when the repository knows exactly one — tags track nothing, so there
+    /// is no upstream to default to. `name` is the tag's raw bytes, captured
+    /// at open like every verb's aim.
+    TagPush {
+        name: Vec<u8>,
         field: Field,
     },
     /// `branches.checkout-name`'s field: whatever it names, git aims at.
@@ -543,6 +580,8 @@ impl Prompt {
             | Prompt::BranchNew { field }
             | Prompt::BranchRename { field, .. }
             | Prompt::TagNew { field, .. }
+            | Prompt::TagMessage { field, .. }
+            | Prompt::TagPush { field, .. }
             | Prompt::BranchCheckoutName { field }
             | Prompt::BranchNewAt { field, .. }
             | Prompt::CheckoutNew { field, .. }
@@ -567,6 +606,8 @@ impl Prompt {
             | Prompt::BranchNew { field }
             | Prompt::BranchRename { field, .. }
             | Prompt::TagNew { field, .. }
+            | Prompt::TagMessage { field, .. }
+            | Prompt::TagPush { field, .. }
             | Prompt::BranchCheckoutName { field }
             | Prompt::BranchNewAt { field, .. }
             | Prompt::CheckoutNew { field, .. }
@@ -629,6 +670,8 @@ impl Prompt {
             Prompt::BranchNew { .. } => "branch: ",
             Prompt::BranchRename { .. } => "rename: ",
             Prompt::TagNew { .. } => "tag: ",
+            Prompt::TagMessage { .. } => "tag message (empty = lightweight): ",
+            Prompt::TagPush { .. } => "push tag to: ",
             Prompt::BranchCheckoutName { .. } => "checkout: ",
             Prompt::BranchNewAt { .. } => "branch: ",
             Prompt::CheckoutNew { .. } => "",
@@ -732,6 +775,8 @@ impl Screens {
             Screens::Files { .. } => "files",
             Screens::Branches { .. } => "branches",
             Screens::Remotes { .. } => "remotes",
+            Screens::Tags { .. } => "tags",
+            Screens::Reflog { .. } => "reflog",
         }
     }
 
@@ -742,7 +787,9 @@ impl Screens {
             | Screens::Merging { label, .. }
             | Screens::Stashes { label, .. }
             | Screens::Branches { label, .. }
-            | Screens::Remotes { label, .. } => label,
+            | Screens::Remotes { label, .. }
+            | Screens::Tags { label, .. }
+            | Screens::Reflog { label, .. } => label,
             Screens::Files { label, .. } => label,
         }
     }
@@ -754,7 +801,9 @@ impl Screens {
             | Screens::Merging { generation, .. }
             | Screens::Stashes { generation, .. }
             | Screens::Branches { generation, .. }
-            | Screens::Remotes { generation, .. } => *generation,
+            | Screens::Remotes { generation, .. }
+            | Screens::Tags { generation, .. }
+            | Screens::Reflog { generation, .. } => *generation,
             Screens::Files { generation, .. } => *generation,
         }
     }
@@ -997,6 +1046,58 @@ impl Screens {
                 *generation = target;
                 Some(Ok(()))
             }
+            Screens::Tags {
+                view,
+                label,
+                generation,
+            } => {
+                // The same two reads: the ref namespace, and the describe
+                // its label is spelled with.
+                let (loaded, described) = std::thread::scope(|s| {
+                    let tags = s.spawn(|| repo.tags());
+                    let described = s.spawn(|| repo.describe());
+                    (
+                        tags.join().unwrap_or_else(|p| std::panic::resume_unwind(p)),
+                        described.join().unwrap_or_default(),
+                    )
+                });
+                let loaded = match loaded {
+                    Ok(tags) => tags,
+                    Err(e) => return Some(Err(e)),
+                };
+                let count = loaded.len();
+                view.replace(loaded);
+                *label = tags_label(&described, count);
+                *generation = target;
+                Some(Ok(()))
+            }
+            Screens::Reflog {
+                view,
+                label,
+                generation,
+            } => {
+                // The same two reads: where HEAD has been, and the describe
+                // its label is spelled with.
+                let (loaded, described) = std::thread::scope(|s| {
+                    let reflog = s.spawn(|| repo.reflog(REFLOG_ENTRIES));
+                    let described = s.spawn(|| repo.describe());
+                    (
+                        reflog
+                            .join()
+                            .unwrap_or_else(|p| std::panic::resume_unwind(p)),
+                        described.join().unwrap_or_default(),
+                    )
+                });
+                let loaded = match loaded {
+                    Ok(entries) => entries,
+                    Err(e) => return Some(Err(e)),
+                };
+                let count = loaded.len();
+                view.replace(loaded);
+                *label = reflog_label(&described, count);
+                *generation = target;
+                Some(Ok(()))
+            }
         }
     }
 
@@ -1039,6 +1140,14 @@ impl Screens {
                 r.set_scrolloff(host.view.scrolloff);
                 r.resize(rect.width, rect.height);
             }
+            Screens::Tags { view: t, .. } => {
+                t.set_scrolloff(host.view.scrolloff);
+                t.resize(rect.width, rect.height);
+            }
+            Screens::Reflog { view: r, .. } => {
+                r.set_scrolloff(host.view.scrolloff);
+                r.resize(rect.width, rect.height);
+            }
         }
     }
 
@@ -1063,6 +1172,8 @@ impl Screens {
             Screens::Files { view: f, .. } => f.paint(screen, x, y, focused, host),
             Screens::Branches { view: b, .. } => b.paint(screen, x, y, focused, host),
             Screens::Remotes { view: r, .. } => r.paint(screen, x, y, focused, host),
+            Screens::Tags { view: t, .. } => t.paint(screen, x, y, focused, host),
+            Screens::Reflog { view: r, .. } => r.paint(screen, x, y, focused, host),
         }
     }
 
@@ -1075,6 +1186,8 @@ impl Screens {
             Screens::Files { view: f, .. } => f.status(),
             Screens::Branches { view: b, .. } => b.status(),
             Screens::Remotes { view: r, .. } => r.status(),
+            Screens::Tags { view: t, .. } => t.status(),
+            Screens::Reflog { view: r, .. } => r.status(),
         }
     }
 
@@ -1098,6 +1211,8 @@ impl Screens {
             Screens::Files { view: f, .. } => f.paint_bar(screen, x, divider, y, host),
             Screens::Branches { view: b, .. } => b.paint_bar(screen, x, divider, y, host),
             Screens::Remotes { view: r, .. } => r.paint_bar(screen, x, divider, y, host),
+            Screens::Tags { view: t, .. } => t.paint_bar(screen, x, divider, y, host),
+            Screens::Reflog { view: r, .. } => r.paint_bar(screen, x, divider, y, host),
         }
     }
 
@@ -1116,6 +1231,8 @@ impl Screens {
             Screens::Files { view: f, .. } => f.press(col, row, clicks, extend, host),
             Screens::Branches { view: b, .. } => b.press(col, row, extend, host),
             Screens::Remotes { view: r, .. } => r.press(col, row, extend, host),
+            Screens::Tags { view: t, .. } => t.press(col, row, extend, host),
+            Screens::Reflog { view: r, .. } => r.press(col, row, extend, host),
         }
     }
 
@@ -1129,7 +1246,11 @@ impl Screens {
             Screens::Stashes { view: s, .. } => s.drag(row, host),
             // A list with no drag selection and an indicator bar has nothing
             // a held button can do.
-            Screens::Files { .. } | Screens::Branches { .. } | Screens::Remotes { .. } => {}
+            Screens::Files { .. }
+            | Screens::Branches { .. }
+            | Screens::Remotes { .. }
+            | Screens::Tags { .. }
+            | Screens::Reflog { .. } => {}
         }
     }
 
@@ -1140,7 +1261,11 @@ impl Screens {
             Screens::Merging { view: m, .. } => m.release(),
             Screens::Stashes { view: s, .. } => s.release(),
             // Nothing held here either — see `drag`.
-            Screens::Files { .. } | Screens::Branches { .. } | Screens::Remotes { .. } => {}
+            Screens::Files { .. }
+            | Screens::Branches { .. }
+            | Screens::Remotes { .. }
+            | Screens::Tags { .. }
+            | Screens::Reflog { .. } => {}
         }
     }
 
@@ -1157,6 +1282,8 @@ impl Screens {
             Screens::Files { view: f, .. } => f.copy_text(),
             Screens::Branches { view: b, .. } => b.copy_text(),
             Screens::Remotes { view: r, .. } => r.copy_text(),
+            Screens::Tags { view: t, .. } => t.copy_text(),
+            Screens::Reflog { view: r, .. } => r.copy_text(),
         }
     }
 
@@ -1174,6 +1301,8 @@ impl Screens {
             Screens::Files { view: f, .. } => f.selection(),
             Screens::Branches { view: b, .. } => b.selection(),
             Screens::Remotes { view: r, .. } => r.selection(),
+            Screens::Tags { view: t, .. } => t.selection(),
+            Screens::Reflog { view: r, .. } => r.selection(),
         }
     }
 
@@ -1186,6 +1315,8 @@ impl Screens {
             Screens::Files { view: f, .. } => f.select_all(),
             Screens::Branches { view: b, .. } => b.select_all(),
             Screens::Remotes { view: r, .. } => r.select_all(),
+            Screens::Tags { view: t, .. } => t.select_all(),
+            Screens::Reflog { view: r, .. } => r.select_all(),
         }
     }
 
@@ -1198,6 +1329,8 @@ impl Screens {
             Screens::Files { view: f, .. } => f.select_none(),
             Screens::Branches { view: b, .. } => b.select_none(),
             Screens::Remotes { view: r, .. } => r.select_none(),
+            Screens::Tags { view: t, .. } => t.select_none(),
+            Screens::Reflog { view: r, .. } => r.select_none(),
         }
     }
 
@@ -1211,6 +1344,8 @@ impl Screens {
             Screens::Branches { view: b, .. } => b.filter_note(),
             Screens::Stashes { view: s, .. } => s.filter_note(),
             Screens::Remotes { view: r, .. } => r.filter_note(),
+            Screens::Tags { view: t, .. } => t.filter_note(),
+            Screens::Reflog { view: r, .. } => r.filter_note(),
             Screens::Diff { view: d, .. } => d.match_note(),
             // The merging view carries no standing search yet.
             Screens::Merging { .. } => None,
@@ -1227,6 +1362,8 @@ impl Screens {
             Screens::Branches { view: b, .. } => b.query().is_some(),
             Screens::Stashes { view: s, .. } => s.query().is_some(),
             Screens::Remotes { view: r, .. } => r.query().is_some(),
+            Screens::Tags { view: t, .. } => t.query().is_some(),
+            Screens::Reflog { view: r, .. } => r.query().is_some(),
             Screens::Diff { view: d, .. } => d.search_query().is_some(),
             Screens::Merging { .. } => false,
         }
@@ -1357,6 +1494,38 @@ impl Screens {
                 "view.top" => r.to_top(),
                 "view.bottom" => r.to_bottom(),
                 // Nothing off the left edge to reach: names clip rather
+                // than pan.
+                "view.left" | "view.right" => {}
+                "search.next" => r.next_match(1),
+                "search.prev" => r.next_match(-1),
+                _ => return false,
+            },
+            Screens::Tags { view: t, .. } => match command {
+                "view.down" => t.down(),
+                "view.up" => t.up(),
+                "view.page-down" => t.page(1),
+                "view.page-up" => t.page(-1),
+                "view.scroll-down" => t.scroll_y(host.view.rows as isize),
+                "view.scroll-up" => t.scroll_y(-(host.view.rows as isize)),
+                "view.top" => t.to_top(),
+                "view.bottom" => t.to_bottom(),
+                // Nothing off the left edge to reach: names clip rather
+                // than pan.
+                "view.left" | "view.right" => {}
+                "search.next" => t.next_match(1),
+                "search.prev" => t.next_match(-1),
+                _ => return false,
+            },
+            Screens::Reflog { view: r, .. } => match command {
+                "view.down" => r.down(),
+                "view.up" => r.up(),
+                "view.page-down" => r.page(1),
+                "view.page-up" => r.page(-1),
+                "view.scroll-down" => r.scroll_y(host.view.rows as isize),
+                "view.scroll-up" => r.scroll_y(-(host.view.rows as isize)),
+                "view.top" => r.to_top(),
+                "view.bottom" => r.to_bottom(),
+                // Nothing off the left edge to reach: selectors clip rather
                 // than pan.
                 "view.left" | "view.right" => {}
                 "search.next" => r.next_match(1),
@@ -1612,6 +1781,28 @@ impl App {
                 generation: Generation::default(),
             }
         });
+        // The tags pane, the same shape again: registered behind a
+        // repository in its loading shape, read by the startup wave.
+        let tags_tenant = repo.is_some().then(|| {
+            let mut view = Tags::unavailable();
+            view.set_bar(bar);
+            Screens::Tags {
+                view,
+                label: STARTUP_LOADING.to_string(),
+                generation: Generation::default(),
+            }
+        });
+        // The reflog pane, the same shape a third time: registered behind
+        // a repository in its loading shape, read by the startup wave.
+        let reflog_tenant = repo.is_some().then(|| {
+            let mut view = Reflog::unavailable();
+            view.set_bar(bar);
+            Screens::Reflog {
+                view,
+                label: STARTUP_LOADING.to_string(),
+                generation: Generation::default(),
+            }
+        });
         let mut panes = panes::Panes::new();
         let mut last_list = None;
         match started.loaded.data {
@@ -1643,6 +1834,12 @@ impl App {
                 if let Some(pane) = remotes_tenant {
                     panes.register("remotes", panes::Placement::sidebar("remotes"), pane);
                 }
+                if let Some(pane) = tags_tenant {
+                    panes.register("tags", panes::Placement::sidebar("tags"), pane);
+                }
+                if let Some(pane) = reflog_tenant {
+                    panes.register("reflog", panes::Placement::sidebar("reflog"), pane);
+                }
                 // The persistent main pane starts empty, then
                 // [`App::sync_main_diff`] below replaces it from row zero
                 // before construction returns. Keeping the honest empty shape
@@ -1671,6 +1868,12 @@ impl App {
                 }
                 if let Some(pane) = remotes_tenant {
                     panes.register("remotes", panes::Placement::sidebar("remotes"), pane);
+                }
+                if let Some(pane) = tags_tenant {
+                    panes.register("tags", panes::Placement::sidebar("tags"), pane);
+                }
+                if let Some(pane) = reflog_tenant {
+                    panes.register("reflog", panes::Placement::sidebar("reflog"), pane);
                 }
                 let mut diff = Diff::new(files, &host);
                 diff.set_bar(bar);
@@ -1847,34 +2050,44 @@ impl App {
         // window's background load carries.
         let host = self.host.clone();
 
-        let (stash_read, remotes_read, status_read, described, branch_reads, diff_read) =
-            std::thread::scope(|s| {
-                // The handle as a stable borrow the `move` spawns copy: an
-                // `Arc` would be four refcount bumps for the same answer.
-                let repo = &repo;
-                let stashes = s.spawn(move || acquire::stashes(repo.as_ref()));
-                let remotes = s.spawn(|| repo.remotes());
-                let status = s.spawn(move || repo.status());
-                let described = s.spawn(move || repo.describe());
-                let branches = s.spawn(move || load_branches(repo.as_ref()));
-                let diff = preview.as_ref().map(|commit| {
-                    let source = Source::Repo {
-                        path: path.clone(),
-                        arg: commit.sha.clone(),
-                    };
-                    s.spawn(move || {
-                        acquire::acquire(View::Diff, &source, &host, Some(repo.as_ref()))
-                    })
-                });
-                (
-                    join_read(stashes),
-                    join_read(remotes),
-                    join_read(status),
-                    join_read(described),
-                    join_read(branches),
-                    diff.map(join_read),
-                )
+        let (
+            stash_read,
+            remotes_read,
+            tags_read,
+            reflog_read,
+            status_read,
+            described,
+            branch_reads,
+            diff_read,
+        ) = std::thread::scope(|s| {
+            // The handle as a stable borrow the `move` spawns copy: an
+            // `Arc` would be four refcount bumps for the same answer.
+            let repo = &repo;
+            let stashes = s.spawn(move || acquire::stashes(repo.as_ref()));
+            let remotes = s.spawn(|| repo.remotes());
+            let tags = s.spawn(|| repo.tags());
+            let reflog = s.spawn(|| repo.reflog(REFLOG_ENTRIES));
+            let status = s.spawn(move || repo.status());
+            let described = s.spawn(move || repo.describe());
+            let branches = s.spawn(move || load_branches(repo.as_ref()));
+            let diff = preview.as_ref().map(|commit| {
+                let source = Source::Repo {
+                    path: path.clone(),
+                    arg: commit.sha.clone(),
+                };
+                s.spawn(move || acquire::acquire(View::Diff, &source, &host, Some(repo.as_ref())))
             });
+            (
+                join_read(stashes),
+                join_read(remotes),
+                join_read(tags),
+                join_read(reflog),
+                join_read(status),
+                join_read(described),
+                join_read(branches),
+                diff.map(join_read),
+            )
+        });
         clock.stage("startup reads joined");
 
         // Apply half, in place — the same `replace` calls the refresh path
@@ -1890,6 +2103,32 @@ impl App {
                     let count = remotes.len();
                     view.replace(remotes);
                     *label = remotes_label(&described, count);
+                }
+                Err(e) => {
+                    *label = "unavailable".to_string();
+                    error.get_or_insert(e);
+                }
+            }
+        }
+        if let Some(Screens::Tags { view, label, .. }) = self.panes.get_mut("tags") {
+            match tags_read {
+                Ok(tags) => {
+                    let count = tags.len();
+                    view.replace(tags);
+                    *label = tags_label(&described, count);
+                }
+                Err(e) => {
+                    *label = "unavailable".to_string();
+                    error.get_or_insert(e);
+                }
+            }
+        }
+        if let Some(Screens::Reflog { view, label, .. }) = self.panes.get_mut("reflog") {
+            match reflog_read {
+                Ok(entries) => {
+                    let count = entries.len();
+                    view.replace(entries);
+                    *label = reflog_label(&described, count);
                 }
                 Err(e) => {
                     *label = "unavailable".to_string();
@@ -2601,6 +2840,8 @@ impl App {
             Some(Screens::Branches { view, .. }) => view.query().unwrap_or_default().to_string(),
             Some(Screens::Stashes { view, .. }) => view.query().unwrap_or_default().to_string(),
             Some(Screens::Remotes { view, .. }) => view.query().unwrap_or_default().to_string(),
+            Some(Screens::Tags { view, .. }) => view.query().unwrap_or_default().to_string(),
+            Some(Screens::Reflog { view, .. }) => view.query().unwrap_or_default().to_string(),
             Some(Screens::Diff { view, .. }) => {
                 if !view.has_search_text() {
                     self.message = format!("{command}: the diff has no text to search");
@@ -3039,25 +3280,99 @@ impl App {
         });
     }
 
-    /// The accepted tag name, as a job. The text is trimmed before it is
-    /// queued, because git would hold the padding as part of the name; a
-    /// duplicate rides on to git and comes back in its words.
-    fn submit_branch_tag(&mut self, at: Vec<u8>, name: String) {
-        let name = name.trim().to_string();
-        if name.is_empty() {
+    /// The accepted tag name, as a message field: empty names are refused
+    /// beside the field that just closed, and the message the next field
+    /// returns decides annotated versus lightweight — the same chain for a
+    /// branch's bytes and a commit's sha, because both are revspecs.
+    fn begin_tag_message(&mut self, at: Vec<u8>, name: String) {
+        if name.trim().is_empty() {
             self.message = "a tag needs a name".into();
             return;
         }
-        if self.panes.get("branches").is_none() {
-            self.message = "the pane the tag was asked over is gone".into();
+        self.open_prompt(Prompt::TagMessage {
+            name,
+            at,
+            field: Field::new(),
+        });
+    }
+
+    /// `tags.new`: name a tag on HEAD — the tags pane holds no commit, so
+    /// the checked-out commit is what a bare name means. Unborn refuses:
+    /// there is no commit to name yet.
+    fn begin_tag_new(&mut self) {
+        if !self.tags_focused("tags.new") {
             return;
         }
         let Some((_, repo)) = self.repo.as_ref() else {
             self.message = "a fixture has no repository to tag in".into();
             return;
         };
-        let job = Write::create_tag(repo, name.into_bytes(), at, None);
-        self.submit(Box::new(job));
+        let at = match repo.head() {
+            Ok(gitten_core::refs::HeadState::Branch {
+                commit: Some(sha), ..
+            })
+            | Ok(gitten_core::refs::HeadState::Detached { commit: sha }) => sha.into_bytes(),
+            _ => {
+                self.message = "no commit to tag yet".into();
+                return;
+            }
+        };
+        self.open_prompt(Prompt::TagNew {
+            at,
+            field: Field::new(),
+        });
+    }
+
+    /// `commits.new-tag`: name the commit under the keyboard with a tag —
+    /// the branches pane's tagger aimed at a sha instead of a branch.
+    fn begin_commit_tag(&mut self) {
+        let Some(Screens::Commits { view, .. }) = self.panes.focused() else {
+            self.message = "commits.new-tag is not supported here".into();
+            return;
+        };
+        let Some(commit) = view.current() else {
+            self.message = "the keyboard is not on a commit".into();
+            return;
+        };
+        if self.repo.is_none() {
+            self.message = "a fixture has no repository to tag in".into();
+            return;
+        }
+        self.open_prompt(Prompt::TagNew {
+            at: commit.sha.clone().into_bytes(),
+            field: Field::new(),
+        });
+    }
+
+    /// `tags.push`: the remote rides a field, prefilled when the repository
+    /// knows exactly one — tags track nothing, so a lone remote is the
+    /// only default that cannot aim wrong.
+    fn begin_tag_push(&mut self) {
+        if !self.tags_focused("tags.push") {
+            return;
+        }
+        let Some(Screens::Tags { view, .. }) = self.panes.focused() else {
+            return;
+        };
+        let Some(name) = view.current() else {
+            self.message = "nothing selected to push".into();
+            return;
+        };
+        let Some((_, repo)) = self.repo.as_ref() else {
+            self.message = "a fixture has no repository to push from".into();
+            return;
+        };
+        let initial = match repo.remotes() {
+            Ok(remotes) if remotes.len() == 1 => remotes
+                .first()
+                .map(|r| r.name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        self.open_prompt(Prompt::TagPush {
+            name: name.as_bytes().to_vec(),
+            field: Field::with_selected(&initial),
+        });
     }
 
     /// `branches.delete`: the destructive verb of this pane, confirmed on
@@ -3088,12 +3403,81 @@ impl App {
         }
     }
 
+    /// Whether the keyboard is on the tags pane — the guard every tag verb
+    /// opens with, said the way every wrong-focus refusal here is said.
+    fn tags_focused(&mut self, command: &str) -> bool {
+        match self.panes.focused() {
+            Some(Screens::Tags { .. }) => true,
+            _ => {
+                self.message = format!("{command} is not supported here");
+                false
+            }
+        }
+    }
+
+    /// Whether the keyboard is on the reflog pane — the guard recovery
+    /// opens with, said the way every wrong-focus refusal here is said.
+    fn reflog_focused(&mut self, command: &str) -> bool {
+        match self.panes.focused() {
+            Some(Screens::Reflog { .. }) => true,
+            _ => {
+                self.message = format!("{command} is not supported here");
+                false
+            }
+        }
+    }
+
     /// The remote row the keyboard is on, as the verbs address it — the
     /// implementation behind [`act::RemoteClient`].
     fn remote_target(&self) -> Option<RefName> {
         match self.panes.focused() {
             Some(Screens::Remotes { view, .. }) => view.current(),
             _ => None,
+        }
+    }
+
+    /// The tag row the keyboard is on — the implementation behind
+    /// [`act::TagClient`].
+    fn tag_target(&self) -> Option<RefName> {
+        match self.panes.focused() {
+            Some(Screens::Tags { view, .. }) => view.current(),
+            _ => None,
+        }
+    }
+
+    /// Arms the selected tag for a confirmed deletion, or spends the arm —
+    /// the implementation behind [`act::TagClient`].
+    fn confirm_or_arm_tag(&mut self, name: &RefName) -> bool {
+        match self.panes.focused_mut() {
+            Some(Screens::Tags { view, .. }) => view.confirm_or_arm_delete(name),
+            _ => false,
+        }
+    }
+
+    /// The reflog row the keyboard is on — the implementation behind
+    /// [`act::ReflogClient`].
+    fn reflog_target(&self) -> Option<gitten_core::refs::ReflogEntry> {
+        match self.panes.focused() {
+            Some(Screens::Reflog { view, .. }) => view.current(),
+            _ => None,
+        }
+    }
+
+    /// Arms the selected reflog entry for a confirmed recovery, or spends
+    /// the arm — the implementation behind [`act::ReflogClient`]. Both
+    /// halves must match the standing arm: the selector asked over and the
+    /// commit it named, so a row that slid under the cursor cannot spend it.
+    fn confirm_or_arm_reflog(&mut self, selector: &str) -> bool {
+        // The row cannot move between the target read and this call — one
+        // press, no awaits — so a mismatch is a stale arm dying unspent.
+        match self.panes.focused_mut() {
+            Some(Screens::Reflog { view, .. }) => match view.current() {
+                Some(entry) if entry.selector == selector => {
+                    view.confirm_or_arm_recover(&entry.selector, &entry.commit)
+                }
+                _ => false,
+            },
+            _ => false,
         }
     }
 
@@ -3278,6 +3662,10 @@ impl App {
         stash.set_bar(self.bar);
         let mut remotes = Remotes::unavailable();
         remotes.set_bar(self.bar);
+        let mut tags = Tags::unavailable();
+        tags.set_bar(self.bar);
+        let mut reflog = Reflog::unavailable();
+        reflog.set_bar(self.bar);
         let mut files = Files::unavailable();
         files.set_bar(self.bar);
         let mut branches = Branches::with_marks(Vec::new(), marks);
@@ -3308,6 +3696,24 @@ impl App {
             panes::Placement::sidebar("remotes"),
             Screens::Remotes {
                 view: remotes,
+                label: STARTUP_LOADING.to_string(),
+                generation: Generation::default(),
+            },
+        );
+        panes.register(
+            "tags",
+            panes::Placement::sidebar("tags"),
+            Screens::Tags {
+                view: tags,
+                label: STARTUP_LOADING.to_string(),
+                generation: Generation::default(),
+            },
+        );
+        panes.register(
+            "reflog",
+            panes::Placement::sidebar("reflog"),
+            Screens::Reflog {
+                view: reflog,
                 label: STARTUP_LOADING.to_string(),
                 generation: Generation::default(),
             },
@@ -3520,6 +3926,8 @@ impl App {
             Some(Screens::Branches { view, .. }) => view.apply_query(query),
             Some(Screens::Stashes { view, .. }) => view.apply_query(query),
             Some(Screens::Remotes { view, .. }) => view.apply_query(query),
+            Some(Screens::Tags { view, .. }) => view.apply_query(query),
+            Some(Screens::Reflog { view, .. }) => view.apply_query(query),
             Some(Screens::Diff { view, .. }) => view.search_edit(query),
             // The merging view has no filter to apply.
             Some(Screens::Merging { .. }) => {}
@@ -3569,6 +3977,8 @@ impl App {
                     Some(Screens::Branches { view, .. }) => view.clear_search(),
                     Some(Screens::Stashes { view, .. }) => view.clear_search(),
                     Some(Screens::Remotes { view, .. }) => view.clear_search(),
+                    Some(Screens::Tags { view, .. }) => view.clear_search(),
+                    Some(Screens::Reflog { view, .. }) => view.clear_search(),
                     Some(Screens::Diff { view, .. }) => view.search_clear(),
                     Some(Screens::Merging { .. }) => {}
                     None => {}
@@ -3587,7 +3997,17 @@ impl App {
             Prompt::BranchRename { from, field } if accept => {
                 self.submit_branch_rename(from, field.take())
             }
-            Prompt::TagNew { at, field } if accept => self.submit_branch_tag(at, field.take()),
+            Prompt::TagNew { at, field } if accept => self.begin_tag_message(at, field.take()),
+            Prompt::TagMessage { name, at, field } if accept => {
+                // An empty message names a lightweight tag; any text an
+                // annotated one carrying it — the field's own contract.
+                let text = field.take();
+                let message = (!text.trim().is_empty()).then_some(text);
+                gitten_app::act::create_tag(self, name, at, message)
+            }
+            Prompt::TagPush { name, field } if accept => {
+                gitten_app::act::push_tag(self, name, field.take())
+            }
             Prompt::BranchCheckoutName { field } if accept => {
                 gitten_app::act::checkout_by_name(self, field.take())
             }
@@ -3916,7 +4336,7 @@ impl App {
             "pane.next" => self.cycle_pane(1),
             "pane.prev" => self.cycle_pane(-1),
             "status.focus" | "files.focus" | "branches.focus" | "commits.focus"
-            | "stashes.focus" | "remotes.focus" | "diff.focus" => {
+            | "stashes.focus" | "remotes.focus" | "tags.focus" | "reflog.focus" | "diff.focus" => {
                 let name = command.strip_suffix(".focus").unwrap_or(command);
                 self.focus_named(name);
             }
@@ -3955,7 +4375,9 @@ impl App {
             // modes, the rest in `input` while any prompt stands — so
             // `gitten.toml` moves them the way it moves everything else.
             "commits.search" | "files.search" | "branches.search" | "stashes.search"
-            | "remotes.search" | "diff.search" => self.begin_search(command),
+            | "remotes.search" | "tags.search" | "reflog.search" | "diff.search" => {
+                self.begin_search(command)
+            }
             "files.commit" => self.begin_commit_message(),
             "files.amend" => self.begin_amend_message(),
             // lazygit's global R, on the same wave a finished write runs:
@@ -3998,6 +4420,8 @@ impl App {
                             Screens::Branches { view, .. } => view.clear_search(),
                             Screens::Stashes { view, .. } => view.clear_search(),
                             Screens::Remotes { view, .. } => view.clear_search(),
+                            Screens::Tags { view, .. } => view.clear_search(),
+                            Screens::Reflog { view, .. } => view.clear_search(),
                             Screens::Diff { view, .. } => view.search_clear(),
                             Screens::Merging { .. } => {}
                         }
@@ -4325,6 +4749,43 @@ impl App {
                     gitten_app::act::remote_remove(self);
                 }
             }
+            // The tag verbs: the row the keyboard is on, the shared
+            // `Write` that means it. New and push open their fields on the
+            // way through; checkout and delete go straight to the action.
+            "tags.checkout" => {
+                if self.tags_focused("tags.checkout") {
+                    gitten_app::act::checkout_tag(self);
+                }
+            }
+            "tags.new" => self.begin_tag_new(),
+            "tags.delete" => {
+                if self.tags_focused("tags.delete") {
+                    gitten_app::act::delete_tag(self);
+                }
+            }
+            "tags.push" => self.begin_tag_push(),
+            // The reflog's one verb: the entry the keyboard is on, put
+            // back, behind the question that previews the move.
+            "reflog.recover" => {
+                if self.reflog_focused("reflog.recover") {
+                    gitten_app::act::recover_reflog(self);
+                }
+            }
+            // History's own pair, global because history is not a pane's:
+            // the standing operation and the fixture refusals are the
+            // shared actions', said where they are decided.
+            "history.undo" => gitten_app::act::undo_last(self),
+            "history.redo" => gitten_app::act::redo_last(self),
+            // A remote-tracking row's source, deleted on its remote — the
+            // local branch survives, and the question says so twice.
+            "branches.delete-remote" => {
+                if self.branches_focused("branches.delete-remote") {
+                    gitten_app::act::delete_remote_branch(self);
+                }
+            }
+            // Tagging the commit under the keyboard: the branches pane's
+            // tagger, aimed at a sha.
+            "commits.new-tag" => self.begin_commit_tag(),
             // A branch grown from the commit the keyboard is on: the sha is
             // captured when the field opens, and the checkout is offered as
             // a question once the branch exists.
@@ -5949,6 +6410,35 @@ fn tui_availability(repo: bool, operation: Option<&Operation>) -> Availability {
         "remotes.edit",
         "remotes.remove",
         "remotes.search",
+        "tags.focus",
+        "tags.checkout",
+        "tags.new",
+        "tags.delete",
+        "tags.push",
+        "tags.search",
+        "reflog.focus",
+        "reflog.recover",
+        "reflog.search",
+        "history.undo",
+        "history.redo",
+        "branches.delete-remote",
+        "commits.new-tag",
+        // Tags, reflog and history: rows, the shared actions, the queue.
+        // The wrong-selection refusals are dispatch's, exactly like the
+        // remotes verbs beside them.
+        "tags.focus",
+        "tags.checkout",
+        "tags.new",
+        "tags.delete",
+        "tags.push",
+        "tags.search",
+        "reflog.focus",
+        "reflog.recover",
+        "reflog.search",
+        "history.undo",
+        "history.redo",
+        "branches.delete-remote",
+        "commits.new-tag",
         // A merge aims at the branch row the keyboard is on; the four
         // conflict answers aim at the conflict row. Both are live whenever
         // a repository is; the wrong-selection refusals are dispatch's.
@@ -6381,6 +6871,30 @@ impl gitten_app::act::RemoteClient for App {
     }
 }
 
+impl gitten_app::act::TagClient for App {
+    fn tag_target(&self) -> Option<RefName> {
+        self.tag_target()
+    }
+
+    fn confirm_or_arm_tag(&mut self, name: &RefName) -> bool {
+        self.confirm_or_arm_tag(name)
+    }
+}
+
+impl gitten_app::act::ReflogClient for App {
+    fn reflog_target(&self) -> Option<gitten_core::refs::ReflogEntry> {
+        self.reflog_target()
+    }
+
+    fn confirm_or_arm_reflog(&mut self, selector: &str) -> bool {
+        self.confirm_or_arm_reflog(selector)
+    }
+
+    fn head_state(&self) -> Option<gitten_core::refs::HeadState> {
+        self.repo.as_ref().and_then(|(_, repo)| repo.head().ok())
+    }
+}
+
 impl gitten_app::act::HistoryClient for App {
     fn commit_target(&self) -> Option<gitten_app::act::SelectedCommit> {
         let Some(Screens::Commits { view, .. }) = self.panes.focused() else {
@@ -6604,6 +7118,29 @@ fn remotes_label(describe: &str, count: usize) -> String {
     let word = match count {
         1 => "remote",
         _ => "remotes",
+    };
+    format!("{describe} · {count} {word}")
+}
+
+/// How many reflog entries the reflog pane reads: enough history to browse
+/// and to recover from, bounded so a years-old repository does not flatten
+/// ten thousand rows on every refresh.
+const REFLOG_ENTRIES: usize = 500;
+
+/// The tags pane's header label: what repository, how many tags.
+fn tags_label(describe: &str, count: usize) -> String {
+    let word = match count {
+        1 => "tag",
+        _ => "tags",
+    };
+    format!("{describe} · {count} {word}")
+}
+
+/// The reflog pane's header label: what repository, how many entries read.
+fn reflog_label(describe: &str, count: usize) -> String {
+    let word = match count {
+        1 => "entry",
+        _ => "entries",
     };
     format!("{describe} · {count} {word}")
 }
@@ -7542,7 +8079,9 @@ mod staging {
     use super::*;
     use gitten_core::command::Code;
     use gitten_core::parse_unified_diff;
-    use gitten_core::refs::{Branch, HeadState, RefName, RemoteBranch, Stash, StashId};
+    use gitten_core::refs::{
+        Branch, HeadState, RefName, ReflogEntry, RemoteBranch, Stash, StashId, Tag,
+    };
     use gitten_core::status::{
         Change, ConflictEntry, ConflictKind, Kind, PathBytes, StagedEntry, Status, Submodule,
         UnstagedEntry, UntrackedEntry,
@@ -7677,6 +8216,23 @@ diff --git a/tracked.txt b/tracked.txt
         branch_reads: usize,
         remote_reads: usize,
         head_reads: usize,
+        /// The tags the ancillary read answers, and how many times it was
+        /// read. Writes record the name they aimed at and, when they land,
+        /// change what the next read answers — which is what lets a test
+        /// observe a refresh reading the namespace after a deletion.
+        tags: Vec<Tag>,
+        tag_reads: usize,
+        /// When set, the next tag *read* fails with exactly this message —
+        /// the ancillary read that happens at `App::new`, so a test can
+        /// launch into the failed tenant rather than only probing it.
+        fail_tags: Option<String>,
+        /// Where HEAD has been, newest first, and how many times it was
+        /// read. Recovery and undo tests set it directly; the next read
+        /// sees the history they built.
+        reflog: Vec<ReflogEntry>,
+        reflog_reads: usize,
+        /// When set, the next reflog read fails with exactly this message.
+        fail_reflog: Option<String>,
         /// Every branch or tag write that reached the repository — as the
         /// person-readable line a test asserts against, and as the raw bytes
         /// the lossy line cannot carry. Tags keep their name/target pair,
@@ -8253,6 +8809,58 @@ diff --git a/tracked.txt b/tracked.txt
                 message.map(|m| format!(" ({m})")).unwrap_or_default()
             ));
             s.tags_written.push((name.to_vec(), target.to_vec()));
+            // A tag the next read answers: creating names it, so a refresh
+            // after the write draws the row the job just made.
+            if !s.tags.iter().any(|t| t.name.as_bytes() == name) {
+                s.tags.push(Tag {
+                    name: RefName::from_bytes(name),
+                    commit: String::from_utf8_lossy(target).into_owned(),
+                    annotated: message.is_some(),
+                    subject: message.map(|m| m.lines().next().unwrap_or_default().to_string()),
+                });
+            }
+            Ok(())
+        }
+
+        fn delete_tag(&self, name: &[u8]) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            s.branch_writes
+                .push(format!("untag {}", String::from_utf8_lossy(name)));
+            s.branch_bytes.push(name.to_vec());
+            s.tags.retain(|t| t.name.as_bytes() != name);
+            Ok(())
+        }
+
+        fn push_tag(&self, remote: &[u8], name: &[u8]) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            s.branch_writes.push(format!(
+                "push tag {} to {}",
+                String::from_utf8_lossy(name),
+                String::from_utf8_lossy(remote)
+            ));
+            Ok(())
+        }
+
+        fn delete_remote_branch(&self, remote: &[u8], branch: &[u8]) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            s.branch_writes.push(format!(
+                "delete {}/{} on {}",
+                String::from_utf8_lossy(remote),
+                String::from_utf8_lossy(branch),
+                String::from_utf8_lossy(remote)
+            ));
+            s.remotes
+                .retain(|b| !(b.remote.as_bytes() == remote && b.branch.as_bytes() == branch));
+            Ok(())
+        }
+
+        fn move_head(&self, target: &[u8], message: &str) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            s.branch_writes.push(format!(
+                "move HEAD to {} ({})",
+                String::from_utf8_lossy(target),
+                message
+            ));
             Ok(())
         }
 
@@ -8417,6 +9025,24 @@ diff --git a/tracked.txt b/tracked.txt
         }
 
         // ------------------------------------------------------ the sync
+
+        fn tags(&self) -> gitten_git::Result<Vec<Tag>> {
+            let mut s = self.0.lock().unwrap();
+            s.tag_reads += 1;
+            if let Some(e) = s.fail_tags.clone() {
+                return Err(e);
+            }
+            Ok(s.tags.clone())
+        }
+
+        fn reflog(&self, limit: usize) -> gitten_git::Result<Vec<ReflogEntry>> {
+            let mut s = self.0.lock().unwrap();
+            s.reflog_reads += 1;
+            if let Some(e) = s.fail_reflog.clone() {
+                return Err(e);
+            }
+            Ok(s.reflog.iter().take(limit).cloned().collect())
+        }
 
         fn remotes(&self) -> gitten_git::Result<Vec<gitten_core::refs::Remote>> {
             // A config read, not a network verb: `git remote -v` never
@@ -9210,7 +9836,7 @@ diff --git a/tracked.txt b/tracked.txt
             app.screen.row_text(3)
         );
 
-        // Wide: the five sidebar lists split the sidebar into canonical
+        // Wide: the seven sidebar lists split the sidebar into canonical
         // equal slices beside the diff, and no row crosses the divider
         // column.
         app.screen.resize(120, 24);
@@ -9221,10 +9847,10 @@ diff --git a/tracked.txt b/tracked.txt
         assert_eq!((files_rect.x, files_rect.width), (0, 40));
         assert_eq!((commits_rect.x, commits_rect.width), (0, 40));
         assert_eq!(files_rect.y, 1);
-        assert_eq!(commits_rect.y, files_rect.y + files_rect.height + 5);
-        // Five slices over the sidebar: the odd rows go to the first two.
-        assert_eq!(files_rect.height, 5, "the first slice takes the remainder");
-        assert_eq!(commits_rect.height, 4, "unequal slices");
+        assert_eq!(commits_rect.y, files_rect.y + files_rect.height + 3);
+        // Seven slices over the sidebar: the odd rows go to the first.
+        assert_eq!(files_rect.height, 4, "the first slice takes the remainder");
+        assert_eq!(commits_rect.height, 3, "unequal slices");
         assert_eq!((diff_rect.x, diff_rect.width), (41, 79));
         for y in 1..24 {
             assert_eq!(
@@ -9287,13 +9913,14 @@ diff --git a/tracked.txt b/tracked.txt
             "the launch focus was not restored"
         );
         assert!(app.panes.get("files").is_some(), "no files tenant");
-        assert_eq!(app.panes.names().count(), 6);
+        assert_eq!(app.panes.names().count(), 8);
         // The sidebar's canonical order: files (rank 1), branches (rank 2),
-        // commits (rank 3), stashes (rank 4) — with nothing in panes.rs the
-        // wiser.
+        // commits (rank 3), stashes (rank 4) — then the unranked tail in
+        // registration order, remotes before tags before reflog, with
+        // nothing in panes.rs the wiser.
         assert_eq!(
             app.panes.list_order(),
-            ["files", "branches", "commits", "stashes", "remotes"]
+            ["files", "branches", "commits", "stashes", "remotes", "tags", "reflog",]
         );
 
         // `2` is the shared files.focus binding, and it now lands.
@@ -9745,8 +10372,12 @@ diff --git a/tracked.txt b/tracked.txt
         onto_work(&mut app);
         let armed_row = files_of(&app).cursor();
         app.dispatch("files.discard");
-        app.mouse(click(MouseKind::Down, 5, 2 + armed_row));
-        app.mouse(click(MouseKind::Up, 5, 2 + armed_row));
+        // The screen row is the content start (past the header) plus the
+        // row's visible offset — the pane scrolls, so the cursor minus the
+        // top, not the cursor alone.
+        let row = 2 + armed_row - files_of(&app).top();
+        app.mouse(click(MouseKind::Down, 5, row));
+        app.mouse(click(MouseKind::Up, 5, row));
         let written = state.lock().unwrap().writes.len();
         app.dispatch("files.discard");
         assert!(
@@ -10046,7 +10677,7 @@ diff --git a/tracked.txt b/tracked.txt
         ));
         app.press(Key::plain(Code::Enter));
         assert_eq!(app.panes.focused_name(), "diff");
-        assert_eq!(app.panes.names().count(), 6, "enter appended a pane");
+        assert_eq!(app.panes.names().count(), 8, "enter appended a pane");
         assert_eq!(state.lock().unwrap().pairs_reads, open_reads);
         // The commits pane stays resident, its cursor where it was.
         assert_eq!(commits_of(&app).cursor(), 0);
@@ -10095,7 +10726,7 @@ diff --git a/tracked.txt b/tracked.txt
         app.press(Key::plain(Code::Enter));
         assert_eq!(
             app.panes.names().count(),
-            6,
+            8,
             "a second enter appended a pane"
         );
         assert_eq!(app.panes.focused_name(), "diff");
@@ -10534,15 +11165,15 @@ diff --git a/tracked.txt b/tracked.txt
         app.draw();
 
         // Down in the commits rectangle presses it, in its own coordinates.
-        // The sidebar splits five ways now, so the commits slice is the
-        // third of them (its content rows are 12–14): local row 2 is two
-        // content rows down.
-        app.mouse(click(MouseKind::Down, 5, 14));
+        // The sidebar splits seven ways now, so the commits slice is the
+        // third of them (its content rows are 9–10): local row 1 is one
+        // content row down.
+        app.mouse(click(MouseKind::Down, 5, 10));
         app.pump_quiet();
         assert_eq!(app.panes.focused_name(), "commits");
         assert_eq!(
             commits_of(&app).cursor(),
-            2,
+            1,
             "the press did not translate to pane-local rows"
         );
 
@@ -10585,13 +11216,13 @@ diff --git a/tracked.txt b/tracked.txt
         // (The commits slice is the middle of the sidebar now.)
         app.dispatch("commits.focus");
         let reads = state.lock().unwrap().pairs_reads;
-        app.mouse(click(MouseKind::Down, 10, 13));
-        app.mouse(click(MouseKind::Up, 10, 13));
+        app.mouse(click(MouseKind::Down, 10, 9));
+        app.mouse(click(MouseKind::Up, 10, 9));
         // The click's own preview is on the lane; let it land before the
         // second press, so the double click meets a shown commit and
         // deduplicates — the count below is the click's read, not the open's.
         app.pump_quiet();
-        app.mouse(click(MouseKind::Down, 10, 13));
+        app.mouse(click(MouseKind::Down, 10, 9));
         app.pump_quiet();
         assert_eq!(
             app.panes.focused_name(),
@@ -10634,10 +11265,10 @@ diff --git a/tracked.txt b/tracked.txt
 
         // A drag in the commits pane: the Up queues exactly its selection,
         // once, and the feedback counts lines. The commits slice is the
-        // middle of the sidebar now, its content rows 12–14.
-        app.mouse(click(MouseKind::Down, 5, 13));
-        app.mouse(click(MouseKind::Drag, 5, 14));
-        app.mouse(click(MouseKind::Up, 5, 14));
+        // third of the sidebar now, its content rows 9–10.
+        app.mouse(click(MouseKind::Down, 5, 9));
+        app.mouse(click(MouseKind::Drag, 5, 10));
+        app.mouse(click(MouseKind::Up, 5, 10));
         let commits_text = commits_of(&app).selection();
         assert!(
             !commits_text.is_empty(),
@@ -10894,7 +11525,7 @@ diff --git a/tracked.txt b/tracked.txt
         // The read is on the preview lane now; the install is what the next
         // dispatch deduplicates against, so give it its turn.
         app.pump_quiet();
-        assert_eq!(app.panes.names().count(), 6, "open-diff appended a pane");
+        assert_eq!(app.panes.names().count(), 8, "open-diff appended a pane");
         assert!(matches!(app.panes.get("diff"), Some(Screens::Diff { .. })));
         app.dispatch("commits.focus");
         assert_eq!(app.panes.focused_name(), "commits");
@@ -11345,17 +11976,17 @@ diff --git a/tracked.txt b/tracked.txt
         let names: Vec<&str> = app.panes.names().collect();
         assert_eq!(
             app.panes.names().collect::<Vec<_>>(),
-            ["commits", "stashes", "remotes", "diff", "files", "branches"],
+            ["commits", "stashes", "remotes", "tags", "reflog", "diff", "files", "branches"],
             "{names:?}"
         );
         assert_eq!(app.panes.focused_name(), "commits");
         assert_eq!(
             app.panes.list_order(),
-            ["files", "branches", "commits", "stashes", "remotes"]
+            ["files", "branches", "commits", "stashes", "remotes", "tags", "reflog",]
         );
         assert_eq!(
             app.panes.reading_order(),
-            ["files", "branches", "commits", "stashes", "remotes", "diff"]
+            ["files", "branches", "commits", "stashes", "remotes", "tags", "reflog", "diff"]
         );
 
         // `5` reaches it — through the keymap, and the mode follows the
@@ -11382,7 +12013,7 @@ diff --git a/tracked.txt b/tracked.txt
         let diff_app = app_on_fake(&source, &handle);
         assert_eq!(
             diff_app.panes.names().collect::<Vec<_>>(),
-            ["stashes", "remotes", "diff", "files", "branches"]
+            ["stashes", "remotes", "tags", "reflog", "diff", "files", "branches"]
         );
         assert_eq!(diff_app.panes.focused_name(), "diff");
 
@@ -11407,27 +12038,27 @@ diff --git a/tracked.txt b/tracked.txt
         let mut app = commits_app(&handle);
         app.draw();
 
-        // Wide: the sidebar splits into five canonical slices — files on
-        // top, branches under it, commits next, the stack, the remotes at
-        // the foot — and the diff takes the rest, one divider column
-        // between. No geometry module changed to make room: this is the
-        // registry's equal-slice answer to the tenants there are.
+        // Wide: the sidebar splits into seven canonical slices — files on
+        // top, branches under it, commits next, the stack, the remotes, the
+        // tags, the reflog at the foot — and the diff takes the rest, one
+        // divider column between. No geometry module changed to make room:
+        // this is the registry's equal-slice answer to the tenants there are.
         assert_eq!(
             app.pane_rect("commits"),
             Some(crate::panes::Rect {
                 x: 0,
-                y: 11,
+                y: 8,
                 width: 40,
-                height: 4
+                height: 3
             })
         );
         assert_eq!(
             app.pane_rect("stashes"),
             Some(crate::panes::Rect {
                 x: 0,
-                y: 15,
+                y: 11,
                 width: 40,
-                height: 4
+                height: 3
             })
         );
         assert_eq!(
@@ -11443,12 +12074,12 @@ diff --git a/tracked.txt b/tracked.txt
         // Headers name the live configured focus keys — 4 and 5, straight
         // out of the shipped map — and the stack says whose repository it
         // is and how much is parked.
-        let commits_header = app.screen.row_text(11).chars().take(40).collect::<String>();
+        let commits_header = app.screen.row_text(8).chars().take(40).collect::<String>();
         assert!(
             commits_header.contains('4') && commits_header.contains("commits"),
             "{commits_header:?}"
         );
-        let stashes_header = app.screen.row_text(15);
+        let stashes_header = app.screen.row_text(11);
         assert!(stashes_header.contains('5'), "{stashes_header:?}");
         assert!(stashes_header.contains("stashes"), "{stashes_header:?}");
         assert!(
@@ -11466,7 +12097,7 @@ diff --git a/tracked.txt b/tracked.txt
         }
 
         // And the stack itself drew: both rows, address first.
-        let rows: Vec<String> = (16..19).map(|y| app.screen.row_text(y)).collect();
+        let rows: Vec<String> = (12..14).map(|y| app.screen.row_text(y)).collect();
         assert!(rows.iter().any(|r| r.contains("stash@{0}")), "{rows:?}");
         assert!(rows.iter().any(|r| r.contains("stash@{1}")), "{rows:?}");
 
@@ -11518,12 +12149,25 @@ diff --git a/tracked.txt b/tracked.txt
             "the cycle did not reach the second list"
         );
         // The remotes list sits between the stack and the foot now; the
-        // wrap takes one more step.
+        // tags and the reflog sit behind it, and the wrap takes three more
+        // steps.
         app.dispatch("pane.next");
         assert_eq!(
             app.panes.focused_name(),
             "remotes",
             "the cycle did not reach the new list"
+        );
+        app.dispatch("pane.next");
+        assert_eq!(
+            app.panes.focused_name(),
+            "tags",
+            "the cycle did not reach the tags"
+        );
+        app.dispatch("pane.next");
+        assert_eq!(
+            app.panes.focused_name(),
+            "reflog",
+            "the cycle did not reach the reflog"
         );
         app.dispatch("pane.next");
         assert_eq!(app.panes.focused_name(), "files", "the cycle did not wrap");
@@ -11536,7 +12180,7 @@ diff --git a/tracked.txt b/tracked.txt
             app.screen.row_text(0)
         );
         assert!(
-            app.screen.row_text(15).contains('5') && app.screen.row_text(15).contains("stashes"),
+            app.screen.row_text(11).contains('5') && app.screen.row_text(11).contains("stashes"),
             "the header did not advertise the stack: {:?}",
             app.screen.row_text(15)
         );
@@ -11590,25 +12234,26 @@ diff --git a/tracked.txt b/tracked.txt
         // release reads that pane; a press in the stack's slice moves the
         // keyboard there, and a drag inside the stack builds no selection —
         // a stack is acted on one entry at a time. The commits slice is the
-        // third of the sidebar's five; the stack the fourth.
+        // third of the sidebar's seven (rows 8–10); the stack the fourth
+        // (rows 11–13).
         app.dispatch("commits.focus");
-        app.mouse(click(MouseKind::Down, 5, 13));
-        app.mouse(click(MouseKind::Drag, 5, 14));
-        app.mouse(click(MouseKind::Up, 5, 14));
+        app.mouse(click(MouseKind::Down, 5, 9));
+        app.mouse(click(MouseKind::Drag, 5, 10));
+        app.mouse(click(MouseKind::Up, 5, 10));
         assert!(
             !commits_of(&app).selection().is_empty(),
             "the drag in the list selected nothing"
         );
-        app.mouse(click(MouseKind::Down, 5, 17));
+        app.mouse(click(MouseKind::Down, 5, 12));
         assert_eq!(
             app.panes.focused_name(),
             "stashes",
             "the press did not move the keyboard to the stack"
         );
-        app.mouse(click(MouseKind::Up, 5, 17));
-        app.mouse(click(MouseKind::Down, 5, 17));
-        app.mouse(click(MouseKind::Drag, 5, 18));
-        app.mouse(click(MouseKind::Up, 5, 18));
+        app.mouse(click(MouseKind::Up, 5, 12));
+        app.mouse(click(MouseKind::Down, 5, 12));
+        app.mouse(click(MouseKind::Drag, 5, 13));
+        app.mouse(click(MouseKind::Up, 5, 13));
         assert_eq!(
             app.panes.get("stashes").map(|pane| pane.selection()),
             Some(String::new()),
@@ -12022,7 +12667,7 @@ diff --git a/tracked.txt b/tracked.txt
         // the exact error kept for the status line.
         assert_eq!(
             app.panes.names().collect::<Vec<_>>(),
-            ["commits", "stashes", "remotes", "diff", "files", "branches"]
+            ["commits", "stashes", "remotes", "tags", "reflog", "diff", "files", "branches"]
         );
         assert_eq!(app.panes.focused_name(), "commits");
         assert_eq!(app.message, "fatal: bad object refs/stash");
@@ -12039,11 +12684,11 @@ diff --git a/tracked.txt b/tracked.txt
         // line, never the empty-stack line that would assert a read that
         // never succeeded, and no row for a verb to address.
         assert!(
-            app.screen.row_text(15).contains("unavailable"),
+            app.screen.row_text(11).contains("unavailable"),
             "the header did not say so: {:?}",
             app.screen.row_text(15)
         );
-        let rows: Vec<String> = (16..19).map(|y| app.screen.row_text(y)).collect();
+        let rows: Vec<String> = (12..14).map(|y| app.screen.row_text(y)).collect();
         assert!(
             rows.iter().any(|r| r.contains("stash list unavailable")),
             "{rows:?}"
@@ -12075,11 +12720,11 @@ diff --git a/tracked.txt b/tracked.txt
         );
         app.draw();
         assert!(
-            app.screen.row_text(15).contains("fake (main) · 2 parked"),
+            app.screen.row_text(11).contains("fake (main) · 2 parked"),
             "the header did not recover: {:?}",
             app.screen.row_text(15)
         );
-        let rows: Vec<String> = (16..19).map(|y| app.screen.row_text(y)).collect();
+        let rows: Vec<String> = (12..14).map(|y| app.screen.row_text(y)).collect();
         assert!(rows.iter().any(|r| r.contains("stash@{0}")), "{rows:?}");
         assert!(
             !app.screen.row_text(23).contains("fatal:"),
@@ -12136,17 +12781,17 @@ diff --git a/tracked.txt b/tracked.txt
         let names: Vec<&str> = app.panes.names().collect();
         assert_eq!(
             app.panes.names().collect::<Vec<_>>(),
-            ["commits", "stashes", "remotes", "diff", "files", "branches"],
+            ["commits", "stashes", "remotes", "tags", "reflog", "diff", "files", "branches"],
             "{names:?}"
         );
         assert_eq!(app.panes.focused_name(), "commits");
         assert_eq!(
             app.panes.list_order(),
-            ["files", "branches", "commits", "stashes", "remotes"]
+            ["files", "branches", "commits", "stashes", "remotes", "tags", "reflog",]
         );
         assert_eq!(
             app.panes.reading_order(),
-            ["files", "branches", "commits", "stashes", "remotes", "diff"]
+            ["files", "branches", "commits", "stashes", "remotes", "tags", "reflog", "diff"]
         );
 
         // `3` reaches it — through the keymap — and the keyboard's modes
@@ -12195,7 +12840,7 @@ diff --git a/tracked.txt b/tracked.txt
         let mut app = app_on_fake(&source, &handle);
         assert_eq!(
             app.panes.names().collect::<Vec<_>>(),
-            ["stashes", "remotes", "diff", "files", "branches"]
+            ["stashes", "remotes", "tags", "reflog", "diff", "files", "branches"]
         );
         assert_eq!(app.panes.focused_name(), "diff");
 
@@ -12223,9 +12868,9 @@ diff --git a/tracked.txt b/tracked.txt
         );
 
         // Wide: branches and diff occupy the foundation's disjoint
-        // rectangles — the sidebar's foot slice and the main region. No
+        // rectangles — the sidebar's second slice and the main region. No
         // layout branch learned the name; this is the registry's own answer
-        // to a third sidebar list.
+        // to a sixth sidebar list.
         app.screen.resize(96, 24);
         app.draw();
         let branches = app.pane_rect("branches").expect("branches is placed wide");
@@ -12234,9 +12879,9 @@ diff --git a/tracked.txt b/tracked.txt
             branches,
             crate::panes::Rect {
                 x: 0,
-                y: 7,
+                y: 5,
                 width: 40,
-                height: 6
+                height: 4
             }
         );
         assert_eq!(
@@ -12279,7 +12924,7 @@ diff --git a/tracked.txt b/tracked.txt
         let mut app = commits_app(&handle);
         assert_eq!(
             app.panes.names().collect::<Vec<_>>(),
-            ["commits", "stashes", "remotes", "diff", "files", "branches"]
+            ["commits", "stashes", "remotes", "tags", "reflog", "diff", "files", "branches"]
         );
         assert_eq!(
             app.panes.focused_name(),
@@ -12750,6 +13395,10 @@ diff --git a/tracked.txt b/tracked.txt
         assert!(status(&app).contains("tag: "), "{:?}", status(&app));
         type_(&mut app, "v1");
         app.press(Key::plain(Code::Enter));
+        // The name opens the message field: empty names an annotated tag
+        // carrying nothing — a lightweight one — and any text annotates.
+        assert!(matches!(app.prompt, Some(Prompt::TagMessage { .. })));
+        app.press(Key::plain(Code::Enter));
         assert!(
             until(Duration::from_secs(2), || {
                 app.pump_quiet();
@@ -12774,6 +13423,8 @@ diff --git a/tracked.txt b/tracked.txt
         app.press(Key::char('T'));
         type_(&mut app, "  v2  ");
         app.press(Key::plain(Code::Enter));
+        assert!(matches!(app.prompt, Some(Prompt::TagMessage { .. })));
+        app.press(Key::plain(Code::Enter));
         assert!(
             until(Duration::from_secs(2), || {
                 app.pump_quiet();
@@ -12790,6 +13441,8 @@ diff --git a/tracked.txt b/tracked.txt
         state.lock().unwrap().refuse_tag = Some("fatal: tag 'v2' already exists".into());
         app.press(Key::char('T'));
         type_(&mut app, "v2");
+        app.press(Key::plain(Code::Enter));
+        assert!(matches!(app.prompt, Some(Prompt::TagMessage { .. })));
         app.press(Key::plain(Code::Enter));
         let gen = app.generation;
         assert!(
@@ -13055,33 +13708,46 @@ diff --git a/tracked.txt b/tracked.txt
         // The mouse moves the question only by moving the keyboard: a press
         // on the armed row leaves it standing — that row is still what the
         // second press would confirm — and a press on another row clears it.
+        // The feature branch died mid-test, so the rows are heading, main,
+        // heading, two remotes: local row 1 is the armed main, local row 3
+        // the first remote. A taller frame fits both without scrolling —
+        // every scroll disarms first, which would prove nothing here.
+        app.screen.resize(120, 40);
+        app.draw();
+        let rect = app.pane_rect("branches").expect("branches placed");
         app.dispatch("view.top");
         app.press(Key::char('d'));
-        app.mouse(click(MouseKind::Down, 2, 8));
-        app.mouse(click(MouseKind::Up, 2, 8));
+        app.mouse(click(MouseKind::Down, 2, rect.y + 2));
+        app.mouse(click(MouseKind::Up, 2, rect.y + 2));
         assert!(
             branches_of(&app).armed_row().is_some(),
             "the arm died on its own row"
         );
-        app.mouse(click(MouseKind::Down, 2, 9));
-        app.mouse(click(MouseKind::Up, 2, 9));
+        app.mouse(click(MouseKind::Down, 2, rect.y + 4));
+        app.mouse(click(MouseKind::Up, 2, rect.y + 4));
         assert_eq!(
             branches_of(&app).armed_row(),
             None,
             "the arm survived a mouse move to another row"
         );
 
-        // A remote row refuses outright: a tracking ref is the remote's
-        // shadow, and this key is not fetch's prune.
+        // A remote row under the same key asks the remote question: the
+        // keyboard is on the first remote from the mouse block above, and
+        // one key routes by row — local rows delete locally, remote rows
+        // delete on the remote.
         app.press(Key::char('d'));
-        assert_eq!(
-            app.message,
-            "a remote branch is its remote's to delete — fetch prunes it here"
+        assert!(
+            app.message.contains("origin/feat/ure") && app.message.contains("press again"),
+            "the remote question did not name both halves: {:?}",
+            app.message
         );
-        assert_eq!(
-            state.lock().unwrap().branch_writes.len(),
-            1,
-            "a remote deletion queued"
+        app.press(Key::char('d'));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                state.lock().unwrap().branch_writes.len() == 2
+            }),
+            "a remote deletion never queued"
         );
 
         // Focus round-trips keep the question: the window's own contract,
@@ -13131,7 +13797,11 @@ diff --git a/tracked.txt b/tracked.txt
         );
         assert_eq!(
             state.lock().unwrap().branch_writes,
-            ["delete branch f\u{fffd}ature", "delete branch main"]
+            [
+                "delete branch f\u{fffd}ature",
+                "delete origin/feat/ure on origin",
+                "delete branch main"
+            ]
         );
         assert_eq!(
             branches_of(&app).armed_row(),
@@ -13222,6 +13892,9 @@ diff --git a/tracked.txt b/tracked.txt
                     app.dispatch("view.down");
                     app.press(Key::char('T'));
                     type_(&mut app, "v1");
+                    app.press(Key::plain(Code::Enter));
+                    // The name opens the message field; empty names a
+                    // lightweight tag and queues the write.
                     app.press(Key::plain(Code::Enter));
                 }
             }
@@ -13317,7 +13990,9 @@ diff --git a/tracked.txt b/tracked.txt
             }),
             "the hidden tenant was not refreshed"
         );
-        for name in ["commits", "stashes", "remotes", "diff", "files", "branches"] {
+        for name in [
+            "commits", "stashes", "remotes", "tags", "reflog", "diff", "files", "branches",
+        ] {
             assert_eq!(
                 app.panes.get(name).unwrap().generation(),
                 app.generation,
@@ -13553,7 +14228,7 @@ diff --git a/tracked.txt b/tracked.txt
             app.screen.row_text(0)
         );
         assert!(
-            app.screen.row_text(6).contains('3') && app.screen.row_text(6).contains("branches"),
+            app.screen.row_text(5).contains('3') && app.screen.row_text(5).contains("branches"),
             "the header did not advertise the pane: {:?}",
             app.screen.row_text(6)
         );
@@ -13604,25 +14279,26 @@ diff --git a/tracked.txt b/tracked.txt
         // Mouse capture: a drag in the commit list selects its rows and its
         // release reads that pane; a press in the branches slice moves the
         // keyboard there, and a drag inside it builds no selection — a ref
-        // list is acted on one row at a time.
+        // list is acted on one row at a time. The commits slice is rows
+        // 8–10; the branches slice rows 5–7.
         app.dispatch("commits.focus");
-        app.mouse(click(MouseKind::Down, 5, 13));
-        app.mouse(click(MouseKind::Drag, 5, 14));
-        app.mouse(click(MouseKind::Up, 5, 14));
+        app.mouse(click(MouseKind::Down, 5, 9));
+        app.mouse(click(MouseKind::Drag, 5, 10));
+        app.mouse(click(MouseKind::Up, 5, 10));
         assert!(
             !commits_of(&app).selection().is_empty(),
             "the drag in the list selected nothing"
         );
-        app.mouse(click(MouseKind::Down, 5, 9));
+        app.mouse(click(MouseKind::Down, 5, 6));
         assert_eq!(
             app.panes.focused_name(),
             "branches",
             "the press did not move the keyboard to the branches"
         );
-        app.mouse(click(MouseKind::Up, 5, 9));
-        app.mouse(click(MouseKind::Down, 5, 9));
-        app.mouse(click(MouseKind::Drag, 5, 11));
-        app.mouse(click(MouseKind::Up, 5, 11));
+        app.mouse(click(MouseKind::Up, 5, 6));
+        app.mouse(click(MouseKind::Down, 5, 6));
+        app.mouse(click(MouseKind::Drag, 5, 7));
+        app.mouse(click(MouseKind::Up, 5, 7));
         assert_eq!(
             app.panes.get("branches").map(|pane| pane.selection()),
             Some(String::new()),
@@ -13670,7 +14346,9 @@ diff --git a/tracked.txt b/tracked.txt
             }),
             "the hidden tenants were not refreshed"
         );
-        for name in ["commits", "stashes", "remotes", "diff", "files", "branches"] {
+        for name in [
+            "commits", "stashes", "remotes", "tags", "reflog", "diff", "files", "branches",
+        ] {
             assert_eq!(
                 app.panes.get(name).unwrap().generation(),
                 app.generation,
@@ -15905,9 +16583,9 @@ diff --git a/tracked.txt b/tracked.txt
         app.dispatch("remotes.focus");
         app.draw();
         assert!(
-            app.screen.row_text(19).contains("remotes"),
+            app.screen.row_text(14).contains("remotes"),
             "the header did not follow: {:?}",
-            app.screen.row_text(19)
+            app.screen.row_text(14)
         );
         assert!(
             app.screen.row_text(0).contains("1 remote"),
@@ -15915,7 +16593,7 @@ diff --git a/tracked.txt b/tracked.txt
             app.screen.row_text(0)
         );
         assert_eq!(remotes_status(&app), "1/1 · origin");
-        let body = (20..23)
+        let body = (15..17)
             .map(|y| app.screen.row_text(y))
             .collect::<Vec<_>>()
             .join("\n");
@@ -15928,6 +16606,503 @@ diff --git a/tracked.txt b/tracked.txt
             app.copy.as_deref().is_some_and(|t| t.contains("origin")),
             "copy did not read the row: {:?}",
             app.copy
+        );
+    }
+
+    /// The tags pane reads the namespace: name ahead of the commit and
+    /// the subject, the count in the header, and the row the keyboard is
+    /// on as the verbs address it.
+    #[test]
+    fn tui_parity_tags_panel_lists_names_commits_and_subjects() {
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().tags = vec![
+            Tag {
+                name: RefName::from("v2.0"),
+                commit: "aaa111bbb222ccc333".into(),
+                annotated: true,
+                subject: Some("release two".into()),
+            },
+            Tag {
+                name: RefName::from("v1"),
+                commit: "ddd444eee555fff666".into(),
+                annotated: false,
+                subject: None,
+            },
+        ];
+        let mut app = commits_app(&handle);
+        app.dispatch("tags.focus");
+        app.draw();
+        assert!(
+            app.screen.row_text(17).contains("tags"),
+            "the header did not follow: {:?}",
+            app.screen.row_text(17)
+        );
+        assert!(
+            app.screen.row_text(0).contains("2 tags"),
+            "the label did not count: {:?}",
+            app.screen.row_text(0)
+        );
+        assert_eq!(tags_status(&app), "1/2 · v2.0");
+        let body = (18..20)
+            .map(|y| app.screen.row_text(y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("v2.0") && body.contains("release two"),
+            "the row did not read name then subject: {body:?}"
+        );
+        // The lightweight tag says so rather than drawing a bare commit.
+        app.dispatch("view.down");
+        app.draw();
+        let bare = (18..20)
+            .map(|y| app.screen.row_text(y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(bare.contains("(lightweight)"), "{bare:?}");
+        app.dispatch("copy.selection");
+        assert!(
+            app.copy.as_deref().is_some_and(|t| t.contains('v')),
+            "copy did not read the row: {:?}",
+            app.copy
+        );
+    }
+
+    fn tags_status(app: &App) -> String {
+        match app.panes.get("tags") {
+            Some(Screens::Tags { view, .. }) => view.status(),
+            _ => panic!("the tags pane is registered"),
+        }
+    }
+
+    /// Tag creation through both doors: the branches pane's T names the
+    /// branch, the commits pane's T names the sha, and the message field
+    /// decides annotated versus lightweight in both.
+    #[test]
+    fn tui_parity_tag_create_annotated_and_lightweight() {
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        let mut app = commits_app(&handle);
+        app.press(Key::plain(Code::Char('3')));
+        app.dispatch("view.down");
+
+        // Annotated: a message rides along, and the write names it.
+        app.press(Key::char('T'));
+        assert!(matches!(app.prompt, Some(Prompt::TagNew { .. })));
+        type_(&mut app, "v2");
+        app.press(Key::plain(Code::Enter));
+        assert!(matches!(app.prompt, Some(Prompt::TagMessage { .. })));
+        type_(&mut app, "release two");
+        app.press(Key::plain(Code::Enter));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                state.lock().unwrap().tags_written.len() == 1
+            }),
+            "the annotated tag never queued"
+        );
+        assert_eq!(
+            state.lock().unwrap().branch_writes,
+            ["tag v2 at f\u{fffd}ature (release two)"],
+            "the message did not ride the write"
+        );
+
+        // Lightweight: the message field comes back empty.
+        app.dispatch("view.top");
+        app.press(Key::char('T'));
+        type_(&mut app, "v1");
+        app.press(Key::plain(Code::Enter));
+        app.press(Key::plain(Code::Enter));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                state.lock().unwrap().tags_written.len() == 2
+            }),
+            "the lightweight tag never queued"
+        );
+        assert_eq!(
+            state.lock().unwrap().branch_writes[1],
+            "tag v1 at main",
+            "an empty message must not annotate"
+        );
+        // And the namespace the next read answers grew both rows.
+        app.dispatch("repo.refresh");
+        app.dispatch("tags.focus");
+        assert_eq!(tags_status(&app), "1/2 · v2");
+    }
+
+    /// `commits.new-tag` converges on the same verb: the sha under the
+    /// keyboard, not the branch, and the same message question.
+    #[test]
+    fn tui_parity_tag_from_commit_names_the_sha() {
+        let (handle, state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        // Captured before the tag: the write's refresh re-reads the list
+        // behind the assertion.
+        let sha = commits_of(&app)
+            .current()
+            .expect("a commit row")
+            .sha
+            .clone();
+        app.press(Key::char('T'));
+        assert!(matches!(app.prompt, Some(Prompt::TagNew { .. })));
+        type_(&mut app, "at-head");
+        app.press(Key::plain(Code::Enter));
+        app.press(Key::plain(Code::Enter));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                !state.lock().unwrap().tags_written.is_empty()
+            }),
+            "the commit tag never queued"
+        );
+        let written = state.lock().unwrap().tags_written.clone();
+        assert_eq!(written.len(), 1, "one tag queued");
+        assert_eq!(written[0].0, b"at-head".to_vec(), "the name rode along");
+        assert_eq!(
+            written[0].1,
+            sha.as_bytes().to_vec(),
+            "the tag was not aimed at the commit's sha"
+        );
+    }
+
+    /// Tag deletion asks twice on the name, spends the arm, and the refresh
+    /// loses the row — while a move between the presses re-arms elsewhere.
+    #[test]
+    fn tui_parity_tag_delete_asks_twice_and_refreshes() {
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().tags = vec![
+            Tag {
+                name: RefName::from("v1"),
+                commit: "aaa111".into(),
+                annotated: false,
+                subject: None,
+            },
+            Tag {
+                name: RefName::from("v2"),
+                commit: "bbb222".into(),
+                annotated: true,
+                subject: Some("two".into()),
+            },
+        ];
+        let mut app = commits_app(&handle);
+        app.dispatch("tags.focus");
+        app.dispatch("tags.delete");
+        assert_eq!(app.message, "delete tag v1? press again to confirm");
+        assert!(state.lock().unwrap().branch_writes.is_empty());
+        app.dispatch("tags.delete");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                state
+                    .lock()
+                    .unwrap()
+                    .branch_writes
+                    .iter()
+                    .any(|w| w == "untag v1")
+            }),
+            "the deletion never queued"
+        );
+        app.dispatch("repo.refresh");
+        assert_eq!(tags_status(&app), "1/1 · v2");
+    }
+
+    /// Pushing a tag names its remote: the field arrives prefilled with the
+    /// lone remote, and the write carries both halves.
+    #[test]
+    fn tui_parity_tag_push_names_its_remote() {
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().servers = vec![remote_ref("origin", &["x.example"])];
+        state.lock().unwrap().tags = vec![Tag {
+            name: RefName::from("v1"),
+            commit: "aaa111".into(),
+            annotated: false,
+            subject: None,
+        }];
+        let mut app = commits_app(&handle);
+        app.dispatch("tags.focus");
+        app.dispatch("tags.push");
+        let prefilled = match &app.prompt {
+            Some(Prompt::TagPush { field, .. }) => field.text().to_string(),
+            _ => panic!("the push field did not open"),
+        };
+        assert_eq!(prefilled, "origin", "the lone remote prefilled");
+        app.press(Key::plain(Code::Enter));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                state
+                    .lock()
+                    .unwrap()
+                    .branch_writes
+                    .iter()
+                    .any(|w| w == "push tag v1 to origin")
+            }),
+            "the push never queued"
+        );
+    }
+
+    /// Deleting a remote-tracking row's source asks twice on the full
+    /// `remote/branch` name, deletes there, and keeps the local branch —
+    /// through the named command and through the `d` key, which routes by
+    /// row.
+    #[test]
+    fn tui_parity_remote_branch_delete_asks_twice_and_keeps_local() {
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        let mut app = commits_app(&handle);
+        app.press(Key::plain(Code::Char('3')));
+        // Walk to the first remote row by name, the honest keyboard walk.
+        app.dispatch("view.top");
+        for _ in 0..8 {
+            if branches_of(&app).status().contains("origin/") {
+                break;
+            }
+            app.dispatch("view.down");
+        }
+        assert!(
+            branches_of(&app).status().contains("origin/feat/ure"),
+            "the remote row was never reached"
+        );
+        app.dispatch("branches.delete-remote");
+        assert!(
+            app.message.contains("origin/feat/ure") && app.message.contains("press again"),
+            "the question did not name both halves: {:?}",
+            app.message
+        );
+        app.dispatch("branches.delete-remote");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                state
+                    .lock()
+                    .unwrap()
+                    .branch_writes
+                    .iter()
+                    .any(|w| w == "delete origin/feat/ure on origin")
+            }),
+            "the remote deletion never queued"
+        );
+        // The local branch of no such name was never in danger, and the
+        // refresh loses the remote row.
+        assert!(
+            state
+                .lock()
+                .unwrap()
+                .locals
+                .iter()
+                .any(|b| b.name.as_bytes() == b"main"),
+            "the local branch moved"
+        );
+        app.dispatch("repo.refresh");
+        assert!(
+            !branches_of(&app).status().contains("origin/feat/ure"),
+            "the remote row survived its deletion"
+        );
+    }
+
+    /// The reflog pane reads where HEAD has been: selectors first, the move
+    /// named beside each, and the keyboard's row as the recovery addresses
+    /// it.
+    #[test]
+    fn tui_parity_reflog_pane_reads_selectors_and_moves() {
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().reflog = vec![
+            ReflogEntry {
+                commit: "bbb222".into(),
+                selector: "HEAD@{0}".into(),
+                message: "commit: third".into(),
+            },
+            ReflogEntry {
+                commit: "aaa111".into(),
+                selector: "HEAD@{1}".into(),
+                message: "checkout: moving from main to feature".into(),
+            },
+        ];
+        let mut app = commits_app(&handle);
+        app.dispatch("reflog.focus");
+        app.draw();
+        assert!(
+            app.screen.row_text(20).contains("reflog"),
+            "the header did not follow: {:?}",
+            app.screen.row_text(20)
+        );
+        assert!(
+            app.screen.row_text(0).contains("2 entries"),
+            "the label did not count: {:?}",
+            app.screen.row_text(0)
+        );
+        assert_eq!(reflog_status(&app), "1/2 · HEAD@{0}");
+        let body = (21..23)
+            .map(|y| app.screen.row_text(y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("HEAD@{0}") && body.contains("commit: third"),
+            "the row did not read selector then move: {body:?}"
+        );
+    }
+
+    fn reflog_status(app: &App) -> String {
+        match app.panes.get("reflog") {
+            Some(Screens::Reflog { view, .. }) => view.status(),
+            _ => panic!("the reflog pane is registered"),
+        }
+    }
+
+    /// Recovery after a reset: the branch goes back onto the entry, softly
+    /// — the tree the reset left is the tree that stays.
+    #[test]
+    fn tui_parity_reflog_recovery_after_reset() {
+        let repo = Git::init("reflog-recover");
+        repo.write("f.txt", "one\n");
+        repo.commit("one");
+        repo.write("f.txt", "two\n");
+        repo.commit("two");
+        let second = repo.ask(&["rev-parse", "HEAD"]);
+        repo.git(&["reset", "--hard", "HEAD~1"]);
+        repo.write("f.txt", "uncommitted\n");
+
+        let mut app = repo_app(repo.0.as_path());
+        app.dispatch("reflog.focus");
+        // Newest first: HEAD@{0} is the reset itself, HEAD@{1} the commit.
+        app.dispatch("view.down");
+        app.dispatch("reflog.recover");
+        assert!(
+            app.message.contains("press again"),
+            "the recovery did not ask: {:?}",
+            app.message
+        );
+        app.dispatch("reflog.recover");
+        assert!(
+            until(Duration::from_secs(5), || {
+                app.pump();
+                repo.ask(&["rev-parse", "HEAD"]) == second
+            }),
+            "the branch never went back: {:?}",
+            app.message
+        );
+        assert_eq!(
+            std::fs::read(repo.0.join("f.txt")).unwrap(),
+            b"uncommitted\n",
+            "soft recovery must not touch the tree"
+        );
+    }
+
+    /// Undo walks a commit back and redo walks it forward; the sentences
+    /// are ours, so the reflog proves the round trip.
+    #[test]
+    fn tui_parity_undo_redo_a_commit() {
+        let repo = Git::init("undo-commit");
+        repo.write("f.txt", "one\n");
+        repo.commit("one");
+        let first = repo.ask(&["rev-parse", "HEAD"]);
+        repo.write("f.txt", "two\n");
+        repo.commit("two");
+
+        let mut app = repo_app(repo.0.as_path());
+        // The key, not just the name: z is the global undo.
+        app.press(Key::char('z'));
+        assert!(
+            until(Duration::from_secs(5), || {
+                app.pump();
+                repo.ask(&["rev-parse", "HEAD"]) == first
+            }),
+            "undo never walked back: {:?}",
+            app.message
+        );
+        assert_eq!(
+            std::fs::read(repo.0.join("f.txt")).unwrap(),
+            b"two\n",
+            "undo moved the tree it promised to leave"
+        );
+        let log = repo.ask(&["log", "-g", "-1", "--format=%gs", "HEAD@{0}"]);
+        assert_eq!(log, "gitten: undo");
+
+        // Z from the files pane: the key is global, but the commits pane
+        // answers Z with the cherry-pick abort — the older door — so redo
+        // is pressed where nothing shadows it.
+        app.dispatch("files.focus");
+        app.press(Key::char('Z'));
+        assert!(
+            until(Duration::from_secs(5), || {
+                app.pump();
+                repo.ask(&["rev-parse", "HEAD"]) != first
+            }),
+            "redo never walked forward: {:?}",
+            app.message
+        );
+        let log = repo.ask(&["log", "-g", "-1", "--format=%gs", "HEAD@{0}"]);
+        assert_eq!(log, "gitten: redo");
+    }
+
+    /// Undoing a checkout checks the old branch back out.
+    #[test]
+    fn tui_parity_undo_checkout_walks_back() {
+        let repo = Git::init("undo-checkout");
+        repo.write("f.txt", "one\n");
+        repo.commit("one");
+        repo.git(&["checkout", "-qb", "feature"]);
+        assert_eq!(repo.ask(&["rev-parse", "--abbrev-ref", "HEAD"]), "feature");
+
+        let mut app = repo_app(repo.0.as_path());
+        app.dispatch("history.undo");
+        assert!(
+            until(Duration::from_secs(5), || {
+                app.pump();
+                repo.ask(&["rev-parse", "--abbrev-ref", "HEAD"]) == "main"
+            }),
+            "undo never checked main back out: {:?}",
+            app.message
+        );
+    }
+
+    /// Empty histories and foreign moves refuse in words: a fresh
+    /// repository has nothing to undo, and a redo behind anything but our
+    /// own undo is a guess declined.
+    #[test]
+    fn tui_parity_undo_and_redo_refuse_honestly() {
+        let repo = Git::init("undo-empty");
+        repo.write("f.txt", "one\n");
+        repo.commit("one");
+        let mut app = repo_app(repo.0.as_path());
+        app.dispatch("history.undo");
+        assert_eq!(app.message, "HEAD is where it was — nothing to undo");
+        app.dispatch("history.redo");
+        assert_eq!(
+            app.message,
+            "nothing to redo — redo follows only our own undo"
+        );
+
+        // A terminal reset is not our undo: redo stays disarmed.
+        let repo = Git::init("undo-foreign");
+        repo.write("f.txt", "one\n");
+        repo.commit("one");
+        repo.write("f.txt", "two\n");
+        repo.commit("two");
+        repo.git(&["reset", "--soft", "HEAD~1"]);
+        let mut app = repo_app(repo.0.as_path());
+        app.dispatch("history.redo");
+        assert_eq!(
+            app.message,
+            "nothing to redo — redo follows only our own undo"
+        );
+    }
+
+    /// Undo behind a standing operation refuses before reading anything:
+    /// moving HEAD under a merge in flight corrupts it.
+    #[test]
+    fn tui_parity_undo_refuses_a_standing_operation() {
+        let repo = externally_conflicted_merge("undo-standing");
+        let mut app = repo_app(repo.0.as_path());
+        app.dispatch("history.undo");
+        assert_eq!(
+            app.message,
+            "finish the standing merge first — undo moves HEAD"
+        );
+        app.dispatch("history.redo");
+        assert_eq!(
+            app.message,
+            "finish the standing merge first — redo moves HEAD"
         );
     }
 

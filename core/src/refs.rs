@@ -479,23 +479,26 @@ pub enum UndoKind {
 }
 
 /// Classifies the step from `before` (`HEAD@{1}`) to `after` (`HEAD@{0}`),
-/// or `None` when there is nothing to walk back: the two entries name the
-/// same commit, so the move was a no-op in terms of position (a reset onto
-/// itself) and walking back would append a reflog entry that says nothing.
-/// Abbreviated shas compare as strings because git's abbreviations are
-/// unique prefixes — equal text is the same object.
+/// or `None` when there is nothing to walk back: outside a checkout, the
+/// two entries naming the same commit means the move was a no-op in terms
+/// of position (a reset onto itself) and walking back would append a
+/// reflog entry that says nothing. Abbreviated shas compare as strings
+/// because git's abbreviations are unique prefixes — equal text is the
+/// same object.
 pub fn undo_for(before: &ReflogEntry, after: &ReflogEntry) -> Option<UndoKind> {
     const PREFIX: &str = "checkout: moving from ";
-    if before.commit == after.commit {
-        return None;
-    }
     if let Some(rest) = after.message.strip_prefix(PREFIX) {
-        // `moving from X to Y`: the target is everything before ` to `.
-        // A branch name never contains it; a sha never does either.
+        // Checkouts always classify, even onto the same commit: switching
+        // branches without moving the sha still changed where the keyboard
+        // is, and only checking the old branch back out walks that back.
+        // (A no-op checkout writes no entry, so one that exists moved.)
         let from = rest.split(" to ").next().unwrap_or(rest);
         return Some(UndoKind::Checkout {
             from: from.to_string(),
         });
+    }
+    if before.commit == after.commit {
+        return None;
     }
     Some(UndoKind::Move {
         selector: before.selector.clone(),
@@ -597,6 +600,24 @@ mod tests {
             undo_for(&before, &after),
             Some(UndoKind::Checkout {
                 from: "aaa111b".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_checkout_onto_the_same_commit_still_walks_back() {
+        // `checkout -b` moves no sha and still moves HEAD: only checking
+        // the old branch back out walks that back.
+        let before = reflog("aaa111", "HEAD@{1}", "commit: on main");
+        let after = reflog(
+            "aaa111",
+            "HEAD@{0}",
+            "checkout: moving from main to feature",
+        );
+        assert_eq!(
+            undo_for(&before, &after),
+            Some(UndoKind::Checkout {
+                from: "main".into()
             })
         );
     }

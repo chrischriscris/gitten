@@ -137,10 +137,12 @@ pub trait FileClient: Client {
 /// `branches.delete`, for every client.
 ///
 /// The guard order is load-bearing and is why this is shared rather than
-/// described: a detached HEAD is refused before a remote is, because "not a
-/// branch" is a truer thing to say than "its remote's to delete"; and the arm
-/// is spent only after the repository is known to exist, so a fixture cannot
-/// consume a question it can never answer.
+/// described: a detached HEAD is refused first, because "not a branch" is
+/// the truest thing to say; a remote-tracking row routes to the remote
+/// deletion below instead — one key, and the row decides which half of
+/// branch deletion it means. The arm is spent only after the repository is
+/// known to exist, so a fixture cannot consume a question it can never
+/// answer.
 pub fn delete_branch(client: &mut impl BranchClient) {
     let Some(target) = client.branch_target() else {
         client.say("nothing selected to delete".into());
@@ -157,7 +159,7 @@ pub fn delete_branch(client: &mut impl BranchClient) {
         }
     };
     if matches!(target, Target::Remote { .. }) {
-        client.say("a remote branch is its remote's to delete — fetch prunes it here".into());
+        delete_remote_branch(client);
         return;
     }
     let Some(repo) = client.repo() else {
@@ -1795,11 +1797,7 @@ pub fn delete_tag(client: &mut impl TagClient) {
 /// knows exactly one), because tags track nothing and there is no upstream
 /// to default to — guessing `origin` in a two-remote repository would aim
 /// a publishable name at the wrong room.
-pub fn push_tag(client: &mut impl TagClient, remote: String) {
-    let Some(name) = client.tag_target() else {
-        client.say("nothing selected to push".into());
-        return;
-    };
+pub fn push_tag(client: &mut impl TagClient, name: Vec<u8>, remote: String) {
     let remote = remote.trim();
     if remote.is_empty() {
         client.say("a push needs a remote".into());
@@ -1812,7 +1810,7 @@ pub fn push_tag(client: &mut impl TagClient, remote: String) {
     if !client.submit(Box::new(Write::push_tag(
         &repo,
         remote.as_bytes().to_vec(),
-        name.as_bytes().to_vec(),
+        name,
     ))) {
         client.say("the job queue is shutting down".into());
     }
@@ -1980,8 +1978,10 @@ pub fn undo_last(client: &mut impl Client) {
             return;
         }
     };
-    let [after, before] = entries.as_slice() else {
-        client.say("nothing to undo".into());
+    let [after, before, ..] = entries.as_slice() else {
+        // One entry or none: HEAD never moved — a fresh repository, a
+        // single commit — so there is nowhere back to walk to.
+        client.say("HEAD is where it was — nothing to undo".into());
         return;
     };
     match undo_for(before, after) {
@@ -2817,17 +2817,22 @@ mod tests {
     }
 
     #[test]
-    fn a_remote_branch_is_refused() {
+    fn a_remote_row_routes_to_remote_deletion() {
+        // One key, and the row decides: a remote-tracking row under `d`
+        // asks the remote question, never the local one.
         let mut client = Fake::with(Some(Target::Remote {
             remote: RefName::from("origin"),
             branch: RefName::from("main"),
         }));
+        client.confirmations = [false, true].into();
         delete_branch(&mut client);
         assert_eq!(
-            client.said,
-            ["a remote branch is its remote's to delete — fetch prunes it here"]
+            client.asked,
+            ["delete origin/main on origin? the local branch stays — press again to confirm"]
         );
         assert!(client.jobs.is_empty());
+        delete_branch(&mut client);
+        assert_eq!(client.jobs.len(), 1);
     }
 
     #[test]

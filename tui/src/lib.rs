@@ -58,12 +58,14 @@ pub mod files;
 pub mod help;
 pub mod markdown;
 pub mod merging;
+pub mod reflog;
 pub mod remotes;
 pub mod rows;
 pub mod screen;
 pub mod scrollbar;
 pub mod split;
 pub mod stashes;
+pub mod tags;
 pub mod term;
 pub mod todo;
 
