@@ -3031,6 +3031,16 @@ impl DevShell {
             self.set_notice("branches.delete is not supported here");
             return;
         }
+        // The desktop deliberately does not delete remote branches: a
+        // tracking ref is its remote's shadow, pruned by fetch. The TUI
+        // owns that verb (LG-075); this door keeps refusing it.
+        if matches!(
+            self.branches_target(cx),
+            Some(views::branches::Target::Remote { .. })
+        ) {
+            self.set_notice("a remote-tracking row is its remote's shadow, pruned by fetch");
+            return;
+        }
         let mut client = WindowActs { shell: self, cx };
         gitten_app::act::delete_branch(&mut client);
     }
