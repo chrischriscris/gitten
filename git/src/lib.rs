@@ -783,9 +783,13 @@ pub trait Repo: Send + Sync {
     /// `git commit --amend --no-edit --reset-author`. The tree and the
     /// message stand exactly still; only the authorship moves, which is
     /// what makes this the narrow sibling of [`amend`](Self::amend) rather
-    /// than a second spelling of it. The standing tree is left alone: staged
-    /// work stays staged, unstaged work stays unstaged, and an unborn branch
-    /// is refused before any process runs — there is no commit to re-author.
+    /// than a second spelling of it. The standing tree is left alone —
+    /// staged work stays staged and unstaged work stays unstaged, which
+    /// takes git's `--only` and is the whole reason this is not spelled
+    /// `amend` with an empty message: a bare `--amend` folds the index into
+    /// the commit it rewrites, so a keypress meant to fix a name would
+    /// quietly commit whatever happened to be staged. An unborn branch is
+    /// refused before any process runs — there is no commit to re-author.
     /// HEAD only: a deeper commit's author is a rebase, and the todo UI for
     /// one is a later slice, so the caller aims this at HEAD and says so.
     fn reset_author(&self) -> Result<()> {
@@ -1988,9 +1992,14 @@ impl Repo for Binary {
     fn reset_author(&self) -> Result<()> {
         // The amend's own guard, minus the message: an unborn branch has no
         // commit to re-author, and git's answer there names nothing a person
-        // can act on. `--no-edit` keeps the message byte-identical; the
-        // tree is untouched by construction — amending never stages — so a
-        // dirty working tree is git's ordinary business, not a refusal.
+        // can act on. `--no-edit` keeps the message byte-identical.
+        //
+        // `--only` is load-bearing and was measured, not reasoned: a bare
+        // `--amend` takes the index with it, so re-authoring with a file
+        // staged folded that file into HEAD — a keypress that fixes a name
+        // silently committing somebody's work in progress. With `--only`
+        // and no pathspec the staged path stays staged and HEAD keeps
+        // exactly the tree it had.
         if let HeadState::Branch { commit: None, .. } = self.head()? {
             return Err("nothing to re-author: this branch has no commits yet".into());
         }
@@ -2002,6 +2011,7 @@ impl Repo for Binary {
                 b"-q",
                 b"--no-edit",
                 b"--reset-author",
+                b"--only",
             ],
         )
         .map(|_| ())
@@ -9105,6 +9115,129 @@ mod tests {
         r.write("f.txt", b"x\n");
         let e = r.open().reset_author().unwrap_err();
         assert!(e.contains("no commits yet"), "{e}");
+    }
+
+    #[test]
+    fn a_pick_into_the_dirty_file_it_touches_is_gits_refusal() {
+        // The counterpart to the pick that steps past unrelated dirt: git
+        // will not overwrite a local edit to a file the patch needs, and it
+        // says so before touching anything. The dirty bytes are the proof —
+        // a refusal that ate them would be worse than one that ran.
+        let (r, one, _, _) = side_three("pick-dirty-clash");
+        r.write("one.txt", b"mine, unsaved\n");
+        let g = r.open();
+        let before = r.rev_parse("HEAD");
+
+        let e = g.cherry_pick(one.as_bytes()).unwrap_err();
+        assert!(!e.is_empty(), "git refused, verbatim");
+        assert_eq!(r.rev_parse("HEAD"), before, "history stood still");
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"one.txt")).unwrap(),
+            b"mine, unsaved\n",
+            "the local edit was eaten"
+        );
+        assert!(!g.cherry_pick_in_progress(), "nothing stands to abort");
+    }
+
+    #[test]
+    fn a_second_range_pick_inside_a_standing_one_is_refused_before_git() {
+        // The sequencer holds one pick at a time; a second start would
+        // disturb the first's plan, so the guard runs before any process.
+        let r = Scratch::new("pick-range-twice");
+        r.write("f.txt", b"base\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        r.git(&["checkout", "-qb", "side"]);
+        r.write("f.txt", b"side\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "clash"]);
+        let clash = r.rev_parse("side");
+        r.git(&["checkout", "-q", "main"]);
+        r.write("f.txt", b"main\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "main-side"]);
+        let g = r.open();
+
+        g.cherry_pick_range(&[clash.clone().into_bytes()])
+            .unwrap_err();
+        assert!(g.cherry_pick_in_progress(), "the conflict stands");
+        let at = r.rev_parse("HEAD");
+        let e = g.cherry_pick_range(&[clash.into_bytes()]).unwrap_err();
+        assert!(e.contains("already in progress"), "{e}");
+        assert_eq!(r.rev_parse("HEAD"), at, "the standing pick was disturbed");
+        g.cherry_pick_abort().expect("aborts");
+    }
+
+    #[test]
+    fn reset_author_leaves_the_standing_tree_exactly_where_it_was() {
+        // The trap this verb exists to avoid: a bare `--amend` would fold
+        // `staged.txt` into HEAD, so a keypress meant to fix a name would
+        // commit somebody's work in progress. `--only` is what keeps the
+        // staged path staged and HEAD's tree exactly what it was.
+        let r = Scratch::new("reset-author-dirty");
+        r.write("f.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&[
+            "commit",
+            "-qm",
+            "mine",
+            "--author=Someone Else <else@example.com>",
+        ]);
+        r.write("staged.txt", b"queued\n");
+        r.git(&["add", "staged.txt"]);
+        r.write("loose.txt", b"not yet\n");
+        let g = r.open();
+        let before = r.rev_parse("HEAD");
+
+        g.reset_author().expect("re-authors past the dirt");
+        assert_ne!(r.rev_parse("HEAD"), before, "the commit was replaced");
+        let tree = g.status().unwrap();
+        assert_eq!(tree.staged.len(), 1, "the staged file moved: {tree:?}");
+        assert_eq!(tree.untracked.len(), 1, "the loose file moved: {tree:?}");
+        assert_eq!(
+            g.log(5).unwrap()[0].subject,
+            "mine",
+            "the message stood still"
+        );
+        let tracked = String::from_utf8(r.git_os_out(&[
+            "ls-tree".into(),
+            "--name-only".into(),
+            "HEAD".into(),
+        ]))
+        .unwrap();
+        assert_eq!(
+            tracked.trim(),
+            "f.txt",
+            "the staged file was folded into HEAD"
+        );
+    }
+
+    #[test]
+    fn a_hard_reset_onto_the_root_shortens_history_to_one() {
+        // The root is a legal reset target like any other commit — the one
+        // edge where the branch keeps a commit but loses every descendant.
+        let r = Scratch::new("reset-to-root");
+        r.write("f.txt", b"first\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "root"]);
+        let root = r.rev_parse("HEAD");
+        for n in ["second", "third"] {
+            r.write("f.txt", format!("{n}\n").as_bytes());
+            r.git(&["add", "-A"]);
+            r.git(&["commit", "-qm", n]);
+        }
+        let g = r.open();
+        assert_eq!(g.log(5).unwrap().len(), 3);
+
+        g.reset(ResetMode::Hard, root.as_bytes()).expect("resets");
+        assert_eq!(g.log(5).unwrap().len(), 1, "history did not shorten");
+        assert_eq!(r.rev_parse("HEAD"), root);
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"first\n",
+            "the working tree did not follow"
+        );
+        assert_eq!(g.status().unwrap().staged.len(), 0, "and nothing is staged");
     }
 
     #[test]
