@@ -50,6 +50,26 @@ fn many(n: usize) -> String {
     }
 }
 
+/// The sha `HEAD` holds, when the repository can say — the one fact a plan
+/// built over a window of history needs to still be true when it runs.
+///
+/// Detached is a sha like any other here: what a rebase replays is measured
+/// from where HEAD points, not from whether a branch name is attached to it.
+/// `None` for an unborn branch and for a read that failed, which are the two
+/// ways a repository has of not having a HEAD to compare.
+fn head_sha(repo: &dyn Repo) -> Option<String> {
+    match repo.head().ok()? {
+        HeadState::Branch { commit, .. } => commit,
+        HeadState::Detached { commit } => Some(commit),
+    }
+}
+
+/// A sha as a sentence says it: git's own eight characters, and the whole
+/// thing when it is shorter than that.
+fn abbreviated(sha: &str) -> &str {
+    &sha[..sha.len().min(8)]
+}
+
 impl Write {
     fn named(
         name: String,
@@ -223,10 +243,37 @@ impl Write {
     /// conflict, or an `edit` the plan asked for, hands back a standing
     /// rebase for the lifecycle keys to carry on from.
     /// DESTRUCTIVE: the caller confirms before this job is ever built.
+    ///
+    /// **Where HEAD was when this was built is part of the job.** A plan is
+    /// a window of history read at some earlier moment, and every row in it
+    /// names a sha. The queue's own generation rail catches a plan staled by
+    /// a *write of ours*; it says nothing about a commit typed in a terminal
+    /// or an amend in another client while the plan stood open, and after
+    /// one of those every sha in the plan names a commit the branch no
+    /// longer has. Replaying them is a rewrite nobody described. So HEAD is
+    /// read here — at the confirmation, which is where this is built — and
+    /// read again in the job, and a difference refuses before git runs.
+    ///
+    /// `None` is the honest answer from a repository that cannot say where
+    /// HEAD is: an unborn branch, or a read that failed. Nothing to compare
+    /// then, and the rebase itself is what refuses.
     pub fn rebase_plan(repo: &Handle, plan: Plan) -> Self {
         let shown = String::from_utf8_lossy(plan.upstream()).into_owned();
         let count = plan.len();
+        let confirmed_at = head_sha(repo.as_ref());
         Self::named(format!("rebase {count} onto {shown}"), repo, move |r| {
+            if let Some(was) = confirmed_at.as_deref() {
+                let now = head_sha(r);
+                if now.as_deref() != Some(was) {
+                    return Err(format!(
+                        "HEAD was {} when this plan was confirmed and is {} now — \
+                         something outside this queue rewrote the branch; \
+                         reopen the plan",
+                        abbreviated(was),
+                        now.as_deref().map(abbreviated).unwrap_or("nowhere"),
+                    ));
+                }
+            }
             r.rebase_plan(&plan)
         })
         .announcing(format!("rewrote {} from {shown}", many_commits(count)))
@@ -1174,6 +1221,136 @@ mod tests {
             ],
             "the band names are the verbs' own words"
         );
+    }
+
+    /// A repository whose HEAD moves out from under the queue: the first
+    /// read answers `before` — the confirmation's read — and every later one
+    /// answers `after`, which is exactly the shape of a commit typed in a
+    /// terminal while a plan stood open.
+    struct Moving {
+        before: String,
+        after: String,
+        reads: Arc<Mutex<usize>>,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Repo for Moving {
+        fn log(&self, _: usize) -> gitten_git::Result<Vec<Commit>> {
+            Ok(Vec::new())
+        }
+        fn pairs(&self, _: &str) -> gitten_git::Result<Vec<gitten_git::Pair>> {
+            Ok(Vec::new())
+        }
+        fn status(&self) -> gitten_git::Result<Status> {
+            Ok(Status::default())
+        }
+        fn describe(&self) -> String {
+            "moving".into()
+        }
+        fn head(&self) -> gitten_git::Result<HeadState> {
+            let mut reads = self.reads.lock().unwrap();
+            *reads += 1;
+            let commit = match *reads {
+                1 => self.before.clone(),
+                _ => self.after.clone(),
+            };
+            Ok(HeadState::Branch {
+                name: RefName::from("main"),
+                commit: Some(commit),
+            })
+        }
+        fn rebase_plan(&self, _plan: &Plan) -> gitten_git::Result<()> {
+            self.calls.lock().unwrap().push("rebase_plan".into());
+            Ok(())
+        }
+    }
+
+    /// Three commits, newest first, as a loaded window reads.
+    fn window() -> Vec<Commit> {
+        ["head", "mid", "under", "root"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| Commit {
+                sha: format!("{name}-sha"),
+                short: (*name).into(),
+                parents: match i {
+                    3 => Box::new([]) as Box<[String]>,
+                    _ => Box::new([format!("{}-sha", ["head", "mid", "under", "root"][i + 1])]),
+                },
+                author: "a".into(),
+                timestamp: 0,
+                subject: format!("{name} subject"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_confirmed_plan_refuses_a_head_that_moved_outside_the_queue() {
+        // The plan is built and confirmed against a window whose newest sha
+        // is what HEAD held then. Nothing of ours writes in between — no
+        // generation bumps, no queue activity at all — and HEAD moves
+        // anyway. The job must refuse rather than replay four shas the
+        // branch no longer has.
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let repo: Handle = Arc::new(Moving {
+            before: "head-sha".into(),
+            after: "somebody-elses-sha".into(),
+            reads: Arc::new(Mutex::new(0)),
+            calls: Arc::clone(&calls),
+        });
+        let plan = Plan::over(&window(), 2).expect("a window of three picks");
+        let runner = Runner::new();
+        assert!(runner
+            .submitter()
+            .submit(Box::new(Write::rebase_plan(&repo, plan)))
+            .is_ok());
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let refusal = loop {
+            assert!(Instant::now() < deadline, "the job never finished");
+            if let Some(Event::Finished { outcome, .. }) = runner.try_next() {
+                break outcome;
+            }
+            std::thread::yield_now();
+        };
+        let Err(said) = refusal else {
+            panic!("a plan confirmed at a sha HEAD no longer holds was replayed");
+        };
+        assert!(
+            said.contains("head-sha") && said.contains("somebody"),
+            "the refusal names both shas: {said}"
+        );
+        assert!(
+            recorded(&calls).is_empty(),
+            "git was reached anyway: {:?}",
+            recorded(&calls)
+        );
+    }
+
+    #[test]
+    fn a_confirmed_plan_runs_when_head_is_where_it_was_left() {
+        // The same job against a HEAD that did not move: the comparison must
+        // not become a refusal every plan trips over.
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let repo: Handle = Arc::new(Moving {
+            before: "head-sha".into(),
+            after: "head-sha".into(),
+            reads: Arc::new(Mutex::new(0)),
+            calls: Arc::clone(&calls),
+        });
+        let plan = Plan::over(&window(), 2).expect("a window of three picks");
+        let runner = Runner::new();
+        assert!(runner
+            .submitter()
+            .submit(Box::new(Write::rebase_plan(&repo, plan)))
+            .is_ok());
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while recorded(&calls).is_empty() {
+            assert!(Instant::now() < deadline, "the plan never ran");
+            std::thread::yield_now();
+        }
+        assert_eq!(recorded(&calls), vec!["rebase_plan"]);
     }
 
     #[test]
