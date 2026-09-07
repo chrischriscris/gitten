@@ -51,7 +51,7 @@ use gitten_core::differ::Overrides;
 use gitten_core::edit::{Edit, Field};
 use gitten_core::host::Host;
 use gitten_core::operation::{Operation, Side};
-use gitten_core::rebase::Rewrite;
+use gitten_core::rebase::{FixupKind, Rewrite};
 use gitten_core::refs::{HeadState, RefName, ResetMode, StashId, StashScope};
 use gitten_core::runs::Run;
 use gitten_core::source::DiffSource;
@@ -4747,6 +4747,49 @@ impl App {
                     gitten_app::act::rewrite_commit(self, command, Rewrite::Drop);
                 }
             }
+            // The fixup family, on lazygit's creation letter and a finder:
+            // `F` commits the index as a fixup for this row, `ctrl-f` moves
+            // the keyboard to the commit the staged changes build on so the
+            // creation aims right, `U` folds every marker into its commit
+            // (`S` is the standing operation's skip in every pane and stays
+            // it), and `K` chooses what `F` writes (`c` is copy here).
+            "commits.create-fixup" => {
+                if self.commits_focused(command) {
+                    let kind = match self.panes.get("commits") {
+                        Some(Screens::Commits { view, .. }) => view.fixup_kind(),
+                        _ => FixupKind::default(),
+                    };
+                    gitten_app::act::create_fixup(self, command, kind);
+                }
+            }
+            "commits.find-fixup-base" => {
+                if self.commits_focused(command) {
+                    if let Some(index) = gitten_app::act::find_fixup_base(self, command) {
+                        if let Some(Screens::Commits { view, .. }) = self.panes.get_mut("commits") {
+                            view.go_to(index);
+                            if let Some(found) = view.current() {
+                                self.message = format!(
+                                    "building on {} — move if it guessed wrong, then F",
+                                    found.short
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            "commits.apply-fixups" => {
+                if self.commits_focused(command) {
+                    gitten_app::act::apply_fixups(self, command);
+                }
+            }
+            "commits.fixup-message" => {
+                if self.commits_focused(command) {
+                    if let Some(Screens::Commits { view, .. }) = self.panes.get_mut("commits") {
+                        let kind = view.cycle_fixup_kind();
+                        self.message = format!("F will create {}", kind.describe());
+                    }
+                }
+            }
             // History *editing*: the plan the todo screen opens on, the
             // stop-here rebase, the reword field, the base mark and the two
             // reorders. Each reads the row the keyboard is on and the
@@ -6579,6 +6622,10 @@ fn tui_availability(repo: bool, operation: Option<&Operation>) -> Availability {
         "commits.squash-up",
         "commits.fixup-up",
         "commits.drop-commit",
+        "commits.create-fixup",
+        "commits.find-fixup-base",
+        "commits.apply-fixups",
+        "commits.fixup-message",
         // The open plan's own verbs. Live whenever the client is: a press
         // with no plan open is refused by name where it is answered, which
         // is a sentence about the plan rather than about the client.
@@ -6792,6 +6839,10 @@ fn tui_availability(repo: bool, operation: Option<&Operation>) -> Availability {
                 "commits.squash-up",
                 "commits.fixup-up",
                 "commits.drop-commit",
+                "commits.create-fixup",
+                "commits.find-fixup-base",
+                "commits.apply-fixups",
+                "commits.fixup-message",
                 "todo.pick",
                 "todo.reword",
                 "todo.edit",

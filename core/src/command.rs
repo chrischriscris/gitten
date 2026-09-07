@@ -691,6 +691,16 @@ impl Keymap {
         // towards HEAD, which is what the list draws above the row.
         bind("commits", "alt-up", "commits.move-up");
         bind("commits", "alt-down", "commits.move-down");
+        // The fixup family, on lazygit's creation letter and a finder: `F`
+        // commits the index as a fixup for this row, `ctrl-f` moves the
+        // keyboard to the commit the staged changes build on. The fold and
+        // the kind take aliases, and both differences are deliberate: `S`
+        // is the standing operation's skip in every pane and stays it, so
+        // the fold is `U`; `c` is copy here, so the kind cycles on `K`.
+        bind("commits", "F", "commits.create-fixup");
+        bind("commits", "ctrl-f", "commits.find-fixup-base");
+        bind("commits", "U", "commits.apply-fixups");
+        bind("commits", "K", "commits.fixup-message");
         // The way out of a stranded rebase — one that stopped mid-flight on
         // a conflict or a refusal and left its state standing. lazygit
         // offers these through a menu that appears during a rebase; here
@@ -1555,6 +1565,26 @@ impl Commands {
                 "commits.drop-commit",
                 "remove this commit from the branch, asked twice",
                 Some("drop"),
+            ),
+            (
+                "commits.create-fixup",
+                "commit the staged changes as a fixup for this commit",
+                Some("fixup"),
+            ),
+            (
+                "commits.find-fixup-base",
+                "move to the commit the staged changes build on",
+                Some("find base"),
+            ),
+            (
+                "commits.apply-fixups",
+                "fold every fixup into the commit it names, asked twice",
+                Some("fold fixups"),
+            ),
+            (
+                "commits.fixup-message",
+                "choose what a fixup creation writes: fixup, amend, reword",
+                Some("fixup kind"),
             ),
             (
                 "commits.interactive-rebase",

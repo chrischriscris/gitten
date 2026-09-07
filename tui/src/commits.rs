@@ -48,6 +48,7 @@ use crate::screen::{Ink, Pen, Screen};
 use crate::scrollbar::{self, Bar};
 use gitten_core::graph::{lane_count, Hues, MAX_LANES};
 use gitten_core::host::Host;
+use gitten_core::rebase::FixupKind;
 use gitten_core::search::Index;
 use gitten_core::theme::{Rgb, Theme};
 use gitten_core::view::Viewport;
@@ -244,6 +245,12 @@ pub struct Commits {
     /// display only, said on the status line. The mark itself is the
     /// client's, because it outlives this pane's every refresh.
     base: Option<String>,
+    /// What the fixup-creation key writes next: `fixup!` unless the kind
+    /// key said otherwise. Pane state, because both keys live here and
+    /// the status line that names it is this pane's; the creation itself
+    /// still goes through the shared action, which re-reads nothing —
+    /// the kind travels as an argument, never as ambient state.
+    fixup_kind: FixupKind,
 }
 
 impl Commits {
@@ -290,6 +297,7 @@ impl Commits {
             copied: Vec::new(),
             base: None,
             marking: false,
+            fixup_kind: FixupKind::default(),
         }
     }
 
@@ -337,6 +345,19 @@ impl Commits {
     /// Tells the pane which commit is the marked rebase base, so the status
     /// line can say so. Called by the client whenever the mark changes and
     /// never on the render path.
+    /// What the fixup-creation key will write, for the dispatch that aims it.
+    pub fn fixup_kind(&self) -> FixupKind {
+        self.fixup_kind
+    }
+
+    /// The next fixup kind, for the key that chooses what a creation
+    /// writes: fixup, then amend, then reword, then round again. Returns
+    /// the one now standing, so the press can say it.
+    pub fn cycle_fixup_kind(&mut self) -> FixupKind {
+        self.fixup_kind = self.fixup_kind.cycle();
+        self.fixup_kind
+    }
+
     pub fn set_base(&mut self, short: Option<String>) {
         self.base = short;
     }
@@ -988,6 +1009,12 @@ impl Commits {
         // long as it stands.
         if let Some(base) = &self.base {
             out.push_str(&format!(" · base {base}"));
+        }
+        // The pending fixup kind is said only while it is not the default:
+        // the default is what the help entry promises, and a quiet status
+        // line is the point.
+        if self.fixup_kind != FixupKind::default() {
+            out.push_str(&format!(" · F:{}", self.fixup_kind.describe()));
         }
         out
     }
