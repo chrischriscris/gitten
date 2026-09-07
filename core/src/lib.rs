@@ -18,6 +18,7 @@ pub mod font;
 pub mod graph;
 pub mod host;
 pub mod markdown;
+pub mod operation;
 pub mod patch;
 pub mod path;
 pub mod prepared;

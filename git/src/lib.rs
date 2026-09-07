@@ -44,6 +44,7 @@
 //! never changes, so a diff keyed on the pair of them is cacheable forever.
 
 use gitten_core::differ::{Differs, Overrides};
+use gitten_core::operation::{Operation, Side};
 use gitten_core::refs::{
     Branch, HeadState, ReflogEntry, Remote, RemoteBranch, ResetMode, Stash, Tag, Upstream,
 };
@@ -897,6 +898,107 @@ pub trait Repo: Send + Sync {
     /// here asks before it starts rather than trusting a stale answer.
     fn cherry_pick_in_progress(&self) -> bool {
         false
+    }
+
+    /// Merges `target` into the current branch: `git merge --no-edit <target>`
+    /// for a regular merge (fast-forward when git can take it), `git merge
+    /// --squash --no-edit <target>` for the squash shape — the collision
+    /// staged and nothing committed, which is why a squash has no
+    /// [`merge_continue`](Self::merge_continue) to reach.
+    ///
+    /// No strategy choices, no message invention: git's own merge machinery
+    /// and, when it stops, its own conflict question standing in the tree —
+    /// which [`operation`](Self::operation) reports and only a human answers.
+    /// An operation already standing refuses before any process runs.
+    fn merge(&self, _target: &[u8], _squash: bool) -> Result<()> {
+        Err(unserved("merging"))
+    }
+
+    /// Abandons an in-progress merge: `git merge --abort`. The tree and index
+    /// return to where the merge found them — git's own guarantee.
+    fn merge_abort(&self) -> Result<()> {
+        Err(unserved("aborting a merge"))
+    }
+
+    /// Finishes an in-progress regular merge after the conflicts are
+    /// resolved: `git merge --continue`, the message editor answered `true`.
+    /// A squash merge leaves no merge state to continue, so nothing offers
+    /// this for one; the commit a squash still needs is
+    /// [`commit`](Self::commit)'s ordinary work.
+    fn merge_continue(&self) -> Result<()> {
+        Err(unserved("continuing a merge"))
+    }
+
+    /// Whether a merge is mid-flight right now — `MERGE_HEAD` on disk,
+    /// resolved through `--git-path` so linked worktrees answer for
+    /// themselves. The same posture as
+    /// [`rebase_in_progress`](Self::rebase_in_progress).
+    fn merge_in_progress(&self) -> bool {
+        false
+    }
+
+    /// Steps over the commit a rebase stopped on: `git rebase --skip`. That
+    /// commit's changes leave the branch — the one lifecycle answer that
+    /// destroys work rather than restoring it, which is why only a rebase
+    /// ever offers it.
+    fn rebase_skip(&self) -> Result<()> {
+        Err(unserved("skipping a rebase commit"))
+    }
+
+    /// Abandons an in-progress revert: `git revert --abort`.
+    fn revert_abort(&self) -> Result<()> {
+        Err(unserved("aborting a revert"))
+    }
+
+    /// Finishes an in-progress revert after conflicts are resolved:
+    /// `git revert --continue`, the message editor answered `true`.
+    fn revert_continue(&self) -> Result<()> {
+        Err(unserved("continuing a revert"))
+    }
+
+    /// Whether a revert is mid-flight right now — `REVERT_HEAD` on disk,
+    /// resolved through `--git-path`.
+    fn revert_in_progress(&self) -> bool {
+        false
+    }
+
+    /// Records one conflicted path as resolved, taking `side`'s answer.
+    ///
+    /// [`Side::Ours`]/[`Side::Theirs`]: `git checkout --ours|--theirs --` the
+    /// path, then `git add` — and when that side's stage does not exist
+    /// (ours of an added-by-them conflict, theirs of a deleted-by-them one),
+    /// the side's answer *is* the deletion, so `git rm -f` records it.
+    /// [`Side::Both`]: stage 2's bytes followed by stage 3's, one newline
+    /// boundary between them, written and staged — a text-only answer git's
+    /// stage read refuses on a binary path, which is the honest fallback.
+    /// [`Side::Keep`]: `git add` alone, recording the working tree as it
+    /// stands — including a deletion, which is what resolves a
+    /// both-deleted conflict. Undo of a *recorded* resolution is not offered:
+    /// `git add` collapsed the stages, and claiming an undo that cannot
+    /// reconstruct them would be a lie.
+    fn resolve(&self, _path: &[u8], _side: Side) -> Result<()> {
+        Err(unserved("resolving a conflict"))
+    }
+
+    /// The operation standing right now, if any — the four state reads plus
+    /// the unmerged count from [`Repo::status`]. The priority order matters
+    /// only while a sequencer drives a rebase: rebase first, then the three
+    /// single-write kinds. `None` is a clean repository.
+    fn operation(&self) -> Option<Operation> {
+        use gitten_core::operation::Kind;
+        let kind = if self.rebase_in_progress() {
+            Kind::Rebase
+        } else if self.merge_in_progress() {
+            Kind::Merge
+        } else if self.cherry_pick_in_progress() {
+            Kind::CherryPick
+        } else if self.revert_in_progress() {
+            Kind::Revert
+        } else {
+            return None;
+        };
+        let conflicts = self.status().map(|s| s.conflicts.len()).unwrap_or(0);
+        Some(Operation { kind, conflicts })
     }
 
     /// Names `target` with a tag: annotated (`-a`) carrying `message` when
@@ -1909,6 +2011,116 @@ impl Repo for Binary {
         ["CHERRY_PICK_HEAD", "sequencer"]
             .iter()
             .any(|state| self.git_state_exists(state))
+    }
+
+    fn merge(&self, target: &[u8], squash: bool) -> Result<()> {
+        if let Some(operation) = self.operation() {
+            return Err(format!(
+                "a {} is in progress; finish or abort it before starting another",
+                operation.kind.word()
+            ));
+        }
+        refuse_dashes(target)?;
+        // --no-edit: a client merge carries its own words ("Merge branch
+        // 'x'") and never opens an editor; the flag is a no-op where git
+        // would not prompt and the difference between an invisible hang and
+        // a finished write where it would.
+        let mut args: Vec<&[u8]> = vec![b"merge", b"--no-edit"];
+        if squash {
+            args.insert(1, b"--squash");
+        }
+        args.push(target);
+        run_bytes(&self.root, &args).map(|_| ())
+    }
+
+    fn merge_abort(&self) -> Result<()> {
+        run_bytes(&self.root, &[b"merge", b"--abort"]).map(|_| ())
+    }
+
+    fn merge_continue(&self) -> Result<()> {
+        run_env(
+            &self.root,
+            &[b"merge", b"--continue"],
+            &[("GIT_EDITOR", "true")],
+        )
+        .map(|_| ())
+    }
+
+    fn merge_in_progress(&self) -> bool {
+        self.git_state_exists("MERGE_HEAD")
+    }
+
+    fn rebase_skip(&self) -> Result<()> {
+        run_env(
+            &self.root,
+            &[b"rebase", b"--skip"],
+            &[("GIT_SEQUENCE_EDITOR", "true"), ("GIT_EDITOR", "true")],
+        )
+        .map(|_| ())
+    }
+
+    fn revert_abort(&self) -> Result<()> {
+        run_bytes(&self.root, &[b"revert", b"--abort"]).map(|_| ())
+    }
+
+    fn revert_continue(&self) -> Result<()> {
+        run_env(
+            &self.root,
+            &[b"revert", b"--continue"],
+            &[("GIT_EDITOR", "true")],
+        )
+        .map(|_| ())
+    }
+
+    fn revert_in_progress(&self) -> bool {
+        self.git_state_exists("REVERT_HEAD")
+    }
+
+    fn resolve(&self, path: &[u8], side: Side) -> Result<()> {
+        // A path rides argv like every name-shaped word; the stage readers
+        // below take it through git's own revspec spelling.
+        refuse_dashes(path)?;
+        match side {
+            Side::Keep => run_bytes(&self.root, &[b"add", b"--", path]).map(|_| ()),
+            Side::Both => {
+                // Stage revspecs are bytes too — ":2:" + the path, never a
+                // lossy string. git's own answer when a stage is absent (a
+                // delete/modify pair) names the missing stage verbatim.
+                let stage = |n: u8| {
+                    let mut rev: Vec<u8> = format!(":{n}:").into_bytes();
+                    rev.extend_from_slice(path);
+                    run_bytes(&self.root, &[b"show", &rev])
+                };
+                let ours = stage(2)?;
+                let theirs = stage(3)?;
+                let mut text = ours;
+                if !text.ends_with(b"\n") {
+                    text.push(b'\n');
+                }
+                text.extend_from_slice(&theirs);
+                // The working tree carries the answer before the index
+                // records it, so what the reader sees is what got staged.
+                let at = join_raw(&self.root, path);
+                std::fs::write(&at, &text)
+                    .map_err(|e| format!("could not write {}: {e}", at.display()))?;
+                run_bytes(&self.root, &[b"add", b"--", path]).map(|_| ())
+            }
+            Side::Ours | Side::Theirs => {
+                let which: &[u8] = match side {
+                    Side::Ours => b"--ours",
+                    _ => b"--theirs",
+                };
+                // A stage that exists: its content becomes the answer. One
+                // that does not: that side's answer is the deletion, and
+                // git's own refusal to check out a missing stage is the
+                // signal to record the removal instead.
+                if run_bytes(&self.root, &[b"checkout", which, b"--", path]).is_ok() {
+                    run_bytes(&self.root, &[b"add", b"--", path]).map(|_| ())
+                } else {
+                    run_bytes(&self.root, &[b"rm", b"-f", b"--", path]).map(|_| ())
+                }
+            }
+        }
     }
 
     fn create_tag(&self, name: &[u8], target: &[u8], message: Option<&str>) -> Result<()> {
@@ -8526,6 +8738,278 @@ mod tests {
         assert_eq!(
             std::fs::read(join_raw(&r.0, b"ours.txt")).unwrap(),
             b"ours\n"
+        );
+    }
+
+    // --------------------------------------------------------- operations
+    // Merge, rebase, cherry-pick and revert stopping mid-flight: state on
+    // disk a *later* client must see, sides a human must choose, and
+    // continue/abort/skip semantics that are git's, not ours.
+
+    /// A repository with `ours`/`theirs` branches having diverged over one
+    /// file, so `git merge theirs` stops with exactly one conflicted path.
+    fn conflicted_merge(name: &str) -> Scratch {
+        let r = Scratch::new(name);
+        r.write("f.txt", b"base\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        r.git(&["checkout", "-qb", "theirs"]);
+        r.write("f.txt", b"theirs\n");
+        r.git(&["commit", "-aqm", "theirs"]);
+        r.git(&["checkout", "-q", "main"]);
+        r.write("f.txt", b"ours\n");
+        r.git(&["commit", "-aqm", "ours"]);
+        r.git_failing(&["merge", "theirs"]);
+        r
+    }
+
+    #[test]
+    fn a_stopped_merge_reports_its_kind_and_its_unmerged_count() {
+        let r = conflicted_merge("operation-merge");
+        let g = r.open();
+        let operation = g.operation().expect("a merge is standing");
+        assert_eq!(operation.kind, gitten_core::operation::Kind::Merge);
+        assert_eq!(operation.conflicts, 1);
+        assert!(g.merge_in_progress());
+        // Only one kind stands, and the others say so:
+        assert!(!g.rebase_in_progress());
+        assert!(!g.cherry_pick_in_progress());
+        assert!(!g.revert_in_progress());
+        assert!(!operation.can_skip(), "a merge has no skip");
+    }
+
+    #[test]
+    fn an_externally_started_merge_is_seen_by_a_fresh_client() {
+        // The state came from git itself, not from any Repo method: the
+        // detection is disk truth, so a client opened later sees it.
+        let r = conflicted_merge("operation-external");
+        let seen = r.open().operation().expect("the standing merge");
+        assert_eq!(seen.kind, gitten_core::operation::Kind::Merge);
+    }
+
+    #[test]
+    fn a_second_merge_refuses_while_one_stands() {
+        let r = conflicted_merge("operation-second-merge");
+        let err = r.open().merge(b"theirs", false).unwrap_err();
+        assert!(
+            err.contains("a merge is in progress"),
+            "the refusal names the way out: {err}"
+        );
+    }
+
+    #[test]
+    fn a_merge_resolved_ours_and_continued_makes_the_merge_commit() {
+        let r = conflicted_merge("operation-merge-ours");
+        let g = r.open();
+        g.resolve(b"f.txt", Side::Ours).expect("resolve");
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"ours\n",
+            "ours' bytes are the answer"
+        );
+        g.merge_continue().expect("continue");
+        assert!(g.operation().is_none(), "the merge is over");
+        // A real merge commit: two parents, and the tree holds our side.
+        let parents = String::from_utf8(r.git_os_out(&[
+            "rev-list".into(),
+            "--parents".into(),
+            "-n".into(),
+            "1".into(),
+            "HEAD".into(),
+        ]))
+        .unwrap();
+        assert_eq!(parents.split_whitespace().count(), 3, "HEAD + two parents");
+        assert_eq!(std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(), b"ours\n");
+    }
+
+    #[test]
+    fn a_merge_resolved_both_carries_both_sides_into_the_commit() {
+        let r = conflicted_merge("operation-merge-both");
+        let g = r.open();
+        g.resolve(b"f.txt", Side::Both).expect("resolve");
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"ours\ntheirs\n",
+            "stage 2 then stage 3, one boundary"
+        );
+        g.merge_continue().expect("continue");
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"ours\ntheirs\n"
+        );
+    }
+
+    #[test]
+    fn a_merge_resolved_theirs_takes_the_other_side() {
+        let r = conflicted_merge("operation-merge-theirs");
+        let g = r.open();
+        g.resolve(b"f.txt", Side::Theirs).expect("resolve");
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"theirs\n"
+        );
+        g.merge_continue().expect("continue");
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"theirs\n"
+        );
+    }
+
+    #[test]
+    fn a_merge_resolved_keep_records_the_working_tree() {
+        let r = conflicted_merge("operation-merge-keep");
+        let g = r.open();
+        // A human's own answer, conflict markers and all: Keep records it,
+        // it does not second-guess it.
+        std::fs::write(join_raw(&r.0, b"f.txt"), b"hand-written\n").unwrap();
+        g.resolve(b"f.txt", Side::Keep).expect("resolve");
+        g.merge_continue().expect("continue");
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"hand-written\n"
+        );
+    }
+
+    #[test]
+    fn a_merge_abort_puts_everything_back_where_it_started() {
+        let r = conflicted_merge("operation-merge-abort");
+        let ours = r.rev_parse("HEAD");
+        r.open().merge_abort().expect("abort");
+        assert_eq!(r.rev_parse("HEAD"), ours);
+        assert_eq!(std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(), b"ours\n");
+        assert!(r.open().operation().is_none());
+    }
+
+    #[test]
+    fn a_squash_merge_stages_the_collision_and_offers_no_continue() {
+        // A branch whose change does not conflict: the squash stages it and
+        // commits nothing — which is why there is no merge state standing.
+        let r = Scratch::new("operation-squash");
+        r.write("f.txt", b"base\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        r.git(&["checkout", "-qb", "side"]);
+        r.write("g.txt", b"side\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "side"]);
+        r.git(&["checkout", "-q", "main"]);
+        r.open().merge(b"side", true).expect("squash");
+        assert!(
+            r.open().operation().is_none(),
+            "a squash leaves no merge state"
+        );
+        // The collision is staged and uncommitted.
+        let staged = r
+            .open()
+            .status()
+            .unwrap()
+            .staged
+            .iter()
+            .any(|e| e.path.as_bytes() == b"g.txt");
+        assert!(staged, "the squash staged side's file");
+        let err = r.open().merge_continue().unwrap_err();
+        assert!(
+            err.to_lowercase().contains("merge"),
+            "git names the missing MERGE_HEAD: {err}"
+        );
+    }
+
+    #[test]
+    fn a_rebase_stopped_on_a_conflict_skips_the_stopped_commit() {
+        let r = Scratch::new("operation-rebase-skip");
+        r.write("f.txt", b"base\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        r.git(&["checkout", "-qb", "topic"]);
+        r.write("f.txt", b"topic\n");
+        r.git(&["commit", "-aqm", "topic one"]);
+        r.write("other.txt", b"other\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "topic two"]);
+        r.git(&["checkout", "-q", "main"]);
+        r.write("f.txt", b"main\n");
+        r.git(&["commit", "-aqm", "main moves f"]);
+        r.git(&["checkout", "-q", "topic"]);
+        r.git_failing(&["rebase", "main"]);
+
+        let g = r.open();
+        let operation = g.operation().expect("the rebase is standing");
+        assert_eq!(operation.kind, gitten_core::operation::Kind::Rebase);
+        assert!(operation.can_skip(), "a rebase has a skip");
+
+        g.rebase_skip().expect("skip");
+        assert!(g.operation().is_none(), "the rebase finished");
+        // The skipped commit's changes are gone; the next commit's arrived.
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"main\n",
+            "topic one left the branch"
+        );
+        assert!(join_raw(&r.0, b"other.txt").exists(), "topic two replayed");
+    }
+
+    #[test]
+    fn a_revert_stopped_on_a_conflict_resolves_theirside_and_continues() {
+        let r = Scratch::new("operation-revert");
+        r.write("f.txt", b"one\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "one"]);
+        let one = r.rev_parse("HEAD");
+        r.write("f.txt", b"one\ntwo\n");
+        r.git(&["commit", "-aqm", "two"]);
+        // Reverting 'one' wants the file gone; the tree since edited it.
+        r.git_failing(&["revert", &one]);
+
+        let g = r.open();
+        let operation = g.operation().expect("the revert is standing");
+        assert_eq!(operation.kind, gitten_core::operation::Kind::Revert);
+        assert!(!operation.can_skip());
+
+        // Theirs is the revert's own answer: the file's removal. Our side's
+        // stage does not exist for the deletion, so the rm records it.
+        g.resolve(b"f.txt", Side::Theirs).expect("resolve");
+        assert!(!join_raw(&r.0, b"f.txt").exists());
+        g.revert_continue().expect("continue");
+        assert!(g.operation().is_none());
+        // The inverse commit: 'one' is no longer in the tree's files.
+        let content = String::from_utf8(r.git_os_out(&[
+            "ls-tree".into(),
+            "--name-only".into(),
+            "HEAD".into(),
+        ]))
+        .unwrap();
+        assert!(
+            !content.lines().any(|line| line == "f.txt"),
+            "the reverted file is gone from the tree"
+        );
+    }
+
+    #[test]
+    fn a_cherry_pick_conflict_resolves_ours_and_continues() {
+        let r = Scratch::new("operation-cherry-pick");
+        r.write("f.txt", b"base\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        r.git(&["checkout", "-qb", "side"]);
+        r.write("f.txt", b"side\n");
+        r.git(&["commit", "-aqm", "side edit"]);
+        let pick = r.rev_parse("HEAD");
+        r.git(&["checkout", "-q", "main"]);
+        r.write("f.txt", b"main\n");
+        r.git(&["commit", "-aqm", "main edit"]);
+        r.open().cherry_pick(pick.as_bytes()).unwrap_err();
+
+        let g = r.open();
+        let operation = g.operation().expect("the pick is standing");
+        assert_eq!(operation.kind, gitten_core::operation::Kind::CherryPick);
+        // Both sides: a resolution that changes the tree, so the continued
+        // pick is a real commit and not the empty one git refuses to make.
+        g.resolve(b"f.txt", Side::Both).expect("resolve");
+        g.cherry_pick_continue().expect("continue");
+        assert!(g.operation().is_none());
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"main\nside\n"
         );
     }
 
