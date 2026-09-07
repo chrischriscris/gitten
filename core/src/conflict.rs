@@ -111,6 +111,30 @@ impl ConflictFile {
     pub fn is_conflicted(&self) -> bool {
         !self.regions.is_empty()
     }
+
+    /// Whether two regions overlap — a merge inside a rebase inside a
+    /// merge pairs by run length, so the inner region closes first and
+    /// lands before the outer holding it. Overlapping regions have no
+    /// disjoint line spans, which is what per-region answers and the
+    /// flattened rows both need; such a file answers whole, never by
+    /// region. Rare, but real.
+    pub fn is_nested(&self) -> bool {
+        overlaps(&self.regions)
+    }
+}
+
+/// In file order, each region must start after the last one ended.
+fn overlaps(regions: &[Region]) -> bool {
+    let mut order: Vec<&Region> = regions.iter().collect();
+    order.sort_by_key(|r| r.start);
+    let mut covered = 0usize;
+    for region in order {
+        if region.start < covered {
+            return true;
+        }
+        covered = covered.max(region.end + 1);
+    }
+    false
 }
 
 /// Is this line a marker run of `c` — at least `min` wide, ending the line
@@ -224,7 +248,11 @@ fn split_lines(bytes: &[u8]) -> Vec<&[u8]> {
 }
 
 fn strip_eol(line: &[u8]) -> &[u8] {
-    line.strip_suffix(b"\n").unwrap_or(line)
+    // The shape tests read the marker, not the line ending: a CRLF file's
+    // markers carry the carriage return, and `=======\r` is not a
+    // separator to a test that does not strip it.
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    line.strip_suffix(b"\r").unwrap_or(line)
 }
 
 /// The number of lines `bytes` holds — what a flattening walk and a
@@ -254,6 +282,14 @@ pub fn apply(
                 if regions.len() == 1 { "" } else { "s" }
             ));
         }
+    }
+    if overlaps(regions) {
+        // A region inside another has no disjoint span to splice: the
+        // walk below would index backwards and the rows would double.
+        // Refused, not guessed — the file-level answers take it whole.
+        return Err(
+            "the file's conflicts nest — resolve it whole with the file-level answers".into(),
+        );
     }
     let mut out = Vec::with_capacity(bytes.len());
     let mut chosen: Vec<Option<Answer>> = vec![None; regions.len()];
@@ -467,6 +503,55 @@ outer theirs side
         // The outer's ours half spans the nested block; answering it keeps
         // whatever the inner still holds.
         assert_eq!(regions[1].ours().count(), 7);
+    }
+
+    #[test]
+    fn a_nested_file_refuses_in_apply_instead_of_panicking() {
+        // The inner region closes first, so `regions` is not in file
+        // order — the old walk sliced `lines[7..0]` here. Both the empty
+        // choice and a real one are the same refusal: the file answers
+        // whole, never by region.
+        let bytes = file(
+            "\
+<<<<<<<<< outer
+outer ours
+<<<<<<< inner
+inner ours
+=======
+inner theirs
+>>>>>>> inner
+outer theirs
+=========
+outer theirs side
+>>>>>>>>> outer
+",
+        );
+        let regions = parse(&bytes);
+        assert_eq!(regions.len(), 2);
+        let err = apply(&bytes, &regions, &[]).unwrap_err();
+        assert!(err.contains("resolve it whole"), "{err:?}");
+        let err = apply(&bytes, &regions, &[(0, Answer::Ours)]).unwrap_err();
+        assert!(err.contains("resolve it whole"), "{err:?}");
+    }
+
+    #[test]
+    fn crlf_markers_parse_and_keep_their_endings() {
+        // Windows checkouts (and `core.autocrlf`) put `\r` before the
+        // newline; the marker is what precedes it, not the line ending.
+        let bytes = file(
+            "top\r\n<<<<<<< ours\r\nours 1\r\n=======\r\ntheirs 1\r\n>>>>>>> other\r\ntail\r\n",
+        );
+        let regions = parse(&bytes);
+        assert_eq!(regions.len(), 1, "the \\r hid every marker");
+        assert_eq!(regions[0].start, 1);
+        assert_eq!(regions[0].sep, 3);
+        assert_eq!(regions[0].end, 5);
+        let out = apply(&bytes, &regions, &[(0, Answer::Theirs)]).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "top\r\ntheirs 1\r\ntail\r\n",
+            "untouched lines keep their carriage returns"
+        );
     }
 
     #[test]

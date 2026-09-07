@@ -83,6 +83,11 @@ pub struct Merging {
     /// One entry per line of the file: `None` for context, the region place
     /// otherwise. Parallel to the file's lines, not to the viewport.
     places: Vec<Row>,
+    /// The file's lines, lossily decoded — drawn from here, never decoded
+    /// per paint. Rebuilt on open and replace beside `places`, for the
+    /// same reason: nothing on the render path recomputes what a cache
+    /// could hold.
+    lines: Vec<String>,
     /// Where each region's first row landed, ascending — the jump list.
     region_rows: Vec<usize>,
     view: Viewport,
@@ -98,6 +103,7 @@ impl Merging {
     /// plain content with nothing to answer.
     pub fn new(path: PathBytes, file: ConflictFile, stages: Vec<UnmergedStage>) -> Self {
         let places = flatten(&file);
+        let lines = display_lines(&file.bytes);
         let region_rows = places
             .iter()
             .enumerate()
@@ -110,6 +116,7 @@ impl Merging {
             file,
             stages,
             places,
+            lines,
             region_rows,
             view,
             cols: 0,
@@ -137,6 +144,7 @@ impl Merging {
         self.file = file;
         self.stages = stages;
         self.places = flatten(&self.file);
+        self.lines = display_lines(&self.file.bytes);
         self.region_rows = self
             .places
             .iter()
@@ -153,6 +161,12 @@ impl Merging {
     /// reads before anything is submitted.
     pub fn is_conflicted(&self) -> bool {
         self.file.is_conflicted()
+    }
+
+    /// Whether the file's regions overlap — the gate that sends the
+    /// answer verbs to the whole-file answers instead.
+    pub fn is_nested(&self) -> bool {
+        self.file.is_nested()
     }
 
     // ------------------------------------------------------------- the viewport
@@ -279,6 +293,9 @@ impl Merging {
     pub fn press(&mut self, _col: usize, row: usize, _extend: bool, _host: &Host) {
         if let Some(index) = self.view.row_at(row) {
             self.view.go_to(index);
+            // The drag handler is armed by the press, the way the diff
+            // pane's is: a press that becomes a drag walks the keyboard.
+            self.dragging = true;
         }
     }
 
@@ -338,9 +355,9 @@ impl Merging {
             pen.wash(blank);
             return;
         }
-        // The marker lines, lossily decoded once per line here and nowhere
-        // else: the bytes are the region's, the string is only what is drawn.
-        let lines = display_lines(&self.file.bytes);
+        // The marker lines, lossily decoded once per open and replace and
+        // drawn from the cache here: the bytes are the region's, the string
+        // is only what is drawn.
         for i in 0..self.view.height() {
             let row = y + i;
             let mut pen = screen.span(row, x, self.cols);
@@ -369,7 +386,7 @@ impl Merging {
                 | Some((_, Part::Close)) => Ink::new(theme.diff.gutter_fg, bg),
                 None => Ink::new(theme.chrome.fg, bg),
             };
-            if let Some(text) = lines.get(vis) {
+            if let Some(text) = self.lines.get(vis) {
                 pen.put(text, ink);
             }
             pen.wash(ink);
@@ -416,8 +433,20 @@ impl Merging {
 fn flatten(file: &ConflictFile) -> Vec<Row> {
     let lines = gitten_core::conflict::line_count(&file.bytes);
     let mut places = Vec::with_capacity(lines);
+    // Regions arrive in close order; an inner region closes before the
+    // outer holding it. The rows need file order, and a region starting
+    // inside an already-drawn one keeps the outer's rows — its lines are
+    // already on the pane, and drawing them twice would double the file.
+    // The skipped region keeps its close-order index in the rows the
+    // outer drew, but the answer verbs refuse a nested file anyway.
+    let mut order: Vec<usize> = (0..file.regions.len()).collect();
+    order.sort_by_key(|&ri| file.regions[ri].start);
     let mut at = 0usize;
-    for (ri, region) in file.regions.iter().enumerate() {
+    for ri in order {
+        let region = &file.regions[ri];
+        if region.start < at {
+            continue;
+        }
         for _ in at..region.start {
             places.push(Row { place: None });
         }
@@ -462,7 +491,13 @@ fn flatten(file: &ConflictFile) -> Vec<Row> {
 fn display_lines(bytes: &[u8]) -> Vec<String> {
     bytes
         .split_inclusive(|b| *b == b'\n')
-        .map(|line| String::from_utf8_lossy(line.strip_suffix(b"\n").unwrap_or(line)).into_owned())
+        .map(|line| {
+            // The carriage return is a line ending, not content: a CRLF
+            // file that drew it would wash every row with a glyph.
+            let line = line.strip_suffix(b"\n").unwrap_or(line);
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            String::from_utf8_lossy(line).into_owned()
+        })
         .collect()
 }
 
@@ -565,6 +600,62 @@ mod tests {
             "{:?}",
             screen.row_text(0)
         );
+    }
+
+    /// A merge inside a rebase inside a merge: the inner region closes
+    /// first, so it sorts before the outer holding it.
+    const NESTED: &[u8] = b"<<<<<<<<< outer\nouter ours\n<<<<<<< inner\ninner ours\n=======\ninner theirs\n>>>>>>> inner\nouter theirs\n=========\nouter theirs side\n>>>>>>>>> outer\n";
+
+    fn nested_view() -> Merging {
+        Merging::new(
+            PathBytes::from("f.txt"),
+            ConflictFile::parse(PathBytes::from("f.txt"), NESTED.to_vec()),
+            stages(),
+        )
+    }
+
+    #[test]
+    fn a_nested_file_flattens_without_duplicating_rows() {
+        let v = nested_view();
+        assert!(v.is_nested());
+        assert_eq!(
+            v.places.len(),
+            11,
+            "eleven lines, eleven rows — the inner region keeps the outer's"
+        );
+        assert_eq!(
+            v.region_rows,
+            vec![0],
+            "only the outer region's opener is a jump target"
+        );
+        // The outer drew lines 0..=10, so the inner's own rows are the
+        // outer's: row 3 sits in the inner's ours text under the outer's
+        // index.
+        assert_eq!(v.places[3].place, Some((1, Part::Ours)));
+        // And it draws: the cached lines and the rows cover each other.
+        let host = Host::new();
+        let mut screen = Screen::new(40, 11);
+        let mut v = nested_view();
+        v.resize(40, 11);
+        v.paint(&mut screen, 0, 0, true, &host);
+        assert!(
+            screen.row_text(0).contains("<<<<<<<<<"),
+            "{:?}",
+            screen.row_text(0)
+        );
+    }
+
+    #[test]
+    fn a_press_arms_the_drag_and_the_drag_walks_the_keyboard() {
+        let host = Host::new();
+        let mut v = view();
+        v.resize(40, 13);
+        v.press(0, 2, false, &host);
+        v.drag(5, &host);
+        assert_eq!(v.view.cursor(), 5, "the press became a drag");
+        v.release();
+        v.drag(9, &host);
+        assert_eq!(v.view.cursor(), 5, "released, the drag is dead again");
     }
 
     #[test]

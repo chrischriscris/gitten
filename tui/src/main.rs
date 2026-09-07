@@ -4650,6 +4650,15 @@ impl App {
                 self.message = "this file has no conflict left to answer".into();
                 return;
             }
+            if view.is_nested() {
+                // A region inside another has no disjoint span to aim a
+                // choice at — refused with the remedy, not a guess at a
+                // region index the job would refuse anyway.
+                self.message =
+                    "this file's conflicts nest — resolve it whole with the file-level answers"
+                        .into();
+                return;
+            }
             match named {
                 Some(answer) => match view.current_region() {
                     Some(region) => Some((region, answer)),
@@ -15440,6 +15449,40 @@ shared tail
         assert_eq!(
             String::from_utf8_lossy(&state.lock().unwrap().conflict_bytes),
             "shared top\nours one\nshared middle\n<<<<<<< ours\nours two\n=======\ntheirs two\n>>>>>>> them\nshared tail\n",
+        );
+    }
+
+    #[test]
+    fn tui_parity_a_nested_file_answers_whole_never_by_region() {
+        // A merge inside a rebase inside a merge: the bytes hold an inner
+        // region inside an outer one. Every named answer is the same
+        // refusal — the remedy, not a region index — and nothing is
+        // submitted to the repository.
+        let (handle, state) = conflict_world();
+        state.lock().unwrap().conflict_bytes = b"<<<<<<<<< outer\nouter ours\n<<<<<<< inner\ninner ours\n=======\ninner theirs\n>>>>>>> inner\nouter theirs\n=========\nouter theirs side\n>>>>>>>>> outer\n".to_vec();
+        let mut app = commits_app(&handle);
+        open_merging(&mut app);
+        assert!(
+            matches!(app.panes.get("diff"), Some(Screens::Merging { .. })),
+            "the nested file still opens its merging view"
+        );
+        for command in [
+            "merge.take-ours",
+            "merge.take-theirs",
+            "merge.take-both",
+            "merge.take-side",
+        ] {
+            app.dispatch("view.down");
+            app.dispatch(command);
+            assert!(
+                app.message.contains("resolve it whole"),
+                "{command}: {:?}",
+                app.message
+            );
+        }
+        assert!(
+            state.lock().unwrap().hunk_answers.is_empty(),
+            "a refused answer submits nothing"
         );
     }
 

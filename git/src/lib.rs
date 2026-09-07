@@ -2254,6 +2254,14 @@ impl Repo for Binary {
                 "the file carries no conflict markers now — resolve it whole with the file-level answers".into(),
             );
         }
+        if file.is_nested() {
+            // A region inside another has no disjoint span to splice —
+            // refused with the same remedy as the unmarked file, because
+            // the remedy is the same: the file-level answers.
+            return Err(
+                "the file's conflicts nest — resolve it whole with the file-level answers".into(),
+            );
+        }
         if choices.iter().any(|(i, _)| *i >= file.regions.len()) {
             return Err(
                 "the conflict moved under the keyboard — reopen the file and answer again".into(),
@@ -9281,6 +9289,27 @@ mod tests {
 
         // The other conflicted file was not touched by f.txt's answer.
         assert_eq!(g.unmerged(b"other.txt").unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_nested_file_refuses_hunk_answers_and_keeps_its_bytes() {
+        // Real git never writes nested markers, so the scratch conflict's
+        // file is overwritten by hand; the unmerged stages are left
+        // standing, which is exactly the merge-inside-a-rebase state.
+        let r = two_region_conflict("merge-hunks-nested");
+        let nested: &[u8] = b"<<<<<<<<< outer\nouter ours\n<<<<<<< inner\ninner ours\n=======\ninner theirs\n>>>>>>> inner\nouter theirs\n=========\nouter theirs side\n>>>>>>>>> outer\n";
+        r.write("f.txt", nested);
+        let g = r.open();
+        let file = g.conflict_file(b"f.txt").expect("the conflicted file");
+        assert!(file.is_nested(), "the fixture is not nested: {file:?}");
+        let err = g
+            .resolve_hunks(b"f.txt", &[(0, gitten_core::conflict::Answer::Ours)])
+            .unwrap_err();
+        assert!(err.contains("resolve it whole"), "{err:?}");
+        // A refusal changes nothing: the bytes are the conflict still,
+        // and the stages still stand.
+        assert_eq!(std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(), nested);
+        assert_eq!(g.unmerged(b"f.txt").unwrap().len(), 3);
     }
 
     #[test]
