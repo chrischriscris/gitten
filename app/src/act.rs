@@ -10,9 +10,10 @@
 use crate::jobs::Job;
 use crate::verbs::Write;
 use gitten_core::operation::{Operation, Side};
-use gitten_core::refs::Target;
+use gitten_core::rebase::{compose, Rewrite};
+use gitten_core::refs::{ResetMode, Target};
 use gitten_core::status::PathBytes;
-use gitten_core::Hunk;
+use gitten_core::{Commit, Hunk};
 use gitten_git::Handle;
 
 /// The client services every shared action needs. Drawing and input stay in
@@ -379,6 +380,200 @@ pub fn operation_verb(client: &mut impl Client, command: &str) {
             return;
         }
     };
+    if !client.submit(Box::new(job)) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+// --------------------------------------------------------------------- history
+
+/// The commit the keyboard is on, as history verbs aim at it: the raw sha
+/// for git, a short display form for the questions a human answers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelectedCommit {
+    pub sha: Vec<u8>,
+    pub short: String,
+}
+
+/// The client-owned selection and confirmation state needed by history actions.
+pub trait HistoryClient: Client {
+    /// The commit row the keyboard is on. Clients refuse a command aimed at
+    /// the wrong pane before entering the shared action; `None` means no row.
+    fn commit_target(&self) -> Option<SelectedCommit>;
+    /// Arms this (command, commit) pair, or spends an arm already standing
+    /// on it. The command names the arm, so a soft reset never spends a
+    /// hard one's question.
+    fn confirm_or_arm_commit(&mut self, command: &str, target: &SelectedCommit) -> bool;
+    /// The loaded history window, newest first, and the source index of
+    /// the keyboard — what a rewrite composes its plan over. `None` when
+    /// the pane cannot offer one: a filtered list, an empty list, a
+    /// fixture with no history at all.
+    fn history_window(&self) -> Option<(&[Commit], usize)>;
+}
+
+/// The guard every history rewrite shares: a repository to write in, and no
+/// operation standing. A reset, revert or cherry-pick aimed into a merge or
+/// rebase in progress is a second write inside git's first, so it waits for
+/// the standing one to be aborted or finished first.
+fn history_repo(client: &mut impl Client, command: &str) -> Option<Handle> {
+    let Some(repo) = client.repo() else {
+        client.say("a fixture has no repository to rewrite in".into());
+        return None;
+    };
+    if let Some(operation) = client.operation() {
+        client.say(format!(
+            "{command} waits for the standing {} — abort it or finish it first",
+            operation.kind.word()
+        ));
+        return None;
+    }
+    Some(repo)
+}
+
+/// `commits.reset-menu`: the question, not the write. The strengths stay
+/// separate commands so each arms and spends its own answer — a soft reset
+/// must never spend a hard one's question.
+pub fn reset_menu(client: &mut impl HistoryClient) {
+    let Some(target) = client.commit_target() else {
+        client.say("nothing selected to reset to".into());
+        return;
+    };
+    if client.repo().is_none() {
+        client.say("a fixture has no repository to rewrite in".into());
+        return;
+    }
+    client.ask(format!(
+        "reset to {}? soft, mixed or hard — s, m, h",
+        target.short
+    ));
+}
+
+/// `commits.reset-soft` / `-mixed` / `-hard`: moves the branch onto the
+/// commit the keyboard is on, taking as much of the index and working tree
+/// along as the strength says. Hard destroys unstaged work, which is why
+/// every strength asks twice — armed on (command, commit), so the second
+/// press has to name the same strength at the same commit.
+pub fn reset_to(client: &mut impl HistoryClient, command: &str, mode: ResetMode) {
+    let Some(target) = client.commit_target() else {
+        client.say("nothing selected to reset to".into());
+        return;
+    };
+    let Some(repo) = history_repo(client, command) else {
+        return;
+    };
+    if !client.confirm_or_arm_commit(command, &target) {
+        client.ask(format!(
+            "reset {} to {}? press again to confirm",
+            mode.flag(),
+            target.short
+        ));
+        return;
+    }
+    let job = Write::reset(&repo, mode, target.sha.clone());
+    if !client.submit(Box::new(job)) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+/// `commits.revert`: lands the commit's inverse as a new commit. Nothing is
+/// destroyed — dropping the result undoes the undo — so no confirmation
+/// precedes it, and a conflict comes back refused in git's own words.
+pub fn revert_commit(client: &mut impl HistoryClient) {
+    const COMMAND: &str = "commits.revert";
+    let Some(target) = client.commit_target() else {
+        client.say("nothing selected to revert".into());
+        return;
+    };
+    let Some(repo) = history_repo(client, COMMAND) else {
+        return;
+    };
+    let job = Write::revert(&repo, target.sha.clone());
+    if !client.submit(Box::new(job)) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+/// `commits.cherry-pick`: replays the commit under the keyboard onto HEAD.
+/// One commit only; the clipboard's ranges are W6's second half. A conflict
+/// stops the pick mid-flight and the lifecycle carries it from there.
+pub fn cherry_pick_single(client: &mut impl HistoryClient) {
+    const COMMAND: &str = "commits.cherry-pick";
+    let Some(target) = client.commit_target() else {
+        client.say("nothing selected to cherry-pick".into());
+        return;
+    };
+    let Some(repo) = history_repo(client, COMMAND) else {
+        return;
+    };
+    let job = Write::cherry_pick(&repo, target.sha.clone());
+    if !client.submit(Box::new(job)) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+/// `commits.squash-up` / `fixup-up` / `drop-commit`: composes the plan
+/// over the loaded window and runs it as a scripted interactive rebase.
+/// Every shape the plan cannot complete refuses in `compose`'s words
+/// before anything is armed — a merge in the window, a fold at the
+/// window's edge, a root — and a composable shape still asks twice,
+/// armed on (command, commit), because a rewrite destroys. The standing
+/// operation (a rebase already mid-flight, a merge unanswered) refuses
+/// first: starting a second rewrite inside git's first is never the move.
+/// A conflict mid-rewrite comes back refused in git's words with rebase
+/// state left standing for the lifecycle to carry on.
+pub fn rewrite_commit(client: &mut impl HistoryClient, command: &str, kind: Rewrite) {
+    let verb = match kind {
+        Rewrite::SquashUp => "squash",
+        Rewrite::FixupUp => "fixup",
+        Rewrite::Drop => "drop",
+    };
+    // The window is cloned out before anything else borrows the client
+    // mutably: the plan composes over owned commits, so a standing
+    // operation or a missing repository can still refuse in its own words
+    // after the window is already in hand.
+    let Some((window, index)) = client.history_window().map(|(w, i)| (w.to_vec(), i)) else {
+        client.say(format!(
+            "{command} needs the whole loaded window — clear the search first"
+        ));
+        return;
+    };
+    let Some(target) = client.commit_target() else {
+        client.say("nothing selected to rewrite".into());
+        return;
+    };
+    let Some(repo) = history_repo(client, command) else {
+        return;
+    };
+    let (upstream, script) = match compose(kind, &window, index) {
+        Ok(plan) => plan,
+        Err(e) => {
+            client.say(e);
+            return;
+        }
+    };
+    if !client.confirm_or_arm_commit(command, &target) {
+        client.ask(format!("{verb} {}? press again to confirm", target.short));
+        return;
+    }
+    let job = Write::rebase_todo(&repo, upstream, script);
+    if !client.submit(Box::new(job)) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+/// `commits.checkout`: moves HEAD onto the commit under the keyboard — a
+/// detached HEAD, said as such, because a checkout that silently stays
+/// attached is a branch moved by accident.
+pub fn checkout_commit(client: &mut impl HistoryClient) {
+    const COMMAND: &str = "commits.checkout";
+    let Some(target) = client.commit_target() else {
+        client.say("nothing selected to check out".into());
+        return;
+    };
+    let Some(repo) = history_repo(client, COMMAND) else {
+        return;
+    };
+    let job = Write::checkout(&repo, target.sha.clone());
     if !client.submit(Box::new(job)) {
         client.say("the job queue is shutting down".into());
     }

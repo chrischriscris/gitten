@@ -305,6 +305,20 @@ impl Commits {
         self.commits.get(*self.visible.get(self.view.cursor())?)
     }
 
+    /// The whole loaded window, newest first, and the source index of
+    /// the cursor — what a history rewrite composes its plan over.
+    /// `None` under a query or past the list's end: a filtered list is
+    /// not a straight window, and a plan built from one would not cover
+    /// what the rebase touches. Unfiltered the visible table is the
+    /// identity, so the cursor already is the source index.
+    pub fn history_window(&self) -> Option<(&[Commit], usize)> {
+        if self.query.is_some() {
+            return None;
+        }
+        let cursor = self.view.cursor();
+        (cursor < self.commits.len()).then_some((self.commits.as_slice(), cursor))
+    }
+
     /// The commit an object id names, from the rows this pane holds — the
     /// subject a preview's label borrows. `None` when the pane does not
     /// hold it: a filtered list, a history the drilldown replaced.

@@ -48,7 +48,7 @@ use gitten_core::differ::Overrides;
 use gitten_core::edit::{Edit, Field};
 use gitten_core::host::Host;
 use gitten_core::operation::{Operation, Side};
-use gitten_core::refs::{HeadState, RefName};
+use gitten_core::refs::{HeadState, RefName, ResetMode};
 use gitten_core::runs::Run;
 use gitten_core::source::DiffSource;
 use gitten_tui::branches::{self, Branches, Marks, Target};
@@ -1393,6 +1393,11 @@ struct App {
     /// keys on it, and shared policy (`act`) reads it instead of asking the
     /// repository a second time. Refreshed wherever the panes are.
     operation: Option<Operation>,
+    /// The armed (command, commit) a destructive history verb asked about —
+    /// spent only by the same command naming the same commit, which is what
+    /// keeps a soft reset from ever spending a hard one's question. `None`
+    /// while no history question stands.
+    history_arm: Option<(String, Vec<u8>)>,
     help: bool,
     /// First key row visible in the help modal. Independent of every pane's
     /// cursor and viewport, as a modal's reading position must be.
@@ -1664,6 +1669,7 @@ impl App {
             repo,
             availability: tui_availability(startup_pending, None),
             operation: None,
+            history_arm: None,
             panes,
             layout: Box::new(panes::BuiltinLayout),
             geometry: None,
@@ -2563,6 +2569,18 @@ impl App {
         match self.panes.focused() {
             Some(Screens::Branches { view, .. }) => view.current(),
             _ => None,
+        }
+    }
+
+    /// Whether the keyboard is on the commits pane — the guard every history
+    /// verb opens with, said the way every wrong-focus refusal here is said.
+    fn commits_focused(&mut self, command: &str) -> bool {
+        match self.panes.focused() {
+            Some(Screens::Commits { .. }) => true,
+            _ => {
+                self.message = format!("{command} is not supported here");
+                false
+            }
         }
     }
 
@@ -3670,6 +3688,47 @@ impl App {
             "branches.unset-upstream" => {
                 if self.branches_focused("branches.unset-upstream") {
                     gitten_app::act::unset_upstream(self);
+                }
+            }
+            // The history verbs: the commit the keyboard is on, the shared
+            // action that means it. Reset's strengths arm separately — a soft
+            // reset never spends a hard one's question — and the menu only
+            // asks which strength; revert and cherry-pick destroy nothing,
+            // so they run on the first press, and a detached checkout is
+            // refused by name while an operation stands.
+            "commits.reset-menu" => {
+                if self.commits_focused("commits.reset-menu") {
+                    gitten_app::act::reset_menu(self);
+                }
+            }
+            "commits.reset-soft" => {
+                if self.commits_focused("commits.reset-soft") {
+                    gitten_app::act::reset_to(self, "commits.reset-soft", ResetMode::Soft);
+                }
+            }
+            "commits.reset-mixed" => {
+                if self.commits_focused("commits.reset-mixed") {
+                    gitten_app::act::reset_to(self, "commits.reset-mixed", ResetMode::Mixed);
+                }
+            }
+            "commits.reset-hard" => {
+                if self.commits_focused("commits.reset-hard") {
+                    gitten_app::act::reset_to(self, "commits.reset-hard", ResetMode::Hard);
+                }
+            }
+            "commits.revert" => {
+                if self.commits_focused("commits.revert") {
+                    gitten_app::act::revert_commit(self);
+                }
+            }
+            "commits.cherry-pick" => {
+                if self.commits_focused("commits.cherry-pick") {
+                    gitten_app::act::cherry_pick_single(self);
+                }
+            }
+            "commits.checkout" => {
+                if self.commits_focused("commits.checkout") {
+                    gitten_app::act::checkout_commit(self);
                 }
             }
             // The merge verbs: the local branch the keyboard is on, brought
@@ -5212,6 +5271,17 @@ fn tui_availability(repo: bool, operation: Option<&Operation>) -> Availability {
         "branches.set-upstream",
         "branches.unset-upstream",
         "commits.new-branch",
+        // The history verbs act on the commit the keyboard is on — the
+        // row, the shared action, the queue. Reset's strengths arm
+        // separately; revert and cherry-pick destroy nothing, so the
+        // dispatch-time refusals are the shared actions'.
+        "commits.reset-menu",
+        "commits.reset-soft",
+        "commits.reset-mixed",
+        "commits.reset-hard",
+        "commits.revert",
+        "commits.cherry-pick",
+        "commits.checkout",
         "remotes.focus",
         "remotes.fetch",
         "remotes.new",
@@ -5289,6 +5359,34 @@ fn tui_availability(repo: bool, operation: Option<&Operation>) -> Availability {
             a.disabled("files.toggle-side", "a fixture has no file to preview");
             a.disabled("stashes.open-diff", "a fixture has no stash to preview");
             a.disabled("branches.open-log", "a fixture has no history to open");
+            a.disabled(
+                "commits.reset-menu",
+                "a fixture has no repository to rewrite in",
+            );
+            a.disabled(
+                "commits.reset-soft",
+                "a fixture has no repository to rewrite in",
+            );
+            a.disabled(
+                "commits.reset-mixed",
+                "a fixture has no repository to rewrite in",
+            );
+            a.disabled(
+                "commits.reset-hard",
+                "a fixture has no repository to rewrite in",
+            );
+            a.disabled(
+                "commits.revert",
+                "a fixture has no repository to rewrite in",
+            );
+            a.disabled(
+                "commits.cherry-pick",
+                "a fixture has no repository to rewrite in",
+            );
+            a.disabled(
+                "commits.checkout",
+                "a fixture has no repository to check out in",
+            );
             a.disabled(
                 "merge.take-side",
                 "a fixture has no repository to resolve in",
@@ -5492,6 +5590,43 @@ impl gitten_app::act::RemoteClient for App {
 
     fn confirm_or_arm_remote(&mut self, name: &RefName) -> bool {
         self.confirm_or_arm_remote(name)
+    }
+}
+
+impl gitten_app::act::HistoryClient for App {
+    fn commit_target(&self) -> Option<gitten_app::act::SelectedCommit> {
+        let Some(Screens::Commits { view, .. }) = self.panes.focused() else {
+            return None;
+        };
+        view.current()
+            .map(|commit| gitten_app::act::SelectedCommit {
+                sha: commit.sha.as_bytes().to_vec(),
+                short: commit.short.clone(),
+            })
+    }
+
+    fn history_window(&self) -> Option<(&[gitten_core::Commit], usize)> {
+        let Some(Screens::Commits { view, .. }) = self.panes.focused() else {
+            return None;
+        };
+        view.history_window()
+    }
+
+    fn confirm_or_arm_commit(
+        &mut self,
+        command: &str,
+        target: &gitten_app::act::SelectedCommit,
+    ) -> bool {
+        // The arm names the command as well as the commit: a soft reset
+        // asked, then a hard reset pressed, asks again rather than firing.
+        let armed = (command.to_string(), target.sha.clone());
+        if self.history_arm.as_ref() == Some(&armed) {
+            self.history_arm = None;
+            true
+        } else {
+            self.history_arm = Some(armed);
+            false
+        }
     }
 }
 
@@ -6781,6 +6916,10 @@ diff --git a/tracked.txt b/tracked.txt
         conflict_stages: Vec<gitten_git::UnmergedStage>,
         hunk_answers: Vec<Vec<(usize, gitten_core::conflict::Answer)>>,
         restores: Vec<Vec<u8>>,
+        /// The operation the history reads answer — `None` is a clean tree.
+        /// Set directly by history tests, exactly like `status` and the
+        /// stash stack: the next `sync_operation` sees the world they built.
+        standing: Option<Operation>,
     }
 
     /// A repository that exists only as this struct. Reads answer what the
@@ -7000,6 +7139,38 @@ diff --git a/tracked.txt b/tracked.txt
             Ok(s.head.clone().unwrap_or(HeadState::Detached {
                 commit: "f00d".into(),
             }))
+        }
+
+        fn operation(&self) -> Option<Operation> {
+            self.0.lock().unwrap().standing
+        }
+
+        fn reset(
+            &self,
+            mode: gitten_core::refs::ResetMode,
+            target: &[u8],
+        ) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            s.writes.push(format!(
+                "reset {} {}",
+                mode.flag(),
+                String::from_utf8_lossy(target)
+            ));
+            Ok(())
+        }
+
+        fn revert(&self, commit: &[u8]) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            s.writes
+                .push(format!("revert {}", String::from_utf8_lossy(commit)));
+            Ok(())
+        }
+
+        fn cherry_pick(&self, sha: &[u8]) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            s.writes
+                .push(format!("cherry-pick {}", String::from_utf8_lossy(sha)));
+            Ok(())
         }
 
         fn checkout(&self, name: &[u8]) -> gitten_git::Result<()> {
