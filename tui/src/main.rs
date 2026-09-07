@@ -47,6 +47,7 @@ use gitten_core::command::{chord_string, Availability, Code, Key, Modes, Resolve
 use gitten_core::differ::Overrides;
 use gitten_core::edit::{Edit, Field};
 use gitten_core::host::Host;
+use gitten_core::operation::{Operation, Side};
 use gitten_core::refs::{HeadState, RefName};
 use gitten_core::runs::Run;
 use gitten_core::source::DiffSource;
@@ -1307,6 +1308,11 @@ struct App {
     /// binary. A config reload rebuilds the host and never this — what the
     /// client can run is not the file's to say.
     availability: Availability,
+    /// The operation standing in the repository, as the last acquisition
+    /// reported it — the banner names it, availability gates the lifecycle
+    /// keys on it, and shared policy (`act`) reads it instead of asking the
+    /// repository a second time. Refreshed wherever the panes are.
+    operation: Option<Operation>,
     help: bool,
     /// First key row visible in the help modal. Independent of every pane's
     /// cursor and viewport, as a modal's reading position must be.
@@ -1573,7 +1579,8 @@ impl App {
         let mut app = Self {
             host,
             repo,
-            availability: tui_availability(startup_pending),
+            availability: tui_availability(startup_pending, None),
+            operation: None,
             panes,
             layout: Box::new(panes::BuiltinLayout),
             geometry: None,
@@ -1767,6 +1774,10 @@ impl App {
             *label = next;
         }
         self.message = error.unwrap_or_default();
+        // The operation standing re-read with the same wave that refreshed
+        // the panes: an externally started rebase is on the banner before
+        // the first real frame draws.
+        self.sync_operation();
         self.panes.focus_named(&launch_focus);
         self.sync_header_keys();
         self.sync_modes();
@@ -2923,8 +2934,10 @@ impl App {
         self.panes = panes;
         self.repo = Some((path.clone(), handle));
         // What the client runs changed with the repository: a fixture view
-        // refused the sync keys, and this one answers them.
-        self.availability = tui_availability(true);
+        // refused the sync keys, and this one answers them. The operation
+        // standing travels with it — the new repository may have arrived
+        // mid-rebase — and the lifecycle keys gate on the fresh answer.
+        self.sync_operation();
         self.startup_pending = true;
         self.help = false;
         self.tail = None;
@@ -3564,6 +3577,47 @@ impl App {
                     gitten_app::act::unset_upstream(self);
                 }
             }
+            // The merge verbs: the local branch the keyboard is on, brought
+            // into the branch HEAD sits on. A remote row says so and stops —
+            // merging a tracking ref is a checkout question first — and the
+            // detached row is a place, not a branch, so every branch verb
+            // refuses it the same way this one does.
+            "branches.merge" | "branches.merge-squash" => {
+                if self.branches_focused(command) {
+                    let squash = command == "branches.merge-squash";
+                    match self.branch_target() {
+                        Some(Target::Local(name)) => {
+                            gitten_app::act::merge_selected(self, name.as_bytes().to_vec(), squash)
+                        }
+                        Some(Target::Remote { .. }) => {
+                            self.message = format!(
+                                "{command} merges a local branch; the row the keyboard is on is remote"
+                            );
+                        }
+                        Some(Target::Detached) | None => {
+                            self.message = format!("{command} has no local branch to merge")
+                        }
+                    }
+                }
+            }
+            // The lifecycle door: whichever operation is standing, one set
+            // of keys — plus the per-kind capitals that reach the same
+            // shared action and are checked against the same standing
+            // operation there.
+            "operation.abort"
+            | "operation.continue"
+            | "operation.skip"
+            | "rebase.abort"
+            | "rebase.continue"
+            | "commits.cherry-pick-abort"
+            | "commits.cherry-pick-continue" => gitten_app::act::operation_verb(self, command),
+            // A conflict row's four answers, routed like every other file
+            // write: the shared action reads the selection, refuses a row
+            // that is not a conflict, and the queue does the resolving.
+            "files.resolve-ours" => gitten_app::act::resolve_conflict(self, Side::Ours),
+            "files.resolve-theirs" => gitten_app::act::resolve_conflict(self, Side::Theirs),
+            "files.resolve-both" => gitten_app::act::resolve_conflict(self, Side::Both),
+            "files.resolve-keep" => gitten_app::act::resolve_conflict(self, Side::Keep),
             // The remotes verbs: the row the keyboard is on, the shared
             // `Write` that means it. Add and edit open the one prompt chain
             // on their way through.
@@ -4408,6 +4462,19 @@ impl App {
         gitten_app::act::ignore_file(self);
     }
 
+    /// Re-reads the operation standing in the repository, and the
+    /// availability that gates on it. Called wherever the panes re-read —
+    /// startup, a finished job's finish wave, a repository switch — and
+    /// nowhere else: it runs git, and a render must not.
+    fn sync_operation(&mut self) {
+        self.operation = self
+            .repo
+            .as_ref()
+            .and_then(|(_, repo)| repo.as_ref().operation());
+        let repo_backed = self.repo.is_some();
+        self.availability = tui_availability(repo_backed, self.operation.as_ref());
+    }
+
     /// Drains the job queue. Called before each frame, so the frame this
     /// iteration draws is the one the finished jobs produced.
     ///
@@ -4442,6 +4509,10 @@ impl App {
                         // itself; a job that named its finish gets its word.
                         (None, None) => done.unwrap_or_default(),
                     };
+                    // A write may have started, finished or abandoned an
+                    // operation; the banner and the lifecycle gates re-read
+                    // it with everything else the finish wave refreshes.
+                    self.sync_operation();
                 }
             }
         }
@@ -4664,6 +4735,49 @@ impl App {
                     .unwrap_or_default(),
                 false => self.message.clone(),
             };
+            // An operation standing names itself before everything else on
+            // this line — it is the one fact every key on the pane is gated
+            // by — with the keys that answer it. The keys come from the
+            // keymap, so a rebind moves this line the way it moves help;
+            // the count names why continue would refuse.
+            let status = match self.operation.as_ref() {
+                Some(op) => {
+                    let key = |name: &str| {
+                        self.host
+                            .keys
+                            .keys_for(name)
+                            .first()
+                            .map(|k| k.to_string())
+                            .unwrap_or_default()
+                    };
+                    let conflicts = match op.conflicts {
+                        0 => String::new(),
+                        1 => " · 1 conflicted file".to_string(),
+                        n => format!(" · {n} conflicted files"),
+                    };
+                    let keys = match op.can_skip() {
+                        true => format!(
+                            "{} abort · {} continue · {} skip",
+                            key("operation.abort"),
+                            key("operation.continue"),
+                            key("operation.skip")
+                        ),
+                        false => format!(
+                            "{} abort · {} continue",
+                            key("operation.abort"),
+                            key("operation.continue")
+                        ),
+                    };
+                    format!(
+                        "{} in progress{} · {} · {}",
+                        op.kind.word(),
+                        conflicts,
+                        keys,
+                        status
+                    )
+                }
+                None => status,
+            };
             // The previous frame's cost, not this one's — this one has not been
             // drawn yet, and a number measured after the fact would be
             // describing a frame nobody saw.
@@ -4740,7 +4854,7 @@ impl App {
 /// The launch is the one variable: `repo.refresh` has a handler, but a
 /// fixture view has no repository behind it, so there it is supported-but-
 /// turned-away with the reason instead of advertised as if it ran.
-fn tui_availability(repo: bool) -> Availability {
+fn tui_availability(repo: bool, operation: Option<&Operation>) -> Availability {
     let mut a = Availability::strict();
     a.available([
         // Dispatched by name, ahead of any pane.
@@ -4803,6 +4917,15 @@ fn tui_availability(repo: bool) -> Availability {
         "remotes.edit",
         "remotes.remove",
         "remotes.search",
+        // A merge aims at the branch row the keyboard is on; the four
+        // conflict answers aim at the conflict row. Both are live whenever
+        // a repository is; the wrong-selection refusals are dispatch's.
+        "branches.merge",
+        "branches.merge-squash",
+        "files.resolve-ours",
+        "files.resolve-theirs",
+        "files.resolve-both",
+        "files.resolve-keep",
         // A repository is what a switch aims away from and at; both are
         // answerable from a fixture view, which is where a repository
         // gets opened from when the launch had none.
@@ -4856,6 +4979,73 @@ fn tui_availability(repo: bool) -> Availability {
             a.disabled("branches.open-log", "a fixture has no history to open");
         }
     }
+    // The lifecycle keys answer whichever operation stands — the one fact
+    // that changes between two runs of the same binary, read from the
+    // repository and carried beside the availability that gates on it. A
+    // key bound to a rewrite in progress must not advertise itself while
+    // the tree is clean; a key aimed at a rebase must not pretend a merge
+    // is one. The per-kind names keep their own kind's gate; the generic
+    // trio (`operation.abort` / `.continue` / `.skip`) answers whatever is
+    // standing, skip being a rebase's alone.
+    match operation {
+        None => {
+            a.disabled(
+                "operation.abort",
+                "no merge, rebase, cherry-pick or revert is in progress",
+            );
+            a.disabled(
+                "operation.continue",
+                "no merge, rebase, cherry-pick or revert is in progress",
+            );
+            a.disabled(
+                "operation.skip",
+                "skip belongs to a rebase; none is in progress",
+            );
+            a.disabled("rebase.abort", "no rebase is in progress");
+            a.disabled("rebase.continue", "no rebase is in progress");
+            a.disabled("commits.cherry-pick-abort", "no cherry-pick is in progress");
+            a.disabled(
+                "commits.cherry-pick-continue",
+                "no cherry-pick is in progress",
+            );
+        }
+        Some(op) => {
+            let standing = op.kind.word();
+            a.available(["operation.abort", "operation.continue"]);
+            if op.can_skip() {
+                a.available(["operation.skip"]);
+            } else {
+                a.disabled(
+                    "operation.skip",
+                    format!("skip belongs to a rebase; a {standing} is in progress"),
+                );
+            }
+            if op.kind == gitten_core::operation::Kind::Rebase {
+                a.available(["rebase.abort", "rebase.continue"]);
+            } else {
+                a.disabled(
+                    "rebase.abort",
+                    format!("a {standing} is in progress, not a rebase"),
+                );
+                a.disabled(
+                    "rebase.continue",
+                    format!("a {standing} is in progress, not a rebase"),
+                );
+            }
+            if op.kind == gitten_core::operation::Kind::CherryPick {
+                a.available(["commits.cherry-pick-abort", "commits.cherry-pick-continue"]);
+            } else {
+                a.disabled(
+                    "commits.cherry-pick-abort",
+                    format!("a {standing} is in progress, not a cherry-pick"),
+                );
+                a.disabled(
+                    "commits.cherry-pick-continue",
+                    format!("a {standing} is in progress, not a cherry-pick"),
+                );
+            }
+        }
+    }
     a
 }
 
@@ -4894,6 +5084,19 @@ impl gitten_app::act::Client for App {
 
     fn submit(&mut self, job: Box<dyn Job>) -> bool {
         self.submitter.submit(job).is_ok()
+    }
+
+    fn operation(&self) -> Option<Operation> {
+        self.operation
+    }
+
+    fn selected_conflict(&self) -> Option<gitten_core::status::PathBytes> {
+        let Some(Screens::Files { view, .. }) = self.panes.focused() else {
+            return None;
+        };
+        view.current_file()
+            .filter(|file| file.section == files::Section::Conflicts)
+            .map(|file| file.path.clone())
     }
 }
 
@@ -9361,7 +9564,7 @@ diff --git a/tracked.txt b/tracked.txt
         // And the availability contract agrees with the dispatch: help
         // lists the three, and the dispatch refuses none of them by
         // availability.
-        let availability = tui_availability(true);
+        let availability = tui_availability(true, None);
         for name in [
             "diff.toggle-line-selection",
             "diff.discard-hunk",
@@ -11633,48 +11836,60 @@ diff --git a/tracked.txt b/tracked.txt
     }
 
     #[test]
-    fn rebase_commands_remain_explicitly_deferred() {
-        // The scope fence for the named lifecycle follow-up — rebase-onto,
-        // conflict state, abort and continue — not the desired final
-        // product: the availability contract marks them unsupported, the
-        // keys say so, and no job is ever submitted.
+    fn lifecycle_commands_gate_on_the_standing_operation() {
+        // One fence survives from the deferred test, on purpose:
+        // `commits.rebase-onto` is history *editing* — W6's packet, not the
+        // lifecycle slice's — and stays unsupported. Everything below it
+        // changed when the lifecycle landed: the exit keys are live, and
+        // with a clean tree the honest word is why not, said through the
+        // availability contract's reason, not a refusal that claims the
+        // client cannot run them at all.
         let (handle, state) = fake(&[]);
         branch_world(&state);
         let mut app = commits_app(&handle);
         app.press(Key::plain(Code::Char('3')));
 
         // The key resolves through core's branches mode — lowercase `r` —
-        // and lands on the same unsupported name.
+        // and lands on the same unsupported name it always did.
         app.press(Key::char('r'));
         assert_eq!(
             app.message,
             "commits.rebase-onto is not supported by this client"
         );
-        app.dispatch("commits.rebase-onto");
-        assert_eq!(
-            app.message,
-            "commits.rebase-onto is not supported by this client"
-        );
 
-        // From the commits pane, the two exits say the same thing.
+        // From the commits pane: gated, not unsupported — and no job ever
+        // submitted, which is what the empty write log proves.
         app.press(Key::plain(Code::Char('4')));
         app.dispatch("rebase.abort");
-        assert_eq!(app.message, "rebase.abort is not supported by this client");
+        assert_eq!(app.message, "rebase.abort: no rebase is in progress");
         app.dispatch("rebase.continue");
+        assert_eq!(app.message, "rebase.continue: no rebase is in progress");
+        // The generic door says it in its own words, and skip names the
+        // kind it belongs to.
+        app.dispatch("operation.abort");
         assert_eq!(
             app.message,
-            "rebase.continue is not supported by this client"
+            "operation.abort: no merge, rebase, cherry-pick or revert is in progress"
+        );
+        app.dispatch("operation.continue");
+        assert_eq!(
+            app.message,
+            "operation.continue: no merge, rebase, cherry-pick or revert is in progress"
+        );
+        app.dispatch("operation.skip");
+        assert_eq!(
+            app.message,
+            "operation.skip: skip belongs to a rebase; none is in progress"
         );
 
         app.pump_quiet();
         let s = state.lock().unwrap();
         assert!(
             s.branch_writes.is_empty() && s.writes.is_empty(),
-            "a rebase job was submitted: {:?}",
+            "a lifecycle job was submitted: {:?}",
             s.branch_writes
         );
     }
-
     #[test]
     fn wave_one_and_plan_016_features_survive_a_third_tenant() {
         let (handle, state) = fake(&[]);
@@ -13523,6 +13738,210 @@ diff --git a/tracked.txt b/tracked.txt
     /// pull, a rejected push said in git's own words, a push that creates
     /// its upstream, a detached HEAD refused by name, and a remote row
     /// checked out as a tracking branch. Nothing leaves the temp dir.
+    /// git allowed to fail: the conflicted start of an operation, whose
+    /// nonzero exit and standing state are exactly the fixture the test
+    /// wants to find already standing.
+    fn git_failing(repo: &Git, args: &[&str]) {
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.0.as_path())
+            .args(Git::setup())
+            .args(args)
+            .output()
+            .expect("git runs");
+    }
+
+    /// Two branches that disagree about f.txt, merged from the shell — the
+    /// operation arrives standing before any client opens, which is how a
+    /// rebase started in another terminal arrives too.
+    fn externally_conflicted_merge(name: &str) -> Git {
+        let repo = Git::init(name);
+        repo.write("f.txt", "base\n");
+        repo.commit("base");
+        repo.git(&["checkout", "-qb", "side"]);
+        repo.write("f.txt", "theirs\n");
+        repo.commit("theirs");
+        repo.git(&["checkout", "-q", "main"]);
+        repo.write("f.txt", "ours\n");
+        repo.commit("ours");
+        git_failing(&repo, &["merge", "side"]);
+        repo
+    }
+
+    #[test]
+    fn tui_parity_an_externally_started_merge_is_bannered_and_aborted() {
+        let repo = externally_conflicted_merge("op-external");
+        let mut app = repo_app(repo.0.as_path());
+        app.draw();
+        // The banner names the operation, the count, and the keys that
+        // answer it — the keys read from the keymap, not memorized here.
+        let line = status(&app);
+        assert!(
+            line.contains("merge in progress · 1 conflicted file"),
+            "{line}"
+        );
+        assert!(line.contains("abort"), "{line}");
+
+        // m backs out: the tree returns to where the merge found it, the
+        // banner goes, and a client opened fresh agrees — reopen recovery
+        // is the same acquisition reading the same disk truth.
+        app.dispatch("operation.abort");
+        assert!(
+            until(Duration::from_secs(5), || {
+                app.pump();
+                app.message.contains("merge aborted")
+            }),
+            "the abort never finished: {:?}",
+            app.message
+        );
+        app.draw();
+        let line = status(&app);
+        assert!(!line.contains("in progress"), "{line}");
+        assert_eq!(std::fs::read(repo.0.join("f.txt")).unwrap(), b"ours\n");
+        let mut reopened = repo_app(repo.0.as_path());
+        reopened.draw();
+        assert!(!status(&reopened).contains("in progress"));
+    }
+
+    #[test]
+    fn tui_parity_a_conflict_resolved_by_key_continues_into_the_merge_commit() {
+        let repo = externally_conflicted_merge("op-resolve");
+        let mut app = repo_app(repo.0.as_path());
+        app.dispatch("files.focus");
+        app.draw();
+        // The conflict row: the files pane's last section, so the bottom of
+        // the list is where the keyboard lands — the honest walk the key
+        // would have taken.
+        app.dispatch("view.bottom");
+        app.draw();
+        app.dispatch("files.resolve-ours");
+        assert!(
+            until(Duration::from_secs(5), || {
+                app.pump();
+                app.message.contains("resolved")
+            }),
+            "the resolution never ran: {:?}",
+            app.message
+        );
+        // Ours' bytes are the answer, and the banner still names the merge.
+        assert_eq!(std::fs::read(repo.0.join("f.txt")).unwrap(), b"ours\n");
+        app.draw();
+        assert!(status(&app).contains("merge in progress"));
+
+        // M carries the merge onward: a real merge commit, two parents.
+        app.dispatch("operation.continue");
+        assert!(
+            until(Duration::from_secs(5), || {
+                app.pump();
+                app.message.contains("merge continued")
+            }),
+            "the continue never finished: {:?}",
+            app.message
+        );
+        let parents = repo.ask(&["rev-list", "--parents", "-n", "1", "HEAD"]);
+        assert_eq!(parents.split_whitespace().count(), 3, "HEAD + two parents");
+        app.draw();
+        assert!(!status(&app).contains("in progress"));
+    }
+
+    #[test]
+    fn tui_parity_the_lifecycle_keys_gate_by_the_kind_standing() {
+        let repo = externally_conflicted_merge("op-gate");
+        let mut app = repo_app(repo.0.as_path());
+        app.draw();
+        // The per-kind keys answer their own kind only: a merge stands, so
+        // the rebase exits refuse through availability, naming what stands.
+        app.dispatch("rebase.abort");
+        assert_eq!(
+            app.message,
+            "rebase.abort: a merge is in progress, not a rebase"
+        );
+        app.dispatch("commits.cherry-pick-continue");
+        assert_eq!(
+            app.message,
+            "commits.cherry-pick-continue: a merge is in progress, not a cherry-pick"
+        );
+        // Skip belongs to a rebase; the generic exits do not.
+        app.dispatch("operation.skip");
+        assert_eq!(
+            app.message,
+            "operation.skip: skip belongs to a rebase; a merge is in progress"
+        );
+        // A continue with conflicts still standing must refuse — git's own
+        // word — and never invent a commit. HEAD proves it.
+        let head_before = repo.ask(&["rev-parse", "HEAD"]);
+        app.dispatch("operation.continue");
+        assert!(
+            until(Duration::from_secs(5), || {
+                app.pump();
+                let m = app.message.to_lowercase();
+                m.contains("unmerged") || m.contains("unresolved")
+            }),
+            "the refused continue never named its reason: {:?}",
+            app.message
+        );
+        assert_eq!(repo.ask(&["rev-parse", "HEAD"]), head_before);
+        // And the standing merge is untouched by every refusal above.
+        app.dispatch("operation.abort");
+        assert!(
+            until(Duration::from_secs(5), || {
+                app.pump();
+                app.message.contains("merge aborted")
+            }),
+            "the abort never finished: {:?}",
+            app.message
+        );
+    }
+
+    #[test]
+    fn tui_parity_merging_a_selected_branch_stops_on_its_conflict() {
+        let repo = Git::init("op-merge-row");
+        repo.write("f.txt", "base\n");
+        repo.commit("base");
+        repo.git(&["checkout", "-qb", "side"]);
+        repo.write("f.txt", "theirs\n");
+        repo.commit("theirs");
+        repo.git(&["checkout", "-q", "main"]);
+        repo.write("f.txt", "ours\n");
+        repo.commit("ours");
+
+        let mut app = repo_app(repo.0.as_path());
+        app.dispatch("branches.focus");
+        app.draw();
+        // Walk down to the `side` row — the honest path the key would take.
+        app.dispatch("view.top");
+        for _ in 0..8 {
+            let named = branches_of(&app).status();
+            if named.contains("side") {
+                break;
+            }
+            app.dispatch("view.down");
+        }
+        app.dispatch("branches.merge");
+        // A conflicted merge refuses with git's own sentence and leaves its
+        // question standing, which the banner then names.
+        assert!(
+            until(Duration::from_secs(5), || {
+                app.pump();
+                app.draw();
+                status(&app).contains("merge in progress · 1 conflicted file")
+            }),
+            "the conflicted merge never surfaced: {:?}",
+            app.message
+        );
+        // The way out is the same door: abort puts the tree back.
+        app.dispatch("operation.abort");
+        assert!(
+            until(Duration::from_secs(5), || {
+                app.pump();
+                app.message.contains("merge aborted")
+            }),
+            "the abort never finished: {:?}",
+            app.message
+        );
+        assert_eq!(std::fs::read(repo.0.join("f.txt")).unwrap(), b"ours\n");
+    }
+
     #[test]
     fn tui_parity_the_sync_trip_over_a_local_bare_remote() {
         let seed = Git::init("sync-seed");

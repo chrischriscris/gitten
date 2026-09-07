@@ -424,6 +424,14 @@ impl Keymap {
         // lazygit's shift-stash: park what the working tree holds and start
         // again from HEAD.
         bind("files", "s", "files.stash");
+        // A conflict row's four answers. Lazygit reaches them through a
+        // main-view merging UI; here they are file-level and live beside the
+        // rows that name the conflict — ours/theirs take the two stages,
+        // both concatenates them, keep records the file as it stands.
+        bind("files", "o", "files.resolve-ours");
+        bind("files", "t", "files.resolve-theirs");
+        bind("files", "b", "files.resolve-both");
+        bind("files", "k", "files.resolve-keep");
         // The commit list's live filter, over the working tree: `/` opens a
         // query and every edit narrows the list in place — the same verb
         // every list pane answers to, on the key lazygit keeps free here.
@@ -489,6 +497,12 @@ impl Keymap {
         bind("branches", "f", "branches.fast-forward");
         bind("branches", "u", "branches.set-upstream");
         bind("branches", "U", "branches.unset-upstream");
+        // lazygit's m on a branch row: bring the selected branch into the
+        // one HEAD is on. The menu it opens becomes two keys — lowercase
+        // regular, capital squash — because a squash's finish (staged,
+        // uncommitted) is a different sentence a reader acts on differently.
+        bind("branches", "m", "branches.merge");
+        bind("branches", "M", "branches.merge-squash");
         // The live filter over the ref list — the pane where sixteen
         // machine-named worktree branches are exactly why a query exists.
         bind("branches", "/", "branches.search");
@@ -589,6 +603,15 @@ impl Keymap {
         // row there being no free letter left that begins either word.
         bind("commits", "Z", "commits.cherry-pick-abort");
         bind("commits", "X", "commits.cherry-pick-continue");
+        // One lifecycle door for all four writes git leaves standing —
+        // merge, rebase, cherry-pick, revert — because only one of them can
+        // stand at a time and the reader should not learn four keys for one
+        // question. m backs out, M carries on, S steps over (a rebase's
+        // alone); the availability layer says which of them the standing
+        // operation answers, and the per-kind capitals above keep working.
+        bind("commits", "m", "operation.abort");
+        bind("commits", "M", "operation.continue");
+        bind("commits", "S", "operation.skip");
 
         // Text itself belongs to the platform input service. These are the
         // two transitions around it, kept as named commands so a config file
@@ -1284,6 +1307,21 @@ impl Commands {
                 None,
             ),
             (
+                "operation.abort",
+                "give up whichever operation is standing — merge, rebase, cherry-pick or revert — and put everything back where it started",
+                Some("abort"),
+            ),
+            (
+                "operation.continue",
+                "carry on whichever operation is standing once its conflicts are resolved",
+                Some("continue"),
+            ),
+            (
+                "operation.skip",
+                "step over the commit the rebase stopped on — its changes leave the branch",
+                Some("skip"),
+            ),
+            (
                 "commits.cherry-pick",
                 "apply this commit onto the current branch as a new commit",
                 Some("cherry-pick"),
@@ -1377,6 +1415,36 @@ impl Commands {
                 "branches.new-tag",
                 "name the selected branch's commit with a new tag",
                 Some("tag"),
+            ),
+            (
+                "branches.merge",
+                "merge the selected branch into the branch you are on",
+                Some("merge"),
+            ),
+            (
+                "branches.merge-squash",
+                "squash the selected branch into the branch you are on, staged and uncommitted",
+                Some("squash merge"),
+            ),
+            (
+                "files.resolve-ours",
+                "record the selected conflict as resolved, taking this side's version",
+                Some("ours"),
+            ),
+            (
+                "files.resolve-theirs",
+                "record the selected conflict as resolved, taking the other side's version",
+                Some("theirs"),
+            ),
+            (
+                "files.resolve-both",
+                "record the selected conflict as resolved with both versions, this side first",
+                Some("both"),
+            ),
+            (
+                "files.resolve-keep",
+                "record the selected conflict as resolved with the file as it stands",
+                Some("keep"),
             ),
             ("branches.search", "search the branches", Some("search")),
             (
