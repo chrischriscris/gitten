@@ -934,6 +934,125 @@ fn marker_of(subject: &str) -> Option<(Action, String)> {
     action.map(|action| (action, rest.to_string()))
 }
 
+/// What `git commit --fixup` writes for its target: the `fixup!` marker
+/// git folds away, the `amend!` marker that folds the same way while
+/// keeping the target's message, and the `reword!` marker that folds and
+/// then asks for the message. Three spellings of one verb, so one enum —
+/// a client that stored them as strings would re-parse git's own flag on
+/// every press.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FixupKind {
+    /// `fixup! <subject>`: meld the change, lose the message.
+    #[default]
+    Fixup,
+    /// `amend! <subject>`: meld the change, keep the target's message.
+    Amend,
+    /// `reword! <subject>`: meld the change, then ask for the message.
+    Reword,
+}
+
+impl FixupKind {
+    /// The flag `git commit` takes, without its target: `--fixup=` is the
+    /// plain spelling, and the `amend:` / `reword:` prefixes are git's
+    /// (2.32 and up — older gits refuse the prefix in their own words, and
+    /// that refusal is the honest answer on such a machine).
+    pub fn flag(self) -> &'static str {
+        match self {
+            FixupKind::Fixup => "--fixup=",
+            FixupKind::Amend => "--fixup=amend:",
+            FixupKind::Reword => "--fixup=reword:",
+        }
+    }
+
+    /// The marker word the created commit's subject opens with.
+    pub fn word(self) -> &'static str {
+        match self {
+            FixupKind::Fixup => "fixup!",
+            FixupKind::Amend => "amend!",
+            FixupKind::Reword => "reword!",
+        }
+    }
+
+    /// The next kind, for the key that chooses what a fixup creation
+    /// writes: fixup, then amend, then reword, then round again.
+    pub fn cycle(self) -> Self {
+        match self {
+            FixupKind::Fixup => FixupKind::Amend,
+            FixupKind::Amend => FixupKind::Reword,
+            FixupKind::Reword => FixupKind::Fixup,
+        }
+    }
+
+    /// The status line's word for what the creation key will write next.
+    pub fn describe(self) -> &'static str {
+        match self {
+            FixupKind::Fixup => "fixup!",
+            FixupKind::Amend => "amend!",
+            FixupKind::Reword => "reword!",
+        }
+    }
+}
+
+/// A `fixup!` / `squash!` / `amend!` line in a loaded window, and the
+/// window row it folds into — the apply flow's read-only view of what
+/// [`Plan::autosquash`] will do, said before anything is armed so a marker
+/// that names nothing refuses instead of riding the plan as a pick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixupMark {
+    /// The marker's own row, newest first like the window.
+    pub index: usize,
+    /// What the marker asks for.
+    pub action: Action,
+    /// The subject with every marker layer stripped, as [`marker_of`] reads it.
+    pub remainder: String,
+    /// The row it folds into, or `None` when no older row answers the
+    /// name: the newest older row whose subject is the remainder, opens
+    /// with it, or whose short sha it is — git's own match, newest first.
+    pub target: Option<usize>,
+}
+
+/// Every marker line in the window, newest first, each with its landing
+/// resolved — or `None`, which is the apply flow's refusal and never a
+/// guess. A marker cannot name another marker (git resolves every landing
+/// before anything moves), and it cannot name anything newer than itself
+/// (a fold only goes down); a bare marker names nothing, because every
+/// subject starts with the empty string.
+///
+/// The matching is [`Plan::autosquash`]'s, said once: resolve here and run
+/// there, and the plan a press arms is the plan these landings describe.
+/// A caller that reordered the window between this call and the run would
+/// be arming a different plan — the run re-resolves for exactly that reason.
+pub fn fixup_marks(commits: &[Commit]) -> Vec<FixupMark> {
+    let mut marks = Vec::new();
+    for (i, commit) in commits.iter().enumerate() {
+        let Some((action, remainder)) = marker_of(&commit.subject) else {
+            continue;
+        };
+        let target = if remainder.is_empty() {
+            None
+        } else {
+            commits
+                .iter()
+                .enumerate()
+                .filter(|(j, c)| *j > i && marker_of(&c.subject).is_none())
+                .rev()
+                .find(|(_, c)| {
+                    c.subject == remainder
+                        || c.subject.starts_with(&remainder)
+                        || c.short == remainder
+                })
+                .map(|(j, _)| j)
+        };
+        marks.push(FixupMark {
+            index: i,
+            action,
+            remainder,
+            target,
+        });
+    }
+    marks
+}
+
 /// Whether the window from HEAD down to `index` is one straight
 /// single-parent line — the precondition every wholesale plan rests on, and
 /// the same check [`compose`] makes, said once.
@@ -1602,6 +1721,70 @@ squash
             vec!["pick under-sha", "edit mid-sha", "pick head-sha"],
             "edit reaches git as itself; it opens nothing"
         );
+    }
+
+    #[test]
+    fn a_marker_lands_on_the_newest_older_row_that_answers_it() {
+        let mut commits = linear();
+        commits[0].subject = "fixup! mid".into();
+        commits[3].subject = "squash! nobody here".into();
+        let marks = fixup_marks(&commits);
+        assert_eq!(marks.len(), 2);
+        assert_eq!(
+            marks[0],
+            FixupMark {
+                index: 0,
+                action: Action::Fixup,
+                remainder: "mid".into(),
+                target: Some(1),
+            },
+            "the fixup names mid, the row directly below"
+        );
+        assert_eq!(marks[1].target, None, "nobody here names no row");
+    }
+
+    #[test]
+    fn a_marker_skips_markers_and_never_names_anything_newer() {
+        let mut commits = linear();
+        commits[0].subject = "fixup! under".into();
+        commits[1].subject = "squash! under".into();
+        let marks = fixup_marks(&commits);
+        assert_eq!(
+            marks[0].target,
+            Some(2),
+            "the marker at row 1 is not a landing"
+        );
+        assert_eq!(marks[1].target, Some(2));
+        commits[1].subject = "fixup! head".into();
+        // `head` sits above the marker: a fold only goes down.
+        assert_eq!(fixup_marks(&commits)[1].target, None);
+    }
+
+    #[test]
+    fn a_prefix_and_a_short_sha_answer_when_nothing_exact_does() {
+        let mut commits = linear();
+        commits[0].subject = "fixup! mi".into();
+        assert_eq!(fixup_marks(&commits)[0].target, Some(1), "prefix");
+        commits[0].subject = "fixup! ".into();
+        commits[0].short = String::new();
+        // A bare marker names nothing even though every subject starts
+        // with the empty string.
+        assert_eq!(fixup_marks(&commits)[0].target, None, "bare marker");
+        commits[1].short = "mid-sha".into();
+        commits[0].subject = "fixup! mid-sha".into();
+        // `mid-sha` is not `mid`'s subject, so the short-sha arm answers.
+        assert_eq!(fixup_marks(&commits)[0].target, Some(1), "short sha");
+    }
+
+    #[test]
+    fn the_fixup_kind_cycles_and_spells_gits_flag() {
+        assert_eq!(FixupKind::Fixup.flag(), "--fixup=");
+        assert_eq!(FixupKind::Amend.flag(), "--fixup=amend:");
+        assert_eq!(FixupKind::Reword.flag(), "--fixup=reword:");
+        assert_eq!(FixupKind::Fixup.cycle(), FixupKind::Amend);
+        assert_eq!(FixupKind::Amend.cycle(), FixupKind::Reword);
+        assert_eq!(FixupKind::Reword.cycle(), FixupKind::Fixup);
+        assert_eq!(FixupKind::default(), FixupKind::Fixup);
     }
 
     #[test]
