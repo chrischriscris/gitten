@@ -2125,6 +2125,125 @@ pub struct HunkAsk {
     pub selection: HunkSelection,
 }
 
+/// What a fresh re-read of one path's side yields: the hunks the drawn
+/// selection matched, the side facts a patch emits with, and the blob
+/// identities and shape flags the caller builds its own expectations and
+/// refusals from.
+pub(crate) struct ResolvedHunks {
+    pub chosen: Vec<Hunk>,
+    pub sides: gitten_core::patch::Sides,
+    pub old_oid: Option<String>,
+    pub new_oid: Option<String>,
+    pub binary: bool,
+    pub old_path: Option<String>,
+}
+
+/// Refuses a selection no context can aim: a hunk with no context line
+/// and an old side to address leaves `git apply` nothing to locate with.
+/// An insertion (no old side to the hunk) and a creation need no context
+/// and pass through.
+pub(crate) fn check_context(chosen: &[Hunk]) -> Result<(), String> {
+    if chosen.iter().any(|h| {
+        h.lines
+            .iter()
+            .all(|l| l.kind != gitten_core::LineKind::Context)
+            && h.lines.iter().any(|l| l.old_no.is_some())
+    }) {
+        return Err(
+            "this diff was read with no context — a partial patch cannot be aimed; raise [diff] context"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// The read half of [`hunk_job`], shared with the patch clipboard: one
+/// path re-read now, the drawn selection matched against what git holds
+/// by full line content, line windows cut with `keep`. Combined has no
+/// per-path read and never reaches here — its caller answers that side
+/// alone.
+pub(crate) fn resolve_side_hunks(
+    repo: &Handle,
+    side: HunkSide,
+    path: &str,
+    selection: &HunkSelection,
+    keep: gitten_core::patch::Unselected,
+    differs: &gitten_core::differ::Differs,
+    over: &gitten_core::differ::Overrides,
+) -> Result<ResolvedHunks, String> {
+    // One path, re-read now. An empty answer is a side that stopped
+    // existing between the preview and this keypress — nothing to aim at,
+    // said the way the preview itself says it.
+    let pair = match side {
+        HunkSide::Unstaged => repo.pairs_unstaged(Some(path.as_bytes()))?.pop(),
+        HunkSide::Staged => repo.pairs_staged(Some(path.as_bytes()))?.pop(),
+        HunkSide::Untracked => repo.pair_untracked(path.as_bytes())?,
+        HunkSide::Combined => unreachable!("the combined aim returned above"),
+    }
+    .ok_or_else(|| match side {
+        HunkSide::Unstaged => format!("nothing unstaged for {} — refresh (R)", path),
+        HunkSide::Staged => format!("nothing staged for {} — refresh (R)", path),
+        HunkSide::Untracked => format!("{} is not readable — deleted, or not a file", path),
+        HunkSide::Combined => unreachable!("the combined aim returned above"),
+    })?;
+
+    // The drawn selection, matched against what git holds now. Matching is
+    // by the hunks' full line content — kinds, texts and numbers — which is
+    // exact whenever the file is as the preview drew it and fails loudly
+    // whenever it is not: the diff cache keys on the pair's OIDs, so a
+    // fresh re-diff of unchanged content is the preview's own hunks back.
+    let fresh = gitten_git::diff_pairs(std::slice::from_ref(&pair), differs, over);
+    let hunks = fresh.first().map(|f| f.hunks.as_slice()).unwrap_or(&[]);
+    let stale = || {
+        format!(
+            "{} changed since this diff was drawn — refresh (R) and try again",
+            path
+        )
+    };
+    let mut chosen: Vec<Hunk> = Vec::new();
+    match selection {
+        HunkSelection::Whole(drawn) => {
+            let hunk = hunks
+                .iter()
+                .find(|h| h.lines == drawn.lines)
+                .ok_or_else(stale)?;
+            chosen.push(hunk.clone());
+        }
+        HunkSelection::Lines(parts) => {
+            for (drawn, lo, hi) in parts {
+                let hunk = hunks
+                    .iter()
+                    .find(|h| h.lines == drawn.lines)
+                    .ok_or_else(stale)?;
+                // A window with no changed line in it — the keyboard sat on
+                // context — stages nothing, and is skipped rather than
+                // refused: the rest of the selection still means what it
+                // says. One that emptied the whole selection is refused
+                // below, where "nothing selected" is one sentence.
+                if let Some(window) = gitten_core::patch::line_window(hunk, *lo, *hi, keep) {
+                    chosen.push(window);
+                }
+            }
+            if chosen.is_empty() {
+                return Err("no changed lines in the selection".into());
+            }
+        }
+    }
+    Ok(ResolvedHunks {
+        sides: gitten_core::patch::Sides {
+            old_lines: pair.old.len(),
+            old_final_newline: pair.old_final_newline,
+            new_lines: pair.new.len(),
+            new_final_newline: pair.new_final_newline,
+        },
+        old_oid: pair.old_oid.clone(),
+        new_oid: pair.new_oid.clone(),
+        binary: pair.binary,
+        old_path: pair.old_path.clone(),
+        chosen,
+    })
+}
+
 /// The one hunk verb, for every client.
 ///
 /// A partial stage is a read, then a patch, then a checked write, in that
@@ -2237,111 +2356,39 @@ pub fn hunk_job(
         }));
     }
 
-    // One path, re-read now. An empty answer is a side that stopped
-    // existing between the preview and this keypress — nothing to aim at,
-    // said the way the preview itself says it.
-    let pair = match ask.side {
-        HunkSide::Unstaged => repo.pairs_unstaged(Some(ask.path.as_bytes()))?.pop(),
-        HunkSide::Staged => repo.pairs_staged(Some(ask.path.as_bytes()))?.pop(),
-        HunkSide::Untracked => repo.pair_untracked(ask.path.as_bytes())?,
-        HunkSide::Combined => unreachable!("the combined aim returned above"),
-    }
-    .ok_or_else(|| match ask.side {
-        HunkSide::Unstaged => format!("nothing unstaged for {} — refresh (R)", ask.path),
-        HunkSide::Staged => format!("nothing staged for {} — refresh (R)", ask.path),
-        HunkSide::Untracked => format!("{} is not readable — deleted, or not a file", ask.path),
-        HunkSide::Combined => unreachable!("the combined aim returned above"),
-    })?;
-    if pair.binary {
+    let keep = match verb {
+        Verb::Stage => gitten_core::patch::Unselected::KeepRemovals,
+        Verb::Unstage | Verb::Discard => gitten_core::patch::Unselected::KeepAdditions,
+    };
+    let resolved = resolve_side_hunks(
+        repo,
+        ask.side,
+        &ask.path,
+        &ask.selection,
+        keep,
+        differs,
+        over,
+    )?;
+    if resolved.binary {
         return Err(format!(
             "{} is binary — there are no lines to select; stage or discard it whole from the files pane",
             ask.path
         ));
     }
-    if pair.old_path.as_ref().is_some_and(|old| old != &pair.path) {
+    if resolved
+        .old_path
+        .as_ref()
+        .is_some_and(|old| old != &ask.path)
+    {
         return Err(format!(
             "{} is a rename from {} — partial staging of a rename is not supported; stage it whole",
             ask.path,
-            pair.old_path.as_deref().unwrap_or_default()
+            resolved.old_path.as_deref().unwrap_or_default()
         ));
     }
-
-    // The drawn selection, matched against what git holds now. Matching is
-    // by the hunks' full line content — kinds, texts and numbers — which is
-    // exact whenever the file is as the preview drew it and fails loudly
-    // whenever it is not: the diff cache keys on the pair's OIDs, so a
-    // fresh re-diff of unchanged content is the preview's own hunks back.
-    let fresh = gitten_git::diff_pairs(std::slice::from_ref(&pair), differs, over);
-    let hunks = fresh.first().map(|f| f.hunks.as_slice()).unwrap_or(&[]);
-    let stale = || {
-        format!(
-            "{} changed since this diff was drawn — refresh (R) and try again",
-            ask.path
-        )
-    };
-    let mut chosen: Vec<Hunk> = Vec::new();
-    match &ask.selection {
-        HunkSelection::Whole(drawn) => {
-            let hunk = hunks
-                .iter()
-                .find(|h| h.lines == drawn.lines)
-                .ok_or_else(stale)?;
-            chosen.push(hunk.clone());
-        }
-        HunkSelection::Lines(parts) => {
-            // The verb decides which unchosen changes a window keeps. The
-            // forward verb rewrites the index and matches the patch's
-            // preimage against it; the two reverse verbs — unstage and
-            // discard — are matched by `git apply --reverse` against the
-            // tree they rewrite, which is the patch's *post*image. See
-            // [`gitten_core::patch::Unselected`] for the rule and why.
-            let keep = match verb {
-                Verb::Stage => gitten_core::patch::Unselected::KeepRemovals,
-                Verb::Unstage | Verb::Discard => gitten_core::patch::Unselected::KeepAdditions,
-            };
-            for (drawn, lo, hi) in parts {
-                let hunk = hunks
-                    .iter()
-                    .find(|h| h.lines == drawn.lines)
-                    .ok_or_else(stale)?;
-                // A window with no changed line in it — the keyboard sat on
-                // context — stages nothing, and is skipped rather than
-                // refused: the rest of the selection still means what it
-                // says. One that emptied the whole selection is refused
-                // below, where "nothing selected" is one sentence.
-                if let Some(window) = gitten_core::patch::line_window(hunk, *lo, *hi, keep) {
-                    chosen.push(window);
-                }
-            }
-            if chosen.is_empty() {
-                return Err("no changed lines in the selection".into());
-            }
-        }
-    }
-    let sides = gitten_core::patch::Sides {
-        old_lines: pair.old.len(),
-        old_final_newline: pair.old_final_newline,
-        new_lines: pair.new.len(),
-        new_final_newline: pair.new_final_newline,
-    };
-    // A hunk that carries no context and addresses an old side cannot be
-    // aimed: `git apply` locates a change by the context around it, and a
-    // zero-context read — `[diff] context = 0` — leaves nothing to locate
-    // with. Refused here, in words that name the setting, rather than in
-    // git's own "patch does not apply" further down the pipe. An insertion
-    // (no old side to the hunk) and a creation need no context and are
-    // allowed through.
-    if chosen.iter().any(|h| {
-        h.lines
-            .iter()
-            .all(|l| l.kind != gitten_core::LineKind::Context)
-            && h.lines.iter().any(|l| l.old_no.is_some())
-    }) {
-        return Err(
-            "this diff was read with no context — a partial patch cannot be aimed; raise [diff] context"
-                .into(),
-        );
-    }
+    check_context(&resolved.chosen)?;
+    let chosen = resolved.chosen;
+    let sides = resolved.sides;
     let refs: Vec<&Hunk> = chosen.iter().collect();
     let patch = gitten_core::patch::emit_with(&ask.path, &refs, &sides)?;
     if patch.is_empty() {
@@ -2359,11 +2406,11 @@ pub fn hunk_job(
     let mut expect = Vec::new();
     match (verb, ask.side) {
         (Verb::Stage, HunkSide::Unstaged) | (Verb::Discard, HunkSide::Unstaged) => {
-            expect.push((OidSide::Index, pair.old_oid.clone()))
+            expect.push((OidSide::Index, resolved.old_oid.clone()))
         }
         (Verb::Unstage, HunkSide::Staged) => {
-            expect.push((OidSide::Head, pair.old_oid.clone()));
-            expect.push((OidSide::Index, pair.new_oid.clone()));
+            expect.push((OidSide::Head, resolved.old_oid.clone()));
+            expect.push((OidSide::Index, resolved.new_oid.clone()));
         }
         _ => unreachable!("every eligible shape is matched above"),
     }
@@ -2402,14 +2449,14 @@ enum PatchVerb {
 
 /// Which side of the index an expectation reads.
 #[derive(Clone, Copy)]
-enum OidSide {
+pub(crate) enum OidSide {
     Index,
     Head,
 }
 
 /// One identity the write re-checks: the side, the path, and the blob the
 /// patch was built against.
-struct ExpectOid {
+pub(crate) struct ExpectOid {
     side: OidSide,
     path: Vec<u8>,
     oid: Option<String>,
