@@ -1031,11 +1031,14 @@ pub fn fixup_marks(commits: &[Commit]) -> Vec<FixupMark> {
         let target = if remainder.is_empty() {
             None
         } else {
+            // Newest first, like the window itself: the enumeration runs
+            // ascending, which *is* newest first here (unlike the
+            // oldest-first file [`Plan::autosquash`] walks, which is why
+            // that one reverses and this one must not).
             commits
                 .iter()
                 .enumerate()
                 .filter(|(j, c)| *j > i && marker_of(&c.subject).is_none())
-                .rev()
                 .find(|(_, c)| {
                     c.subject == remainder
                         || c.subject.starts_with(&remainder)

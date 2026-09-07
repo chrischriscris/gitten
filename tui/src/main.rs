@@ -8612,6 +8612,10 @@ diff --git a/tracked.txt b/tracked.txt
 +inserted
 ";
 
+    /// One commit's file listing, by sha — the fixup discovery's per-row
+    /// answers. Named so the nesting does not sprawl across the struct.
+    type CommitFiles = Vec<(char, Vec<u8>)>;
+
     #[derive(Default)]
     struct FakeState {
         /// What `pairs` answers before and after the first write lands —
@@ -8747,6 +8751,10 @@ diff --git a/tracked.txt b/tracked.txt
         /// letters a commit's own listing would report. Tests set it
         /// directly — a rename here is what the graft refuses on.
         commit_file_list: Vec<(char, Vec<u8>)>,
+        /// Per-sha answers for the same read, consulted first: the fixup
+        /// discovery names a different file set per row, which one flat
+        /// list cannot say. Falls back to `commit_file_list`.
+        commit_files_by_sha: Vec<(Vec<u8>, CommitFiles)>,
         /// When set, the graft reads its own result as empty: lifting the
         /// commit's only change, refused with the drop door named.
         graft_empty: bool,
@@ -9830,8 +9838,25 @@ diff --git a/tracked.txt b/tracked.txt
             Ok(())
         }
 
-        fn commit_files(&self, _sha: &[u8]) -> gitten_git::Result<Vec<(char, Vec<u8>)>> {
-            Ok(self.0.lock().unwrap().commit_file_list.clone())
+        fn commit_files(&self, sha: &[u8]) -> gitten_git::Result<Vec<(char, Vec<u8>)>> {
+            let s = self.0.lock().unwrap();
+            if let Some((_, files)) = s.commit_files_by_sha.iter().find(|(s, _)| s == sha) {
+                return Ok(files.clone());
+            }
+            Ok(s.commit_file_list.clone())
+        }
+
+        fn commit_fixup(
+            &self,
+            sha: &[u8],
+            kind: gitten_git::FixupKind,
+        ) -> gitten_git::Result<String> {
+            self.0.lock().unwrap().writes.push(format!(
+                "fixup {} {}",
+                String::from_utf8_lossy(sha),
+                kind.word()
+            ));
+            Ok("f00d".into())
         }
 
         fn amend_no_edit(&self) -> gitten_git::Result<String> {
@@ -19948,6 +19973,315 @@ shared tail
             planned(&mut app, &state),
             "rebase-plan 00000003 | pick 00000002; fixup 00000000; pick 00000001",
             "the marker did not land on the commit it names"
+        );
+    }
+
+    /// A staged index, as the fixup creation reads it: the paths are the
+    /// overlap the finder scores, and their presence is the creation's
+    /// guard.
+    fn staged(paths: &[&str]) -> Status {
+        Status {
+            staged: paths
+                .iter()
+                .map(|p| StagedEntry {
+                    path: PathBytes::from(*p),
+                    change: Change::Modified,
+                    old_path: None,
+                    kind: Kind::File,
+                    submodule: Submodule::default(),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// LG-081. `F` commits the staged index as a fixup for the row: the
+    /// job aims the row's full sha, the marker is git's, and the finish
+    /// says what it wrote.
+    #[test]
+    fn tui_parity_a_fixup_commit_aims_the_row_and_names_its_marker() {
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().status = staged(&["f.txt"]);
+        let mut app = history_app(&handle);
+        let sha = row_sha(&app);
+        let short = commits_of(&app).current().expect("a row").short.clone();
+        app.press(Key::char('F'));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                state
+                    .lock()
+                    .unwrap()
+                    .writes
+                    .iter()
+                    .any(|w| *w == format!("fixup {sha} fixup!"))
+                    && app.message.contains(&format!("fixup! {short} created"))
+            }),
+            "the fixup never reached the repository saying its name: {:?} / {:?}",
+            app.message,
+            state.lock().unwrap().writes
+        );
+    }
+
+    /// LG-081. A fixup over an empty index is refused before git could
+    /// answer "nothing to commit" — which would name the wrong failure —
+    /// and an amend!/reword! kind is refused before any process runs,
+    /// because those spellings open an editor this client has no door for.
+    #[test]
+    fn tui_parity_a_fixup_refuses_an_empty_index_and_an_editor_kind() {
+        let (handle, state) = fake(&[]);
+        let mut app = history_app(&handle);
+        app.press(Key::char('F'));
+        assert!(
+            app.message.contains("nothing staged to fix up"),
+            "{:?}",
+            app.message
+        );
+        app.pump_quiet();
+        assert!(state.lock().unwrap().writes.is_empty());
+
+        state.lock().unwrap().status = staged(&["f.txt"]);
+        app.press(Key::char('K'));
+        assert!(
+            app.message.contains("F will create amend!"),
+            "{:?}",
+            app.message
+        );
+        app.press(Key::char('F'));
+        assert!(app.message.contains("opens an editor"), "{:?}", app.message);
+        app.pump_quiet();
+        assert!(
+            state.lock().unwrap().writes.is_empty(),
+            "an editor kind wrote: {:?}",
+            state.lock().unwrap().writes
+        );
+    }
+
+    /// LG-082. `K` cycles what `F` writes — fixup, amend, reword, round
+    /// again — and the status line names the standing kind while it is not
+    /// the default the help entry promises.
+    #[test]
+    fn tui_parity_the_kind_key_cycles_what_a_creation_writes() {
+        let (handle, _state) = fake(&[]);
+        let mut app = history_app(&handle);
+        app.press(Key::char('K'));
+        assert!(
+            app.message.contains("F will create amend!"),
+            "{:?}",
+            app.message
+        );
+        // The pane's own status names the standing kind; the screen's
+        // bottom row is the message bar in tests, so read the pane.
+        assert!(
+            commits_of(&app).status().contains("F:amend!"),
+            "{:?}",
+            commits_of(&app).status()
+        );
+        app.press(Key::char('K'));
+        assert!(
+            app.message.contains("F will create reword!"),
+            "{:?}",
+            app.message
+        );
+        app.press(Key::char('K'));
+        assert!(
+            app.message.contains("F will create fixup!"),
+            "{:?}",
+            app.message
+        );
+        assert!(
+            !commits_of(&app).status().contains("F:"),
+            "the default needs no ink: {:?}",
+            commits_of(&app).status()
+        );
+    }
+
+    /// LG-080. `ctrl-f` moves the keyboard to the commit the staged
+    /// changes build on: file overlap, newest wins. The move is announced
+    /// as a guess, because the creation still aims at whatever row the
+    /// keyboard is on when it lands.
+    #[test]
+    fn tui_parity_the_finder_moves_to_the_commit_the_change_builds_on() {
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().status = staged(&["f.txt"]);
+        {
+            let mut s = state.lock().unwrap();
+            s.commit_files_by_sha = vec![
+                (b"00000005".to_vec(), vec![('M', b"f.txt".to_vec())]),
+                (b"00000002".to_vec(), vec![('M', b"other.txt".to_vec())]),
+            ];
+        }
+        let mut app = history_app(&handle);
+        if let Some(Screens::Commits { view, .. }) = app.panes.get_mut("commits") {
+            *view = Commits::new(hundred_commits());
+        }
+        app.press(Key::ctrl(Code::Char('f')));
+        assert_eq!(commits_of(&app).cursor(), 5, "the finder stayed home");
+        assert!(
+            app.message.contains("building on 00000005"),
+            "{:?}",
+            app.message
+        );
+    }
+
+    /// LG-080. Staged changes no loaded commit touched move nothing and
+    /// say so: a guess with no evidence is worse than no guess.
+    #[test]
+    fn tui_parity_the_finder_says_when_nothing_overlaps() {
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().status = staged(&["lonely.txt"]);
+        let mut app = history_app(&handle);
+        if let Some(Screens::Commits { view, .. }) = app.panes.get_mut("commits") {
+            *view = Commits::new(hundred_commits());
+        }
+        app.press(Key::ctrl(Code::Char('f')));
+        assert_eq!(commits_of(&app).cursor(), 0);
+        assert!(
+            app.message
+                .contains("touch no file any recent commit touched"),
+            "{:?}",
+            app.message
+        );
+        app.pump_quiet();
+        assert!(state.lock().unwrap().writes.is_empty());
+    }
+
+    /// LG-082. `U` folds every marker into the commit it names, asked
+    /// twice like every rewrite: the plan covers the deepest landing and
+    /// the autosquash order is git's.
+    #[test]
+    fn tui_parity_the_fold_asks_twice_and_folds_every_marker() {
+        let (handle, state) = fake(&[]);
+        let mut app = history_app(&handle);
+        if let Some(Screens::Commits { view, .. }) = app.panes.get_mut("commits") {
+            let mut rows = hundred_commits();
+            rows[0].subject = "fixup! commit 2".into();
+            *view = Commits::new(rows);
+        }
+        app.press(Key::char('U'));
+        assert_eq!(
+            app.message,
+            "rewrite 3 commits from 00000002? press again to confirm"
+        );
+        app.press(Key::char('U'));
+        assert_eq!(
+            planned(&mut app, &state),
+            "rebase-plan 00000003 | pick 00000002; fixup 00000000; pick 00000001",
+            "the fold did not reach the plan in git's order"
+        );
+    }
+
+    /// LG-082. A marker that names nothing refuses by name instead of
+    /// riding the plan as a pick — a pick in this run is a fixup that
+    /// silently stays a commit — and a window with no markers says so.
+    /// Esc on the armed question writes nothing.
+    #[test]
+    fn tui_parity_the_fold_refuses_what_it_cannot_aim_cancels_clean() {
+        let (handle, state) = fake(&[]);
+        let mut app = history_app(&handle);
+        if let Some(Screens::Commits { view, .. }) = app.panes.get_mut("commits") {
+            let mut rows = hundred_commits();
+            rows[0].subject = "fixup! nowhere".into();
+            *view = Commits::new(rows);
+        }
+        app.press(Key::char('U'));
+        assert!(
+            app.message.contains("nowhere"),
+            "the refusal did not name the remainder: {:?}",
+            app.message
+        );
+        app.pump_quiet();
+        assert!(state.lock().unwrap().writes.is_empty());
+
+        if let Some(Screens::Commits { view, .. }) = app.panes.get_mut("commits") {
+            *view = Commits::new(hundred_commits());
+        }
+        app.press(Key::char('U'));
+        assert!(
+            app.message.contains("no fixup! or squash! commits"),
+            "{:?}",
+            app.message
+        );
+
+        if let Some(Screens::Commits { view, .. }) = app.panes.get_mut("commits") {
+            let mut rows = hundred_commits();
+            rows[0].subject = "fixup! commit 2".into();
+            *view = Commits::new(rows);
+        }
+        app.press(Key::char('U'));
+        assert!(app.message.contains("press again to confirm"));
+        app.press(Key::plain(Code::Esc));
+        app.pump_quiet();
+        assert!(
+            state.lock().unwrap().writes.is_empty(),
+            "a cancelled fold wrote: {:?}",
+            state.lock().unwrap().writes
+        );
+    }
+
+    /// LG-081. A real repository: the creation lands a `fixup!` commit
+    /// under HEAD, byte for byte what `git commit --fixup` writes.
+    #[test]
+    fn tui_parity_a_fixup_commit_lands_on_a_real_repository() {
+        let g = Git::init("fixup-create");
+        g.write("f.txt", "one\n");
+        g.git(&["add", "-A"]);
+        g.git(&["commit", "-qm", "base"]);
+        g.write("f.txt", "one\ntwo\n");
+        g.git(&["add", "f.txt"]);
+        let mut app = repo_app(g.0.as_path());
+        app.dispatch("commits.focus");
+        app.press(Key::char('F'));
+        assert!(
+            until(Duration::from_secs(5), || {
+                app.pump();
+                app.message.contains("fixup! ") && app.message.contains("created")
+            }),
+            "the fixup never finished: {:?}",
+            app.message
+        );
+        assert_eq!(
+            g.ask(&["log", "--format=%s", "-2"]).trim(),
+            "fixup! base\nbase",
+            "the fixup did not land on HEAD"
+        );
+    }
+
+    /// LG-082. A real repository: the fold replays the window with every
+    /// marker on the commit it names, and the tree keeps the change.
+    #[test]
+    fn tui_parity_the_fold_replays_a_real_window_in_gits_order() {
+        let g = Git::init("fixup-apply");
+        g.write("f.txt", "one\n");
+        g.git(&["add", "-A"]);
+        g.git(&["commit", "-qm", "base"]);
+        g.write("f.txt", "one\ntwo\n");
+        g.git(&["commit", "-qam", "second"]);
+        g.write("f.txt", "one\ntwo\nthree\n");
+        g.git(&["add", "f.txt"]);
+        g.git(&["commit", "--fixup", "HEAD"]);
+        let mut app = repo_app(g.0.as_path());
+        app.dispatch("commits.focus");
+        app.press(Key::char('U'));
+        assert!(
+            app.message.contains("press again to confirm"),
+            "the fold did not ask first: {:?}",
+            app.message
+        );
+        app.press(Key::char('U'));
+        assert!(
+            until(Duration::from_secs(10), || {
+                app.pump();
+                g.ask(&["log", "--format=%s"]).trim() == "second\nbase"
+            }),
+            "the fold never finished: {:?} / {:?}",
+            app.message,
+            g.ask(&["log", "--format=%s"])
+        );
+        assert_eq!(
+            g.ask(&["show", "HEAD:./f.txt"]).trim(),
+            "one\ntwo\nthree",
+            "the folded change did not survive"
         );
     }
 
