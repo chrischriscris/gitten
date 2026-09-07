@@ -34,10 +34,15 @@ use crate::Commit;
 pub enum Action {
     /// Replay the commit.
     Pick,
-    /// Replay it, but stop to edit the message. Not drivable tonight — see
-    /// [`TodoScript::validate`] for why, said where a user will read it.
+    /// Replay it, but stop to edit the message. Never emitted as this word:
+    /// git opens `GIT_EDITOR` on it and nothing here can answer that prompt,
+    /// so a [`Plan`] carries the new message itself and reaches git as a
+    /// pick plus an `exec`. Parsed, because somebody else's todo file may
+    /// hold one; refused by [`TodoScript::validate`] for the same reason.
     Reword,
-    /// Replay it, but stop for amending. Same story as [`Action::Reword`].
+    /// Replay it, then stop with the rebase standing so a human can amend
+    /// it. No editor opens — the pause *is* the rebase state, which
+    /// [`crate::operation`] models and the lifecycle keys carry on from.
     Edit,
     /// Replay it and meld it into the commit above it, keeping both messages.
     Squash,
@@ -118,10 +123,18 @@ impl Action {
     }
 
     /// Whether acting on this action stops mid-rebase to open *another*
-    /// editor — the one thing this client cannot drive tonight, because a
-    /// scripted `GIT_SEQUENCE_EDITOR` says nothing about `GIT_EDITOR`.
+    /// editor with a question only a human can answer — the one thing a
+    /// scripted `GIT_SEQUENCE_EDITOR` says nothing about.
+    ///
+    /// `reword` alone. `edit` also stops, but it stops with the *rebase*
+    /// standing and no editor open: that is the lifecycle's own state, the
+    /// one the banner and `rebase.continue` were built for, so it is a
+    /// pause this client drives rather than a prompt it cannot see. A
+    /// reworded message travels as [`Action::Reword`] on a [`Plan`] and
+    /// reaches git as a pick and an `exec`, which is why nothing here ever
+    /// emits the word itself.
     fn needs_an_editor(self) -> bool {
-        matches!(self, Action::Reword | Action::Edit)
+        matches!(self, Action::Reword)
     }
 }
 
@@ -271,10 +284,12 @@ impl TodoScript {
     /// Whether git would run this plan hands-off — without stopping mid-rebase
     /// to ask a human something through an editor this client does not drive.
     ///
-    /// `reword` and `edit` each stop and open `GIT_EDITOR`, a second editor
-    /// beyond the sequencer one, with no scripted answer tonight; so does
-    /// `fixup -c`, whose lowercase flag exists precisely to edit the melded
-    /// message (capital `-C` keeps it and opens nothing, so it passes).
+    /// `reword` stops and opens `GIT_EDITOR`, a second editor beyond the
+    /// sequencer one, with no scripted answer; so does `fixup -c`, whose
+    /// lowercase flag exists precisely to edit the melded message (capital
+    /// `-C` keeps it and opens nothing, so it passes). `edit` stops too and
+    /// passes: it opens nothing, and what it leaves standing is a rebase the
+    /// lifecycle already drives.
     /// Refusing here, before any process runs, is what makes the refusal a
     /// sentence about the plan rather than a background job hung on an
     /// invisible prompt. Everything else in the vocabulary replays unattended.
@@ -394,19 +409,7 @@ pub fn compose(
         }
         _ => {}
     }
-    for j in 1..=index {
-        if commits[j - 1].parents.len() != 1 {
-            return Err("history between HEAD and the keyboard holds a merge; \
-                 rebasing would flatten it"
-                .into());
-        }
-        if commits[j - 1].parents[0] != commits[j].sha {
-            return Err("the loaded history is not a straight line down to this \
-                 commit, so a plan built from it would not cover everything \
-                 the rebase would touch"
-                .into());
-        }
-    }
+    straight_line(commits, index)?;
 
     let mut script = TodoScript::default();
     let upstream = match kind {
@@ -474,6 +477,427 @@ pub fn compose(
         }
     };
     Ok((upstream, script))
+}
+
+// ------------------------------------------------------------------ the plan
+
+/// What a plan does to a commit *besides* replaying it — the amendments git
+/// has no todo word for, and which reach it as an `exec` beside the pick.
+///
+/// One member today, and a member rather than a `bool` because the next one
+/// is already visible: re-authoring is the amendment `commits.reset-author`
+/// needs on a commit deeper than HEAD, and `--reset-author` is one flag of
+/// several that `git commit --amend` takes without opening anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Amend {
+    /// Hand the replayed commit's authorship to whoever is running git —
+    /// `git commit --amend --reset-author`, message and tree untouched.
+    ResetAuthor,
+}
+
+/// One row of an editable plan: a commit, and what is to become of it.
+///
+/// The sha travels as bytes and the two strings are for a reader — a todo UI
+/// draws the short sha and the subject beside the action word, and neither
+/// ever reaches git.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    pub sha: Vec<u8>,
+    pub short: String,
+    pub subject: String,
+    pub action: Action,
+    /// The message an [`Action::Reword`] carries, as the bytes a commit
+    /// message is. `None` for every other action, and the thing
+    /// [`Plan::validate`] refuses a reword without: a reword whose message
+    /// nobody typed would silently keep the old one.
+    pub message: Option<Vec<u8>>,
+    /// An amendment to run after this commit is replayed.
+    pub amend: Option<Amend>,
+}
+
+impl Entry {
+    /// Whether replaying this entry leaves a commit behind at all — the one
+    /// question the fold and drop rules are all phrased in terms of.
+    fn lands(&self) -> bool {
+        !matches!(self.action, Action::Drop)
+    }
+}
+
+/// An editable interactive-rebase plan over one straight stretch of history.
+///
+/// [`compose`] answers a keypress with a finished plan; this answers a *UI*
+/// with an editable one. The entries are newest first — the order every log
+/// pane in this repository already draws, so a row of the list and a row of
+/// the plan are the same row — and [`Plan::script`] reverses them into the
+/// order git's file is in. Which means "the commit below" is one word in
+/// both places: `squash` folds an entry into the entry *below* it, and
+/// that entry is its parent.
+///
+/// Its constraints are git's, checked before any process runs:
+///
+/// - the window has to be a straight single-parent line, for exactly the
+///   reason [`compose`] says — our sequencer editor *replaces* what git
+///   generated, so a plan is only complete when the window it was built
+///   from is the range;
+/// - the oldest entry cannot be a fold, because git refuses a plan whose
+///   first line is a squash or a fixup ("cannot 'squash' without a previous
+///   commit");
+/// - something has to survive, because git refuses an empty todo — and
+///   dropping every commit in the range already has a name in this app.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    upstream: Vec<u8>,
+    base: String,
+    entries: Vec<Entry>,
+}
+
+impl Plan {
+    /// Builds the plan for the window from HEAD down to and including
+    /// `base` — the deepest commit it may touch — over history as a client's
+    /// log presents it: newest first.
+    ///
+    /// Every entry starts as a `pick`, which is git's own starting plan and
+    /// a rebase that changes nothing. The rebase sits on `base`'s parent,
+    /// so a root there refuses: replaying a root needs `git rebase --root`,
+    /// which this client does not drive.
+    pub fn over(commits: &[Commit], base: usize) -> Result<Self, String> {
+        let Some(deepest) = commits.get(base) else {
+            return Err("nothing under the keyboard to rewrite".into());
+        };
+        match deepest.parents.len() {
+            0 => {
+                return Err(
+                    "the deepest commit in the plan is the root; there is nothing \
+                     beneath it to rebuild onto"
+                        .into(),
+                )
+            }
+            n if n > 1 => {
+                return Err("the deepest commit in the plan is a merge; rebasing \
+                     would flatten it"
+                    .into())
+            }
+            _ => {}
+        }
+        straight_line(commits, base)?;
+        let entries = commits[..=base]
+            .iter()
+            .map(|c| Entry {
+                sha: c.sha.clone().into_bytes(),
+                short: c.short.clone(),
+                subject: c.subject.clone(),
+                action: Action::Pick,
+                message: None,
+                amend: None,
+            })
+            .collect();
+        Ok(Self {
+            upstream: deepest.parents[0].clone().into_bytes(),
+            base: deepest.short.clone(),
+            entries,
+        })
+    }
+
+    /// The revspec the rebase sits on: the parent of the deepest entry.
+    pub fn upstream(&self) -> &[u8] {
+        &self.upstream
+    }
+
+    /// The deepest entry's short sha, for a sentence a person reads.
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+
+    /// The entries, newest first.
+    pub fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Where a sha sits in the plan now — the only honest way to follow a
+    /// commit across a reorder, since its row moved and its identity did not.
+    pub fn index_of(&self, sha: &[u8]) -> Option<usize> {
+        self.entries.iter().position(|e| e.sha == sha)
+    }
+
+    /// Sets one entry's action.
+    ///
+    /// The oldest entry refuses a fold in its own words rather than letting
+    /// git refuse the whole plan later: there is nothing below it in the
+    /// window to fold into, and the fix is a deeper base, not a different
+    /// key.
+    pub fn set_action(&mut self, index: usize, action: Action) -> Result<(), String> {
+        let last = self.entries.len().saturating_sub(1);
+        let Some(entry) = self.entries.get_mut(index) else {
+            return Err("that row is not in the plan".into());
+        };
+        if index == last && matches!(action, Action::Squash | Action::Fixup) {
+            return Err("the oldest commit in the plan has nothing below it to \
+                 fold into — start the rebase one commit deeper"
+                .into());
+        }
+        entry.action = action;
+        if action != Action::Reword {
+            entry.message = None;
+        }
+        Ok(())
+    }
+
+    /// Rewords one entry: the action and the message it carries, together,
+    /// because neither means anything alone.
+    pub fn set_message(&mut self, index: usize, message: Vec<u8>) -> Result<(), String> {
+        if message.iter().all(|b| b.is_ascii_whitespace()) {
+            return Err("an empty message rewords nothing".into());
+        }
+        let Some(entry) = self.entries.get_mut(index) else {
+            return Err("that row is not in the plan".into());
+        };
+        entry.action = Action::Reword;
+        entry.message = Some(message);
+        Ok(())
+    }
+
+    /// Hangs an amendment on one entry, to run once it has been replayed.
+    pub fn set_amend(&mut self, index: usize, amend: Amend) -> Result<(), String> {
+        let Some(entry) = self.entries.get_mut(index) else {
+            return Err("that row is not in the plan".into());
+        };
+        if !entry.lands() {
+            return Err("a dropped commit is not replayed, so there is nothing \
+                 to amend"
+                .into());
+        }
+        entry.amend = Some(amend);
+        Ok(())
+    }
+
+    /// Moves an entry one row towards HEAD, answering where it landed.
+    pub fn move_up(&mut self, index: usize) -> Result<usize, String> {
+        if index >= self.entries.len() {
+            return Err("that row is not in the plan".into());
+        }
+        if index == 0 {
+            return Err("that commit is already the newest in the plan".into());
+        }
+        self.entries.swap(index, index - 1);
+        Ok(index - 1)
+    }
+
+    /// Moves an entry one row away from HEAD, answering where it landed.
+    ///
+    /// The oldest row refuses: below it is the base the rebase stands on,
+    /// which the plan does not replay and therefore cannot reorder past.
+    pub fn move_down(&mut self, index: usize) -> Result<usize, String> {
+        if index >= self.entries.len() {
+            return Err("that row is not in the plan".into());
+        }
+        if index + 1 == self.entries.len() {
+            return Err("that commit is already the oldest in the plan — the \
+                 row below it is the base the rebase stands on"
+                .into());
+        }
+        self.entries.swap(index, index + 1);
+        Ok(index + 1)
+    }
+
+    /// git's `--autosquash`, as a reordering of this plan: every commit
+    /// whose subject opens with `fixup!` or `squash!` moves to sit directly
+    /// on top of the commit it names and takes that action. Answers how many
+    /// moved.
+    ///
+    /// Matching is git's, minus the parts a client cannot see: the marker
+    /// words are stripped — repeatedly, because `fixup! fixup! x` is a real
+    /// thing git writes — and what is left is matched against a subject
+    /// exactly, then as a prefix, then against a short sha. The newest
+    /// candidate *older* than the marker wins, which is the only direction a
+    /// fold can go. A marker naming nothing in the window is left exactly
+    /// where it is, as a pick: silently folding it into a guess is how a
+    /// change lands in the wrong commit.
+    pub fn autosquash(&mut self) -> usize {
+        // File order — oldest first — because that is the order the fold
+        // rule is phrased in and the order git itself walks.
+        let mut source: Vec<Entry> = self.entries.iter().rev().cloned().collect();
+        let mut out: Vec<Entry> = Vec::with_capacity(source.len());
+        let mut moved = 0;
+        // Every marker, by the index of the entry it lands on, resolved
+        // before anything moves: a marker cannot target another marker.
+        let mut markers: Vec<(usize, usize, Action)> = Vec::new();
+        for (i, entry) in source.iter().enumerate() {
+            let Some((action, target)) = marker_of(&entry.subject) else {
+                continue;
+            };
+            let landing = source[..i]
+                .iter()
+                .enumerate()
+                .filter(|(j, c)| marker_of(&c.subject).is_none() && *j < i)
+                .rev()
+                .find(|(_, c)| {
+                    c.subject == target
+                        || c.subject.starts_with(&target)
+                        || (!target.is_empty() && c.short == target)
+                });
+            if let Some((j, _)) = landing {
+                markers.push((i, j, action));
+            }
+        }
+        for i in 0..source.len() {
+            if markers.iter().any(|(marker, _, _)| *marker == i) {
+                continue;
+            }
+            out.push(source[i].clone());
+            for (marker, landing, action) in &markers {
+                if *landing != i {
+                    continue;
+                }
+                let mut folded = source[*marker].clone();
+                folded.action = *action;
+                folded.message = None;
+                out.push(folded);
+                moved += 1;
+            }
+        }
+        source = out;
+        source.reverse();
+        self.entries = source;
+        moved
+    }
+
+    /// Whether the plan stops mid-flight, and therefore hands the reader
+    /// back a standing rebase rather than a finished one.
+    pub fn pauses(&self) -> bool {
+        self.entries.iter().any(|e| e.action == Action::Edit)
+    }
+
+    /// Everything git would refuse, said before any process runs.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.entries.is_empty() {
+            return Err("the plan is empty; there is nothing to rebuild".into());
+        }
+        if !self.entries.iter().any(Entry::lands) {
+            return Err("this plan drops every commit it covers, which leaves git \
+                 an empty plan — reset to the base instead"
+                .into());
+        }
+        // File order: a fold needs something already replayed above it, and
+        // "already replayed" means a landing entry deeper in the file.
+        let mut landed = false;
+        for entry in self.entries.iter().rev() {
+            let folding = matches!(entry.action, Action::Squash | Action::Fixup);
+            if folding && !landed {
+                return Err(format!(
+                    "{} has nothing beneath it to fold into: every commit below \
+                     it in the plan is dropped or folded away",
+                    entry.short
+                ));
+            }
+            if entry.action == Action::Reword && entry.message.is_none() {
+                return Err(format!("{} is reworded with no message", entry.short));
+            }
+            if entry.amend.is_some() && !entry.lands() {
+                return Err(format!(
+                    "{} is dropped, so there is nothing of it left to amend",
+                    entry.short
+                ));
+            }
+            landed |= entry.lands() && !folding;
+        }
+        Ok(())
+    }
+
+    /// git's own bytes for this plan — one line per entry, oldest first.
+    ///
+    /// `exec_for` is where the amendments come from, and it is a callback
+    /// for one reason: a reworded message lives in a file somebody has to
+    /// *write*, and `core` does no I/O. So the ordering — which commit,
+    /// which action, which command after it — is decided exactly once, here,
+    /// and the acquisition layer supplies only the shell bytes it alone can
+    /// build. A dropped entry is never asked for one: nothing was replayed,
+    /// so there is nothing to amend.
+    ///
+    /// A [`Action::Reword`] reaches git as a `pick`, never as the word
+    /// itself: git's own `reword` opens an editor this client cannot answer,
+    /// and the message it would have asked for is already in hand.
+    pub fn script(&self, exec_for: ExecFor<'_>) -> Result<TodoScript, String> {
+        self.validate()?;
+        let mut script = TodoScript::default();
+        for entry in self.entries.iter().rev() {
+            let action = match entry.action {
+                Action::Reword => Action::Pick,
+                other => other,
+            };
+            script.push_step(action, &entry.sha);
+            if !entry.lands() {
+                continue;
+            }
+            for command in exec_for(entry)? {
+                script.push_step(Action::Exec, &command);
+            }
+        }
+        script.validate()?;
+        Ok(script)
+    }
+}
+
+/// Where a plan's amendments get their shell bytes: called once per
+/// replayed entry, answering the `exec` lines to run after it.
+///
+/// A callback and not a list because the bytes cost I/O — a reworded
+/// message lives in a file somebody has to write — and `core` does none.
+pub type ExecFor<'a> = &'a mut dyn FnMut(&Entry) -> Result<Vec<Vec<u8>>, String>;
+
+/// The action a `fixup!` / `squash!` subject asks for, and the subject it
+/// names — with every layer of marker stripped, because git writes
+/// `fixup! fixup! x` when a fixup is fixed up.
+fn marker_of(subject: &str) -> Option<(Action, String)> {
+    let mut rest = subject.trim_start();
+    let mut action = None;
+    loop {
+        let next = if let Some(tail) = rest.strip_prefix("fixup!") {
+            action.get_or_insert(Action::Fixup);
+            tail
+        } else if let Some(tail) = rest.strip_prefix("squash!") {
+            action.get_or_insert(Action::Squash);
+            tail
+        } else if let Some(tail) = rest.strip_prefix("amend!") {
+            // git's third marker. It rewords as well as folds, and the
+            // message it would reword *with* is its own body — which a log
+            // window does not carry. Folded as a fixup, which keeps the
+            // change and loses only the rewording nothing here could read.
+            action.get_or_insert(Action::Fixup);
+            tail
+        } else {
+            break;
+        };
+        rest = next.trim_start();
+    }
+    action.map(|action| (action, rest.to_string()))
+}
+
+/// Whether the window from HEAD down to `index` is one straight
+/// single-parent line — the precondition every wholesale plan rests on, and
+/// the same check [`compose`] makes, said once.
+fn straight_line(commits: &[Commit], index: usize) -> Result<(), String> {
+    for j in 1..=index {
+        if commits[j - 1].parents.len() != 1 {
+            return Err("history between HEAD and the keyboard holds a merge; \
+                 rebasing would flatten it"
+                .into());
+        }
+        if commits[j - 1].parents[0] != commits[j].sha {
+            return Err("the loaded history is not a straight line down to this \
+                 commit, so a plan built from it would not cover everything \
+                 the rebase would touch"
+                .into());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -624,19 +1048,27 @@ squash
     }
 
     #[test]
-    fn reword_and_edit_are_named_by_the_validation_that_refuses_them() {
+    fn reword_is_named_by_the_validation_that_refuses_it_and_edit_passes() {
         let mut script = TodoScript::default();
         script.push_step(Action::Pick, b"1111111");
         script.push_step(Action::Squash, b"2222222");
         assert_eq!(script.validate(), Ok(()));
 
-        for action in [Action::Reword, Action::Edit] {
-            let mut bad = TodoScript::default();
-            bad.push_step(action, b"1111111");
-            let err = bad.validate().expect_err("refused");
-            assert!(err.contains(action.word()), "{action:?} named: {err}");
-            assert!(err.contains("editor"), "{err}");
-        }
+        // The word itself opens a second editor nothing here can answer, so
+        // it is refused by name — a [`Plan`] reaches the same result with a
+        // pick and an exec instead, which is why nothing composes it.
+        let mut bad = TodoScript::default();
+        bad.push_step(Action::Reword, b"1111111");
+        let err = bad.validate().expect_err("refused");
+        assert!(err.contains("reword"), "reword named: {err}");
+        assert!(err.contains("editor"), "{err}");
+
+        // `edit` opens nothing. It stops with the rebase standing, which is
+        // the state the lifecycle keys already carry on from, so a plan that
+        // holds one runs.
+        let mut pausing = TodoScript::default();
+        pausing.push_step(Action::Edit, b"1111111");
+        assert_eq!(pausing.validate(), Ok(()));
 
         // git's own header validates fine: it survives the rewrite untouched.
         assert_eq!(TodoScript::parse(SAMPLE).validate(), Ok(()));
@@ -803,5 +1235,271 @@ squash
         let err = compose(Rewrite::Drop, &forked, 2)
             .expect_err("a side commit interleaved in the window breaks completeness");
         assert!(err.contains("straight line"), "{err}");
+    }
+
+    // ------------------------------------------------------------ the plan
+
+    /// The plan's own script, with the amendments spelled as the shell
+    /// bytes an acquisition layer would have supplied — a stand-in here,
+    /// because `core` writes no message file and never will.
+    fn planned(plan: &Plan) -> Vec<String> {
+        let script = plan
+            .script(&mut |entry: &Entry| {
+                let mut out = Vec::new();
+                if let Some(message) = &entry.message {
+                    out.push([b"amend -F ".as_slice(), message].concat());
+                }
+                if entry.amend == Some(Amend::ResetAuthor) {
+                    out.push(b"amend --reset-author".to_vec());
+                }
+                Ok(out)
+            })
+            .expect("a runnable plan");
+        shown(&script)
+    }
+
+    #[test]
+    fn a_fresh_plan_is_git_own_starting_point() {
+        let commits = linear();
+        let plan = Plan::over(&commits, 2).expect("a straight window");
+        // Every entry a pick, the deepest one's parent underneath: a rebase
+        // that changes nothing, which is what git generates too.
+        assert_eq!(plan.upstream(), b"deep-sha");
+        assert_eq!(plan.len(), 3);
+        assert_eq!(
+            planned(&plan),
+            vec!["pick under-sha", "pick mid-sha", "pick head-sha"],
+            "oldest first, the order the file itself is in"
+        );
+        // Newest first in the model, because that is the order the row under
+        // the keyboard is in.
+        assert_eq!(plan.entries()[0].subject, "head");
+        assert_eq!(plan.entries()[2].subject, "under");
+    }
+
+    #[test]
+    fn a_plan_refuses_the_windows_it_cannot_cover() {
+        let commits = linear();
+        // The root has no parent, so nothing is left to rebuild onto.
+        let err = Plan::over(&commits, 4).expect_err("refused");
+        assert!(err.contains("root"), "{err}");
+
+        // A merge in the window flattens under `rebase -i`.
+        let mut merged = linear();
+        merged[1].parents = vec!["under-sha".into(), "other-sha".into()].into_boxed_slice();
+        let err = Plan::over(&merged, 2).expect_err("refused");
+        assert!(err.contains("merge"), "{err}");
+
+        // The deepest commit itself being a merge is its own sentence.
+        let err = Plan::over(&merged, 1).expect_err("refused");
+        assert!(err.contains("merge"), "{err}");
+
+        // A window that is not one line — a side branch interleaved — would
+        // build a plan that does not cover what the rebase touches.
+        let mut broken = linear();
+        broken[1].parents = vec!["somewhere-else".into()].into_boxed_slice();
+        let err = Plan::over(&broken, 3).expect_err("refused");
+        assert!(err.contains("straight line"), "{err}");
+
+        // Past the end of the window there is no row at all.
+        assert!(Plan::over(&commits, 9).is_err());
+    }
+
+    #[test]
+    fn folds_squash_and_fixup_into_the_commit_below() {
+        let commits = linear();
+        // The keyboard on `mid`, folding into `under` — which is the entry
+        // below it in the list and its parent in the history.
+        let mut plan = Plan::over(&commits, 2).expect("a window");
+        plan.set_action(1, Action::Squash).expect("a fold");
+        assert_eq!(
+            planned(&plan),
+            vec!["pick under-sha", "squash mid-sha", "pick head-sha"]
+        );
+
+        let mut plan = Plan::over(&commits, 2).expect("a window");
+        plan.set_action(0, Action::Fixup).expect("a fold");
+        assert_eq!(
+            planned(&plan),
+            vec!["pick under-sha", "pick mid-sha", "fixup head-sha"]
+        );
+
+        // The oldest row has nothing below it *in the plan*: refused where
+        // the press happened, naming the fix, rather than by git after a
+        // process started.
+        let mut plan = Plan::over(&commits, 2).expect("a window");
+        let err = plan.set_action(2, Action::Squash).expect_err("refused");
+        assert!(err.contains("nothing below it"), "{err}");
+        assert!(err.contains("deeper"), "the way out is named: {err}");
+    }
+
+    #[test]
+    fn a_drop_leaves_the_rest_and_dropping_everything_refuses() {
+        let commits = linear();
+        let mut plan = Plan::over(&commits, 2).expect("a window");
+        plan.set_action(1, Action::Drop).expect("a drop");
+        assert_eq!(
+            planned(&plan),
+            vec!["pick under-sha", "drop mid-sha", "pick head-sha"],
+            "the drop is a line git reads, not a line nobody wrote"
+        );
+
+        // Everything dropped is an empty todo, which git refuses — said
+        // here, with the move that was meant named.
+        for i in 0..plan.len() {
+            plan.set_action(i, Action::Drop).expect("a drop");
+        }
+        let err = plan.validate().expect_err("refused");
+        assert!(err.contains("reset to the base"), "{err}");
+
+        // A fold with nothing left beneath it is the same refusal wearing
+        // another shape, and it names the commit.
+        let mut plan = Plan::over(&commits, 2).expect("a window");
+        plan.set_action(2, Action::Drop).expect("a drop");
+        plan.set_action(1, Action::Fixup).expect("a fold");
+        let err = plan.validate().expect_err("refused");
+        assert!(err.contains("nothing beneath it"), "{err}");
+    }
+
+    #[test]
+    fn a_reword_travels_as_a_pick_and_its_own_message() {
+        let commits = linear();
+        let mut plan = Plan::over(&commits, 1).expect("a window");
+        plan.set_message(0, b"a better subject".to_vec())
+            .expect("a message");
+        assert_eq!(plan.entries()[0].action, Action::Reword);
+        assert_eq!(
+            planned(&plan),
+            vec![
+                "pick mid-sha",
+                "pick head-sha",
+                "exec amend -F a better subject",
+            ],
+            "git's own reword word never reaches the file"
+        );
+
+        // A reword with no message would keep the old one silently.
+        let mut plan = Plan::over(&commits, 1).expect("a window");
+        plan.set_action(0, Action::Reword).expect("an action");
+        let err = plan.validate().expect_err("refused");
+        assert!(err.contains("no message"), "{err}");
+        assert!(plan.set_message(0, b"   \n".to_vec()).is_err(), "blank");
+
+        // Choosing another action afterwards drops the message with it:
+        // a stale message hanging on a pick is a reword waiting to surprise
+        // somebody.
+        let mut plan = Plan::over(&commits, 1).expect("a window");
+        plan.set_message(0, b"typed".to_vec()).expect("a message");
+        plan.set_action(0, Action::Pick).expect("an action");
+        assert_eq!(plan.entries()[0].message, None);
+    }
+
+    #[test]
+    fn an_amendment_rides_the_pick_that_replayed_it() {
+        let commits = linear();
+        let mut plan = Plan::over(&commits, 2).expect("a window");
+        plan.set_amend(1, Amend::ResetAuthor).expect("an amendment");
+        assert_eq!(
+            planned(&plan),
+            vec![
+                "pick under-sha",
+                "pick mid-sha",
+                "exec amend --reset-author",
+                "pick head-sha",
+            ],
+            "the exec runs against the commit it followed"
+        );
+
+        // Nothing is amended about a commit that was never replayed.
+        let mut plan = Plan::over(&commits, 2).expect("a window");
+        plan.set_action(1, Action::Drop).expect("a drop");
+        let err = plan.set_amend(1, Amend::ResetAuthor).expect_err("refused");
+        assert!(err.contains("dropped"), "{err}");
+    }
+
+    #[test]
+    fn moving_a_commit_swaps_it_with_its_neighbour_and_stops_at_the_edges() {
+        let commits = linear();
+        let mut plan = Plan::over(&commits, 2).expect("a window");
+        // Down is away from HEAD, which is *earlier* in git's file.
+        assert_eq!(plan.move_down(0), Ok(1));
+        assert_eq!(
+            planned(&plan),
+            vec!["pick under-sha", "pick head-sha", "pick mid-sha"]
+        );
+        // And up puts it back.
+        assert_eq!(plan.move_up(1), Ok(0));
+        assert_eq!(
+            planned(&plan),
+            vec!["pick under-sha", "pick mid-sha", "pick head-sha"]
+        );
+
+        // The edges refuse in their own words rather than wrapping around:
+        // below the oldest row is the base the rebase stands on.
+        let err = plan.move_up(0).expect_err("refused");
+        assert!(err.contains("newest"), "{err}");
+        let err = plan.move_down(2).expect_err("refused");
+        assert!(err.contains("base"), "{err}");
+        assert!(plan.move_up(9).is_err(), "a row that is not there");
+    }
+
+    #[test]
+    fn autosquash_lands_each_marker_on_the_commit_it_names() {
+        let mut commits = linear();
+        commits[0].subject = "fixup! under".into();
+        commits[1].subject = "squash! under".into();
+        let mut plan = Plan::over(&commits, 2).expect("a window");
+        assert_eq!(plan.autosquash(), 2);
+        assert_eq!(
+            planned(&plan),
+            vec!["pick under-sha", "squash mid-sha", "fixup head-sha",],
+            "each marker sits directly on its target, in the order written"
+        );
+
+        // A marker naming nothing in the window keeps its place and its
+        // pick: folding it into a guess lands a change in the wrong commit.
+        let mut commits = linear();
+        commits[0].subject = "fixup! something else entirely".into();
+        let mut plan = Plan::over(&commits, 2).expect("a window");
+        assert_eq!(plan.autosquash(), 0);
+        assert_eq!(
+            planned(&plan),
+            vec!["pick under-sha", "pick mid-sha", "pick head-sha"]
+        );
+
+        // git's stacked markers: `fixup! fixup! x` names x, not a marker.
+        let mut commits = linear();
+        commits[0].subject = "fixup! fixup! mid".into();
+        let mut plan = Plan::over(&commits, 2).expect("a window");
+        assert_eq!(plan.autosquash(), 1);
+        assert_eq!(
+            planned(&plan),
+            vec!["pick under-sha", "pick mid-sha", "fixup head-sha"]
+        );
+    }
+
+    #[test]
+    fn a_plan_says_when_it_will_pause() {
+        let commits = linear();
+        let mut plan = Plan::over(&commits, 2).expect("a window");
+        assert!(!plan.pauses());
+        plan.set_action(1, Action::Edit).expect("an edit");
+        assert!(plan.pauses(), "an edit hands the rebase back standing");
+        assert_eq!(
+            planned(&plan),
+            vec!["pick under-sha", "edit mid-sha", "pick head-sha"],
+            "edit reaches git as itself; it opens nothing"
+        );
+    }
+
+    #[test]
+    fn a_sha_is_followed_across_a_reorder_and_not_a_row() {
+        let commits = linear();
+        let mut plan = Plan::over(&commits, 2).expect("a window");
+        assert_eq!(plan.index_of(b"head-sha"), Some(0));
+        plan.move_down(0).expect("a move");
+        assert_eq!(plan.index_of(b"head-sha"), Some(1), "the row moved");
+        assert_eq!(plan.index_of(b"nobody"), None);
+        assert_eq!(plan.base(), commits[2].short);
     }
 }
