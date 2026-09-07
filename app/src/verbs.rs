@@ -805,7 +805,9 @@ impl Write {
                     .map(|s| !s.is_empty())
                     .unwrap_or(false);
                 if dirty {
-                    return Err(format!("worktree at {shown} has uncommitted changes"));
+                    return Err(format!(
+                        "worktree at {shown} has uncommitted changes — press d again to force its removal"
+                    ));
                 }
             }
             r.worktree_remove(&path, force)

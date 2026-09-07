@@ -2043,6 +2043,10 @@ pub trait WorktreeClient: Client {
     /// carries whether the force spelling is what the next press runs:
     /// a dirty refusal upgrades the question, anything else re-arms it.
     fn confirm_or_arm_worktree(&mut self, path: &[u8], force: bool) -> bool;
+    /// Stands the force upgrade on this path after a plain removal was
+    /// submitted for it: the refusal it comes back with is what the next
+    /// press spends. A no-op unless the arm stands unforced on this path.
+    fn upgrade_worktree_force(&mut self, path: &[u8]);
 }
 
 /// `worktrees.new`: check a starting point out into a new worktree.
@@ -2081,9 +2085,9 @@ pub fn create_worktree(
 }
 
 /// `worktrees.remove`: forget the selected checkout. First press asks,
-/// second press runs the plain removal — and when that comes back refused
-/// for dirt, the App re-arms with the force spelling standing, so the
-/// third press is the confirmed force rather than a second surprise.
+/// second press runs the plain removal and stands the force upgrade — and
+/// when that comes back refused for dirt, the third press is the confirmed
+/// force rather than a second surprise: the refusal sentence offers it.
 pub fn remove_worktree(client: &mut impl WorktreeClient, force: bool) {
     let Some(path) = client.worktree_target() else {
         client.say("nothing selected on the worktree list".into());
@@ -2094,22 +2098,19 @@ pub fn remove_worktree(client: &mut impl WorktreeClient, force: bool) {
         return;
     }
     if !client.confirm_or_arm_worktree(&path, force) {
-        match force {
-            true => client.ask(format!(
-                "remove {} even though it is dirty? the checkout goes with it — press again to confirm",
-                String::from_utf8_lossy(&path)
-            )),
-            false => client.say(format!(
-                "remove {}? press again to confirm",
-                String::from_utf8_lossy(&path)
-            )),
-        }
+        client.say(format!(
+            "remove {}? press again to confirm",
+            String::from_utf8_lossy(&path)
+        ));
         return;
     }
     let Some(repo) = client.repo() else {
         client.say("a fixture has no worktrees to remove".into());
         return;
     };
+    if !force {
+        client.upgrade_worktree_force(&path);
+    }
     if !client.submit(Box::new(Write::worktree_remove(&repo, path, force))) {
         client.say("the job queue is shutting down".into());
     }

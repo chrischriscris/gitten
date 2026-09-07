@@ -69,6 +69,7 @@ pub mod stashes;
 pub mod tags;
 pub mod term;
 pub mod todo;
+pub mod worktrees;
 
 /// The two rendering budgets, from `gitten_app` — where they are shared rather
 /// than picked independently by three clients that all picked the same numbers.
