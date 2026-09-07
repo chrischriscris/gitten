@@ -38,6 +38,7 @@
 //! timing in `docs/measurements.md` is measured rather than observed.
 
 use gitten_app::acquire::{self, Data};
+use gitten_app::act::{hunk_job, verb_refusal, HunkAsk, HunkSelection, HunkSide};
 use gitten_app::cli::{self, Source, View};
 use gitten_app::jobs::{Event as JobEvent, Generation, Job, Runner, Submitter};
 use gitten_app::verbs::Write;
@@ -49,10 +50,10 @@ use gitten_core::host::Host;
 use gitten_core::refs::{HeadState, RefName};
 use gitten_core::runs::Run;
 use gitten_core::source::DiffSource;
-use gitten_core::Hunk;
 use gitten_tui::branches::{self, Branches, Marks, Target};
 use gitten_tui::commits::{Commits, Glyphs};
 use gitten_tui::diff::Diff;
+use gitten_tui::diff::PatchSelection;
 use gitten_tui::files::{self, Files};
 use gitten_tui::help;
 use gitten_tui::screen::{Ink, Pen, Screen};
@@ -914,6 +915,10 @@ impl Screens {
                 "search.prev" => d.search_next(-1),
                 "diff.next-hunk" => d.jump_hunk(1),
                 "diff.prev-hunk" => d.jump_hunk(-1),
+                "diff.toggle-line-selection" => {
+                    d.toggle_line_selection();
+                }
+                "select.mark" => d.select_mark(),
                 _ => return false,
             },
             Screens::Stashes { view: s, .. } => match command {
@@ -2805,7 +2810,9 @@ impl App {
             // was acquired through, and a view is drawing and input only.
             // Routed here, ahead of the pane, for the same reason the
             // window routes them in its `run_command`.
-            "diff.stage-hunk" | "diff.unstage-hunk" => self.hunk_verb(command),
+            "diff.stage-hunk" | "diff.unstage-hunk" | "diff.discard-hunk" => {
+                self.hunk_verb(command)
+            }
             // The stash verbs act on the *repository*, not the pane: the
             // pane answers "which row", the queue takes it from there.
             // Routed ahead of the focused pane for the same reason the hunk
@@ -3399,47 +3406,101 @@ impl App {
         }
     }
 
-    /// `diff.stage-hunk` / `diff.unstage-hunk`: send the hunk the keyboard is
-    /// on to the index, or take it back out. The terminal's share of the
-    /// window's `hunk_verb`: the gates, the patch, the verb — and not one
-    /// line more, because every one of those is shared with an extension
-    /// calling the same command through the same name.
+    /// `diff.stage-hunk` / `diff.unstage-hunk` / `diff.discard-hunk`: act on
+    /// what the keyboard selects — the whole hunk, or the marked lines.
+    /// The terminal's share of the window's `hunk_verb`: the gates, the
+    /// aim, the arm, the job — and not one line more, because every one of
+    /// those is shared with an extension calling the same command through
+    /// the same name, and the verb itself is [`act::hunk_job`], shared with
+    /// every client.
     ///
-    /// The verbs reach only a diff that was actually acquired: the empty pane
-    /// a commits launch registers has no source, and "not loaded yet" refuses
-    /// rather than pretending — no fake source, no fake generation, no patch
-    /// against nothing.
+    /// The verbs reach only a diff that was actually acquired: the empty
+    /// pane a commits launch registers has no source, and "not loaded yet"
+    /// refuses rather than pretending — no fake source, no fake generation,
+    /// no patch against nothing. What each verb *means* on each side of the
+    /// index is the shared policy's to say; what the keyboard selected is
+    /// the pane's (`patch_selection`); and a discard asks twice, on the
+    /// pane's own arm, before any job exists.
     fn hunk_verb(&mut self, command: &str) {
-        let (origin, hunk) = match self.panes.focused() {
+        // Everything decided ahead of anything queued, in the order a
+        // reader meets the facts: which diff this is (and which aims no
+        // side of it can serve), whether a repository is open, what the
+        // keyboard selected — and a refusal or a question is said here,
+        // so the queue only ever sees a job that means it.
+        enum Gate {
+            OffDiff,
+            NoDiff,
+            Refused(String),
+            Ask(String),
+            Proceed(HunkAsk, gitten_git::Handle),
+        }
+        let gate;
+        match self.panes.focused_mut() {
             Some(Screens::Diff {
                 view,
                 origin: Some(origin),
                 ..
-            }) => (Some(origin.clone()), view.current_hunk()),
-            Some(Screens::Diff { origin: None, .. }) => {
-                self.message = "no diff is open".into();
-                return;
-            }
-            _ => {
-                self.message = "the keyboard is not on a diff".into();
-                return;
-            }
-        };
-        // Everything decided ahead of anything queued: a refusal is said
-        // here, and the queue only ever sees a job that means it.
-        let handle = self.repo.as_ref().map(|(_, handle)| handle);
-        match hunk_action(
-            command,
-            origin.as_ref().expect("a diff with an origin"),
-            handle,
-            hunk,
-        ) {
-            Ok(job) => {
-                if self.submitter.submit(job).is_err() {
-                    self.message = "the job queue is shutting down".into();
+            }) => match hunk_side_of(origin) {
+                Err(refusal) => gate = Gate::Refused(refusal),
+                Ok(side) => match self.repo.as_ref() {
+                    None => gate = Gate::Refused("no repository is open".into()),
+                    Some((_, handle)) => {
+                        let handle = gitten_git::Handle::clone(handle);
+                        match view.patch_selection() {
+                            Err(refusal) => gate = Gate::Refused(refusal),
+                            Ok(aim) => {
+                                // A verb the side cannot serve is refused
+                                // here, before the arm — a destructive
+                                // question asked on an aim that will never
+                                // run is a question nobody should have to
+                                // answer.
+                                if let Some(refusal) = verb_refusal(command, side) {
+                                    gate = Gate::Refused(refusal);
+                                } else if command == "diff.discard-hunk"
+                                    && !view.confirm_or_arm_discard()
+                                {
+                                    gate = Gate::Ask(discard_question(&aim));
+                                } else {
+                                    let (path, selection) = match aim {
+                                        PatchSelection::Whole { path, hunk } => {
+                                            (path, HunkSelection::Whole(hunk))
+                                        }
+                                        PatchSelection::Lines { path, parts } => {
+                                            (path, HunkSelection::Lines(parts))
+                                        }
+                                    };
+                                    gate = Gate::Proceed(
+                                        HunkAsk {
+                                            path,
+                                            side,
+                                            selection,
+                                        },
+                                        handle,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                },
+            },
+            Some(Screens::Diff { origin: None, .. }) => gate = Gate::NoDiff,
+            _ => gate = Gate::OffDiff,
+        }
+        match gate {
+            Gate::OffDiff => self.message = "the keyboard is not on a diff".into(),
+            Gate::NoDiff => self.message = "no diff is open".into(),
+            Gate::Refused(refusal) | Gate::Ask(refusal) => self.message = refusal,
+            Gate::Proceed(ask, handle) => {
+                let differs = self.host.differ.clone();
+                match hunk_job(command, ask, &handle, &differs, &Overrides::default()) {
+                    Ok(job) => {
+                        if self.submitter.submit(job).is_err() {
+                            self.message = "the job queue is shutting down".into();
+                        }
+                    }
+                    Err(e) => self.message = e,
                 }
             }
-            Err(e) => self.message = e,
         }
     }
 
@@ -3929,6 +3990,8 @@ fn tui_availability(repo: bool) -> Availability {
         "input.cancel",
         "diff.stage-hunk",
         "diff.unstage-hunk",
+        "diff.discard-hunk",
+        "diff.toggle-line-selection",
         "stashes.apply",
         "stashes.pop",
         "stashes.drop",
@@ -4076,82 +4139,36 @@ impl gitten_app::act::FileClient for App {
     }
 }
 
-/// The gates `diff.stage-hunk` / `diff.unstage-hunk` run, headless, in the
-/// window's own words.
-///
-/// Everything decided before anything is queued: only a working-tree diff has
-/// an index to aim at; a commit's diff is between two snapshots and has
-/// neither index nor worktree in reach; a fixture or a patch has no repository
-/// behind it; the keyboard may not be on a hunk at all. And a hunk whose every
-/// line is an addition *looks* like a creation but only [`Repo::status`] knows
-/// whether it is one — at `[diff] context = 0` a mid-file addition to a tracked
-/// file carries no old numbers either, so absence of them is not evidence.
-/// The status read is the same one the files pane draws from; a status that
-/// cannot be read is not proof of a creation, so the patch is still emitted
-/// and git's own refusal is what surfaces.
-///
-/// The patch is [`gitten_core::patch::emit`]'s and nothing else's; the verb is
-/// a [`Write`] job against the caller's retained handle; the caller owns the
-/// queue. Nothing here runs git and nothing here blocks — a constructor
-/// refusal (an empty patch) comes back as an error and is said, not queued.
-fn hunk_action(
-    command: &str,
-    origin: &DiffSource,
-    repo: Option<&gitten_git::Handle>,
-    hunk: Option<(String, Hunk)>,
-) -> Result<Box<dyn Job>, String> {
+/// Which side of the index a diff's origin is, for the hunk verbs — and
+/// the refusals for the aims no side can serve. The messages here are the
+/// ones the headless tests hold, worded once so every caller says the same
+/// sentence; what each verb *means* per side is [`act::hunk_job`]'s to say.
+fn hunk_side_of(origin: &DiffSource) -> Result<HunkSide, String> {
     match origin {
-        // The combined HEAD→worktree read is the one source the hunk verbs
-        // act on tonight: its hunks are reverse-appliable to the working
-        // tree as it stands. The inference lives on [`DiffSource
-        // ::combined_worktree`]; the partial-staging packet replaces it
-        // with per-side sources.
-        DiffSource::Revspec { arg } if arg.is_empty() => {}
+        DiffSource::Staged { .. } => Ok(HunkSide::Staged),
+        DiffSource::Unstaged { .. } => Ok(HunkSide::Unstaged),
+        DiffSource::Untracked { .. } => Ok(HunkSide::Untracked),
+        DiffSource::Revspec { arg } if arg.is_empty() => Ok(HunkSide::Combined),
         DiffSource::Revspec { .. } | DiffSource::Commit { .. } | DiffSource::Stash { .. } => {
-            return Err(
-                "only the working-tree diff can act on hunks — this one is between commits".into(),
-            )
+            Err("only the working-tree diff can act on hunks — this one is between commits".into())
         }
-        DiffSource::Fixture => return Err("a fixture has no repository behind it".into()),
-        DiffSource::Patch => return Err("a patch file has no repository behind it".into()),
-        // A file's own side is where per-hunk staging belongs, and that is
-        // the partial-staging packet's work. Until it lands, the files pane
-        // is the whole-file door, and this says so instead of guessing at
-        // which half of the index a hunk belongs to.
-        DiffSource::Staged { .. }
-        | DiffSource::Unstaged { .. }
-        | DiffSource::Untracked { .. } => {
-            return Err(
-                "hunk verbs are not wired to a file's preview yet — stage the file whole from the working-tree pane".into(),
-            )
+        DiffSource::Fixture => Err("a fixture has no repository behind it".into()),
+        DiffSource::Patch => Err("a patch file has no repository behind it".into()),
+    }
+}
+
+/// The question an armed discard asks, once, in the status line: what is
+/// under the keyboard, named closely enough to be answered on purpose.
+fn discard_question(aim: &PatchSelection) -> String {
+    match aim {
+        PatchSelection::Whole { path, .. } => {
+            format!("discard the hunk of {path} under the keyboard? press again to confirm")
+        }
+        PatchSelection::Lines { path, parts } => {
+            let lines: usize = parts.iter().map(|(_, lo, hi)| hi - lo + 1).sum();
+            format!("discard {lines} marked lines of {path}? press again to confirm")
         }
     }
-    let repo = repo.ok_or_else(|| "no repository is open".to_string())?;
-    let Some((path, hunk)) = hunk else {
-        return Err("the keyboard is not on a hunk".into());
-    };
-    // A status read on the path, and only for hunks that could be creations —
-    // every other shape pays nothing and cannot be misread this way.
-    let creation = !hunk.lines.iter().any(|l| l.old_no.is_some())
-        && repo
-            .status()
-            .map(|s| {
-                s.untracked
-                    .iter()
-                    .any(|e| e.path.as_bytes() == path.as_bytes())
-            })
-            .unwrap_or(false);
-    if creation {
-        return Err(
-            "that hunk adds a new file — stage or unstage it whole from the files pane".into(),
-        );
-    }
-    let patch = gitten_core::patch::emit(&path, &[&hunk]);
-    let built = match command {
-        "diff.stage-hunk" => Write::stage_patch(repo, patch),
-        _ => Write::unstage_patch(repo, patch),
-    };
-    built.map(|job| Box::new(job) as Box<dyn Job>)
 }
 
 /// The three branch reads one launch or one refresh needs, and the honest
@@ -5223,6 +5240,8 @@ mod staging {
             new,
             old_oid: None,
             new_oid: None,
+            old_final_newline: true,
+            new_final_newline: true,
             binary: false,
         }
     }
@@ -5326,6 +5345,11 @@ diff --git a/tracked.txt b/tracked.txt
         /// named, the way git's own pathspec would.
         staged: Vec<Pair>,
         unstaged: Vec<Pair>,
+        /// What the unstaged side reads answer after the next stage lands —
+        /// the same world-flip `applied` performs for the aggregate read,
+        /// one shot, because a stage that lands really does change what
+        /// the index→worktree diff shows.
+        unstaged_after: Option<Vec<Pair>>,
         staged_reads: usize,
         unstaged_reads: usize,
         /// The untracked files' contents, as the pairs the preview asks
@@ -5345,6 +5369,13 @@ diff --git a/tracked.txt b/tracked.txt
         /// keyboard live: the read really is slow, and the test really
         /// types while it runs.
         gate: Option<Arc<(Mutex<bool>, std::sync::Condvar)>>,
+        /// The blob OIDs the checked-patch job's revalidation reads answer,
+        /// keyed by lossy path. The identity a patch is built against, and
+        /// the knob a staleness test turns: changing the answer makes the
+        /// next write refuse, exactly as a repository that moved under the
+        /// keyboard would.
+        index_oids: Vec<(String, String)>,
+        head_oids: Vec<(String, String)>,
     }
 
     /// A repository that exists only as this struct. Reads answer what the
@@ -5662,6 +5693,9 @@ diff --git a/tracked.txt b/tracked.txt
                 return Err("the fake refused".into());
             }
             s.applied += 1;
+            if let Some(after) = s.unstaged_after.take() {
+                s.unstaged = after;
+            }
             Ok(())
         }
 
@@ -5671,6 +5705,41 @@ diff --git a/tracked.txt b/tracked.txt
                 .push(format!("unstage {}", String::from_utf8_lossy(patch)));
             s.applied += 1;
             Ok(())
+        }
+
+        fn discard_patch(&self, patch: &[u8]) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            s.writes
+                .push(format!("discard {}", String::from_utf8_lossy(patch)));
+            if s.refuses.iter().any(|r| patch.starts_with(r)) {
+                return Err("the fake refused".into());
+            }
+            s.applied += 1;
+            Ok(())
+        }
+
+        fn index_blob_oid(&self, path: &[u8]) -> gitten_git::Result<Option<String>> {
+            let shown = String::from_utf8_lossy(path).into_owned();
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .index_oids
+                .iter()
+                .find(|(p, _)| *p == shown)
+                .map(|(_, oid)| oid.clone()))
+        }
+
+        fn head_blob_oid(&self, path: &[u8]) -> gitten_git::Result<Option<String>> {
+            let shown = String::from_utf8_lossy(path).into_owned();
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .head_oids
+                .iter()
+                .find(|(p, _)| *p == shown)
+                .map(|(_, oid)| oid.clone()))
         }
 
         fn commit(&self, message: &str) -> gitten_git::Result<String> {
@@ -7681,9 +7750,10 @@ diff --git a/tracked.txt b/tracked.txt
             "a refusal queued a write"
         );
 
-        // An untracked creation is refused by name — and the refusal names
-        // the pane that serves whole-file verbs, because a patch cannot
-        // carry the mode `git apply --cached` would need.
+        // A creation on the combined view is the policy gate's refusal, not
+        // a geometry guess: the combined view folds both sides of the index
+        // into one text, so no hunk of it can say which side it stages —
+        // and the refusal names the door that can.
         let (handle, state) = fake(&["new.txt"]);
         let (message, _) = said(
             Source::Repo {
@@ -7695,29 +7765,38 @@ diff --git a/tracked.txt b/tracked.txt
         );
         assert_eq!(
             message,
-            "that hunk adds a new file — stage or unstage it whole from the files pane"
+            "the combined view folds both sides of the index — open the file's own side from the files pane (enter)"
         );
         assert!(
             state.lock().unwrap().writes.is_empty(),
             "a refusal queued a write"
         );
 
-        // The plausible wrong refusal: this hunk is *also* every line an
-        // addition, but the file is tracked — `[diff] context = 0` makes a
-        // mid-file insertion look exactly like a creation, and geometry
-        // alone does not decide which it is.
-        let (handle, state) = fake(&["new.txt"]);
-        let (message, app) = said(
-            Source::Repo {
+        // The one that lands, does so on a file's own side: the unstaged
+        // preview of a tracked file, whose hunk is the index→worktree
+        // change and whose patch stages exactly that. Every refusal above
+        // left the queue untouched; this is the whole table's single write.
+        let (handle, state) = fake(&[]);
+        {
+            let mut s = state.lock().unwrap();
+            s.unstaged = vec![tracked_insertion()];
+            // The identity the patch is built against — what the write's
+            // revalidation read must still answer.
+            s.index_oids = vec![("tracked.txt".into(), "i0".into())];
+        }
+        let mut app = app_on_fake(
+            &Source::Repo {
                 path: std::path::PathBuf::from("/fake"),
                 arg: String::new(),
             },
-            Some(handle),
-            6,
+            &handle,
         );
-        assert!(message.is_empty(), "{message}");
+        open_side(&mut app, "tracked.txt");
+        move_to(&mut app, 2);
+        app.dispatch("diff.stage-hunk");
         assert!(
             until(Duration::from_secs(2), || {
+                app.pump_quiet();
                 !state.lock().unwrap().writes.is_empty()
             }),
             "the tracked insertion never reached the repository"
@@ -7725,12 +7804,43 @@ diff --git a/tracked.txt b/tracked.txt
         let writes = state.lock().unwrap().writes.clone();
         assert_eq!(writes.len(), 1, "{writes:?}");
         assert!(writes[0].starts_with("stage "), "{writes:?}");
-        // The one that landed is the only write the whole table produced:
-        // every refusal above left the queue untouched.
         assert!(
             app.submitter.submit(Box::new(Dead)).is_ok(),
             "the queue still runs"
         );
+    }
+
+    /// One unstaged pair for a tracked file: the old side the index holds
+    /// and the new side the worktree shows, five lines apart by one
+    /// inserted line — the shape a partial stage acts on.
+    fn tracked_insertion() -> Pair {
+        let mut p = pair(
+            "tracked.txt",
+            (0..5)
+                .map(|i| Arc::from(format!("line {i}").as_str()))
+                .collect(),
+            (0..5)
+                .map(|i| match i {
+                    3 => Arc::<str>::from("inserted"),
+                    n => Arc::from(format!("line {n}").as_str()),
+                })
+                .collect(),
+        );
+        p.status = 'M';
+        p.old_oid = Some("i0".into());
+        p
+    }
+
+    /// Opens one file's unstaged preview through the front door — the same
+    /// request the files pane makes — and waits for it to install.
+    fn open_side(app: &mut App, path: &str) {
+        app.request_preview(
+            gitten_core::source::DiffSource::Unstaged {
+                path: gitten_core::status::PathBytes::from_bytes(path.as_bytes()),
+            },
+            true,
+        );
+        app.pump_quiet();
     }
 
     /// A job that does nothing, for probing the queue's liveness.
@@ -7844,6 +7954,262 @@ diff --git a/tracked.txt b/tracked.txt
         assert_ne!(app.message, "the pairs read failed");
     }
 
+    // ------------------------------------------------------ partial staging
+    //
+    // The W3 behaviors, end to end through the real input path: commands
+    // dispatched by name against a diff pane whose side preview was
+    // acquired through the front door. The bytes git will see are proven
+    // against real repositories in `gitten-git`'s own tests; these prove
+    // the TUI aims the right verb at the right side with the right
+    // selection, and refuses where it must.
+
+    #[test]
+    fn tui_parity_line_selection_marks_and_stages_only_its_lines() {
+        let (handle, state) = fake(&[]);
+        {
+            let mut s = state.lock().unwrap();
+            s.unstaged = vec![tracked_insertion()];
+            s.index_oids = vec![("tracked.txt".into(), "i0".into())];
+        }
+        let source = Source::Repo {
+            path: std::path::PathBuf::from("/fake"),
+            arg: String::new(),
+        };
+        let mut app = app_on_fake(&source, &handle);
+        open_side(&mut app, "tracked.txt");
+        // Line selection: `a` turns it on, `v` marks the added line, space
+        // stages what is marked — and the status line says which unit the
+        // verbs are aimed at.
+        app.dispatch("diff.toggle-line-selection");
+        move_to(&mut app, 6);
+        app.press(Key::plain(Code::Char('v')));
+        app.dispatch("diff.stage-hunk");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                !state.lock().unwrap().writes.is_empty()
+            }),
+            "the marked line never reached the repository"
+        );
+        let writes = state.lock().unwrap().writes.clone();
+        assert_eq!(writes.len(), 1, "{writes:?}");
+        let applied = parse_unified_diff(&writes[0]["stage ".len()..]);
+        let changed: Vec<&str> = applied[0]
+            .hunks
+            .iter()
+            .flat_map(|h| &h.lines)
+            .filter(|l| l.kind != gitten_core::LineKind::Context)
+            .map(|l| l.text.as_ref())
+            .collect();
+        assert_eq!(changed, ["inserted"], "only the marked line travels");
+        let status = match app.panes.get("diff") {
+            Some(Screens::Diff { view, .. }) => view.status(&app.host),
+            _ => panic!("a diff is registered"),
+        };
+        assert!(
+            status.contains("line selection") && status.contains("1 marked"),
+            "the unit and the mark are on the status line: {status}"
+        );
+    }
+
+    #[test]
+    fn tui_parity_discard_hunk_asks_twice_on_one_spot_and_then_discards() {
+        let (handle, state) = fake(&[]);
+        {
+            let mut s = state.lock().unwrap();
+            s.unstaged = vec![tracked_insertion()];
+            s.index_oids = vec![("tracked.txt".into(), "i0".into())];
+        }
+        let source = Source::Repo {
+            path: std::path::PathBuf::from("/fake"),
+            arg: String::new(),
+        };
+        let mut app = app_on_fake(&source, &handle);
+        open_side(&mut app, "tracked.txt");
+        move_to(&mut app, 2);
+        // First press arms the question; nothing runs.
+        app.dispatch("diff.discard-hunk");
+        assert_eq!(
+            app.message,
+            "discard the hunk of tracked.txt under the keyboard? press again to confirm"
+        );
+        assert!(state.lock().unwrap().writes.is_empty(), "the arm ran git");
+        // A move of the keyboard disarms it — a yes addressed to a row
+        // that is no longer under the keyboard is not a yes.
+        app.dispatch("view.down");
+        app.dispatch("diff.discard-hunk");
+        assert!(
+            state.lock().unwrap().writes.is_empty(),
+            "a moved-away answer ran git"
+        );
+        // Back on the row: the question again, and the second press spends
+        // it and runs.
+        move_to(&mut app, 2);
+        app.dispatch("diff.discard-hunk");
+        app.dispatch("diff.discard-hunk");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                !state.lock().unwrap().writes.is_empty()
+            }),
+            "the answered discard never reached the repository"
+        );
+        let writes = state.lock().unwrap().writes.clone();
+        assert_eq!(writes.len(), 1, "{writes:?}");
+        assert!(writes[0].starts_with("discard "), "{writes:?}");
+    }
+
+    #[test]
+    fn tui_parity_the_staged_side_says_what_each_verb_means_there() {
+        let (handle, state) = fake(&[]);
+        {
+            let mut s = state.lock().unwrap();
+            let mut staged = tracked_insertion();
+            staged.old_oid = Some("h0".into());
+            staged.new_oid = Some("i0".into());
+            s.staged = vec![staged];
+            s.head_oids = vec![("tracked.txt".into(), "h0".into())];
+            s.index_oids = vec![("tracked.txt".into(), "i0".into())];
+        }
+        let source = Source::Repo {
+            path: std::path::PathBuf::from("/fake"),
+            arg: String::new(),
+        };
+        let mut app = app_on_fake(&source, &handle);
+        app.request_preview(
+            gitten_core::source::DiffSource::Staged {
+                path: gitten_core::status::PathBytes::from_bytes(b"tracked.txt"),
+            },
+            true,
+        );
+        app.pump_quiet();
+        move_to(&mut app, 2);
+        // Staging the staged side means nothing: the index is the diff's
+        // own new side.
+        app.dispatch("diff.stage-hunk");
+        assert_eq!(
+            app.message,
+            "the index is this diff's new side — it is already staged"
+        );
+        // A discard has no working tree to aim at — the refusal offers the
+        // unstage instead, and no arm was spent asking.
+        app.dispatch("diff.discard-hunk");
+        assert_eq!(
+            app.message,
+            "the staged side has no working tree to discard — unstage it (u), then discard the unstaged side"
+        );
+        assert!(state.lock().unwrap().writes.is_empty(), "a refusal ran git");
+        // Unstaging is what the side is for.
+        app.dispatch("diff.unstage-hunk");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                !state.lock().unwrap().writes.is_empty()
+            }),
+            "the unstage never reached the repository"
+        );
+        let writes = state.lock().unwrap().writes.clone();
+        assert_eq!(writes.len(), 1, "{writes:?}");
+        assert!(writes[0].starts_with("unstage "), "{writes:?}");
+    }
+
+    #[test]
+    fn tui_parity_a_stale_diff_refuses_before_anything_is_read_for_the_write() {
+        let (handle, state) = fake(&[]);
+        {
+            let mut s = state.lock().unwrap();
+            s.unstaged = vec![tracked_insertion()];
+            s.index_oids = vec![("tracked.txt".into(), "i0".into())];
+        }
+        let source = Source::Repo {
+            path: std::path::PathBuf::from("/fake"),
+            arg: String::new(),
+        };
+        let mut app = app_on_fake(&source, &handle);
+        open_side(&mut app, "tracked.txt");
+        move_to(&mut app, 2);
+        // The repository moved under the preview: the verb re-reads, finds
+        // the drawn hunk gone, and refuses before any write exists.
+        state.lock().unwrap().unstaged[0].new[2] = Arc::from("MOVED ON");
+        app.dispatch("diff.stage-hunk");
+        assert_eq!(
+            app.message,
+            "tracked.txt changed since this diff was drawn — refresh (R) and try again"
+        );
+        assert!(
+            state.lock().unwrap().writes.is_empty(),
+            "a stale aim ran git"
+        );
+    }
+
+    #[test]
+    fn tui_parity_a_drifted_index_refuses_at_write_time() {
+        let (handle, state) = fake(&[]);
+        {
+            let mut s = state.lock().unwrap();
+            s.unstaged = vec![tracked_insertion()];
+            // The identity the patch is built against is already stale: the
+            // index holds something else by the time the job runs.
+            s.index_oids = vec![("tracked.txt".into(), "moved-on".into())];
+        }
+        let source = Source::Repo {
+            path: std::path::PathBuf::from("/fake"),
+            arg: String::new(),
+        };
+        let mut app = app_on_fake(&source, &handle);
+        open_side(&mut app, "tracked.txt");
+        move_to(&mut app, 2);
+        app.dispatch("diff.stage-hunk");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                app.message.contains("changed since the patch was read")
+            }),
+            "the drifted write never refused: {}",
+            app.message
+        );
+        assert!(
+            state.lock().unwrap().writes.is_empty(),
+            "a drifted write ran"
+        );
+    }
+
+    #[test]
+    fn tui_parity_line_selection_keys_resolve_help_and_dispatch_agree() {
+        // `a` and `v` are the shipped bindings, resolved through the same
+        // builtin keymap every client reads, and the help panel shows them
+        // — with the discard now advertised where it runs.
+        let keys = Host::new().keys;
+        let mut modes = Modes::new();
+        modes.push("diff");
+        assert_eq!(
+            keys.resolve(&modes, &[Key::plain(Code::Char('a'))]),
+            Resolve::Run("diff.toggle-line-selection")
+        );
+        assert_eq!(
+            keys.resolve(&modes, &[Key::plain(Code::Char('v'))]),
+            Resolve::Run("select.mark")
+        );
+        assert_eq!(
+            keys.resolve(&modes, &[Key::plain(Code::Char('D'))]),
+            Resolve::Run("diff.discard-hunk")
+        );
+        // And the availability contract agrees with the dispatch: help
+        // lists the three, and the dispatch refuses none of them by
+        // availability.
+        let availability = tui_availability(true);
+        for name in [
+            "diff.toggle-line-selection",
+            "diff.discard-hunk",
+            "select.mark",
+        ] {
+            assert!(
+                availability.runnable(name),
+                "{name} is not runnable, but the keymap resolves it"
+            );
+        }
+    }
+
     #[test]
     fn a_refreshed_frame_is_drawable_headlessly() {
         let (handle, state) = fake(&[]);
@@ -7851,7 +8217,17 @@ diff --git a/tracked.txt b/tracked.txt
             path: std::path::PathBuf::from("/fake"),
             arg: String::new(),
         };
+        // The staging verb acts on a file's own side now: the unstaged
+        // preview, whose hunk is the index→worktree change — and a stage
+        // that lands flips the side read, the same world-change the
+        // aggregate read always answered with.
+        {
+            let mut s = state.lock().unwrap();
+            s.unstaged = s.before.clone();
+            s.unstaged_after = Some(s.after.clone());
+        }
         let mut app = app_on_fake(&source, &handle);
+        open_side(&mut app, "f.txt");
         // The keyboard is on the first hunk — the one about to be staged.
         move_to(&mut app, 2);
         let (path, hunk) = match app.panes.get("diff") {
@@ -7861,19 +8237,12 @@ diff --git a/tracked.txt b/tracked.txt
             _ => panic!("a diff is registered"),
         };
         assert_eq!(path, "f.txt");
-        let patch = gitten_core::patch::emit(&path, &[&hunk]);
-        // What the fake will be asked to apply is exactly the chosen hunk's
-        // edit and not its distant neighbour's.
-        let applied = parse_unified_diff(&String::from_utf8_lossy(&patch));
-        let changed: Vec<&str> = applied[0]
-            .hunks
+        let drawn: Vec<String> = hunk
+            .lines
             .iter()
-            .flat_map(|h| &h.lines)
             .filter(|l| l.kind != gitten_core::LineKind::Context)
-            .map(|l| l.text.as_ref())
+            .map(|l| l.text.to_string())
             .collect();
-        assert_eq!(changed, ["line 4", "EDIT ONE"]);
-
         app.dispatch("diff.stage-hunk");
         assert!(
             until(Duration::from_secs(2), || {
@@ -7882,6 +8251,18 @@ diff --git a/tracked.txt b/tracked.txt
             }),
             "the staged hunk never reached the repository"
         );
+        // What the verb applied is exactly the chosen hunk's edit and not
+        // its distant neighbour's — read off the recorded write, the same
+        // patch the queue carried.
+        let applied = parse_unified_diff(&state.lock().unwrap().writes[0]["stage ".len()..]);
+        let changed: Vec<String> = applied[0]
+            .hunks
+            .iter()
+            .flat_map(|h| &h.lines)
+            .filter(|l| l.kind != gitten_core::LineKind::Context)
+            .map(|l| l.text.to_string())
+            .collect();
+        assert_eq!(changed, drawn, "the applied patch is not the drawn hunk");
         assert!(
             until(Duration::from_secs(2), || {
                 app.pump_quiet();

@@ -495,6 +495,11 @@ impl Keymap {
         bind("diff", "space", "diff.stage-hunk");
         bind("diff", "u", "diff.unstage-hunk");
         bind("diff", "D", "diff.discard-hunk");
+        // lazygit's selection unit and range: `a` says which unit the verbs
+        // above act on — the whole hunk, or the marked lines — and `v`
+        // marks the range, the same key every list pane already answers.
+        bind("diff", "a", "diff.toggle-line-selection");
+        bind("diff", "v", "select.mark");
         bind("commits", "enter", "commits.open-diff");
         bind("commits", "/", "commits.search");
         // Resetting to the commit under the keyboard, exactly lazygit's
@@ -1173,6 +1178,11 @@ impl Commands {
                 "diff.discard-hunk",
                 "discard the hunk under the keyboard from the working tree, asked twice",
                 Some("discard hunk"),
+            ),
+            (
+                "diff.toggle-line-selection",
+                "act on marked lines instead of the whole hunk",
+                Some("line selection"),
             ),
             ("theme.cycle", "the next theme", None),
             (

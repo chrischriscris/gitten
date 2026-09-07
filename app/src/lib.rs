@@ -451,6 +451,8 @@ mod tests {
                 new: vec!["fake contents".into()],
                 old_oid: None,
                 new_oid: Some("3333333333333333333333333333333333333333".into()),
+                old_final_newline: true,
+                new_final_newline: true,
                 binary: false,
             }])
         }

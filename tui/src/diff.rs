@@ -105,6 +105,18 @@ pub struct Diff {
     /// True between a press and a release on the text, so a motion event that
     /// belongs to nothing does not extend a selection made minutes ago.
     dragging: bool,
+    /// The rows the keyboard marked (`select.mark`), over visual rows — the
+    /// same address the cursor uses, normalized on read.
+    marks: Option<(usize, usize)>,
+    /// True while a mark is armed and the motions extend it.
+    marking: bool,
+    /// What the hunk verbs aim at: the whole hunk under the keyboard, or the
+    /// marked lines. lazygit's `a`, and the unit the status line names.
+    line_unit: bool,
+    /// The cursor an armed destructive question was asked on, when one
+    /// stands. Any move of the keyboard disarms it — a yes addressed to a
+    /// row that is no longer under the keyboard is not a yes. See `moved`.
+    armed: Option<usize>,
     bar: Bar,
     /// The standing search's query, kept across the reflows and layout
     /// changes it survives — `None` when no search stands.
@@ -124,6 +136,21 @@ struct Search {
     folded: TextIndex,
     /// Rows (of `order`) whose text matches the query, ascending.
     matches: Vec<usize>,
+}
+
+/// What the hunk verbs aim at, as [`Diff::patch_selection`] reports it.
+pub enum PatchSelection {
+    /// The whole hunk under the keyboard.
+    Whole {
+        path: String,
+        hunk: gitten_core::Hunk,
+    },
+    /// The marked lines, grouped per touched hunk: the hunk as drawn and
+    /// the inclusive line range marked within it.
+    Lines {
+        path: String,
+        parts: Vec<(gitten_core::Hunk, usize, usize)>,
+    },
 }
 
 /// Where every row's selectable text comes from, for [`gitten_core::select`].
@@ -182,6 +209,10 @@ impl Diff {
             file_count: 0,
             sel: None,
             dragging: false,
+            marks: None,
+            marking: false,
+            line_unit: false,
+            armed: None,
             bar: Bar::default(),
             search_query: None,
             search: None,
@@ -356,18 +387,22 @@ impl Diff {
 
     pub fn move_by(&mut self, by: isize) {
         self.view.move_by(by);
+        self.moved();
     }
 
     pub fn down(&mut self) {
         self.view.down();
+        self.moved();
     }
 
     pub fn up(&mut self) {
         self.view.up();
+        self.moved();
     }
 
     pub fn page(&mut self, pages: isize) {
         self.view.page(pages);
+        self.moved();
     }
 
     /// Scrolls the viewport without moving the cursor. The wheel.
@@ -382,10 +417,12 @@ impl Diff {
 
     pub fn to_top(&mut self) {
         self.view.to_top();
+        self.moved();
     }
 
     pub fn to_bottom(&mut self) {
         self.view.to_bottom();
+        self.moved();
     }
 
     /// Moves the cursor to the header of the next or previous file.
@@ -412,6 +449,7 @@ impl Diff {
         };
         if let Some(t) = target {
             self.view.go_to(t);
+            self.moved();
         }
     }
 
@@ -443,6 +481,93 @@ impl Diff {
         };
         if let Some(t) = target {
             self.view.go_to(t);
+            self.moved();
+        }
+    }
+
+    // ----------------------------------------------------------------- marks
+
+    /// The cursor moved. An armed mark grows to cover the new position; a
+    /// destructive question asked on the old one dies — moving away is the
+    /// whole of the "no" a twice-pressed key can hear.
+    fn moved(&mut self) {
+        if self.marking {
+            let at = self.view.cursor();
+            self.marks = Some(match self.marks {
+                Some((anchor, _)) => (anchor, at),
+                None => (at, at),
+            });
+        }
+        self.armed = None;
+    }
+
+    /// `select.mark`, lazygit's `v`: arm a range at the cursor, extend it by
+    /// moving, and `v` again takes it off. A range of one row is a real
+    /// range — the mark is what the next action is aimed at, and one row is
+    /// a legal aim. In line-selection mode the range is what the staging
+    /// verbs slice; in hunk mode it marks rows to move through and stages
+    /// nothing by itself.
+    pub fn select_mark(&mut self) {
+        if self.marks.is_some() {
+            self.marks = None;
+            self.marking = false;
+            return;
+        }
+        let at = self.view.cursor();
+        self.marks = Some((at, at));
+        self.marking = true;
+    }
+
+    /// The marked range, normalized — anchors first, over visual rows.
+    pub fn marks(&self) -> Option<(usize, usize)> {
+        self.marks.map(|(a, b)| (a.min(b), a.max(b)))
+    }
+
+    /// Whether a mark is armed and the arrows extend it.
+    pub fn is_marking(&self) -> bool {
+        self.marking
+    }
+
+    /// How many rows are marked, for a status line.
+    pub fn mark_note(&self) -> Option<String> {
+        self.marks().map(|(a, b)| format!("{} marked", b - a + 1))
+    }
+
+    /// `diff.toggle-line-selection`, lazygit's `a`: what the hunk verbs aim
+    /// at — the whole hunk under the keyboard, or the marked lines. Returns
+    /// the new state for the status line; leaving line mode takes its stale
+    /// line mark with it, because a mark made for line slicing is not a
+    /// hunk answer.
+    pub fn toggle_line_selection(&mut self) -> bool {
+        self.line_unit = !self.line_unit;
+        if !self.line_unit {
+            self.marks = None;
+            self.marking = false;
+        }
+        self.line_unit
+    }
+
+    /// Whether the hunk verbs currently aim at lines rather than the whole
+    /// hunk.
+    pub fn line_selection(&self) -> bool {
+        self.line_unit
+    }
+
+    /// Arms the destructive question on the cursor's row, or spends an arm
+    /// already standing there. `false` means the question now stands and
+    /// the caller says so; `true` means it was answered on the same spot
+    /// and the verb may run.
+    pub fn confirm_or_arm_discard(&mut self) -> bool {
+        let at = self.view.cursor();
+        match self.armed {
+            Some(armed) if armed == at => {
+                self.armed = None;
+                true
+            }
+            _ => {
+                self.armed = Some(at);
+                false
+            }
         }
     }
 
@@ -665,6 +790,7 @@ impl Diff {
         // The cursor follows the mouse: a click is a place, and everything a key
         // does next — copy, jump, open — acts on the row the cursor is on.
         self.view.go_to(visual);
+        self.moved();
         let Some((part, caret)) = self.locate(col, visual) else {
             self.sel = None;
             return;
@@ -883,6 +1009,89 @@ impl Diff {
         Some((path, loaded.hunks.get(hunk)?.clone()))
     }
 
+    /// What the hunk verbs aim at, in the terms the shared hunk job reads:
+    /// the whole hunk under the keyboard, or the marked lines grouped per
+    /// hunk. In line mode with no mark standing, the one line under the
+    /// keyboard is the aim — the same one-row range a fresh mark is.
+    ///
+    /// `Err` is the refusal, worded for the status line: the keyboard not
+    /// on a hunk at all, a mark that spans files, a selection over no line,
+    /// or a presentation that does not address lines — the side-by-side
+    /// layout pairs a removal and its addition on one row, and it says so
+    /// rather than guessing which half a verb means.
+    pub fn patch_selection(&self) -> Result<PatchSelection, String> {
+        if !self.line_unit {
+            let (path, hunk) = self
+                .current_hunk()
+                .ok_or_else(|| "the keyboard is not on a hunk".to_string())?;
+            return Ok(PatchSelection::Whole { path, hunk });
+        }
+        let range = self.marks().unwrap_or_else(|| {
+            let at = self.view.cursor();
+            (at, at)
+        });
+        let mut any_line = false;
+        let mut any_hunk = false;
+        let mut paths: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        // Per touched hunk: the loaded hunk and the inclusive line range
+        // the selection covers. The addresses come from the presentations'
+        // own line maps, via the same `(owner, index)` pair `current_hunk`
+        // reads — and wrapped rows fold to their line, because a mark was
+        // made over what was visible and a line is what staging means.
+        let mut parts: Vec<(gitten_core::Hunk, usize, usize)> = Vec::new();
+        for row in range.0..=range.1 {
+            let Some(r) = self.order.get(row) else {
+                continue;
+            };
+            let Some(rows) = self.owners.get(r.owner as usize) else {
+                continue;
+            };
+            let logical = r.index as usize;
+            if let Some((file, hunk, line)) = rows.line_at(logical) {
+                any_line = true;
+                any_hunk = true;
+                let Some(entry) = rows.files().get(file) else {
+                    continue;
+                };
+                paths.insert(entry.path.clone());
+                let Some(loaded) = self.files.iter().find(|f| f.path == entry.path) else {
+                    continue;
+                };
+                let Some(h) = loaded.hunks.get(hunk) else {
+                    continue;
+                };
+                match parts.iter_mut().find(|(known, _, _)| known == h) {
+                    Some((_, lo, hi)) => {
+                        *lo = (*lo).min(line);
+                        *hi = (*hi).max(line);
+                    }
+                    None => parts.push((h.clone(), line, line)),
+                }
+            } else if rows.hunk_at(logical).is_some() {
+                any_hunk = true;
+            }
+        }
+        if !any_line {
+            return Err(match any_hunk {
+                true => "this layout does not address single lines — switch layouts (s)".into(),
+                false => "no lines under the selection".into(),
+            });
+        }
+        if paths.len() > 1 {
+            let shown: Vec<&str> = paths.iter().map(|p| p.as_str()).collect();
+            return Err(format!(
+                "a line selection covers one file — this one spans {} and {}",
+                shown[0],
+                shown[1..].join(", ")
+            ));
+        }
+        let path = paths
+            .into_iter()
+            .next()
+            .ok_or_else(|| "no lines under the selection".to_string())?;
+        Ok(PatchSelection::Lines { path, parts })
+    }
+
     /// Swaps in a refreshed diff, keeping the reading position numerically.
     ///
     /// A write leaves no hunk identity to anchor to — the hunk just staged may
@@ -898,10 +1107,14 @@ impl Diff {
         }
         let (cursor, top, shift) = (self.view.cursor(), self.view.top(), self.shift);
         // A refresh is the repository saying things moved: a selection was
-        // anchored to how they were, and a drag was holding rows that may
-        // not be there.
+        // anchored to how they were, a drag was holding rows that may
+        // not be there, a mark and an armed question were addressed to
+        // rows that no longer exist.
         self.sel = None;
         self.dragging = false;
+        self.marks = None;
+        self.marking = false;
+        self.armed = None;
         self.files = files;
         self.owners = self.layouts.build(self.current, host);
         let built = assemble(&self.files, host, &mut self.owners);
@@ -1039,6 +1252,15 @@ impl Diff {
         // A standing search says where the keyboard is among its matches —
         // the same sentence the prompt carried, outliving it.
         if let Some(note) = self.match_note() {
+            out.push_str(" · ");
+            out.push_str(&note);
+        }
+        // What the hunk verbs will act on, when that is not the obvious
+        // whole hunk: the unit a space or a discard will mean.
+        if self.line_unit {
+            out.push_str(" · line selection");
+        }
+        if let Some(note) = self.mark_note() {
             out.push_str(" · ");
             out.push_str(&note);
         }

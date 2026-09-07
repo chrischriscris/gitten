@@ -69,18 +69,6 @@ impl DiffSource {
         }
     }
 
-    /// Whether this is the combined `HEAD`→worktree aggregate — the one
-    /// source hunk verbs act on tonight, because its hunks are
-    /// reverse-appliable to the working tree as it stands. Per-side staging
-    /// replaces this inference in the partial-staging packet; it is spelled
-    /// here, and only here, so the inference has one address to remove.
-    pub fn combined_worktree(&self) -> bool {
-        match self {
-            DiffSource::Revspec { arg } => arg.is_empty(),
-            _ => false,
-        }
-    }
-
     /// The short display form — what a title bar or a header calls it.
     /// The paths are display-decoded here and only here; everything that
     /// addressed git went through the raw bytes.
@@ -121,11 +109,6 @@ mod tests {
             empty.working_tree().is_none(),
             "an empty revspec is not a write source"
         );
-        assert!(empty.combined_worktree(), "it is the combined view");
-        let between = DiffSource::Revspec {
-            arg: "HEAD~1".into(),
-        };
-        assert!(!between.combined_worktree());
         for source in [
             DiffSource::Commit { sha: "abc".into() },
             DiffSource::Stash {

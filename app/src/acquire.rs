@@ -456,6 +456,8 @@ mod tests {
                 // and what lets the diff-cache tests observe a hit.
                 old_oid: Some("1111111111111111111111111111111111111111".into()),
                 new_oid: Some("2222222222222222222222222222222222222222".into()),
+                old_final_newline: true,
+                new_final_newline: true,
                 binary: false,
             }])
         }

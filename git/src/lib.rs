@@ -605,6 +605,23 @@ pub trait Repo: Send + Sync {
         Err(unserved("patch discarding"))
     }
 
+    /// The blob OID the index holds for one path — the stage-0 entry — or
+    /// `None` when the index has no entry under that name. The write-time
+    /// half of partial staging's staleness contract: a patch is built
+    /// against a read, and this is how the write checks the read still
+    /// holds before `git apply` aims it anywhere.
+    fn index_blob_oid(&self, _path: &[u8]) -> Result<Option<String>> {
+        Err(unserved("the index's blob"))
+    }
+
+    /// The blob OID `HEAD`'s tree holds for one path, under the same
+    /// contract as [`Self::index_blob_oid`]. An unborn HEAD, and a path
+    /// HEAD never carried, answer `None` — which is exactly the identity a
+    /// patch built against "nothing" revalidates against.
+    fn head_blob_oid(&self, _path: &[u8]) -> Result<Option<String>> {
+        Err(unserved("HEAD's blob"))
+    }
+
     /// Commits what the index holds with `message`, returning the new
     /// commit's OID.
     ///
@@ -1202,6 +1219,8 @@ impl Repo for Binary {
                 },
                 old_oid: None,
                 new_oid: Some(oid),
+                old_final_newline: true,
+                new_final_newline: content.as_ref().is_some_and(|b| b.ends_with(b"\n")),
                 binary,
             });
         }
@@ -1592,6 +1611,14 @@ impl Repo for Binary {
             &[b"apply", b"--reverse", b"--whitespace=nowarn", b"-"],
             patch,
         )
+    }
+
+    fn index_blob_oid(&self, path: &[u8]) -> Result<Option<String>> {
+        tree_blob_oid(&self.root, b":0", path)
+    }
+
+    fn head_blob_oid(&self, path: &[u8]) -> Result<Option<String>> {
+        tree_blob_oid(&self.root, b"HEAD", path)
     }
 
     fn checkout(&self, name: &[u8]) -> Result<()> {
@@ -2058,6 +2085,10 @@ impl Binary {
                 },
                 old_oid: fetchable(&c.old_mode, &c.old_oid).then(|| c.old_oid.clone()),
                 new_oid: fetchable(&c.new_mode, &c.new_oid).then(|| c.new_oid.clone()),
+                // A side with no content has no final line, so the marker
+                // question never arises for it — `true` says so.
+                old_final_newline: old.as_ref().is_none_or(|b| b.ends_with(b"\n")),
+                new_final_newline: new.as_ref().is_none_or(|b| b.ends_with(b"\n")),
                 binary,
             });
         }
@@ -2473,6 +2504,15 @@ pub struct Pair {
     /// untracked file's contents live nowhere but disk, so its new side is
     /// `None` even though its text is right there in `new`.
     pub new_oid: Option<String>,
+    /// Whether each side's final line is newline-terminated.
+    ///
+    /// The terminator went with the raw bytes and [`lines`] throws it away,
+    /// so these ride beside the content rather than being re-derived by
+    /// whoever emits a patch: they are the facts a `\ No newline at end of
+    /// file` marker needs, and a side with no content at all reads `true` —
+    /// no final line, so no marker can ever attach to it.
+    pub old_final_newline: bool,
+    pub new_final_newline: bool,
     /// Either side contains a NUL byte. Nothing here can usefully diff it, and
     /// the frontend needs to say so rather than draw mojibake.
     pub binary: bool,
@@ -2833,8 +2873,27 @@ fn loose_pair(entry: &UntrackedEntry, root: &Path) -> Option<Pair> {
         // by — every diff of it is computed, never cached.
         old_oid: None,
         new_oid: None,
+        old_final_newline: true,
+        new_final_newline: content.ends_with(b"\n"),
         binary,
     })
+}
+
+/// One `rev-parse --verify --quiet <rev>:<path>`, raw bytes end to end: the
+/// spec is built from the path git itself named, so a non-UTF-8 name looks
+/// up the entry that is actually there. `--quiet` makes "no such entry" a
+/// nonzero exit with nothing on the streams — which is a `None`, the
+/// ordinary answer for an unstaged or never-committed path, and not a
+/// failure; the same reading [`Repo::head_commit`] takes.
+fn tree_blob_oid(root: &Path, rev: &[u8], path: &[u8]) -> Result<Option<String>> {
+    let mut spec = Vec::with_capacity(rev.len() + 1 + path.len());
+    spec.extend_from_slice(rev);
+    spec.push(b':');
+    spec.extend_from_slice(path);
+    match run_bytes(root, &[b"rev-parse", b"--verify", b"--quiet", &spec]) {
+        Ok(bytes) => Ok(Some(lossy(trimmed(&bytes)))),
+        Err(_) => Ok(None),
+    }
 }
 
 // ----------------------------------------------------------------------- refs
@@ -5381,6 +5440,8 @@ mod tests {
             new: Vec::new(),
             old_oid: None,
             new_oid: None,
+            old_final_newline: true,
+            new_final_newline: true,
             binary: false,
         };
         assert_eq!(p.label(), "old.rs → new.rs");
@@ -6497,6 +6558,398 @@ mod tests {
         assert!(
             err.contains("patch failed") || err.contains("does not apply"),
             "{err}"
+        );
+    }
+
+    // --------------------------------------------------- partial staging
+    //
+    // The acceptance bar the plan sets for W3: real scratch repositories,
+    // exact HEAD/index/worktree bytes after stage/unstage/discard of a
+    // subset of ONE replacement hunk, and the untouched changes untouched.
+    // Everything here runs the pipeline the verb runs — per-side pair,
+    // `diff_pairs`, `line_window`, `emit_with`, `git apply` — and nothing
+    // inspects a git argument that was not also executed.
+
+    /// HEAD=A, index=B, worktree=C, all inside one replacement hunk's
+    /// reach: B stages `STAGED ONE`, C additionally changes the next line
+    /// to `WORKTREE TWO`. The shape every partial-stage bug hides in.
+    fn mixed_repo(name: &str) -> (Scratch, Handle) {
+        let r = Scratch::new(name);
+        r.write("f.txt", b"alpha\nkeep one\nkeep two\nkeep three\nomega\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        // B: staged. C: staged change plus an unstaged one.
+        r.write("f.txt", b"alpha\nSTAGED ONE\nkeep two\nkeep three\nomega\n");
+        r.git(&["add", "f.txt"]);
+        r.write(
+            "f.txt",
+            b"alpha\nSTAGED ONE\nWORKTREE TWO\nkeep three\nomega\n",
+        );
+        let g = r.open();
+        (r, g)
+    }
+
+    /// The one path's per-side pair, diffed through the pipeline the view
+    /// and the verb share.
+    fn side_files(g: &Handle, unstaged: bool, path: &[u8]) -> Vec<gitten_core::FileDiff> {
+        let differs = gitten_core::differ::Differs::builtin();
+        let pair = if unstaged {
+            g.pairs_unstaged(Some(path))
+                .expect("the unstaged side reads")
+                .pop()
+                .expect("a change is there")
+        } else {
+            g.pairs_staged(Some(path))
+                .expect("the staged side reads")
+                .pop()
+                .expect("a change is there")
+        };
+        crate::diff_pairs(&[pair], &differs, &Default::default())
+    }
+
+    fn bytes_of(r: &Scratch, rev: &str) -> Vec<u8> {
+        let out = r
+            .cmd(&["show".into(), format!("{rev}:f.txt").into()])
+            .output()
+            .expect("git show runs");
+        assert!(
+            out.status.success(),
+            "show {rev}:f.txt: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.stdout
+    }
+
+    fn porcelain_of(r: &Scratch) -> String {
+        String::from_utf8_lossy(
+            &r.cmd(&["status".into(), "--porcelain".into()])
+                .output()
+                .expect("status")
+                .stdout,
+        )
+        .into_owned()
+    }
+
+    #[test]
+    fn staging_a_subset_of_one_replacement_hunk_moves_exactly_the_chosen_lines() {
+        let (r, g) = mixed_repo("partial-stage-lines");
+        let files = side_files(&g, true, b"f.txt");
+        assert_eq!(files.len(), 1, "one file's unstaged side");
+        let hunk = &files[0].hunks[0];
+        // The hunk is one replacement: `-keep two` paired with
+        // `+WORKTREE TWO`, context around both.
+        let plus = hunk
+            .lines
+            .iter()
+            .position(|l| l.kind == gitten_core::LineKind::Added)
+            .expect("an addition to select");
+        // Stage the ADDITION alone. The index gains the new line; the
+        // removal was not chosen, so the old line stays in the index and
+        // remains the unstaged half.
+        let window = gitten_core::patch::line_window(
+            hunk,
+            plus,
+            plus,
+            gitten_core::patch::Unselected::KeepRemovals,
+        )
+        .expect("a changed line");
+        let sides = gitten_core::patch::Sides {
+            old_lines: 5,
+            old_final_newline: true,
+            new_lines: 5,
+            new_final_newline: true,
+        };
+        let patch = gitten_core::patch::emit_with("f.txt", &[&window], &sides)
+            .expect("the sides agree about their final newline");
+        assert!(!patch.is_empty());
+        g.stage_patch(&patch).expect("the subset stages");
+
+        let index = bytes_of(&r, "");
+        assert_eq!(
+            String::from_utf8(index).unwrap(),
+            "alpha\nSTAGED ONE\nkeep two\nWORKTREE TWO\nkeep three\nomega\n",
+            "the chosen line is in the index, the unchosen removal is still there"
+        );
+        assert_eq!(
+            porcelain_of(&r),
+            "MM f.txt\n",
+            "the removal remains unstaged"
+        );
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"alpha\nSTAGED ONE\nWORKTREE TWO\nkeep three\nomega\n",
+            "the worktree was never touched by --cached"
+        );
+
+        // Now stage the removal too. The index has moved — the first apply
+        // saw to that — so the verb's contract is followed here as well:
+        // the side is re-read, and the selection matched against what git
+        // holds now, not against the hunk the first patch came from.
+        let files = side_files(&g, true, b"f.txt");
+        let hunk = &files[0].hunks[0];
+        let minus = hunk
+            .lines
+            .iter()
+            .position(|l| l.kind == gitten_core::LineKind::Removed)
+            .expect("the removal is now the whole unstaged change");
+        let window = gitten_core::patch::line_window(
+            hunk,
+            minus,
+            minus,
+            gitten_core::patch::Unselected::KeepRemovals,
+        )
+        .expect("a changed line");
+        let patch = gitten_core::patch::emit_with("f.txt", &[&window], &sides)
+            .expect("the sides agree about their final newline");
+        g.stage_patch(&patch).expect("the removal stages");
+        let index = bytes_of(&r, "");
+        assert_eq!(
+            String::from_utf8_lossy(&index),
+            "alpha\nSTAGED ONE\nWORKTREE TWO\nkeep three\nomega\n",
+            "staging the rest of the hunk completes it"
+        );
+        assert_eq!(porcelain_of(&r), "M  f.txt\n", "fully staged");
+        let head = bytes_of(&r, "HEAD");
+        assert_ne!(index, head, "HEAD holds A, untouched by any of this");
+    }
+
+    #[test]
+    fn an_unstage_patch_is_built_from_the_staged_side_and_takes_exactly_its_lines() {
+        let (r, g) = mixed_repo("partial-unstage");
+        let files = side_files(&g, false, b"f.txt");
+        let hunk = &files[0].hunks[0];
+        let plus = hunk
+            .lines
+            .iter()
+            .position(|l| l.kind == gitten_core::LineKind::Added)
+            .expect("the staged addition");
+        // An unstage is a reverse verb: the window keeps the unchosen
+        // additions and drops the unchosen removals — unstaging the
+        // addition alone leaves the removal staged, and neither half of
+        // the pair in the index.
+        let window = gitten_core::patch::line_window(
+            hunk,
+            plus,
+            plus,
+            gitten_core::patch::Unselected::KeepAdditions,
+        )
+        .expect("a changed line");
+        let sides = gitten_core::patch::Sides {
+            old_lines: 5,
+            old_final_newline: true,
+            new_lines: 5,
+            new_final_newline: true,
+        };
+        let patch = gitten_core::patch::emit_with("f.txt", &[&window], &sides)
+            .expect("the sides agree about their final newline");
+        g.unstage_patch(&patch).expect("the subset unstages");
+
+        let index = bytes_of(&r, "");
+        assert_eq!(
+            String::from_utf8_lossy(&index),
+            "alpha\nkeep two\nkeep three\nomega\n",
+            "the addition left, the removal still staged"
+        );
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"alpha\nSTAGED ONE\nWORKTREE TWO\nkeep three\nomega\n",
+            "the worktree was never touched"
+        );
+        assert_eq!(porcelain_of(&r), "MM f.txt\n", "still work on both sides");
+    }
+
+    #[test]
+    fn a_discard_patch_takes_exactly_the_unstaged_lines_from_the_worktree() {
+        let (r, g) = mixed_repo("partial-discard");
+        let files = side_files(&g, true, b"f.txt");
+        let hunk = &files[0].hunks[0];
+        let plus = hunk
+            .lines
+            .iter()
+            .position(|l| l.kind == gitten_core::LineKind::Added)
+            .expect("the unstaged addition");
+        // A discard's window keeps the unchosen additions — the worktree
+        // they live in is what `--reverse` matches against.
+        let window = gitten_core::patch::line_window(
+            hunk,
+            plus,
+            plus,
+            gitten_core::patch::Unselected::KeepAdditions,
+        )
+        .expect("a changed line");
+        let sides = gitten_core::patch::Sides {
+            old_lines: 5,
+            old_final_newline: true,
+            new_lines: 5,
+            new_final_newline: true,
+        };
+        let patch = gitten_core::patch::emit_with("f.txt", &[&window], &sides)
+            .expect("the sides agree about their final newline");
+        // DESTRUCTIVE in the view; here it simply runs.
+        g.discard_patch(&patch).expect("reverses onto the worktree");
+
+        // The worktree loses exactly the addition — keep two was never in
+        // it to come back, and the discard does not pretend otherwise.
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"alpha\nSTAGED ONE\nkeep three\nomega\n",
+            "the addition is gone, the worktree otherwise untouched"
+        );
+        let index = bytes_of(&r, "");
+        assert_eq!(
+            String::from_utf8(index).unwrap(),
+            "alpha\nSTAGED ONE\nkeep two\nkeep three\nomega\n",
+            "the index was never touched by a discard"
+        );
+        assert_eq!(
+            porcelain_of(&r),
+            "MM f.txt\n",
+            "staged work survives, and the worktree differs from the index again"
+        );
+    }
+
+    #[test]
+    fn a_patch_against_content_without_a_final_newline_carries_the_marker_and_applies() {
+        // The acquisition-level gap `emit` documented for years: content
+        // that does not end in a newline produced a patch `git apply`
+        // refuses. With the sides' final-line facts, the marker is written
+        // the way git writes it and the patch applies.
+        let r = Scratch::new("partial-no-newline");
+        r.write("f.txt", b"alpha\nend");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        let g = r.open();
+
+        // The unsayable shape first: an addition after a final line that
+        // has no newline — the old side's last line becomes the new side's
+        // middle, and no partial patch can say both at once.
+        r.write("f.txt", b"alpha\nend\nappended");
+        let files = side_files(&g, true, b"f.txt");
+        let pair_old = g.pairs_unstaged(Some(b"f.txt")).unwrap().pop().unwrap();
+        let err = gitten_core::patch::emit_with(
+            "f.txt",
+            &[&files[0].hunks[0]],
+            &gitten_core::patch::Sides {
+                old_lines: pair_old.old.len(),
+                old_final_newline: pair_old.old_final_newline,
+                new_lines: pair_old.new.len(),
+                new_final_newline: pair_old.new_final_newline,
+            },
+        )
+        .expect_err("the disagreement refuses");
+        assert!(
+            err.contains("final newline"),
+            "the refusal names the shape: {err}"
+        );
+
+        // The sayable shape: a modified final line both sides end on, the
+        // marker riding each side's own last line.
+        r.write("f.txt", b"alpha\nEND");
+        let files = side_files(&g, true, b"f.txt");
+        let pair_old = g.pairs_unstaged(Some(b"f.txt")).unwrap().pop().unwrap();
+        assert!(
+            !pair_old.old_final_newline && !pair_old.new_final_newline,
+            "both sides end without the newline"
+        );
+        let hunk = &files[0].hunks[0];
+        let patch = gitten_core::patch::emit_with(
+            "f.txt",
+            &[hunk],
+            &gitten_core::patch::Sides {
+                old_lines: pair_old.old.len(),
+                old_final_newline: pair_old.old_final_newline,
+                new_lines: pair_old.new.len(),
+                new_final_newline: pair_old.new_final_newline,
+            },
+        )
+        .expect("the agreeing sides say their patch");
+        let text = String::from_utf8(patch.clone()).unwrap();
+        assert!(
+            text.contains("-end\n\\ No newline at end of file\n"),
+            "the marker rides the removal: {text}"
+        );
+        assert!(
+            text.contains("+END\n\\ No newline at end of file\n"),
+            "and the addition: {text}"
+        );
+        g.stage_patch(&patch).expect("the marked patch applies");
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"alpha\nEND",
+            "the worktree bytes, reproduced exactly in the index"
+        );
+        let index = bytes_of(&r, "");
+        assert_eq!(index, b"alpha\nEND");
+
+        // The removal direction: taking the no-newline final line away.
+        r.git(&["reset", "-q", "HEAD", "--"]);
+        r.write("f.txt", b"alpha\n");
+        let files = side_files(&g, true, b"f.txt");
+        let pair_old = g.pairs_unstaged(Some(b"f.txt")).unwrap().pop().unwrap();
+        assert!(
+            !pair_old.old_final_newline,
+            "the old side's last line is the one without the newline"
+        );
+        let hunk = &files[0].hunks[0];
+        let patch = gitten_core::patch::emit_with(
+            "f.txt",
+            &[hunk],
+            &gitten_core::patch::Sides {
+                old_lines: pair_old.old.len(),
+                old_final_newline: pair_old.old_final_newline,
+                new_lines: pair_old.new.len(),
+                new_final_newline: pair_old.new_final_newline,
+            },
+        )
+        .expect("the removal direction says its marker");
+        let text = String::from_utf8(patch.clone()).unwrap();
+        assert!(
+            text.contains("-end\n\\ No newline at end of file\n"),
+            "the marker rides the removal: {text}"
+        );
+        g.discard_patch(&patch).expect("reverses cleanly");
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"alpha\nend",
+            "discarding the removal restores the line, marker and all"
+        );
+    }
+
+    #[test]
+    fn the_revalidation_reads_answer_the_index_and_head_byte_exactly() {
+        // index_blob_oid and head_blob_oid are the write-time half of the
+        // staleness contract; their answers are checked against the same
+        // OIDs acquisition carries in the pair — one definition of "this
+        // side's blob", not two.
+        let r = Scratch::new("partial-oids");
+        r.write("f.txt", b"head bytes\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        r.write("f.txt", b"index bytes\n");
+        r.git(&["add", "f.txt"]);
+        // The unstaged side needs a change of its own to read: the worktree
+        // moves past the index.
+        r.write("f.txt", b"worktree bytes\n");
+        r.write("notes.md", b"untracked\n");
+        let g = r.open();
+
+        let head_oid = g.pairs_staged(Some(b"f.txt")).unwrap()[0].old_oid.clone();
+        let index_oid = g.pairs_unstaged(Some(b"f.txt")).unwrap()[0].old_oid.clone();
+        assert!(head_oid.is_some() && index_oid.is_some());
+        assert_ne!(head_oid, index_oid, "the two sides really differ");
+        assert_eq!(
+            g.index_blob_oid(b"f.txt").unwrap().as_deref(),
+            index_oid.as_deref(),
+            "the revalidation read answers what acquisition read"
+        );
+        assert_eq!(
+            g.head_blob_oid(b"f.txt").unwrap().as_deref(),
+            head_oid.as_deref()
+        );
+        assert_eq!(
+            g.index_blob_oid(b"notes.md").unwrap(),
+            None,
+            "an untracked path has no index entry to revalidate against"
         );
     }
 
