@@ -60,7 +60,7 @@ use gitten_core::{parse_log, Commit, FileDiff};
 /// spelled them. [`TodoScript`] is git's file as bytes; [`Plan`] is the
 /// editable model a todo UI holds, and the one that can carry a reworded
 /// message down to the layer with a filesystem to put it in.
-pub use gitten_core::rebase::{Plan, TodoScript};
+pub use gitten_core::rebase::{FixupKind, Plan, TodoScript};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
@@ -686,6 +686,17 @@ pub trait Repo: Send + Sync {
     /// names the wrong failure.
     fn commit(&self, _message: &str) -> Result<String> {
         Err(unserved("committing"))
+    }
+
+    /// Commits what the index holds as a fixup for `sha`, returning the new
+    /// commit's OID — `git commit --fixup[=amend:|=reword:]<sha>`, so the
+    /// message is git's marker, never a prompt. `--fixup` never opens an
+    /// editor, which is why this rides [`run_bytes`] instead of the
+    /// message-piping road [`commit`](Self::commit) takes. The sha rides
+    /// argv as bytes behind [`refuse_dashes`], like every other rev that
+    /// travels there.
+    fn commit_fixup(&self, _sha: &[u8], _kind: FixupKind) -> Result<String> {
+        Err(unserved("a fixup commit"))
     }
 
     /// Moves HEAD onto the named local branch: `git checkout -q`.
@@ -2195,6 +2206,14 @@ impl Repo for Binary {
 
     fn commit(&self, message: &str) -> Result<String> {
         self.commit_via(&[b"commit", b"--file=-"], message)
+    }
+
+    fn commit_fixup(&self, sha: &[u8], kind: FixupKind) -> Result<String> {
+        refuse_dashes(sha)?;
+        let flag = [kind.flag().as_bytes(), sha].concat();
+        run_bytes(&self.root, &[b"commit", &flag])?;
+        let out = run(&self.root, &["rev-parse", "HEAD"])?;
+        Ok(lossy(trimmed(&out)))
     }
 
     fn stash_push(&self, message: Option<&str>) -> Result<usize> {
@@ -9543,6 +9562,54 @@ mod tests {
         let e = r.open().commit("nothing staged").unwrap_err();
         assert!(e.starts_with("git commit:"), "{e}");
         assert!(!e.trim().is_empty(), "git's stderr travelled");
+    }
+
+    #[test]
+    fn a_fixup_commit_names_its_target_and_nothing_else() {
+        let r = Scratch::new("commit-fixup");
+        r.write("f.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "the target"]);
+        r.write("f.txt", b"y\n");
+        r.git(&["add", "f.txt"]);
+
+        let g = r.open();
+        let target = g.log(5).unwrap()[0].sha.clone();
+        let sha = g
+            .commit_fixup(target.as_bytes(), FixupKind::Fixup)
+            .expect("fixups");
+        assert_eq!(sha, r.rev_parse("HEAD"));
+        let subject = String::from_utf8(r.git_os_out(&[
+            "show".into(),
+            "-s".into(),
+            "--format=%s".into(),
+            sha.into(),
+        ]))
+        .unwrap();
+        assert_eq!(subject.trim_end(), "fixup! the target");
+    }
+
+    // No scratch test for the amend!/reword! spellings: unlike plain
+    // `--fixup=`, those two open an editor, and a headless test has no
+    // answer for one — the probe hung on the ambient `$EDITOR` (nvim).
+    // The flags themselves are pinned in core's
+    // `the_fixup_kind_cycles_and_spells_gits_flag`, and creation with
+    // either kind refuses before any process runs until the external-
+    // editor door (W10) exists.
+
+    #[test]
+    fn a_fixup_with_nothing_staged_is_gits_refusal_not_a_commit() {
+        let r = Scratch::new("commit-fixup-empty");
+        r.write("f.txt", b"x\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "the target"]);
+        let g = r.open();
+        let target = g.log(5).unwrap()[0].sha.clone();
+        let e = g
+            .commit_fixup(target.as_bytes(), FixupKind::Fixup)
+            .unwrap_err();
+        assert!(!e.is_empty(), "git's own sentence travelled");
+        assert_eq!(g.log(5).unwrap().len(), 1, "nothing was committed");
     }
 
     // ------------------------------------------------------- the branch verbs

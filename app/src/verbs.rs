@@ -11,7 +11,7 @@
 
 use crate::jobs::Job;
 use gitten_core::operation::Side;
-use gitten_core::rebase::{Plan, TodoScript};
+use gitten_core::rebase::{FixupKind, Plan, TodoScript};
 use gitten_core::refs::{HeadState, Remote, ResetMode, StashId, StashScope};
 use gitten_git::{Handle, Repo};
 
@@ -311,6 +311,20 @@ impl Write {
             // The rewritten history shows up in a pane that may not be focused —
             // the key lives over the working tree — so this one says what it did.
             .announcing("amended HEAD")
+    }
+
+    /// Commits the index as a fixup for `sha`: the message is git's marker
+    /// (`fixup! <subject>` and its `amend!` / `reword!` siblings), so no
+    /// prompt stands between the key and the commit. Non-destructive — it
+    /// only adds — so like [`Write::revert`] it takes no confirmation
+    /// dance; the finish announces the marker it wrote, because a key that
+    /// silently grows history is a key nobody trusts.
+    pub fn fixup_commit(repo: &Handle, sha: Vec<u8>, short: String, kind: FixupKind) -> Self {
+        let word = kind.word().to_string();
+        Self::named(format!("{word} {short}"), repo, move |r| {
+            r.commit_fixup(&sha, kind).map(|_| ())
+        })
+        .announcing(format!("{word} {short} created"))
     }
 
     /// Rewrites this branch by installing `script` as git's own

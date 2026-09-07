@@ -11,7 +11,7 @@ use crate::jobs::Job;
 use crate::verbs::Write;
 use gitten_core::clipboard::CherryClipboard;
 use gitten_core::operation::{Operation, Side};
-use gitten_core::rebase::{compose, Amend, Plan, Rewrite};
+use gitten_core::rebase::{compose, fixup_marks, Amend, FixupKind, Plan, Rewrite};
 use gitten_core::refs::{
     redo_selector, undo_for, HeadState, RefName, ReflogEntry, ResetMode, StashId, StashScope,
     Target, UndoKind, REDO_MESSAGE, UNDO_MESSAGE,
@@ -811,6 +811,160 @@ pub fn rewrite_commit(client: &mut impl HistoryClient, command: &str, kind: Rewr
     if !client.submit(Box::new(job)) {
         client.say("the job queue is shutting down".into());
     }
+}
+
+/// `commits.create-fixup`: commits the index as a fixup for the commit
+/// under the keyboard. The message is git's marker (`fixup! <subject>` and
+/// its `amend!` / `reword!` siblings, chosen by the kind key), so there is
+/// no prompt to answer and no confirmation dance — like a revert it only
+/// adds, and the finish announces the marker it wrote.
+///
+/// Two refusals before anything is queued. Nothing staged is the common
+/// one: a fixup over an empty index is git's "nothing to commit", which
+/// names the wrong failure, so the staged read answers first. An
+/// amend!/reword! kind is the other: those spellings open an editor, and
+/// this client has no external-editor door yet — asking for one must say
+/// that, never hang on a prompt nobody can see.
+pub fn create_fixup(client: &mut impl HistoryClient, command: &str, kind: FixupKind) {
+    let Some(target) = client.commit_target() else {
+        client.say("nothing selected to fix up".into());
+        return;
+    };
+    if !matches!(kind, FixupKind::Fixup) {
+        client.say(format!(
+            "{} creation opens an editor, and this client has no external-editor door yet",
+            kind.word()
+        ));
+        return;
+    }
+    let Some(repo) = history_repo(client, command) else {
+        return;
+    };
+    let staged = match repo.status() {
+        Ok(status) => status.staged,
+        Err(e) => {
+            client.say(e);
+            return;
+        }
+    };
+    if staged.is_empty() {
+        client.say("nothing staged to fix up — stage the change first (space)".into());
+        return;
+    }
+    let job = Write::fixup_commit(&repo, target.sha.clone(), target.short.clone(), kind);
+    if !client.submit(Box::new(job)) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+/// How far back the fixup discovery looks: one `commit_files` read per
+/// row, so an unbounded scan would put a whole log's latency on a
+/// keypress. A fixup target is all but always close; past the cap the
+/// keyboard moves by hand, which is the honest fallback rather than a
+/// guess made slowly.
+const FIXUP_SEARCH_DEPTH: usize = 100;
+
+/// `commits.find-fixup-base`: moves the keyboard to the commit the staged
+/// changes build on, so the creation aims right without hunting history
+/// one row at a time.
+///
+/// The guess is file overlap: the staged paths against every recent
+/// commit's files, newest wins, ties stay newest. A guess is announced as
+/// one — the creation still aims at whatever row the keyboard is on when
+/// it lands, so a wrong guess costs a move and nothing else. No overlap
+/// with any loaded commit says so and moves nothing. Returns the window
+/// index found, so the client can move its own cursor.
+pub fn find_fixup_base(client: &mut impl HistoryClient, command: &str) -> Option<usize> {
+    let repo = history_repo(client, command)?;
+    let (window, _) = plan_window(client, command)?;
+    let staged = match repo.status() {
+        Ok(status) => status.staged,
+        Err(e) => {
+            client.say(e);
+            return None;
+        }
+    };
+    if staged.is_empty() {
+        client.say("nothing staged to place — stage the change first (space)".into());
+        return None;
+    }
+    let mut best: Option<(usize, usize)> = None;
+    for (index, commit) in window.iter().enumerate().take(FIXUP_SEARCH_DEPTH) {
+        let files = match repo.commit_files(commit.sha.as_bytes()) {
+            Ok(files) => files,
+            Err(e) => {
+                client.say(e);
+                return None;
+            }
+        };
+        let mut score = 0;
+        for entry in &staged {
+            if files.iter().any(|(_, path)| path == entry.path.as_bytes()) {
+                score += 1;
+            }
+        }
+        if score > best.map(|(_, s)| s).unwrap_or(0) {
+            best = Some((index, score));
+        }
+    }
+    match best {
+        Some((index, _)) => Some(index),
+        None => {
+            client.say(
+                "the staged changes touch no file any recent commit touched — move the keyboard by hand"
+                    .into(),
+            );
+            None
+        }
+    }
+}
+
+/// `commits.apply-fixups`: folds every `fixup!` / `squash!` line in the
+/// window into the commit it names, through the same plan machinery the
+/// todo screen runs — build over the deepest landing, autosquash, confirm,
+/// submit. Markers that name nothing refuse by name instead of riding the
+/// plan as picks: a pick in this run is a fixup that silently stays a
+/// commit, which is the one outcome this key must never produce.
+pub fn apply_fixups(client: &mut impl HistoryClient, command: &str) {
+    // The guard's refusals are the point — a fixture has no history to
+    // fold, and a second rewrite must never start inside git's first. The
+    // plan machinery re-acquires the handle itself.
+    if history_repo(client, command).is_none() {
+        return;
+    }
+    let Some((window, _)) = plan_window(client, command) else {
+        return;
+    };
+    let marks = fixup_marks(&window);
+    if marks.is_empty() {
+        client.say("no fixup! or squash! commits in the window".into());
+        return;
+    }
+    let mut deepest = 0;
+    for mark in &marks {
+        match mark.target {
+            Some(target) => deepest = deepest.max(target),
+            None => {
+                client.say(format!(
+                    "{} names no loaded commit — reword it onto one, or drop it, first",
+                    mark.remainder
+                ));
+                return;
+            }
+        }
+    }
+    let mut plan = match Plan::over(&window, deepest) {
+        Ok(plan) => plan,
+        Err(e) => {
+            client.say(e);
+            return;
+        }
+    };
+    // Every marker moves by construction — the landings were resolved
+    // above — so the count needs no gate. Re-resolving inside the run is
+    // the plan machinery's own staleness contract.
+    plan.autosquash();
+    run_plan(client, command, plan);
 }
 
 // -------------------------------------------------------------- the todo plan
