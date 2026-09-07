@@ -1105,6 +1105,13 @@ fn graft(
     // worktree, so every patch aims at exactly what it was built from.
     r.checkout(sha)?;
     let restore = |r: &dyn Repo| {
+        // Back to the detached commit's own content first: a bare
+        // checkout refuses to overwrite the graft's half-applied work,
+        // stranding the reader detached. Reset hard — the commit is
+        // untouched, only worktree and index move, and the graft required
+        // a clean tree so nothing but its own work can be in the way —
+        // then go home.
+        let _ = r.reset(ResetMode::Hard, sha);
         let _ = match &home {
             HeadState::Branch { name, .. } => r.checkout(name.as_bytes()),
             HeadState::Detached { commit } => r.checkout(commit.as_bytes()),
@@ -1118,6 +1125,17 @@ fn graft(
                 r.apply_patch(patch)?;
             }
             r.stage(path)?;
+        }
+        // Lifting a commit's only change does not rewrite it — it
+        // deletes it, and git's own amend refuses an empty result for
+        // exactly that reason. The graft refuses first, naming the door
+        // that owns it, before the position or the history moves.
+        if r.graft_empties(sha)? {
+            let short = String::from_utf8_lossy(sha);
+            let short = short.chars().take(8).collect::<String>();
+            return Err(format!(
+                "removing this would empty {short} — drop the commit instead"
+            ));
         }
         r.amend_no_edit()
     })();

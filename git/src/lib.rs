@@ -919,6 +919,16 @@ pub trait Repo: Send + Sync {
         Err(unserved("amending without rewording"))
     }
 
+    /// Whether folding the current index into `sha` would leave it empty —
+    /// the staged tree byte-identical to the commit's first-parent tree.
+    /// The graft's guard against amending a commit into nothing: lifting a
+    /// commit's only change does not rewrite it, it deletes it, and the
+    /// drop door owns that. Compared as trees, not as patches, so a commit
+    /// that changed two files and loses one still stands.
+    fn graft_empties(&self, _sha: &[u8]) -> Result<bool> {
+        Err(unserved("an emptiness check"))
+    }
+
     /// Resets HEAD's author to the current user —
     /// `git commit --amend --no-edit --reset-author`. The tree and the
     /// message stand exactly still; only the authorship moves, which is
@@ -2344,6 +2354,23 @@ impl Repo for Binary {
             .map_err(|e| format!("git commit --amend --no-edit: {e}"))?;
         let sha = run(&self.root, &["rev-parse", "HEAD"])?;
         Ok(lossy(trimmed(&sha)))
+    }
+
+    fn graft_empties(&self, sha: &[u8]) -> Result<bool> {
+        refuse_dashes(sha)?;
+        // `write-tree` reads the index as staged — no commit, no hook,
+        // no movement — and the parent's tree is what the amend would
+        // collapse onto. Equal trees mean the commit's every change just
+        // left through the graft. A root commit has no parent: its
+        // emptiness is the empty tree's hash, asked of git itself rather
+        // than canned here.
+        let staged = run(&self.root, &["write-tree"])?;
+        let parent_rev = [sha.to_vec(), b"^^{tree}".to_vec()].concat();
+        let parent = match run_bytes(&self.root, &[b"rev-parse", &parent_rev]) {
+            Ok(tree) => tree,
+            Err(_) => run(&self.root, &["hash-object", "-t", "tree", "/dev/null"])?,
+        };
+        Ok(trimmed(&staged) == trimmed(&parent))
     }
 
     fn reset_author(&self) -> Result<()> {

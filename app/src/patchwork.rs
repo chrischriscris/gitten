@@ -635,3 +635,477 @@ fn short(sha: &[u8]) -> String {
     let text = String::from_utf8_lossy(sha);
     text.chars().take(HEX).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jobs::{Event, Runner};
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    /// A throwaway repository with byte-exact contents, mirroring the
+    /// staging round trip's: setup and oracle only, everything under test
+    /// travels through [`Write`] behind the same [`Handle`] and the same
+    /// [`Runner`] every client submits to. No tty, no window.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("gitten-graft-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("a temp dir");
+            let me = Scratch(dir);
+            me.git(&["init", "-q", "-b", "main", "."]);
+            me.git(&["config", "user.name", "t"]);
+            me.git(&["config", "user.email", "t@t"]);
+            me.git(&["config", "core.autocrlf", "false"]);
+            me
+        }
+
+        fn git(&self, args: &[&str]) -> String {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&self.0)
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        }
+
+        fn write(&self, path: &str, content: &[u8]) {
+            std::fs::write(self.0.join(path), content).expect("wrote the file");
+        }
+
+        fn read(&self, path: &str) -> Vec<u8> {
+            std::fs::read(self.0.join(path)).expect("the file reads")
+        }
+
+        fn commit(&self, path: &str, content: &[u8], message: &str) {
+            self.write(path, content);
+            self.git(&["add", path]);
+            self.git(&["commit", "-qm", message]);
+        }
+
+        fn rev(&self, rev: &str) -> String {
+            self.git(&["rev-parse", rev]).trim().to_string()
+        }
+
+        fn log_subjects(&self) -> Vec<String> {
+            self.git(&["log", "--format=%s", "--topo-order"])
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+
+        fn porcelain(&self) -> String {
+            self.git(&["status", "--porcelain"])
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn wait(runner: &Runner, count: usize) -> Vec<Event> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut events = Vec::new();
+        while events.len() < count && std::time::Instant::now() < deadline {
+            if let Some(event) = runner.try_next() {
+                events.push(event);
+            } else {
+                std::thread::yield_now();
+            }
+        }
+        assert_eq!(events.len(), count, "the worker did not report in time");
+        events
+    }
+
+    fn run_job(runner: &Runner, job: Write) -> Result<(), String> {
+        let submit = runner.submitter();
+        assert!(submit.submit(Box::new(job)).is_ok(), "queued");
+        let events = wait(runner, 2);
+        let Event::Finished { outcome, .. } = &events[1] else {
+            panic!("no finish: {:?}", events[1]);
+        };
+        match outcome {
+            Ok(()) => Ok(()),
+            Err(e) => Err(e.clone()),
+        }
+    }
+
+    /// Ten lines, the middle commit editing two distant ones: lifting one
+    /// leaves the other, so the rewrite is a rewrite and not a deletion —
+    /// a commit's only change lifts through the empty refusal below, never
+    /// through the graft. The tip appends past both, so it replays clean.
+    fn base_lines() -> Vec<u8> {
+        (1..=10)
+            .map(|i| format!("line-{i:02}\n"))
+            .collect::<String>()
+            .into_bytes()
+    }
+
+    fn three_commits(name: &str) -> Scratch {
+        let r = Scratch::new(name);
+        r.commit("f.txt", &base_lines(), "base");
+        let mut middle = String::from_utf8(base_lines()).unwrap();
+        middle = middle.replace("line-02\n", "EDIT-TWO\n");
+        middle = middle.replace("line-08\n", "EDIT-EIGHT\n");
+        r.commit("f.txt", middle.as_bytes(), "middle");
+        let tip = middle + "line-11\n";
+        r.commit("f.txt", tip.as_bytes(), "tip");
+        r
+    }
+
+    /// The middle commit's first hunk, as the keyboard emits it: the graft
+    /// reverses it at apply time to lift `EDIT-TWO` back out. Written out
+    /// here so the test pins the bytes.
+    fn lift_two() -> Vec<u8> {
+        b"diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -1,5 +1,5 @@\n line-01\n-line-02\n+EDIT-TWO\n line-03\n line-04\n line-05\n"
+            .to_vec()
+    }
+
+    #[test]
+    fn removing_a_line_from_a_historical_commit_replays_its_children() {
+        let r = three_commits("remove-hist");
+        let handle = gitten_git::open(&r.0);
+        let middle = r.rev("HEAD~1");
+        let tip = r.rev("HEAD");
+        let runner = Runner::new();
+
+        let job = Write::graft_files(
+            &handle,
+            middle.as_bytes().to_vec(),
+            vec![(b"f.txt".to_vec(), lift_two())],
+            true,
+        )
+        .expect("a non-empty patch grafts");
+        run_job(&runner, job).expect("the graft runs");
+
+        let after = String::from_utf8(r.read("f.txt")).unwrap();
+        assert!(
+            after.contains("line-02\n") && !after.contains("EDIT-TWO"),
+            "the middle lost EDIT-TWO: {after:?}"
+        );
+        assert!(
+            after.contains("EDIT-EIGHT\n") && after.contains("line-11\n"),
+            "the middle kept EDIT-EIGHT and the tip kept line-11: {after:?}"
+        );
+        assert_eq!(
+            r.log_subjects(),
+            vec!["tip".to_string(), "middle".to_string(), "base".to_string()],
+            "messages replay unchanged"
+        );
+        assert_ne!(r.rev("HEAD"), tip, "the tip was replayed, not kept");
+        assert_eq!(r.porcelain(), "", "the tree is clean after the graft");
+        assert_eq!(
+            r.git(&["branch", "--show-current"]).trim(),
+            "main",
+            "the reader is home on the branch, not detached"
+        );
+    }
+
+    #[test]
+    fn removing_a_line_from_the_tip_steps_the_branch_onto_its_replacement() {
+        let r = three_commits("remove-tip");
+        // The tip appends past the middle's edits and renames the first
+        // line: lifting the append leaves a rewrite, so the branch steps
+        // onto the replacement instead of replaying.
+        // The tip gains a second change beside its append: the append
+        // lifts through the graft while the rename stays a rewrite.
+        let mut tip = String::from_utf8(r.read("f.txt")).unwrap();
+        tip = tip.replace("line-01\n", "LINE-01\n");
+        r.write("f.txt", tip.as_bytes());
+        r.git(&["add", "f.txt"]);
+        r.git(&["commit", "-q", "--amend", "--no-edit"]);
+        let tip_sha = r.rev("HEAD");
+        let handle = gitten_git::open(&r.0);
+        let runner = Runner::new();
+
+        let lift_eleven = b"diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -8,3 +8,4 @@\n EDIT-EIGHT\n line-09\n line-10\n+line-11\n"
+            .to_vec();
+        let job = Write::graft_files(
+            &handle,
+            tip_sha.as_bytes().to_vec(),
+            vec![(b"f.txt".to_vec(), lift_eleven)],
+            true,
+        )
+        .expect("a non-empty patch grafts");
+        run_job(&runner, job).expect("the graft runs");
+
+        let after = String::from_utf8(r.read("f.txt")).unwrap();
+        assert!(
+            after.contains("LINE-01\n") && !after.contains("line-11"),
+            "the append left, the rename stayed: {after:?}"
+        );
+        assert_ne!(r.rev("HEAD"), tip_sha, "the branch stepped on");
+        assert_eq!(
+            r.log_subjects(),
+            vec!["tip".to_string(), "middle".to_string(), "base".to_string()],
+        );
+        assert!(handle.as_ref().operation().is_none(), "no rebase stood");
+        assert_eq!(r.porcelain(), "");
+    }
+
+    #[test]
+    fn lifting_a_commits_only_change_refuses_and_names_the_drop() {
+        let r = Scratch::new("graft-empty");
+        r.commit("f.txt", b"one\ntwo\n", "base");
+        r.commit("f.txt", b"one\nTWO\n", "only");
+        let handle = gitten_git::open(&r.0);
+        let only = r.rev("HEAD");
+        let branch = r.git(&["branch", "--show-current"]).trim().to_string();
+        let runner = Runner::new();
+
+        // The only change, lifted: the result would be the parent's tree,
+        // which is a deletion wearing a rewrite's clothes.
+        let lift = b"diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+TWO\n"
+            .to_vec();
+        let job = Write::graft_files(
+            &handle,
+            only.as_bytes().to_vec(),
+            vec![(b"f.txt".to_vec(), lift)],
+            true,
+        )
+        .expect("a non-empty patch grafts");
+        let err = run_job(&runner, job).expect_err("emptiness refuses");
+        assert!(
+            err.contains("empty") && err.contains("drop"),
+            "the refusal names the door: {err}"
+        );
+        assert_eq!(r.read("f.txt"), b"one\nTWO\n", "nothing applied");
+        assert_eq!(r.rev("HEAD"), only, "history never moved");
+        assert_eq!(
+            r.git(&["branch", "--show-current"]).trim(),
+            branch,
+            "never detached"
+        );
+        assert_eq!(r.porcelain(), "", "the index came home too");
+    }
+
+    #[test]
+    fn a_conflicted_replay_stops_standing_and_says_so() {
+        let r = three_commits("remove-conflict");
+        // The tip rewrites the same line the graft lifts: the replay
+        // cannot carry it. Built on the shared fixture so the middle
+        // holds two changes and the lift is a rewrite, not a deletion.
+        let mut tip = String::from_utf8(r.read("f.txt")).unwrap();
+        tip = tip.replace("EDIT-TWO\n", "LINE-02\n");
+        // NB: the shared tip appended line-11; keep it so the replay has
+        // a clean hunk beside the conflicting one.
+        r.commit("f.txt", tip.as_bytes(), "tip");
+        let handle = gitten_git::open(&r.0);
+        let middle = r.rev("HEAD~1");
+        let runner = Runner::new();
+
+        let job = Write::graft_files(
+            &handle,
+            middle.as_bytes().to_vec(),
+            vec![(b"f.txt".to_vec(), lift_two())],
+            true,
+        )
+        .expect("a non-empty patch grafts");
+        let err = run_job(&runner, job).expect_err("the replay stops");
+        assert!(
+            err.contains("stopped on a conflict"),
+            "the stop is named, not git's raw exit: {err}"
+        );
+        assert!(
+            handle.as_ref().operation().is_some(),
+            "the rebase stands for the lifecycle"
+        );
+        // A standing rebase is detached by definition — HEAD sits at
+        // the stopped pick — so the assertions are the stop itself: the
+        // operation stands, the conflict markers are on disk, and the
+        // history below the replay never moved.
+        assert!(
+            r.read("f.txt").windows(7).any(|w| w == b"<<<<<<<"),
+            "the conflict is on disk for the lifecycle"
+        );
+        r.git(&["rebase", "--abort"]);
+        assert!(handle.as_ref().operation().is_none(), "aborted clean");
+    }
+
+    #[test]
+    fn a_dirty_tree_refuses_the_graft_and_stays_where_it_was() {
+        let r = three_commits("remove-dirty");
+        let branch = r.git(&["branch", "--show-current"]).trim().to_string();
+        r.write("f.txt", b"dirty\n");
+        let handle = gitten_git::open(&r.0);
+        let runner = Runner::new();
+
+        let job = Write::graft_files(
+            &handle,
+            r.rev("HEAD~1").as_bytes().to_vec(),
+            vec![(b"f.txt".to_vec(), lift_two())],
+            true,
+        )
+        .expect("a non-empty patch grafts");
+        let err = run_job(&runner, job).expect_err("a dirty tree refuses");
+        assert!(err.contains("clean tree"), "{err}");
+        assert_eq!(r.read("f.txt"), b"dirty\n", "the dirt is untouched");
+        assert_eq!(
+            r.git(&["branch", "--show-current"]).trim(),
+            branch,
+            "never detached"
+        );
+        assert_eq!(r.log_subjects()[0], "tip", "history never moved");
+    }
+
+    #[test]
+    fn an_empty_graft_is_refused_before_the_queue() {
+        let job = Write::graft_files(
+            &gitten_git::open(&std::env::temp_dir()),
+            b"abc".to_vec(),
+            vec![(b"f.txt".to_vec(), Vec::new())],
+            true,
+        );
+        let Err(err) = job else {
+            panic!("emptiness must refuse before the queue");
+        };
+        assert!(err.contains("empty"), "{err}");
+    }
+
+    #[test]
+    fn amending_a_historical_commit_folds_work_in_and_replays() {
+        let r = three_commits("remove-amend");
+        let handle = gitten_git::open(&r.0);
+        let middle = r.rev("HEAD~1");
+        let runner = Runner::new();
+
+        // Forward: the middle gains a line it never had, the tip replays
+        // over it.
+        let add = b"diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -1,4 +1,5 @@\n line-01\n EDIT-TWO\n line-03\n+line-00\n line-04\n"
+            .to_vec();
+        let job = Write::graft_files(
+            &handle,
+            middle.as_bytes().to_vec(),
+            vec![(b"f.txt".to_vec(), add)],
+            false,
+        )
+        .expect("a non-empty patch grafts");
+        run_job(&runner, job).expect("the graft runs");
+
+        let after = String::from_utf8(r.read("f.txt")).unwrap();
+        assert!(
+            after.contains("line-00\n") && after.contains("line-11\n"),
+            "the middle gained line-00 and the tip kept line-11: {after:?}"
+        );
+        assert_eq!(
+            r.log_subjects(),
+            vec!["tip".to_string(), "middle".to_string(), "base".to_string()],
+        );
+        assert_eq!(r.porcelain(), "");
+    }
+
+    #[test]
+    fn moving_a_patch_onto_a_new_branch_leaves_it_uncommitted_there() {
+        let r = three_commits("move-new");
+        let handle = gitten_git::open(&r.0);
+        let runner = Runner::new();
+
+        // A patch adding one line past the tip's own content: it aims
+        // at what the new branch holds, because the branch starts at HEAD.
+        let add_moved = b"diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -1,3 +1,4 @@\n line-01\n+MOVED\n EDIT-TWO\n line-03\n"
+            .to_vec();
+        let job = Write::move_patch_to_branch(
+            &handle,
+            b"feature".to_vec(),
+            true,
+            vec![(b"f.txt".to_vec(), add_moved)],
+        )
+        .expect("a non-empty patch moves");
+        run_job(&runner, job).expect("the move runs");
+
+        assert_eq!(
+            r.git(&["branch", "--show-current"]).trim(),
+            "feature",
+            "the reader moved with the patch"
+        );
+        let after = String::from_utf8(r.read("f.txt")).unwrap();
+        assert!(
+            after.contains("MOVED\n"),
+            "the patch landed on the new branch: {after:?}"
+        );
+        assert_ne!(
+            r.porcelain(),
+            "",
+            "uncommitted — the commit is the reader's next keypress"
+        );
+        // The branch it left never moved.
+        assert_eq!(
+            r.git(&["rev-parse", "main"]).trim(),
+            r.rev("main"),
+            "main stands where it stood"
+        );
+        assert_eq!(r.log_subjects()[0], "tip", "no commit was made");
+    }
+
+    #[test]
+    fn moving_onto_a_branch_a_dirty_tree_cannot_carry_refuses_cleanly() {
+        let r = three_commits("move-dirty");
+        // A diverged branch to move onto: its f.txt differs, so carrying
+        // dirty work across is git's refusal, not ours.
+        r.git(&["branch", "other", "HEAD~1"]);
+        r.write("f.txt", b"dirty\n");
+        let handle = gitten_git::open(&r.0);
+        let runner = Runner::new();
+
+        let add_moved = b"diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -1,3 +1,4 @@\n line-01\n+MOVED\n EDIT-TWO\n line-03\n"
+            .to_vec();
+        let job = Write::move_patch_to_branch(
+            &handle,
+            b"other".to_vec(),
+            false,
+            vec![(b"f.txt".to_vec(), add_moved)],
+        )
+        .expect("a non-empty patch moves");
+        let err = run_job(&runner, job).expect_err("the checkout refuses");
+        assert!(
+            err.contains("local changes") || err.contains("overwritten"),
+            "git's own refusal, verbatim: {err}"
+        );
+        assert_eq!(r.read("f.txt"), b"dirty\n", "the dirt is untouched");
+        assert_eq!(
+            r.git(&["branch", "--show-current"]).trim(),
+            "main",
+            "never left"
+        );
+    }
+
+    #[test]
+    fn checking_a_file_out_of_a_commit_restores_worktree_and_index() {
+        let r = three_commits("checkout-file");
+        // Diverge both sides from the middle's version.
+        r.write("f.txt", b"worktree\n");
+        r.git(&["add", "f.txt"]);
+        r.write("f.txt", b"worktree-and-more\n");
+        let handle = gitten_git::open(&r.0);
+        let middle = r.rev("HEAD~1");
+        let middle_bytes = r.git(&["show", &format!("{middle}:f.txt")]).into_bytes();
+        let runner = Runner::new();
+
+        let job = Write::checkout_file_from_commit(
+            &handle,
+            middle.as_bytes().to_vec(),
+            b"f.txt".to_vec(),
+        );
+        run_job(&runner, job).expect("the checkout runs");
+
+        assert_eq!(
+            r.read("f.txt"),
+            middle_bytes,
+            "the worktree carries the commit's version"
+        );
+        let staged = r.git(&["show", ":f.txt"]).into_bytes();
+        assert_eq!(staged, middle_bytes, "the index moved with it");
+        assert_eq!(r.log_subjects()[0], "tip", "history never moved");
+    }
+}
