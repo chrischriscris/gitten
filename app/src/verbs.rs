@@ -629,14 +629,37 @@ impl Write {
     }
 
     /// Deletes one tag — a name and not a home, so every commit it pointed
-    /// at survives. No tags pane exists yet for anything built-in to aim
-    /// this from; it sits here on the same rails as its siblings so the
-    /// tags pane (a future wave) and any extension reach it through the one
-    /// door, never a private path.
-    #[allow(dead_code)]
+    /// at survives.
     pub fn delete_tag(repo: &Handle, name: Vec<u8>) -> Self {
         let shown = String::from_utf8_lossy(&name).into_owned();
         Self::named(format!("untag {shown}"), repo, move |r| r.delete_tag(&name))
+    }
+
+    /// Pushes one tag to the named remote. The `tag` word rides inside the
+    /// verb (see [`Repo::push_tag`](gitten_git::Repo::push_tag)), so a
+    /// caller can never push a branch by spelling a name two things share.
+    pub fn push_tag(repo: &Handle, remote: Vec<u8>, name: Vec<u8>) -> Self {
+        let shown = String::from_utf8_lossy(&name).into_owned();
+        let at = String::from_utf8_lossy(&remote).into_owned();
+        Self::named(format!("push tag {shown} to {at}"), repo, move |r| {
+            r.push_tag(&remote, &name)
+        })
+    }
+
+    /// Deletes the branch from the named remote, keeping the local branch.
+    pub fn delete_remote_branch(repo: &Handle, remote: Vec<u8>, branch: Vec<u8>) -> Self {
+        let shown = String::from_utf8_lossy(&branch).into_owned();
+        let at = String::from_utf8_lossy(&remote).into_owned();
+        Self::named(format!("delete {shown} from {at}"), repo, move |r| {
+            r.delete_remote_branch(&remote, &branch)
+        })
+    }
+
+    /// Points HEAD's ref at `target` with `message` as the reflog sentence —
+    /// undo's and redo's verb. The label names the direction, so the queue
+    /// and the status line read as prose rather than as a git invocation.
+    pub fn move_head(repo: &Handle, label: String, message: &'static str, target: Vec<u8>) -> Self {
+        Self::named(label, repo, move |r| r.move_head(&target, message))
     }
 
     /// Parks the tracked working tree on the stash stack — `git stash push`.

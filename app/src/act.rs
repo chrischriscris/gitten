@@ -12,7 +12,10 @@ use crate::verbs::Write;
 use gitten_core::clipboard::CherryClipboard;
 use gitten_core::operation::{Operation, Side};
 use gitten_core::rebase::{compose, Amend, Plan, Rewrite};
-use gitten_core::refs::{ResetMode, StashId, StashScope, Target};
+use gitten_core::refs::{
+    redo_selector, undo_for, HeadState, RefName, ReflogEntry, ResetMode, StashId, StashScope,
+    Target, UndoKind, REDO_MESSAGE, UNDO_MESSAGE,
+};
 use gitten_core::status::PathBytes;
 use gitten_core::{Commit, Hunk};
 use gitten_git::Handle;
@@ -1723,7 +1726,336 @@ pub fn remote_remove(client: &mut impl RemoteClient) {
     }
 }
 
-/// Turn accepted commit text into its write job.
+// ------------------------------------------------------------------- tags
+
+/// The client-owned selection and confirmation state needed by tag actions.
+pub trait TagClient: Client {
+    /// The tag row the keyboard is on, by the name verbs address it with.
+    fn tag_target(&self) -> Option<RefName>;
+    /// Arms this tag, or spends an arm already standing on it.
+    fn confirm_or_arm_tag(&mut self, name: &RefName) -> bool;
+}
+
+/// A tag's accepted name: names `target` — a branch, a commit, any revspec
+/// git resolves — carrying `message` when one was given (annotated) and
+/// nothing when the field came back empty (lightweight). The branches and
+/// commits panes converge here: both hold a revspec in the prompt, so both
+/// reach the same verb and neither learns what a tag is.
+pub fn create_tag(
+    client: &mut impl Client,
+    name: String,
+    target: Vec<u8>,
+    message: Option<String>,
+) {
+    let name = name.trim();
+    if name.is_empty() {
+        client.say("a tag needs a name".into());
+        return;
+    }
+    let Some(repo) = client.repo() else {
+        client.say("a fixture has no repository to tag in".into());
+        return;
+    };
+    if !client.submit(Box::new(Write::create_tag(
+        &repo,
+        name.as_bytes().to_vec(),
+        target,
+        message,
+    ))) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+/// `tags.delete`: forget one tag name. The commits it named survive — a
+/// name and not a home — and the question is asked twice, armed on the
+/// name, like every other destructive key here.
+pub fn delete_tag(client: &mut impl TagClient) {
+    let Some(name) = client.tag_target() else {
+        client.say("nothing selected to delete".into());
+        return;
+    };
+    let Some(repo) = client.repo() else {
+        client.say("a fixture has no repository to delete tags from".into());
+        return;
+    };
+    if !client.confirm_or_arm_tag(&name) {
+        client.ask(format!(
+            "delete tag {}? press again to confirm",
+            name.to_string_lossy()
+        ));
+        return;
+    }
+    if !client.submit(Box::new(Write::delete_tag(&repo, name.as_bytes().to_vec()))) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+/// `tags.push`'s accepted remote: pushes the selected tag there. The remote
+/// rides the prompt the keypress opened (prefilled when the repository
+/// knows exactly one), because tags track nothing and there is no upstream
+/// to default to — guessing `origin` in a two-remote repository would aim
+/// a publishable name at the wrong room.
+pub fn push_tag(client: &mut impl TagClient, remote: String) {
+    let Some(name) = client.tag_target() else {
+        client.say("nothing selected to push".into());
+        return;
+    };
+    let remote = remote.trim();
+    if remote.is_empty() {
+        client.say("a push needs a remote".into());
+        return;
+    }
+    let Some(repo) = client.repo() else {
+        client.say("a fixture has no repository to push from".into());
+        return;
+    };
+    if !client.submit(Box::new(Write::push_tag(
+        &repo,
+        remote.as_bytes().to_vec(),
+        name.as_bytes().to_vec(),
+    ))) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+/// `tags.checkout`: check the selected tag out, detached. The tag is a
+/// name for a commit, so this is the commits pane's detached checkout with
+/// a different row under the keyboard — same verb, same refusal when the
+/// tree cannot move.
+pub fn checkout_tag(client: &mut impl TagClient) {
+    let Some(name) = client.tag_target() else {
+        client.say("nothing selected to check out".into());
+        return;
+    };
+    let Some(repo) = client.repo() else {
+        client.say("a fixture has no repository to check out in".into());
+        return;
+    };
+    if !client.submit(Box::new(Write::checkout(&repo, name.as_bytes().to_vec()))) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+/// `branches.delete-remote`: delete the remote-tracking row's source on its
+/// remote. The local branch of the same name survives — this is the remote
+/// half of branch deletion, and the question says so twice: first press
+/// arms and names both halves, second press on the same row deletes.
+pub fn delete_remote_branch(client: &mut impl BranchClient) {
+    let Some(Target::Remote { remote, branch }) = client.branch_target() else {
+        client.say("only a remote-tracking row has a remote branch to delete".into());
+        return;
+    };
+    let Some(repo) = client.repo() else {
+        client.say("a fixture has no repository to delete from".into());
+        return;
+    };
+    let target = Target::Remote {
+        remote: remote.clone(),
+        branch: branch.clone(),
+    };
+    if !client.confirm_or_arm_branch(&target) {
+        client.ask(format!(
+            "delete {}/{} on {}? the local branch stays — press again to confirm",
+            remote.to_string_lossy(),
+            branch.to_string_lossy(),
+            remote.to_string_lossy()
+        ));
+        return;
+    }
+    if !client.submit(Box::new(Write::delete_remote_branch(
+        &repo,
+        remote.as_bytes().to_vec(),
+        branch.as_bytes().to_vec(),
+    ))) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+// ----------------------------------------------------------------- reflog
+
+/// The client-owned selection and confirmation state needed by reflog
+/// actions: the entry, and the HEAD it would move.
+pub trait ReflogClient: Client {
+    /// The reflog row the keyboard is on — selector, commit and message.
+    fn reflog_target(&self) -> Option<ReflogEntry>;
+    /// Arms this entry, or spends an arm already standing on it.
+    fn confirm_or_arm_reflog(&mut self, selector: &str) -> bool;
+    /// Where HEAD is now, so recovery can name what moves. The honest
+    /// default for a client that tracks no HEAD: none, and recovery
+    /// refuses rather than guessing.
+    fn head_state(&self) -> Option<HeadState> {
+        None
+    }
+}
+
+/// `reflog.recover`: put the current branch back onto the selected entry —
+/// `reset --soft`, so the index and the working tree are untouched — or
+/// check the entry out when HEAD is detached. The question previews the
+/// move in both directions: what the ref leaves and what it lands on, and
+/// what stays (everything uncommitted). A standing operation refuses
+/// first: moving HEAD under a merge in flight corrupts it.
+pub fn recover_reflog(client: &mut impl ReflogClient) {
+    let Some(entry) = client.reflog_target() else {
+        client.say("nothing selected to recover".into());
+        return;
+    };
+    let Some(repo) = client.repo() else {
+        client.say("a fixture has no repository to recover in".into());
+        return;
+    };
+    if let Some(op) = client.operation() {
+        client.say(format!(
+            "finish the standing {} first — recovery moves HEAD",
+            op.kind.word()
+        ));
+        return;
+    }
+    let Some(head) = client.head_state() else {
+        client.say("no HEAD to move".into());
+        return;
+    };
+    match head {
+        HeadState::Branch { name, commit } => {
+            let from = commit.as_deref().unwrap_or("unborn");
+            if !client.confirm_or_arm_reflog(&entry.selector) {
+                client.ask(format!(
+                    "move {} from {} onto {} ({})? index and worktree untouched — press again to confirm",
+                    name.to_string_lossy(),
+                    from,
+                    entry.commit,
+                    entry.message
+                ));
+                return;
+            }
+            if !client.submit(Box::new(Write::reset(
+                &repo,
+                ResetMode::Soft,
+                entry.commit.as_bytes().to_vec(),
+            ))) {
+                client.say("the job queue is shutting down".into());
+            }
+        }
+        HeadState::Detached { .. } => {
+            if !client.confirm_or_arm_reflog(&entry.selector) {
+                client.ask(format!(
+                    "check out {} ({})? press again to confirm",
+                    entry.commit, entry.message
+                ));
+                return;
+            }
+            if !client.submit(Box::new(Write::checkout(
+                &repo,
+                entry.commit.as_bytes().to_vec(),
+            ))) {
+                client.say("the job queue is shutting down".into());
+            }
+        }
+    }
+}
+
+// --------------------------------------------------------------- undo/redo
+
+/// `history.undo` (`z`): walk the last HEAD move back. A checkout walks
+/// back by checking out where it came from; every other move is walked
+/// back by pointing HEAD's ref at the earlier entry — `update-ref`, never
+/// a reset flag — so uncommitted work is exactly where it was. Refuses
+/// behind a fixture, a standing operation, an unreadable reflog, and a
+/// move that went nowhere.
+pub fn undo_last(client: &mut impl Client) {
+    let Some(repo) = client.repo() else {
+        client.say("a fixture has no history to undo".into());
+        return;
+    };
+    if let Some(op) = client.operation() {
+        client.say(format!(
+            "finish the standing {} first — undo moves HEAD",
+            op.kind.word()
+        ));
+        return;
+    };
+    let entries = match repo.reflog(2) {
+        Ok(entries) => entries,
+        Err(e) => {
+            client.say(e);
+            return;
+        }
+    };
+    let [after, before] = entries.as_slice() else {
+        client.say("nothing to undo".into());
+        return;
+    };
+    match undo_for(before, after) {
+        None => client.say("HEAD is where it was — nothing to undo".into()),
+        Some(UndoKind::Checkout { from }) => {
+            if !client.submit(Box::new(Write::checkout(&repo, from.as_bytes().to_vec()))) {
+                client.say("the job queue is shutting down".into());
+            }
+        }
+        Some(UndoKind::Move { selector }) => {
+            let label = format!("undo ({})", after.message);
+            if !client.submit(Box::new(Write::move_head(
+                &repo,
+                label,
+                UNDO_MESSAGE,
+                selector.as_bytes().to_vec(),
+            ))) {
+                client.say("the job queue is shutting down".into());
+            }
+        }
+    }
+}
+
+/// `history.redo` (`Z`): walk forward again — but only behind our own
+/// undo, on an unmoved HEAD. Anything else (a commit, a checkout, the
+/// reader's own terminal reset, a redo already standing) reads as "nothing
+/// to redo" rather than a guess about which forward step was meant. The
+/// check is the reflog's, not the session's, so reopening the client does
+/// not disarm a redo that is still honestly armed.
+pub fn redo_last(client: &mut impl Client) {
+    let Some(repo) = client.repo() else {
+        client.say("a fixture has no history to redo".into());
+        return;
+    };
+    if let Some(op) = client.operation() {
+        client.say(format!(
+            "finish the standing {} first — redo moves HEAD",
+            op.kind.word()
+        ));
+        return;
+    };
+    let head_sha = match repo.head() {
+        Ok(HeadState::Branch {
+            commit: Some(sha), ..
+        })
+        | Ok(HeadState::Detached { commit: sha }) => sha,
+        _ => {
+            client.say("no HEAD to redo".into());
+            return;
+        }
+    };
+    let entries = match repo.reflog(2) {
+        Ok(entries) => entries,
+        Err(e) => {
+            client.say(e);
+            return;
+        }
+    };
+    match redo_selector(&entries, &head_sha) {
+        None => client.say("nothing to redo — redo follows only our own undo".into()),
+        Some(selector) => {
+            if !client.submit(Box::new(Write::move_head(
+                &repo,
+                "redo".into(),
+                REDO_MESSAGE,
+                selector.as_bytes().to_vec(),
+            ))) {
+                client.say("the job queue is shutting down".into());
+            }
+        }
+    }
+}
+
+/// Turn accepted commit text into its write job./// Turn accepted commit text into its write job.
 pub fn commit_message(client: &mut impl Client, message: String) {
     if message.trim().is_empty() {
         client.say("a commit needs a message".into());
