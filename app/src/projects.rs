@@ -90,6 +90,34 @@ pub fn remove(path: &Path) -> Vec<PathBuf> {
     list
 }
 
+/// Points `GITTEN_PROJECTS` at one file for the lifetime of this value, and
+/// puts whatever was there back on drop — a panicking test included. The
+/// override is one process-global variable, so the guard is the whole
+/// cleanup story: a body that unwinds cannot leak its spelling of the
+/// variable into every test that runs after it.
+#[doc(hidden)]
+pub struct EnvOverride {
+    prev: Option<std::ffi::OsString>,
+}
+
+impl EnvOverride {
+    /// Overrides the store path for as long as the guard lives.
+    pub fn set(file: &Path) -> Self {
+        let prev = std::env::var_os("GITTEN_PROJECTS");
+        std::env::set_var("GITTEN_PROJECTS", file);
+        Self { prev }
+    }
+}
+
+impl Drop for EnvOverride {
+    fn drop(&mut self) {
+        match self.prev.take() {
+            Some(prev) => std::env::set_var("GITTEN_PROJECTS", prev),
+            None => std::env::remove_var("GITTEN_PROJECTS"),
+        }
+    }
+}
+
 /// Serializes every test that redirects the store through the env override.
 ///
 /// `GITTEN_PROJECTS` is one process-global variable, and this crate's own
@@ -118,13 +146,13 @@ mod tests {
     }
 
     /// Points `path()` at a fresh scratch file, runs `body`, then unsets the
-    /// override and removes the file. Serialized: the env var is global.
+    /// override and removes the file. Serialized: the env var is global, and
+    /// the guard is what makes that true even when `body` panics.
     fn with_scratch(name: &str, body: impl FnOnce(&Path)) {
         let _guard = env_lock();
         let file = scratch(name);
-        std::env::set_var("GITTEN_PROJECTS", &file);
+        let _override = EnvOverride::set(&file);
         body(&file);
-        std::env::remove_var("GITTEN_PROJECTS");
         let _ = std::fs::remove_file(&file);
     }
 
@@ -132,15 +160,15 @@ mod tests {
     fn the_env_override_names_the_file() {
         let _guard = env_lock();
         let file = scratch("override");
-        std::env::set_var("GITTEN_PROJECTS", &file);
+        let _override = EnvOverride::set(&file);
         assert_eq!(path(), file);
-        std::env::remove_var("GITTEN_PROJECTS");
     }
 
     #[test]
     fn without_an_override_it_lives_under_target() {
         let _guard = env_lock();
-        std::env::remove_var("GITTEN_PROJECTS");
+        let _override = EnvOverride::set(Path::new("/nonexistent/gitten-projects-mru"));
+        drop(_override);
         assert_eq!(path(), PathBuf::from("target/gitten-projects"));
     }
 

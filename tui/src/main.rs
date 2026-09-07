@@ -13310,10 +13310,11 @@ diff --git a/tracked.txt b/tracked.txt
         let file =
             std::env::temp_dir().join(format!("gitten-tui-mru-{name}-{}", std::process::id()));
         let _ = std::fs::remove_file(&file);
-        std::env::set_var("GITTEN_PROJECTS", &file);
+        // The override comes down on drop, panic included — a test that
+        // unwinds cannot leak its spelling of the variable into the rest.
+        let _override = gitten_app::projects::EnvOverride::set(&file);
         std::fs::write(&file, rows.join("\n")).expect("a scratch MRU");
         body();
-        std::env::remove_var("GITTEN_PROJECTS");
         let _ = std::fs::remove_file(&file);
     }
 
