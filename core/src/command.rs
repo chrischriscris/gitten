@@ -335,6 +335,10 @@ impl Keymap {
         // of the keyboard for a panel at the edge of the app's life.
         bind(GLOBAL, "`", "message.show");
         bind(GLOBAL, "esc", "back");
+        // The patch clipboard's door, on lazygit's own ctrl+p: the menu
+        // names the targets and the builder, and every answer is a command
+        // of its own — nothing here writes, so it asks nothing twice.
+        bind(GLOBAL, "ctrl-p", "patch.menu");
 
         bind(GLOBAL, "j", "view.down");
         bind(GLOBAL, "down", "view.down");
@@ -443,6 +447,18 @@ impl Keymap {
         bind("stash", "u", "files.stash-unstaged");
         bind("stash", "U", "files.stash-untracked");
         bind("stash", "f", "files.stash-file");
+        // The patch menu's answers, in a mode of their own for the reason
+        // the stash menu is: `a` and `i` apply the clipboard forwards onto
+        // the worktree and the index, `r` and `u` reverse it off them, `b`
+        // opens the builder, `m` moves the patch onto a named branch, and
+        // `c` clears the clipboard.
+        bind("patch", "a", "patch.apply-worktree");
+        bind("patch", "i", "patch.apply-index");
+        bind("patch", "r", "patch.reverse-worktree");
+        bind("patch", "u", "patch.reverse-index");
+        bind("patch", "b", "patch.show");
+        bind("patch", "m", "patch.move-to-branch");
+        bind("patch", "c", "patch.clear");
         // lazygit's files-panel reset menu, on its own `g`: the strengths
         // aim at the *upstream* rather than at a row, and the nuke throws
         // the working tree away. It shadows the global `view.top` inside
@@ -616,6 +632,21 @@ impl Keymap {
         // marks the range, the same key every list pane already answers.
         bind("diff", "a", "diff.toggle-line-selection");
         bind("diff", "v", "select.mark");
+        // The patch clipboard's pick, on the free `p`: the hunk — or the
+        // marked lines — under the keyboard joins the clipboard, from any
+        // diff that names a read. Commits and stashes keep as drawn (their
+        // reads are immutable); working-tree sides are re-read and matched
+        // before anything is kept.
+        bind("diff", "p", "patch.pick");
+        // History surgery from a commit's diff, where the staging verbs
+        // have nothing to aim at: `d` lifts the hunk out of the commit it
+        // belongs to, `D` the whole file under the keyboard, `c` checks
+        // the file out of the commit, and `A` amends the commit with the
+        // clipboard. Every one rewrites history and asks twice.
+        bind("diff", "d", "patch.remove-from-commit");
+        bind("diff", "D", "patch.discard-file");
+        bind("diff", "c", "patch.checkout-file");
+        bind("diff", "A", "patch.amend-commit");
         bind("commits", "enter", "commits.open-diff");
         bind("commits", "/", "commits.search");
         // Resetting to the commit under the keyboard, exactly lazygit's
@@ -816,6 +847,33 @@ impl Keymap {
         bind("todo", "home", "view.top");
         bind("todo", "G", "view.bottom");
         bind("todo", "end", "view.bottom");
+        // The patch builder owns the keyboard for as long as it stands,
+        // on exactly the todo screen's terms: a press it does not name
+        // must run nothing underneath, because the clipboard it edits is
+        // one keypress from landing somewhere. Its own mode, because the
+        // menu's letters mean other things — `a` applies there and toggles
+        // here. Space toggles the hunk, `a` the file, `D` drops the file
+        // whole; enter and `i` apply onto the worktree and the index, `r`
+        // and `u` reverse off them, `m` moves onto a named branch.
+        bind("builder", "?", "help");
+        bind("builder", "esc", "back");
+        bind("builder", "j", "view.down");
+        bind("builder", "down", "view.down");
+        bind("builder", "k", "view.up");
+        bind("builder", "up", "view.up");
+        bind("builder", "g", "view.top");
+        bind("builder", "home", "view.top");
+        bind("builder", "G", "view.bottom");
+        bind("builder", "end", "view.bottom");
+        bind("builder", "space", "patch.toggle-hunk");
+        bind("builder", "a", "patch.toggle-file");
+        bind("builder", "D", "patch.drop-file");
+        bind("builder", "enter", "patch.apply-worktree");
+        bind("builder", "i", "patch.apply-index");
+        bind("builder", "r", "patch.reverse-worktree");
+        bind("builder", "u", "patch.reverse-index");
+        bind("builder", "m", "patch.move-to-branch");
+        bind("builder", "c", "patch.clear");
 
         // The settings panel owns the keyboard for as long as it stands, for
         // the same reason the help overlay does: a press it does not name must
@@ -1389,6 +1447,70 @@ impl Commands {
                 "act on marked lines instead of the whole hunk",
                 Some("line selection"),
             ),
+            ("patch.menu", "the patch clipboard's targets and builder", Some("patch")),
+            (
+                "patch.pick",
+                "pick the hunk under the keyboard onto the patch clipboard",
+                Some("pick"),
+            ),
+            (
+                "patch.remove-from-commit",
+                "lift the hunk under the keyboard out of its own commit, asked twice",
+                Some("remove"),
+            ),
+            (
+                "patch.discard-file",
+                "lift the whole file under the keyboard out of its own commit, asked twice",
+                Some("discard file"),
+            ),
+            (
+                "patch.checkout-file",
+                "check the file under the keyboard out of its commit, asked twice",
+                Some("checkout file"),
+            ),
+            (
+                "patch.amend-commit",
+                "amend this commit with the patch clipboard, asked twice",
+                Some("amend"),
+            ),
+            (
+                "patch.apply-worktree",
+                "apply the patch clipboard onto the working tree",
+                Some("apply"),
+            ),
+            (
+                "patch.apply-index",
+                "apply the patch clipboard onto the index",
+                Some("apply indexed"),
+            ),
+            (
+                "patch.reverse-worktree",
+                "reverse the patch clipboard off the working tree, asked twice",
+                Some("reverse"),
+            ),
+            (
+                "patch.reverse-index",
+                "reverse the patch clipboard off the index",
+                Some("reverse indexed"),
+            ),
+            ("patch.show", "open the patch builder", Some("builder")),
+            (
+                "patch.toggle-hunk",
+                "include or exclude the hunk under the keyboard",
+                Some("toggle hunk"),
+            ),
+            (
+                "patch.toggle-file",
+                "include or exclude the whole file under the keyboard",
+                Some("toggle file"),
+            ),
+            ("patch.drop-file", "drop the file under the keyboard off the patch", Some("drop")),
+            (
+                "patch.move-to-branch",
+                "carry the patch clipboard onto a named branch, uncommitted",
+                Some("move"),
+            ),
+            ("patch.clear", "empty the patch clipboard", Some("clear patch")),
             ("theme.cycle", "the next theme", None),
             (
                 "commits.open-diff",
@@ -2637,14 +2759,103 @@ mod tests {
         let k = Keymap::builtin();
         let mut found = k.keys_for("view.down");
         found.sort();
-        // `view.down` is also how the settings panel, the remotes picker and
-        // the rebase plan move their selection — the same verb, intercepted
-        // while each of them stands.
+        // `view.down` is also how the settings panel, the remotes picker,
+        // the rebase plan and the patch builder move their selection — the
+        // same verb, intercepted while each of them stands.
         assert_eq!(
             found,
-            vec!["down", "down", "down", "down", "j", "j", "j", "j"]
+            vec!["down", "down", "down", "down", "down", "j", "j", "j", "j", "j"]
         );
         assert!(k.keys_for("nothing.at.all").is_empty());
+    }
+
+    #[test]
+    fn the_patch_menu_and_builder_answer_in_their_modes() {
+        let k = Keymap::builtin();
+        let resolve = |modes: &[&str], chord: &str| {
+            let mut m = Modes::new();
+            for mode in modes {
+                m.push(*mode);
+            }
+            k.resolve(&m, &keys(chord))
+        };
+        // The menu's letters, in the question's mode and nowhere else.
+        for (chord, name) in [
+            ("a", "patch.apply-worktree"),
+            ("i", "patch.apply-index"),
+            ("r", "patch.reverse-worktree"),
+            ("u", "patch.reverse-index"),
+            ("b", "patch.show"),
+            ("m", "patch.move-to-branch"),
+            ("c", "patch.clear"),
+        ] {
+            assert_eq!(
+                resolve(&["patch"], chord),
+                Resolve::Run(name),
+                "{chord} did not reach {name} in [patch]"
+            );
+        }
+        // Most answers mean the same with the builder open — the letters
+        // coincide on purpose — except `a`, which applies in the menu and
+        // toggles in the builder, and `b`, which opens the builder and so
+        // has nothing to open inside it.
+        for (chord, name) in [
+            ("i", "patch.apply-index"),
+            ("r", "patch.reverse-worktree"),
+            ("u", "patch.reverse-index"),
+            ("m", "patch.move-to-branch"),
+            ("c", "patch.clear"),
+        ] {
+            assert_eq!(
+                resolve(&["builder"], chord),
+                Resolve::Run(name),
+                "{chord} did not reach {name} in [builder]"
+            );
+        }
+        assert_eq!(
+            resolve(&["builder"], "a"),
+            Resolve::Run("patch.toggle-file"),
+            "a toggles in [builder], it does not apply"
+        );
+        assert_ne!(
+            resolve(&["builder"], "b"),
+            Resolve::Run("patch.show"),
+            "patch.show leaked into [builder]"
+        );
+        // The builder's own letters, where the menu's mean other things.
+        for (chord, name) in [
+            ("space", "patch.toggle-hunk"),
+            ("a", "patch.toggle-file"),
+            ("D", "patch.drop-file"),
+            ("enter", "patch.apply-worktree"),
+            ("m", "patch.move-to-branch"),
+            ("c", "patch.clear"),
+        ] {
+            assert_eq!(
+                resolve(&["builder"], chord),
+                Resolve::Run(name),
+                "{chord} did not reach {name} in [builder]"
+            );
+        }
+        // The diff's surgery keys, answered by origin at dispatch.
+        for (chord, name) in [
+            ("p", "patch.pick"),
+            ("d", "patch.remove-from-commit"),
+            ("D", "patch.discard-file"),
+            ("c", "patch.checkout-file"),
+            ("A", "patch.amend-commit"),
+        ] {
+            assert_eq!(
+                resolve(&["diff"], chord),
+                Resolve::Run(name),
+                "{chord} did not reach {name} in [diff]"
+            );
+        }
+        assert_eq!(
+            resolve(&[], "ctrl-p"),
+            Resolve::Run("patch.menu"),
+            "ctrl-p did not reach the patch menu globally"
+        );
     }
 
     #[test]
