@@ -612,6 +612,40 @@ pub trait Repo: Send + Sync {
         Err(unserved("patch discarding"))
     }
 
+    /// Writes exactly what `patch` describes into the working tree:
+    /// `git apply` without `--cached` and without `--reverse`.
+    ///
+    /// The fourth corner the other three patch verbs leave open: stage and
+    /// unstage aim at the index, discard runs the worktree backwards, and
+    /// this one runs it forwards — what a patch picked from anywhere lands
+    /// through. The index is not touched, so staged work stands still while
+    /// the worktree takes the patch; context that drifted since the patch
+    /// was built fails with git's own sentence, verbatim, because "patch
+    /// does not apply" is advice only the person holding both sides can
+    /// act on. The same stdin transport as its siblings, for the same
+    /// reason: a patch is arbitrary text and never argv.
+    fn apply_patch(&self, _patch: &[u8]) -> Result<()> {
+        Err(unserved("patch applying"))
+    }
+
+    /// The files one commit touched, in the order git names them: each
+    /// entry is the status letter git's own `diff-tree` reports (`A`, `M`,
+    /// `D`, `R` with the similarity score, `T` for a type change) beside
+    /// the path as the reader will see it. Renames report the new path —
+    /// the name the worktree holds now — with the old one folded into the
+    /// status letter's score, because a verb aims at what exists.
+    ///
+    /// `git diff-tree --no-commit-id --name-status -r -z`, so raw-byte
+    /// paths survive whole and empty commits answer empty rather than
+    /// erroring: a commit that changed nothing has no files, which is a
+    /// fact and not a failure. `-M` so a rename reports once, under its
+    /// new name, rather than as a delete plus an add that no verb could
+    /// aim at together. The sha rides argv as bytes and passes
+    /// [`refuse_dashes`] first, like every other rev that travels there.
+    fn commit_files(&self, _sha: &[u8]) -> Result<Vec<(char, Vec<u8>)>> {
+        Err(unserved("a commit's files"))
+    }
+
     /// The blob OID the index holds for one path — the stage-0 entry — or
     /// `None` when the index has no entry under that name. The write-time
     /// half of partial staging's staleness contract: a patch is built
@@ -853,6 +887,22 @@ pub trait Repo: Send + Sync {
     /// guard arrives when the ahead/behind read can be asked honestly.
     fn amend(&self, _message: &str) -> Result<String> {
         Err(unserved("amending"))
+    }
+
+    /// Rewrites HEAD keeping tree, message, author and date exactly as
+    /// they are — `git commit --amend --no-edit -q` — returning the
+    /// replacement commit's OID.
+    ///
+    /// The verb a graft ends with: the worktree was already aimed at the
+    /// commit being rewritten (detached), the patch applied and staged, so
+    /// what remains is to fold it in without touching a word of the
+    /// message. `--no-edit` is load-bearing — without it git opens an
+    /// editor, or with one configured silently rewords — and there is no
+    /// `--only` here because the staged patch is exactly what must land.
+    /// An unborn branch is refused before any process runs, like
+    /// [`amend`](Self::amend)'s own guard.
+    fn amend_no_edit(&self) -> Result<String> {
+        Err(unserved("amending without rewording"))
     }
 
     /// Resets HEAD's author to the current user —
@@ -2018,6 +2068,51 @@ impl Repo for Binary {
         )
     }
 
+    fn apply_patch(&self, patch: &[u8]) -> Result<()> {
+        if patch.is_empty() {
+            return Err("an empty patch applies nothing".into());
+        }
+        run_stdin(&self.root, &[b"apply", b"--whitespace=nowarn", b"-"], patch)
+    }
+
+    fn commit_files(&self, sha: &[u8]) -> Result<Vec<(char, Vec<u8>)>> {
+        refuse_dashes(sha)?;
+        let out = run_bytes(
+            &self.root,
+            &[
+                b"diff-tree",
+                b"--no-commit-id",
+                b"--name-status",
+                b"-r",
+                b"-M",
+                b"-z",
+                sha,
+            ],
+        )?;
+        // `-z` NUL-separates every field: a status letter, then its paths
+        // — one path, or two when the letter is a rename (`R100`, old,
+        // new). Bytes throughout, because a path is not text until drawn.
+        let mut fields = out.split(|b| *b == 0);
+        let mut files = Vec::new();
+        while let Some(status) = fields.next() {
+            if status.is_empty() {
+                continue;
+            }
+            let letter = status[0] as char;
+            let first = fields.next().unwrap_or_default();
+            let path = if letter == 'R' {
+                fields.next().unwrap_or_default()
+            } else {
+                first
+            };
+            if path.is_empty() {
+                continue;
+            }
+            files.push((letter, path.to_vec()));
+        }
+        Ok(files)
+    }
+
     fn index_blob_oid(&self, path: &[u8]) -> Result<Option<String>> {
         tree_blob_oid(&self.root, b":0", path)
     }
@@ -2220,6 +2315,16 @@ impl Repo for Binary {
             return Err("nothing to amend: this branch has no commits yet".into());
         }
         self.commit_via(&[b"commit", b"--amend", b"-q", b"--file=-"], message)
+    }
+
+    fn amend_no_edit(&self) -> Result<String> {
+        if let HeadState::Branch { commit: None, .. } = self.head()? {
+            return Err("nothing to amend: this branch has no commits yet".into());
+        }
+        run_bytes(&self.root, &[b"commit", b"--amend", b"--no-edit", b"-q"])
+            .map_err(|e| format!("git commit --amend --no-edit: {e}"))?;
+        let sha = run(&self.root, &["rev-parse", "HEAD"])?;
+        Ok(lossy(trimmed(&sha)))
     }
 
     fn reset_author(&self) -> Result<()> {
@@ -8837,15 +8942,156 @@ mod tests {
                     .push([b"d".to_vec(), p.to_vec()].concat());
                 Ok(())
             }
+            fn apply_patch(&self, p: &[u8]) -> Result<()> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push([b"a".to_vec(), p.to_vec()].concat());
+                Ok(())
+            }
         }
         let patches = Arc::new(Patches(Mutex::new(Vec::new())));
         let g: Handle = Arc::clone(&patches) as Handle;
         g.discard_patch(b"-- hunk\n").expect("discard reaches");
+        g.apply_patch(b"++ hunk\n").expect("apply reaches");
         assert_eq!(
             *patches.0.lock().unwrap(),
-            vec![b"d-- hunk\n".to_vec()],
+            vec![b"d-- hunk\n".to_vec(), b"a++ hunk\n".to_vec()],
             "the bytes arrived whole"
         );
+    }
+
+    #[test]
+    fn an_apply_patch_writes_into_the_worktree_and_leaves_the_index() {
+        let r = Scratch::new("patch-apply-worktree");
+        r.write("f.txt", b"old\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+
+        let g = r.open();
+        let patch =
+            b"diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-old\n+new\n";
+        g.apply_patch(patch).expect("applies onto the worktree");
+
+        let now = std::fs::read(join_raw(&r.0, b"f.txt")).unwrap();
+        assert_eq!(now, b"new\n", "the worktree took the patch");
+        let porcelain = String::from_utf8_lossy(
+            &r.cmd(&["status".into(), "--porcelain".into()])
+                .output()
+                .expect("status")
+                .stdout,
+        )
+        .into_owned();
+        assert_eq!(porcelain, " M f.txt\n", "the index stood still");
+
+        let err = g.apply_patch(patch).expect_err("a second apply refuses");
+        assert!(
+            err.contains("patch failed") || err.contains("does not apply"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn commit_files_names_what_a_commit_touched() {
+        let r = Scratch::new("commit-files");
+        r.write("keep.txt", b"keep\n");
+        r.write("chg.txt", b"before\n");
+        r.write("del.txt", b"gone\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "init"]);
+        r.write("chg.txt", b"after\n");
+        r.git(&["rm", "-q", "del.txt"]);
+        r.write("new.txt", b"new\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "second"]);
+
+        let g = r.open();
+        let named = |files: Vec<(char, Vec<u8>)>| {
+            files
+                .into_iter()
+                .map(|(s, p)| (s, String::from_utf8(p).unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let second = named(
+            g.commit_files(r.rev_parse("HEAD").as_bytes())
+                .expect("lists the second commit"),
+        );
+        assert!(
+            second.contains(&('M', "chg.txt".to_string())),
+            "modified: {second:?}"
+        );
+        assert!(
+            second.contains(&('D', "del.txt".to_string())),
+            "deleted: {second:?}"
+        );
+        assert!(
+            second.contains(&('A', "new.txt".to_string())),
+            "added: {second:?}"
+        );
+        assert!(
+            !second.iter().any(|(_, p)| p == "keep.txt"),
+            "untouched stays out: {second:?}"
+        );
+
+        r.git(&["mv", "new.txt", "renamed.txt"]);
+        r.git(&["commit", "-qm", "rename"]);
+        let renamed = named(
+            g.commit_files(r.rev_parse("HEAD").as_bytes())
+                .expect("lists the rename"),
+        );
+        assert_eq!(
+            renamed,
+            vec![('R', "renamed.txt".to_string())],
+            "a rename reports the new path: {renamed:?}"
+        );
+
+        r.git(&["commit", "-q", "--allow-empty", "-m", "empty"]);
+        let empty = g
+            .commit_files(r.rev_parse("HEAD").as_bytes())
+            .expect("an empty commit lists");
+        assert!(empty.is_empty(), "nothing touched is empty, not an error");
+    }
+
+    #[test]
+    fn amend_no_edit_folds_staged_work_keeping_everything_else() {
+        let r = Scratch::new("amend-no-edit");
+        r.write("f.txt", b"one\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "first"]);
+        let before = r.rev_parse("HEAD");
+        let author = |r: &Scratch| {
+            String::from_utf8(r.git_os_out(&[
+                "log".into(),
+                "-1".into(),
+                "--format=%an <%ae>".into(),
+            ]))
+            .unwrap()
+        };
+        let message = |r: &Scratch| {
+            String::from_utf8(r.git_os_out(&["log".into(), "-1".into(), "--format=%B".into()]))
+                .unwrap()
+        };
+        let author_before = author(&r);
+        let message_before = message(&r);
+
+        r.write("f.txt", b"one\ntwo\n");
+        r.git(&["add", "f.txt"]);
+        let g = r.open();
+        let after = g.amend_no_edit().expect("amends without rewording");
+        assert_ne!(before, after, "the replacement is a new commit");
+        assert_eq!(r.rev_parse("HEAD"), after, "HEAD moved onto it");
+        assert_eq!(message(&r), message_before, "the message stands");
+        assert_eq!(author(&r), author_before, "the author stands");
+        let now = std::fs::read(join_raw(&r.0, b"f.txt")).unwrap();
+        assert_eq!(now, b"one\ntwo\n", "the staged work landed");
+        let porcelain = String::from_utf8_lossy(
+            &r.cmd(&["status".into(), "--porcelain".into()])
+                .output()
+                .expect("status")
+                .stdout,
+        )
+        .into_owned();
+        assert!(porcelain.is_empty(), "amending cleaned the index");
     }
 
     #[test]
