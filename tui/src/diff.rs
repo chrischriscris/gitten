@@ -43,6 +43,7 @@ use crate::scrollbar::{self, Bar};
 use gitten_core::host::Host;
 use gitten_core::rows::{expand, RowRef};
 use gitten_core::runs::Run;
+use gitten_core::search::TextIndex;
 use gitten_core::select::{self, Caret, RowId, Selection, Text as _};
 use gitten_core::view::Viewport;
 use gitten_core::FileDiff;
@@ -101,6 +102,24 @@ pub struct Diff {
     /// belongs to nothing does not extend a selection made minutes ago.
     dragging: bool,
     bar: Bar,
+    /// The standing search's query, kept across the reflows and layout
+    /// changes it survives — `None` when no search stands.
+    search_query: Option<String>,
+    /// The folded row texts the standing query scans, and the matches it
+    /// found. Built on the first use against the rows as they stand, and
+    /// dropped — never recomputed eagerly — whenever the rows change under
+    /// it: a layout change has no row correspondence, and a reflow moves
+    /// every break. The next keystroke against the standing query refolds
+    /// from the rows then current, which is the honest answer for a search
+    /// of text that is no longer the text it matched.
+    search: Option<Search>,
+}
+
+/// One standing search over the rows: the query, the fold, the matches.
+struct Search {
+    folded: TextIndex,
+    /// Rows (of `order`) whose text matches the query, ascending.
+    matches: Vec<usize>,
 }
 
 /// Where every row's selectable text comes from, for [`gitten_core::select`].
@@ -159,6 +178,8 @@ impl Diff {
             sel: None,
             dragging: false,
             bar: Bar::default(),
+            search_query: None,
+            search: None,
         };
         view.rebuild(host, 0.0);
         view
@@ -187,6 +208,8 @@ impl Diff {
         // The width has to be re-applied: the presentations are new objects and
         // have never been told how wide they are.
         self.applied = (usize::MAX, "");
+        // New rows: the fold is stale, and nothing here refolds eagerly.
+        self.search = None;
         self.view.set_len(self.order.len());
         self.view.go_to_fraction(at);
         self.reflow(host);
@@ -235,6 +258,9 @@ impl Diff {
         self.order = built.order;
         self.widest = built.widest;
         self.index_headers();
+        // The rows moved under any standing search: the fold is stale, and
+        // the query is kept — the next keystroke refolds from what stands.
+        self.search = None;
         self.view.set_len(self.order.len());
         self.view.go_to(built.anchor);
         // Every caret caches the visual rows its line occupies, and a reflow
@@ -361,6 +387,146 @@ impl Diff {
     /// picker lists.
     pub fn headers(&self) -> &[usize] {
         &self.headers
+    }
+
+    // ----------------------------------------------------------------- search
+
+    /// The standing search, for pre-filling a second `/`.
+    pub fn search_query(&self) -> Option<&str> {
+        self.search_query.as_deref()
+    }
+
+    /// Whether there are rows with text to search at all. An empty pane has
+    /// none, and neither has a presentation that draws no text — a search
+    /// over it would be a search of nothing, and says so.
+    pub fn has_search_text(&self) -> bool {
+        self.order.iter().any(|r| {
+            let rows = match self.owners.get(r.owner as usize) {
+                Some(rows) => rows,
+                None => return false,
+            };
+            (0..2).any(|part| rows.selectable(r.index as usize, part).is_some())
+        })
+    }
+
+    /// The query changed — live, once per keystroke. Folds the rows on the
+    /// first use (never per frame, never per keystroke more than once),
+    /// rematches, and puts the keyboard on the first match at or after the
+    /// cursor, wrapping: the eye is on the row it matches, not on a count.
+    pub fn search_edit(&mut self, query: &str) {
+        let query = query.trim().to_string();
+        self.search_query = (!query.is_empty()).then_some(query);
+        if self.search_query.is_some() {
+            self.ensure_fold();
+            self.rematch();
+            self.jump_to_match(1);
+        } else {
+            self.search = None;
+        }
+    }
+
+    /// `search.next` / `search.prev`: the next match after — or before — the
+    /// keyboard, wrapping. No standing query, or no matches: nothing, and
+    /// the status line says what stands.
+    pub fn search_next(&mut self, by: isize) {
+        if self.search_query.is_some() {
+            self.ensure_fold();
+            self.rematch();
+            self.jump_to_match(by);
+        }
+    }
+
+    /// Takes the search off — the one door `search.clear` opens. The cursor
+    /// stays where the search left it.
+    pub fn search_clear(&mut self) {
+        self.search_query = None;
+        self.search = None;
+    }
+
+    /// What the search found, for the status row while one stands: the
+    /// ordinal of the match the keyboard is on over the count, or the bare
+    /// count when the keyboard is not on a match — and `no matches` when
+    /// there are none. Honest about all three.
+    pub fn match_note(&self) -> Option<String> {
+        let search = self.search.as_ref()?;
+        if search.matches.is_empty() {
+            return Some("no matches".into());
+        }
+        let cursor = self.view.cursor();
+        match search.matches.iter().position(|&m| m == cursor) {
+            Some(i) => Some(format!("{}/{}", i + 1, search.matches.len())),
+            None => Some(format!("{} matches", search.matches.len())),
+        }
+    }
+
+    /// Folds the rows' texts, once — the standing search's whole index. One
+    /// walk of `order`, the texts borrowed and lowercased into the fold; the
+    /// rows themselves are never copied.
+    fn ensure_fold(&mut self) {
+        if self.search.is_some() {
+            return;
+        }
+        let folded = TextIndex::new(self.order.iter().map(|r| {
+            let rows = &self.owners[r.owner as usize];
+            let mut text = String::new();
+            for part in 0..2 {
+                if let Some(t) = rows.selectable(r.index as usize, part) {
+                    if !text.is_empty() {
+                        text.push(' ');
+                    }
+                    text.push_str(t);
+                }
+            }
+            text
+        }));
+        self.search = Some(Search {
+            folded,
+            matches: Vec::new(),
+        });
+    }
+
+    /// Rebuilds the match table against the fold and the standing query.
+    fn rematch(&mut self) {
+        let Some(query) = self.search_query.as_ref() else {
+            return;
+        };
+        if let Some(search) = self.search.as_mut() {
+            search.matches = search.folded.indices(query);
+        }
+    }
+
+    /// Puts the keyboard on the next match in `by`'s direction, wrapping —
+    /// strictly beyond the cursor, so `n` from a match lands on the next
+    /// one, and one match alone stays put.
+    fn jump_to_match(&mut self, by: isize) {
+        let Some(target) = self.match_after(by) else {
+            return;
+        };
+        self.view.go_to(target);
+    }
+
+    /// The row [`Diff::jump_to_match`] lands on.
+    fn match_after(&self, by: isize) -> Option<usize> {
+        let search = self.search.as_ref()?;
+        if search.matches.is_empty() {
+            return None;
+        }
+        let cursor = self.view.cursor() as isize;
+        Some(match by.is_negative() {
+            false => search
+                .matches
+                .iter()
+                .find(|&&m| m as isize > cursor)
+                .copied()
+                .unwrap_or(search.matches[0]),
+            true => search
+                .matches
+                .iter()
+                .rev()
+                .find(|&&m| (m as isize) < cursor)
+                .copied()
+                .unwrap_or(*search.matches.last().unwrap()),
+        })
     }
 
     /// Scrolls sideways. A no-op with wrapping on, where nothing is off the edge.
@@ -812,6 +978,12 @@ impl Diff {
         {
             out.push_str(" · ");
             out.push_str(&report);
+        }
+        // A standing search says where the keyboard is among its matches —
+        // the same sentence the prompt carried, outliving it.
+        if let Some(note) = self.match_note() {
+            out.push_str(" · ");
+            out.push_str(&note);
         }
         out
     }

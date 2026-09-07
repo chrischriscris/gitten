@@ -72,6 +72,52 @@ impl Index {
     }
 }
 
+/// A plain list of folded texts, for lists whose rows are not commits.
+///
+/// The commit [`Index`] folds three named fields because a commit is three
+/// named fields; a file's path, a branch's label and a stash's message are
+/// one text each, and the honest fold for them is this: the list's own
+/// display texts, lowercased once, substring per keystroke. The trim,
+/// empty-means-every and fold rules are the commit index's, so a query
+/// means the same thing in every pane.
+#[derive(Debug, Clone)]
+pub struct TextIndex {
+    rows: Vec<String>,
+}
+
+impl TextIndex {
+    /// Folds every row's text. Once per data load, never per keystroke.
+    pub fn new<I, S>(texts: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        Self {
+            rows: texts
+                .into_iter()
+                .map(|s| s.as_ref().to_lowercase())
+                .collect(),
+        }
+    }
+
+    /// Indices into the indexed list whose folded text contains `query` —
+    /// ascending and complete, the caller's visible table. An empty (or
+    /// whitespace-only) query is every row.
+    pub fn indices(&self, query: &str) -> Vec<usize> {
+        let needle = query.trim().to_lowercase();
+        if needle.is_empty() {
+            return Vec::from_iter(0..self.rows.len());
+        }
+        Vec::from_iter(
+            self.rows
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| t.contains(&needle))
+                .map(|(i, _)| i),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Index;
@@ -142,5 +188,26 @@ mod tests {
         let index = Index::new(&commits());
         assert!(index.indices("nothing matches this").is_empty());
         assert_eq!(index.indices("e"), vec![0, 1, 2, 3], "ascending, complete");
+    }
+}
+
+#[cfg(test)]
+mod text_tests {
+    use super::TextIndex;
+
+    #[test]
+    fn the_text_index_shares_the_commit_indexs_query_rules() {
+        let index = TextIndex::new(["src/main.rs", "docs/README.md", "Émile/src/lib.rs"]);
+        assert_eq!(index.indices("readme"), [1]);
+        assert_eq!(
+            index.indices("SRC"),
+            [0, 2],
+            "a needle matches every text holding it"
+        );
+        assert_eq!(index.indices("émile"), [2]);
+        // An empty — or whitespace-only — query is every row.
+        assert_eq!(index.indices("").len(), 3);
+        assert_eq!(index.indices("   ").len(), 3);
+        assert!(index.indices("nothing").is_empty());
     }
 }

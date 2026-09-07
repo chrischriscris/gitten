@@ -24,6 +24,7 @@ use crate::screen::{width, Ink, Pen, Screen};
 use crate::scrollbar::{self, Bar};
 use gitten_core::host::Host;
 use gitten_core::refs::{Branch, HeadState, RefName, RemoteBranch, Upstream};
+use gitten_core::search::TextIndex;
 use gitten_core::theme::Rgb;
 use gitten_core::view::Viewport;
 
@@ -307,6 +308,19 @@ fn selectable(row: Option<&Row>) -> bool {
 /// confirms is a row of this list.
 pub struct Branches {
     rows: Vec<Row>,
+    /// Every row's search text, folded once at load — headings fold to the
+    /// empty text, so a non-empty query can never name one. See
+    /// [`gitten_core::search::TextIndex`].
+    search: TextIndex,
+    /// The standing query, `None` when the list is whole — always the
+    /// *trimmed* text, the same normalization the commit list applies.
+    query: Option<String>,
+    /// Which source rows the viewport can see, ascending — the one
+    /// visible-to-source table every row reader goes through. Unfiltered it
+    /// is `0..len`; filtered it is what [`TextIndex::indices`] answered,
+    /// which is ref rows only: a heading never matches, and a filtered ref
+    /// list is a flat list.
+    visible: Vec<usize>,
     /// The cursor, the top row and the height — [`Viewport`], the same model
     /// every other list holds.
     view: Viewport,
@@ -348,15 +362,20 @@ impl Branches {
             view.go_to(first);
         }
         let total = rows.iter().filter(|r| selectable(Some(r))).count();
-        Self {
+        let mut this = Self {
             rows,
+            search: TextIndex::new(Vec::<String>::new()),
+            query: None,
+            visible: Vec::new(),
             view,
             cols: 0,
             bar: Bar::default(),
             marks,
             armed: None,
             total,
-        }
+        };
+        this.reindex();
+        this
     }
 
     /// How many columns the pane draws into, and how many rows it shows.
@@ -389,7 +408,105 @@ impl Branches {
     /// from `from`, in the direction it was travelling. Called after every
     /// cursor move and every refresh, so the cursor never rests on a heading.
     fn settle(&mut self, from: usize) {
-        self.view.settle(from, |i| selectable(self.rows.get(i)));
+        self.view.settle(from, |i| {
+            self.visible
+                .get(i)
+                .is_some_and(|&r| selectable(self.rows.get(r)))
+        });
+    }
+
+    /// The row the viewport names, through the visible table — the cursor is
+    /// a row of the *filtered* list, and only the final lookup names a row of
+    /// the source.
+    fn row_at(&self, visual: usize) -> Option<&Row> {
+        self.rows.get(*self.visible.get(visual)?)
+    }
+
+    /// Rebuilds the folded search texts against the rows as they stand. A
+    /// row's text is its display form — the name a person reads, which is
+    /// what a query is about; the raw bytes stay the verbs' business.
+    fn reindex(&mut self) {
+        self.search = TextIndex::new(self.rows.iter().map(|r| match r {
+            Row::Local(l) => l.text.clone(),
+            Row::Remote(remote) => remote.label.clone(),
+            Row::Detached { text, .. } => text.clone(),
+            Row::Heading { .. } => String::new(),
+        }));
+        self.refilter();
+    }
+
+    /// Rebuilds the visible table against the standing query and re-clamps
+    /// the viewport. `apply_query` and `reindex` land here.
+    fn refilter(&mut self) {
+        self.visible = match &self.query {
+            Some(q) => self.search.indices(q),
+            None => Vec::from_iter(0..self.rows.len()),
+        };
+        self.view.set_len(self.visible.len());
+    }
+
+    // ----------------------------------------------------------------- search
+
+    /// The live query, for pre-filling a second `/`. `None` when unfiltered.
+    pub fn query(&self) -> Option<&str> {
+        self.query.as_deref()
+    }
+
+    /// The filter while one stands, for a status line: `15/30` — hits over
+    /// refs. `None` unfiltered.
+    pub fn filter_note(&self) -> Option<String> {
+        self.query
+            .is_some()
+            .then(|| format!("{}/{}", self.visible.len(), self.total))
+    }
+
+    /// Sets the filter — once per keystroke, and never anywhere else. The
+    /// keyboard stays on the ref it was on: anchored by the target verbs aim
+    /// at into the next result set wherever it survives the narrower query,
+    /// and clamped when it does not. An empty (or whitespace-only) query is
+    /// no query, so clearing restores the whole list; the same trimmed query
+    /// twice rebuilds nothing.
+    ///
+    /// An armed delete dies with a result set that changed, like any other
+    /// refresh: the question was about a row of yesterday's list.
+    pub fn apply_query(&mut self, query: &str) {
+        let next = Some(query.trim()).filter(|q| !q.is_empty());
+        if self.query.as_deref() == next {
+            return;
+        }
+        let anchored = self.row_at(self.view.cursor()).and_then(row_target);
+        self.query = next.map(str::to_string);
+        self.refilter();
+        self.armed = None;
+        let cursor = anchored
+            .and_then(|target| {
+                self.visible.iter().position(|&r| {
+                    self.rows
+                        .get(r)
+                        .is_some_and(|row| row_targets(row, &target))
+                })
+            })
+            .unwrap_or_else(|| self.view.cursor());
+        self.view.go_to(cursor);
+    }
+
+    /// The next — or previous — row of the visible list, wrapping. With a
+    /// filter standing the visible list *is* the matches, so this is what
+    /// iterating them is; with none standing it says so by doing nothing.
+    pub fn next_match(&mut self, by: isize) {
+        if self.query.is_none() || self.visible.is_empty() {
+            return;
+        }
+        let len = self.visible.len() as isize;
+        let at = (self.view.cursor() as isize + by).rem_euclid(len) as usize;
+        self.armed = None;
+        self.view.go_to(at);
+    }
+
+    /// Takes the filter off. The one door `search.clear` opens, so a search
+    /// that is cancelled restores the list it filtered.
+    pub fn clear_search(&mut self) {
+        self.apply_query("");
     }
 
     /// Swaps in refreshed rows, keeping the keyboard on its branch.
@@ -411,17 +528,24 @@ impl Branches {
         };
         self.rows = rows;
         self.total = self.rows.iter().filter(|r| selectable(Some(r))).count();
+        // The folded search texts and the visible table were built against
+        // the rows the pane held; a refresh may have added branches under a
+        // standing filter, and both are rebuilt with the list.
+        self.reindex();
         // The old scroll position first, then the anchor: `go_to` drags the
         // viewport after the cursor, and the surviving branch's row must be
         // the one on screen when it survives.
-        let mut view = old;
-        view.set_len(self.rows.len());
-        view.scroll_to(old.top());
+        self.view.scroll_to(old.top());
         let cursor = anchored
-            .and_then(|target| self.rows.iter().position(|r| row_targets(r, &target)))
-            .unwrap_or_else(|| old.cursor().min(self.rows.len().saturating_sub(1)));
-        view.go_to(cursor);
-        self.view = view;
+            .and_then(|target| {
+                self.visible.iter().position(|&r| {
+                    self.rows
+                        .get(r)
+                        .is_some_and(|row| row_targets(row, &target))
+                })
+            })
+            .unwrap_or_else(|| old.cursor().min(self.visible.len().saturating_sub(1)));
+        self.view.go_to(cursor);
         // A vanished anchor can leave the cursor on whatever heading took its
         // row; the direction is "where it was", so it walks on to the next
         // selectable row rather than back to the previous group's last.
@@ -433,10 +557,7 @@ impl Branches {
     /// What the keyboard is on, as verbs aim at it. `None` on an empty pane —
     /// and on a heading, which the cursor never rests on.
     pub fn current(&self) -> Option<Target> {
-        match self.rows.get(self.view.cursor()) {
-            Some(r) => row_target(r),
-            None => None,
-        }
+        row_target(self.row_at(self.view.cursor())?)
     }
 
     /// Arms — or confirms — a delete of this exact target. The first call on
@@ -519,7 +640,7 @@ impl Branches {
 
     pub fn to_bottom(&mut self) {
         self.view.to_bottom();
-        self.settle(self.rows.len().saturating_sub(1));
+        self.settle(self.visible.len().saturating_sub(1));
         self.armed = None;
     }
 
@@ -580,13 +701,13 @@ impl Branches {
         if self.total == 0 {
             return "no branches".into();
         }
-        let at = match self.rows.get(self.view.cursor()) {
+        let at = match self.row_at(self.view.cursor()) {
             Some(Row::Detached { n, .. }) => *n,
             Some(Row::Local(l)) => l.n,
             Some(Row::Remote(r)) => r.n,
             _ => 0,
         };
-        let named = match self.rows.get(self.view.cursor()) {
+        let named = match self.row_at(self.view.cursor()) {
             Some(Row::Detached { text, .. }) => text.clone(),
             Some(Row::Local(l)) => l.text.clone(),
             Some(Row::Remote(r)) => r.label.clone(),
@@ -626,7 +747,12 @@ impl Branches {
         let armed = self.armed_index();
         for i in 0..self.view.height() {
             let row = y + i;
-            let Some(index) = self.view.row_at(i) else {
+            let Some(index) = self
+                .view
+                .row_at(i)
+                .and_then(|v| self.visible.get(v))
+                .copied()
+            else {
                 screen.span(row, x, self.cols).wash(plain);
                 continue;
             };

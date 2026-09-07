@@ -26,6 +26,7 @@ use crate::screen::{Ink, Screen};
 use crate::scrollbar::{self, Bar};
 use gitten_core::host::Host;
 use gitten_core::refs::Stash;
+use gitten_core::search::TextIndex;
 use gitten_core::view::Viewport;
 
 /// One flat row of the pane: one entry of the stack, flattened once per
@@ -65,6 +66,17 @@ pub fn drop_question(index: usize) -> String {
 /// [`crate::commits::Commits`] and for the same reason.
 pub struct Stashes {
     rows: Vec<Row>,
+    /// Every row's search text, folded once at load — the message a person
+    /// reads, plus the address git spells. See
+    /// [`gitten_core::search::TextIndex`].
+    search: TextIndex,
+    /// The standing query, `None` when the list is whole — always the
+    /// *trimmed* text, the same normalization the commit list applies.
+    query: Option<String>,
+    /// Which source rows the viewport can see, ascending — the one
+    /// visible-to-source table every row reader goes through. Unfiltered it
+    /// is `0..len`; filtered it is what [`TextIndex::indices`] answered.
+    visible: Vec<usize>,
     /// Whether the stack behind these rows was read at all. `false` after a
     /// failed ancillary read: the pane opens anyway — a failed side read
     /// must not abort a launch the main view made good — but it draws as
@@ -92,15 +104,20 @@ impl Stashes {
     pub fn new(stashes: Vec<Stash>) -> Self {
         let mut view = Viewport::new();
         view.set_len(stashes.len());
-        Self {
+        let mut this = Self {
             rows: flatten(&stashes),
+            search: TextIndex::new(Vec::<String>::new()),
+            query: None,
+            visible: Vec::new(),
             available: true,
             view,
             cols: 0,
             bar: Bar::default(),
             armed: None,
             dragging: false,
-        }
+        };
+        this.reindex();
+        this
     }
 
     /// The pane after a failed read: honest emptiness that is *not* the
@@ -109,6 +126,9 @@ impl Stashes {
     pub fn unavailable() -> Self {
         Self {
             rows: Vec::new(),
+            search: TextIndex::new(Vec::<String>::new()),
+            query: None,
+            visible: Vec::new(),
             available: false,
             view: Viewport::new(),
             cols: 0,
@@ -116,6 +136,94 @@ impl Stashes {
             armed: None,
             dragging: false,
         }
+    }
+
+    /// The row the viewport names, through the visible table — the cursor is
+    /// a row of the *filtered* list, and only the final lookup names a row of
+    /// the source.
+    fn row_at(&self, visual: usize) -> Option<&Row> {
+        self.rows.get(*self.visible.get(visual)?)
+    }
+
+    /// Rebuilds the folded search texts against the rows as they stand.
+    fn reindex(&mut self) {
+        self.search = TextIndex::new(
+            self.rows
+                .iter()
+                .map(|r| format!("{} {}", r.title, r.message)),
+        );
+        self.refilter();
+    }
+
+    /// Rebuilds the visible table against the standing query and re-clamps
+    /// the viewport. `apply_query` and `reindex` land here.
+    fn refilter(&mut self) {
+        self.visible = match &self.query {
+            Some(q) => self.search.indices(q),
+            None => Vec::from_iter(0..self.rows.len()),
+        };
+        self.view.set_len(self.visible.len());
+    }
+
+    // ----------------------------------------------------------------- search
+
+    /// The live query, for pre-filling a second `/`. `None` when unfiltered.
+    pub fn query(&self) -> Option<&str> {
+        self.query.as_deref()
+    }
+
+    /// The filter while one stands, for a status line: `2/5` — hits over
+    /// parked. `None` unfiltered.
+    pub fn filter_note(&self) -> Option<String> {
+        self.query
+            .is_some()
+            .then(|| format!("{}/{}", self.visible.len(), self.rows.len()))
+    }
+
+    /// Sets the filter — once per keystroke, and never anywhere else. The
+    /// keyboard stays on its entry: anchored by the commit under it — the
+    /// identity that survives a drop's renumbering — into the next result
+    /// set wherever it survives the narrower query, and clamped when it does
+    /// not. An empty (or whitespace-only) query is no query, so clearing
+    /// restores the whole stack; the same trimmed query twice rebuilds
+    /// nothing. An armed drop dies with a result set that changed, like any
+    /// other refresh: the question was about a row of yesterday's list.
+    pub fn apply_query(&mut self, query: &str) {
+        let next = Some(query.trim()).filter(|q| !q.is_empty());
+        if self.query.as_deref() == next {
+            return;
+        }
+        let anchored = self.row_at(self.view.cursor()).map(|r| r.commit.clone());
+        self.query = next.map(str::to_string);
+        self.refilter();
+        self.armed = None;
+        let cursor = anchored
+            .and_then(|c| {
+                self.visible
+                    .iter()
+                    .position(|&r| self.rows.get(r).is_some_and(|row| row.commit == c))
+            })
+            .unwrap_or_else(|| self.view.cursor());
+        self.view.go_to(cursor);
+    }
+
+    /// The next — or previous — row of the visible list, wrapping. With a
+    /// filter standing the visible list *is* the matches, so this is what
+    /// iterating them is; with none standing it says so by doing nothing.
+    pub fn next_match(&mut self, by: isize) {
+        if self.query.is_none() || self.visible.is_empty() {
+            return;
+        }
+        let len = self.visible.len() as isize;
+        let at = (self.view.cursor() as isize + by).rem_euclid(len) as usize;
+        self.armed = None;
+        self.view.go_to(at);
+    }
+
+    /// Takes the filter off. The one door `search.clear` opens, so a search
+    /// that is cancelled restores the list it filtered.
+    pub fn clear_search(&mut self) {
+        self.apply_query("");
     }
 
     /// Swaps in a refreshed stack, keeping the keyboard on its entry.
@@ -137,14 +245,21 @@ impl Stashes {
         let (cursor, top) = (self.view.cursor(), self.view.top());
         let anchored = self.rows.get(cursor).map(|r| r.commit.clone());
         self.rows = flatten(&stashes);
+        // The folded search texts and the visible table were built against
+        // the stack the pane held; a refresh may have added entries under a
+        // standing filter, and both are rebuilt with the list.
+        self.reindex();
         // The old scroll position first, then the anchor: `go_to` drags the
         // viewport after the cursor, and the surviving commit's row must be
         // the one on screen when it survives.
-        self.view.set_len(self.rows.len());
         self.view.scroll_to(top);
         let at = anchored
-            .and_then(|c| self.rows.iter().position(|r| r.commit == c))
-            .unwrap_or_else(|| cursor.min(self.rows.len().saturating_sub(1)));
+            .and_then(|c| {
+                self.visible
+                    .iter()
+                    .position(|&r| self.rows.get(r).is_some_and(|row| row.commit == c))
+            })
+            .unwrap_or_else(|| cursor.min(self.visible.len().saturating_sub(1)));
         self.view.go_to(at);
     }
 
@@ -168,6 +283,13 @@ impl Stashes {
     /// The row the keyboard is on, as the verbs address it: the stack index,
     /// the `n` of `stash@{n}`. `None` on an empty stack — and on an
     /// unavailable one, which exposes no row to act on at all.
+    pub fn current(&self) -> Option<usize> {
+        if !self.available {
+            return None;
+        }
+        self.row_at(self.view.cursor()).map(|r| r.index)
+    }
+
     /// The entry the keyboard is on, as its two identities: the place on
     /// the stack the verbs address, and the commit that survives a drop —
     /// what a preview of this entry is anchored by.
@@ -187,13 +309,6 @@ impl Stashes {
             .iter()
             .find(|row| row.commit == commit)
             .map(|row| row.message.as_str())
-    }
-
-    pub fn current(&self) -> Option<usize> {
-        if !self.available {
-            return None;
-        }
-        self.rows.get(self.view.cursor()).map(|r| r.index)
     }
 
     /// One row down or up. A keyboard move always disarms the drop: the
@@ -290,10 +405,12 @@ impl Stashes {
     /// if one stands, was asked about the row it stood on. Different rows,
     /// no question.
     fn disarm_if_row_moved(&mut self, index: usize) {
-        if self
-            .armed
-            .is_some_and(|a| self.rows.iter().position(|r| r.index == a) != Some(index))
-        {
+        let at = self
+            .visible
+            .get(index)
+            .and_then(|&r| self.rows.get(r))
+            .map(|r| r.index);
+        if self.armed.is_some() && self.armed != at {
             self.armed = None;
         }
     }
@@ -394,7 +511,7 @@ impl Stashes {
                     pen.wash(blank);
                     continue;
                 };
-                let Some(r) = self.rows.get(vis) else {
+                let Some(r) = self.visible.get(vis).and_then(|&r| self.rows.get(r)) else {
                     pen.wash(blank);
                     continue;
                 };
@@ -445,12 +562,12 @@ impl Stashes {
         if self.rows.is_empty() {
             return "0 parked".into();
         }
-        format!(
-            "{}/{} · {}",
-            (self.view.cursor() + 1).min(self.rows.len()),
-            self.rows.len(),
-            self.rows[self.view.cursor().min(self.rows.len() - 1)].title,
-        )
+        let shown = self.visible.len();
+        let at = self
+            .row_at(self.view.cursor())
+            .map(|r| r.title.as_str())
+            .unwrap_or("");
+        format!("{}/{shown} · {at}", (self.view.cursor() + 1).min(shown),)
     }
 }
 

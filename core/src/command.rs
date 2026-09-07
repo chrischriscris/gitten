@@ -474,6 +474,10 @@ impl Keymap {
         bind("diff", "[", "diff.prev-file");
         bind("diff", "tab", "diff.next-file");
         bind("diff", "backtab", "diff.prev-file");
+        // The live query over the diff, on the same key every list answers
+        // to: it walks the keyboard to each match — a filtered diff is not a
+        // diff — and `n`/`N` walk on from there, wrapping.
+        bind("diff", "/", "diff.search");
         // The keyboard acts on the hunk it sits on, on lazygit's staging key:
         // space sends the hunk to the index, `u` brings it back (one less
         // finger than a shifted key, and nothing else claims it here — the
@@ -547,11 +551,35 @@ impl Keymap {
         bind("commits", "Z", "commits.cherry-pick-abort");
         bind("commits", "X", "commits.cherry-pick-continue");
 
-        // Text itself belongs to the platform input service. These are the two
-        // transitions around it, kept as named commands so a config file can
-        // move them without teaching a client another keymap.
+        // Text itself belongs to the platform input service. These are the
+        // two transitions around it, kept as named commands so a config file
+        // can move them without teaching a client another keymap.
         bind("input", "enter", "input.accept");
         bind("input", "esc", "input.cancel");
+        // The one key that carries text into a field instead of resolving to
+        // a command: Enter is accept, so a message that grew past one line is
+        // typed through this — lazygit's commit description has no key at all
+        // for it, which is the gap this fills.
+        bind("input", "alt-enter", "input.newline");
+
+        // A standing search's own mode — pushed only while a query stands in
+        // the focused pane, above the pane's bindings, so `n` and `N` mean
+        // next and previous match exactly for as long as there is a match to
+        // walk. That is also the honest answer to the collision with
+        // branches.new and commits.new-branch: with no query standing those
+        // keys are the pane's, as lazygit's panel bindings are; with one
+        // standing, the matches are what the keyboard is for. `esc` clears
+        // the query rather than leaving — a search that eats the way out is
+        // a search that was never cancelled.
+        bind("search", "n", "search.next");
+        bind("search", "N", "search.prev");
+        bind("search", "esc", "search.clear");
+
+        // Marking a range of rows for the next action — lazygit's `v`, which
+        // toggles drag-select. The text-copy selection is a different thing
+        // and keeps its own keys: this marks *rows* for *actions*, and the
+        // first consumer is the commit list.
+        bind("commits", "v", "select.mark");
 
         // The help overlay owns the keyboard for as long as it stands: a client
         // resolves against this mode *alone* while it is up, so a chord that is
@@ -1093,6 +1121,15 @@ impl Commands {
             ("view.bottom", "the last row", None),
             ("view.left", "scroll the text left", None),
             ("view.right", "scroll the text right", None),
+            ("search.next", "the next match", None),
+            ("search.prev", "the previous match", None),
+            ("search.clear", "clear the standing search", None),
+            (
+                "select.mark",
+                "mark or release a range of rows for the next action",
+                Some("mark"),
+            ),
+            ("input.newline", "a line break", None),
             (
                 "diff.next-file",
                 "the next file's header",
@@ -1127,6 +1164,7 @@ impl Commands {
                 Some("diff"),
             ),
             ("commits.search", "search the commits", Some("search")),
+            ("diff.search", "search the diff", Some("search")),
             (
                 "commits.reset-soft",
                 "move this branch here, keeping every change staged",

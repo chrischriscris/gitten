@@ -44,8 +44,9 @@ use gitten_app::verbs::Write;
 use gitten_app::{StartClock, Startup};
 use gitten_core::command::{chord_string, Availability, Code, Key, Modes, Resolve, Usable};
 use gitten_core::differ::Overrides;
+use gitten_core::edit::{Edit, Field};
 use gitten_core::host::Host;
-use gitten_core::refs::RefName;
+use gitten_core::refs::{HeadState, RefName};
 use gitten_core::runs::Run;
 use gitten_core::source::DiffSource;
 use gitten_core::Hunk;
@@ -364,56 +365,80 @@ const INPUT: &str = "input";
 /// `String` that may be longer than the row it draws on — the stored text is
 /// never cut, only the drawing is.
 enum Prompt {
-    /// The commit-list query: every edit filters the list under it live.
-    Search { query: String },
+    /// The live query: every edit filters the list under it — or walks the
+    /// diff to its next match — live. The pane it stands over is held by
+    /// *name*, the way the window holds every pane, so however focus moves
+    /// while it stands the query still lands on the list it was opened over.
+    /// One line by design: a query narrows a list, and a line break in a
+    /// needle is a paste's accident, not a search.
+    Search { pane: String, field: Field },
     /// `files.commit`'s field. Accepting submits [`Write::commit`] with the
-    /// text whole.
-    CommitMessage { text: String },
-    /// `files.amend`'s field — the same field, aimed one step back. Starts
-    /// empty: HEAD's old subject is nothing to prefill a rewrite with.
-    AmendMessage { text: String },
+    /// text whole. Multiline: a commit message is a message, and `alt+enter`
+    /// (or a paste) is how a second line gets in.
+    CommitMessage { field: Field },
+    /// `files.amend`'s field — the same field, aimed one step back. Prefilled
+    /// from HEAD's subject, so an amend is an edit of what is standing rather
+    /// than a retyping of it.
+    AmendMessage { field: Field },
     /// `branches.new`'s field. Reads no row: creating is at HEAD, so it is
     /// available in an empty or unborn repository too. Accepting submits
     /// [`Write::create_branch`] and checks nothing out.
-    BranchNew { text: String },
+    BranchNew { field: Field },
     /// `branches.rename`'s field. `from` is the raw bytes of the branch being
-    /// renamed — what the job is aimed at, whatever the field shows — and
-    /// `selected` says the prefilled name is wholly selected, so the first
-    /// edit replaces it rather than appending to it.
-    BranchRename {
-        from: Vec<u8>,
-        text: String,
-        selected: bool,
-    },
+    /// renamed — what the job is aimed at, whatever the field shows — and the
+    /// field arrives wholly selected, so the first edit replaces it rather
+    /// than appending to it.
+    BranchRename { from: Vec<u8>, field: Field },
     /// `branches.new-tag`'s field. `at` is the raw bytes of the local branch
     /// the tag names — a revspec git resolves, so the tag moves with the
     /// branch — captured at open and never re-read from the pane.
-    TagNew { at: Vec<u8>, text: String },
+    TagNew { at: Vec<u8>, field: Field },
 }
 
 impl Prompt {
-    /// The text the prompt is editing — the accepted value, whole.
-    fn text(&self) -> &str {
+    /// The field the prompt is editing — every edit lands through here,
+    /// whatever the prompt is for.
+    fn field(&self) -> &Field {
         match self {
-            Prompt::Search { query } => query,
-            Prompt::CommitMessage { text }
-            | Prompt::AmendMessage { text }
-            | Prompt::BranchNew { text }
-            | Prompt::BranchRename { text, .. }
-            | Prompt::TagNew { text, .. } => text,
+            Prompt::Search { field, .. }
+            | Prompt::CommitMessage { field }
+            | Prompt::AmendMessage { field }
+            | Prompt::BranchNew { field }
+            | Prompt::BranchRename { field, .. }
+            | Prompt::TagNew { field, .. } => field,
         }
     }
 
-    /// The text the prompt is editing, mutable — every edit lands through
-    /// here, whatever the prompt is for.
-    fn text_mut(&mut self) -> &mut String {
+    /// The field, mutable.
+    fn field_mut(&mut self) -> &mut Field {
         match self {
-            Prompt::Search { query } => query,
-            Prompt::CommitMessage { text }
-            | Prompt::AmendMessage { text }
-            | Prompt::BranchNew { text }
-            | Prompt::BranchRename { text, .. }
-            | Prompt::TagNew { text, .. } => text,
+            Prompt::Search { field, .. }
+            | Prompt::CommitMessage { field }
+            | Prompt::AmendMessage { field }
+            | Prompt::BranchNew { field }
+            | Prompt::BranchRename { field, .. }
+            | Prompt::TagNew { field, .. } => field,
+        }
+    }
+
+    /// Whether this field holds multiline text — a message — or one line, by
+    /// design. A query, a branch name and a tag name are one line: git has no
+    /// newline in them and neither does this prompt. A paste into a one-line
+    /// field is flattened, and the flattening is the field's own documented
+    /// answer, said here and not per keystroke.
+    fn multiline(&self) -> bool {
+        matches!(
+            self,
+            Prompt::CommitMessage { .. } | Prompt::AmendMessage { .. }
+        )
+    }
+
+    /// The pane a search prompt stands over — its edits route there by name,
+    /// not by focus.
+    fn pane(&self) -> &str {
+        match self {
+            Prompt::Search { pane, .. } => pane,
+            _ => "",
         }
     }
 
@@ -817,15 +842,29 @@ impl Screens {
         }
     }
 
-    /// The live filter count, while a search prompt stands over a list. A diff
-    /// has nothing to count, and a note is only drawn when there is one.
-    fn filter_note(&self) -> Option<String> {
+    /// The live filter count, while a search prompt stands over a list; on
+    /// the diff, what the standing search found. A note is only drawn when
+    /// there is one.
+    fn search_note(&self) -> Option<String> {
         match self {
             Screens::Commits { view: c, .. } => c.filter_note(),
-            Screens::Diff { .. }
-            | Screens::Stashes { .. }
-            | Screens::Files { .. }
-            | Screens::Branches { .. } => None,
+            Screens::Files { view: f, .. } => f.filter_note(),
+            Screens::Branches { view: b, .. } => b.filter_note(),
+            Screens::Stashes { view: s, .. } => s.filter_note(),
+            Screens::Diff { view: d, .. } => d.match_note(),
+        }
+    }
+
+    /// Whether a search stands in this pane — the filter a prompt left
+    /// behind, or the diff's standing query. What puts the `search` mode on
+    /// the stack, and with it `n`/`N` and the clearing `esc`.
+    fn search_standing(&self) -> bool {
+        match self {
+            Screens::Commits { view: c, .. } => c.query().is_some(),
+            Screens::Files { view: f, .. } => f.query().is_some(),
+            Screens::Branches { view: b, .. } => b.query().is_some(),
+            Screens::Stashes { view: s, .. } => s.query().is_some(),
+            Screens::Diff { view: d, .. } => d.search_query().is_some(),
         }
     }
 
@@ -851,6 +890,9 @@ impl Screens {
                 "view.bottom" => c.to_bottom(),
                 // A commit list has nothing off the left edge to reach.
                 "view.left" | "view.right" => {}
+                "search.next" => c.next_match(1),
+                "search.prev" => c.next_match(-1),
+                "select.mark" => c.select_mark(),
                 _ => return false,
             },
             Screens::Diff { view: d, .. } => match command {
@@ -868,6 +910,8 @@ impl Screens {
                 "diff.prev-file" => d.jump_file(-1),
                 "diff.cycle-layout" => d.cycle_layout(host),
                 "diff.cycle-wrap" => d.cycle_wrap(host),
+                "search.next" => d.search_next(1),
+                "search.prev" => d.search_next(-1),
                 _ => return false,
             },
             Screens::Stashes { view: s, .. } => match command {
@@ -881,6 +925,8 @@ impl Screens {
                 "view.bottom" => s.to_bottom(),
                 // A stack has nothing off the left edge to reach.
                 "view.left" | "view.right" => {}
+                "search.next" => s.next_match(1),
+                "search.prev" => s.next_match(-1),
                 _ => return false,
             },
             Screens::Files { view: f, .. } => match command {
@@ -895,6 +941,8 @@ impl Screens {
                 // Nothing off the left edge to reach: paths clip rather
                 // than pan.
                 "view.left" | "view.right" => {}
+                "search.next" => f.next_match(1),
+                "search.prev" => f.next_match(-1),
                 _ => return false,
             },
             Screens::Branches { view: b, .. } => match command {
@@ -909,50 +957,12 @@ impl Screens {
                 // Nothing off the left edge to reach: names clip rather
                 // than pan.
                 "view.left" | "view.right" => {}
+                "search.next" => b.next_match(1),
+                "search.prev" => b.next_match(-1),
                 _ => return false,
             },
         }
         true
-    }
-}
-
-/// One edit to the open query, already reduced to text by whoever routed the
-/// event: a character typed, a character removed, or a paste's worth. The
-/// prompt never sees an event, so a pasted `q` is the character `q` and the
-/// keymap never learns a paste happened.
-enum Edit {
-    Char(char),
-    /// Backspace or Delete — both remove backwards, because a status-line
-    /// prompt has no cursor position to delete from.
-    Backspace,
-    /// A bracketed paste, sanitized on its way in.
-    Paste(String),
-}
-
-/// Lands one [`Edit`] in a prompt's text. Generic over the prompt on
-/// purpose: a message and a query are the same one-line field with
-/// different consumers, and the sanitizer is where that is true.
-fn apply_edit(text: &mut String, edit: Edit) {
-    match edit {
-        Edit::Char(c) => text.push(c),
-        Edit::Backspace => {
-            // A status line has no cursor position: both delete keys remove
-            // the last Unicode scalar, whatever it is. A long text keeps
-            // being edited whether its tail is on screen or not.
-            text.pop();
-        }
-        Edit::Paste(pasted) => {
-            // One paste, one edit, and never a transcript of keypresses:
-            // line breaks and tabs become spaces and other control
-            // characters are dropped, because that is what fits the one
-            // line the prompt owns. Nothing here can execute, whatever the
-            // paste held — see [`App::input`] for the door this came in.
-            text.extend(pasted.chars().filter_map(|c| match c {
-                '\n' | '\r' | '\t' => Some(' '),
-                c if c.is_control() => None,
-                c => Some(c),
-            }));
-        }
     }
 }
 
@@ -1586,6 +1596,13 @@ impl App {
         }
         if let Some(screen) = self.panes.focused() {
             self.modes.push(screen.mode());
+            // A standing search is its own innermost list mode: `n` and `N`
+            // walk matches exactly for as long as there is a match to walk,
+            // above the pane's own `n` — branches.new and commits.new-branch
+            // keep their keys the moment the query is gone.
+            if screen.search_standing() {
+                self.modes.push("search");
+            }
         }
         if self.help {
             self.modes.push("help");
@@ -1969,41 +1986,103 @@ impl App {
             Resolve::Pending => {}
             Resolve::None => {
                 self.pending.clear();
-                match key.code {
-                    Code::Char(c) if !key.ctrl && !key.alt => self.edit_prompt(Edit::Char(c)),
-                    Code::Backspace | Code::Delete if !key.ctrl && !key.alt => {
-                        self.edit_prompt(Edit::Backspace)
-                    }
-                    // Modified keys and everything else no binding claimed do
-                    // nothing, and say nothing: a key that does nothing while
-                    // a field owns the keyboard is the field doing its job,
-                    // and none of them may fall through to the globals.
-                    _ => {}
-                }
+                // The keys a field understands as editing, in the shared
+                // [`Edit`] vocabulary. Chords (ctrl/alt) are word motion on
+                // the arrows and nobody's elsewhere; everything else no
+                // binding claimed does nothing, and says nothing: a key that
+                // does nothing while a field owns the keyboard is the field
+                // doing its job, and none of them may fall through to the
+                // globals.
+                let edit = match key.code {
+                    Code::Char(c) if !key.ctrl && !key.alt => Some(Edit::Char(c)),
+                    Code::Backspace if !key.ctrl && !key.alt => Some(Edit::Backspace),
+                    Code::Delete if !key.ctrl && !key.alt => Some(Edit::Delete),
+                    Code::Left if !key.alt => Some(match key.ctrl {
+                        true => Edit::WordLeft,
+                        false => Edit::Left,
+                    }),
+                    Code::Right if !key.alt => Some(match key.ctrl {
+                        true => Edit::WordRight,
+                        false => Edit::Right,
+                    }),
+                    Code::Home if !key.ctrl && !key.alt => Some(Edit::Home),
+                    Code::End if !key.ctrl && !key.alt => Some(Edit::End),
+                    Code::Up if !key.ctrl && !key.alt => Some(Edit::Up),
+                    Code::Down if !key.ctrl && !key.alt => Some(Edit::Down),
+                    _ => None,
+                };
+                let Some(edit) = edit else {
+                    return;
+                };
+                self.edit_prompt(edit);
             }
         }
     }
 
-    /// `commits.search`: gather a query over the commit list.
+    /// `*.search`: gather a query over the pane the keyboard is on.
     ///
     /// Seeded from the standing query, so a second `/` finds the list as the
     /// first one left it; the full data stays in place, and each edit filters
-    /// it live. Only over the pane *named* `commits` — the prompt holds the
-    /// name, not an index, so however focus moves while it stands the query
-    /// still lands on the list it was opened over — and a diff has no query,
-    /// and says so.
-    fn begin_search(&mut self) {
-        let standing = match self.panes.get("commits") {
+    /// it live — every list pane answers to the same verb, and the diff
+    /// walks to its matches instead of filtering, because a filtered diff is
+    /// not a diff. The prompt holds the pane by *name* — the prompt holds
+    /// the name, not an index, so however focus moves while it stands the
+    /// query still lands on the list it was opened over.
+    fn begin_search(&mut self, command: &str) {
+        let name = self.panes.focused_name().to_string();
+        if name.is_empty() {
+            self.message = format!("{command} is not supported here");
+            return;
+        }
+        let standing = match self.panes.get(&name) {
             Some(Screens::Commits { view, .. }) => view.query().unwrap_or_default().to_string(),
-            _ => {
-                self.message = "commits.search is not supported here".into();
+            Some(Screens::Files { view, .. }) => view.query().unwrap_or_default().to_string(),
+            Some(Screens::Branches { view, .. }) => view.query().unwrap_or_default().to_string(),
+            Some(Screens::Stashes { view, .. }) => view.query().unwrap_or_default().to_string(),
+            Some(Screens::Diff { view, .. }) => {
+                if !view.has_search_text() {
+                    self.message = format!("{command}: the diff has no text to search");
+                    return;
+                }
+                view.search_query().unwrap_or_default().to_string()
+            }
+            None => {
+                self.message = format!("{command} is not supported here");
                 return;
             }
         };
-        self.prompt = Some(Prompt::Search { query: standing });
+        self.prompt = Some(Prompt::Search {
+            pane: name,
+            field: Field::with(standing),
+        });
         self.gesture = None;
         self.pending.clear();
         self.sync_modes();
+    }
+
+    /// HEAD's subject, as the loaded history holds it — the amend prompt's
+    /// prefill, so an amend is an edit of what is standing. `None` without a
+    /// repository, on an unborn or detached HEAD, and when the loaded list
+    /// does not hold the commit: the prompt then opens empty, which is an
+    /// honest amend of nothing rather than a wrong prefill.
+    ///
+    /// The subject and not the whole message, deliberately narrow: the
+    /// loaded [`Commit`] carries the subject line only. A prefill of the
+    /// full message needs a `%B` read behind the `Repo` trait — recorded as
+    /// a need, not smuggled in past the acquisition layer.
+    fn head_subject(&self) -> Option<String> {
+        let (_, repo) = self.repo.as_ref()?;
+        let sha = match repo.head() {
+            Ok(HeadState::Branch {
+                commit: Some(sha), ..
+            })
+            | Ok(HeadState::Detached { commit: sha }) => sha,
+            _ => return None,
+        };
+        match self.panes.get("commits") {
+            Some(Screens::Commits { view, .. }) => view.with_sha(&sha).map(|c| c.subject.clone()),
+            _ => None,
+        }
     }
 
     /// `files.commit` / `files.amend`: gather a message on the status row,
@@ -2011,8 +2090,9 @@ impl App {
     ///
     /// Both validate the two things the verb needs before opening the field:
     /// the files pane holds the keyboard, and there is a repository behind
-    /// the app. Both open **empty** — amending does not prefill HEAD's old
-    /// subject, because a rewrite is not an edit of what is standing.
+    /// the app. Amend opens on HEAD's subject — an edit of what is standing
+    /// is what amend is; commit opens empty, because there is nothing to
+    /// edit yet.
     fn begin_commit_message(&mut self) {
         if !matches!(self.panes.focused(), Some(Screens::Files { .. })) {
             self.message = "files.commit is not supported here".into();
@@ -2023,7 +2103,7 @@ impl App {
             return;
         }
         self.open_prompt(Prompt::CommitMessage {
-            text: String::new(),
+            field: Field::new(),
         });
     }
 
@@ -2036,8 +2116,9 @@ impl App {
             self.message = "a fixture has no repository to amend in".into();
             return;
         }
+        let subject = self.head_subject().unwrap_or_default();
         self.open_prompt(Prompt::AmendMessage {
-            text: String::new(),
+            field: Field::with(subject),
         });
     }
 
@@ -2118,7 +2199,7 @@ impl App {
             return;
         }
         self.open_prompt(Prompt::BranchNew {
-            text: String::new(),
+            field: Field::new(),
         });
     }
 
@@ -2164,8 +2245,7 @@ impl App {
         let initial = std::str::from_utf8(name.as_bytes()).unwrap_or("");
         self.open_prompt(Prompt::BranchRename {
             from: name.as_bytes().to_vec(),
-            text: initial.to_string(),
-            selected: !initial.is_empty(),
+            field: Field::with_selected(initial),
         });
     }
 
@@ -2207,7 +2287,7 @@ impl App {
         }
         self.open_prompt(Prompt::TagNew {
             at: name.as_bytes().to_vec(),
-            text: String::new(),
+            field: Field::new(),
         });
     }
 
@@ -2282,102 +2362,138 @@ impl App {
         }
     }
 
-    /// One edit to the open prompt's text, and the routing the variant asks
+    /// One edit to the open prompt's field, and the routing the variant asks
     /// for.
     ///
     /// Per keystroke and never per frame — the next frame only draws what
     /// this already decided, which is why nothing in [`App::draw`] searches.
-    /// The edit itself is generic — a character, a removal, a sanitized
-    /// paste — and only the search routes the result anywhere: the list
-    /// filter rebuilds under it live, because a message being typed is
-    /// nobody else's business until Enter says so. A rename's prefilled name
-    /// is the one other state an edit touches: it arrives wholly selected,
-    /// so the first character or paste replaces it and Backspace clears it —
-    /// editing what is there beats retyping it, but keeping the old name
-    /// glued to the front of whatever was typed serves nobody.
+    /// The edit itself is generic — the field's, whatever the prompt — and
+    /// only the search routes the result anywhere: the list filter rebuilds
+    /// under it live, and the diff walks to its next match live, because a
+    /// message being typed is nobody else's business until Enter says so. A
+    /// paste is sized by the field it lands in: a message keeps its line
+    /// breaks, a one-line field flattens them, both by the shared
+    /// [`Field::paste`]. `input.newline` in a one-line field is refused — the
+    /// field is one line by design, and the reason is said, not swallowed.
     fn edit_prompt(&mut self, edit: Edit) {
+        if matches!(edit, Edit::Newline) {
+            let multiline = self
+                .prompt
+                .as_ref()
+                .is_some_and(|prompt| prompt.multiline());
+            if !multiline {
+                self.message = "this field is one line".into();
+                return;
+            }
+        }
         let routes_live = matches!(&self.prompt, Some(Prompt::Search { .. }));
         let Some(prompt) = self.prompt.as_mut() else {
             return;
         };
-        if let Prompt::BranchRename { text, selected, .. } = prompt {
-            if *selected {
-                // The selection is spent by the first edit, whichever it is.
-                *selected = false;
-                match edit {
-                    Edit::Char(c) => {
-                        text.clear();
-                        text.push(c);
-                        return;
-                    }
-                    Edit::Backspace => {
-                        text.clear();
-                        return;
-                    }
-                    Edit::Paste(pasted) => {
-                        text.clear();
-                        apply_edit(text, Edit::Paste(pasted));
-                        return;
-                    }
-                }
-            }
-        }
-        apply_edit(prompt.text_mut(), edit);
+        // A paste is one edit; which shape it takes is the field's own kind.
+        let edit = match edit {
+            Edit::Paste(text) if prompt.multiline() => Edit::PasteMultiline(text),
+            other => other,
+        };
+        prompt.field_mut().edit(edit);
         if !routes_live {
             return;
         }
         // The edit is in; the borrow `prompt` holds ends with it. The query
         // is copied out rather than borrowed across the call, because the
-        // list filter needs `&mut self` — a line of text, once per keystroke
+        // routing needs `&mut self` — a line of text, once per keystroke
         // and never per frame, against a rebuild the filter does anyway.
-        let Some(Prompt::Search { query }) = self.prompt.as_ref() else {
+        let Some(Prompt::Search { field, .. }) = self.prompt.as_ref() else {
             return;
         };
-        let query = query.clone();
+        let query = field.text().to_string();
         self.apply_query(&query);
     }
 
-    /// The filter `query` describes, onto the list under the prompt — an empty
-    /// one is no filter. The one place an edit, an accept or a cancel reaches
-    /// the view, so the prompt and the list stay two things: the prompt is
-    /// input, the list is data, and this is the line between them.
+    /// The search the open prompt describes, routed to the pane it stands
+    /// over — by name, not by focus, so a focus change cannot strand the
+    /// query. A list filters; the diff walks. The one place an edit, an
+    /// accept or a cancel reaches the views, so the prompt and the lists
+    /// stay two things: the prompt is input, the lists are data, and this is
+    /// the line between them.
     fn apply_query(&mut self, query: &str) {
-        let before = self.current_commit_sha();
-        // Disjoint field borrows, as everywhere else in this file: the query is
-        // read while the list is written.
-        let Self { panes, .. } = self;
-        if let Some(Screens::Commits { view: list, .. }) = panes.get_mut("commits") {
-            list.apply_query(query);
+        let Some(pane) = self.prompt.as_ref().map(Prompt::pane) else {
+            return;
+        };
+        if pane.is_empty() {
+            return;
         }
-        if self.current_commit_sha() != before {
-            self.request_commit_preview(false);
+        let pane = pane.to_string();
+        let before = self.eye_of(&pane);
+        match self.panes.get_mut(&pane) {
+            Some(Screens::Commits { view, .. }) => view.apply_query(query),
+            Some(Screens::Files { view, .. }) => view.apply_query(query),
+            Some(Screens::Branches { view, .. }) => view.apply_query(query),
+            Some(Screens::Stashes { view, .. }) => view.apply_query(query),
+            Some(Screens::Diff { view, .. }) => view.search_edit(query),
+            None => {}
+        }
+        self.eye_follow(&pane, before);
+    }
+
+    /// A list or diff under the keyboard changed what its eye is on — a
+    /// filter moved it, a clear restored it — so the main preview follows,
+    /// exactly as a cursor move's eye change does in dispatch. Nothing is
+    /// asked when the pane is not the one holding the keyboard: its eye
+    /// moved, but the eye the frame draws is the focused pane's.
+    fn eye_follow(&mut self, pane: &str, before: Option<DiffSource>) {
+        if self.panes.focused_name() != pane {
+            return;
+        }
+        let after = self.eye_of(pane);
+        if after.as_ref() != before.as_ref() {
+            if let Some(after) = after {
+                self.request_preview(after, false);
+            }
         }
     }
 
     /// `input.accept` / `input.cancel` of the open prompt.
     ///
     /// Accept hands the text to whoever the variant names — the search keeps
-    /// its last edit standing (an *empty* accept is how a filter comes off),
-    /// a message submits its write — and cancel throws the text away with no
-    /// write built, which for the search means restoring the unfiltered
-    /// list. Both close the prompt and give the keyboard back.
+    /// its last edit standing (an *empty* accept is how a filter comes off,
+    /// and on the diff it is how a search ends with nothing), a message
+    /// submits its write — and cancel throws the text away with no write
+    /// built, which for a search means restoring what stood before it: the
+    /// unfiltered list, or the diff without its standing query. Both close
+    /// the prompt and give the keyboard back.
     fn finish_prompt(&mut self, accept: bool) {
         let Some(prompt) = self.prompt.take() else {
             return;
         };
         match prompt {
-            Prompt::Search { .. } => {
-                if !accept {
-                    self.apply_query("");
+            Prompt::Search { pane, .. } if !accept => {
+                // Cancel restores what stood before the search: the
+                // unfiltered list, or the diff without its standing query.
+                let before = self.eye_of(&pane);
+                match self.panes.get_mut(&pane) {
+                    Some(Screens::Commits { view, .. }) => view.apply_query(""),
+                    Some(Screens::Files { view, .. }) => view.clear_search(),
+                    Some(Screens::Branches { view, .. }) => view.clear_search(),
+                    Some(Screens::Stashes { view, .. }) => view.clear_search(),
+                    Some(Screens::Diff { view, .. }) => view.search_clear(),
+                    None => {}
                 }
+                self.eye_follow(&pane, before);
             }
-            Prompt::CommitMessage { text } if accept => self.submit_commit(text),
-            Prompt::AmendMessage { text } if accept => self.submit_amend(text),
-            Prompt::BranchNew { text } if accept => self.submit_branch_new(text),
-            Prompt::BranchRename { from, text, .. } if accept => {
-                self.submit_branch_rename(from, text)
+            Prompt::Search { .. } => {
+                // Accept keeps what is standing: a list's filter was applied
+                // live per keystroke, and the diff's standing query too. An
+                // empty accept is how a filter comes off — the next keystroke
+                // is the other door, and the mode's `esc` the one beside it.
             }
-            Prompt::TagNew { at, text } if accept => self.submit_branch_tag(at, text),
+            Prompt::CommitMessage { field } if accept => self.submit_commit(field.take()),
+            Prompt::AmendMessage { field } if accept => self.submit_amend(field.take()),
+            Prompt::BranchNew { field } if accept => self.submit_branch_new(field.take()),
+            Prompt::BranchRename { from, field } if accept => {
+                self.submit_branch_rename(from, field.take())
+            }
+            Prompt::TagNew { at, field } if accept => self.submit_branch_tag(at, field.take()),
             // Cancelled: the text was the prompt's and dies with it.
             _ => {}
         }
@@ -2630,11 +2746,11 @@ impl App {
             "branches.open-log" => self.open_branch_log(),
             // The prompt's names, and the whole of what they gather: open a
             // query or a message field, accept it, cancel it. Each resolves
-            // through the live keymap — `commits.search` and the files
-            // verbs in their modes, the other two in `input` while any
-            // prompt stands — so `gitten.toml` moves them the way it moves
-            // everything else.
-            "commits.search" => self.begin_search(),
+            // through the live keymap — the search names in their pane
+            // modes, the rest in `input` while any prompt stands — so
+            // `gitten.toml` moves them the way it moves everything else.
+            "commits.search" | "files.search" | "branches.search" | "stashes.search"
+            | "diff.search" => self.begin_search(command),
             "files.commit" => self.begin_commit_message(),
             "files.amend" => self.begin_amend_message(),
             // lazygit's global R, on the same wave a finished write runs:
@@ -2646,6 +2762,42 @@ impl App {
             "repo.refresh" => self.manual_refresh(),
             "input.accept" => self.finish_prompt(true),
             "input.cancel" => self.finish_prompt(false),
+            // A line break, into a field that holds multiline text.
+            "input.newline" => self.edit_prompt(Edit::Newline),
+            // The standing search's two walks — the `search` mode's whole
+            // point, so they are refused by name when no search stands
+            // rather than falling into a pane that would answer with
+            // silence. Routed to the focused pane, whose `run` knows which
+            // walk it is.
+            "search.next" | "search.prev" => {
+                if !self.panes.focused().is_some_and(Screens::search_standing) {
+                    self.message = "no search standing — / to start one".into();
+                } else {
+                    let routed = self.panes.focused_name().to_string();
+                    if let Some(pane) = self.panes.get_mut(&routed) {
+                        pane.run(command, &self.host);
+                    }
+                }
+            }
+            // The search off — the `esc` of the `search` mode, and the door
+            // `search.clear` names. The eye follows, exactly as a filter
+            // edit's does.
+            "search.clear" => {
+                let name = self.panes.focused_name().to_string();
+                if !name.is_empty() {
+                    let before = self.eye_of(&name);
+                    if let Some(pane) = self.panes.get_mut(&name) {
+                        match pane {
+                            Screens::Commits { view, .. } => view.clear_search(),
+                            Screens::Files { view, .. } => view.clear_search(),
+                            Screens::Branches { view, .. } => view.clear_search(),
+                            Screens::Stashes { view, .. } => view.clear_search(),
+                            Screens::Diff { view, .. } => view.search_clear(),
+                        }
+                    }
+                    self.eye_follow(&name, before);
+                }
+            }
             // The hunk verbs act on the *repository*, not the pane: they
             // need the source the diff was acquired from and the handle it
             // was acquired through, and a view is drawing and input only.
@@ -3612,26 +3764,40 @@ impl App {
             let mut pen = self.screen.row(h - 1);
             pen.put(" ", ink);
             pen.put(prompt.label(), loud);
-            match prompt {
-                Prompt::Search { query } => {
-                    pen.put(query, text_ink);
-                    pen.put("█", loud);
-                    if pen.room() > 2 {
-                        if let Some(note) = self.panes.get("commits").and_then(Screens::filter_note)
-                        {
-                            pen.put(" · ", ink);
-                            pen.put(&note, Ink::new(c.faint, c.status_bg));
-                        }
+            let field = prompt.field();
+            // A message that grew past one line says which line the cursor
+            // is on — the one fact a status row cannot draw for itself.
+            let (line, lines) = field.line_of();
+            if prompt.multiline() && lines > 1 {
+                pen.put(
+                    &format!("{line}/{lines} · "),
+                    Ink::new(c.faint, c.status_bg),
+                );
+            }
+            // The window around the cursor, with the cursor drawn in place —
+            // not a tail with a block glued on the end: the cursor is *in*
+            // the text now, and a field edited from the middle must show it
+            // there.
+            let room = pen.room().saturating_sub(1);
+            let (window, at) = field.window(room);
+            let head = window
+                .char_indices()
+                .nth(at)
+                .map(|(i, _)| i)
+                .unwrap_or(window.len());
+            pen.put(&window[..head], text_ink);
+            pen.put("█", loud);
+            pen.put(&window[head..], text_ink);
+            if let Prompt::Search { .. } = prompt {
+                if pen.room() > 2 {
+                    if let Some(note) = self
+                        .panes
+                        .get(prompt.pane())
+                        .and_then(|pane| pane.search_note())
+                    {
+                        pen.put(" · ", ink);
+                        pen.put(&note, Ink::new(c.faint, c.status_bg));
                     }
-                }
-                Prompt::CommitMessage { .. }
-                | Prompt::AmendMessage { .. }
-                | Prompt::BranchNew { .. }
-                | Prompt::BranchRename { .. }
-                | Prompt::TagNew { .. } => {
-                    let room = pen.room().saturating_sub(1);
-                    pen.put(tail(prompt.text(), room), text_ink);
-                    pen.put("█", loud);
                 }
             }
             pen.wash(ink);
@@ -3746,6 +3912,15 @@ fn tui_availability(repo: bool) -> Availability {
         "status.focus",
         "commits.open-diff",
         "commits.search",
+        "files.search",
+        "branches.search",
+        "stashes.search",
+        "diff.search",
+        "search.next",
+        "search.prev",
+        "search.clear",
+        "select.mark",
+        "input.newline",
         "files.commit",
         "files.amend",
         "input.accept",
@@ -4049,28 +4224,6 @@ fn join_read<T>(h: std::thread::ScopedJoinHandle<'_, T>) -> T {
     h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))
 }
 
-/// The longest suffix of `s` that fits `budget` columns, by the screen's own
-/// column arithmetic — what a message prompt draws when its text is longer
-/// than the row it owns. A wide character that does not fit whole is left
-/// off rather than half-drawn; the stored text is never touched, only the
-/// drawing is.
-fn tail(s: &str, budget: usize) -> &str {
-    if gitten_tui::screen::width(s) <= budget {
-        return s;
-    }
-    let mut used = 0;
-    let mut start = s.len();
-    for (i, c) in s.char_indices().rev() {
-        let w = gitten_tui::screen::cols(c);
-        if used + w > budget {
-            break;
-        }
-        used += w;
-        start = i;
-    }
-    &s[start..]
-}
-
 /// What to say on the status line after a copy.
 ///
 /// Lines and not bytes, because a selection is measured in what you can see.
@@ -4233,9 +4386,9 @@ mod tests {
 
     /// The search prompt's query, while one stands — the tests' window on the
     /// typed prompt's text.
-    fn query(app: &App) -> Option<String> {
+    pub(crate) fn query(app: &App) -> Option<String> {
         match &app.prompt {
-            Some(Prompt::Search { query }) => Some(query.clone()),
+            Some(Prompt::Search { field, .. }) => Some(field.text().to_string()),
             _ => None,
         }
     }
@@ -4360,10 +4513,18 @@ mod tests {
 
         // The shipped focus keys are text while the prompt owns the keyboard.
         app.press(Key::plain(Code::Char('4')));
-        assert_eq!(query(&app).as_deref(), Some("4"), "4 was not text");
+        assert_eq!(
+            crate::tests::query(&app).as_deref(),
+            Some("4"),
+            "4 was not text"
+        );
         assert_eq!(app.panes.focused_name(), "commits", "4 moved the focus");
         app.press(Key::char('h'));
-        assert_eq!(query(&app).as_deref(), Some("4h"), "h was not text");
+        assert_eq!(
+            crate::tests::query(&app).as_deref(),
+            Some("4h"),
+            "h was not text"
+        );
         assert_eq!(app.panes.focused_name(), "commits", "h moved the focus");
         // The mouse is inert under the prompt.
         app.draw();
@@ -4437,7 +4598,7 @@ mod tests {
 
         // A second `/` finds the query as the first one left it.
         app.press(Key::char('/'));
-        assert_eq!(query(&app).as_deref(), Some("engine"));
+        assert_eq!(crate::tests::query(&app).as_deref(), Some("engine"));
         app.draw();
         assert!(status(&app).contains("/engine"), "{:?}", status(&app));
         // Cancel — the edit never stood, and the whole list comes back.
@@ -4453,7 +4614,7 @@ mod tests {
         // An accepted empty query removes the filter too: it is the same door
         // out, reached by keeping an empty prompt.
         app.press(Key::char('/'));
-        assert_eq!(query(&app).as_deref(), Some(""));
+        assert_eq!(crate::tests::query(&app).as_deref(), Some(""));
         app.press(Key::plain(Code::Enter));
         assert!((app).prompt.is_none());
         app.press(Key::char('/'));
@@ -4476,11 +4637,15 @@ mod tests {
         app.press(Key::char('/'));
         app.press(Key::char('?'));
         assert!(!app.help, "help opened over the prompt");
-        assert_eq!(query(&app).as_deref(), Some("?"), "the ? was not text");
+        assert_eq!(
+            crate::tests::query(&app).as_deref(),
+            Some("?"),
+            "the ? was not text"
+        );
         // The same for the other printable global: `q` quits nothing here.
         app.press(Key::char('q'));
         assert!(!app.quit);
-        assert_eq!(query(&app).as_deref(), Some("?q"));
+        assert_eq!(crate::tests::query(&app).as_deref(), Some("?q"));
         app.draw();
         assert!(status(&app).contains("/?q"), "{:?}", status(&app));
     }
@@ -4546,7 +4711,7 @@ mod tests {
             (app).prompt.is_some(),
             "the unbound enter closed the prompt"
         );
-        assert_eq!(query(&app).as_deref(), Some("engine"));
+        assert_eq!(crate::tests::query(&app).as_deref(), Some("engine"));
 
         // The configured accept key closes it, filter standing.
         app.press(Key::ctrl(Code::Char('s')));
@@ -4572,7 +4737,7 @@ mod tests {
         // An invalid continuation drops the buffer rather than replaying it as
         // text; the character typed is still text.
         app.press(Key::char('q'));
-        assert_eq!(query(&app).as_deref(), Some("engineq"));
+        assert_eq!(crate::tests::query(&app).as_deref(), Some("engineq"));
         assert!(app.pending.is_empty());
         // Completed, the chord cancels: the list is whole again.
         app.press(alt_x);
@@ -6976,7 +7141,7 @@ diff --git a/tracked.txt b/tracked.txt
         app.press(Key::char('c'));
         assert!(matches!(
             app.prompt,
-            Some(Prompt::CommitMessage { ref text }) if text.is_empty()
+            Some(Prompt::CommitMessage { ref field }) if field.text().is_empty()
         ));
         app.draw();
         assert!(status(&app).contains("commit: █"), "{:?}", status(&app));
@@ -6991,11 +7156,13 @@ diff --git a/tracked.txt b/tracked.txt
         assert!(!app.help);
         assert_eq!(app.panes.focused_name(), "files");
         assert!(matches!(app.prompt, Some(Prompt::CommitMessage { .. })));
-        // A paste is one sanitized edit, and a multiline one at that.
+        // A paste is one sanitized edit, and a message field keeps its line
+        // breaks: a commit message is multiline by design, and a paste is
+        // how a whole message arrives at once.
         app.input(Input::Paste("one\ntwo\tb".into()));
         assert_eq!(
-            app.prompt.as_ref().map(Prompt::text),
-            Some("q?42hjone two b"),
+            app.prompt.as_ref().map(|p| p.field().text()),
+            Some("q?42hjone\ntwo\tb"),
             "the paste did not arrive as one sanitized edit"
         );
 
@@ -7020,8 +7187,8 @@ diff --git a/tracked.txt b/tracked.txt
         let row = status(&app);
         assert!(row.ends_with("end█"), "{row:?}");
         assert_eq!(
-            app.prompt.as_ref().map(Prompt::text).map(str::len),
-            Some(long.len() + "q?42hjone two b".len()),
+            app.prompt.as_ref().map(|p| p.field().text()).map(str::len),
+            Some(long.len() + "q?42hjone\ntwo\tb".len()),
             "the logical message was cut to what fits"
         );
 
@@ -7081,12 +7248,13 @@ diff --git a/tracked.txt b/tracked.txt
         let mut app = commits_app(&handle);
         app.dispatch("files.focus");
 
-        // `A` opens empty — HEAD's old subject is nothing to prefill a
-        // rewrite with.
+        // `A` opens on HEAD's subject when the loaded history holds it —
+        // an edit of what is standing is what amend is — and empty here,
+        // because the fake's HEAD names a commit the list does not hold.
         app.press(Key::char('A'));
         assert!(matches!(
             app.prompt,
-            Some(Prompt::AmendMessage { ref text }) if text.is_empty()
+            Some(Prompt::AmendMessage { ref field }) if field.text().is_empty()
         ));
         app.draw();
         assert!(status(&app).contains("amend: █"), "{:?}", status(&app));
@@ -7104,7 +7272,8 @@ diff --git a/tracked.txt b/tracked.txt
         assert!(state.lock().unwrap().writes.is_empty());
 
         // Enter submits exactly `Write::amend` with the whole sanitized
-        // text — a pasted line break became a space, and nothing was sliced.
+        // text — a message field keeps its line breaks, so a pasted
+        // two-line message arrives as two lines, and nothing was sliced.
         app.press(Key::char('A'));
         app.input(Input::Paste("rewritten subject\nbody".into()));
         app.press(Key::plain(Code::Enter));
@@ -7117,7 +7286,7 @@ diff --git a/tracked.txt b/tracked.txt
             "the amend never reached the repository"
         );
         let writes = state.lock().unwrap().writes.clone();
-        assert_eq!(writes, vec!["amend rewritten subject body"]);
+        assert_eq!(writes, vec!["amend rewritten subject\nbody"]);
 
         // No confirmation mode rides the path, and no extra command exists:
         // a confirm-looking name is nobody's command, refused by the same
@@ -11046,6 +11215,439 @@ diff --git a/tracked.txt b/tracked.txt
         assert_eq!(
             app.message,
             "branches.open-log: a fixture has no history to open",
+        );
+    }
+
+    // ------------------------------------------------- tui_parity_: W2
+
+    /// The files world the search test filters: one file in each of the two
+    /// sections a query can tell apart.
+    fn two_files_status() -> Status {
+        Status {
+            staged: vec![StagedEntry {
+                path: PathBytes::from("src/main.rs"),
+                change: Change::Modified,
+                old_path: None,
+                kind: Kind::File,
+                submodule: Submodule::default(),
+            }],
+            unstaged: vec![UnstagedEntry {
+                path: PathBytes::from("docs/readme.md"),
+                change: Change::Modified,
+                kind: Kind::File,
+                submodule: Submodule::default(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// The names the help panel would draw in `mode`, as the audit reads
+    /// them.
+    fn help_names(app: &App, mode: &str) -> Vec<String> {
+        let mut modes = Modes::new();
+        modes.push(mode);
+        app.host
+            .keys
+            .help_supported(&app.host.commands, &modes, &app.availability)
+            .into_iter()
+            .filter_map(|row| match row {
+                gitten_core::command::HelpRow::Command { name, .. } => Some(name),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tui_parity_search_covers_every_list_and_n_walks_the_matches() {
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().status = two_files_status();
+        let mut app = commits_app(&handle);
+        eprintln!(
+            "DBG cursor={} rows={:?}",
+            files_of(&app).cursor(),
+            files_of(&app).current_file().map(|f| f.text.clone())
+        );
+        app.draw();
+        eprintln!(
+            "DBG after draw cursor={} cur={:?}",
+            files_of(&app).cursor(),
+            files_of(&app).current_file().map(|f| f.text.clone())
+        );
+
+        // Files: `/` opens over the files pane, and every keystroke narrows
+        // the list live — the keyboard follows the surviving file.
+        app.dispatch("files.focus");
+        app.press(Key::char('/'));
+        assert!(matches!(app.prompt, Some(Prompt::Search { .. })));
+        type_(&mut app, "readme");
+        eprintln!(
+            "DBG after type cur={:?} q={:?} vis={}",
+            files_of(&app).current_file().map(|f| f.text.clone()),
+            files_of(&app).query(),
+            files_of(&app).filter_note().unwrap_or_default()
+        );
+        assert_eq!(
+            files_of(&app).current_file().map(|f| f.text.as_str()),
+            Some("docs/readme.md"),
+            "the filter did not move the keyboard onto the surviving file"
+        );
+        app.draw();
+        assert!(status(&app).contains("1/2"), "{}", status(&app));
+        // Enter keeps the filter standing, and now n walks the matches —
+        // while the prompt stands, n is text.
+        app.press(Key::plain(Code::Enter));
+        assert!(app.prompt.is_none());
+        app.press(Key::char('n'));
+        assert_eq!(
+            files_of(&app).current_file().map(|f| f.text.as_str()),
+            Some("docs/readme.md"),
+            "the one match did not wrap onto itself"
+        );
+        assert_eq!(
+            files_of(&app).query(),
+            Some("readme"),
+            "enter did not keep the filter"
+        );
+        // A second `/` is seeded from what stands.
+        app.press(Key::char('/'));
+        assert_eq!(crate::tests::query(&app).as_deref(), Some("readme"));
+        app.press(Key::plain(Code::Esc));
+        // And esc — the search mode's own — takes the filter off entirely,
+        // the keyboard back on the file it filtered to.
+        assert!(files_of(&app).query().is_none(), "esc left the filter on");
+        assert_eq!(
+            files_of(&app).current_file().map(|f| f.text.as_str()),
+            Some("docs/readme.md"),
+            "clearing the filter lost the file"
+        );
+
+        // Stashes: the query matches the message, and the keyboard follows
+        // the entry by its surviving identity.
+        app.dispatch("stashes.focus");
+        app.press(Key::char('/'));
+        type_(&mut app, "wip");
+        assert_eq!(
+            app.panes.get("stashes").and_then(|pane| match pane {
+                Screens::Stashes { view, .. } => {
+                    view.current_entry().map(|(_, commit)| commit)
+                }
+                _ => None,
+            }),
+            Some("aaa".into()),
+            "the filter did not keep the keyboard on the wip entry"
+        );
+        app.press(Key::plain(Code::Esc));
+        assert!(app.panes.get("stashes").is_some_and(|pane| match pane {
+            Screens::Stashes { view, .. } => view.query().is_none(),
+            _ => true,
+        }));
+
+        // Branches: the query matches the display name.
+        app.dispatch("branches.focus");
+        app.press(Key::char('/'));
+        type_(&mut app, "main");
+        assert_eq!(
+            branches_of(&app).current(),
+            Some(gitten_core::refs::Target::Local(RefName::from("main")))
+        );
+        app.press(Key::plain(Code::Esc));
+
+        // Commits: eleven rows carry "commit 4" — 4 and 40 through 49 —
+        // and n walks them in order, wrapping at the end.
+        app.dispatch("commits.focus");
+        app.press(Key::char('/'));
+        type_(&mut app, "commit 4");
+        // The prompt stands: n is text in it. Accept, and n walks.
+        app.press(Key::plain(Code::Enter));
+        let first = commits_of(&app).cursor();
+        app.press(Key::char('n'));
+        let second = commits_of(&app).cursor();
+        assert!(
+            second > first,
+            "n did not walk to the next match: {first} -> {second}"
+        );
+        app.press(Key::char('N'));
+        assert_eq!(commits_of(&app).cursor(), first, "N did not walk back");
+        // The keyboard then behaves: accept keeps the filter, and the arrow
+        // keys are still the list's, not the search's.
+        app.press(Key::plain(Code::Enter));
+        app.dispatch("view.down");
+        assert_eq!(commits_of(&app).cursor(), first + 1);
+    }
+
+    #[test]
+    fn tui_parity_search_mode_takes_n_and_gives_it_back() {
+        // With no query standing, `n` is the pane's: branches.new opens a
+        // field. With one standing, the matches own the keyboard. That is
+        // the whole trade, and both halves must hold.
+        let (handle, _state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        app.dispatch("branches.focus");
+        app.press(Key::char('n'));
+        assert!(
+            matches!(app.prompt, Some(Prompt::BranchNew { .. })),
+            "n was not branches.new while no search stood"
+        );
+        app.press(Key::plain(Code::Esc));
+        assert!(app.prompt.is_none());
+
+        app.press(Key::char('/'));
+        type_(&mut app, "main");
+        app.press(Key::plain(Code::Enter));
+        app.message.clear();
+        app.press(Key::char('n'));
+        assert!(
+            app.prompt.is_none(),
+            "n opened a prompt while a search stood"
+        );
+        assert_eq!(
+            app.message, "",
+            "the walk over a standing search said something else"
+        );
+        // No branch matches `nomatch`; the walk says so where the filter
+        // already shows an empty list.
+        app.press(Key::char('/'));
+        type_(&mut app, "nomatch");
+        app.press(Key::plain(Code::Enter));
+        app.message.clear();
+        app.press(Key::char('n'));
+        assert_eq!(
+            app.message, "",
+            "a search with no matches said something on the walk"
+        );
+    }
+
+    #[test]
+    fn tui_parity_the_diff_search_walks_the_rows_that_match() {
+        // The tall fake's diff: an edit every ten lines, so "EDIT 1" lands
+        // on a real spread of rows and n/N has somewhere to go.
+        let (handle, _state) = fake_tall(&[]);
+        let mut app = commits_app(&handle);
+        app.dispatch("commits.open-diff");
+        until(Duration::from_secs(2), || {
+            app.pump_quiet();
+            diff_of(&app).rows() > 0
+        });
+        app.dispatch("diff.focus");
+        let before = diff_of(&app).cursor();
+        app.press(Key::char('/'));
+        type_(&mut app, "EDIT 1");
+        let first = diff_of(&app).cursor();
+        assert!(
+            first != before,
+            "the live search did not put the keyboard on a match"
+        );
+        app.press(Key::plain(Code::Enter));
+        // The standing query walks, wrapping, and the pane's own status
+        // says where in the matches the keyboard is.
+        app.press(Key::char('n'));
+        let next = diff_of(&app).cursor();
+        assert!(next != first, "n stayed on the match it was on");
+        app.press(Key::char('N'));
+        assert_eq!(diff_of(&app).cursor(), first, "N did not walk back");
+        let note = diff_of(&app)
+            .match_note()
+            .expect("the standing search said nothing");
+        assert!(
+            note.contains('/'),
+            "the note is not an ordinal over a count: {note}"
+        );
+        // A reflow moves every row under the fold; the note honestly goes
+        // quiet rather than describing matches it has not re-found, and the
+        // next walk re-folds and brings it back.
+        app.draw();
+        app.press(Key::char('n'));
+        assert!(
+            diff_of(&app).match_note().is_some(),
+            "the next walk did not re-fold"
+        );
+        // Clear takes the search off; the cursor stays where the search
+        // left it, and n without a query is refused by name.
+        let at = diff_of(&app).cursor();
+        app.press(Key::plain(Code::Esc));
+        assert_eq!(diff_of(&app).cursor(), at, "clear moved the cursor");
+        assert_eq!(diff_of(&app).search_query(), None, "clear kept the query");
+        app.message.clear();
+        app.press(Key::char('n'));
+        assert_eq!(app.message, "no search standing — / to start one");
+    }
+
+    #[test]
+    fn tui_parity_prompt_editing_has_a_cursor_and_a_multiline_message() {
+        let (handle, _state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        app.dispatch("files.focus");
+        app.press(Key::char('c'));
+        type_(&mut app, "hello wrold");
+        // The arrows and Home are editing now: fix the typo without retyping.
+        // ctrl-Left lands on the start of the mistyped word, Delete takes the
+        // wrong letter out, and the Right plus one character puts it back —
+        // a cursor, not an append-only tail.
+        app.press(Key::ctrl(Code::Left));
+        app.press(Key::plain(Code::Right));
+        app.press(Key::plain(Code::Delete));
+        app.press(Key::plain(Code::Right));
+        app.press(Key::char('r'));
+        assert_eq!(
+            app.prompt.as_ref().map(|p| p.field().text()),
+            Some("hello world"),
+            "the cursor edits did not land"
+        );
+        // The drawn row shows the cursor in place, not glued to the end.
+        app.draw();
+        assert!(
+            status(&app).contains("hello wor█ld"),
+            "the caret is not where the cursor is: {}",
+            status(&app)
+        );
+        // Multibyte scalars are scalars, never bytes: ß is two bytes and one
+        // Left. The drawn window never splits one, and Delete removes exactly
+        // the scalar before — at — the cursor.
+        app.press(Key::plain(Code::Home));
+        app.press(Key::plain(Code::End));
+        type_(&mut app, " ßx");
+        app.press(Key::plain(Code::Left));
+        app.press(Key::plain(Code::Left));
+        app.press(Key::plain(Code::Delete));
+        assert_eq!(
+            app.prompt.as_ref().map(|p| p.field().text()),
+            Some("hello world x"),
+            "delete did not remove exactly one scalar"
+        );
+        // A line break is text: alt-enter inserts at the cursor, enter still
+        // accepts.
+        app.press(Key::plain(Code::End));
+        app.press(Key::parse("alt-enter").unwrap());
+        type_(&mut app, "body");
+        assert_eq!(
+            app.prompt.as_ref().map(|p| p.field().text()),
+            Some("hello world x\nbody"),
+        );
+        app.draw();
+        assert!(
+            status(&app).contains("2/2 · "),
+            "a multiline field did not say which line it is on: {}",
+            status(&app)
+        );
+        // A search field is one line by design, and says so: alt-enter there
+        // is refused, not swallowed.
+        app.press(Key::plain(Code::Esc));
+        app.press(Key::char('/'));
+        app.message.clear();
+        app.press(Key::parse("alt-enter").unwrap());
+        assert_eq!(app.message, "this field is one line");
+        assert_eq!(crate::tests::query(&app), Some(String::new()));
+    }
+
+    #[test]
+    fn tui_parity_amend_prefills_heads_subject() {
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().head = Some(gitten_core::refs::HeadState::Branch {
+            name: RefName::from("main"),
+            commit: Some("00000042".into()),
+        });
+        let mut app = commits_app(&handle);
+        app.dispatch("files.focus");
+        app.press(Key::char('A'));
+        assert_eq!(
+            app.prompt.as_ref().map(|p| p.field().text()),
+            Some("commit 42"),
+            "the amend did not open on HEAD's subject"
+        );
+        // The prefill is the field's own text: editing appends at its end,
+        // and accepting submits the whole thing.
+        type_(&mut app, "!");
+        app.press(Key::plain(Code::Enter));
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                !state.lock().unwrap().writes.is_empty()
+            }),
+            "the amend never reached the repository"
+        );
+        let writes = state.lock().unwrap().writes.clone();
+        assert_eq!(writes.len(), 1);
+    }
+
+    #[test]
+    fn tui_parity_marked_commit_range_is_kept_and_cleared() {
+        let (handle, _state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        // v marks the row the keyboard is on; moving extends it; v again
+        // takes it off. The status says what is marked — the range is for
+        // the next action, and it is a different thing from the copy range.
+        app.press(Key::char('v'));
+        app.draw();
+        assert!(status(&app).contains("1 marked"), "{}", status(&app));
+        app.dispatch("view.down");
+        app.dispatch("view.down");
+        app.draw();
+        assert!(status(&app).contains("3 marked"), "{}", status(&app));
+        // The mark survives a page and a top; a filter kills it, the way a
+        // refresh kills every row-named thing.
+        app.press(Key::char('v'));
+        app.draw();
+        assert!(!status(&app).contains("marked"), "{}", status(&app));
+        assert!(commits_of(&app).marks().is_none());
+        // And the copy range is untouched by any of it: `y` still copies the
+        // row the keyboard is on.
+        app.press(Key::char('y'));
+        assert!(app.copy.is_some(), "marking broke the copy path");
+    }
+
+    #[test]
+    fn tui_parity_an_extension_command_is_refused_and_hidden_from_help() {
+        // The extension seam registers a name and a key; the client that has
+        // no handler for it refuses it by name and never advertises it — the
+        // no-op audit covers the built-ins by enumeration; this covers the
+        // names that arrive after it.
+        let (handle, _state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        app.host.commands.register("ext.hello", "say hello");
+        app.host.keys.bind("commits", "e", "ext.hello").unwrap();
+        app.dispatch("ext.hello");
+        assert_eq!(
+            app.message, "ext.hello is not supported by this client",
+            "a registered extension command ran without a handler"
+        );
+        assert!(
+            !help_names(&app, "commits").iter().any(|n| n == "ext.hello"),
+            "the panel advertised a command the client cannot run"
+        );
+    }
+
+    #[test]
+    fn tui_parity_remapped_search_keys_help_and_dispatch_agree() {
+        let (handle, _state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        // The move: search.next leaves n for M, in the same mode.
+        assert!(app.host.keys.unbind("search", "n"));
+        app.host.keys.bind("search", "M", "search.next").unwrap();
+        // Help shows the new spelling and not the old.
+        let names = help_names(&app, "search");
+        assert!(names.iter().any(|n| n == "search.next"));
+        // With a filter standing, M walks and n is nobody's — said, not
+        // swallowed.
+        app.press(Key::char('/'));
+        type_(&mut app, "commit 4");
+        app.press(Key::plain(Code::Enter));
+        let first = commits_of(&app).cursor();
+        app.press(Key::char('M'));
+        assert!(
+            commits_of(&app).cursor() != first,
+            "the remapped key did not walk the matches"
+        );
+        // The old key fell through to the pane's own `n` — branches.new's
+        // neighbour here is commits.new-branch, refused unsupported — and
+        // never walked a match again.
+        app.message.clear();
+        let at = commits_of(&app).cursor();
+        app.press(Key::char('n'));
+        assert_eq!(commits_of(&app).cursor(), at, "the old key still walked");
+        assert!(
+            app.message.contains("commits.new-branch"),
+            "n fell through to nothing: {}",
+            app.message
         );
     }
 }

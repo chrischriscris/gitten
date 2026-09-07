@@ -13,6 +13,7 @@ pub use crate::source::DiffSource;
 pub mod align;
 pub mod command;
 pub mod differ;
+pub mod edit;
 pub mod font;
 pub mod graph;
 pub mod host;

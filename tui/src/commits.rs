@@ -217,6 +217,18 @@ pub struct Commits {
     /// held here rather than inferred again, and a keyboard *move* clears it.
     sel: Option<(usize, usize)>,
     dragging: bool,
+    /// The marked range — **rows kept for the next action**, lazygit's `v`,
+    /// and a different thing from `sel`: that one is what a copy takes, this
+    /// one is what an action will be aimed at. Visible-table rows, so a
+    /// filter's renumbering kills it the way it kills everything else that
+    /// names a row. Drawing it earns its own ink when the first action
+    /// consumes it (history surgery); until then the status line says what
+    /// is marked, and nothing borrows the copy selection's colour to mean
+    /// something else.
+    marks: Option<(usize, usize)>,
+    /// Whether the mark is armed — `v` opened it and the arrows extend it
+    /// until `v` says stop. The toggle lazygit's drag-select key has.
+    marking: bool,
 }
 
 impl Commits {
@@ -259,6 +271,8 @@ impl Commits {
             bar: Bar::default(),
             sel: None,
             dragging: false,
+            marks: None,
+            marking: false,
         }
     }
 
@@ -287,15 +301,15 @@ impl Commits {
     /// of the *filtered* list, and under a query those are not the same
     /// position. Everything that acts on "this commit" — open-diff, copy —
     /// reads through here, which is why filtering cannot desync them.
+    pub fn current(&self) -> Option<&Commit> {
+        self.commits.get(*self.visible.get(self.view.cursor())?)
+    }
+
     /// The commit an object id names, from the rows this pane holds — the
     /// subject a preview's label borrows. `None` when the pane does not
     /// hold it: a filtered list, a history the drilldown replaced.
     pub fn with_sha(&self, sha: &str) -> Option<&Commit> {
         self.commits.iter().find(|c| c.sha == sha)
-    }
-
-    pub fn current(&self) -> Option<&Commit> {
-        self.commits.get(*self.visible.get(self.view.cursor())?)
     }
 
     pub fn resize(&mut self, cols: usize, height: usize) {
@@ -348,6 +362,10 @@ impl Commits {
         self.refilter();
         self.sel = None;
         self.dragging = false;
+        // The marks named rows of the visible table, and the table just
+        // changed under them.
+        self.marks = None;
+        self.marking = false;
         // `set_len` clamped the cursor onto the surviving rows; the anchor,
         // where it survived, is put back by name.
         let cursor = anchored
@@ -374,9 +392,32 @@ impl Commits {
         self.view.set_len(self.visible.len());
     }
 
+    /// The next — or previous — row of the visible list, wrapping. With a
+    /// filter standing the visible list *is* the matches, so this is what
+    /// iterating them is; with none standing it says so by doing nothing.
+    /// A move of the keyboard, with a move's usual costs: the copy range
+    /// dies, and an armed mark grows.
+    pub fn next_match(&mut self, by: isize) {
+        if self.query.is_none() || self.visible.is_empty() {
+            return;
+        }
+        let len = self.visible.len() as isize;
+        let at = (self.view.cursor() as isize + by).rem_euclid(len) as usize;
+        self.sel = None;
+        self.view.go_to(at);
+        self.extend_marks();
+    }
+
+    /// Takes the filter off. The one door `search.clear` opens, so a search
+    /// that is cancelled restores the list it filtered.
+    pub fn clear_search(&mut self) {
+        self.apply_query("");
+    }
+
     pub fn move_by(&mut self, by: isize) {
         self.sel = None;
         self.view.move_by(by);
+        self.extend_marks();
     }
 
     pub fn down(&mut self) {
@@ -390,6 +431,7 @@ impl Commits {
     pub fn page(&mut self, pages: isize) {
         self.sel = None;
         self.view.page(pages);
+        self.extend_marks();
     }
 
     /// Scrolls the viewport without moving the cursor. The wheel.
@@ -405,17 +447,20 @@ impl Commits {
     pub fn to_top(&mut self) {
         self.sel = None;
         self.view.to_top();
+        self.extend_marks();
     }
 
     pub fn to_bottom(&mut self) {
         self.sel = None;
         self.view.to_bottom();
+        self.extend_marks();
     }
 
     /// Puts a saved row on screen, for a session restored across a restart.
     pub fn go_to(&mut self, row: usize) {
         self.sel = None;
         self.view.go_to(row);
+        self.extend_marks();
     }
 
     /// Swaps in a refreshed list, keeping the selection by identity.
@@ -437,6 +482,8 @@ impl Commits {
         // renumbered. It is the mouse's, and the mouse has let go.
         self.sel = None;
         self.dragging = false;
+        self.marks = None;
+        self.marking = false;
         self.commits = commits;
         let rows = assign_lanes(&self.commits);
         self.lanes = lane_count(&rows);
@@ -785,6 +832,53 @@ impl Commits {
         }
     }
 
+    // ---------------------------------------------------------------- the mark
+
+    /// `select.mark`, lazygit's `v`: arm a range at the cursor, extend it by
+    /// moving, and `v` again takes it off. A range of one row is a real
+    /// range — the mark is what the *next* action is aimed at, and one row
+    /// is a legal aim.
+    pub fn select_mark(&mut self) {
+        if self.marks.is_some() {
+            self.marks = None;
+            self.marking = false;
+            return;
+        }
+        let at = self.view.cursor();
+        self.marks = Some((at, at));
+        self.marking = true;
+    }
+
+    /// The marked range, normalized — anchors first. `None` when nothing is
+    /// marked. Rows of the visible list, so the caller resolves them to
+    /// commits the way the cursor does.
+    pub fn marks(&self) -> Option<(usize, usize)> {
+        self.marks.map(|(a, b)| (a.min(b), a.max(b)))
+    }
+
+    /// Whether a mark is armed and the arrows extend it.
+    pub fn is_marking(&self) -> bool {
+        self.marking
+    }
+
+    /// How many rows are marked, for a status line. `None` when nothing is.
+    pub fn mark_note(&self) -> Option<String> {
+        self.marks().map(|(a, b)| format!("{} marked", b - a + 1))
+    }
+
+    /// The cursor moved; an armed mark grows to cover it, a standing one
+    /// stays what it was. One lookup, once per move — never per frame.
+    fn extend_marks(&mut self) {
+        if !self.marking {
+            return;
+        }
+        let at = self.view.cursor();
+        self.marks = Some(match self.marks {
+            Some((anchor, _)) => (anchor, at),
+            None => (at, at),
+        });
+    }
+
     /// One line describing the list, for whatever draws a status bar. The lane
     /// count is the uncapped one: "280 lanes" is worth knowing when twelve are
     /// drawn. Position is counted over the *visible* rows — what the cursor
@@ -810,6 +904,9 @@ impl Commits {
         let mut out = format!("{position} · {} lanes", self.lanes);
         if self.lanes > MAX_LANES {
             out.push_str(&format!(" · {MAX_LANES} drawn"));
+        }
+        if let Some(note) = self.mark_note() {
+            out.push_str(&format!(" · {note}"));
         }
         out
     }
