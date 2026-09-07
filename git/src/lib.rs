@@ -46,7 +46,8 @@
 use gitten_core::differ::{Differs, Overrides};
 use gitten_core::operation::{Operation, Side};
 use gitten_core::refs::{
-    Branch, HeadState, ReflogEntry, Remote, RemoteBranch, ResetMode, Stash, Tag, Upstream,
+    Branch, HeadState, ReflogEntry, Remote, RemoteBranch, ResetMode, Stash, StashId, StashScope,
+    Tag, Upstream,
 };
 use gitten_core::status::{
     Change, ConflictEntry, ConflictKind, Kind, PathBytes, StagedEntry, Status, Submodule,
@@ -731,6 +732,76 @@ pub trait Repo: Send + Sync {
     /// positions across any of these verbs.
     fn stash_drop(&self, _index: usize) -> Result<()> {
         Err(unserved("dropping a stash"))
+    }
+
+    /// Parks a *chosen part* of the working tree — [`StashScope`] says which,
+    /// and just as bindingly which part must be left exactly where it is.
+    ///
+    /// [`Self::stash_push`] is this with [`StashScope::Tracked`], kept as its
+    /// own verb because it is the one a bare "stash" means and every client
+    /// already asks for it by that name.
+    ///
+    /// The same "did the stack move" test as the plain push, and one more
+    /// thing said when it moved *and* git failed: `--staged` writes its entry
+    /// before it tries to take the change back out of the index, and a path
+    /// with changes on both sides is a reversal git cannot perform. The entry
+    /// stands, nothing was taken away, and both halves of that reach the
+    /// reader — the alternative is dropping a stash git just made, which is
+    /// the one thing this family may never do behind somebody's back.
+    fn stash_push_scoped(&self, _message: Option<&str>, _scope: &StashScope) -> Result<usize> {
+        Err(unserved("stashing"))
+    }
+
+    /// [`Self::stash_apply`], aimed by the entry's own commit instead of by a
+    /// position that renumbers.
+    ///
+    /// The resolution happens here, against a stack read immediately before
+    /// the write, which is the whole difference: a push or a drop between the
+    /// keypress and the queue's turn moves the entry, and the number captured
+    /// at the keypress then names somebody else's work. See
+    /// [`StashId`](gitten_core::refs::StashId) for the rule, and
+    /// [`StashAt`](gitten_core::refs::StashAt) for the two answers that are
+    /// refusals rather than positions.
+    fn stash_apply_id(&self, _id: &StashId) -> Result<()> {
+        Err(unserved("applying a stash"))
+    }
+
+    /// [`Self::stash_pop`], aimed by commit — see [`Self::stash_apply_id`].
+    /// A conflicted restore is git's own refusal with the entry kept, which
+    /// is why nothing here drops as a separate step.
+    fn stash_pop_id(&self, _id: &StashId) -> Result<()> {
+        Err(unserved("popping a stash"))
+    }
+
+    /// [`Self::stash_drop`], aimed by commit — see [`Self::stash_apply_id`].
+    /// The verb this identity matters most for: a drop aimed at a stale
+    /// number destroys work nobody chose.
+    fn stash_drop_id(&self, _id: &StashId) -> Result<()> {
+        Err(unserved("dropping a stash"))
+    }
+
+    /// Gives a stash entry a new message, keeping its commit.
+    ///
+    /// **A rename re-files the entry at the top of the stack**, and that is
+    /// git's shape rather than a choice: the stash is a reflog, `git stash
+    /// store` appends, and no verb rewrites an entry's message in place. So
+    /// the commit is stored again under the new message and the old entry is
+    /// dropped — in that order, so the commit is named twice in the middle
+    /// and never zero times.
+    fn stash_rename(&self, _id: &StashId, _message: &str) -> Result<()> {
+        Err(unserved("renaming a stash"))
+    }
+
+    /// Starts a branch from a stash entry: `git stash branch`.
+    ///
+    /// Three things in one verb, which is why it is git's and not a checkout
+    /// plus an apply assembled here — the branch starts at the commit the
+    /// stash was *made on*, the entry is applied with its index intact so
+    /// what was staged is staged again, and the entry is dropped only if
+    /// that apply was clean. A dirty tree that the checkout would overwrite
+    /// is git's refusal, surfaced verbatim, with the stash untouched.
+    fn stash_branch(&self, _id: &StashId, _name: &[u8]) -> Result<()> {
+        Err(unserved("a branch from a stash"))
     }
 
     /// Moves the branch HEAD names onto `target` — `git reset -q --<mode>`.
@@ -1985,6 +2056,10 @@ impl Repo for Binary {
     }
 
     fn stash_push(&self, message: Option<&str>) -> Result<usize> {
+        self.stash_push_scoped(message, &StashScope::Tracked)
+    }
+
+    fn stash_push_scoped(&self, message: Option<&str>, scope: &StashScope) -> Result<usize> {
         // What `stash@{0}` resolves to before the push. Git answers "nothing
         // to stash" with exit 0 and one localized sentence on stdout — no
         // flag makes it machine-readable — so the only honest test of whether
@@ -1992,14 +2067,37 @@ impl Repo for Binary {
         // cheap rev-parses around a rare write, and no prose parsing to go
         // wrong in another locale.
         let before = self.stash_head();
-        match message {
-            Some(m) => run(&self.root, &["stash", "push", "-m", m])?,
-            None => run(&self.root, &["stash", "push"])?,
-        };
-        if self.stash_head() == before {
-            return Err("nothing to stash: the working tree has no tracked changes".into());
+        let mut args: Vec<&[u8]> = vec![b"stash", b"push"];
+        args.extend(scope.flags().iter().map(|flag| flag.as_bytes()));
+        if let Some(m) = message {
+            args.push(b"-m");
+            args.push(m.as_bytes());
         }
-        Ok(0)
+        // The pathspec goes last, behind `--`, which is also what makes a
+        // path beginning with `-` safe here without a refusal of its own:
+        // everything after the separator is a path to git, whatever it looks
+        // like.
+        if let Some(path) = scope.path() {
+            args.push(b"--");
+            args.push(path.as_bytes());
+        }
+        let ran = run_bytes(&self.root, &args);
+        let moved = self.stash_head() != before;
+        match (ran, moved) {
+            (Ok(_), true) => Ok(0),
+            (Ok(_), false) => Err(format!(
+                "nothing to stash: {} has no changes",
+                scope.label()
+            )),
+            // Git failed *after* writing the entry — `--staged` against a
+            // path with changes on both sides is the way in. Nothing was
+            // taken out of the index or the working tree, and the entry it
+            // wrote is on the stack: both facts, behind git's own words.
+            (Err(e), true) => Err(format!(
+                "{e} — the entry was recorded, and the index and working tree are untouched"
+            )),
+            (Err(e), false) => Err(e),
+        }
     }
 
     fn stash_apply(&self, index: usize) -> Result<()> {
@@ -2018,6 +2116,49 @@ impl Repo for Binary {
         run_bytes(
             &self.root,
             &[b"stash", b"drop", stash_ref(index).as_slice()],
+        )
+        .map(|_| ())
+    }
+
+    fn stash_apply_id(&self, id: &StashId) -> Result<()> {
+        self.stash_apply(self.stash_position(id)?)
+    }
+
+    fn stash_pop_id(&self, id: &StashId) -> Result<()> {
+        self.stash_pop(self.stash_position(id)?)
+    }
+
+    fn stash_drop_id(&self, id: &StashId) -> Result<()> {
+        self.stash_drop(self.stash_position(id)?)
+    }
+
+    fn stash_rename(&self, id: &StashId, message: &str) -> Result<()> {
+        if message.trim().is_empty() {
+            return Err("a stash needs a message".into());
+        }
+        let at = self.stash_position(id)?;
+        // Store first, drop second, and never the other way round: between
+        // the two the commit is named by two reflog entries, so a failure in
+        // the middle leaves the stash listed twice rather than not at all.
+        // The store lands on top, which shifts every entry under it — this
+        // one included — up by one, so the drop aims at `at + 1`.
+        run(&self.root, &["stash", "store", "-m", message, &id.commit])?;
+        self.stash_drop(at + 1)
+    }
+
+    fn stash_branch(&self, id: &StashId, name: &[u8]) -> Result<()> {
+        if !nameable(name) {
+            return Err("a branch needs a name".into());
+        }
+        refuse_dashes(name)?;
+        // Addressed by `stash@{n}` rather than by the commit for the third
+        // of the three things this verb does: handed a raw object id git
+        // makes the branch and applies the entry, then leaves it standing,
+        // because there is no reflog entry it could delete.
+        let at = self.stash_position(id)?;
+        run_bytes(
+            &self.root,
+            &[b"stash", b"branch", name, stash_ref(at).as_slice()],
         )
         .map(|_| ())
     }
@@ -3030,6 +3171,21 @@ impl Binary {
         run(&self.root, &["rev-parse", "-q", "--verify", "stash@{0}"])
             .ok()
             .map(|oid| lossy(trimmed(&oid)))
+    }
+
+    /// Turns a stash entry's identity back into the position git's own verbs
+    /// address — the `n` of `stash@{n}` — against the stack as it is *right
+    /// now*.
+    ///
+    /// Not a convenience: `git stash pop` and `git stash drop` take only a
+    /// `stash@{n}` reference and answer a raw object id with "is not a stash
+    /// reference", so this is the only road an identity has to those two
+    /// verbs. Read immediately before the write, so a push or a drop between
+    /// the keypress and the queue's turn is seen rather than assumed away —
+    /// and answered by [`StashAt`](gitten_core::refs::StashAt) with a
+    /// refusal when the entry is gone or doubled.
+    fn stash_position(&self, id: &StashId) -> Result<usize> {
+        id.resolve(&self.stashes()?).position()
     }
 
     /// Where git would keep the state file called `name`, resolved once per
@@ -6652,6 +6808,556 @@ mod tests {
         }
     }
 
+    // ------------------------------------------------------------ the stash family
+
+    /// A repository with one path staged, another unstaged and a third
+    /// untracked — the three sides every stash scope has to keep apart.
+    fn three_sided(name: &str) -> Scratch {
+        let r = Scratch::new(name);
+        r.write("staged.txt", b"one\n");
+        r.write("unstaged.txt", b"one\n");
+        r.git(&["add", "."]);
+        r.git(&["commit", "-qm", "base"]);
+        r.write("staged.txt", b"one\nstaged\n");
+        r.git(&["add", "staged.txt"]);
+        r.write("unstaged.txt", b"one\nunstaged\n");
+        r.write("fresh.txt", b"new\n");
+        r
+    }
+
+    /// The three sides as sorted display paths, for one assertion per side.
+    fn sides(g: &Handle) -> (Vec<String>, Vec<String>, Vec<String>) {
+        let st = g.status().expect("a status");
+        let sorted = |mut v: Vec<String>| {
+            v.sort();
+            v
+        };
+        (
+            sorted(
+                st.staged
+                    .iter()
+                    .map(|e| e.path.to_string_lossy().into_owned())
+                    .collect(),
+            ),
+            sorted(
+                st.unstaged
+                    .iter()
+                    .map(|e| e.path.to_string_lossy().into_owned())
+                    .collect(),
+            ),
+            sorted(
+                st.untracked
+                    .iter()
+                    .map(|e| e.path.to_string_lossy().into_owned())
+                    .collect(),
+            ),
+        )
+    }
+
+    /// Every path the stash entry `commit` holds, tracked half and untracked
+    /// half together — what a preview of that entry would draw, and the only
+    /// honest test of what a push actually took.
+    fn parked(g: &Handle, commit: &str) -> Vec<String> {
+        let mut all: Vec<String> = g
+            .pairs(commit)
+            .expect("the tracked half")
+            .iter()
+            .chain(
+                g.pairs_stash_untracked(commit)
+                    .expect("the third parent")
+                    .iter(),
+            )
+            .map(|pair| pair.path.clone())
+            .collect();
+        all.sort();
+        all
+    }
+
+    #[test]
+    fn a_named_stash_carries_its_message_and_the_default_still_does_not() {
+        let r = three_sided("stash-named");
+        let g = r.open();
+
+        assert_eq!(g.stash_push(Some("parser rewrite")).unwrap(), 0);
+        assert_eq!(g.stashes().unwrap()[0].message, "On main: parser rewrite");
+        // The default path is untouched: no message means git's own WIP text,
+        // which is a sentence about where it was made and not an empty one.
+        r.write("unstaged.txt", b"one\nagain\n");
+        assert_eq!(g.stash_push(None).unwrap(), 0);
+        let stack = g.stashes().unwrap();
+        assert!(
+            stack[0].message.starts_with("WIP on main:"),
+            "git's own default: {:?}",
+            stack[0].message
+        );
+        assert_eq!(stack[1].message, "On main: parser rewrite");
+    }
+
+    #[test]
+    fn the_staged_scope_takes_the_index_and_leaves_the_rest_standing() {
+        let r = three_sided("stash-scope-staged");
+        let g = r.open();
+
+        g.stash_push_scoped(Some("index only"), &StashScope::Staged)
+            .expect("the staged side parks");
+        let entry = g.stashes().unwrap()[0].commit.clone();
+        assert_eq!(
+            parked(&g, &entry),
+            vec!["staged.txt"],
+            "the entry holds the index side and nothing else"
+        );
+        // Nothing excluded was stolen: the unstaged change and the untracked
+        // file are exactly where they were, and the index is clean.
+        assert_eq!(
+            sides(&g),
+            (
+                Vec::<String>::new(),
+                vec!["unstaged.txt".to_string()],
+                vec!["fresh.txt".to_string()]
+            )
+        );
+    }
+
+    #[test]
+    fn the_unstaged_scope_leaves_the_staged_work_staged() {
+        let r = three_sided("stash-scope-unstaged");
+        let g = r.open();
+
+        g.stash_push_scoped(Some("worktree only"), &StashScope::Unstaged)
+            .expect("the unstaged side parks");
+        // The promise this scope makes: the staged work is still staged, and
+        // still in the tree. The untracked file is untouched too.
+        assert_eq!(
+            sides(&g),
+            (
+                vec!["staged.txt".to_string()],
+                Vec::<String>::new(),
+                vec!["fresh.txt".to_string()]
+            )
+        );
+        assert_eq!(
+            std::fs::read(r.0.join("staged.txt")).unwrap(),
+            b"one\nstaged\n",
+            "the staged bytes are still on disk"
+        );
+        assert_eq!(
+            std::fs::read(r.0.join("unstaged.txt")).unwrap(),
+            b"one\n",
+            "the unstaged change is the one that left"
+        );
+    }
+
+    #[test]
+    fn the_untracked_scope_takes_new_files_and_the_tracked_one_does_not() {
+        let r = three_sided("stash-scope-untracked");
+        let g = r.open();
+
+        // Tracked first: the new file is not work git was asked about.
+        g.stash_push_scoped(None, &StashScope::Tracked).unwrap();
+        assert_eq!(
+            sides(&g),
+            (
+                Vec::<String>::new(),
+                Vec::<String>::new(),
+                vec!["fresh.txt".to_string()]
+            ),
+            "a tracked push leaves an untracked file alone"
+        );
+        assert_eq!(
+            parked(&g, &g.stashes().unwrap()[0].commit),
+            vec!["staged.txt", "unstaged.txt"]
+        );
+
+        // Then the scope that was asked for it by name.
+        g.stash_push_scoped(Some("and the new one"), &StashScope::WithUntracked)
+            .unwrap();
+        assert!(g.status().unwrap().is_empty(), "{:?}", g.status().unwrap());
+        assert!(
+            !r.0.join("fresh.txt").exists(),
+            "the untracked file left the working tree"
+        );
+        assert_eq!(
+            parked(&g, &g.stashes().unwrap()[0].commit),
+            vec!["fresh.txt"],
+            "and it is in the entry, read out of the third parent"
+        );
+    }
+
+    #[test]
+    fn the_path_scope_takes_one_file_and_no_other() {
+        let r = three_sided("stash-scope-path");
+        let g = r.open();
+
+        g.stash_push_scoped(
+            Some("just the unstaged one"),
+            &StashScope::Path {
+                path: "unstaged.txt".into(),
+                untracked: false,
+            },
+        )
+        .expect("one path parks");
+        // What matters, and what the scope promises: nothing excluded was
+        // taken away. The staged change is still staged and still on disk;
+        // the untracked file is still there; only the named path left the
+        // working tree.
+        assert_eq!(
+            sides(&g),
+            (
+                vec!["staged.txt".to_string()],
+                Vec::<String>::new(),
+                vec!["fresh.txt".to_string()]
+            ),
+            "every other path stayed on its own side"
+        );
+        assert_eq!(
+            std::fs::read(r.0.join("staged.txt")).unwrap(),
+            b"one\nstaged\n"
+        );
+        assert_eq!(std::fs::read(r.0.join("unstaged.txt")).unwrap(), b"one\n");
+        // And the limit, asserted rather than assumed: git records the whole
+        // working tree in the entry and reverts only the pathspec out of it,
+        // so the entry is not a patch of one file. Documented on the scope.
+        assert_eq!(
+            parked(&g, &g.stashes().unwrap()[0].commit),
+            vec!["staged.txt", "unstaged.txt"],
+            "the entry carries the moment, not the pathspec"
+        );
+    }
+
+    #[test]
+    fn an_untracked_path_needs_the_flag_that_lets_git_see_it() {
+        let r = three_sided("stash-scope-path-untracked");
+        let g = r.open();
+
+        // Without `-u` git answers a pathspec naming nothing it tracks with
+        // "did not match any file(s) known to git" and stashes nothing — so
+        // the scope carries the flag, and the wrong answer is a refusal
+        // rather than a silent nothing.
+        let refused = g
+            .stash_push_scoped(
+                None,
+                &StashScope::Path {
+                    path: "fresh.txt".into(),
+                    untracked: false,
+                },
+            )
+            .expect_err("git cannot see an untracked path without -u");
+        assert!(refused.contains("did not match"), "{refused}");
+        assert!(g.stashes().unwrap().is_empty(), "nothing was recorded");
+
+        g.stash_push_scoped(
+            Some("the new file"),
+            &StashScope::Path {
+                path: "fresh.txt".into(),
+                untracked: true,
+            },
+        )
+        .expect("with -u it parks");
+        assert!(!r.0.join("fresh.txt").exists());
+        assert_eq!(
+            sides(&g),
+            (
+                vec!["staged.txt".to_string()],
+                vec!["unstaged.txt".to_string()],
+                Vec::<String>::new()
+            ),
+            "the tracked sides were not touched"
+        );
+    }
+
+    #[test]
+    fn a_scope_with_nothing_in_it_refuses_instead_of_reporting_success() {
+        let r = Scratch::new("stash-scope-empty");
+        r.write("f.txt", b"one\n");
+        r.git(&["add", "."]);
+        r.git(&["commit", "-qm", "base"]);
+        r.write("f.txt", b"one\nunstaged\n");
+        let g = r.open();
+
+        // Nothing is staged, and git has its own words for that — surfaced
+        // verbatim, because "No staged changes" says more than a sentence of
+        // ours would.
+        let said = g
+            .stash_push_scoped(None, &StashScope::Staged)
+            .expect_err("an empty index parks nothing");
+        assert!(said.contains("No staged changes"), "{said}");
+        assert!(g.stashes().unwrap().is_empty());
+
+        // A clean tree is the other shape: git answers it on *stdout* with
+        // exit 0 — "No local changes to save" — and no flag makes that
+        // machine-readable, so the stack not having moved is what turns it
+        // into a refusal, and the scope's own label is what names it.
+        r.git(&["checkout", "-q", "--", "f.txt"]);
+        let said = g
+            .stash_push_scoped(None, &StashScope::Tracked)
+            .expect_err("a clean tree parks nothing");
+        assert!(said.contains("the working tree has no changes"), "{said}");
+        assert!(g.stashes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_stash_verb_follows_its_commit_when_the_stack_moved_underneath() {
+        let r = Scratch::new("stash-identity-churn");
+        r.write("f.txt", b"one\n");
+        r.git(&["add", "."]);
+        r.git(&["commit", "-qm", "base"]);
+        let g = r.open();
+
+        for text in ["first", "second", "third"] {
+            r.write("f.txt", format!("{text}\n").as_bytes());
+            g.stash_push(Some(text)).unwrap();
+        }
+        // Chosen at stash@{1} — "second".
+        let chosen = StashId::of(&g.stashes().unwrap()[1]);
+        assert_eq!(chosen.index, 1);
+
+        // Then the stack churns: something drops the entry above it, and
+        // stash@{1} now names "first". A verb addressed by the number would
+        // take the wrong work; addressed by the commit it takes "second".
+        g.stash_drop(0).unwrap();
+        assert_eq!(g.stashes().unwrap()[1].message, "On main: first");
+        g.stash_apply_id(&chosen).expect("the chosen entry applies");
+        assert_eq!(std::fs::read(r.0.join("f.txt")).unwrap(), b"second\n");
+
+        // And a pop of the same identity takes that entry off, leaving the
+        // one the number would have hit.
+        r.git(&["checkout", "-q", "--", "f.txt"]);
+        g.stash_pop_id(&chosen).expect("the chosen entry pops");
+        let left: Vec<String> = g
+            .stashes()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.message)
+            .collect();
+        assert_eq!(left, vec!["On main: first".to_string()]);
+        assert_eq!(std::fs::read(r.0.join("f.txt")).unwrap(), b"second\n");
+    }
+
+    #[test]
+    fn a_stash_verb_refuses_an_entry_that_left_the_stack() {
+        let r = Scratch::new("stash-identity-gone");
+        r.write("f.txt", b"one\n");
+        r.git(&["add", "."]);
+        r.git(&["commit", "-qm", "base"]);
+        let g = r.open();
+
+        r.write("f.txt", b"parked\n");
+        g.stash_push(Some("wip")).unwrap();
+        let chosen = StashId::of(&g.stashes().unwrap()[0]);
+        r.write("f.txt", b"also parked\n");
+        g.stash_push(Some("later")).unwrap();
+        // Dropped by somebody else. The remembered number still names a row;
+        // the commit names nothing.
+        g.stash_drop(1).unwrap();
+
+        for outcome in [
+            g.stash_apply_id(&chosen),
+            g.stash_pop_id(&chosen),
+            g.stash_drop_id(&chosen),
+        ] {
+            let said = outcome.expect_err("a gone entry is refused");
+            assert!(said.contains("no longer on the stack"), "{said}");
+        }
+        assert_eq!(
+            g.stashes().unwrap().len(),
+            1,
+            "and the surviving entry was not touched"
+        );
+        assert_eq!(g.stashes().unwrap()[0].message, "On main: later");
+    }
+
+    #[test]
+    fn a_conflicted_pop_keeps_the_stash_and_says_so() {
+        let r = Scratch::new("stash-pop-conflict-id");
+        r.write("f.txt", b"one\n");
+        r.git(&["add", "."]);
+        r.git(&["commit", "-qm", "base"]);
+        let g = r.open();
+
+        r.write("f.txt", b"parked\n");
+        g.stash_push(Some("wip")).unwrap();
+        let chosen = StashId::of(&g.stashes().unwrap()[0]);
+        // The same file, changed again: the restore would overwrite work git
+        // was not asked to throw away.
+        r.write("f.txt", b"in the way\n");
+
+        let said = g
+            .stash_pop_id(&chosen)
+            .expect_err("git refuses the restore");
+        assert!(
+            said.contains("would be overwritten") || said.contains("conflict"),
+            "git's own words: {said}"
+        );
+        // The entry survived, addressed by the identity that chose it — a
+        // failed pop that lost the stash is the accident this asserts against.
+        assert_eq!(g.stashes().unwrap().len(), 1);
+        assert_eq!(
+            g.stashes().unwrap()[0].commit,
+            chosen.commit,
+            "the same entry, still recoverable"
+        );
+        assert_eq!(
+            std::fs::read(r.0.join("f.txt")).unwrap(),
+            b"in the way\n",
+            "and the working tree was not half-written"
+        );
+        // Recoverable means recoverable: with the way cleared it pops.
+        r.git(&["checkout", "-q", "--", "f.txt"]);
+        g.stash_pop_id(&chosen).expect("the kept entry still pops");
+        assert!(g.stashes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_renamed_stash_keeps_its_commit_and_is_re_filed_on_top() {
+        let r = Scratch::new("stash-rename");
+        r.write("f.txt", b"one\n");
+        r.git(&["add", "."]);
+        r.git(&["commit", "-qm", "base"]);
+        let g = r.open();
+
+        for text in ["first", "second"] {
+            r.write("f.txt", format!("{text}\n").as_bytes());
+            g.stash_push(None).unwrap();
+        }
+        // The older entry — stash@{1}, "first".
+        let chosen = StashId::of(&g.stashes().unwrap()[1]);
+        g.stash_rename(&chosen, "the parser one").unwrap();
+
+        let stack = g.stashes().unwrap();
+        assert_eq!(stack.len(), 2, "renaming adds no entry: {stack:?}");
+        // The commit is the identity and it did not change; git's stash is a
+        // reflog and only appends, so the entry is re-filed at the top.
+        assert_eq!(stack[0].message, "the parser one");
+        assert_eq!(stack[0].commit, chosen.commit);
+        assert!(
+            stack[1].message.starts_with("WIP on main:"),
+            "the other entry is untouched: {:?}",
+            stack[1].message
+        );
+        // And it is still the same work.
+        g.stash_apply_id(&StashId::of(&stack[0])).unwrap();
+        assert_eq!(std::fs::read(r.0.join("f.txt")).unwrap(), b"first\n");
+
+        let empty = g
+            .stash_rename(&StashId::of(&stack[0]), "   ")
+            .expect_err("a blank message is refused");
+        assert!(empty.contains("needs a message"), "{empty}");
+    }
+
+    #[test]
+    fn a_branch_from_a_stash_starts_where_the_stash_was_made() {
+        let r = Scratch::new("stash-branch");
+        r.write("f.txt", b"one\n");
+        r.git(&["add", "."]);
+        r.git(&["commit", "-qm", "base"]);
+        let base = r.rev_parse("HEAD");
+        let g = r.open();
+
+        r.write("f.txt", b"one\nwip\n");
+        r.git(&["add", "f.txt"]);
+        r.write("f.txt", b"one\nwip\nmore\n");
+        g.stash_push(Some("wip")).unwrap();
+        let chosen = StashId::of(&g.stashes().unwrap()[0]);
+        // History moves on, so the stash's base is no longer HEAD — which is
+        // the whole reason this verb exists rather than a checkout plus an
+        // apply.
+        r.write("f.txt", b"one\nsomething else\n");
+        r.git(&["commit", "-qam", "moved on"]);
+        assert_ne!(r.rev_parse("HEAD"), base);
+
+        g.stash_branch(&chosen, b"wip-branch").expect("the branch");
+
+        assert_eq!(
+            r.rev_parse("HEAD"),
+            base,
+            "the branch starts at the commit the stash was made on"
+        );
+        match g.head().unwrap() {
+            HeadState::Branch { name, .. } => assert_eq!(name.as_bytes(), b"wip-branch"),
+            other => panic!("checked out onto {other:?}"),
+        }
+        // Applied with its index intact: what was staged is staged again.
+        assert_eq!(
+            sides(&g),
+            (
+                vec!["f.txt".to_string()],
+                vec!["f.txt".to_string()],
+                Vec::<String>::new()
+            )
+        );
+        assert_eq!(
+            std::fs::read(r.0.join("f.txt")).unwrap(),
+            b"one\nwip\nmore\n"
+        );
+        // Addressed by stash@{n} and not by the raw commit, which is what
+        // lets git drop the entry after a clean apply.
+        assert!(
+            g.stashes().unwrap().is_empty(),
+            "the entry was dropped: {:?}",
+            g.stashes().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_branch_from_a_stash_refuses_a_name_that_is_not_one() {
+        let r = Scratch::new("stash-branch-name");
+        r.write("f.txt", b"one\n");
+        r.git(&["add", "."]);
+        r.git(&["commit", "-qm", "base"]);
+        let g = r.open();
+        r.write("f.txt", b"two\n");
+        g.stash_push(None).unwrap();
+        let chosen = StashId::of(&g.stashes().unwrap()[0]);
+
+        for (name, word) in [
+            (b"".as_slice(), "needs a name"),
+            (b"  ".as_slice(), "needs a name"),
+            (b"--detach".as_slice(), "beginning with '-'"),
+        ] {
+            let said = g
+                .stash_branch(&chosen, name)
+                .expect_err("a name git would read as an option");
+            assert!(said.contains(word), "{said}");
+        }
+        assert_eq!(g.stashes().unwrap().len(), 1, "and nothing happened");
+    }
+
+    #[test]
+    fn a_stash_entry_holds_both_its_halves_for_a_preview() {
+        // What an inspection before applying draws: the tracked half from
+        // the stash commit itself, the untracked half out of the third
+        // parent `-u` writes. Both, in one list, before anything is applied.
+        let r = three_sided("stash-preview-halves");
+        let g = r.open();
+
+        g.stash_push_scoped(Some("everything"), &StashScope::WithUntracked)
+            .unwrap();
+        let entry = g.stashes().unwrap()[0].commit.clone();
+
+        let tracked = g.pairs(&entry).unwrap();
+        assert_eq!(
+            paths(&tracked),
+            vec!["staged.txt", "unstaged.txt"],
+            "the tracked half is what the stash commit changed"
+        );
+        let untracked = g.pairs_stash_untracked(&entry).unwrap();
+        assert_eq!(paths(&untracked), vec!["fresh.txt"]);
+        // The new file's contents are there to read, with nothing opposite
+        // them — it existed nowhere before the stash took it.
+        assert!(untracked[0].old.is_empty(), "nothing on the old side");
+        assert_eq!(
+            untracked[0]
+                .new
+                .iter()
+                .map(|l| l.as_ref())
+                .collect::<Vec<&str>>(),
+            vec!["new"]
+        );
+        // And the working tree is clean, so this really was inspection
+        // before application.
+        assert!(g.status().unwrap().is_empty());
+    }
+
     #[test]
     fn the_ref_run_is_the_wave_and_never_the_answer() {
         // The one-run share must never outlive its wave: whatever a call
@@ -7058,6 +7764,82 @@ mod tests {
         assert_eq!(
             ReadsOnly.stash_drop(0).unwrap_err(),
             "this repository does not serve dropping a stash"
+        );
+        // The scoped push and the identity-addressed trio borrow their
+        // singulars' words: a backend that serves no stashing serves no
+        // *kind* of stashing either, and there is nothing new to say.
+        assert_eq!(
+            ReadsOnly
+                .stash_push_scoped(None, &StashScope::Staged)
+                .unwrap_err(),
+            "this repository does not serve stashing"
+        );
+        let id = StashId {
+            index: 0,
+            commit: "abc".into(),
+        };
+        assert_eq!(
+            ReadsOnly.stash_apply_id(&id).unwrap_err(),
+            "this repository does not serve applying a stash"
+        );
+        assert_eq!(
+            ReadsOnly.stash_pop_id(&id).unwrap_err(),
+            "this repository does not serve popping a stash"
+        );
+        assert_eq!(
+            ReadsOnly.stash_drop_id(&id).unwrap_err(),
+            "this repository does not serve dropping a stash"
+        );
+        assert_eq!(
+            ReadsOnly.stash_rename(&id, "new").unwrap_err(),
+            "this repository does not serve renaming a stash"
+        );
+        assert_eq!(
+            ReadsOnly.stash_branch(&id, b"side").unwrap_err(),
+            "this repository does not serve a branch from a stash"
+        );
+    }
+
+    #[test]
+    fn a_staged_scope_over_a_path_changed_on_both_sides_says_what_it_left() {
+        // Git's own limit, and worth a test because the failure is not clean:
+        // `--staged` writes the entry and *then* tries to take the change
+        // back out of the index, which for a path changed on both sides is a
+        // reversal it cannot perform. It exits nonzero with the entry
+        // already recorded. Nothing here drops that entry — a stash git just
+        // made is not ours to destroy behind somebody's back — so the
+        // refusal says both halves and the reader decides.
+        let r = Scratch::new("stash-staged-both-sides");
+        r.write("f.txt", b"one\n");
+        r.git(&["add", "."]);
+        r.git(&["commit", "-qm", "base"]);
+        r.write("f.txt", b"one\nstaged\n");
+        r.git(&["add", "f.txt"]);
+        r.write("f.txt", b"one\nstaged\nunstaged\n");
+        let g = r.open();
+
+        let said = g
+            .stash_push_scoped(Some("index only"), &StashScope::Staged)
+            .expect_err("git cannot lift the staged side out alone");
+        assert!(
+            said.contains("the entry was recorded")
+                && said.contains("index and working tree are untouched"),
+            "{said}"
+        );
+        // Both halves are true: the entry is there, and every byte of the
+        // working tree and the index survived.
+        assert_eq!(g.stashes().unwrap().len(), 1);
+        assert_eq!(
+            std::fs::read(r.0.join("f.txt")).unwrap(),
+            b"one\nstaged\nunstaged\n"
+        );
+        assert_eq!(
+            sides(&g),
+            (
+                vec!["f.txt".to_string()],
+                vec!["f.txt".to_string()],
+                Vec::<String>::new()
+            )
         );
     }
 

@@ -237,7 +237,14 @@ pub enum StashScope {
     /// the staged work, is git applying a change that is already there.
     Unstaged,
     /// One path, both its sides — `git stash push -- <path>`. Every other
-    /// path stays exactly as it was.
+    /// path stays exactly as it was: still on disk, still staged if it was
+    /// staged.
+    ///
+    /// The same honest limit as [`StashScope::Unstaged`], and git's again:
+    /// the *entry* records the whole working tree, and only the named path is
+    /// reverted out of it. Nothing excluded is taken away — that is the
+    /// invariant — but an entry made this way is not a patch of one file, and
+    /// applying it later brings the rest of that moment back with it.
     Path {
         path: PathBytes,
         /// The path is untracked, so the push needs `-u` to see it at all:
