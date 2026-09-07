@@ -48,6 +48,7 @@ use gitten_core::differ::Overrides;
 use gitten_core::edit::{Edit, Field};
 use gitten_core::host::Host;
 use gitten_core::operation::{Operation, Side};
+use gitten_core::rebase::Rewrite;
 use gitten_core::refs::{HeadState, RefName, ResetMode};
 use gitten_core::runs::Run;
 use gitten_core::source::DiffSource;
@@ -4057,6 +4058,24 @@ impl App {
                     gitten_app::act::reset_commit_author(self);
                 }
             }
+            // The three one-key rewrites, each composing the whole window it
+            // touches and each asking twice, armed per command so a squash
+            // never spends a fixup's answer.
+            "commits.squash-up" => {
+                if self.commits_focused(command) {
+                    gitten_app::act::rewrite_commit(self, command, Rewrite::SquashUp);
+                }
+            }
+            "commits.fixup-up" => {
+                if self.commits_focused(command) {
+                    gitten_app::act::rewrite_commit(self, command, Rewrite::FixupUp);
+                }
+            }
+            "commits.drop-commit" => {
+                if self.commits_focused(command) {
+                    gitten_app::act::rewrite_commit(self, command, Rewrite::Drop);
+                }
+            }
             // History *editing*: the plan the todo screen opens on, the
             // stop-here rebase, the reword field, the base mark and the two
             // reorders. Each reads the row the keyboard is on and the
@@ -6034,6 +6053,21 @@ impl gitten_app::act::Client for App {
         self.rebase_base.clone()
     }
 
+    fn confirm_or_arm(&mut self, command: &str, target: &[u8]) -> bool {
+        // The same arm the history questions use, on the same terms: named
+        // by the command as well as by what it is aimed at, and dying on a
+        // repository switch with everything else that was asked about the
+        // repository that just left.
+        let armed = (command.to_string(), target.to_vec());
+        if self.history_arm.as_ref() == Some(&armed) {
+            self.history_arm = None;
+            true
+        } else {
+            self.history_arm = Some(armed);
+            false
+        }
+    }
+
     fn selected_conflict(&self) -> Option<gitten_core::status::PathBytes> {
         let Some(Screens::Files { view, .. }) = self.panes.focused() else {
             return None;
@@ -6093,21 +6127,6 @@ impl gitten_app::act::FileClient for App {
                 view.confirm_or_arm_discard(view_file_section(target.section), &target.path)
             }
             _ => false,
-        }
-    }
-
-    fn confirm_or_arm_command(&mut self, command: &str) -> bool {
-        // The same arm the history questions use, with no commit to name —
-        // which is what a repository-wide question has instead of a row,
-        // and which buys it the same death on a refresh or a repository
-        // switch that every other armed question here dies of.
-        let armed = (command.to_string(), Vec::new());
-        if self.history_arm.as_ref() == Some(&armed) {
-            self.history_arm = None;
-            true
-        } else {
-            self.history_arm = Some(armed);
-            false
         }
     }
 }
@@ -7829,6 +7848,21 @@ diff --git a/tracked.txt b/tracked.txt
                 String::from_utf8_lossy(plan.upstream()),
                 shown_script(&script)
             ));
+            Ok(())
+        }
+
+        fn rebase_abort(&self) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            s.writes.push("rebase abort".into());
+            // git's own guarantee: the state is gone and the branch is back.
+            s.standing = None;
+            Ok(())
+        }
+
+        fn rebase_continue(&self) -> gitten_git::Result<()> {
+            let mut s = self.0.lock().unwrap();
+            s.writes.push("rebase continue".into());
+            s.standing = None;
             Ok(())
         }
 
@@ -17046,6 +17080,762 @@ shared tail
             "the deep re-author never landed: {:?}",
             state.lock().unwrap().writes
         );
+    }
+
+    // ------------------------------------------------ W6 history editing
+
+    /// The plan a write recorded, as one line. Waits for it, pumping the
+    /// finish wave meanwhile, and answers what the fake actually holds so a
+    /// failure prints the difference rather than "false".
+    fn planned(app: &mut App, state: &Arc<Mutex<FakeState>>) -> String {
+        until(Duration::from_secs(2), || {
+            app.pump_quiet();
+            !state.lock().unwrap().writes.is_empty()
+        });
+        state.lock().unwrap().writes.join(" / ")
+    }
+
+    /// LG-048 / LG-049 / LG-050. The three one-key rewrites, each asked
+    /// twice and each composing the whole window it touches: a fold replays
+    /// the parent first, because git refuses a plan opening on a squash,
+    /// and a drop simply leaves the commit out. What git makes of each plan
+    /// is `gitten-git`'s `squash_melds_messages_by_gits_own_rule_and_fixup_discards_them`.
+    #[test]
+    fn tui_parity_squash_fixup_and_drop_compose_the_window_they_rewrite() {
+        for (command, verb, expected) in [
+            (
+                "commits.squash-up",
+                "squash",
+                "rebase-todo 00000003 | pick 00000002; squash 00000001; pick 00000000",
+            ),
+            (
+                "commits.fixup-up",
+                "fixup",
+                "rebase-todo 00000003 | pick 00000002; fixup 00000001; pick 00000000",
+            ),
+            (
+                "commits.drop-commit",
+                "drop",
+                "rebase-todo 00000002 | pick 00000000",
+            ),
+        ] {
+            let (handle, state) = fake(&[]);
+            let mut app = history_app(&handle);
+            app.dispatch("view.down");
+            let row = row_sha(&app);
+
+            app.dispatch(command);
+            assert_eq!(
+                app.message,
+                format!("{verb} {row}? press again to confirm"),
+                "{command} ran without asking"
+            );
+            app.pump_quiet();
+            assert!(
+                state.lock().unwrap().writes.is_empty(),
+                "{command} wrote before its question was answered"
+            );
+
+            app.dispatch(command);
+            assert_eq!(planned(&mut app, &state), expected, "{command}");
+        }
+    }
+
+    /// LG-048's other half: a fold arms per command, so a squash asked and
+    /// a fixup pressed asks again rather than folding under the other
+    /// verb's answer.
+    #[test]
+    fn tui_parity_a_fold_never_spends_another_folds_question() {
+        let (handle, state) = fake(&[]);
+        let mut app = history_app(&handle);
+        app.dispatch("view.down");
+        let row = row_sha(&app);
+        app.dispatch("commits.squash-up");
+        app.dispatch("commits.fixup-up");
+        assert_eq!(
+            app.message,
+            format!("fixup {row}? press again to confirm"),
+            "the fixup spent the squash's question"
+        );
+        app.pump_quiet();
+        assert!(state.lock().unwrap().writes.is_empty());
+    }
+
+    /// LG-051. HEAD's message is one amend that leaves the index alone;
+    /// anything deeper is the same reword arriving as a plan, with git's
+    /// own `reword` word never emitted — it would open an editor nothing
+    /// here can answer, and the message is already in hand.
+    #[test]
+    fn tui_parity_reword_amends_head_and_replans_anything_deeper() {
+        let (handle, state) = fake(&[]);
+        let mut app = history_app(&handle);
+        let head = row_sha(&app);
+        state.lock().unwrap().head = Some(HeadState::Branch {
+            name: RefName::from("main"),
+            commit: Some(head.clone()),
+        });
+
+        // The field opens on the commit's own subject: a reword is an edit
+        // of what is standing, not a retyping of it.
+        app.dispatch("commits.reword");
+        assert_eq!(
+            app.prompt.as_ref().map(|p| p.field().text().to_string()),
+            Some("commit 0".into())
+        );
+        type_(&mut app, " — said better");
+        app.press(Key::plain(Code::Enter));
+        assert_eq!(
+            planned(&mut app, &state),
+            "reword-head commit 0 — said better"
+        );
+
+        // One row down is a rebase: the plan carries the message, and the
+        // pick that replays the commit is followed by the exec that amends
+        // it. Fresh, because the write above re-read the window.
+        let (handle, state) = fake(&[]);
+        let mut app = history_app(&handle);
+        app.dispatch("view.down");
+        let deeper = row_sha(&app);
+        app.dispatch("commits.reword");
+        type_(&mut app, "!");
+        app.press(Key::plain(Code::Enter));
+        assert_eq!(
+            app.message,
+            format!("rewrite 2 commits from {deeper}? press again to confirm")
+        );
+        app.dispatch("commits.reword");
+        assert!(
+            app.prompt.is_some(),
+            "the second press should re-open the field, not confirm blind"
+        );
+        app.press(Key::plain(Code::Esc));
+        // The question stands on the plan, so the plan's own key answers it.
+        app.dispatch("commits.reword");
+        type_(&mut app, "!");
+        app.press(Key::plain(Code::Enter));
+        assert_eq!(
+            planned(&mut app, &state),
+            format!("rebase-plan 00000002 | pick {deeper}; exec amend -F commit 1!; pick 00000000")
+        );
+    }
+
+    /// LG-052. `i` opens the plan over the window from HEAD down to the row
+    /// the keyboard is on — every commit picked, which is git's own
+    /// starting plan and a rebase that changes nothing — and the screen
+    /// owns the keyboard while it stands. Editing writes nothing; enter
+    /// asks; the second enter runs it.
+    #[test]
+    fn tui_parity_the_todo_screen_edits_a_plan_and_runs_it_once_confirmed() {
+        let (handle, state) = fake(&[]);
+        let mut app = history_app(&handle);
+        app.screen = Screen::new(120, 24);
+        app.dispatch("view.down");
+        app.dispatch("view.down");
+        let base = row_sha(&app);
+
+        app.press(Key::char('i'));
+        assert!(
+            app.todo.is_some(),
+            "the plan never opened: {:?}",
+            app.message
+        );
+        assert!(
+            app.message.contains("3 commits from 00000002"),
+            "{:?}",
+            app.message
+        );
+        app.draw();
+        let body: String = (0..24)
+            .map(|y| app.screen.row_text(y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(body.contains("rebase plan"), "{body}");
+        assert!(body.contains("pick 00000000 commit 0"), "{body}");
+
+        // The screen owns the keyboard: `d` is the plan's drop here, not
+        // the commit list's own drop-commit, and nothing underneath runs.
+        app.press(Key::plain(Code::Down));
+        app.press(Key::char('d'));
+        assert_eq!(
+            app.todo.as_ref().unwrap().plan().entries()[1].action,
+            gitten_core::rebase::Action::Drop
+        );
+        app.pump_quiet();
+        assert!(
+            state.lock().unwrap().writes.is_empty(),
+            "editing the plan wrote to the repository"
+        );
+
+        // Enter asks once, naming what is at stake, and only then runs.
+        app.press(Key::plain(Code::Enter));
+        assert_eq!(
+            app.message,
+            format!("rewrite 3 commits from {base}? press again to confirm")
+        );
+        assert!(app.todo.is_some(), "the plan closed on the question");
+        app.press(Key::plain(Code::Enter));
+        assert!(app.todo.is_none(), "the plan stayed open after running");
+        assert_eq!(
+            planned(&mut app, &state),
+            "rebase-plan 00000003 | pick 00000002; drop 00000001; pick 00000000"
+        );
+    }
+
+    /// A cancelled todo edit writes nothing and leaves the repository
+    /// exactly as it was — the whole reason a plan is safe to open.
+    #[test]
+    fn tui_parity_a_cancelled_todo_edit_writes_nothing() {
+        let (handle, state) = fake(&[]);
+        let mut app = history_app(&handle);
+        app.dispatch("view.down");
+        app.press(Key::char('i'));
+        assert!(app.todo.is_some());
+        app.press(Key::plain(Code::Down));
+        app.press(Key::char('s'));
+        app.press(Key::char('S'));
+        app.press(Key::plain(Code::Esc));
+        assert!(app.todo.is_none(), "esc left the plan open");
+        assert_eq!(app.message, "the plan is closed — nothing was rewritten");
+        app.pump_quiet();
+        assert!(
+            state.lock().unwrap().writes.is_empty(),
+            "a cancelled plan wrote: {:?}",
+            state.lock().unwrap().writes
+        );
+        // And the keyboard is the commit list's again: `s` means the fold,
+        // which asks rather than editing a plan that is not there.
+        app.press(Key::char('s'));
+        assert!(app.message.contains("squash"), "{:?}", app.message);
+    }
+
+    /// The plan's fold refuses on its own oldest row, where the press
+    /// happened, rather than letting git refuse the whole plan after a
+    /// process started: there is nothing below it in the window to fold
+    /// into, and the way out is a deeper base.
+    #[test]
+    fn tui_parity_the_todo_screen_refuses_a_fold_with_nothing_beneath_it() {
+        let (handle, _) = fake(&[]);
+        let mut app = history_app(&handle);
+        app.dispatch("view.down");
+        app.press(Key::char('i'));
+        app.press(Key::plain(Code::End));
+        app.press(Key::char('s'));
+        assert!(
+            app.message.contains("nothing below it"),
+            "{:?}",
+            app.message
+        );
+        assert!(app.message.contains("deeper"), "{:?}", app.message);
+    }
+
+    /// LG-052's second key. `e` stops the rebase *at* the commit under the
+    /// keyboard — the one plan that is meant to hand back a standing rebase
+    /// rather than a finished one, which is the state W5's banner and
+    /// continue were built for.
+    #[test]
+    fn tui_parity_edit_commit_stops_the_rebase_where_it_was_asked_to() {
+        let (handle, state) = fake(&[]);
+        let mut app = history_app(&handle);
+        app.dispatch("view.down");
+        let row = row_sha(&app);
+        app.press(Key::char('e'));
+        assert_eq!(
+            app.message,
+            format!("rewrite 2 commits from {row}? press again to confirm")
+        );
+        app.press(Key::char('e'));
+        assert!(
+            app.message.contains("amend, then continue the rebase"),
+            "{:?}",
+            app.message
+        );
+        assert_eq!(
+            planned(&mut app, &state),
+            format!("rebase-plan 00000002 | edit {row}; pick 00000000")
+        );
+    }
+
+    /// LG-055. The alt-arrows swap a commit with its neighbour, up meaning
+    /// towards HEAD — which is *later* in git's own file, and the reason
+    /// the plan holds the list's order rather than the file's. The edges
+    /// refuse rather than wrapping.
+    #[test]
+    fn tui_parity_moving_a_commit_swaps_it_with_its_neighbour() {
+        let (handle, state) = fake(&[]);
+        let mut app = history_app(&handle);
+
+        // The newest row has nothing above it, and says so without asking.
+        app.press(Key::new(Code::Up, false, true, false));
+        assert!(
+            app.message.contains("already the newest"),
+            "{:?}",
+            app.message
+        );
+        app.pump_quiet();
+        assert!(state.lock().unwrap().writes.is_empty());
+
+        app.press(Key::new(Code::Down, false, true, false));
+        assert_eq!(
+            app.message,
+            "rewrite 2 commits from 00000001? press again to confirm"
+        );
+        app.press(Key::new(Code::Down, false, true, false));
+        assert_eq!(
+            planned(&mut app, &state),
+            "rebase-plan 00000002 | pick 00000000; pick 00000001",
+            "the swap did not reach the plan"
+        );
+    }
+
+    /// Autosquash lands every `fixup!` on the commit it names, in the plan
+    /// and not in the repository: the screen stays open, and the run is
+    /// still a separate, confirmed press.
+    #[test]
+    fn tui_parity_autosquash_folds_each_marker_onto_its_commit() {
+        let (handle, state) = fake(&[]);
+        // A window whose newest commit is a fixup! of the oldest one.
+        {
+            let mut s = state.lock().unwrap();
+            s.log_at_answers.clear();
+        }
+        let mut app = history_app(&handle);
+        // The pane's own rows are what a plan composes over, so the marker
+        // is planted there — the same place a real `git commit --fixup`
+        // would have put it.
+        if let Some(Screens::Commits { view, .. }) = app.panes.get_mut("commits") {
+            let mut rows = hundred_commits();
+            rows[0].subject = "fixup! commit 2".into();
+            *view = Commits::new(rows);
+        }
+        app.dispatch("view.down");
+        app.dispatch("view.down");
+        app.press(Key::char('i'));
+        assert!(app.todo.is_some(), "{:?}", app.message);
+        app.press(Key::char('S'));
+        assert_eq!(app.message, "1 commit folded onto the one it names");
+        app.press(Key::plain(Code::Enter));
+        app.press(Key::plain(Code::Enter));
+        assert_eq!(
+            planned(&mut app, &state),
+            "rebase-plan 00000003 | pick 00000002; fixup 00000000; pick 00000001",
+            "the marker did not land on the commit it names"
+        );
+    }
+
+    /// LG-053 and LG-054. `r` in the branches pane moves this branch onto
+    /// the row, asked twice; with a base marked it is git's `--onto`
+    /// instead, and the marked commit stays exactly where it is.
+    #[test]
+    fn tui_parity_rebase_onto_uses_the_marked_base_when_one_stands() {
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        let mut app = history_app(&handle);
+
+        // The mark is made on the commit list and says so, and the list
+        // carries it on its status line for as long as it stands.
+        app.dispatch("view.down");
+        let base = row_sha(&app);
+        app.press(Key::char('B'));
+        assert_eq!(
+            app.message,
+            format!("{base} is the rebase base — everything after it moves")
+        );
+        assert!(
+            commits_of(&app).status().contains(&format!("base {base}")),
+            "{}",
+            commits_of(&app).status()
+        );
+
+        // And it is spent one pane over: the same key, now git's `--onto`,
+        // with the marked commit left where it is and only its children
+        // moving. Asked twice, because it rewrites this branch's history.
+        app.dispatch("branches.focus");
+        app.dispatch("view.top");
+        app.press(Key::char('r'));
+        assert_eq!(
+            app.message,
+            format!("rebase onto main, from {base} up? press again to confirm")
+        );
+        app.pump_quiet();
+        assert!(state.lock().unwrap().writes.is_empty(), "it ran unasked");
+        app.press(Key::char('r'));
+        assert_eq!(
+            planned(&mut app, &state),
+            format!("rebase-onto main from {base}")
+        );
+    }
+
+    /// LG-054's other half: the mark toggles off on the row that set it,
+    /// and the branch verb is the plain rebase again — a mark nobody can
+    /// clear is a mark carried into the next rewrite by accident.
+    #[test]
+    fn tui_parity_the_rebase_base_toggles_off_and_the_plain_rebase_returns() {
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        let mut app = history_app(&handle);
+        app.dispatch("view.down");
+        app.press(Key::char('B'));
+        assert!(commits_of(&app).status().contains("base "), "never marked");
+        app.press(Key::char('B'));
+        assert!(
+            app.message.contains("no longer the rebase base"),
+            "{:?}",
+            app.message
+        );
+        assert!(
+            !commits_of(&app).status().contains("base "),
+            "{}",
+            commits_of(&app).status()
+        );
+
+        app.dispatch("branches.focus");
+        app.dispatch("view.top");
+        app.press(Key::char('r'));
+        assert_eq!(app.message, "rebase onto main? press again to confirm");
+        app.press(Key::char('r'));
+        assert_eq!(planned(&mut app, &state), "rebase-onto main");
+    }
+
+    /// A rewrite's question never retargets: armed on the branch it was
+    /// asked about, so moving the keyboard and pressing again asks afresh
+    /// — and the branches pane's own delete arm cannot be spent by it.
+    #[test]
+    fn tui_parity_a_rebase_question_never_retargets_or_arms_a_delete() {
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        let mut app = history_app(&handle);
+        app.dispatch("branches.focus");
+        app.dispatch("view.top");
+        app.press(Key::char('r'));
+        assert_eq!(app.message, "rebase onto main? press again to confirm");
+
+        // A second row, a second question — the first is not spendable here.
+        app.dispatch("view.down");
+        app.press(Key::char('r'));
+        assert!(
+            app.message.contains("press again to confirm"),
+            "{:?}",
+            app.message
+        );
+        app.pump_quiet();
+        assert!(
+            state.lock().unwrap().writes.is_empty(),
+            "a retargeted rebase ran: {:?}",
+            state.lock().unwrap().writes
+        );
+
+        // And the delete's own arm is untouched: `d` asks rather than
+        // spending the rebase's answer.
+        app.dispatch("view.top");
+        app.press(Key::char('r'));
+        app.dispatch("branches.delete");
+        assert!(app.message.contains("delete"), "{:?}", app.message);
+        app.pump_quiet();
+        assert!(
+            state.lock().unwrap().branch_writes.is_empty(),
+            "the rebase's question armed a delete: {:?}",
+            state.lock().unwrap().branch_writes
+        );
+    }
+
+    /// LG-062. The files pane's `g` opens the reset menu, whose strengths
+    /// aim at the upstream the branch is configured against — read from the
+    /// repository and named in full, so what the question says and what git
+    /// resolves are the same string.
+    #[test]
+    fn tui_parity_upstream_reset_names_the_tracking_ref_and_asks_twice() {
+        let (handle, state) = fake(&[]);
+        {
+            let mut s = state.lock().unwrap();
+            s.locals = vec![Branch {
+                name: RefName::from("main"),
+                commit: "f00d".into(),
+                upstream: Some(gitten_core::refs::Upstream {
+                    remote: RefName::from("origin"),
+                    branch: RefName::from("main"),
+                    ahead: Some(1),
+                    behind: Some(2),
+                }),
+                head: true,
+            }];
+            s.head = Some(HeadState::Branch {
+                name: RefName::from("main"),
+                commit: Some("f00d".into()),
+            });
+        }
+        let mut app = commits_app(&handle);
+        app.dispatch("files.focus");
+
+        // The menu asks and writes nothing.
+        app.press(Key::char('g'));
+        assert!(
+            app.message.contains("soft, mixed or hard"),
+            "{:?}",
+            app.message
+        );
+        app.pump_quiet();
+        assert!(state.lock().unwrap().writes.is_empty(), "the menu reset");
+
+        // And its letters belong to the question while it stands: `h` is
+        // the hard reset here and the pane walk everywhere else.
+        app.press(Key::char('h'));
+        assert_eq!(
+            app.message,
+            "reset --hard to the upstream? press again to confirm"
+        );
+        app.dispatch("files.reset-upstream-hard");
+        assert_eq!(planned(&mut app, &state), "reset --hard origin/main");
+    }
+
+    /// The upstream reset refuses in a sentence when there is nothing to
+    /// aim at, rather than queueing a job git would answer with a revspec
+    /// error — and spends no question doing it.
+    #[test]
+    fn tui_parity_upstream_reset_refuses_without_an_upstream() {
+        let (handle, state) = fake(&[]);
+        branch_world(&state);
+        {
+            let mut s = state.lock().unwrap();
+            s.head = Some(HeadState::Branch {
+                name: RefName::from("main"),
+                commit: Some("f00d".into()),
+            });
+        }
+        let mut app = commits_app(&handle);
+        app.dispatch("files.focus");
+        app.dispatch("files.reset-upstream-mixed");
+        assert!(
+            app.message.contains("tracks no upstream"),
+            "{:?}",
+            app.message
+        );
+        app.dispatch("files.reset-upstream-mixed");
+        assert!(
+            app.message.contains("tracks no upstream"),
+            "a refusal spent its own question: {:?}",
+            app.message
+        );
+        app.pump_quiet();
+        assert!(state.lock().unwrap().writes.is_empty());
+    }
+
+    /// LG-063. The nuke is the most destructive key here, and the only one
+    /// whose question says what cannot be undone. It sits behind the menu
+    /// rather than on the pane's own `D`, because `D` on a row discards
+    /// that file and the two are a keypress and a catastrophe apart.
+    #[test]
+    fn tui_parity_nuking_the_working_tree_asks_twice_and_is_not_the_row_key() {
+        let (handle, state) = fake(&["new.txt"]);
+        let mut app = commits_app(&handle);
+        app.dispatch("files.focus");
+
+        // The pane's own `D` is the row's discard, untouched by any of
+        // this: it names the file it would take, and nothing else.
+        app.press(Key::char('D'));
+        assert!(app.message.contains("new.txt"), "{:?}", app.message);
+        assert!(!app.message.contains("nuke"), "{:?}", app.message);
+
+        // The nuke is one door further in, and asks in words that say what
+        // survives.
+        app.press(Key::char('g'));
+        app.press(Key::char('D'));
+        assert!(
+            app.message.contains("nuke the working tree?"),
+            "{:?}",
+            app.message
+        );
+        assert!(
+            app.message.contains("ignored files stay"),
+            "{:?}",
+            app.message
+        );
+        app.pump_quiet();
+        assert!(
+            state.lock().unwrap().writes.is_empty(),
+            "an unconfirmed nuke ran: {:?}",
+            state.lock().unwrap().writes
+        );
+        app.dispatch("files.nuke");
+        assert_eq!(planned(&mut app, &state), "nuke");
+    }
+
+    /// A rewrite the loaded window cannot cover refuses in words, before
+    /// anything is armed and before any process runs: a root with nothing
+    /// beneath it, and a merge that `rebase -i` would flatten.
+    #[test]
+    fn tui_parity_a_plan_refuses_the_shapes_it_cannot_cover() {
+        let (handle, state) = fake(&[]);
+        let mut app = history_app(&handle);
+        // The root: `hundred_commits` ends on one, and there is nothing
+        // beneath it to rebuild onto.
+        app.dispatch("view.bottom");
+        app.press(Key::char('i'));
+        assert!(app.todo.is_none(), "a plan opened on the root");
+        assert!(app.message.contains("root"), "{:?}", app.message);
+
+        // A merge in the window would be flattened, so the plan says so
+        // instead of flattening it.
+        if let Some(Screens::Commits { view, .. }) = app.panes.get_mut("commits") {
+            let mut rows = hundred_commits();
+            rows[1].parents =
+                vec!["00000002".to_string(), "0000dead".to_string()].into_boxed_slice();
+            *view = Commits::new(rows);
+        }
+        app.dispatch("view.top");
+        app.dispatch("view.down");
+        app.dispatch("view.down");
+        app.press(Key::char('i'));
+        assert!(app.todo.is_none(), "a plan opened over a merge");
+        assert!(app.message.contains("merge"), "{:?}", app.message);
+
+        app.pump_quiet();
+        assert!(
+            state.lock().unwrap().writes.is_empty(),
+            "a refused plan wrote: {:?}",
+            state.lock().unwrap().writes
+        );
+    }
+
+    /// A conflict mid-rewrite is git's own state, and the lifecycle carries
+    /// it: the refusal comes back in git's words, the rebase is standing
+    /// afterwards, and the keys that were disabled a moment ago answer it.
+    #[test]
+    fn tui_parity_a_conflicted_plan_leaves_the_lifecycle_holding_it() {
+        let (handle, state) = fake(&[]);
+        state.lock().unwrap().refuse_rebase = Some("could not apply 00000001... commit 1".into());
+        let mut app = history_app(&handle);
+        app.dispatch("view.down");
+        app.press(Key::char('i'));
+        app.press(Key::plain(Code::Enter));
+        app.press(Key::plain(Code::Enter));
+
+        // git's own words, and the rebase standing behind them.
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                app.operation.is_some()
+            }),
+            "the standing rebase never reached the app: {:?}",
+            app.message
+        );
+        assert!(app.message.contains("could not apply"), "{:?}", app.message);
+        assert_eq!(
+            app.operation.map(|o| o.kind),
+            Some(gitten_core::operation::Kind::Rebase)
+        );
+
+        // The lifecycle keys are live now, and a second rewrite is not:
+        // one sequencer, one index.
+        app.dispatch("commits.interactive-rebase");
+        assert!(
+            app.message.contains("waits for the standing rebase"),
+            "{:?}",
+            app.message
+        );
+        state.lock().unwrap().refuse_rebase = None;
+        app.dispatch("rebase.abort");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                state
+                    .lock()
+                    .unwrap()
+                    .writes
+                    .iter()
+                    .any(|w| w == "rebase abort")
+            }),
+            "the abort never ran: {:?}",
+            state.lock().unwrap().writes
+        );
+    }
+
+    /// The new keys are data like every other: what the panel advertises
+    /// and what a press does come from the same registry, and a rebind
+    /// moves both together.
+    #[test]
+    fn tui_parity_history_editing_keys_resolve_help_and_dispatch_agree() {
+        let (handle, _) = fake(&[]);
+        let mut app = history_app(&handle);
+        let mut modes = Modes::new();
+        modes.push("commits");
+        for (key, name) in [
+            ("i", "commits.interactive-rebase"),
+            ("e", "commits.edit-commit"),
+            ("r", "commits.reword"),
+            ("B", "commits.mark-base"),
+            ("alt-up", "commits.move-up"),
+            ("alt-down", "commits.move-down"),
+        ] {
+            assert_eq!(
+                app.host.keys.resolve(
+                    &modes,
+                    &gitten_core::command::parse_chord(key).expect("a chord")
+                ),
+                Resolve::Run(name),
+                "{key} does not run {name}"
+            );
+            assert!(matches!(app.availability.state(name), Usable::Available));
+        }
+
+        // The plan's own mode, which owns the keyboard while it stands.
+        let mut modes = Modes::new();
+        modes.push("todo");
+        for (key, name) in [
+            ("p", "todo.pick"),
+            ("r", "todo.reword"),
+            ("e", "todo.edit"),
+            ("s", "todo.squash"),
+            ("f", "todo.fixup"),
+            ("d", "todo.drop"),
+            ("S", "todo.autosquash"),
+            ("enter", "todo.run"),
+            ("ctrl-k", "todo.move-up"),
+            ("ctrl-j", "todo.move-down"),
+        ] {
+            assert_eq!(
+                app.host.keys.resolve(
+                    &modes,
+                    &gitten_core::command::parse_chord(key).expect("a chord")
+                ),
+                Resolve::Run(name),
+                "{key} does not run {name} in the plan"
+            );
+            assert!(matches!(app.availability.state(name), Usable::Available));
+        }
+
+        // And the files pane's menu: `g` opens it, its letters answer it.
+        let mut modes = Modes::new();
+        modes.push("files");
+        assert_eq!(
+            app.host.keys.resolve(
+                &modes,
+                &gitten_core::command::parse_chord("g").expect("a chord")
+            ),
+            Resolve::Run("files.reset-menu")
+        );
+        let mut modes = Modes::new();
+        modes.push("files");
+        modes.push("upstream");
+        for (key, name) in [
+            ("s", "files.reset-upstream-soft"),
+            ("m", "files.reset-upstream-mixed"),
+            ("h", "files.reset-upstream-hard"),
+            ("D", "files.nuke"),
+        ] {
+            assert_eq!(
+                app.host.keys.resolve(
+                    &modes,
+                    &gitten_core::command::parse_chord(key).expect("a chord")
+                ),
+                Resolve::Run(name),
+                "{key} does not run {name} while the menu stands"
+            );
+        }
+
+        // A press with no plan open is refused by name where it is
+        // answered — a sentence about the plan, not about the client.
+        app.dispatch("todo.drop");
+        assert_eq!(app.message, "todo.drop needs an open rebase plan");
     }
 
     /// Every history write waits for a standing operation rather than

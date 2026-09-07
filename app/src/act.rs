@@ -43,6 +43,26 @@ pub trait Client {
         None
     }
 
+    /// Arms a destructive question that no *pane row* names — a rebase onto
+    /// a branch, a reset toward the upstream, a nuke — or spends the arm
+    /// already standing on the same pair.
+    ///
+    /// Keyed on the command *and* the raw bytes the write is aimed at, for
+    /// the reason every arm here is: a soft reset must never spend a hard
+    /// one's question, and a rebase onto one branch must never spend the
+    /// question asked about another. `target` is empty where the question
+    /// is about the repository itself, which is a target too — there is
+    /// exactly one working tree to nuke.
+    ///
+    /// The default never confirms, which is the honest answer for a client
+    /// that keeps no such arm: the question stands, the write never runs,
+    /// and nothing is destroyed by a client that cannot ask twice. A client
+    /// that binds these commands implements it; one that does not never
+    /// reaches here at all.
+    fn confirm_or_arm(&mut self, _command: &str, _target: &[u8]) -> bool {
+        false
+    }
+
     /// The commit marked as a rebase base, when one is. Read from the base
     /// trait because the mark is *made* in a history pane and *spent* in a
     /// branch one, and neither should have to know about the other's
@@ -94,19 +114,6 @@ pub trait FileClient: Client {
     fn paths_in(&self, section: FileSection) -> Vec<PathBytes>;
     /// Arms this file target, or spends an identical arm already standing.
     fn confirm_or_arm_file(&mut self, target: &SelectedFile) -> bool;
-    /// Arms a question this pane asks about the *repository* rather than a
-    /// row — a reset toward the upstream, a nuke — or spends the arm
-    /// standing on that same command. Keyed on the command alone, because
-    /// that is all such a question has to name.
-    ///
-    /// The default never confirms, which is the honest answer for a client
-    /// that keeps no such arm: the question stands, the write never runs,
-    /// and nothing is destroyed by a client that cannot ask twice. A client
-    /// that binds these commands implements it; one that does not, does not
-    /// reach here at all.
-    fn confirm_or_arm_command(&mut self, _command: &str) -> bool {
-        false
-    }
 }
 
 /// `branches.delete`, for every client.
@@ -870,6 +877,7 @@ pub fn mark_rebase_base(client: &mut impl HistoryClient) {
 /// and a conflict are git's own sentences, coming back verbatim with
 /// whatever state git left standing.
 pub fn rebase_onto(client: &mut impl BranchClient, onto: Vec<u8>, shown: String) {
+    const COMMAND: &str = "commits.rebase-onto";
     let Some(repo) = client.repo() else {
         client.say("a fixture has no repository to rebase in".into());
         return;
@@ -878,8 +886,10 @@ pub fn rebase_onto(client: &mut impl BranchClient, onto: Vec<u8>, shown: String)
         return;
     }
     let base = client.rebase_base();
-    let target = Target::Local(gitten_core::refs::RefName::from_bytes(&onto));
-    if !client.confirm_or_arm_branch(&target) {
+    // Armed on the branch it is aimed at, and not on the row: the pane's
+    // own arm is the delete's, and a question about a rewrite must never be
+    // spendable by a keypress that means destroy the branch.
+    if !client.confirm_or_arm(COMMAND, &onto) {
         client.ask(match &base {
             Some(base) => format!(
                 "rebase onto {shown}, from {} up? press again to confirm",
@@ -937,7 +947,7 @@ pub fn reset_to_upstream(client: &mut impl FileClient, command: &str, mode: Rese
             return;
         }
     };
-    if !client.confirm_or_arm_command(command) {
+    if !client.confirm_or_arm(command, &[]) {
         client.ask(format!(
             "reset {} to the upstream? press again to confirm",
             mode.flag()
@@ -966,7 +976,7 @@ pub fn nuke_worktree(client: &mut impl FileClient) {
     if refuse_while_operating(client) {
         return;
     }
-    if !client.confirm_or_arm_command(COMMAND) {
+    if !client.confirm_or_arm(COMMAND, &[]) {
         client.ask(
             "nuke the working tree? every uncommitted change goes, tracked and \
              untracked — ignored files stay. press again to confirm"
@@ -2023,6 +2033,11 @@ mod tests {
     }
 
     impl Client for Fake {
+        fn confirm_or_arm(&mut self, _: &str, _: &[u8]) -> bool {
+            self.confirm_calls += 1;
+            self.confirmations.pop_front().unwrap_or(false)
+        }
+
         fn say(&mut self, message: String) {
             self.events.push(format!("say:{message}"));
             self.said.push(message);
@@ -2072,11 +2087,6 @@ mod tests {
         }
 
         fn confirm_or_arm_file(&mut self, _: &SelectedFile) -> bool {
-            self.confirm_calls += 1;
-            self.confirmations.pop_front().unwrap_or(false)
-        }
-
-        fn confirm_or_arm_command(&mut self, _: &str) -> bool {
             self.confirm_calls += 1;
             self.confirmations.pop_front().unwrap_or(false)
         }
