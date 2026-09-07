@@ -1286,6 +1286,24 @@ pub trait Repo: Send + Sync {
         Err(unserved("pulling"))
     }
 
+    /// Pushes one tag to the named remote — `git push <remote> tag <name>`.
+    fn push_tag(&self, _remote: &[u8], _name: &[u8]) -> Result<()> {
+        Err(unserved("pushing a tag"))
+    }
+
+    /// Deletes the branch from the named remote — `git push <remote>
+    /// --delete <branch>`. The local branch of the same name survives.
+    fn delete_remote_branch(&self, _remote: &[u8], _branch: &[u8]) -> Result<()> {
+        Err(unserved("deleting a remote branch"))
+    }
+
+    /// Points HEAD's ref at `target` — a sha or a reflog selector — with
+    /// `message` as the reflog sentence. The index and the working tree do
+    /// not move; see the implementation for why this is undo's verb.
+    fn move_head(&self, _target: &[u8], _message: &str) -> Result<()> {
+        Err(unserved("moving HEAD"))
+    }
+
     /// Updates remote-tracking refs — the one remote named, or every remote
     /// this repository knows when `None`. Nothing else moves: a fetch never
     /// touches local branches, HEAD or the working tree, which is what makes
@@ -2706,6 +2724,42 @@ impl Repo for Binary {
             false => &[b"push", b"-q", b"--set-upstream", remote, branch],
         };
         run_bytes(&self.root, argv).map(|_| ())
+    }
+
+    fn push_tag(&self, remote: &[u8], name: &[u8]) -> Result<()> {
+        refuse_dashes(remote)?;
+        refuse_dashes(name)?;
+        // `push <remote> tag <name>`: the `tag` word is what keeps a tag
+        // named like a branch from pushing the branch instead. Bytes end
+        // to end, like every other push-shaped verb.
+        run_bytes(&self.root, &[b"push", remote, b"tag", name]).map(|_| ())
+    }
+
+    fn delete_remote_branch(&self, remote: &[u8], branch: &[u8]) -> Result<()> {
+        refuse_dashes(remote)?;
+        refuse_dashes(branch)?;
+        // `--delete` names the remote-tracking branch's *source*, never a
+        // local ref: the local branch of the same name survives, which is
+        // what makes this the remote half of branch deletion rather than
+        // the whole of it.
+        run_bytes(&self.root, &[b"push", remote, b"--delete", branch]).map(|_| ())
+    }
+
+    fn move_head(&self, target: &[u8], message: &str) -> Result<()> {
+        if target.first() == Some(&b'-') {
+            return Err("a revision never begins with `-`".into());
+        }
+        // `update-ref -m`, not a reset flag: pointing HEAD's ref at the
+        // target moves neither the index nor the working tree, which is
+        // the whole of undo's promise — the reader's uncommitted work is
+        // exactly where they left it. The message rides `-m` as one argv,
+        // so our own undo/redo sentences are exact strings the reflog can
+        // later be asked for, not substrings of git's own prose.
+        run_bytes(
+            &self.root,
+            &[b"update-ref", b"-m", message.as_bytes(), b"HEAD", target],
+        )
+        .map(|_| ())
     }
 
     fn pull(&self) -> Result<()> {
@@ -10379,6 +10433,136 @@ mod tests {
             before,
             "an existing upstream is none of a push's business"
         );
+    }
+
+    #[test]
+    fn a_pushed_tag_lands_on_the_remote_not_a_branch_of_the_same_name() {
+        let origin = Scratch::bare("tag-push-origin");
+        let r = Scratch::new("tag-push");
+        r.write("seed.txt", b"seed\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "seed"]);
+        r.git(&["branch", "v1"]);
+        r.git(&["tag", "v1"]);
+        r.git(&[
+            "remote",
+            "add",
+            "origin",
+            &format!("{}", origin.0.display()),
+        ]);
+
+        r.open().push_tag(b"origin", b"v1").expect("the tag pushes");
+
+        assert_eq!(
+            origin.rev_parse("refs/tags/v1"),
+            r.rev_parse("refs/tags/v1"),
+            "the tag arrived"
+        );
+        assert!(
+            origin
+                .git_os_out(&["for-each-ref".into(), "refs/heads/v1".into()])
+                .is_empty(),
+            "the branch of the same name stayed home"
+        );
+    }
+
+    #[test]
+    fn deleting_a_remote_branch_leaves_the_local_branch_standing() {
+        let origin = Scratch::bare("remote-delete-origin");
+        let r = Scratch::new("remote-delete");
+        r.write("seed.txt", b"seed\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "seed"]);
+        r.git(&["branch", "doomed"]);
+        r.git(&[
+            "remote",
+            "add",
+            "origin",
+            &format!("{}", origin.0.display()),
+        ]);
+        r.git(&["push", "-q", "origin", "doomed"]);
+
+        r.open()
+            .delete_remote_branch(b"origin", b"doomed")
+            .expect("the remote branch deletes");
+
+        assert!(
+            origin
+                .git_os_out(&["for-each-ref".into(), "refs/heads/doomed".into()])
+                .is_empty(),
+            "the remote ref is gone"
+        );
+        assert_eq!(
+            r.rev_parse("refs/heads/doomed"),
+            r.rev_parse("HEAD"),
+            "the local branch never moved"
+        );
+    }
+
+    #[test]
+    fn move_head_walks_back_a_commit_and_leaves_tree_and_index() {
+        let r = Scratch::new("move-head");
+        r.write("f.txt", b"one\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "one"]);
+        r.write("f.txt", b"two\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "two"]);
+        // Uncommitted work on both sides of the index: the promise is that
+        // neither moves — bytes below, staged and unstaged alike.
+        r.write("f.txt", b"two-and-a-half\n");
+        r.git(&["add", "-A"]);
+        r.write("f.txt", b"two-and-three-quarters\n");
+
+        let g = r.open();
+        let back = r.rev_parse("HEAD~1");
+        g.move_head(back.as_bytes(), "gitten: undo")
+            .expect("the walk back");
+
+        assert_eq!(r.rev_parse("HEAD"), back, "the branch moved");
+        assert_eq!(r.rev_parse("HEAD"), r.rev_parse("main"));
+        assert_eq!(
+            std::fs::read(join_raw(&r.0, b"f.txt")).unwrap(),
+            b"two-and-three-quarters\n",
+            "the working tree is untouched"
+        );
+        assert_eq!(
+            r.git_os_out(&["diff".into(), "--cached".into(), "--name-only".into()]),
+            b"f.txt\n".as_slice(),
+            "the index still holds what was staged"
+        );
+    }
+
+    #[test]
+    fn move_head_writes_the_sentence_it_was_given() {
+        let r = Scratch::new("move-head-message");
+        r.write("f.txt", b"one\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "one"]);
+
+        let g = r.open();
+        let back = r.rev_parse("HEAD");
+        r.write("f.txt", b"two\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "two"]);
+        g.move_head(back.as_bytes(), "gitten: undo")
+            .expect("the walk back");
+
+        let log = g.reflog(1).expect("the reflog reads");
+        assert_eq!(log[0].message, "gitten: undo", "the exact sentence");
+        assert_eq!(log[0].selector, "HEAD@{0}");
+    }
+
+    #[test]
+    fn move_head_refuses_a_dash_revision() {
+        let r = Scratch::new("move-head-dash");
+        r.write("f.txt", b"one\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "one"]);
+        let before = r.rev_parse("HEAD");
+        let e = r.open().move_head(b"-x", "gitten: undo").unwrap_err();
+        assert!(e.contains("never begins"), "{e}");
+        assert_eq!(r.rev_parse("HEAD"), before, "nothing moved");
     }
 
     #[test]
