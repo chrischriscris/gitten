@@ -201,7 +201,9 @@ impl Write {
     /// in its announcement — the lifecycle owns it from there — and
     /// anything earlier failing restores the reader's position before
     /// reporting, so a failed graft never strands a detached HEAD behind
-    /// it. Files with empty patches are skipped; all empty is refused
+    /// it. A graft that finds the reader detached refuses outright: there
+    /// is no branch to carry the rewrite, and amending one would leave it
+    /// dangling. Files with empty patches are skipped; all empty is refused
     /// before the queue.
     pub fn graft_files(
         repo: &Handle,
@@ -1100,6 +1102,17 @@ fn graft(
     let home = r.head()?;
     if matches!(&home, HeadState::Branch { commit: None, .. }) {
         return Err("no commits to rewrite yet".into());
+    }
+    // A detached HEAD has no branch to carry the rewrite: the dance
+    // below would detach at the commit, amend a replacement, and then
+    // check out the old commit again — the replacement dangling
+    // unreferenced while the visible state reads byte-identical to
+    // before. Refuse up front, naming the door, before anything moves.
+    if let HeadState::Detached { commit } = &home {
+        return Err(format!(
+            "checkout a branch first — grafting onto a detached HEAD would leave the rewrite dangling at {}",
+            abbreviated(commit)
+        ));
     }
     // Detach at the commit being rewritten: its content is then the
     // worktree, so every patch aims at exactly what it was built from.

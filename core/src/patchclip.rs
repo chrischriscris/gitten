@@ -86,7 +86,9 @@ pub struct PickedFile {
 /// reads once in the builder — and a hunk already held stays where it was
 /// put: re-picking never reorders, because a patch that moves under a
 /// second press is an apply order nobody can predict. The same rule the
-/// cherry-pick clipboard keeps, for the same reason.
+/// cherry-pick clipboard keeps, for the same reason. A re-pick from a
+/// different side re-anchors the entry: the hunks are content and stay,
+/// but the read they revalidate against is the most recent one.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct PatchClipboard {
     files: Vec<PickedFile>,
@@ -117,8 +119,11 @@ impl PatchClipboard {
 
     /// Picks `hunks` of `path` from `anchor`, folding into the standing
     /// entry when the path is already held. Every picked hunk starts
-    /// included; a hunk already held is left alone. Returns how many hunks
-    /// were new.
+    /// included; a hunk already held is left alone. A re-pick from a
+    /// different side re-anchors the entry — the hunks are content and
+    /// stay, but the OIDs the apply re-checks are the latest read's, or a
+    /// stale anchor's identity would vouch for content it never saw.
+    /// Returns how many hunks were new.
     pub fn pick(
         &mut self,
         path: String,
@@ -128,7 +133,14 @@ impl PatchClipboard {
         hunks: Vec<Hunk>,
     ) -> usize {
         let entry = match self.files.iter_mut().find(|f| f.path == path) {
-            Some(entry) => entry,
+            Some(entry) => {
+                if entry.anchor != anchor {
+                    entry.anchor = anchor;
+                    entry.index_oid = index_oid;
+                    entry.head_oid = head_oid;
+                }
+                entry
+            }
             None => {
                 self.files.push(PickedFile {
                     path,
@@ -300,6 +312,37 @@ mod tests {
         assert_eq!(file.hunks.len(), 2);
         assert!(!file.hunks[0].included, "the toggle survived the re-pick");
         assert!(file.hunks[1].included);
+    }
+
+    #[test]
+    fn repicking_a_held_path_from_another_side_reanchors_the_entry() {
+        let mut clip = PatchClipboard::new();
+        clip.pick(
+            "a.txt".into(),
+            Anchor::Unstaged,
+            Some("i1".into()),
+            Some("h1".into()),
+            vec![hunk("one")],
+        );
+        // Tab between staged and unstaged, `p` in each: the same path
+        // picked from the other side.
+        let added = clip.pick(
+            "a.txt".into(),
+            Anchor::Staged,
+            Some("i2".into()),
+            None,
+            vec![hunk("two")],
+        );
+        assert_eq!(added, 1);
+        let file = &clip.files()[0];
+        assert_eq!(
+            file.anchor,
+            Anchor::Staged,
+            "the entry follows the latest pick"
+        );
+        assert_eq!(file.index_oid.as_deref(), Some("i2"));
+        assert_eq!(file.head_oid, None);
+        assert_eq!(file.hunks.len(), 2, "the held hunk survives the re-anchor");
     }
 
     #[test]

@@ -960,6 +960,52 @@ mod tests {
     }
 
     #[test]
+    fn a_detached_graft_refuses_and_leaves_the_reader_where_they_were() {
+        let r = three_commits("remove-detached");
+        let middle = r.rev("HEAD~1");
+        let tip = r.rev("HEAD");
+        // Detach at the commit under the knife: the reader's whole
+        // position is the detached commit, with no branch to carry a
+        // rewrite back to.
+        r.git(&["checkout", "-q", &middle]);
+        let handle = gitten_git::open(&r.0);
+        let runner = Runner::new();
+
+        let job = Write::graft_files(
+            &handle,
+            middle.as_bytes().to_vec(),
+            vec![(b"f.txt".to_vec(), lift_two())],
+            true,
+        )
+        .expect("a non-empty patch grafts");
+        let err = run_job(&runner, job).expect_err("a detached graft must refuse");
+        assert!(
+            err.contains("checkout a branch first") && err.contains("dangling"),
+            "the refusal did not name the door: {err}"
+        );
+        // The position is untouched: still detached, at the same commit,
+        // the tree byte-identical, the history never moved.
+        assert_eq!(r.rev("HEAD"), middle, "the reader moved");
+        assert_eq!(r.rev("main"), tip, "the branch tip moved");
+        assert_eq!(
+            r.git(&["branch", "--show-current"]).trim(),
+            "",
+            "a branch appeared"
+        );
+        let after = String::from_utf8(r.read("f.txt")).unwrap();
+        assert!(
+            after.contains("EDIT-TWO\n") && after.contains("EDIT-EIGHT\n"),
+            "the tree moved under a refusal: {after:?}"
+        );
+        assert_eq!(
+            r.log_subjects(),
+            vec!["middle".to_string(), "base".to_string()],
+            "the detached line never moved"
+        );
+        assert_eq!(r.porcelain(), "", "the index came home too");
+    }
+
+    #[test]
     fn an_empty_graft_is_refused_before_the_queue() {
         let job = Write::graft_files(
             &gitten_git::open(&std::env::temp_dir()),

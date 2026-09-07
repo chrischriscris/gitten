@@ -11911,6 +11911,35 @@ mod tests {
     }
 
     #[test]
+    fn a_planned_reword_on_a_detached_head_moves_the_detached_head() {
+        // The analog the graft guard deliberately does not cover: the
+        // todo path never detaches and restores, it runs `git rebase`
+        // with HEAD implicit — and git moves a detached HEAD onto the
+        // replayed tip itself. No dangling replacement, no byte-identical
+        // no-op: the position visibly moves to the rewritten history.
+        let r = linear_repo("plan-detached");
+        let at = r.rev_parse("HEAD");
+        r.git(&["checkout", "-q", &at]);
+        let g = r.open();
+        let commits = window(&r);
+        let mut plan = Plan::over(&commits, 1).expect("a straight window");
+        plan.set_message(1, b"two, said properly\n".to_vec())
+            .expect("a message");
+        g.rebase_plan(&plan).expect("the plan runs");
+        assert_eq!(
+            subjects(&r),
+            vec!["three", "two, said properly", "one", "base"],
+            "the reword landed"
+        );
+        assert_ne!(
+            r.rev_parse("HEAD"),
+            at,
+            "the detached HEAD rode the replay instead of dangling"
+        );
+        assert!(!g.rebase_in_progress(), "the rebase finished");
+    }
+
+    #[test]
     fn a_planned_drop_and_reorder_rewrite_the_line_they_cover() {
         let r = linear_repo("plan-drop-reorder");
         let g = r.open();
