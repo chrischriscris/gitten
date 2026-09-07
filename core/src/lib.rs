@@ -22,6 +22,7 @@ pub mod host;
 pub mod markdown;
 pub mod operation;
 pub mod patch;
+pub mod patchclip;
 pub mod path;
 pub mod prepared;
 pub mod rebase;
