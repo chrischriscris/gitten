@@ -3066,6 +3066,12 @@ impl App {
         // mid-rebase — and the lifecycle keys gate on the fresh answer.
         self.sync_operation();
         self.startup_pending = true;
+        // A clipboard of shas from the repository just left names objects
+        // the new one does not have, so a paste would be git's "bad object"
+        // over commits nobody can see. The same goes for an armed history
+        // question: it was asked about a commit that is no longer on screen.
+        self.clipboard.clear();
+        self.history_arm = None;
         self.help = false;
         self.tail = None;
         self.tail_commits.clear();
@@ -16249,6 +16255,56 @@ shared tail
         );
         app.dispatch("commits.clear-copies");
         assert_eq!(app.message, "the cherry-pick clipboard is already empty");
+    }
+
+    /// A clipboard of shas from one repository names nothing in the next,
+    /// so the switch drops it rather than leaving a paste that would come
+    /// back as git's "bad object" over commits nobody can see. The armed
+    /// history question goes with it, for the same reason.
+    #[test]
+    fn tui_parity_a_repository_switch_drops_the_clipboard_and_the_arm() {
+        let (a_handle, a_state) = fake(&[]);
+        let (b_handle, _b_state) = fake(&[]);
+        with_mru("w6-switch", &["/b", "/a"], || {
+            let mut app = history_app(&a_handle);
+            app.use_opener(Arc::new(KeyedOpener {
+                repos: vec![
+                    (std::path::PathBuf::from("/a"), a_handle.clone()),
+                    (std::path::PathBuf::from("/b"), b_handle.clone()),
+                ],
+            }));
+
+            app.dispatch("commits.copy");
+            assert_eq!(app.message, "copied 1 commit — 1 on the clipboard");
+            app.dispatch("commits.reset-hard");
+            assert!(app.message.contains("press again to confirm"));
+
+            app.dispatch("project.next");
+            app.pump_quiet();
+            assert_eq!(app.message, "switched to /b", "{:?}", app.message);
+
+            // Nothing to paste, and the arm that stood is gone: the second
+            // press of a hard reset asks again rather than firing on a row
+            // the eye never confirmed in this repository.
+            app.dispatch("commits.paste");
+            assert_eq!(
+                app.message, "nothing copied to cherry-pick — copy commits first",
+                "{:?}",
+                app.message
+            );
+            app.dispatch("commits.reset-hard");
+            assert!(
+                app.message.contains("press again to confirm"),
+                "the arm survived the switch: {:?}",
+                app.message
+            );
+            app.pump_quiet();
+            assert!(
+                a_state.lock().unwrap().writes.is_empty(),
+                "a write reached the repository that was left: {:?}",
+                a_state.lock().unwrap().writes
+            );
+        });
     }
 
     /// LG-057, the part a status line cannot carry: a copied row says so in
