@@ -513,6 +513,20 @@ pub struct Entry {
     pub message: Option<Vec<u8>>,
     /// An amendment to run after this commit is replayed.
     pub amend: Option<Amend>,
+    /// For an [`Action::Fixup`] only: keep *this* commit's message for the
+    /// melded result instead of the one it folds into — git's `fixup -C`.
+    ///
+    /// The third of a fold's three message answers, beside squash (keep
+    /// both) and plain fixup (keep the older one). It is a flag rather than
+    /// a fourth action because it is the same fold: everything that reasons
+    /// about folding — the first-line rule, the "nothing beneath it"
+    /// refusal, the autosquash landing — must go on treating it as one, and
+    /// a fourth action is exactly how that stops happening.
+    ///
+    /// git learned the spelling in 2.32; older gits reject the todo line.
+    /// Whoever runs the plan is where that is checked, because a version is
+    /// a fact about a machine and this file has none.
+    pub keep_message: bool,
 }
 
 impl Entry {
@@ -589,6 +603,7 @@ impl Plan {
                 action: Action::Pick,
                 message: None,
                 amend: None,
+                keep_message: false,
             })
             .collect();
         Ok(Self {
@@ -647,7 +662,31 @@ impl Plan {
         if action != Action::Reword {
             entry.message = None;
         }
+        if action != Action::Fixup {
+            entry.keep_message = false;
+        }
         Ok(())
+    }
+
+    /// The fold that keeps *this* commit's message — `fixup -C`, the third
+    /// answer to the question squash and fixup answer the other two ways.
+    ///
+    /// Sets the action too, because the flag means nothing without it.
+    pub fn set_fixup_keeping_message(&mut self, index: usize) -> Result<(), String> {
+        self.set_action(index, Action::Fixup)?;
+        if let Some(entry) = self.entries.get_mut(index) {
+            entry.keep_message = true;
+        }
+        Ok(())
+    }
+
+    /// Whether any entry asks for `fixup -C` — the one spelling in this
+    /// vocabulary that a git older than 2.32 does not know, and so the one
+    /// thing a runner has to check a version for.
+    pub fn keeps_a_message(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|e| e.keep_message && e.action == Action::Fixup)
     }
 
     /// Rewords one entry: the action and the message it carries, together,
@@ -832,7 +871,13 @@ impl Plan {
                 Action::Reword => Action::Pick,
                 other => other,
             };
-            script.push_step(action, &entry.sha);
+            // `fixup -C <sha>`: the flag rides in the argument slot, which
+            // is exactly how the parser reads such a line back — bytes in,
+            // bytes out, nothing here interpreting git's own flags.
+            match entry.keep_message && action == Action::Fixup {
+                true => script.push_step(action, &[b"-C ".as_slice(), &entry.sha].concat()),
+                false => script.push_step(action, &entry.sha),
+            }
             if !entry.lands() {
                 continue;
             }
@@ -1476,6 +1521,46 @@ squash
             planned(&plan),
             vec!["pick under-sha", "pick mid-sha", "fixup head-sha"]
         );
+    }
+
+    #[test]
+    fn a_fold_has_three_answers_to_the_message_question() {
+        let commits = linear();
+        // Squash keeps both messages, fixup keeps the older one, and
+        // `fixup -C` keeps this commit's — one fold, three answers, which
+        // is why the third is a flag and not a fourth action.
+        let mut plan = Plan::over(&commits, 2).expect("a window");
+        plan.set_fixup_keeping_message(1).expect("a fold");
+        assert!(plan.keeps_a_message(), "the runner is not warned");
+        assert_eq!(
+            planned(&plan),
+            vec!["pick under-sha", "fixup -C mid-sha", "pick head-sha"]
+        );
+        // And the bytes round-trip: parsing puts `-C` in the arg slot and
+        // the sha in the rest, which reads oddly and emits exactly right —
+        // the tolerance this module promises, over a flag it never
+        // interprets.
+        let script = plan.script(&mut |_| Ok(Vec::new())).expect("a script");
+        let bytes = script.emit();
+        assert!(
+            bytes.starts_with(b"pick under-sha\nfixup -C mid-sha\n"),
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert_eq!(TodoScript::parse(&bytes).emit(), bytes);
+
+        // Choosing another answer takes the flag with it: a stale `-C`
+        // hanging on a squash is a message landing somewhere nobody chose.
+        plan.set_action(1, Action::Squash).expect("a fold");
+        assert!(!plan.keeps_a_message());
+        assert_eq!(
+            planned(&plan),
+            vec!["pick under-sha", "squash mid-sha", "pick head-sha"]
+        );
+
+        // The oldest row refuses it exactly as it refuses every fold.
+        let mut plan = Plan::over(&commits, 2).expect("a window");
+        assert!(plan.set_fixup_keeping_message(2).is_err());
     }
 
     #[test]

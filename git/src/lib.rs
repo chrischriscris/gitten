@@ -2114,6 +2114,18 @@ impl Repo for Binary {
 
     fn rebase_plan(&self, plan: &Plan) -> Result<()> {
         plan.validate()?;
+        // `fixup -C` is the one spelling in this vocabulary a git older than
+        // 2.32 does not know, and its answer to one is to leave the rebase
+        // standing on an unparseable todo — a state the reader then has to
+        // clean up after a keypress that only meant "keep this message".
+        // One `git --version` before anything starts turns that into a
+        // sentence, and it runs only for a plan that actually asks.
+        if plan.keeps_a_message() && !self.git_at_least(2, 32) {
+            return Err(
+                "keeping the folded commit's message needs git 2.32 or newer                  (it is git's `fixup -C`); squash keeps both messages here"
+                    .into(),
+            );
+        }
         // The message files outlive the script and die with the rebase: git
         // reads each one when its `exec` line runs, which is somewhere in
         // the middle of the process below.
@@ -2683,6 +2695,31 @@ impl Repo for Binary {
 }
 
 impl Binary {
+    /// Whether the `git` on this machine is at least `major.minor`.
+    ///
+    /// Asked, never remembered: a binary can be upgraded under a running
+    /// process, and this costs one process on the rare plan that needs it.
+    /// A version string this cannot parse answers `true` — every git that
+    /// prints something unexpected is likelier to be newer than older, and
+    /// refusing a rewrite over an unreadable version string would be
+    /// refusing it for the wrong reason.
+    fn git_at_least(&self, major: u32, minor: u32) -> bool {
+        let Ok(out) = run(&self.root, &["--version"]) else {
+            return true;
+        };
+        let text = String::from_utf8_lossy(&out);
+        let Some(rest) = text.split_whitespace().nth(2) else {
+            return true;
+        };
+        let mut parts = rest.split('.').map(str::parse::<u32>);
+        match (parts.next(), parts.next()) {
+            (Some(Ok(found_major)), Some(Ok(found_minor))) => {
+                (found_major, found_minor) >= (major, minor)
+            }
+            _ => true,
+        }
+    }
+
     // The one process every scripted rebase runs, shared by the two verbs
     // above so a plan and a script cannot drift into two different
     // invocations. Everything it does is documented on
@@ -10734,6 +10771,36 @@ mod tests {
         assert_eq!(subjects(&r), vec!["tip", "mid", "base"]);
         for file in ["base.txt", "mid.txt", "tip.txt"] {
             assert!(r.0.join(file).exists(), "{file} left the tree");
+        }
+    }
+
+    #[test]
+    fn a_fold_that_keeps_its_own_message_runs_or_says_why_it_cannot() {
+        let r = linear_repo("plan-fixup-keep");
+        let g = r.open();
+        let commits = window(&r);
+        let mut plan = Plan::over(&commits, 1).expect("a window");
+        plan.set_fixup_keeping_message(0).expect("a fold");
+        assert!(plan.keeps_a_message());
+
+        match g.rebase_plan(&plan) {
+            Ok(()) => {
+                // git 2.32 or newer: the newest commit folds into its
+                // parent and the *folded* commit's message is what stands.
+                assert_eq!(subjects(&r), vec!["three", "one", "base"]);
+                assert!(
+                    r.0.join("two.txt").exists() && r.0.join("three.txt").exists(),
+                    "the fold lost work"
+                );
+            }
+            Err(e) => {
+                // Older git: refused before anything started, naming the
+                // version and the answer that does work here.
+                assert!(e.contains("2.32"), "{e}");
+                assert!(e.contains("squash"), "the way out is named: {e}");
+                assert!(!g.rebase_in_progress(), "a refusal started something");
+                assert_eq!(subjects(&r), vec!["three", "two", "one", "base"]);
+            }
         }
     }
 

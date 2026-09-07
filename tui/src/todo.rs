@@ -101,6 +101,12 @@ impl Todo {
         self.plan.set_action(self.cursor, action)
     }
 
+    /// The fold that keeps *this* commit's message — the third answer to
+    /// the question squash and fixup answer the other two ways.
+    pub fn fixup_keeping_message(&mut self) -> Result<(), String> {
+        self.plan.set_fixup_keeping_message(self.cursor)
+    }
+
     /// Rewords the row with bytes a reader typed.
     pub fn set_message(&mut self, message: Vec<u8>) -> Result<(), String> {
         self.plan.set_message(self.cursor, message)
@@ -205,7 +211,7 @@ impl Todo {
             .plan
             .entries()
             .iter()
-            .map(|e| e.action.word().len())
+            .map(|e| e.action.word().len() + if e.keep_message { 3 } else { 0 })
             .max()
             .unwrap_or(4);
         let sha_w = self
@@ -265,7 +271,14 @@ impl Todo {
             // Left-aligned, padded to the widest word actually in the plan:
             // this is a column of words and not of numbers, and the eye runs
             // down their first letter.
-            pen.put(&format!("{:<action_w$}", entry.action.word()), word_ink);
+            // `fixup -C` says so in the word column: three folds that
+            // looked identical on screen would be three folds nobody could
+            // tell apart afterwards.
+            let word = match entry.keep_message && entry.action == Action::Fixup {
+                true => format!("{} -C", entry.action.word()),
+                false => entry.action.word().to_string(),
+            };
+            pen.put(&format!("{word:<action_w$}"), word_ink);
             pen.put(" ", Ink::new(c.dim, bg));
             pen.put(&entry.short, Ink::new(c.dim, bg));
             pen.put(" ", Ink::new(c.fg, bg));
@@ -381,6 +394,25 @@ mod tests {
         assert!(text.contains("pick   head00 head"), "{text}");
         assert!(text.contains("squash mid00 mid"), "{text}");
         assert!(text.contains("1 changed"), "{text}");
+    }
+
+    #[test]
+    fn the_third_fold_says_which_fold_it_is() {
+        let mut screen = Screen::new(60, 12);
+        let host = Host::new();
+        let mut todo = open();
+        todo.down();
+        todo.fixup_keeping_message().expect("a fold");
+        todo.paint(&mut screen, 0, 10, &host, &Availability::strict());
+        let text: String = (0..12)
+            .map(|y| screen.row_text(y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Three folds that looked identical on screen would be three folds
+        // nobody could tell apart afterwards.
+        assert!(text.contains("fixup -C mid00 mid"), "{text}");
+        assert!(text.contains("pick     head00 head"), "{text}");
+        assert!(todo.plan().keeps_a_message());
     }
 
     #[test]

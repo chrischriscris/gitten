@@ -751,6 +751,9 @@ impl Keymap {
         bind("todo", "s", "todo.squash");
         bind("todo", "f", "todo.fixup");
         bind("todo", "d", "todo.drop");
+        // The fold's third message answer, on the capital beside its own
+        // letter: `f` keeps the older message, `F` keeps this commit's.
+        bind("todo", "F", "todo.fixup-keep");
         bind("todo", "S", "todo.autosquash");
         bind("todo", "alt-up", "todo.move-up");
         bind("todo", "alt-down", "todo.move-down");
@@ -1432,6 +1435,11 @@ impl Commands {
                 "todo.fixup",
                 "fold it into the commit below, dropping its message",
                 Some("fixup"),
+            ),
+            (
+                "todo.fixup-keep",
+                "fold it into the commit below, keeping this message instead",
+                Some("fixup -C"),
             ),
             (
                 "todo.drop",

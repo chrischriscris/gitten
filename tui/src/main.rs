@@ -2705,6 +2705,16 @@ impl App {
             return;
         }
         match command {
+            "todo.fixup-keep" => {
+                let said = match self.todo.as_mut() {
+                    Some(todo) => match todo.fixup_keeping_message() {
+                        Ok(()) => todo.summary(),
+                        Err(e) => e,
+                    },
+                    None => return,
+                };
+                self.message = said;
+            }
             "todo.reword" => {
                 let subject = match self.todo.as_ref() {
                     Some(todo) => todo.selected_subject(),
@@ -4149,9 +4159,8 @@ impl App {
             // and writes nothing; `todo.run` is the single door to the
             // queue, and it asks first.
             "todo.pick" | "todo.reword" | "todo.edit" | "todo.squash" | "todo.fixup"
-            | "todo.drop" | "todo.move-up" | "todo.move-down" | "todo.autosquash" | "todo.run" => {
-                self.todo_verb(command)
-            }
+            | "todo.fixup-keep" | "todo.drop" | "todo.move-up" | "todo.move-down"
+            | "todo.autosquash" | "todo.run" => self.todo_verb(command),
             // The files pane's reset menu: the question, then the strengths
             // aimed at the upstream, and the nuke behind the same door.
             "files.reset-menu" => {
@@ -5773,6 +5782,7 @@ fn tui_availability(repo: bool, operation: Option<&Operation>) -> Availability {
         "todo.edit",
         "todo.squash",
         "todo.fixup",
+        "todo.fixup-keep",
         "todo.drop",
         "todo.move-up",
         "todo.move-down",
@@ -5922,6 +5932,7 @@ fn tui_availability(repo: bool, operation: Option<&Operation>) -> Availability {
                 "todo.edit",
                 "todo.squash",
                 "todo.fixup",
+                "todo.fixup-keep",
                 "todo.drop",
                 "todo.move-up",
                 "todo.move-down",
@@ -17313,6 +17324,33 @@ shared tail
         );
     }
 
+    /// The fold's three message answers are three keys and three plans:
+    /// squash keeps both messages, `f` keeps the older one, and `F` keeps
+    /// this commit's — git's `fixup -C`, which the acquisition layer
+    /// refuses on a git too old to know it rather than leaving one standing
+    /// on a todo it cannot parse.
+    #[test]
+    fn tui_parity_the_fold_has_three_message_answers_in_the_plan() {
+        for (key, line) in [
+            ('s', "squash 00000000"),
+            ('f', "fixup 00000000"),
+            ('F', "fixup -C 00000000"),
+        ] {
+            let (handle, state) = fake(&[]);
+            let mut app = history_app(&handle);
+            app.dispatch("view.down");
+            app.press(Key::char('i'));
+            app.press(Key::char(key));
+            app.press(Key::plain(Code::Enter));
+            app.press(Key::plain(Code::Enter));
+            assert_eq!(
+                planned(&mut app, &state),
+                format!("rebase-plan 00000002 | pick 00000001; {line}"),
+                "`{key}` did not compose its own fold"
+            );
+        }
+    }
+
     /// A cancelled todo edit writes nothing and leaves the repository
     /// exactly as it was — the whole reason a plan is safe to open.
     #[test]
@@ -17909,6 +17947,7 @@ shared tail
             ("e", "todo.edit"),
             ("s", "todo.squash"),
             ("f", "todo.fixup"),
+            ("F", "todo.fixup-keep"),
             ("d", "todo.drop"),
             ("S", "todo.autosquash"),
             ("enter", "todo.run"),
