@@ -2441,10 +2441,22 @@ pub fn hunk_job(
 }
 
 /// What [`hunk_job`]'s write applies, once its expectations hold.
-enum PatchVerb {
+/// The clipboard's applies ride the same rail: one checked write per
+/// file, whatever the target, because a patch aimed at a moved side is
+/// the same mistake wherever it lands.
+#[derive(Clone, Copy)]
+pub(crate) enum PatchVerb {
     Stage,
     Unstage,
     Discard,
+    /// Onto the working tree, forwards — `git apply`.
+    ApplyWorktree,
+    /// Onto the index, forwards — `git apply --cached`.
+    ApplyIndex,
+    /// Off the working tree, backwards — `git apply --reverse`.
+    ReverseWorktree,
+    /// Off the index, backwards — `git apply --cached --reverse`.
+    ReverseIndex,
 }
 
 /// Which side of the index an expectation reads.
@@ -2457,9 +2469,9 @@ pub(crate) enum OidSide {
 /// One identity the write re-checks: the side, the path, and the blob the
 /// patch was built against.
 pub(crate) struct ExpectOid {
-    side: OidSide,
-    path: Vec<u8>,
-    oid: Option<String>,
+    pub side: OidSide,
+    pub path: Vec<u8>,
+    pub oid: Option<String>,
 }
 
 /// A patch whose assumptions are checked at write time, not build time.
@@ -2469,12 +2481,12 @@ pub(crate) struct ExpectOid {
 /// byte applies, every blob the patch was built against is re-read and
 /// compared; a mismatch refuses with the refresh spelled out rather than
 /// letting `git apply` aim at whatever the side holds now.
-struct CheckedPatch {
-    name: String,
-    repo: Handle,
-    verb: PatchVerb,
-    patch: Vec<u8>,
-    expect: Vec<ExpectOid>,
+pub(crate) struct CheckedPatch {
+    pub name: String,
+    pub repo: Handle,
+    pub verb: PatchVerb,
+    pub patch: Vec<u8>,
+    pub expect: Vec<ExpectOid>,
 }
 
 impl Job for CheckedPatch {
@@ -2497,9 +2509,10 @@ impl Job for CheckedPatch {
             }
         }
         match self.verb {
-            PatchVerb::Stage => repo.stage_patch(&self.patch),
-            PatchVerb::Unstage => repo.unstage_patch(&self.patch),
-            PatchVerb::Discard => repo.discard_patch(&self.patch),
+            PatchVerb::Stage | PatchVerb::ApplyIndex => repo.stage_patch(&self.patch),
+            PatchVerb::Unstage | PatchVerb::ReverseIndex => repo.unstage_patch(&self.patch),
+            PatchVerb::Discard | PatchVerb::ReverseWorktree => repo.discard_patch(&self.patch),
+            PatchVerb::ApplyWorktree => repo.apply_patch(&self.patch),
         }
     }
 }

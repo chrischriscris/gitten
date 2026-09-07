@@ -163,6 +163,106 @@ impl Write {
         }))
     }
 
+    /// Writes exactly what a synthesized patch describes into the working
+    /// tree — `git apply`, the fourth corner the other three patch verbs
+    /// leave open. Bytes end to end, emptiness refused before the queue,
+    /// drift refused by git's own sentence at apply time.
+    pub fn apply_patch(repo: &Handle, patch: Vec<u8>) -> Result<Self, String> {
+        if patch.is_empty() {
+            return Err("an empty patch applies nothing".into());
+        }
+        Ok(Self::named("apply patch".into(), repo, move |r| {
+            r.apply_patch(&patch)
+        }))
+    }
+
+    /// Restores one path to the version a commit holds —
+    /// `git checkout <sha> -- <path>`, worktree and index together, which
+    /// is git's semantic and is said as such wherever this is offered.
+    /// DESTRUCTIVE when the path differs: the caller confirms before this
+    /// job is ever built.
+    pub fn checkout_file_from_commit(repo: &Handle, sha: Vec<u8>, path: Vec<u8>) -> Self {
+        let shown = String::from_utf8_lossy(&path).into_owned();
+        Self::named(format!("checkout {shown} from commit"), repo, move |r| {
+            r.checkout_file_from(&sha, &path)
+        })
+    }
+
+    /// Folds `files` into the commit `sha` names and replays what followed
+    /// it: detach at the commit, run each patch against its content
+    /// (`reverse` aims removals, forward aims additions), stage the paths,
+    /// amend without rewording, restore the reader's position, and replay
+    /// the descendants onto the replacement.
+    ///
+    /// One job, because the steps are one decision and the queue's finish
+    /// wave is the only honest place for the refresh: halfway generations
+    /// would draw a detached HEAD mid-graft as a state. A rebase that
+    /// stops on a conflict is a clean finish carrying the standing rebase
+    /// in its announcement — the lifecycle owns it from there — and
+    /// anything earlier failing restores the reader's position before
+    /// reporting, so a failed graft never strands a detached HEAD behind
+    /// it. Files with empty patches are skipped; all empty is refused
+    /// before the queue.
+    pub fn graft_files(
+        repo: &Handle,
+        sha: Vec<u8>,
+        files: Vec<(Vec<u8>, Vec<u8>)>,
+        reverse: bool,
+    ) -> Result<Self, String> {
+        let live: Vec<(Vec<u8>, Vec<u8>)> =
+            files.into_iter().filter(|(_, p)| !p.is_empty()).collect();
+        if live.is_empty() {
+            return Err("an empty patch grafts nothing".into());
+        }
+        let short = String::from_utf8_lossy(&sha);
+        let short = short.chars().take(8).collect::<String>();
+        Ok(Self::named(
+            format!("graft {} files into {short}", live.len()),
+            repo,
+            move |r| graft(r, &sha, &live, reverse),
+        ))
+    }
+
+    /// Carries `patches` onto `branch`, creating it at HEAD first when
+    /// asked: checkout (a dirty tree it cannot carry is git's own
+    /// refusal), then each patch onto the worktree in order, uncommitted —
+    /// the commit is the reader's next keypress, not this job's last
+    /// step. When creation was requested and the checkout fails, the new
+    /// branch is removed again, so a failed move leaves no empty branch
+    /// behind it.
+    pub fn move_patch_to_branch(
+        repo: &Handle,
+        branch: Vec<u8>,
+        create: bool,
+        patches: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<Self, String> {
+        if patches.iter().all(|(_, p)| p.is_empty()) {
+            return Err("an empty patch moves nothing".into());
+        }
+        let shown = String::from_utf8_lossy(&branch).into_owned();
+        let job = Self::named(format!("move patch onto {shown}"), repo, move |r| {
+            if create {
+                r.create_branch(&branch, None)?;
+            }
+            if let Err(e) = r.checkout(&branch) {
+                if create {
+                    let _ = r.delete_branch(&branch, true);
+                }
+                return Err(e);
+            }
+            for (_, patch) in &patches {
+                if !patch.is_empty() {
+                    r.apply_patch(patch)?;
+                }
+            }
+            Ok(())
+        })
+        .announcing(format!(
+            "patch on {shown} — uncommitted, commit it or leave it"
+        ));
+        Ok(job)
+    }
+
     /// Checks out one path's working-tree state away. DESTRUCTIVE: unstaged
     /// work ends here, which is why the caller confirms before this job is
     /// ever built.
@@ -978,6 +1078,84 @@ fn default_remote(remotes: &[Remote]) -> Result<Vec<u8>, String> {
          push it from the branches panel to set one"
             .into(),
     )
+}
+
+/// The steps [`Write::graft_patch`] runs as one job. Each step names its
+/// own failure; the reader's position is restored before any error
+/// leaves, except the one state that is meant to stand: a replay stopped
+/// on a conflict, which the lifecycle owns from there and the refresh
+/// wave will draw.
+fn graft(
+    r: &dyn Repo,
+    sha: &[u8],
+    files: &[(Vec<u8>, Vec<u8>)],
+    reverse: bool,
+) -> Result<(), String> {
+    if !r.status()?.is_empty() {
+        return Err("stow or commit the working tree first — a graft needs a clean tree".into());
+    }
+    if r.operation().is_some() {
+        return Err("a standing operation waits — abort it or finish it first".into());
+    }
+    let home = r.head()?;
+    if matches!(&home, HeadState::Branch { commit: None, .. }) {
+        return Err("no commits to rewrite yet".into());
+    }
+    // Detach at the commit being rewritten: its content is then the
+    // worktree, so every patch aims at exactly what it was built from.
+    r.checkout(sha)?;
+    let restore = |r: &dyn Repo| {
+        let _ = match &home {
+            HeadState::Branch { name, .. } => r.checkout(name.as_bytes()),
+            HeadState::Detached { commit } => r.checkout(commit.as_bytes()),
+        };
+    };
+    let amended = (|| {
+        for (path, patch) in files {
+            if reverse {
+                r.discard_patch(patch)?;
+            } else {
+                r.apply_patch(patch)?;
+            }
+            r.stage(path)?;
+        }
+        r.amend_no_edit()
+    })();
+    let new = match amended {
+        Ok(new) => new,
+        Err(e) => {
+            restore(r);
+            return Err(e);
+        }
+    };
+    match &home {
+        HeadState::Detached { commit } => {
+            r.checkout(commit.as_bytes())?;
+            Ok(())
+        }
+        HeadState::Branch { name, commit } => {
+            r.checkout(name.as_bytes())?;
+            // The rewritten commit was the tip: no descendants to replay,
+            // so the branch steps onto the replacement — what the replay
+            // would have meant with an empty range.
+            if commit.as_deref() == Some(String::from_utf8_lossy(sha).as_ref()) {
+                r.reset(ResetMode::Hard, new.as_bytes())?;
+                return Ok(());
+            }
+            match r.rebase_onto_base(new.as_bytes(), sha) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    if r.operation().is_some() {
+                        Err(format!(
+                            "the replay stopped on a conflict — resolve it and continue, or abort: {e}"
+                        ))
+                    } else {
+                        Err(e)
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl Job for Write {

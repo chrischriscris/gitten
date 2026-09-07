@@ -58,6 +58,7 @@ pub mod cli;
 pub mod config;
 pub mod env;
 pub mod jobs;
+pub mod patchwork;
 pub mod projects;
 pub mod verbs;
 
