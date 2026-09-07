@@ -18,6 +18,7 @@
 //! counts are simply unknowable. A repository with no stashes answers an
 //! empty list.
 
+use crate::status::PathBytes;
 use std::borrow::Cow;
 
 // ---------------------------------------------------------------------- names
@@ -192,6 +193,198 @@ pub struct Stash {
     pub commit: String,
 }
 
+/// Which changes a stash push takes — and, by omission, which it must leave
+/// standing in the index and the working tree.
+///
+/// The omission is the whole point of the type. "Stash the staged side"
+/// means *and leave my unstaged work where it is*; a variant that swept it
+/// along would be a keypress that took away more than it named, which is
+/// the one thing a stash must never do. So the scopes are named by what
+/// they take, and every one of them is a claim about what stays.
+///
+/// The flags are git's own spelling, kept here beside the concept for the
+/// reason [`ResetMode::flag`] is: which words reach the command line is one
+/// fact, and a client that offers a menu of these should not have to know
+/// any of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StashScope {
+    /// Every tracked change, staged and unstaged — `git stash push`. The
+    /// default, and the one a bare "stash" means. Untracked files stay:
+    /// they are in no tree and no index, so nothing about "park my changes"
+    /// says they were meant.
+    Tracked,
+    /// Every tracked change *plus* the untracked files — `-u`. Ignored files
+    /// still stay, which is git's own line and the right one: an ignored
+    /// file is not work.
+    WithUntracked,
+    /// Only what the index holds — `--staged`. The unstaged half of a file
+    /// stays in the working tree, unstaged.
+    ///
+    /// One honest limit, and it is git's: a path with changes on *both*
+    /// sides cannot have its staged side lifted out alone, because the
+    /// worktree side of that path is a patch git then cannot reverse. Git
+    /// says so and fails; the entry it had already written stays on the
+    /// stack, and nothing in the index or the working tree is touched.
+    Staged,
+    /// Only what the working tree holds past the index — `--keep-index`.
+    /// The staged work stays staged and stays in the tree, which is the
+    /// promise this scope makes.
+    ///
+    /// The *entry* git writes carries both sides, because `--keep-index`
+    /// records the whole difference from HEAD and then puts the index back.
+    /// Nothing is taken away that was not named — that is the invariant —
+    /// but an entry made this way, applied later onto a tree that still has
+    /// the staged work, is git applying a change that is already there.
+    Unstaged,
+    /// One path, both its sides — `git stash push -- <path>`. Every other
+    /// path stays exactly as it was.
+    Path {
+        path: PathBytes,
+        /// The path is untracked, so the push needs `-u` to see it at all:
+        /// git answers a pathspec naming nothing it tracks with "did not
+        /// match any file(s) known to git" and stashes nothing.
+        untracked: bool,
+    },
+}
+
+impl StashScope {
+    /// git's own flags for this scope, in the order they go on the command
+    /// line. Empty for the two that need none.
+    pub fn flags(&self) -> &'static [&'static str] {
+        match self {
+            StashScope::Tracked => &[],
+            StashScope::WithUntracked => &["-u"],
+            StashScope::Staged => &["--staged"],
+            StashScope::Unstaged => &["--keep-index"],
+            StashScope::Path {
+                untracked: false, ..
+            } => &[],
+            StashScope::Path {
+                untracked: true, ..
+            } => &["-u"],
+        }
+    }
+
+    /// The one path this scope is confined to, when it is confined to one.
+    pub fn path(&self) -> Option<&PathBytes> {
+        match self {
+            StashScope::Path { path, .. } => Some(path),
+            _ => None,
+        }
+    }
+
+    /// What the running band and a refusal call this scope — what it takes,
+    /// said the way a person would.
+    pub fn label(&self) -> String {
+        match self {
+            StashScope::Tracked => "the working tree".into(),
+            StashScope::WithUntracked => "the working tree and its new files".into(),
+            StashScope::Staged => "the staged side".into(),
+            StashScope::Unstaged => "the unstaged side".into(),
+            StashScope::Path { path, .. } => path.to_string_lossy().into_owned(),
+        }
+    }
+}
+
+/// A stash entry as a verb aims at it: the commit that survives stack churn,
+/// and the position it sat at when the keyboard chose it.
+///
+/// **The commit is the identity and the index is only a memory of where it
+/// was.** Every push, pop and drop renumbers the stack — the former
+/// `stash@{1}` *is* `stash@{0}` after one drop — so an index captured when a
+/// row was selected and spent when a key was pressed can name a different
+/// entry entirely. The commit cannot: a stash's commit is written once and
+/// never moves.
+///
+/// The index is still carried, for two reasons that are not nostalgia.
+/// `git stash pop` and `git stash drop` accept **only** a `stash@{n}`
+/// reference and refuse a raw object id, so something has to turn the
+/// identity back into a position at the moment of the write; and when one
+/// commit appears twice on the stack, the remembered position is the only
+/// thing that says which of them the keyboard was on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StashId {
+    /// Where it sat when it was chosen. A hint, re-checked before any write.
+    pub index: usize,
+    /// The stash commit, full object id — the identity.
+    pub commit: String,
+}
+
+impl StashId {
+    /// The entry the keyboard is on, as both its identities.
+    pub fn of(stash: &Stash) -> Self {
+        Self {
+            index: stash.index,
+            commit: stash.commit.clone(),
+        }
+    }
+
+    /// Where this entry sits on `stack` *now* — the question every stash
+    /// write asks immediately before it runs, against a freshly read stack.
+    ///
+    /// The rule, in order:
+    ///
+    /// - the remembered position still carries this commit: [`StashAt::Same`];
+    /// - exactly one other position carries it: [`StashAt::Moved`], and the
+    ///   write goes there, because the commit is what was chosen;
+    /// - no position carries it: [`StashAt::Gone`] — dropped, popped clean,
+    ///   or the stack was cleared, and there is nothing to act on;
+    /// - two or more carry it and the remembered position is not one of
+    ///   them: [`StashAt::Ambiguous`]. Two identical stash commits are
+    ///   possible — same tree, same parent, same second — and which one was
+    ///   meant is then genuinely unknowable, so nothing is guessed.
+    pub fn resolve(&self, stack: &[Stash]) -> StashAt {
+        let carrying: Vec<usize> = stack
+            .iter()
+            .filter(|entry| entry.commit == self.commit)
+            .map(|entry| entry.index)
+            .collect();
+        if carrying.contains(&self.index) {
+            return StashAt::Same(self.index);
+        }
+        match carrying.as_slice() {
+            [] => StashAt::Gone,
+            [only] => StashAt::Moved(*only),
+            _ => StashAt::Ambiguous,
+        }
+    }
+}
+
+/// Where a [`StashId`] turned out to be, read against the live stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StashAt {
+    /// Still at the position the keyboard left it.
+    Same(usize),
+    /// On the stack, at a new position: something pushed, popped or dropped
+    /// underneath, and the commit is what followed the entry there. The
+    /// write aims here — this *is* the entry that was chosen.
+    Moved(usize),
+    /// No entry on the stack carries this commit any more.
+    Gone,
+    /// More than one entry carries it, and none of them is where the
+    /// keyboard left it.
+    Ambiguous,
+}
+
+impl StashAt {
+    /// The position to address, or the sentence that says why there is
+    /// none. The words are here rather than in a client because every
+    /// client's refusal is the same refusal.
+    pub fn position(self) -> Result<usize, String> {
+        match self {
+            StashAt::Same(at) | StashAt::Moved(at) => Ok(at),
+            StashAt::Gone => {
+                Err("that stash is no longer on the stack — it was popped or dropped".into())
+            }
+            StashAt::Ambiguous => Err(
+                "two stashes on the stack are the same commit and neither is where this \
+                 one was — refresh and choose again"
+                    .into(),
+            ),
+        }
+    }
+}
+
 // -------------------------------------------------------------------- remotes
 
 /// A remote this repository knows by name, with the URLs configured for it.
@@ -268,6 +461,127 @@ mod tests {
                 commit: None,
             }
         );
+    }
+
+    fn stack(commits: &[&str]) -> Vec<Stash> {
+        commits
+            .iter()
+            .enumerate()
+            .map(|(index, commit)| Stash {
+                index,
+                message: format!("on main: {commit}"),
+                commit: (*commit).into(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_stash_scope_names_what_it_takes_and_spells_its_own_flags() {
+        // The flags are git's; the point of the table is that a client
+        // offering the menu never learns one of them.
+        assert_eq!(StashScope::Tracked.flags(), &[] as &[&str]);
+        assert_eq!(StashScope::WithUntracked.flags(), &["-u"]);
+        assert_eq!(StashScope::Staged.flags(), &["--staged"]);
+        assert_eq!(StashScope::Unstaged.flags(), &["--keep-index"]);
+        // A tracked path needs no flag; an untracked one needs -u, or git
+        // answers the pathspec with "did not match any file(s) known to
+        // git" and stashes nothing at all.
+        let tracked = StashScope::Path {
+            path: "src/x.rs".into(),
+            untracked: false,
+        };
+        let fresh = StashScope::Path {
+            path: "notes.md".into(),
+            untracked: true,
+        };
+        assert_eq!(tracked.flags(), &[] as &[&str]);
+        assert_eq!(fresh.flags(), &["-u"]);
+        assert_eq!(
+            tracked.path().map(|p| p.as_bytes()),
+            Some(b"src/x.rs".as_slice())
+        );
+        assert_eq!(StashScope::Tracked.path(), None);
+        assert_eq!(StashScope::Staged.label(), "the staged side");
+        assert_eq!(fresh.label(), "notes.md");
+    }
+
+    #[test]
+    fn a_scoped_path_addresses_bytes_and_labels_lossily() {
+        // Same discipline as everywhere: the pathspec git receives is exact,
+        // the sentence a person reads is decoded.
+        let raw = b"caf\xe9.txt";
+        let scope = StashScope::Path {
+            path: PathBytes::from_bytes(raw),
+            untracked: false,
+        };
+        assert_eq!(scope.path().map(|p| p.as_bytes()), Some(raw.as_slice()));
+        assert!(scope.label().contains('\u{FFFD}'), "the label decodes");
+    }
+
+    #[test]
+    fn a_stash_identity_follows_its_commit_when_the_stack_renumbers() {
+        // Chosen at stash@{1}. A push lands on top and every entry shifts
+        // up one: the number now names somebody else's work, the commit
+        // still names this.
+        let chosen = StashId::of(&stack(&["c0", "c1", "c2"])[1]);
+        assert_eq!(chosen.index, 1);
+        assert_eq!(
+            chosen.resolve(&stack(&["c0", "c1", "c2"])),
+            StashAt::Same(1)
+        );
+        assert_eq!(
+            chosen.resolve(&stack(&["new", "c0", "c1", "c2"])),
+            StashAt::Moved(2),
+            "a push under the selection moves the entry, not the choice"
+        );
+        assert_eq!(
+            chosen.resolve(&stack(&["c1", "c2"])),
+            StashAt::Moved(0),
+            "the entry above it was dropped"
+        );
+        assert_eq!(StashAt::Moved(2).position(), Ok(2));
+    }
+
+    #[test]
+    fn a_stash_identity_that_left_the_stack_refuses_instead_of_renumbering() {
+        // The accident this whole type exists to prevent: stash@{1} chosen,
+        // stash@{1} dropped elsewhere, and the number now names the entry
+        // that used to be stash@{2}. Acting on it would apply the wrong
+        // work; saying so costs a keypress.
+        let chosen = StashId::of(&stack(&["c0", "c1", "c2"])[1]);
+        assert_eq!(chosen.resolve(&stack(&["c0", "c2"])), StashAt::Gone);
+        let said = StashAt::Gone.position().expect_err("gone is a refusal");
+        assert!(said.contains("no longer on the stack"), "{said}");
+    }
+
+    #[test]
+    fn two_identical_stash_commits_are_unknowable_rather_than_guessed() {
+        // Same tree, same parent, same second: git writes the same commit
+        // twice and the stack carries it twice. While the remembered
+        // position is one of them the choice is still clear; once it is
+        // not, which one was meant cannot be recovered.
+        let chosen = StashId::of(&stack(&["c0", "twin", "twin"])[1]);
+        assert_eq!(
+            chosen.resolve(&stack(&["c0", "twin", "twin"])),
+            StashAt::Same(1)
+        );
+        assert_eq!(
+            chosen.resolve(&stack(&["twin", "twin"])),
+            StashAt::Same(1),
+            "still one of them: the remembered position wins"
+        );
+        let drifted = StashId {
+            index: 5,
+            commit: "twin".into(),
+        };
+        assert_eq!(
+            drifted.resolve(&stack(&["twin", "twin"])),
+            StashAt::Ambiguous
+        );
+        let said = StashAt::Ambiguous
+            .position()
+            .expect_err("ambiguous is a refusal");
+        assert!(said.contains("choose again"), "{said}");
     }
 
     #[test]
