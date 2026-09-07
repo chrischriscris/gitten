@@ -771,6 +771,77 @@ impl Write {
         })
     }
 
+    /// Checks `base` out into a new worktree at `path`: `git worktree add`.
+    /// `branch` names a new branch to create there; empty `base` checks
+    /// out HEAD's branch, which git refuses when this tree holds it.
+    pub fn worktree_add(
+        repo: &Handle,
+        path: Vec<u8>,
+        base: Vec<u8>,
+        branch: Option<Vec<u8>>,
+    ) -> Self {
+        let shown = String::from_utf8_lossy(&path).into_owned();
+        Self::named(format!("worktree add {shown}"), repo, move |r| {
+            r.worktree_add(&path, &base, branch.as_deref())
+        })
+        .announcing(format!("worktree at {shown}"))
+    }
+
+    /// Forgets the worktree at `path`. A dirty tree refuses first — in our
+    /// own words, read from the tree itself — so the App can offer the
+    /// force spelling on the next press; anything else is git's sentence.
+    pub fn worktree_remove(repo: &Handle, path: Vec<u8>, force: bool) -> Self {
+        let shown = String::from_utf8_lossy(&path).into_owned();
+        let name = match force {
+            true => format!("worktree remove --force {shown}"),
+            false => format!("worktree remove {shown}"),
+        };
+        Self::named(name, repo, move |r| {
+            if !force {
+                use std::os::unix::ffi::OsStrExt;
+                let at = std::path::Path::new(std::ffi::OsStr::from_bytes(&path));
+                let dirty = gitten_git::open(at)
+                    .status()
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false);
+                if dirty {
+                    return Err(format!("worktree at {shown} has uncommitted changes"));
+                }
+            }
+            r.worktree_remove(&path, force)
+        })
+    }
+
+    /// Starts a bisection with `bad` where the bug is and `goods` where it
+    /// is not. The goods ride one argv — one process, one question.
+    pub fn bisect_start(repo: &Handle, bad: Vec<u8>, goods: Vec<Vec<u8>>) -> Self {
+        Self::named("bisect start".into(), repo, move |r| {
+            r.bisect_start(&bad, &goods)
+        })
+        .announcing("bisecting — mark the checkout good, bad, or skipped")
+    }
+
+    /// Marks the bisect checkout good (`rev` empty) or the named commit.
+    pub fn bisect_good(repo: &Handle, rev: Vec<u8>) -> Self {
+        Self::named("bisect good".into(), repo, move |r| r.bisect_good(&rev))
+    }
+
+    /// Marks the bisect checkout bad (`rev` empty) or the named commit.
+    pub fn bisect_bad(repo: &Handle, rev: Vec<u8>) -> Self {
+        Self::named("bisect bad".into(), repo, move |r| r.bisect_bad(&rev))
+    }
+
+    /// Skips the bisect checkout as untestable.
+    pub fn bisect_skip(repo: &Handle, rev: Vec<u8>) -> Self {
+        Self::named("bisect skip".into(), repo, move |r| r.bisect_skip(&rev))
+    }
+
+    /// Ends the bisection, back where it started. Outside one this is the
+    /// quiet no-op, so it takes no confirmation anywhere.
+    pub fn bisect_reset(repo: &Handle) -> Self {
+        Self::named("bisect reset".into(), repo, move |r| r.bisect_reset())
+    }
+
     /// Points HEAD's ref at `target` with `message` as the reflog sentence —
     /// undo's and redo's verb. The label names the direction, so the queue
     /// and the status line read as prose rather than as a git invocation.

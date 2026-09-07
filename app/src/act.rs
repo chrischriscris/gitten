@@ -40,6 +40,14 @@ pub trait Client {
         None
     }
 
+    /// The bisection standing in the repository, as the client last
+    /// acquired it — read through the repository on open and on every
+    /// refresh, the way the operation above is. The honest default for a
+    /// client that tracks none: none.
+    fn bisect(&self) -> Option<gitten_core::bisect::BisectState> {
+        None
+    }
+
     /// The conflicted path the keyboard is on, when there is one. The
     /// honest default for a client with no conflict selection: none.
     fn selected_conflict(&self) -> Option<PathBytes> {
@@ -2019,6 +2027,169 @@ pub fn delete_remote_branch(client: &mut impl BranchClient) {
         remote.as_bytes().to_vec(),
         branch.as_bytes().to_vec(),
     ))) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+// -------------------------------------------------------------- worktrees
+
+/// The client-owned selection and confirmation state needed by worktree
+/// actions: the row, and the force upgrade a dirty refusal offers.
+pub trait WorktreeClient: Client {
+    /// The worktree row the keyboard is on, as the path verbs address it
+    /// with — raw bytes, exactly as the listing spelled them.
+    fn worktree_target(&self) -> Option<Vec<u8>>;
+    /// Arms this path, or spends an arm already standing on it. The arm
+    /// carries whether the force spelling is what the next press runs:
+    /// a dirty refusal upgrades the question, anything else re-arms it.
+    fn confirm_or_arm_worktree(&mut self, path: &[u8], force: bool) -> bool;
+}
+
+/// `worktrees.new`: check a starting point out into a new worktree.
+///
+/// `base` is what the new checkout holds — the row's rev, or empty for
+/// HEAD — and `branch` names a new branch there instead of a detached
+/// checkout. An empty path is refused beside the field that just closed;
+/// a base the repository does not hold is git's refusal, in git's words.
+pub fn create_worktree(
+    client: &mut impl Client,
+    base: Vec<u8>,
+    path: String,
+    branch: Option<String>,
+) {
+    let path = path.trim();
+    if path.is_empty() {
+        client.say("a worktree needs a path".into());
+        return;
+    }
+    let Some(repo) = client.repo() else {
+        client.say("a fixture has no repository to branch a worktree from".into());
+        return;
+    };
+    let branch = branch
+        .map(|b| b.trim().to_string())
+        .filter(|b| !b.is_empty())
+        .map(String::into_bytes);
+    if !client.submit(Box::new(Write::worktree_add(
+        &repo,
+        path.as_bytes().to_vec(),
+        base,
+        branch,
+    ))) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+/// `worktrees.remove`: forget the selected checkout. First press asks,
+/// second press runs the plain removal — and when that comes back refused
+/// for dirt, the App re-arms with the force spelling standing, so the
+/// third press is the confirmed force rather than a second surprise.
+pub fn remove_worktree(client: &mut impl WorktreeClient, force: bool) {
+    let Some(path) = client.worktree_target() else {
+        client.say("nothing selected on the worktree list".into());
+        return;
+    };
+    if client.repo().is_none() {
+        client.say("a fixture has no worktrees to remove".into());
+        return;
+    }
+    if !client.confirm_or_arm_worktree(&path, force) {
+        match force {
+            true => client.ask(format!(
+                "remove {} even though it is dirty? the checkout goes with it — press again to confirm",
+                String::from_utf8_lossy(&path)
+            )),
+            false => client.say(format!(
+                "remove {}? press again to confirm",
+                String::from_utf8_lossy(&path)
+            )),
+        }
+        return;
+    }
+    let Some(repo) = client.repo() else {
+        client.say("a fixture has no worktrees to remove".into());
+        return;
+    };
+    if !client.submit(Box::new(Write::worktree_remove(&repo, path, force))) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+// ---------------------------------------------------------------- bisect
+
+/// `commits.bisect-start`: open the question the bisection answers, with
+/// the selected commit where the bug is and the prompt's rev where it is
+/// not. A standing bisection refuses before any process runs — one
+/// question at a time — and so does a standing merge, rebase, pick or
+/// revert: bisecting checks commits out, and an operation owns the tree.
+pub fn bisect_start(client: &mut impl Client, bad: Vec<u8>, good: String) {
+    if bad.is_empty() {
+        client.say("nothing selected to bisect from".into());
+        return;
+    }
+    let good = good.trim();
+    if good.is_empty() {
+        client.say("a bisect needs a revision the bug is not in".into());
+        return;
+    }
+    let Some(repo) = client.repo() else {
+        client.say("a fixture has no history to bisect".into());
+        return;
+    };
+    if client.bisect().is_some() {
+        client.say("a bisect is already in progress — reset it first".into());
+        return;
+    }
+    if refuse_while_operating(client) {
+        return;
+    }
+    if !client.submit(Box::new(Write::bisect_start(
+        &repo,
+        bad,
+        vec![good.as_bytes().to_vec()],
+    ))) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+/// `commits.bisect-good` / `-bad` / `-skip`: judge the checkout the
+/// bisection is asking about. Outside a bisection this is git's refusal,
+/// said by the verb; the shared action only checks there is a repository
+/// to ask in.
+pub fn bisect_mark(client: &mut impl Client, verb: BisectMark) {
+    let Some(repo) = client.repo() else {
+        client.say("a fixture has no bisection to judge".into());
+        return;
+    };
+    let job = match verb {
+        BisectMark::Good => Write::bisect_good(&repo, Vec::new()),
+        BisectMark::Bad => Write::bisect_bad(&repo, Vec::new()),
+        BisectMark::Skip => Write::bisect_skip(&repo, Vec::new()),
+    };
+    if !client.submit(Box::new(job)) {
+        client.say("the job queue is shutting down".into());
+    }
+}
+
+/// Which judgement a `bisect_mark` carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BisectMark {
+    /// The checkout works: `git bisect good`.
+    Good,
+    /// The checkout shows the bug: `git bisect bad`.
+    Bad,
+    /// The checkout cannot be judged: `git bisect skip`.
+    Skip,
+}
+
+/// `commits.bisect-reset`: end the bisection, back where it started.
+/// Outside one this is the quiet no-op, so it takes no confirmation.
+pub fn bisect_reset(client: &mut impl Client) {
+    let Some(repo) = client.repo() else {
+        client.say("a fixture has no bisection to end".into());
+        return;
+    };
+    if !client.submit(Box::new(Write::bisect_reset(&repo))) {
         client.say("the job queue is shutting down".into());
     }
 }
