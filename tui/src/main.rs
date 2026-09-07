@@ -3626,7 +3626,7 @@ impl App {
                 }
             }
             Prompt::StashMessage { field } if accept => {
-                gitten_app::act::stash_scoped(self, Some(field.take()), StashScope::Tracked)
+                gitten_app::act::stash_named(self, field.take())
             }
             Prompt::StashRename { at, field } if accept => {
                 gitten_app::act::rename_stash(self, at, field.take())
@@ -18487,6 +18487,790 @@ shared tail
                 "{command} stayed disabled"
             );
             assert!(a.runnable(command));
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // W7: the stash family — named and scoped pushes, rename,
+    // branch-from-stash, inspection before applying, and an identity the
+    // stack cannot churn out from under.
+
+    /// An app on the stash pane, keyboard on `stash@{0}`, with the stack
+    /// the fake ships and one untracked file parked in the entries.
+    fn stash_app(handle: &Handle) -> App {
+        let mut app = commits_app(handle);
+        app.draw();
+        app.dispatch("stashes.focus");
+        app
+    }
+
+    /// Every stash write the fake has recorded so far.
+    fn stash_writes(state: &Arc<Mutex<FakeState>>) -> Vec<String> {
+        state.lock().unwrap().stash_writes.clone()
+    }
+
+    /// The stack as the fake holds it: `(index, message, commit)` per entry.
+    fn stack_now(state: &Arc<Mutex<FakeState>>) -> Vec<(usize, String, String)> {
+        state
+            .lock()
+            .unwrap()
+            .stashes
+            .iter()
+            .map(|e| (e.index, e.message.clone(), e.commit.clone()))
+            .collect()
+    }
+
+    /// Waits for the next write to land and its refresh wave with it.
+    fn stash_landed(app: &mut App, state: &Arc<Mutex<FakeState>>, count: usize) -> bool {
+        until(Duration::from_secs(2), || {
+            app.pump_quiet();
+            stash_writes(state).len() >= count
+        })
+    }
+
+    #[test]
+    fn tui_parity_a_named_stash_gathers_its_message_before_it_parks() {
+        // lazygit's stash-with-a-message, and the field is the whole of the
+        // difference: the press opens it and writes nothing, the accept
+        // parks under what was typed, and the escape parks nothing at all.
+        let (handle, state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        app.dispatch("files.stash-named");
+        assert!(
+            matches!(app.prompt, Some(Prompt::StashMessage { .. })),
+            "the field never opened"
+        );
+        assert!(stash_writes(&state).is_empty(), "the press wrote");
+
+        // Escape throws the text away with no write built.
+        app.press(Key::plain(Code::Esc));
+        assert!(app.prompt.is_none());
+        assert!(stash_writes(&state).is_empty(), "a cancel wrote");
+
+        // And typed, accepted: git's `-m`, with the text whole.
+        app.dispatch("files.stash-named");
+        for ch in "parser rewrite".chars() {
+            app.press(Key::char(ch));
+        }
+        app.press(Key::plain(Code::Enter));
+        assert!(app.prompt.is_none());
+        assert!(
+            stash_landed(&mut app, &state, 1),
+            "the named push never landed: {:?}",
+            stash_writes(&state)
+        );
+        assert_eq!(stash_writes(&state), ["push parser rewrite"]);
+        assert_eq!(
+            stack_now(&state)[0].1,
+            "On fake: parser rewrite",
+            "the entry carries the message it was given"
+        );
+        // The default path is untouched beside it: no message, git's own text.
+        app.dispatch("files.stash");
+        assert!(stash_landed(&mut app, &state, 2));
+        assert_eq!(stash_writes(&state)[1], "push ");
+        assert_eq!(stack_now(&state)[0].1, "WIP on fake (main)");
+    }
+
+    #[test]
+    fn tui_parity_a_named_stash_refuses_an_empty_message_and_a_fixture() {
+        // An accepted blank is not a message and not git's default either:
+        // the field's own refusal, said where the field just was, with
+        // nothing queued.
+        let (handle, state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        app.dispatch("files.stash-named");
+        app.press(Key::plain(Code::Enter));
+        assert_eq!(
+            app.message,
+            "a stash needs a message — the plain stash key parks without one"
+        );
+        assert!(
+            stash_writes(&state).is_empty(),
+            "a blank message parked anyway: {:?}",
+            stash_writes(&state)
+        );
+        // Whitespace is blank too — a stash called "   " is a row nobody can
+        // read and a message git would keep verbatim.
+        app.dispatch("files.stash-named");
+        app.press(Key::char(' '));
+        app.press(Key::char(' '));
+        app.press(Key::plain(Code::Enter));
+        assert!(
+            stash_writes(&state).is_empty(),
+            "{:?}",
+            stash_writes(&state)
+        );
+
+        // A fixture has no working tree, and says so before a field opens
+        // over a repository that is not there.
+        let mut fixture = app_on_diff(Source::Fixtures, None);
+        fixture.screen = Screen::new(120, 40);
+        fixture.dispatch("files.stash-named");
+        assert!(
+            fixture
+                .message
+                .contains("a fixture has no working tree to park"),
+            "{:?}",
+            fixture.message
+        );
+        assert!(fixture.prompt.is_none(), "a field opened over a fixture");
+    }
+
+    #[test]
+    fn tui_parity_the_stash_menu_offers_the_scopes_and_each_reaches_git() {
+        // lazygit's `S`: the choices behind a question of their own, in a
+        // mode that stands only while it does. Each answer reaches git with
+        // the flags its scope spells and nothing else.
+        let (handle, state) = fake(&["fresh.txt"]);
+        let mut app = commits_app(&handle);
+        app.dispatch("files.focus");
+        app.press(Key::char('S'));
+        assert!(
+            app.message.contains("park what?"),
+            "the menu never asked: {:?}",
+            app.message
+        );
+        assert_eq!(app.question, Some("stash"), "the mode never went up");
+
+        for (key, expected) in [
+            ('s', "push [--staged] "),
+            ('u', "push [--keep-index] "),
+            ('U', "push [-u] "),
+        ] {
+            let before = stash_writes(&state).len();
+            app.dispatch("files.focus");
+            app.press(Key::char('S'));
+            app.press(Key::char(key));
+            assert!(
+                stash_landed(&mut app, &state, before + 1),
+                "{key} never reached git: {:?}",
+                stash_writes(&state)
+            );
+            assert_eq!(
+                stash_writes(&state)[before],
+                expected,
+                "{key} reached git with the wrong scope"
+            );
+            // And the question came down with the answer, so the next `s`
+            // means whatever `s` means in the pane again.
+            assert_eq!(app.question, None, "{key} left the menu standing");
+        }
+    }
+
+    #[test]
+    fn tui_parity_the_stash_menu_letters_stand_only_while_the_question_does() {
+        // `m` is the message field inside the menu and nothing at all
+        // outside it; an unbound key answers the question by taking it
+        // down, and runs nothing underneath.
+        let (handle, state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        app.dispatch("files.focus");
+        app.press(Key::char('m'));
+        assert!(
+            app.message.contains("is not bound"),
+            "m meant something outside the menu: {:?}",
+            app.message
+        );
+        assert!(app.prompt.is_none());
+
+        app.press(Key::char('S'));
+        app.press(Key::char('m'));
+        assert!(
+            matches!(app.prompt, Some(Prompt::StashMessage { .. })),
+            "m inside the menu did not open the field"
+        );
+        app.press(Key::plain(Code::Esc));
+
+        // A key the question does not name takes it down rather than
+        // leaving the next press meaning a scope nobody is asking about.
+        app.dispatch("files.focus");
+        app.press(Key::char('S'));
+        assert_eq!(app.question, Some("stash"));
+        app.press(Key::char('Z'));
+        assert_eq!(app.question, None, "an unbound key left the menu up");
+        assert!(stash_writes(&state).is_empty(), "something was parked");
+    }
+
+    #[test]
+    fn tui_parity_the_file_scope_parks_the_row_and_knows_an_untracked_one() {
+        // `f` inside the menu: the path the keyboard is on, behind `--`, and
+        // `-u` when the row is untracked — without which git answers the
+        // pathspec with "did not match any file(s) known to git" and parks
+        // nothing at all.
+        let (handle, state) = fake(&["fresh.txt"]);
+        {
+            let mut s = state.lock().unwrap();
+            s.status.unstaged = vec![UnstagedEntry {
+                path: PathBytes::from("work.rs"),
+                change: Change::Modified,
+                kind: Kind::File,
+                submodule: Submodule::default(),
+            }];
+        }
+        let mut app = commits_app(&handle);
+        app.dispatch("files.focus");
+
+        // Walk to the unstaged row, bounded: a pane that lost it fails the
+        // test rather than hanging it.
+        let mut found = false;
+        for _ in 0..8 {
+            if gitten_app::act::FileClient::selected_file(&app)
+                .is_some_and(|f| f.path.as_bytes() == b"work.rs")
+            {
+                found = true;
+                break;
+            }
+            app.dispatch("view.down");
+        }
+        assert!(found, "the unstaged row was never reached");
+        app.press(Key::char('S'));
+        app.press(Key::char('f'));
+        assert!(
+            stash_landed(&mut app, &state, 1),
+            "{:?}",
+            stash_writes(&state)
+        );
+        assert_eq!(stash_writes(&state), ["push -- work.rs"]);
+
+        // Then the untracked row, which needs the flag.
+        found = false;
+        for _ in 0..8 {
+            if gitten_app::act::FileClient::selected_file(&app)
+                .is_some_and(|f| f.path.as_bytes() == b"fresh.txt")
+            {
+                found = true;
+                break;
+            }
+            app.dispatch("view.down");
+        }
+        assert!(found, "the untracked row was never reached");
+        app.press(Key::char('S'));
+        app.press(Key::char('f'));
+        assert!(
+            stash_landed(&mut app, &state, 2),
+            "{:?}",
+            stash_writes(&state)
+        );
+        assert_eq!(stash_writes(&state)[1], "push [-u] -- fresh.txt");
+    }
+
+    #[test]
+    fn tui_parity_the_file_scope_refuses_off_the_pane_and_on_a_conflict() {
+        let (handle, state) = fake(&[]);
+        {
+            let mut s = state.lock().unwrap();
+            s.status.conflicts = vec![gitten_core::status::ConflictEntry {
+                path: PathBytes::from("both.rs"),
+                state: gitten_core::status::ConflictKind::BothModified,
+                kind: Kind::File,
+                submodule: Submodule::default(),
+            }];
+        }
+        let mut app = commits_app(&handle);
+        // Off the files pane: the row this scope is about is a files row.
+        app.dispatch("stashes.focus");
+        app.dispatch("files.stash-file");
+        assert_eq!(app.message, "files.stash-file is not supported here");
+        assert!(stash_writes(&state).is_empty());
+
+        // On a conflict: its working-tree side is the merge's open question,
+        // and git cannot write a stash over unmerged stages anyway.
+        app.dispatch("files.focus");
+        let mut found = false;
+        for _ in 0..8 {
+            if gitten_app::act::FileClient::selected_file(&app)
+                .is_some_and(|f| f.path.as_bytes() == b"both.rs")
+            {
+                found = true;
+                break;
+            }
+            app.dispatch("view.down");
+        }
+        assert!(found, "the conflict row was never reached");
+        app.dispatch("files.stash-file");
+        assert_eq!(
+            app.message,
+            "a conflicted file's merge has to be resolved, not parked"
+        );
+        assert!(stash_writes(&state).is_empty());
+    }
+
+    #[test]
+    fn tui_parity_a_stash_is_renamed_from_its_own_message_and_re_filed_on_top() {
+        // lazygit's `r`: the field arrives prefilled and wholly selected, so
+        // an edit replaces what is standing rather than appending to it.
+        // The commit survives; the entry moves to the top, because git's
+        // stash is a reflog and only appends.
+        let (handle, state) = fake(&[]);
+        let mut app = stash_app(&handle);
+        app.dispatch("view.down");
+        let chosen = state.lock().unwrap().stashes[1].clone();
+        app.press(Key::char('r'));
+        match &app.prompt {
+            Some(Prompt::StashRename { at, field }) => {
+                assert_eq!(at.commit, chosen.commit, "the field aims at the entry");
+                assert_eq!(at.index, 1);
+                assert_eq!(field.text(), chosen.message, "the field was not prefilled");
+            }
+            _ => panic!("the rename field never opened"),
+        }
+        assert!(stash_writes(&state).is_empty(), "the press wrote");
+
+        for ch in "the parser one".chars() {
+            app.press(Key::char(ch));
+        }
+        app.press(Key::plain(Code::Enter));
+        assert!(
+            stash_landed(&mut app, &state, 1),
+            "{:?}",
+            stash_writes(&state)
+        );
+        assert_eq!(stash_writes(&state), ["rename stash@{1} the parser one"]);
+        let stack = stack_now(&state);
+        assert_eq!(stack.len(), 2, "a rename added an entry: {stack:?}");
+        assert_eq!(
+            (stack[0].1.as_str(), stack[0].2.as_str()),
+            ("the parser one", chosen.commit.as_str()),
+            "the message changed and the commit did not"
+        );
+        assert_eq!(stack[1].2, "aaa", "the other entry was left alone");
+    }
+
+    #[test]
+    fn tui_parity_a_rename_refuses_a_blank_field_and_the_wrong_pane() {
+        let (handle, state) = fake(&[]);
+        let mut app = commits_app(&handle);
+        // The keyboard is on the commits list: a rename is a stash row's.
+        app.dispatch("stashes.rename");
+        assert_eq!(app.message, "the keyboard is not on a stash");
+        assert!(app.prompt.is_none());
+
+        app.dispatch("stashes.focus");
+        app.press(Key::char('r'));
+        // Clear the prefill, then accept nothing: refused where the field
+        // was, and no job built.
+        for _ in 0..40 {
+            app.press(Key::plain(Code::Backspace));
+        }
+        app.press(Key::plain(Code::Enter));
+        assert_eq!(app.message, "a stash needs a message");
+        assert!(stash_writes(&state).is_empty());
+    }
+
+    #[test]
+    fn tui_parity_a_branch_from_a_stash_starts_where_the_stash_was_made() {
+        // lazygit's `n`: git's own three-in-one behind one field — the
+        // branch at the commit the stash was made on, the entry applied
+        // with its index, and the entry dropped after a clean apply.
+        let (handle, state) = fake(&[]);
+        let mut app = stash_app(&handle);
+        let chosen = state.lock().unwrap().stashes[0].clone();
+        app.press(Key::char('n'));
+        match &app.prompt {
+            Some(Prompt::StashBranch { at, field }) => {
+                assert_eq!(at.commit, chosen.commit);
+                assert!(field.text().is_empty(), "a branch field is not prefilled");
+            }
+            _ => panic!("the branch field never opened"),
+        }
+        assert!(stash_writes(&state).is_empty(), "the press wrote");
+
+        for ch in "wip-branch".chars() {
+            app.press(Key::char(ch));
+        }
+        app.press(Key::plain(Code::Enter));
+        assert!(
+            stash_landed(&mut app, &state, 1),
+            "{:?}",
+            stash_writes(&state)
+        );
+        assert_eq!(stash_writes(&state), ["branch wip-branch from stash@{0}"]);
+        {
+            let s = state.lock().unwrap();
+            assert!(
+                matches!(&s.head, Some(HeadState::Branch { name, .. })
+                    if name.as_bytes() == b"wip-branch"),
+                "the branch was not checked out: {:?}",
+                s.head
+            );
+            assert_eq!(s.stashes.len(), 1, "the entry was not dropped");
+            assert_eq!(s.stashes[0].commit, "bbb");
+        }
+    }
+
+    #[test]
+    fn tui_parity_a_branch_from_a_stash_refuses_a_blank_name_and_an_operation() {
+        let (handle, state) = fake(&[]);
+        let mut app = stash_app(&handle);
+        app.press(Key::char('n'));
+        app.press(Key::plain(Code::Enter));
+        assert_eq!(app.message, "a branch needs a name");
+        assert!(stash_writes(&state).is_empty());
+
+        // It checks out, so it waits for git's own standing write.
+        state.lock().unwrap().standing = Some(Operation {
+            kind: gitten_core::operation::Kind::Rebase,
+            conflicts: 1,
+        });
+        let mut app = stash_app(&handle);
+        app.press(Key::char('n'));
+        for ch in "wip".chars() {
+            app.press(Key::char(ch));
+        }
+        app.press(Key::plain(Code::Enter));
+        assert_eq!(
+            app.message,
+            "a rebase is in progress; finish or abort it before starting another"
+        );
+        assert!(stash_writes(&state).is_empty());
+    }
+
+    #[test]
+    fn tui_parity_a_stash_is_inspected_whole_before_anything_is_applied() {
+        // Inspection is the point: both halves of the entry, drawn in the
+        // preview lane, with nothing applied to the working tree. The
+        // untracked half goes first, exactly as the aggregate read puts
+        // creations before modifications, and the diff pane's own file jumps
+        // are the drilldown.
+        let (handle, state) = fake(&[]);
+        {
+            let mut s = state.lock().unwrap();
+            // One line, so the tracked half's heading is still on screen
+            // below it: what is being asserted is the *order* of the two
+            // halves, not how far a 40-line file scrolls.
+            s.stash_untracked = vec![pair("fresh.txt", Vec::new(), vec![Arc::from("brand new")])];
+        }
+        let mut app = stash_app(&handle);
+        app.dispatch("stashes.open-diff");
+        app.pump_quiet();
+        assert_eq!(app.panes.focused_name(), "diff");
+        let entry = state.lock().unwrap().stashes[0].clone();
+        assert_eq!(
+            origin_of(&app),
+            Some(DiffSource::Stash {
+                index: 0,
+                commit: entry.commit.clone()
+            })
+        );
+        // Both halves are drawn — the untracked file first, exactly as the
+        // aggregate read puts creations before modifications — and the
+        // pane's own file jump is the drilldown between them.
+        app.draw();
+        let frame: Vec<String> = (0..app.screen.size().1)
+            .map(|y| app.screen.row_text(y))
+            .collect();
+        let seen = |needle: &str| frame.iter().any(|row| row.contains(needle));
+        assert!(
+            seen("fresh.txt"),
+            "the untracked half is not drawn: {frame:?}"
+        );
+        let fresh_at = frame
+            .iter()
+            .position(|row| row.contains("fresh.txt"))
+            .expect("the untracked heading");
+        let tracked_at = frame
+            .iter()
+            .position(|row| row.contains("f.txt") && !row.contains("fresh.txt"))
+            .expect("the tracked heading");
+        assert!(
+            fresh_at < tracked_at,
+            "the untracked half is not first: {fresh_at} vs {tracked_at}"
+        );
+        let at_first = diff_of(&app).cursor();
+        app.dispatch("diff.next-file");
+        assert_ne!(
+            diff_of(&app).cursor(),
+            at_first,
+            "the file jump moved nothing"
+        );
+        // Nothing was applied: inspection reads, and the stack is whole.
+        assert!(
+            stash_writes(&state).is_empty(),
+            "{:?}",
+            stash_writes(&state)
+        );
+        assert_eq!(state.lock().unwrap().stashes.len(), 2);
+    }
+
+    #[test]
+    fn tui_parity_a_stash_verb_follows_its_commit_when_the_stack_churns() {
+        // The accident stable identity exists to prevent. `stash@{1}` is
+        // chosen; something outside the pane drops `stash@{0}`, so the row
+        // the pane last drew as `stash@{1}` is now `stash@{0}` and the
+        // number the keyboard captured names the *other* entry. The write
+        // must land on the entry that was chosen.
+        let (handle, state) = fake(&[]);
+        let mut app = stash_app(&handle);
+        app.dispatch("view.down");
+        let chosen =
+            gitten_app::act::StashClient::selected_stash(&app).expect("a row under the keyboard");
+        assert_eq!((chosen.index, chosen.commit.as_str()), (1, "bbb"));
+
+        // The churn, behind the pane's back: the stack the *repository*
+        // holds loses its top entry and renumbers.
+        {
+            let mut s = state.lock().unwrap();
+            s.stashes.remove(0);
+            for (i, entry) in s.stashes.iter_mut().enumerate() {
+                entry.index = i;
+            }
+        }
+        app.dispatch("stashes.apply");
+        assert!(
+            stash_landed(&mut app, &state, 1),
+            "{:?}",
+            stash_writes(&state)
+        );
+        // Resolved to where the commit *is*, not to the number it was at.
+        assert_eq!(
+            stash_writes(&state),
+            ["apply stash@{0}"],
+            "the apply did not follow the commit"
+        );
+        assert_eq!(
+            app.message, "",
+            "a correct apply said something: {:?}",
+            app.message
+        );
+    }
+
+    #[test]
+    fn tui_parity_a_stash_verb_refuses_an_entry_the_churn_took_away() {
+        // The other half of the same rule: the chosen entry left the stack
+        // entirely, and the number it was at now names somebody else's
+        // work. Refused in words, and nothing is written.
+        let (handle, state) = fake(&[]);
+        for command in ["stashes.apply", "stashes.pop"] {
+            // Each pass opens on the same stack: the churn below is what the
+            // test does to it, not what the pass before left behind.
+            {
+                let mut s = state.lock().unwrap();
+                s.stashes = two_stashes();
+                s.stash_writes.clear();
+            }
+            let mut app = stash_app(&handle);
+            app.dispatch("view.down");
+            assert_eq!(
+                gitten_app::act::StashClient::selected_stash(&app).map(|id| id.commit),
+                Some("bbb".into())
+            );
+            {
+                let mut s = state.lock().unwrap();
+                s.stashes = vec![
+                    Stash {
+                        index: 0,
+                        message: "On main: wip things".into(),
+                        commit: "aaa".into(),
+                    },
+                    Stash {
+                        index: 1,
+                        message: "On main: somebody else's".into(),
+                        commit: "ccc".into(),
+                    },
+                ];
+                s.stash_writes.clear();
+            }
+            app.dispatch(command);
+            assert!(
+                until(Duration::from_secs(2), || {
+                    app.pump_quiet();
+                    app.message.contains("no longer on the stack")
+                }),
+                "{command} never refused: {:?}",
+                app.message
+            );
+            assert!(
+                stash_writes(&state).is_empty(),
+                "{command} wrote anyway: {:?}",
+                stash_writes(&state)
+            );
+            assert_eq!(stack_now(&state).len(), 2, "the refusal moved the stack");
+        }
+    }
+
+    #[test]
+    fn tui_parity_a_drop_armed_on_one_entry_is_never_spent_on_another() {
+        // The arm holds the identity, so the yes cannot be inherited: the
+        // entry the question was asked about leaves the stack, another one
+        // takes its number, and the second press asks again about *that*
+        // one instead of dropping it.
+        let (handle, state) = fake(&[]);
+        let mut app = stash_app(&handle);
+        app.press(Key::char('d'));
+        assert_eq!(app.message, "drop stash@{0}? press again to confirm");
+        assert!(stash_writes(&state).is_empty());
+
+        // The pane's rows are replaced with a stack whose stash@{0} is a
+        // different commit — which is exactly what a refresh after somebody
+        // else's push looks like.
+        if let Some(Screens::Stashes { view, .. }) = app.panes.get_mut("stashes") {
+            view.replace(vec![
+                Stash {
+                    index: 0,
+                    message: "On main: somebody else's".into(),
+                    commit: "ccc".into(),
+                },
+                Stash {
+                    index: 1,
+                    message: "On dev: other work".into(),
+                    commit: "bbb".into(),
+                },
+            ]);
+        }
+        app.press(Key::char('d'));
+        assert_eq!(
+            app.message, "drop stash@{0}? press again to confirm",
+            "a stale yes was spent: {:?}",
+            app.message
+        );
+        assert!(
+            stash_writes(&state).is_empty(),
+            "the inherited row was dropped: {:?}",
+            stash_writes(&state)
+        );
+    }
+
+    #[test]
+    fn tui_parity_a_conflicted_pop_keeps_the_stash_and_says_git_s_words() {
+        // git decides, and it keeps the entry: a pop whose apply fails
+        // never reaches the drop, so the work is still parked and still
+        // recoverable. The refusal is git's sentence, not a UI-invented
+        // word like `conflict`.
+        let (handle, state) = fake(&[]);
+        let mut app = stash_app(&handle);
+        state.lock().unwrap().refuse_stash =
+            Some("error: Your local changes would be overwritten by merge".into());
+        let chosen = gitten_app::act::StashClient::selected_stash(&app).expect("a row");
+        app.dispatch("stashes.pop");
+        assert!(
+            until(Duration::from_secs(2), || {
+                app.pump_quiet();
+                app.message.contains("would be overwritten")
+            }),
+            "the refusal never arrived: {:?}",
+            app.message
+        );
+        assert_eq!(
+            state.lock().unwrap().stashes.len(),
+            2,
+            "a refused pop moved the stack"
+        );
+        assert_eq!(state.lock().unwrap().stashes[0].commit, chosen.commit);
+
+        // Recoverable means recoverable: with the way cleared, the same
+        // entry pops, addressed by the identity that chose it.
+        state.lock().unwrap().refuse_stash = None;
+        let before = stash_writes(&state).len();
+        app.dispatch("stashes.pop");
+        assert!(
+            stash_landed(&mut app, &state, before + 1),
+            "the kept entry never popped: {:?}",
+            stash_writes(&state)
+        );
+        assert_eq!(stash_writes(&state).last().unwrap(), "pop stash@{0}");
+        assert_eq!(state.lock().unwrap().stashes.len(), 1);
+    }
+
+    #[test]
+    fn tui_parity_the_stash_family_is_disabled_without_a_repository() {
+        // Every one of them needs a working tree or a stack, so a fixture
+        // says why rather than advertising a key that cannot run.
+        let a = tui_availability(false, None);
+        for command in [
+            "files.stash-menu",
+            "files.stash-named",
+            "files.stash-staged",
+            "files.stash-unstaged",
+            "files.stash-untracked",
+            "files.stash-file",
+            "stashes.rename",
+            "stashes.new-branch",
+        ] {
+            match a.state(command) {
+                gitten_core::command::Usable::Disabled(why) => assert!(
+                    why.contains("fixture"),
+                    "{command}'s reason names no fixture: {why:?}"
+                ),
+                other => panic!("{command} is advertised against a fixture: {other:?}"),
+            }
+            assert!(!a.runnable(command));
+        }
+        let a = tui_availability(true, None);
+        for command in [
+            "files.stash-menu",
+            "files.stash-file",
+            "stashes.rename",
+            "stashes.new-branch",
+        ] {
+            assert_eq!(
+                a.state(command),
+                &gitten_core::command::Usable::Available,
+                "{command} stayed disabled"
+            );
+        }
+    }
+
+    #[test]
+    fn tui_parity_the_stash_keys_resolve_where_lazygit_puts_them() {
+        // Keys are data: the shipped map is what says so, and the panel
+        // reads the same table the press does.
+        let map = gitten_core::command::Keymap::builtin();
+        let mut stashes = Modes::new();
+        stashes.push("stashes");
+        for (chord, name) in [
+            ("space", "stashes.apply"),
+            ("g", "stashes.pop"),
+            ("d", "stashes.drop"),
+            ("r", "stashes.rename"),
+            ("n", "stashes.new-branch"),
+            ("enter", "stashes.open-diff"),
+        ] {
+            assert_eq!(
+                map.resolve(
+                    &stashes,
+                    &gitten_core::command::parse_chord(chord).expect("a chord")
+                ),
+                gitten_core::command::Resolve::Run(name),
+                "{chord} did not reach {name} in [stashes]"
+            );
+        }
+        let mut files = Modes::new();
+        files.push("files");
+        assert_eq!(
+            map.resolve(
+                &files,
+                &gitten_core::command::parse_chord("S").expect("a chord")
+            ),
+            gitten_core::command::Resolve::Run("files.stash-menu")
+        );
+        // The scope letters live in the question's mode and nowhere else.
+        let mut menu = Modes::new();
+        menu.push("files");
+        menu.push("stash");
+        for (chord, name) in [
+            ("m", "files.stash-named"),
+            ("s", "files.stash-staged"),
+            ("u", "files.stash-unstaged"),
+            ("U", "files.stash-untracked"),
+            ("f", "files.stash-file"),
+        ] {
+            assert_eq!(
+                map.resolve(
+                    &menu,
+                    &gitten_core::command::parse_chord(chord).expect("a chord")
+                ),
+                gitten_core::command::Resolve::Run(name),
+                "{chord} did not reach {name} in [stash]"
+            );
+            assert_ne!(
+                map.resolve(
+                    &files,
+                    &gitten_core::command::parse_chord(chord).expect("a chord")
+                ),
+                gitten_core::command::Resolve::Run(name),
+                "{name} leaked out of the menu into [files]"
+            );
         }
     }
 }

@@ -351,6 +351,23 @@ pub fn stash_scoped(client: &mut impl Client, message: Option<String>, scope: St
     }
 }
 
+/// `files.stash-named`'s accepted field: the message, then the tracked push
+/// under it.
+///
+/// A blank field is refused rather than quietly becoming git's own `WIP on
+/// …` — the reader pressed the key that *names* a stash, and the plain
+/// stash key is the one that does not, which the refusal says so the second
+/// attempt is the right one. The text travels whole otherwise, padding
+/// included: a message is free text the way a commit message is, and
+/// trimming it would be this module editing somebody's words.
+pub fn stash_named(client: &mut impl Client, message: String) {
+    if message.trim().is_empty() {
+        client.say("a stash needs a message — the plain stash key parks without one".into());
+        return;
+    }
+    stash_scoped(client, Some(message), StashScope::Tracked);
+}
+
 /// `stashes.apply`: restore the selected entry, keeping it on the stack.
 ///
 /// Aimed by the entry's commit, so the write survives a stack that churned
