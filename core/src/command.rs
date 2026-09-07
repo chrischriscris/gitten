@@ -761,6 +761,9 @@ impl Keymap {
         bind("todo", "ctrl-j", "todo.move-down");
         bind("todo", "enter", "todo.run");
         bind("todo", "esc", "back");
+        // The panel over the plan: `?` is the one key every mode here keeps,
+        // and a screen of unfamiliar letters is exactly where it is wanted.
+        bind("todo", "?", "help");
         bind("todo", "j", "view.down");
         bind("todo", "down", "view.down");
         bind("todo", "k", "view.up");

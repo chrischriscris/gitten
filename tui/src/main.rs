@@ -2358,7 +2358,7 @@ impl App {
         // While the plan is open it owns the keyboard the way help does:
         // resolved against exactly its one mode, so nothing underneath runs
         // — and what is underneath a rebase plan is the history verbs.
-        if self.todo.is_some() && self.prompt.is_none() {
+        if self.todo.is_some() && self.prompt.is_none() && !self.help {
             self.press_modal(TODO, key, ModalKind::List);
             return;
         }
@@ -3826,7 +3826,10 @@ impl App {
         // While the plan is open it owns the moves and the way out, exactly
         // as the picker does — and its own verbs fall through to the match
         // below, which is where the model is edited.
-        if self.todo.is_some() {
+        // With the help panel over it, the panel is the innermost thing on
+        // screen and answers first — otherwise `esc` would close the plan
+        // from behind the keys it was opened to read.
+        if self.todo.is_some() && !self.help {
             match command {
                 "view.down" | "view.up" | "view.top" | "view.bottom" => {
                     if let Some(todo) = self.todo.as_mut() {
@@ -5651,6 +5654,13 @@ impl App {
             pen.wash(ink);
         }
 
+        // The plan floats over everything the panes drew, on the picker's
+        // own terms — it owns the keyboard, so it owns the rows it covers —
+        // and under the help panel, which owns the keyboard back off it for
+        // as long as somebody is reading the keys.
+        if let Some(todo) = self.todo.as_mut() {
+            todo.paint(&mut self.screen, 1, body, &self.host, &self.availability);
+        }
         if self.help {
             help::paint(
                 &mut self.screen,
@@ -5665,11 +5675,6 @@ impl App {
         }
         if let Some(picker) = self.picker.as_ref() {
             paint_picker(&mut self.screen, 1, body, picker, &self.host);
-        }
-        // The plan floats over everything the panes drew, on the picker's
-        // own terms — it owns the keyboard, so it owns the rows it covers.
-        if let Some(todo) = self.todo.as_mut() {
-            todo.paint(&mut self.screen, 1, body, &self.host, &self.availability);
         }
     }
 }
@@ -17349,6 +17354,40 @@ shared tail
                 "`{key}` did not compose its own fold"
             );
         }
+    }
+
+    /// `?` over the open plan shows the plan's own keys, and the panel
+    /// answers before the plan does while it stands — otherwise `esc` would
+    /// close the plan from behind the very keys it was opened to read.
+    #[test]
+    fn tui_parity_the_plan_shows_its_own_keys_and_the_panel_closes_first() {
+        let (handle, _) = fake(&[]);
+        let mut app = history_app(&handle);
+        app.screen = Screen::new(120, 40);
+        app.dispatch("view.down");
+        app.press(Key::char('i'));
+        assert!(app.todo.is_some(), "{:?}", app.message);
+
+        app.press(Key::char('?'));
+        assert!(app.help, "the panel never opened over the plan");
+        app.press(Key::plain(Code::End));
+        app.draw();
+        let body: String = (0..40)
+            .map(|y| app.screen.row_text(y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("leave this commit out of the branch"),
+            "the panel did not list the plan's keys: {body}"
+        );
+
+        // Esc takes the panel, not the plan.
+        app.press(Key::plain(Code::Esc));
+        assert!(!app.help, "the panel stayed up");
+        assert!(app.todo.is_some(), "esc closed the plan behind the panel");
+        // And now it takes the plan.
+        app.press(Key::plain(Code::Esc));
+        assert!(app.todo.is_none(), "esc left the plan open");
     }
 
     /// A cancelled todo edit writes nothing and leaves the repository
