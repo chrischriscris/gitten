@@ -54,10 +54,12 @@ use gitten_core::status::{
 };
 use gitten_core::{parse_log, Commit, FileDiff};
 
-/// The interactive-rebase plan, re-exported because it appears on the
+/// The interactive-rebase plans, re-exported because they appear on the
 /// [`Repo`] trait: an implementor should not need to know which crate
-/// spelled it.
-pub use gitten_core::rebase::TodoScript;
+/// spelled them. [`TodoScript`] is git's file as bytes; [`Plan`] is the
+/// editable model a todo UI holds, and the one that can carry a reworded
+/// message down to the layer with a filesystem to put it in.
+pub use gitten_core::rebase::{Plan, TodoScript};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
@@ -198,10 +200,10 @@ fn run_env(repo: &Path, args: &[&[u8]], env: &[(&str, &str)]) -> Result<Vec<u8>>
     Ok(out.stdout)
 }
 
-/// Writes a plan to one freshly created temp file and names it.
+/// Writes bytes to one freshly created temp file and names it.
 ///
-/// Three properties, because this file carries commit subjects and lives in
-/// a directory other users may be able to write:
+/// Three properties, because these files carry commit subjects and messages
+/// and live in a directory other users may be able to write:
 ///
 /// **`create_new`** — the create fails if anything already sits at the
 /// path, so a pre-planted file or symlink cannot be clobbered with a plan
@@ -216,8 +218,9 @@ fn run_env(repo: &Path, args: &[&[u8]], env: &[(&str, &str)]) -> Result<Vec<u8>>
 ///
 /// The file exists only for the length of the rebase process; uniqueness
 /// is per call rather than per process, because two rebases queued behind
-/// each other on the job thread must not share a plan.
-fn write_todo_tmpfile(script: Vec<u8>) -> Result<PathBuf> {
+/// each other on the job thread must not share a plan — and one rebase's
+/// own reworded messages are one file each, for the same reason.
+fn write_private_tmpfile(kind: &str, contents: Vec<u8>) -> Result<PathBuf> {
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -229,7 +232,7 @@ fn write_todo_tmpfile(script: Vec<u8>) -> Result<PathBuf> {
     for attempt in 0..4 {
         let mut at = std::env::temp_dir();
         at.push(format!(
-            "gitten-todo-{}-{:x}-{:x}-{:x}",
+            "gitten-{kind}-{}-{:x}-{:x}-{:x}",
             std::process::id(),
             nanos,
             attempt,
@@ -245,7 +248,7 @@ fn write_todo_tmpfile(script: Vec<u8>) -> Result<PathBuf> {
                 file.set_permissions(std::fs::Permissions::from_mode(0o600))
                     .map_err(|e| format!("could not lock down {}: {e}", at.display()))?;
                 (&file)
-                    .write_all(&script)
+                    .write_all(&contents)
                     .map_err(|e| format!("could not write {}: {e}", at.display()))?;
                 return Ok(at);
             }
@@ -255,7 +258,9 @@ fn write_todo_tmpfile(script: Vec<u8>) -> Result<PathBuf> {
             Err(e) => return Err(format!("could not create {}: {e}", at.display())),
         }
     }
-    Err("could not create a private todo tempfile after four attempts".into())
+    Err(format!(
+        "could not create a private {kind} tempfile after four attempts"
+    ))
 }
 
 /// A path as one shell word. Temp directories do not usually need the
@@ -831,6 +836,31 @@ pub trait Repo: Send + Sync {
         Err(unserved("interactive rebase"))
     }
 
+    /// Rewrites history from an editable [`Plan`] — the same
+    /// `git rebase -i` machinery as [`rebase_todo`](Self::rebase_todo), with
+    /// the two things a plan carries that a bare script cannot.
+    ///
+    /// A **reworded** message is bytes somebody typed, and git's own
+    /// `reword` would ask for them again through an editor nothing here can
+    /// answer. So the plan's reword reaches git as a `pick` followed by an
+    /// `exec` of `git commit --amend -F <file>`, the file being one private
+    /// temp file per message, removed once the rebase is over. That is the
+    /// whole reason this verb exists beside its sibling: the message needs a
+    /// filesystem, and [`gitten_core::rebase`] has none.
+    ///
+    /// An **amendment** is the same trick without the file —
+    /// `--reset-author` is the one today — which is what lets a commit
+    /// deeper than HEAD be re-authored at all.
+    ///
+    /// Everything else is [`rebase_todo`](Self::rebase_todo)'s story
+    /// verbatim, refusals included: an invalid plan refuses before any
+    /// process runs, a dirty tree is git's own sentence, and a conflict or
+    /// an `edit` stop leaves rebase state standing for the lifecycle to
+    /// carry on from.
+    fn rebase_plan(&self, _plan: &Plan) -> Result<()> {
+        Err(unserved("interactive rebase"))
+    }
+
     /// Moves the current branch onto `upstream`, replaying its own commits:
     /// plain `git rebase -q <upstream>`, no plan involved.
     ///
@@ -841,6 +871,38 @@ pub trait Repo: Send + Sync {
     /// upstream has them, which is git deciding rather than us.
     fn rebase_onto(&self, _upstream: &[u8]) -> Result<()> {
         Err(unserved("rebasing"))
+    }
+
+    /// Replays everything after `base` onto `onto` —
+    /// `git rebase --onto <onto> <base>`, git's own three-argument form
+    /// with HEAD as the implicit third.
+    ///
+    /// `base` is **exclusive**: the commit marked stays where it is and its
+    /// children are what move. That is what makes marking a base worth a
+    /// key — it is the only way to say "not from where the branches
+    /// diverged, from *here*" — and it is also the sharp edge, because a
+    /// base that is not an ancestor of HEAD replays a range nobody meant.
+    /// Both names are bytes and both pass [`refuse_dashes`] first.
+    fn rebase_onto_base(&self, _onto: &[u8], _base: &[u8]) -> Result<()> {
+        Err(unserved("rebasing onto a base"))
+    }
+
+    /// Throws the whole working tree away: `git reset --hard HEAD` and then
+    /// `git clean -fd`.
+    ///
+    /// DESTRUCTIVE, and the most destructive verb in this trait — every
+    /// uncommitted byte goes, tracked and untracked alike, with no stash and
+    /// no reflog to walk back through. The caller confirms; nothing here
+    /// does.
+    ///
+    /// Two deliberate limits. Ignored files **stay**: `clean` runs without
+    /// `-x`, because a build directory is not somebody's work and deleting
+    /// half an hour of compilation is not what the key said. And an unborn
+    /// branch skips the reset — there is no HEAD to reset to — and cleans
+    /// alone, rather than failing at the first process and leaving the
+    /// second undone.
+    fn nuke_worktree(&self) -> Result<()> {
+        Err(unserved("nuking the working tree"))
     }
 
     /// Abandons an in-progress rebase and puts everything back:
@@ -2021,38 +2083,56 @@ impl Repo for Binary {
         // The plan is checked before anything runs: a refusal that names the
         // action beats a background job hung on an editor nobody can see.
         script.validate()?;
-        if self.rebase_in_progress() {
-            return Err(
-                "a rebase is already in progress; finish or abort it before \
-                 starting another"
-                    .into(),
-            );
-        }
-        refuse_dashes(upstream)?;
-        let todo = write_todo_tmpfile(script.emit())?;
-        // git runs the sequencer editor as `$EDITOR <todo>`, through the
-        // shell. `cp <ours>` takes the todo path as its second argument,
-        // overwrites it with our plan and exits 0 — an editor that always
-        // agrees with us. The temp path rides as bytes: a `$TMPDIR` with an
-        // odd byte in it is unusual, not impossible.
-        //
-        // `GIT_EDITOR=true` answers the *second* editor: a `squash` opens it
-        // on a message template git already filled in, and `true` accepts
-        // that text untouched — which is precisely what keeps git's own
-        // message-concatenation rule while nothing blocks on a prompt.
-        let editor = {
-            use std::os::unix::ffi::OsStrExt;
-            format!("cp {}", shell_quote(todo.as_os_str().as_bytes()))
-        };
-        let result = run_env(
-            &self.root,
-            &[b"rebase", b"-i", upstream],
-            &[("GIT_SEQUENCE_EDITOR", &editor[..]), ("GIT_EDITOR", "true")],
-        );
-        let _ = std::fs::remove_file(&todo);
-        result.map(|_| ())
+        self.run_todo(upstream, script)
     }
 
+    fn rebase_plan(&self, plan: &Plan) -> Result<()> {
+        plan.validate()?;
+        // The message files outlive the script and die with the rebase: git
+        // reads each one when its `exec` line runs, which is somewhere in
+        // the middle of the process below.
+        let mut scratch: Vec<PathBuf> = Vec::new();
+        let script = plan.script(&mut |entry| {
+            let mut out = Vec::new();
+            if let Some(message) = &entry.message {
+                use std::os::unix::ffi::OsStrExt;
+                let at = write_private_tmpfile("message", message.clone())?;
+                let quoted = shell_quote(at.as_os_str().as_bytes());
+                scratch.push(at);
+                // `--only` for the same measured reason
+                // [`reset_author`](Self::reset_author) takes it: a bare
+                // `--amend` folds the index into the commit, and a keypress
+                // that said *reword* must not commit anything.
+                out.push(format!("git commit --amend --quiet --only -F {quoted}").into_bytes());
+            }
+            if entry.amend == Some(gitten_core::rebase::Amend::ResetAuthor) {
+                out.push(b"git commit --amend --quiet --only --no-edit --reset-author".to_vec());
+            }
+            Ok(out)
+        });
+        let ran = script.and_then(|script| self.run_todo(plan.upstream(), &script));
+        for at in scratch {
+            let _ = std::fs::remove_file(at);
+        }
+        ran
+    }
+
+    fn rebase_onto_base(&self, onto: &[u8], base: &[u8]) -> Result<()> {
+        refuse_dashes(onto)?;
+        refuse_dashes(base)?;
+        run_bytes(&self.root, &[b"rebase", b"-q", b"--onto", onto, base]).map(|_| ())
+    }
+
+    fn nuke_worktree(&self) -> Result<()> {
+        // An unborn branch has no HEAD to reset to, and git's own answer
+        // there ("fatal: ambiguous argument 'HEAD'") names nothing a person
+        // can act on. The clean still runs: an untracked file is exactly
+        // what an unborn branch's working tree is made of.
+        if !matches!(self.head()?, HeadState::Branch { commit: None, .. }) {
+            run_bytes(&self.root, &[b"reset", b"-q", b"--hard", b"HEAD"])?;
+        }
+        run_bytes(&self.root, &[b"clean", b"-q", b"-f", b"-d"]).map(|_| ())
+    }
     fn rebase_onto(&self, upstream: &[u8]) -> Result<()> {
         refuse_dashes(upstream)?;
         run_bytes(&self.root, &[b"rebase", b"-q", upstream]).map(|_| ())
@@ -2577,6 +2657,45 @@ impl Repo for Binary {
 }
 
 impl Binary {
+    // The one process every scripted rebase runs, shared by the two verbs
+    // above so a plan and a script cannot drift into two different
+    // invocations. Everything it does is documented on
+    // [`Repo::rebase_todo`]; the checks it does not make — a script's
+    // validation, a plan's — belong to the caller, because their words
+    // differ and the refusal is what a reader sees.
+    fn run_todo(&self, upstream: &[u8], script: &TodoScript) -> Result<()> {
+        if self.rebase_in_progress() {
+            return Err(
+                "a rebase is already in progress; finish or abort it before \
+                 starting another"
+                    .into(),
+            );
+        }
+        refuse_dashes(upstream)?;
+        let todo = write_private_tmpfile("todo", script.emit())?;
+        // git runs the sequencer editor as `$EDITOR <todo>`, through the
+        // shell. `cp <ours>` takes the todo path as its second argument,
+        // overwrites it with our plan and exits 0 — an editor that always
+        // agrees with us. The temp path rides as bytes: a `$TMPDIR` with an
+        // odd byte in it is unusual, not impossible.
+        //
+        // `GIT_EDITOR=true` answers the *second* editor: a `squash` opens it
+        // on a message template git already filled in, and `true` accepts
+        // that text untouched — which is precisely what keeps git's own
+        // message-concatenation rule while nothing blocks on a prompt.
+        let editor = {
+            use std::os::unix::ffi::OsStrExt;
+            format!("cp {}", shell_quote(todo.as_os_str().as_bytes()))
+        };
+        let result = run_env(
+            &self.root,
+            &[b"rebase", b"-i", upstream],
+            &[("GIT_SEQUENCE_EDITOR", &editor[..]), ("GIT_EDITOR", "true")],
+        );
+        let _ = std::fs::remove_file(&todo);
+        result.map(|_| ())
+    }
+
     /// Whether `HEAD` names a commit, and which.
     ///
     /// `--verify --quiet` answers empty and nonzero when it does not — the
@@ -10057,7 +10176,7 @@ mod tests {
 
     // ------------------------------------------------------------- the rebase
 
-    use gitten_core::rebase::{Action, Line, Rewrite, TodoScript};
+    use gitten_core::rebase::{Action, Line, Plan, Rewrite, TodoScript};
 
     /// A straight line of work over separate files: `base`, then three
     /// commits each adding its own file, so a rewrite that loses content
@@ -10397,7 +10516,7 @@ mod tests {
     }
 
     #[test]
-    fn reword_and_edit_are_refused_before_any_process_runs() {
+    fn a_bare_reword_is_refused_before_any_process_runs() {
         let r = linear_repo("rebase-reword");
         let before = r.rev_parse("HEAD");
         let g = r.open();
@@ -10411,6 +10530,296 @@ mod tests {
         // Nothing started: no state directory, HEAD where it was.
         assert!(!g.rebase_in_progress(), "the refusal predated any process");
         assert_eq!(r.rev_parse("HEAD"), before);
+    }
+
+    /// The loaded window a plan is built over — the same read a log pane
+    /// makes, so a test's plan is composed over exactly what a user's is.
+    fn window(r: &Scratch) -> Vec<Commit> {
+        r.open().log(50).expect("a log")
+    }
+
+    /// Every commit's author name, newest first.
+    fn authors(r: &Scratch) -> Vec<String> {
+        let out = r.git_os_out(&["log".into(), "--format=%an".into(), "--topo-order".into()]);
+        String::from_utf8_lossy(&out)
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn a_planned_reword_replaces_one_message_and_moves_nothing_else() {
+        let r = linear_repo("plan-reword");
+        let g = r.open();
+        let commits = window(&r);
+        let mut plan = Plan::over(&commits, 1).expect("a straight window");
+        // The row below HEAD — `two` — reworded, with the message this
+        // client already holds. git's own `reword` would open an editor for
+        // exactly these bytes.
+        plan.set_message(1, b"two, said properly\n".to_vec())
+            .expect("a message");
+        g.rebase_plan(&plan).expect("the plan runs");
+
+        assert_eq!(
+            subjects(&r),
+            vec!["three", "two, said properly", "one", "base"],
+            "one message changed and the order did not"
+        );
+        // And the content is all still there: a reword rewrites a message,
+        // never a tree.
+        for file in ["base.txt", "one.txt", "two.txt", "three.txt"] {
+            assert!(r.0.join(file).exists(), "{file} left the tree");
+        }
+        assert!(!g.rebase_in_progress(), "the rebase finished");
+    }
+
+    #[test]
+    fn a_planned_drop_and_reorder_rewrite_the_line_they_cover() {
+        let r = linear_repo("plan-drop-reorder");
+        let g = r.open();
+        let commits = window(&r);
+        let mut plan = Plan::over(&commits, 1).expect("a window");
+        plan.set_action(0, Action::Drop).expect("a drop");
+        g.rebase_plan(&plan).expect("the plan runs");
+        assert_eq!(subjects(&r), vec!["two", "one", "base"]);
+        assert!(!r.0.join("three.txt").exists(), "the dropped file stayed");
+
+        // And a reorder over what is left: the two newest swap places.
+        let commits = window(&r);
+        let mut plan = Plan::over(&commits, 1).expect("a window");
+        assert_eq!(plan.move_down(0), Ok(1));
+        g.rebase_plan(&plan).expect("the plan runs");
+        assert_eq!(subjects(&r), vec!["one", "two", "base"]);
+        // Both files survive the swap — a reorder moves commits, not work.
+        for file in ["one.txt", "two.txt"] {
+            assert!(r.0.join(file).exists(), "{file} left the tree");
+        }
+    }
+
+    #[test]
+    fn a_planned_fold_keeps_both_messages_and_a_fixup_keeps_one() {
+        let r = linear_repo("plan-fold");
+        let g = r.open();
+        let commits = window(&r);
+        let mut plan = Plan::over(&commits, 1).expect("a window");
+        plan.set_action(0, Action::Squash).expect("a fold");
+        g.rebase_plan(&plan).expect("the plan runs");
+        assert_eq!(subjects(&r), vec!["two", "one", "base"]);
+        let body = body_of(&r, "HEAD");
+        assert!(body.contains("two"), "{body}");
+        assert!(
+            body.contains("three"),
+            "the folded message went missing: {body}"
+        );
+        assert!(
+            r.0.join("three.txt").exists(),
+            "the folded work went missing"
+        );
+
+        // The fixup keeps the change and drops the message.
+        let r = linear_repo("plan-fixup");
+        let g = r.open();
+        let commits = window(&r);
+        let mut plan = Plan::over(&commits, 1).expect("a window");
+        plan.set_action(0, Action::Fixup).expect("a fold");
+        g.rebase_plan(&plan).expect("the plan runs");
+        assert_eq!(subjects(&r), vec!["two", "one", "base"]);
+        assert!(
+            !body_of(&r, "HEAD").contains("three"),
+            "the message survived"
+        );
+        assert!(r.0.join("three.txt").exists());
+    }
+
+    #[test]
+    fn an_edit_entry_stops_the_rebase_and_the_lifecycle_carries_it_on() {
+        let r = linear_repo("plan-edit");
+        let g = r.open();
+        let commits = window(&r);
+        let mut plan = Plan::over(&commits, 1).expect("a window");
+        plan.set_action(1, Action::Edit).expect("an edit");
+        assert!(plan.pauses(), "the plan says it will stop");
+
+        // It exits clean and leaves the rebase standing: that pause is a
+        // state, not a failure, and it is the state W5's banner draws.
+        g.rebase_plan(&plan).expect("the plan runs");
+        assert!(g.rebase_in_progress(), "the edit did not stop the rebase");
+        assert_eq!(
+            String::from_utf8_lossy(&r.git_os_out(&[
+                "log".into(),
+                "-1".into(),
+                "--format=%s".into()
+            ]))
+            .trim(),
+            "two",
+            "the rebase stopped on the commit the plan named"
+        );
+
+        // A human amends and carries on, exactly as the lifecycle keys do.
+        r.write("extra.txt", b"extra\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-q", "--amend", "--no-edit"]);
+        g.rebase_continue().expect("continue");
+        assert!(!g.rebase_in_progress(), "the rebase never finished");
+        assert_eq!(subjects(&r), vec!["three", "two", "one", "base"]);
+        assert!(
+            r.0.join("extra.txt").exists(),
+            "the amendment was replayed over"
+        );
+    }
+
+    #[test]
+    fn a_commit_deeper_than_head_is_reauthored_through_the_plan() {
+        let r = Scratch::new("plan-reauthor");
+        r.write("base.txt", b"base\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        r.write("mid.txt", b"mid\n");
+        r.git(&["add", "-A"]);
+        r.git(&[
+            "commit",
+            "-qm",
+            "mid",
+            "--author=Someone Else <else@example.com>",
+        ]);
+        r.write("tip.txt", b"tip\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "tip"]);
+        assert_eq!(authors(&r)[1], "Someone Else", "the fixture set the stage");
+        let before = authors(&r);
+
+        let g = r.open();
+        let commits = window(&r);
+        let mut plan = Plan::over(&commits, 1).expect("a window");
+        plan.set_amend(1, gitten_core::rebase::Amend::ResetAuthor)
+            .expect("an amendment");
+        g.rebase_plan(&plan).expect("the plan runs");
+
+        // The amended commit takes the identity git itself would use — the
+        // repository's own configuration, since the rebase runs as its own
+        // process — and its neighbours keep the authors they had.
+        let after = authors(&r);
+        assert_eq!(after[1], "gitten-test", "the deep commit kept its author");
+        assert_eq!(
+            (&after[0], &after[2]),
+            (&before[0], &before[2]),
+            "a neighbour's author moved too"
+        );
+        assert_eq!(subjects(&r), vec!["tip", "mid", "base"]);
+        for file in ["base.txt", "mid.txt", "tip.txt"] {
+            assert!(r.0.join(file).exists(), "{file} left the tree");
+        }
+    }
+
+    #[test]
+    fn a_plan_git_would_refuse_is_refused_before_any_process_runs() {
+        let r = linear_repo("plan-refused");
+        let g = r.open();
+        let before = r.rev_parse("HEAD");
+        let commits = window(&r);
+
+        // Every commit dropped is an empty todo, which git refuses — said
+        // here instead, with nothing started.
+        let mut plan = Plan::over(&commits, 1).expect("a window");
+        for i in 0..plan.len() {
+            plan.set_action(i, Action::Drop).expect("a drop");
+        }
+        let err = g.rebase_plan(&plan).unwrap_err();
+        assert!(err.contains("reset to the base"), "{err}");
+        assert!(!g.rebase_in_progress(), "a refusal started something");
+        assert_eq!(r.rev_parse("HEAD"), before);
+
+        // And a reword with no message: the plan knows before git does.
+        let mut plan = Plan::over(&commits, 1).expect("a window");
+        plan.set_action(0, Action::Reword).expect("an action");
+        let err = g.rebase_plan(&plan).unwrap_err();
+        assert!(err.contains("no message"), "{err}");
+        assert_eq!(r.rev_parse("HEAD"), before);
+    }
+
+    #[test]
+    fn rebase_onto_base_replays_only_what_follows_the_marked_commit() {
+        // A trunk, and a side branch of two commits growing off its tip.
+        let r = Scratch::new("rebase-onto-base");
+        r.write("base.txt", b"base\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        r.git(&["checkout", "-q", "-b", "side"]);
+        for (file, msg) in [("keep.txt", "keep"), ("move.txt", "move")] {
+            r.write(file, b"x\n");
+            r.git(&["add", "-A"]);
+            r.git(&["commit", "-qm", msg]);
+        }
+        let keep = r.rev_parse("HEAD~1");
+        r.git(&["checkout", "-q", "main"]);
+        r.write("trunk.txt", b"trunk\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "trunk"]);
+        r.git(&["checkout", "-q", "side"]);
+
+        // The marked commit is the base and is *exclusive*: only what grew
+        // after it moves, which is the whole reason the mark is worth a key.
+        r.open()
+            .rebase_onto_base(b"main", keep.as_bytes())
+            .expect("rebases");
+        assert_eq!(
+            subjects(&r),
+            vec!["move", "trunk", "base"],
+            "the marked commit stayed behind and its child moved"
+        );
+        assert!(!r.0.join("keep.txt").exists(), "the base commit came along");
+
+        // Both names pass the dash guard before any process runs.
+        let err = r
+            .open()
+            .rebase_onto_base(b"--exec=touch /tmp/x", b"HEAD~1")
+            .unwrap_err();
+        assert!(err.contains("refused"), "{err}");
+    }
+
+    #[test]
+    fn nuking_the_working_tree_keeps_the_commits_and_the_ignored_files() {
+        let r = Scratch::new("nuke");
+        r.write(".gitignore", b"build/\n");
+        r.write("kept.txt", b"committed\n");
+        r.git(&["add", "-A"]);
+        r.git(&["commit", "-qm", "base"]);
+        let head = r.rev_parse("HEAD");
+
+        r.write("kept.txt", b"edited\n");
+        r.write("new.txt", b"untracked\n");
+        r.write("build/artifact.o", b"expensive\n");
+        r.git(&["add", "kept.txt"]);
+
+        r.open().nuke_worktree().expect("nukes");
+
+        assert_eq!(r.rev_parse("HEAD"), head, "a nuke moved the branch");
+        assert_eq!(
+            std::fs::read(r.0.join("kept.txt")).expect("still there"),
+            b"committed\n",
+            "the staged edit survived the nuke"
+        );
+        assert!(!r.0.join("new.txt").exists(), "the untracked file survived");
+        // Ignored files are not somebody's work: `clean` runs without `-x`,
+        // so half an hour of compilation is not what the key spent.
+        assert!(
+            r.0.join("build/artifact.o").exists(),
+            "the nuke took the ignored build directory with it"
+        );
+        // And the index is clean afterwards.
+        let status = r.open().status().expect("a status");
+        assert!(status.staged.is_empty() && status.unstaged.is_empty());
+        assert!(status.untracked.is_empty(), "{:?}", status.untracked);
+    }
+
+    #[test]
+    fn nuking_an_unborn_branch_cleans_rather_than_failing() {
+        let r = Scratch::new("nuke-unborn");
+        r.write("new.txt", b"untracked\n");
+        // No commit yet: there is no HEAD to reset to, and the clean is the
+        // whole of what an unborn branch's working tree needs.
+        r.open().nuke_worktree().expect("nukes");
+        assert!(!r.0.join("new.txt").exists(), "the untracked file survived");
     }
 
     #[test]
@@ -10648,8 +11057,8 @@ mod tests {
         // so the file answers to a stricter contract than convenience:
         // owner-only however the umask feels, never the same name twice,
         // bytes intact, gone when the caller removes it.
-        let first = write_todo_tmpfile(b"pick 1111111\n".to_vec()).expect("first");
-        let second = write_todo_tmpfile(b"pick 2222222\n".to_vec()).expect("second");
+        let first = write_private_tmpfile("todo", b"pick 1111111\n".to_vec()).expect("first");
+        let second = write_private_tmpfile("todo", b"pick 2222222\n".to_vec()).expect("second");
         assert_ne!(first, second, "two plans never share a file");
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&first).unwrap().permissions().mode();
