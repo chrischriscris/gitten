@@ -55,6 +55,10 @@ fn main() {
             MAX_LINE_CHARS,
         )))),
         Loaded::Commits(commits) => Data::Commits(Log::build(commits)),
+        // A launch never opens on a conflict: no files pane exists to put
+        // the eye on one. Named, not wildcarded, so a launch that can must
+        // say what it means to serve.
+        Loaded::Conflict(..) => unreachable!("no launch opens on a conflict"),
     };
     // `Rc`, not `Arc`: requests run on the serving thread (see http.rs) and the
     // host behind this state is deliberately not Send. An Arc here is the same

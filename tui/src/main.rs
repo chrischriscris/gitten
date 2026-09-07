@@ -57,6 +57,7 @@ use gitten_tui::diff::Diff;
 use gitten_tui::diff::PatchSelection;
 use gitten_tui::files::{self, Files};
 use gitten_tui::help;
+use gitten_tui::merging;
 use gitten_tui::remotes::Remotes;
 use gitten_tui::screen::{Ink, Pen, Screen};
 use gitten_tui::scrollbar::Bar;
@@ -309,6 +310,14 @@ enum Screens {
         /// a file's side, a stash's parked work; `None` for the empty pane
         /// nothing was ever acquired for.
         origin: Option<DiffSource>,
+        label: String,
+        generation: Generation,
+    },
+    /// The merging view: one conflicted file, its regions, and the answers.
+    /// Lives in the main slot like the diff it replaces while a conflict row
+    /// holds the eye; a refresh re-reads the file the view names.
+    Merging {
+        view: merging::Merging,
         label: String,
         generation: Generation,
     },
@@ -655,6 +664,7 @@ impl Screens {
         match self {
             Screens::Commits { .. } => "commits",
             Screens::Diff { .. } => "diff",
+            Screens::Merging { .. } => "merge",
             Screens::Stashes { .. } => "stashes",
             Screens::Files { .. } => "files",
             Screens::Branches { .. } => "branches",
@@ -666,6 +676,7 @@ impl Screens {
         match self {
             Screens::Commits { label, .. }
             | Screens::Diff { label, .. }
+            | Screens::Merging { label, .. }
             | Screens::Stashes { label, .. }
             | Screens::Branches { label, .. }
             | Screens::Remotes { label, .. } => label,
@@ -677,6 +688,7 @@ impl Screens {
         match self {
             Screens::Commits { generation, .. }
             | Screens::Diff { generation, .. }
+            | Screens::Merging { generation, .. }
             | Screens::Stashes { generation, .. }
             | Screens::Branches { generation, .. }
             | Screens::Remotes { generation, .. } => *generation,
@@ -790,6 +802,39 @@ impl Screens {
                 // nothing to re-read.
                 None => None,
             },
+            Screens::Merging {
+                view,
+                label,
+                generation,
+                ..
+            } => {
+                // One path, two reads: the file's bytes and the stages git
+                // still holds. The read decides the label — a resolution
+                // that emptied the markers is "resolved", not the old
+                // conflict's name — and a file that has left the working
+                // tree while the stages are gone with it is the resolved
+                // deletion, drawn as an empty view, never an error wave
+                // that never stops.
+                let path = view.path().as_bytes().to_vec();
+                let stages = match repo.unmerged(&path) {
+                    Ok(stages) => stages,
+                    Err(e) => return Some(Err(e)),
+                };
+                let file = match repo.conflict_file(&path) {
+                    Ok(file) => file,
+                    Err(_) if stages.is_empty() => {
+                        gitten_core::conflict::ConflictFile::parse(view.path().clone(), Vec::new())
+                    }
+                    Err(e) => return Some(Err(e)),
+                };
+                let source = DiffSource::Conflict {
+                    path: view.path().clone(),
+                };
+                *label = source.label();
+                view.replace(file, stages);
+                *generation = target;
+                Some(Ok(()))
+            }
             Screens::Stashes {
                 view,
                 label,
@@ -911,6 +956,10 @@ impl Screens {
                 d.set_scrolloff(host.view.scrolloff);
                 d.resize(rect.width, rect.height, host);
             }
+            Screens::Merging { view: m, .. } => {
+                m.set_scrolloff(host.view.scrolloff);
+                m.resize(rect.width, rect.height);
+            }
             Screens::Stashes { view: s, .. } => {
                 s.set_scrolloff(host.view.scrolloff);
                 s.resize(rect.width, rect.height);
@@ -944,6 +993,7 @@ impl Screens {
         match self {
             Screens::Commits { view: c, .. } => c.paint(screen, x, y, focused, host),
             Screens::Diff { view: d, .. } => d.paint(screen, x, y, focused, host, out),
+            Screens::Merging { view: m, .. } => m.paint(screen, x, y, focused, host),
             Screens::Stashes { view: s, .. } => s.paint(screen, x, y, focused, host),
             // The files pane needs no run-list buffer: its rows are cells,
             // not shaped spans.
@@ -957,6 +1007,7 @@ impl Screens {
         match self {
             Screens::Commits { view: c, .. } => c.status(),
             Screens::Diff { view: d, .. } => d.status(host),
+            Screens::Merging { view: m, .. } => m.status(),
             Screens::Stashes { view: s, .. } => s.status(),
             Screens::Files { view: f, .. } => f.status(),
             Screens::Branches { view: b, .. } => b.status(),
@@ -979,6 +1030,7 @@ impl Screens {
         match self {
             Screens::Commits { view: c, .. } => c.paint_bar(screen, x, divider, y, host),
             Screens::Diff { view: d, .. } => d.paint_bar(screen, x, divider, y, host),
+            Screens::Merging { view: m, .. } => m.paint_bar(screen, x, divider, y, host),
             Screens::Stashes { view: s, .. } => s.paint_bar(screen, x, divider, y, host),
             Screens::Files { view: f, .. } => f.paint_bar(screen, x, divider, y, host),
             Screens::Branches { view: b, .. } => b.paint_bar(screen, x, divider, y, host),
@@ -996,6 +1048,7 @@ impl Screens {
         match self {
             Screens::Commits { view: c, .. } => c.press(col, row, extend, host),
             Screens::Diff { view: d, .. } => d.press(col, row, clicks, extend, host),
+            Screens::Merging { view: m, .. } => m.press(col, row, extend, host),
             Screens::Stashes { view: s, .. } => s.press(col, row, extend, host),
             Screens::Files { view: f, .. } => f.press(col, row, clicks, extend, host),
             Screens::Branches { view: b, .. } => b.press(col, row, extend, host),
@@ -1009,6 +1062,7 @@ impl Screens {
         match self {
             Screens::Commits { view: c, .. } => c.drag(row, host),
             Screens::Diff { view: d, .. } => d.drag(col, row, host),
+            Screens::Merging { view: m, .. } => m.drag(row, host),
             Screens::Stashes { view: s, .. } => s.drag(row, host),
             // A list with no drag selection and an indicator bar has nothing
             // a held button can do.
@@ -1020,6 +1074,7 @@ impl Screens {
         match self {
             Screens::Commits { view: c, .. } => c.release(),
             Screens::Diff { view: d, .. } => d.release(),
+            Screens::Merging { view: m, .. } => m.release(),
             Screens::Stashes { view: s, .. } => s.release(),
             // Nothing held here either — see `drag`.
             Screens::Files { .. } | Screens::Branches { .. } | Screens::Remotes { .. } => {}
@@ -1032,6 +1087,9 @@ impl Screens {
         match self {
             Screens::Commits { view: c, .. } => c.copy_text(),
             Screens::Diff { view: d, .. } => d.copy_text(),
+            // A conflict file is not a range the verbs act on; the row's
+            // text is what the diff pane's copy is for.
+            Screens::Merging { .. } => String::new(),
             Screens::Stashes { view: s, .. } => s.copy_text(),
             Screens::Files { view: f, .. } => f.copy_text(),
             Screens::Branches { view: b, .. } => b.copy_text(),
@@ -1046,6 +1104,7 @@ impl Screens {
         match self {
             Screens::Commits { view: c, .. } => c.selection(),
             Screens::Diff { view: d, .. } => d.selection(),
+            Screens::Merging { view: m, .. } => m.selection(),
             Screens::Stashes { view: s, .. } => s.selection(),
             // A file list has no drag selection, so copy-on-select has
             // nothing to fire on here — the empty answer is the mechanism.
@@ -1059,6 +1118,7 @@ impl Screens {
         match self {
             Screens::Commits { view: c, .. } => c.select_all(),
             Screens::Diff { view: d, .. } => d.select_all(),
+            Screens::Merging { view: m, .. } => m.select_all(),
             Screens::Stashes { view: s, .. } => s.select_all(),
             Screens::Files { view: f, .. } => f.select_all(),
             Screens::Branches { view: b, .. } => b.select_all(),
@@ -1070,6 +1130,7 @@ impl Screens {
         match self {
             Screens::Commits { view: c, .. } => c.select_none(),
             Screens::Diff { view: d, .. } => d.select_none(),
+            Screens::Merging { view: m, .. } => m.select_none(),
             Screens::Stashes { view: s, .. } => s.select_none(),
             Screens::Files { view: f, .. } => f.select_none(),
             Screens::Branches { view: b, .. } => b.select_none(),
@@ -1088,6 +1149,8 @@ impl Screens {
             Screens::Stashes { view: s, .. } => s.filter_note(),
             Screens::Remotes { view: r, .. } => r.filter_note(),
             Screens::Diff { view: d, .. } => d.match_note(),
+            // The merging view carries no standing search yet.
+            Screens::Merging { .. } => None,
         }
     }
 
@@ -1102,6 +1165,7 @@ impl Screens {
             Screens::Stashes { view: s, .. } => s.query().is_some(),
             Screens::Remotes { view: r, .. } => r.query().is_some(),
             Screens::Diff { view: d, .. } => d.search_query().is_some(),
+            Screens::Merging { .. } => false,
         }
     }
 
@@ -1155,6 +1219,22 @@ impl Screens {
                     d.toggle_line_selection();
                 }
                 "select.mark" => d.select_mark(),
+                _ => return false,
+            },
+            Screens::Merging { view: m, .. } => match command {
+                "view.down" => m.down(),
+                "view.up" => m.up(),
+                "view.page-down" => m.page(1),
+                "view.page-up" => m.page(-1),
+                "view.scroll-down" => m.scroll_y(host.view.rows as isize),
+                "view.scroll-up" => m.scroll_y(-(host.view.rows as isize)),
+                "view.top" => m.to_top(),
+                "view.bottom" => m.to_bottom(),
+                // Nothing off the left edge to reach: the file's lines
+                // clip rather than pan, like every list here.
+                "view.left" | "view.right" => {}
+                "merge.next-conflict" => m.jump_region(1),
+                "merge.prev-conflict" => m.jump_region(-1),
                 _ => return false,
             },
             Screens::Stashes { view: s, .. } => match command {
@@ -1233,7 +1313,7 @@ struct PreviewOutcome {
     root: std::path::PathBuf,
     origin: DiffSource,
     focus: bool,
-    outcome: Result<Vec<gitten_core::FileDiff>, String>,
+    outcome: Result<acquire::Data, String>,
 }
 
 struct App {
@@ -1445,6 +1525,9 @@ impl App {
         let mut panes = panes::Panes::new();
         let mut last_list = None;
         match started.loaded.data {
+            // A launch never opens on a conflict: the files pane does not
+            // exist yet, so no eye could be on one.
+            Data::Conflict(..) => {}
             Data::Commits(commits) => {
                 let mut list = Commits::with_glyphs(commits, glyphs);
                 list.set_bar(bar);
@@ -1803,7 +1886,10 @@ impl App {
                             false,
                         );
                     }
-                    Data::Commits(_) => {}
+                    // A startup preview asks about a commit; a conflict
+                    // answer here would mean the read was asked the wrong
+                    // question. Neither installs.
+                    Data::Commits(_) | Data::Conflict(..) => {}
                 },
                 Some(Err(e)) => self.message = e,
                 None => {}
@@ -2386,6 +2472,11 @@ impl App {
                     return;
                 }
                 view.search_query().unwrap_or_default().to_string()
+            }
+            // The merging view carries no standing search to re-open.
+            Some(Screens::Merging { .. }) => {
+                self.message = format!("{command} is not supported here");
+                return;
             }
             None => {
                 self.message = format!("{command} is not supported here");
@@ -3100,6 +3191,8 @@ impl App {
             Some(Screens::Stashes { view, .. }) => view.apply_query(query),
             Some(Screens::Remotes { view, .. }) => view.apply_query(query),
             Some(Screens::Diff { view, .. }) => view.search_edit(query),
+            // The merging view has no filter to apply.
+            Some(Screens::Merging { .. }) => {}
             None => {}
         }
         self.eye_follow(&pane, before);
@@ -3147,6 +3240,7 @@ impl App {
                     Some(Screens::Stashes { view, .. }) => view.clear_search(),
                     Some(Screens::Remotes { view, .. }) => view.clear_search(),
                     Some(Screens::Diff { view, .. }) => view.search_clear(),
+                    Some(Screens::Merging { .. }) => {}
                     None => {}
                 }
                 self.eye_follow(&pane, before);
@@ -3518,6 +3612,7 @@ impl App {
                             Screens::Stashes { view, .. } => view.clear_search(),
                             Screens::Remotes { view, .. } => view.clear_search(),
                             Screens::Diff { view, .. } => view.search_clear(),
+                            Screens::Merging { .. } => {}
                         }
                     }
                     self.eye_follow(&name, before);
@@ -3618,6 +3713,16 @@ impl App {
             "files.resolve-theirs" => gitten_app::act::resolve_conflict(self, Side::Theirs),
             "files.resolve-both" => gitten_app::act::resolve_conflict(self, Side::Both),
             "files.resolve-keep" => gitten_app::act::resolve_conflict(self, Side::Keep),
+            // The merging view's answers: the view reads live, the shared
+            // `Write` means the choice, and the queue runs it. take-side
+            // reads the half under the keyboard; the named answers read the
+            // region under it.
+            "merge.take-ours" => self.merging_take(Some(gitten_core::conflict::Answer::Ours)),
+            "merge.take-theirs" => self.merging_take(Some(gitten_core::conflict::Answer::Theirs)),
+            "merge.take-both" => self.merging_take(Some(gitten_core::conflict::Answer::Both)),
+            "merge.take-side" => self.merging_take(None),
+            "merge.undo" => self.merging_undo(),
+            "merge.options" => self.merging_options(),
             // The remotes verbs: the row the keyboard is on, the shared
             // `Write` that means it. Add and edit open the one prompt chain
             // on their way through.
@@ -3920,8 +4025,11 @@ impl App {
         self.preview_seq += 1;
         self.preview_pending += 1;
         let seq = self.preview_seq;
-        if let Some(Screens::Diff { label, .. }) = self.panes.get_mut("diff") {
-            *label = format!("loading {}", origin.label());
+        match self.panes.get_mut("diff") {
+            Some(Screens::Diff { label, .. }) | Some(Screens::Merging { label, .. }) => {
+                *label = format!("loading {}", origin.label());
+            }
+            _ => {}
         }
         let differs = self.host.differ.clone();
         let over = Overrides::default();
@@ -3929,16 +4037,8 @@ impl App {
         let started = std::thread::Builder::new()
             .name("gitten-preview".into())
             .spawn(move || {
-                let outcome =
-                    match acquire::diff_source(&origin, &differs, &over, repo.as_ref(), false) {
-                        Ok(loaded) => match loaded.data {
-                            Data::Diff(files) => Ok(files),
-                            Data::Commits(_) => {
-                                Err("the preview answered with the wrong view".into())
-                            }
-                        },
-                        Err(e) => Err(e),
-                    };
+                let outcome = acquire::diff_source(&origin, &differs, &over, repo.as_ref(), false)
+                    .map(|loaded| loaded.data);
                 let _ = tx.send(PreviewOutcome {
                     seq,
                     root,
@@ -4027,22 +4127,25 @@ impl App {
                 _ => None,
             },
             "files" => match self.panes.get(pane) {
-                Some(Screens::Files { view, .. }) => view.current_file().and_then(|file| {
-                    match file.section {
-                        files::Section::Staged => Some(DiffSource::Staged {
+                Some(Screens::Files { view, .. }) => {
+                    view.current_file().map(|file| match file.section {
+                        files::Section::Staged => DiffSource::Staged {
                             path: file.path.clone(),
-                        }),
-                        files::Section::Unstaged => Some(DiffSource::Unstaged {
+                        },
+                        files::Section::Unstaged => DiffSource::Unstaged {
                             path: file.path.clone(),
-                        }),
-                        files::Section::Untracked => Some(DiffSource::Untracked {
+                        },
+                        files::Section::Untracked => DiffSource::Untracked {
                             path: file.path.clone(),
-                        }),
-                        // A conflicted file has no side of the index to
-                        // preview; its resolution views are their own packet.
-                        files::Section::Conflicts => None,
-                    }
-                }),
+                        },
+                        // A conflicted file's preview is its merging view:
+                        // the markers are the conflict, the stages are the
+                        // sides, and no diff of an index side says either.
+                        files::Section::Conflicts => DiffSource::Conflict {
+                            path: file.path.clone(),
+                        },
+                    })
+                }
                 _ => None,
             },
             "stashes" => match self.panes.get(pane) {
@@ -4056,8 +4159,9 @@ impl App {
     }
 
     /// `files.open-diff`: preview the file the keyboard is on, and put the
-    /// keyboard on the preview. A row that is a heading, or a conflicted
-    /// file with no side to preview, says so and does nothing.
+    /// keyboard on the preview. A row that is a heading says so and does
+    /// nothing; a conflict row's preview is its merging view, which is
+    /// what [`DiffSource::Conflict`] is for.
     fn open_file_diff(&mut self) {
         match self.eye_of("files") {
             Some(origin) => self.request_preview(origin, true),
@@ -4213,17 +4317,75 @@ impl App {
             return;
         }
         match answer.outcome {
-            Ok(files) => {
+            Ok(acquire::Data::Diff(files)) => {
                 let label = self.preview_label(&answer.origin);
                 self.install_diff(answer.origin, label, files, answer.focus);
             }
+            Ok(acquire::Data::Conflict(file, stages)) => {
+                let label = self.preview_label(&answer.origin);
+                self.install_merging(answer.origin, label, file, stages, answer.focus);
+            }
+            Ok(acquire::Data::Commits(_)) => {
+                self.message = "the preview answered with the wrong view".into();
+            }
             Err(e) => {
                 self.message = e;
-                if let Some(Screens::Diff { label, .. }) = self.panes.get_mut("diff") {
-                    *label = answer.origin.label();
+                match self.panes.get_mut("diff") {
+                    Some(Screens::Diff { label, .. }) | Some(Screens::Merging { label, .. }) => {
+                        *label = answer.origin.label();
+                    }
+                    _ => {}
                 }
             }
         }
+    }
+
+    /// Installs a merging view into the main slot — the same shape
+    /// [`App::install_diff`] runs for a diff, for the one source whose
+    /// answer is not a diff at all.
+    fn install_merging(
+        &mut self,
+        origin: DiffSource,
+        label: String,
+        file: gitten_core::conflict::ConflictFile,
+        stages: Vec<gitten_git::UnmergedStage>,
+        focus: bool,
+    ) {
+        let path = match &origin {
+            DiffSource::Conflict { path } => path.clone(),
+            _ => return,
+        };
+        let old_focus = self.panes.focused_name().to_string();
+        let mut view = merging::Merging::new(path, file, stages);
+        view.set_bar(self.bar);
+        self.ensure_geometry();
+        if let Some(rect) = self.pane_content("diff") {
+            view.set_scrolloff(self.host.view.scrolloff);
+            view.resize(rect.width, rect.height);
+        }
+        self.panes.register(
+            "diff",
+            panes::Placement::Main,
+            Screens::Merging {
+                view,
+                label,
+                // Acquired this instant, so it is as current as the queue's
+                // last finish — not a generation older.
+                generation: self.generation,
+            },
+        );
+        // Only a gesture captured in the tenant just replaced became stale. A
+        // click in commits is what requested this preview and must still
+        // receive its release.
+        if self.gesture.as_deref() == Some("diff") {
+            self.gesture = None;
+        }
+        let target = match focus {
+            true => "diff",
+            false => &old_focus,
+        };
+        self.panes.focus_named(target);
+        self.sync_modes();
     }
 
     /// Full sha under the commits cursor, for detecting a real selection
@@ -4460,6 +4622,136 @@ impl App {
             return;
         }
         gitten_app::act::ignore_file(self);
+    }
+
+    /// The merging view's named or under-the-keyboard answer: one region,
+    /// one side, one job — and the session's undo snapshot taken from the
+    /// view only when the queue accepted the job, so a refused answer
+    /// pushes nothing it cannot make true.
+    fn merging_take(&mut self, named: Option<gitten_core::conflict::Answer>) {
+        if !matches!(self.panes.focused(), Some(Screens::Merging { .. })) {
+            self.message = "the merging view is not showing".into();
+            return;
+        }
+        let Some((_, repo)) = self.repo.clone() else {
+            self.message = "a fixture has no repository to resolve in".into();
+            return;
+        };
+        // Everything decided ahead of anything queued, in the order a
+        // reader meets the facts: a file with regions left, a region under
+        // the keyboard, and — for take-side — a half under it. Markers and
+        // the diff3 base are the seam, not a side; a choice asked for there
+        // is said no to, not guessed at.
+        let aim = {
+            let Some(Screens::Merging { view, .. }) = self.panes.get("diff") else {
+                return;
+            };
+            if !view.is_conflicted() {
+                self.message = "this file has no conflict left to answer".into();
+                return;
+            }
+            match named {
+                Some(answer) => match view.current_region() {
+                    Some(region) => Some((region, answer)),
+                    None => {
+                        self.message = "the keyboard is not on a conflict".into();
+                        return;
+                    }
+                },
+                None => match view.under_the_keyboard() {
+                    Some(aim) => Some(aim),
+                    None => {
+                        self.message =
+                            "the keyboard is on a marker or the base — pick a side".into();
+                        return;
+                    }
+                },
+            }
+        };
+        let Some((region, answer)) = aim else {
+            return;
+        };
+        let (path, snapshot) = {
+            let Some(Screens::Merging { view, .. }) = self.panes.get("diff") else {
+                return;
+            };
+            (view.path().as_bytes().to_vec(), view.snapshot())
+        };
+        let job = Write::resolve_hunks(&repo, path.clone(), vec![(region, answer)]);
+        let accepted = gitten_app::act::Client::submit(self, Box::new(job));
+        let Some(Screens::Merging { view, .. }) = self.panes.get_mut("diff") else {
+            return;
+        };
+        if accepted {
+            view.push_undo(snapshot);
+        } else {
+            self.message = "the job queue is shutting down".into();
+        }
+    }
+
+    /// `merge.undo`: the session's last answer, put back — the file's bytes
+    /// to the working tree and the unmerged stages to the index, both as
+    /// the snapshot found them. The stack is the view's session; a refused
+    /// answer pushed nothing, and an empty stack says so instead of
+    /// pretending to undo.
+    fn merging_undo(&mut self) {
+        if !matches!(self.panes.focused(), Some(Screens::Merging { .. })) {
+            self.message = "the merging view is not showing".into();
+            return;
+        }
+        let Some((_, repo)) = self.repo.clone() else {
+            self.message = "a fixture has no repository to undo in".into();
+            return;
+        };
+        let (path, step) = {
+            let Some(Screens::Merging { view, .. }) = self.panes.get_mut("diff") else {
+                return;
+            };
+            let Some(step) = view.pop_undo() else {
+                self.message = "nothing left to undo in this file".into();
+                return;
+            };
+            (view.path().as_bytes().to_vec(), step)
+        };
+        let job = Write::restore(&repo, path, step.bytes, step.stages);
+        if !gitten_app::act::Client::submit(self, Box::new(job)) {
+            self.message = "the job queue is shutting down".into();
+        }
+    }
+
+    /// `merge.options`: the whole-file answers live on the conflict row —
+    /// the same row the eye is already on. The keyboard goes back to the
+    /// files pane, and the band names the four keys *from the keymap*, so a
+    /// rebind moves this line the way it moves help.
+    fn merging_options(&mut self) {
+        if !matches!(self.panes.focused(), Some(Screens::Merging { .. })) {
+            self.message = "the merging view is not showing".into();
+            return;
+        }
+        if self.panes.get("files").is_none() {
+            self.message = "there is no files pane to answer from".into();
+            return;
+        }
+        // The message is built before the focus moves, because the keys are
+        // read from the host and the host read is the immutable half.
+        let key = |name: &str| {
+            self.host
+                .keys
+                .keys_for(name)
+                .first()
+                .map(|k| k.to_string())
+                .unwrap_or_default()
+        };
+        let said = format!(
+            "whole-file answers: {} {} {} {} on the conflict row",
+            key("files.resolve-ours"),
+            key("files.resolve-theirs"),
+            key("files.resolve-both"),
+            key("files.resolve-keep"),
+        );
+        self.panes.focus_named("files");
+        self.sync_modes();
+        self.message = said;
     }
 
     /// Re-reads the operation standing in the repository, and the
@@ -4926,6 +5218,15 @@ fn tui_availability(repo: bool, operation: Option<&Operation>) -> Availability {
         "files.resolve-theirs",
         "files.resolve-both",
         "files.resolve-keep",
+        // The merging view's answers are live whenever a repository is;
+        // the wrong-selection refusals are dispatch's, exactly like the
+        // file-level answers beside them.
+        "merge.take-side",
+        "merge.take-ours",
+        "merge.take-theirs",
+        "merge.take-both",
+        "merge.undo",
+        "merge.options",
         // A repository is what a switch aims away from and at; both are
         // answerable from a fixture view, which is where a repository
         // gets opened from when the launch had none.
@@ -5175,6 +5476,11 @@ fn hunk_side_of(origin: &DiffSource) -> Result<HunkSide, String> {
         DiffSource::Revspec { arg } if arg.is_empty() => Ok(HunkSide::Combined),
         DiffSource::Revspec { .. } | DiffSource::Commit { .. } | DiffSource::Stash { .. } => {
             Err("only the working-tree diff can act on hunks — this one is between commits".into())
+        }
+        // A merging view is not a diff at all: the hunk verbs have no side
+        // of an index to aim at, and the region answers are the verbs here.
+        DiffSource::Conflict { .. } => {
+            Err("a merging view has no hunks to stage — answer its regions".into())
         }
         DiffSource::Fixture => Err("a fixture has no repository behind it".into()),
         DiffSource::Patch => Err("a patch file has no repository behind it".into()),
@@ -12931,20 +13237,20 @@ diff --git a/tracked.txt b/tracked.txt
                 path: PathBytes::from("f.txt"),
             },
             focus: false,
-            outcome: Ok(vec![gitten_core::FileDiff {
+            outcome: Ok(Data::Diff(vec![gitten_core::FileDiff {
                 path: "wrong.txt".into(),
                 hunks: Vec::new(),
-            }]),
+            }])),
         });
         app.install_preview(PreviewOutcome {
             seq: newest,
             root: std::path::PathBuf::from("/elsewhere"),
             origin: shown.clone(),
             focus: false,
-            outcome: Ok(vec![gitten_core::FileDiff {
+            outcome: Ok(Data::Diff(vec![gitten_core::FileDiff {
                 path: "other-repo.txt".into(),
                 hunks: Vec::new(),
-            }]),
+            }])),
         });
         app.pump_quiet();
         assert_eq!(

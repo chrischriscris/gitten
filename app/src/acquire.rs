@@ -37,6 +37,13 @@ pub struct Loaded {
 pub enum Data {
     Commits(Vec<Commit>),
     Diff(Vec<FileDiff>),
+    /// One conflicted file: the working-tree bytes parsed into regions, and
+    /// the stages git still holds for the path — the undo's raw material
+    /// and the delete/modify answer's evidence.
+    Conflict(
+        gitten_core::conflict::ConflictFile,
+        Vec<gitten_git::UnmergedStage>,
+    ),
 }
 
 impl Data {
@@ -46,6 +53,7 @@ impl Data {
         match self {
             Data::Commits(c) => c.len(),
             Data::Diff(f) => f.len(),
+            Data::Conflict(file, _) => file.regions.len(),
         }
     }
 
@@ -153,6 +161,18 @@ pub fn diff_source(
     allow_empty: bool,
 ) -> Result<Loaded, String> {
     use gitten_git::diff_pairs;
+    // The conflict source is not a diff and never becomes one: its answer
+    // is the file's own markers and the stages behind them. It also carries
+    // its own empty answer — a file whose markers are gone is "resolved",
+    // which is a state a merging view wants to draw, not an error.
+    if let DiffSource::Conflict { path } = source {
+        let file = repo.conflict_file(path.as_bytes())?;
+        let stages = repo.unmerged(path.as_bytes())?;
+        return Ok(Loaded {
+            label: source.label(),
+            data: Data::Conflict(file, stages),
+        });
+    }
     let pairs = match source {
         DiffSource::Staged { path } => repo.pairs_staged(Some(path.as_bytes()))?,
         DiffSource::Unstaged { path } => repo.pairs_unstaged(Some(path.as_bytes()))?,
@@ -185,9 +205,10 @@ pub fn diff_source(
             pairs
         }
         DiffSource::Revspec { arg } => repo.pairs(arg)?,
-        // Detached content has no repository behind it and no read to run:
-        // a caller asking is the bug, and the message is the usage.
-        DiffSource::Fixture | DiffSource::Patch => {
+        // The conflict source answered above; detached content has no
+        // repository behind it and no read to run: a caller asking is the
+        // bug, and the message is the usage.
+        DiffSource::Conflict { .. } | DiffSource::Fixture | DiffSource::Patch => {
             return Err("this diff has no repository behind it".into())
         }
     };
@@ -202,7 +223,11 @@ pub fn diff_source(
                 "no changes for (working tree)".to_string()
             }
             DiffSource::Revspec { arg } => format!("no changes for {arg}"),
-            DiffSource::Fixture | DiffSource::Patch => unreachable!("refused above"),
+            // All unreachable: the conflict source returned above, and the
+            // detached sources refused above.
+            DiffSource::Conflict { .. } | DiffSource::Fixture | DiffSource::Patch => {
+                unreachable!("refused above")
+            }
         };
         return Err(what);
     }
@@ -778,6 +803,9 @@ mod tests {
                 .map(|l| (l.kind, l.text.to_string()))
                 .collect(),
             Data::Commits(_) => Vec::new(),
+            // A conflict read is not lines of a diff; the line-shaped test
+            // helpers above never acquire one.
+            Data::Conflict(..) => Vec::new(),
         }
     }
 

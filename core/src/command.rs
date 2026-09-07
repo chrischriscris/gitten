@@ -442,6 +442,21 @@ impl Keymap {
         bind("files", "enter", "files.open-diff");
         bind("files", "tab", "files.toggle-side");
 
+        // The merging view's region answers, on lazygit's merging keys:
+        // space takes whichever half the keyboard is on, o/t/b take a side
+        // by name, z undoes this session's last answer (the snapshot it
+        // restores dies with the view and any refresh), left/right walk the
+        // conflicts, and M hands whole-file choices back to the conflict
+        // row's own o/t/b/k. Esc is `back`, already global.
+        bind("merge", "space", "merge.take-side");
+        bind("merge", "o", "merge.take-ours");
+        bind("merge", "t", "merge.take-theirs");
+        bind("merge", "b", "merge.take-both");
+        bind("merge", "z", "merge.undo");
+        bind("merge", "M", "merge.options");
+        bind("merge", "left", "merge.prev-conflict");
+        bind("merge", "right", "merge.next-conflict");
+
         // The stash stack, on lazygit's own three: space applies and keeps,
         // g pops — apply, then drop only when the apply was clean — and d
         // drops (twice-pressed, like files.discard). `g` and `d` are bound
@@ -1445,6 +1460,46 @@ impl Commands {
                 "files.resolve-keep",
                 "record the selected conflict as resolved with the file as it stands",
                 Some("keep"),
+            ),
+            (
+                "merge.take-side",
+                "keep whichever half of the conflict the keyboard is on",
+                Some("pick"),
+            ),
+            (
+                "merge.take-ours",
+                "keep this side's half of the conflict the keyboard is on",
+                Some("ours"),
+            ),
+            (
+                "merge.take-theirs",
+                "keep the other side's half of the conflict the keyboard is on",
+                Some("theirs"),
+            ),
+            (
+                "merge.take-both",
+                "keep both halves of the conflict the keyboard is on, this side first",
+                Some("both"),
+            ),
+            (
+                "merge.undo",
+                "put the file back the way the last answer found it — this session only",
+                Some("undo"),
+            ),
+            (
+                "merge.options",
+                "whole-file answers: hand the keyboard back to the conflict row",
+                Some("whole file"),
+            ),
+            (
+                "merge.next-conflict",
+                "the next conflict in the file",
+                Some("next conflict"),
+            ),
+            (
+                "merge.prev-conflict",
+                "the previous conflict in the file",
+                Some("prev conflict"),
             ),
             ("branches.search", "search the branches", Some("search")),
             (

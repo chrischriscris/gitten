@@ -38,6 +38,12 @@ pub enum DiffSource {
     /// one is between commits. Kept for the command line's own behavior —
     /// a client wanting a *side* asks for a side by name.
     Revspec { arg: String },
+    /// One conflicted path's merging view: the working-tree bytes and the
+    /// stages git is holding for it, not a diff at all — the presentation is
+    /// the conflict's own markers, and the verbs are the file-level answers.
+    /// Named like every other source so the preview lane's staleness rules
+    /// govern it unchanged.
+    Conflict { path: PathBytes },
     /// The fixtures' own diff: content with no repository behind it.
     Fixture,
     /// A patch file's diff: content with no repository behind it.
@@ -51,7 +57,8 @@ impl DiffSource {
         match self {
             DiffSource::Staged { path }
             | DiffSource::Unstaged { path }
-            | DiffSource::Untracked { path } => Some(path),
+            | DiffSource::Untracked { path }
+            | DiffSource::Conflict { path } => Some(path),
             _ => None,
         }
     }
@@ -77,6 +84,7 @@ impl DiffSource {
             DiffSource::Staged { path } => format!("{} · staged", path),
             DiffSource::Unstaged { path } => format!("{} · unstaged", path),
             DiffSource::Untracked { path } => format!("{} · untracked", path),
+            DiffSource::Conflict { path } => format!("{} · conflict", path),
             DiffSource::Commit { sha } => sha[..sha.len().min(8)].to_string(),
             DiffSource::Stash { index, .. } => format!("stash@{{{index}}}"),
             DiffSource::Revspec { arg } if arg.is_empty() => "(working tree)".into(),

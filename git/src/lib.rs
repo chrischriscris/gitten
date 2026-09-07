@@ -962,6 +962,51 @@ pub trait Repo: Send + Sync {
         false
     }
 
+    /// The unmerged stages git still holds for one path, as `git ls-files
+    /// -u` spells them: mode, object id and stage number. What a merging
+    /// view reads to say *which kind* of conflict stands (a missing stage 2
+    /// is a delete-by-us, and its hunk view is whole-file answers only), and
+    /// what an undo restores the index from — the entries go back through
+    /// `update-index --index-info` exactly as they were read.
+    fn unmerged(&self, _path: &[u8]) -> Result<Vec<UnmergedStage>> {
+        Err(unserved("reading a path's unmerged stages"))
+    }
+
+    /// The conflicted file itself: the working-tree bytes on disk, parsed
+    /// into regions by [`gitten_core::conflict`]. A file that has left the
+    /// working tree is an error naming that, not an empty parse — the
+    /// caller's message can then say what actually happened.
+    fn conflict_file(&self, _path: &[u8]) -> Result<gitten_core::conflict::ConflictFile> {
+        Err(unserved("reading a conflicted file"))
+    }
+
+    /// Applies region answers to the conflicted file as it stands **now** —
+    /// re-read, re-parsed and re-validated against `choices` before a byte
+    /// is written — then stages it. Unchosen regions keep their markers, so
+    /// a half-answered file stays unmerged in git's own eyes.
+    fn resolve_hunks(
+        &self,
+        _path: &[u8],
+        _choices: &[(usize, gitten_core::conflict::Answer)],
+    ) -> Result<()> {
+        Err(unserved("applying region answers"))
+    }
+
+    /// Puts a conflicted path back the way a snapshot found it: the bytes
+    /// written as they were, and the unmerged stages restored through
+    /// `update-index --index-info` — the undo of this session's region
+    /// answers. The stages come from [`Repo::unmerged`] read *before* the
+    /// choice they undo; their object ids are already in the store, and
+    /// resolution never rewrote them.
+    fn restore_conflict(
+        &self,
+        _path: &[u8],
+        _bytes: Vec<u8>,
+        _stages: &[UnmergedStage],
+    ) -> Result<()> {
+        Err(unserved("undoing region answers"))
+    }
+
     /// Records one conflicted path as resolved, taking `side`'s answer.
     ///
     /// [`Side::Ours`]/[`Side::Theirs`]: `git checkout --ours|--theirs --` the
@@ -2110,17 +2155,148 @@ impl Repo for Binary {
                     Side::Ours => b"--ours",
                     _ => b"--theirs",
                 };
+                let want = match side {
+                    Side::Ours => 2,
+                    _ => 3,
+                };
                 // A stage that exists: its content becomes the answer. One
-                // that does not: that side's answer is the deletion, and
-                // git's own refusal to check out a missing stage is the
-                // signal to record the removal instead.
+                // that does not: that side's answer *is* the deletion, and
+                // only that case reaches `git rm -f` — a checkout that
+                // failed for any other reason comes back as the error it
+                // is, because "the working tree refused" silently turned
+                // into "the file was deleted" is how a resolution eats a
+                // file nobody asked to remove.
                 if run_bytes(&self.root, &[b"checkout", which, b"--", path]).is_ok() {
                     run_bytes(&self.root, &[b"add", b"--", path]).map(|_| ())
                 } else {
-                    run_bytes(&self.root, &[b"rm", b"-f", b"--", path]).map(|_| ())
+                    let refused = run_bytes(&self.root, &[b"checkout", which, b"--", path]);
+                    let have = self
+                        .unmerged(path)
+                        .is_ok_and(|stages| stages.iter().any(|stage| stage.stage == want));
+                    if have {
+                        // The stage is there and checkout still refused:
+                        // say why, and never guess.
+                        refused.map(|_| ())
+                    } else {
+                        run_bytes(&self.root, &[b"rm", b"-f", b"--", path]).map(|_| ())
+                    }
                 }
             }
         }
+    }
+
+    fn unmerged(&self, path: &[u8]) -> Result<Vec<UnmergedStage>> {
+        refuse_dashes(path)?;
+        // `-z` because a path may hold anything but NUL; the record shape is
+        // `mode SP oid SP stage TAB path NUL`, and the path on the record is
+        // the one asked for — checked, not trusted, because a pathspec that
+        // matched more than one name would quietly answer with somebody
+        // else's stages.
+        let raw = run_bytes(&self.root, &[b"ls-files", b"-u", b"-z", b"--", path])?;
+        let mut stages = Vec::new();
+        for record in raw.split(|&b| b == 0) {
+            if record.is_empty() {
+                continue;
+            }
+            let Some(tab) = record.iter().position(|&b| b == b'\t') else {
+                return Err("git ls-files -u answered a record without a path".into());
+            };
+            let head = String::from_utf8_lossy(&record[..tab]).into_owned();
+            let mut fields = head.split(' ');
+            let (Some(mode), Some(oid), Some(stage), None) =
+                (fields.next(), fields.next(), fields.next(), fields.next())
+            else {
+                return Err(format!(
+                    "git ls-files -u answered a record that is not mode, oid, stage: {head:?}"
+                ));
+            };
+            let stage: u8 = stage
+                .parse()
+                .map_err(|_| format!("stage {stage:?} is not a number"))?;
+            stages.push(UnmergedStage {
+                mode: mode.to_string(),
+                oid: oid.to_string(),
+                stage,
+            });
+        }
+        stages.sort_by_key(|s| s.stage);
+        Ok(stages)
+    }
+
+    fn conflict_file(&self, path: &[u8]) -> Result<gitten_core::conflict::ConflictFile> {
+        refuse_dashes(path)?;
+        let at = join_raw(&self.root, path);
+        let bytes =
+            std::fs::read(&at).map_err(|e| format!("could not read {}: {}", at.display(), e))?;
+        Ok(gitten_core::conflict::ConflictFile::parse(
+            gitten_core::status::PathBytes::from_bytes(path),
+            bytes,
+        ))
+    }
+
+    fn resolve_hunks(
+        &self,
+        path: &[u8],
+        choices: &[(usize, gitten_core::conflict::Answer)],
+    ) -> Result<()> {
+        refuse_dashes(path)?;
+        let at = join_raw(&self.root, path);
+        let bytes =
+            std::fs::read(&at).map_err(|e| format!("could not read {}: {e}", at.display()))?;
+        // The parse is the freshness check: the answers were composed
+        // against a snapshot of this file, and a file whose regions moved —
+        // resolved elsewhere, re-merged, edited by hand — refuses here
+        // rather than applying a choice to the wrong region.
+        let file = gitten_core::conflict::ConflictFile::parse(
+            gitten_core::status::PathBytes::from_bytes(path),
+            bytes,
+        );
+        if !file.is_conflicted() {
+            return Err(
+                "the file carries no conflict markers now — resolve it whole with the file-level answers".into(),
+            );
+        }
+        if choices.iter().any(|(i, _)| *i >= file.regions.len()) {
+            return Err(
+                "the conflict moved under the keyboard — reopen the file and answer again".into(),
+            );
+        }
+        let combined = gitten_core::conflict::apply(&file.bytes, &file.regions, choices)?;
+        // The working tree carries the answer before the index records it,
+        // so what the reader sees is what got staged.
+        std::fs::write(&at, &combined)
+            .map_err(|e| format!("could not write {}: {e}", at.display()))?;
+        run_bytes(&self.root, &[b"add", b"--", path]).map(|_| ())
+    }
+
+    fn restore_conflict(
+        &self,
+        path: &[u8],
+        bytes: Vec<u8>,
+        stages: &[UnmergedStage],
+    ) -> Result<()> {
+        refuse_dashes(path)?;
+        let at = join_raw(&self.root, path);
+        // The bytes first, so the worktree and the index agree on which
+        // conflict is standing again; then the stages, by id — the blobs
+        // they name are still in the store, resolution never rewrote them.
+        std::fs::write(&at, &bytes)
+            .map_err(|e| format!("could not write {}: {e}", at.display()))?;
+        if stages.is_empty() {
+            return Ok(());
+        }
+        let mut input = Vec::new();
+        for stage in stages {
+            input.extend_from_slice(stage.mode.as_bytes());
+            input.push(b' ');
+            input.extend_from_slice(stage.oid.as_bytes());
+            input.push(b' ');
+            input.extend_from_slice(stage.stage.to_string().as_bytes());
+            input.push(b'\t');
+            input.extend_from_slice(path);
+            input.push(b'\n');
+        }
+        run_stdin(&self.root, &[b"update-index", b"--index-info"], &input)
     }
 
     fn create_tag(&self, name: &[u8], target: &[u8], message: Option<&str>) -> Result<()> {
@@ -2845,6 +3021,22 @@ fn refuse_dashes(name: &[u8]) -> Result<()> {
 }
 
 // ------------------------------------------------------------------- the pair
+
+/// One unmerged stage git still holds for a conflicted path, exactly as
+/// `git ls-files -u` spells it. The object id is the undo's anchor: a
+/// resolution `git add`s a new blob over the stages, and restoring the
+/// entries by id — the contents never moved — is how the stages come back
+/// without anybody re-reading their bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnmergedStage {
+    /// The tree entry's mode, as git spells it (`100644`, `100755`,
+    /// `120000`, `160000`).
+    pub mode: String,
+    /// The blob (or gitlink) object id, full.
+    pub oid: String,
+    /// 1 base, 2 ours, 3 theirs.
+    pub stage: u8,
+}
 
 /// One changed file, as the two versions of its text.
 ///

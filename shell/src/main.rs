@@ -6466,6 +6466,14 @@ fn open_main_window(launch: Launch, cx: &mut App) {
                         v.load.clone(),
                     )
                 }
+                // A launch never opens on a conflict: the files pane does
+                // not exist at startup, so no eye could be on one. The arm
+                // names itself rather than hiding in a wildcard, so a
+                // future launch that can open on a conflict must say what
+                // screen it means.
+                Some(Data::Conflict(..)) => {
+                    unreachable!("no launch opens on a conflict")
+                }
                 // The skeleton: the same screens at their loading shapes,
                 // one generation below the wave that fills them. The saved
                 // row waits — restoring into an empty list would clamp it

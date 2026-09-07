@@ -12,6 +12,7 @@ pub use crate::source::DiffSource;
 
 pub mod align;
 pub mod command;
+pub mod conflict;
 pub mod differ;
 pub mod edit;
 pub mod font;

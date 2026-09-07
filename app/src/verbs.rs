@@ -332,6 +332,50 @@ impl Write {
         .announcing(format!("resolved {shown} ({label})"))
     }
 
+    /// Applies region answers to a conflicted file — the merging view's
+    /// half-answered file, staged region by region. The repo re-reads and
+    /// re-validates against the file as it stands now; this job only names
+    /// the choices for the status line.
+    pub fn resolve_hunks(
+        repo: &Handle,
+        path: Vec<u8>,
+        choices: Vec<(usize, gitten_core::conflict::Answer)>,
+    ) -> Self {
+        let shown = String::from_utf8_lossy(&path).into_owned();
+        let named = choices
+            .iter()
+            .map(|(region, answer)| {
+                let word = match answer {
+                    gitten_core::conflict::Answer::Ours => "ours",
+                    gitten_core::conflict::Answer::Theirs => "theirs",
+                    gitten_core::conflict::Answer::Both => "both",
+                };
+                format!("{region}:{word}")
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        Self::named(format!("resolve {shown} ({named})"), repo, move |r| {
+            r.resolve_hunks(&path, &choices)
+        })
+        .announcing(format!("resolved {shown} ({named})"))
+    }
+
+    /// Puts a conflicted path back the way a region answer found it — the
+    /// bytes on disk and the unmerged stages in the index, both as they
+    /// were read before the choice this undoes.
+    pub fn restore(
+        repo: &Handle,
+        path: Vec<u8>,
+        bytes: Vec<u8>,
+        stages: Vec<gitten_git::UnmergedStage>,
+    ) -> Self {
+        let shown = String::from_utf8_lossy(&path).into_owned();
+        Self::named(format!("undo {shown}"), repo, move |r| {
+            r.restore_conflict(&path, bytes, &stages)
+        })
+        .announcing(format!("undo recorded for {shown}"))
+    }
+
     /// Moves the current branch onto `target`, taking as much of the index
     /// and working tree along as `mode` says. Soft and mixed keep every
     /// change on disk or in the reflog; hard destroys unstaged work, which
