@@ -2684,6 +2684,12 @@ impl App {
             self.message = format!("{command} needs an open rebase plan");
             return;
         }
+        // Any edit takes the standing question down with it: the answer
+        // was given about the plan as it read a moment ago, and a confirm
+        // that survived an edit would run a rewrite nobody was asked about.
+        if command != "todo.run" {
+            self.history_arm = None;
+        }
         use gitten_core::rebase::Action;
         let action = match command {
             "todo.pick" => Some(Action::Pick),
@@ -17321,6 +17327,20 @@ shared tail
             format!("rewrite 3 commits from {base}? press again to confirm")
         );
         assert!(app.todo.is_some(), "the plan closed on the question");
+
+        // An edit after the question takes the question with it: the answer
+        // was about the plan as it read a moment ago.
+        app.press(Key::char('p'));
+        app.press(Key::char('d'));
+        app.press(Key::plain(Code::Enter));
+        assert!(
+            app.message.contains("press again to confirm"),
+            "an edited plan ran on the old answer: {:?}",
+            app.message
+        );
+        app.pump_quiet();
+        assert!(state.lock().unwrap().writes.is_empty());
+
         app.press(Key::plain(Code::Enter));
         assert!(app.todo.is_none(), "the plan stayed open after running");
         assert_eq!(
