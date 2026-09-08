@@ -65,12 +65,13 @@ pub const MODE: &str = "panes";
 /// with another one — the name the keymap and `gitten.toml` use for the
 /// `[`/`]` bindings.
 ///
-/// Its own mode rather than a corner of [`MODE`], and only ever pushed when
-/// the focused pane's section has a second *registered* tab: `stashes` shares
-/// its slot with nothing, a fixture launch has one list, and a `[` advertised
-/// in either place would be exactly the lie a mode-scoped help panel exists to
-/// prevent. The window has no sections and never pushes it, which is the other
-/// half of the same argument.
+/// Its own mode rather than a corner of [`MODE`], pushed whenever two or
+/// more sidebar tabs are registered: the ring is the whole sidebar's, so a
+/// focused `stashes` shares nothing yet still wraps to the column's head.
+/// A fixture launch with one list is the one shape without a ring, and a
+/// `[` advertised there would be exactly the lie a mode-scoped help panel
+/// exists to prevent. The window has no sections and never pushes it, which
+/// is the other half of the same argument.
 pub const TABS: &str = "tabs";
 
 /// Body width at which the sidebar and the main region sit side by side.
@@ -837,34 +838,24 @@ impl<T> Panes<T> {
             .unwrap_or(usize::MAX)
     }
 
-    /// The registered tabs of the section `name` sits in, in draw order —
-    /// what `[`/`]` cycle and what a section header lists. Empty for the main
-    /// region and for a name nothing registered: neither is a tab.
-    pub fn section_tabs(&self, name: &str) -> Vec<&str> {
-        let Some(group) = self.group_of(name) else {
-            return Vec::new();
-        };
-        self.list_order()
-            .into_iter()
-            .filter(|n| self.group_of(n) == Some(group))
-            .collect()
-    }
-
-    /// Cycles the focus one tab along the focused pane's own section,
-    /// wrapping — what `[`/`]` do. `false` when the keyboard is not on a
-    /// sidebar list, or when its section has no second registered tab, which
-    /// is the honest answer for a `stashes` on its own.
+    /// Cycles the focus one tab along the whole sidebar ring — every
+    /// registered sidebar tab in reading order, wrapping — what `[`/`]` do.
+    /// `false` when fewer than two sidebar tabs registered, which is the
+    /// honest answer for a fixture with one list. Crosses section lines:
+    /// the ring is the order the headers draw, and a cycle that stopped at
+    /// a section edge would strand a `stashes` focused with the pair dead.
     pub fn cycle_tab(&mut self, by: isize) -> bool {
         let focused = self.focused_name().to_string();
-        let tabs: Vec<String> = self
-            .section_tabs(&focused)
-            .into_iter()
-            .map(str::to_string)
-            .collect();
+        let tabs: Vec<String> = self.list_order().into_iter().map(str::to_string).collect();
         if tabs.len() < 2 {
             return false;
         }
-        let at = tabs.iter().position(|n| *n == focused).unwrap_or(0);
+        let at = match tabs.iter().position(|n| *n == focused) {
+            Some(at) => at,
+            // The main region is not a tab: the pair refuses rather than
+            // landing blind on the column's head.
+            None => return false,
+        };
         let next = (at as isize + by).rem_euclid(tabs.len() as isize) as usize;
         self.focus_named(&tabs[next])
     }
@@ -1168,13 +1159,21 @@ mod tests {
         );
         assert_eq!(*p.reading_order().last().unwrap(), "diff");
 
-        // And each name knows the tabs it shares a slot with.
-        assert_eq!(p.section_tabs("worktrees"), ["files", "worktrees"]);
-        assert_eq!(p.section_tabs("tags"), ["branches", "remotes", "tags"]);
-        assert_eq!(p.section_tabs("reflog"), ["commits", "reflog"]);
-        assert_eq!(p.section_tabs("stashes"), ["stashes"]);
+        // And each name knows the slot it shares: the same group the layout
+        // groups by, so a header, a click and the ring all agree.
+        fn slot<'a>(p: &'a Panes<&'a str>, name: &str) -> Vec<&'a str> {
+            let group = p.group_of(name);
+            p.list_order()
+                .into_iter()
+                .filter(|n| p.group_of(n) == group)
+                .collect()
+        }
+        assert_eq!(slot(&p, "worktrees"), ["files", "worktrees"]);
+        assert_eq!(slot(&p, "tags"), ["branches", "remotes", "tags"]);
+        assert_eq!(slot(&p, "reflog"), ["commits", "reflog"]);
+        assert_eq!(slot(&p, "stashes"), ["stashes"]);
         // The main region is nobody's tab.
-        assert!(p.section_tabs("diff").is_empty());
+        assert_eq!(slot(&p, "diff"), Vec::<&str>::new());
 
         // The keyboard is on `commits`, so its section shows it and the
         // others show their first tab — which is what the headers say.
@@ -1239,17 +1238,16 @@ mod tests {
         assert_eq!(g.rect("commits"), None, "the tab behind kept its rows");
         assert_eq!(g.rect("reflog").unwrap().height, 5);
         assert_eq!(active(&g.headers()[2]), Some("reflog"));
-        // It wraps within its own section and never leaves it.
+        // The ring is the whole sidebar's: from reflog the next tab crosses
+        // into the stash section, and one more wraps to the column's head.
         assert!(p.cycle_tab(1));
-        assert_eq!(p.focused_name(), "commits");
-        assert!(p.cycle_tab(-1));
-        assert_eq!(p.focused_name(), "reflog");
-        // A section of one has no second tab, and says so rather than moving.
-        p.focus_named("stashes");
-        assert!(!p.cycle_tab(1), "a lone tab is not a cycle");
         assert_eq!(p.focused_name(), "stashes");
-        // Nor does the main region, which is not a section.
-        p.focus_named("reflog");
+        assert!(p.cycle_tab(1));
+        assert_eq!(p.focused_name(), "files", "the ring did not wrap");
+        assert!(p.cycle_tab(-1));
+        assert_eq!(p.focused_name(), "stashes");
+        // The main region is not a tab: the pair refuses rather than
+        // landing blind, and the keyboard stays where it was.
         p.focus_named("diff");
         assert!(!p.cycle_tab(1));
         assert_eq!(p.focused_name(), "diff");
@@ -1306,14 +1304,14 @@ mod tests {
         );
         assert_eq!(g.rect("tags").unwrap().height, 11);
         assert_eq!(g.rect("files").unwrap().height, 11);
-        assert_eq!(p.section_tabs("tags"), ["tags"]);
+        assert_eq!(p.list_order(), ["files", "tags"]);
 
         // An ungrouped name is a section of its own at the tail, never tabbed
         // behind a built-in it has never heard of.
         let mut p = tabbed();
         p.register("ext", Placement::sidebar("ext"), "ext");
         p.focus_named("commits");
-        assert_eq!(p.section_tabs("ext"), ["ext"]);
+        assert_eq!(*p.list_order().last().unwrap(), "ext");
         let g = layout.arrange(&p.spots(), body);
         assert_eq!(g.headers().len(), 5);
         assert_eq!(
