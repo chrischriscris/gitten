@@ -136,15 +136,18 @@ keys all still move to exactly the pane they name. `Spot::open` and
 `Header::open` are removed: nothing outside the layout's own tests read
 them, and height no longer has an expanded state to record.
 
-## Supersession (2026-09-08): the ring is the whole sidebar's
+## Supersession (2026-09-08): h/l cycle panes, [ and ] cycle a section's tabs
 
-The `]`/`[` pair first cycled the focused section's own tabs, and a section
-of one — the stash — had no ring at all. That is not lazygit's pair: there
-the keys reach every tab, and the headers keep every tab visible at all
-times, so a key that dies on `stashes` breaks the picture the headers draw.
+Two keys moved onto the lazygit model the sections were built for:
 
-**`tab.next`/`tab.prev` now walk every registered sidebar tab in reading
-order, wrapping, across section lines.** The `tabs` mode is pushed whenever
-two or more sidebar tabs are registered — the same condition `panes` rides —
-and the main region still refuses rather than landing blind. The
-equal-shares policy above stands.
+- **`h`/`l` cycle the panes** — every sidebar section, standing for the tab
+  it is showing, then the main region, wrapping. A pane is a section or the
+  main region; the old walk's edge-stop is gone. `pane.left`/`pane.right`
+  keep their names; the walk they replaced is not coming back.
+- **`[`/`]` cycle the tabs of the selected section**, wrapping inside it,
+  and are only advertised where the focused section has a second registered
+  tab — the honest reading of "the tabs of the selected pane". A fixture
+  with one list and a stash on its own are the two shapes without them.
+
+The equal-shares policy above stands; nothing in this record's arithmetic
+changes with either key move.

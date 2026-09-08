@@ -770,32 +770,33 @@ impl<T> Panes<T> {
         sidebars.into_iter().map(|(_, _, name)| name).collect()
     }
 
-    /// The full reading order the `pane.left`/`pane.right` walk follows: the
-    /// sidebar lists top to bottom, then the main region. Left of the diff is
-    /// the sidebar's foot; right of the last list is the diff; an edge stops.
-    pub fn reading_order(&self) -> Vec<&str> {
-        let mut order = self.list_order();
+    /// The pane one step `by` around the pane ring — every sidebar section,
+    /// standing for the tab it is showing, then the main region, wrapping.
+    /// What `h`/`l` cycle: a pane is a section or the main region, and a
+    /// section is reached through the tab it shows. `None` when there is no
+    /// pane to cycle to — a single pane is no cycle.
+    pub fn cycle_sections(&self, by: isize) -> Option<&str> {
+        let mut order: Vec<&str> = Vec::new();
+        for name in self.list_order() {
+            let group = self.group_of(name)?;
+            if order.iter().any(|n| self.group_of(n) == Some(group)) {
+                continue; // the section already stands in the ring
+            }
+            order.push(self.shown_of(group)?);
+        }
         order.extend(
             self.entries
                 .iter()
                 .filter(|e| matches!(e.placement, Placement::Main))
                 .map(|e| e.name.as_str()),
         );
-        order
-    }
-
-    /// The neighbour one step `by` along the reading order, or `None` at
-    /// either edge — the walk never wraps, because the number keys already
-    /// cover the jumping.
-    pub fn walk(&self, by: isize) -> Option<&str> {
-        let order = self.reading_order();
-        let focused = self.focused_name();
-        let at = order.iter().position(|name| *name == focused)?;
-        let next = at as isize + by;
-        if next < 0 || next >= order.len() as isize {
+        if order.len() < 2 {
             return None;
         }
-        order.get(next as usize).copied()
+        let focused = self.focused_name();
+        let at = order.iter().position(|n| *n == focused)?;
+        let next = (at as isize + by).rem_euclid(order.len() as isize) as usize;
+        Some(order[next])
     }
 
     /// Cycles focus by an offset through the sidebar lists only, wrapping —
@@ -838,24 +839,34 @@ impl<T> Panes<T> {
             .unwrap_or(usize::MAX)
     }
 
-    /// Cycles the focus one tab along the whole sidebar ring — every
-    /// registered sidebar tab in reading order, wrapping — what `[`/`]` do.
-    /// `false` when fewer than two sidebar tabs registered, which is the
-    /// honest answer for a fixture with one list. Crosses section lines:
-    /// the ring is the order the headers draw, and a cycle that stopped at
-    /// a section edge would strand a `stashes` focused with the pair dead.
+    /// The registered tabs of the section `name` sits in, in draw order —
+    /// what `[`/`]` cycle and what a section header lists. Empty for the main
+    /// region and for a name nothing registered: neither is a tab.
+    pub fn section_tabs(&self, name: &str) -> Vec<&str> {
+        let Some(group) = self.group_of(name) else {
+            return Vec::new();
+        };
+        self.list_order()
+            .into_iter()
+            .filter(|n| self.group_of(n) == Some(group))
+            .collect()
+    }
+
+    /// Cycles the focus one tab along the focused pane's own section,
+    /// wrapping — what `[`/`]` do. `false` when the keyboard is not on a
+    /// sidebar list, or when its section has no second registered tab, which
+    /// is the honest answer for a `stashes` on its own.
     pub fn cycle_tab(&mut self, by: isize) -> bool {
         let focused = self.focused_name().to_string();
-        let tabs: Vec<String> = self.list_order().into_iter().map(str::to_string).collect();
+        let tabs: Vec<String> = self
+            .section_tabs(&focused)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
         if tabs.len() < 2 {
             return false;
         }
-        let at = match tabs.iter().position(|n| *n == focused) {
-            Some(at) => at,
-            // The main region is not a tab: the pair refuses rather than
-            // landing blind on the column's head.
-            None => return false,
-        };
+        let at = tabs.iter().position(|n| *n == focused).unwrap_or(0);
         let next = (at as isize + by).rem_euclid(tabs.len() as isize) as usize;
         self.focus_named(&tabs[next])
     }
@@ -955,27 +966,31 @@ mod tests {
         assert_eq!(*p.get("ext-a").unwrap(), 5);
         assert_eq!(p.focused_name(), "ext-a", "focus did not stay stable");
 
-        // Canonical built-ins before extensions, and Main last.
+        // Canonical built-ins before extensions, and Main last: the pane ring
+        // closes on the diff.
         assert_eq!(p.list_order(), ["commits", "ext-a", "ext-b"]);
-        assert_eq!(p.reading_order(), ["commits", "ext-a", "ext-b", "diff"]);
+        p.focus_named("ext-b");
+        assert_eq!(p.cycle_sections(1), Some("diff"));
     }
 
     #[test]
-    fn pane_walk_stops_and_sidebar_cycle_wraps() {
+    fn h_l_cycle_panes_and_the_sidebar_cycle_wraps() {
         let mut p = full();
         p.focus_named("status");
-        // Right walks the whole reading order and stops at the diff.
-        for expected in ["files", "branches", "commits", "stashes", "diff"] {
-            assert_eq!(p.walk(1), Some(expected), "at {}", p.focused_name());
-            let name = p.walk(1).expect("in range").to_string();
+        // Right cycles the panes — each section standing for the tab it is
+        // showing, the main region closing the ring — and wraps.
+        for expected in ["files", "branches", "commits", "stashes", "diff", "status"] {
+            let name = p.cycle_sections(1).expect("a pane to cycle to").to_string();
             p.focus_named(&name);
             assert_eq!(p.focused_name(), expected);
         }
-        assert_eq!(p.walk(1), None, "the walk wrapped past the diff");
-        // Left walks back and stops at the top of the stack.
-        assert_eq!(p.walk(-1), Some("stashes"));
-        p.focus_named("status");
-        assert_eq!(p.walk(-1), None, "the walk wrapped above status");
+        // Left cycles back the same ring.
+        let name = p.cycle_sections(-1).expect("a pane").to_string();
+        p.focus_named(&name);
+        assert_eq!(p.focused_name(), "diff");
+        let name = p.cycle_sections(-1).expect("a pane").to_string();
+        p.focus_named(&name);
+        assert_eq!(p.focused_name(), "stashes");
 
         // The cycle wraps through the sidebar only, never reaching the diff.
         p.focus_named("stashes");
@@ -993,14 +1008,15 @@ mod tests {
         assert!(p.cycle_sidebar(-1));
         assert_eq!(p.focused_name(), "stashes");
 
-        // Two panes: the walk moves, the cycle has no second list.
+        // Two panes: the pane cycle has both, the list cycle has no second
+        // list.
         let mut p = Panes::new();
         p.register("commits", Placement::sidebar("commits"), 1);
         p.register("diff", Placement::Main, 2);
         p.focus_named("commits");
-        assert_eq!(p.walk(1), Some("diff"));
+        assert_eq!(p.cycle_sections(1), Some("diff"));
         p.focus_named("diff");
-        assert_eq!(p.walk(-1), Some("commits"));
+        assert_eq!(p.cycle_sections(-1), Some("commits"));
         assert!(!p.cycle_sidebar(1), "one list is not a cycle");
         assert_eq!(p.focused_name(), "diff", "a refused cycle moved focus");
     }
@@ -1157,23 +1173,14 @@ mod tests {
                 "stashes"
             ]
         );
-        assert_eq!(*p.reading_order().last().unwrap(), "diff");
 
-        // And each name knows the slot it shares: the same group the layout
-        // groups by, so a header, a click and the ring all agree.
-        fn slot<'a>(p: &'a Panes<&'a str>, name: &str) -> Vec<&'a str> {
-            let group = p.group_of(name);
-            p.list_order()
-                .into_iter()
-                .filter(|n| p.group_of(n) == group)
-                .collect()
-        }
-        assert_eq!(slot(&p, "worktrees"), ["files", "worktrees"]);
-        assert_eq!(slot(&p, "tags"), ["branches", "remotes", "tags"]);
-        assert_eq!(slot(&p, "reflog"), ["commits", "reflog"]);
-        assert_eq!(slot(&p, "stashes"), ["stashes"]);
+        // And each name knows the tabs it shares a slot with.
+        assert_eq!(p.section_tabs("worktrees"), ["files", "worktrees"]);
+        assert_eq!(p.section_tabs("tags"), ["branches", "remotes", "tags"]);
+        assert_eq!(p.section_tabs("reflog"), ["commits", "reflog"]);
+        assert_eq!(p.section_tabs("stashes"), ["stashes"]);
         // The main region is nobody's tab.
-        assert_eq!(slot(&p, "diff"), Vec::<&str>::new());
+        assert!(p.section_tabs("diff").is_empty());
 
         // The keyboard is on `commits`, so its section shows it and the
         // others show their first tab — which is what the headers say.
@@ -1238,16 +1245,17 @@ mod tests {
         assert_eq!(g.rect("commits"), None, "the tab behind kept its rows");
         assert_eq!(g.rect("reflog").unwrap().height, 5);
         assert_eq!(active(&g.headers()[2]), Some("reflog"));
-        // The ring is the whole sidebar's: from reflog the next tab crosses
-        // into the stash section, and one more wraps to the column's head.
+        // It wraps within its own section and never leaves it.
         assert!(p.cycle_tab(1));
-        assert_eq!(p.focused_name(), "stashes");
-        assert!(p.cycle_tab(1));
-        assert_eq!(p.focused_name(), "files", "the ring did not wrap");
+        assert_eq!(p.focused_name(), "commits");
         assert!(p.cycle_tab(-1));
+        assert_eq!(p.focused_name(), "reflog");
+        // A section of one has no second tab, and says so rather than moving.
+        p.focus_named("stashes");
+        assert!(!p.cycle_tab(1), "a lone tab is not a cycle");
         assert_eq!(p.focused_name(), "stashes");
-        // The main region is not a tab: the pair refuses rather than
-        // landing blind, and the keyboard stays where it was.
+        // Nor does the main region, which is not a section.
+        p.focus_named("reflog");
         p.focus_named("diff");
         assert!(!p.cycle_tab(1));
         assert_eq!(p.focused_name(), "diff");
@@ -1304,14 +1312,14 @@ mod tests {
         );
         assert_eq!(g.rect("tags").unwrap().height, 11);
         assert_eq!(g.rect("files").unwrap().height, 11);
-        assert_eq!(p.list_order(), ["files", "tags"]);
+        assert_eq!(p.section_tabs("tags"), ["tags"]);
 
         // An ungrouped name is a section of its own at the tail, never tabbed
         // behind a built-in it has never heard of.
         let mut p = tabbed();
         p.register("ext", Placement::sidebar("ext"), "ext");
         p.focus_named("commits");
-        assert_eq!(*p.list_order().last().unwrap(), "ext");
+        assert_eq!(p.section_tabs("ext"), ["ext"]);
         let g = layout.arrange(&p.spots(), body);
         assert_eq!(g.headers().len(), 5);
         assert_eq!(

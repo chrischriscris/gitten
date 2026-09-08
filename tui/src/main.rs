@@ -2508,17 +2508,17 @@ impl App {
     ///
     /// `panes` comes first, when a second sidebar list exists to cycle
     /// between — its Ctrl-J/Ctrl-K bindings would be a lie with one list —
-    /// then `tabs` beside it, on the same condition: the ring crosses
-    /// section lines, so two sidebar lists anywhere is all `[`/`]` need.
+    /// then `tabs` when the focused list shares its section with another,
     /// then the focused pane's own mode, then help and any prompt.
     fn sync_modes(&mut self) {
         self.modes = Modes::new();
         if self.panes.list_order().len() > 1 {
             self.modes.push(panes::MODE);
-            // The tab pair rides the same condition: the ring is the whole
-            // sidebar's, so two registered tabs anywhere is all it needs.
-            // The help panel must not list a key that would answer with a
-            // refusal, and one list is that refusal.
+        }
+        // And the tab pair only where there is a second tab to reach: a
+        // section of one has nothing for `[`/`]` to say, and the help panel
+        // must not list a key that would answer with a refusal.
+        if self.panes.section_tabs(self.panes.focused_name()).len() > 1 {
             self.modes.push(panes::TABS);
         }
         if let Some(screen) = self.panes.focused() {
@@ -4852,11 +4852,13 @@ impl App {
         match command {
             // The ten names the shared registry ships, answered from the pane
             // registry and not from any view: h/l and the arrows walk the
-            // reading order — sidebar lists, then the main diff — and stop at
-            // the edges; Ctrl-J/Ctrl-K cycle the sidebar lists; the digits name
-            // sections and land on the tab each is showing, while `diff.focus`
-            // and the rest name panes, and a name with no pane is said, not
-            // swallowed. No new command name, no local key table: every one of
+            // reading order — sidebar lists, then the main diff — and h/l
+            // cycle the panes, wrapping: a section stands for the tab it is
+            // showing, the main region closes the ring. Ctrl-J/Ctrl-K cycle
+            // the sidebar lists; `[`/`]` cycle the focused section's own
+            // tabs; the digits name sections and land on the tab each is
+            // showing, while `diff.focus` and the rest name panes, and a
+            // name with no pane is said, not swallowed. No new command name, no local key table: every one of
             // these resolved through the same keymap `gitten.toml` writes.
             "pane.left" => self.pane_walk(-1),
             "pane.right" => self.pane_walk(1),
@@ -5618,8 +5620,12 @@ impl App {
     /// right of the last list is the diff; an edge answers and stays, which is
     /// what a walk that refuses to wrap must do to keep h/l a line and not a
     /// ring — the number keys already cover the jumping.
+    /// Cycles the panes — what `h`/`l` do once more than one exists. A pane
+    /// is a sidebar section, through the tab it is showing, or the main
+    /// region, and the cycle wraps: lazygit's pair never dead-ends at an
+    /// edge.
     fn pane_walk(&mut self, by: isize) {
-        let Some(name) = self.panes.walk(by).map(str::to_string) else {
+        let Some(name) = self.panes.cycle_sections(by).map(str::to_string) else {
             return;
         };
         self.focus_named(&name);
@@ -5638,16 +5644,17 @@ impl App {
         }
     }
 
-    /// Walks the tabs of the whole sidebar — what `[`/`]` do.
+    /// Walks the tabs of the focused section — what `[`/`]` do.
     ///
-    /// One ring over every registered sidebar tab in reading order, wrapping,
-    /// crossing section lines: the headers keep every tab visible at all
-    /// times, so the pair reaches every one of them, and a `stashes` focused
-    /// alone is no dead end. Nothing to walk is said rather than swallowed —
-    /// a fixture with one list is the only shape without a ring.
+    /// A section is a slot in the sidebar its lists take turns in, so this is
+    /// the *inner* move: h/l cycle the panes, ctrl-j/ctrl-k walk every list
+    /// in the column, and these two stay inside the section the keyboard is
+    /// in. Nothing to walk is said rather than swallowed — a `stashes` on its
+    /// own is a section of one, and so is the main region, which is not a
+    /// section at all.
     fn cycle_tab(&mut self, by: isize) {
-        if self.panes.list_order().len() < 2 {
-            self.message = "no second tab in the sidebar".into();
+        if self.panes.section_tabs(self.panes.focused_name()).len() < 2 {
+            self.message = "no second tab in this section".into();
             return;
         }
         if self.panes.cycle_tab(by) {
@@ -8525,17 +8532,18 @@ mod tests {
             Resolve::Run("pane.prev")
         );
 
-        // And the dispatch answers them: the walk runs and stops at the
-        // edges, the digits name panes, and an absent pane is said, exactly.
+        // And the dispatch answers them: h/l cycle the panes and wrap — a
+        // one-list app still has the main region to cycle to — the digits
+        // name panes, and an absent pane is said, exactly.
         let mut app = app(30);
         app.press(Key::char('h'));
         assert_eq!(
             app.panes.focused_name(),
-            "commits",
-            "left from the first pane wrapped to the diff"
+            "diff",
+            "left from the only list wrapped to the main pane"
         );
         app.press(Key::char('l'));
-        assert_eq!(app.panes.focused_name(), "diff");
+        assert_eq!(app.panes.focused_name(), "commits");
         app.press(Key::char('l'));
         assert_eq!(
             app.panes.focused_name(),
@@ -8546,7 +8554,7 @@ mod tests {
         assert_eq!(
             app.panes.focused_name(),
             "commits",
-            "the arrows stopped walking"
+            "the arrows cycle the same ring"
         );
 
         app.press(Key::plain(Code::Char('0')));
@@ -11360,31 +11368,33 @@ diff --git a/tracked.txt b/tracked.txt
         assert_eq!(app.panes.focused_name(), "worktrees");
         app.press(Key::ctrl(Code::Char('k')));
         assert_eq!(app.panes.focused_name(), "files");
-        // `]`/`[` are the ring over every sidebar tab, crossing section
-        // lines: from files one `]` reaches worktrees, the next crosses
-        // into branches, and the ring wraps back to the column's head.
+        // `]`/`[` are the *inner* move, and they stay in the section they
+        // started in: files and worktrees share a slot, so the pair walks
+        // between exactly those two and wraps rather than reaching branches.
         app.press(Key::plain(Code::Char(']')));
         assert_eq!(app.panes.focused_name(), "worktrees");
         app.press(Key::plain(Code::Char(']')));
-        assert_eq!(app.panes.focused_name(), "branches");
+        assert_eq!(app.panes.focused_name(), "files", "the tabs did not wrap");
         app.press(Key::plain(Code::Char('[')));
         assert_eq!(app.panes.focused_name(), "worktrees");
         app.press(Key::plain(Code::Char('[')));
         assert_eq!(app.panes.focused_name(), "files");
-        // The ring is the whole sidebar's, so a section of one is no dead
-        // end: `tabs` rides on the stack there, and `]` from the stash
-        // wraps to the column's head.
+        // A section of one does not carry the pair at all: the stack shares
+        // its slot with nothing, so `tabs` is off the stack there and `]` is
+        // an unbound key rather than a key that refuses.
         app.press(Key::plain(Code::Char('5')));
         assert!(
-            app.modes.as_slice().contains(&panes::TABS.to_string()),
+            !app.modes.as_slice().contains(&panes::TABS.to_string()),
             "{:?}",
             app.modes.as_slice()
         );
         app.press(Key::plain(Code::Char(']')));
-        assert_eq!(app.panes.focused_name(), "files", "the ring did not wrap");
-        // Asked for by name anyway — a config file or an extension can —
-        // and the dispatch runs the same ring, both ways round.
-        app.dispatch("tab.prev");
+        assert_eq!(app.panes.focused_name(), "stashes");
+        assert_eq!(app.message, "] is not bound — ? for the keys");
+        // Asked for by name anyway — a config file or an extension can — and
+        // the refusal is a sentence and not a silent no-op.
+        app.dispatch("tab.next");
+        assert_eq!(app.message, "no second tab in this section");
         assert_eq!(app.panes.focused_name(), "stashes");
         app.press(Key::plain(Code::Char('2')));
         // Headers derive live keys: the files *section* advertises `2`,
@@ -13461,20 +13471,6 @@ diff --git a/tracked.txt b/tracked.txt
                 "stashes",
             ]
         );
-        assert_eq!(
-            app.panes.reading_order(),
-            [
-                "files",
-                "worktrees",
-                "branches",
-                "remotes",
-                "tags",
-                "commits",
-                "reflog",
-                "stashes",
-                "diff"
-            ]
-        );
 
         // `5` reaches it — through the keymap, and the mode follows the
         // keyboard.
@@ -13731,19 +13727,16 @@ diff --git a/tracked.txt b/tracked.txt
         assert_eq!(app.panes.focused_name(), "tags");
         app.mouse(click(MouseKind::Up, 38, 7));
 
-        // `]`/`[` walk the whole sidebar ring and cross section lines:
-        // from the tags tab the next tab is commits, and the ring wraps at
-        // the stash to the column's head.
+        // `]`/`[` walk that section and wrap inside it, never reaching the
+        // commits section next door; h/l are the panes' pair, not theirs.
         app.press(Key::plain(Code::Char(']')));
-        assert_eq!(app.panes.focused_name(), "commits");
+        assert_eq!(app.panes.focused_name(), "branches");
         app.press(Key::plain(Code::Char(']')));
-        assert_eq!(app.panes.focused_name(), "reflog");
+        assert_eq!(app.panes.focused_name(), "remotes");
         app.press(Key::plain(Code::Char(']')));
-        assert_eq!(app.panes.focused_name(), "stashes");
-        app.press(Key::plain(Code::Char(']')));
-        assert_eq!(app.panes.focused_name(), "files", "the ring did not wrap");
+        assert_eq!(app.panes.focused_name(), "tags", "the tabs did not wrap");
         app.press(Key::plain(Code::Char('[')));
-        assert_eq!(app.panes.focused_name(), "stashes");
+        assert_eq!(app.panes.focused_name(), "remotes");
 
         // The digits name sections, not first tabs: over to the files
         // section, one tab along to `worktrees`, and `2` comes back to the
@@ -13798,8 +13791,8 @@ diff --git a/tracked.txt b/tracked.txt
             .collect::<Vec<_>>()
             .join("\n");
         for doc in [
-            "the next sidebar tab, wrapping",
-            "the previous sidebar tab, wrapping",
+            "the next tab in this section",
+            "the previous tab in this section",
         ] {
             assert!(help.contains(doc), "help dropped {doc:?}: {help:?}");
         }
@@ -14559,20 +14552,6 @@ diff --git a/tracked.txt b/tracked.txt
                 "stashes",
             ]
         );
-        assert_eq!(
-            app.panes.reading_order(),
-            [
-                "files",
-                "worktrees",
-                "branches",
-                "remotes",
-                "tags",
-                "commits",
-                "reflog",
-                "stashes",
-                "diff"
-            ]
-        );
 
         // `3` reaches it — through the keymap — and the keyboard's modes
         // follow, because the mode stack is built from the focused screen.
@@ -14602,16 +14581,16 @@ diff --git a/tracked.txt b/tracked.txt
         // instead of dragging it back to `branches`.
         app.press(Key::plain(Code::Char('3')));
         assert_eq!(app.panes.focused_name(), "remotes");
-        // The walk h/l still reaches every list exactly: left from remotes
-        // is branches, and left again is the worktrees tab above it.
+        // h/l cycle the panes — a section stands for the tab it is showing,
+        // the main region closes the ring, and the cycle wraps: left from
+        // the branches section is the files section, and left again is the
+        // diff at the ring's foot.
         app.dispatch("pane.left");
-        assert_eq!(app.panes.focused_name(), "branches");
+        assert_eq!(app.panes.focused_name(), "files");
         app.dispatch("pane.left");
-        assert_eq!(
-            app.panes.focused_name(),
-            "worktrees",
-            "the walk skipped a list"
-        );
+        assert_eq!(app.panes.focused_name(), "diff", "the ring did not wrap");
+        app.dispatch("pane.right");
+        assert_eq!(app.panes.focused_name(), "files");
 
         // A repository-backed diff launch registers the tenant the same way —
         // `App::new` never assumed commits exists — and the diff keeps the
