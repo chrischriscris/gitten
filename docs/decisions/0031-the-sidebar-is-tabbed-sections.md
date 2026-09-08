@@ -44,12 +44,19 @@ resized when they are next shown.
 `ctrl-j`/`ctrl-k`) is the order the column draws rather than registration order
 behind the built-ins. `Placement::Sidebar` carries the section beside the rank.
 
-**Keys.** `[`/`]` walk the tabs of the focused section, bound in the `panes`
-mode — which only exists once a second list does, so the pair is never
-advertised where there is nothing to walk. The numbers are untouched: `2` is
-still `files.focus`. Reaching a section by naming its first tab is what makes a
-section jump out of a binding that already shipped, and it keeps every
-`<name>.focus` command meaning exactly one pane.
+**Keys.** `[`/`]` walk the tabs of the focused section, bound in a `tabs` mode
+of its own — pushed only when the focused list has a second *registered* tab to
+reach, so the pair is never advertised where it would answer with a refusal.
+Not a corner of `panes`, because the two are different facts: `panes` is "there
+is more than one list to cycle", which every client with a sidebar has, and
+`tabs` is "the list with the keyboard shares its slot", which only a client
+whose sidebar groups its lists has. The window pushes `panes` and would
+otherwise have gained a `[` that says *not supported here* for a feature it
+does not have.
+
+The numbers are untouched: `2` is still `files.focus`. Reaching a section by
+naming its first tab is what makes a section jump out of a binding that already
+shipped, and it keeps every `<name>.focus` command meaning exactly one pane.
 
 **Mouse.** A press on a tab's word focuses that tab; a press anywhere else on a
 section header focuses the tab that section is showing. Both are the whole of

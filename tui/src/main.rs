@@ -2508,11 +2508,18 @@ impl App {
     ///
     /// `panes` comes first, when a second sidebar list exists to cycle
     /// between — its Ctrl-J/Ctrl-K bindings would be a lie with one list —
+    /// then `tabs` when the focused list shares its section with another,
     /// then the focused pane's own mode, then help and any prompt.
     fn sync_modes(&mut self) {
         self.modes = Modes::new();
         if self.panes.list_order().len() > 1 {
             self.modes.push(panes::MODE);
+        }
+        // And the tab pair only where there is a second tab to reach: a
+        // section of one has nothing for `[`/`]` to say, and the help panel
+        // must not list a key that would answer with a refusal.
+        if self.panes.section_tabs(self.panes.focused_name()).len() > 1 {
+            self.modes.push(panes::TABS);
         }
         if let Some(screen) = self.panes.focused() {
             self.modes.push(screen.mode());
@@ -11359,12 +11366,23 @@ diff --git a/tracked.txt b/tracked.txt
         assert_eq!(app.panes.focused_name(), "worktrees");
         app.press(Key::plain(Code::Char('[')));
         assert_eq!(app.panes.focused_name(), "files");
-        // A section of one says so rather than moving: the stack shares its
-        // slot with nothing.
+        // A section of one does not carry the pair at all: the stack shares
+        // its slot with nothing, so `tabs` is off the stack there and `]` is
+        // an unbound key rather than a key that refuses.
         app.press(Key::plain(Code::Char('5')));
+        assert!(
+            !app.modes.as_slice().contains(&panes::TABS.to_string()),
+            "{:?}",
+            app.modes.as_slice()
+        );
         app.press(Key::plain(Code::Char(']')));
         assert_eq!(app.panes.focused_name(), "stashes");
+        assert_eq!(app.message, "] is not bound — ? for the keys");
+        // Asked for by name anyway — a config file or an extension can — and
+        // the refusal is a sentence and not a silent no-op.
+        app.dispatch("tab.next");
         assert_eq!(app.message, "no second tab in this section");
+        assert_eq!(app.panes.focused_name(), "stashes");
         app.press(Key::plain(Code::Char('2')));
         // Headers derive live keys: the files *section* advertises `2`,
         // which is its first tab's, and names both tabs on the one row.
@@ -13727,6 +13745,7 @@ diff --git a/tracked.txt b/tracked.txt
         let keys = Host::new().keys;
         let mut modes = Modes::new();
         modes.push(panes::MODE);
+        modes.push(panes::TABS);
         modes.push("branches");
         assert_eq!(
             keys.resolve(&modes, &[Key::plain(Code::Char(']'))]),
@@ -13740,6 +13759,7 @@ diff --git a/tracked.txt b/tracked.txt
         // has files to jump between and no section to tab through.
         let mut in_diff = Modes::new();
         in_diff.push(panes::MODE);
+        in_diff.push(panes::TABS);
         in_diff.push("diff");
         assert_eq!(
             keys.resolve(&in_diff, &[Key::plain(Code::Char(']'))]),
@@ -13791,11 +13811,13 @@ diff --git a/tracked.txt b/tracked.txt
         fixture.screen = Screen::new(120, 24);
         fixture.dispatch("commits.focus");
         fixture.draw();
-        assert!(
-            !fixture.modes.as_slice().contains(&panes::MODE.to_string()),
-            "{:?}",
-            fixture.modes.as_slice()
-        );
+        for absent in [panes::MODE, panes::TABS] {
+            assert!(
+                !fixture.modes.as_slice().contains(&absent.to_string()),
+                "{absent} is on the stack: {:?}",
+                fixture.modes.as_slice()
+            );
+        }
         fixture.press(Key::plain(Code::Char(']')));
         assert_eq!(
             fixture.message, "] is not bound — ? for the keys",

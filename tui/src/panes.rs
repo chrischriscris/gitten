@@ -60,6 +60,18 @@
 /// a lie on the help panel.
 pub const MODE: &str = "panes";
 
+/// The mode the keyboard is in while the list it is on shares its section
+/// with another one — the name the keymap and `gitten.toml` use for the
+/// `[`/`]` bindings.
+///
+/// Its own mode rather than a corner of [`MODE`], and only ever pushed when
+/// the focused pane's section has a second *registered* tab: `stashes` shares
+/// its slot with nothing, a fixture launch has one list, and a `[` advertised
+/// in either place would be exactly the lie a mode-scoped help panel exists to
+/// prevent. The window has no sections and never pushes it, which is the other
+/// half of the same argument.
+pub const TABS: &str = "tabs";
+
 /// Body width at which the sidebar and the main region sit side by side.
 ///
 /// 40 columns draw an abbreviated sha, an author, a useful graph and a

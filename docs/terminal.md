@@ -152,9 +152,12 @@ commit — so the lists are grouped into `panes::SECTIONS` and take turns:
 One header row of tabs per section; the section with the keyboard takes every
 row the column has left. Only the tab a section is *showing* has a rectangle at
 all — the rest are hidden the way the narrow layout hides an unfocused pane, and
-are resized when next shown. `[`/`]` walk the tabs of the focused section; the
-numbers are unchanged, because `2` naming `files` reaches the files section
-through its first tab and every `<name>.focus` still means exactly one pane. A
+are resized when next shown. `[`/`]` walk the tabs of the focused section, in a
+`tabs` mode pushed only when there is a second registered tab to reach — so the
+help panel lists them exactly where they move, and the window, which has no
+sections, never pushes it. The numbers are unchanged, because `2` naming
+`files` reaches the files section through its first tab and every
+`<name>.focus` still means exactly one pane. A
 tab whose pane never registered is not drawn and not reachable, and a section
 with no registered tab collapses out of the column: a fixture launch draws one
 header, not five.

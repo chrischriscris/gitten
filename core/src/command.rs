@@ -947,15 +947,23 @@ impl Keymap {
 
         bind("panes", "ctrl-j", "pane.next");
         bind("panes", "ctrl-k", "pane.prev");
-        // lazygit's tab pair, in the same mode and for the same reason: the
-        // sidebar groups its lists into numbered sections and these walk the
-        // tabs *within* the focused one, while the numbers name a section and
-        // ctrl-j/ctrl-k walk every list in the column. Under the focused
-        // pane's own mode, so `[diff]`'s file jumps keep the keys where the
-        // main region has the keyboard — the sideways pair a diff needs is
-        // older and more urgent than a tab there is no section for.
-        bind("panes", "[", "tab.prev");
-        bind("panes", "]", "tab.next");
+
+        // lazygit's tab pair. A mode of its own rather than `panes`', because
+        // the two are different facts: `panes` is "there is more than one
+        // list to cycle", which every client with a sidebar has, and this is
+        // "the list with the keyboard shares its slot with another one",
+        // which only a client whose sidebar groups its lists into sections
+        // has. A client pushes it when that is true of the pane it focused,
+        // so the help panel lists these two exactly where they move —
+        // `stashes` shares its slot with nothing, and a `[` advertised there
+        // would be the one lie a mode-scoped help exists to prevent.
+        //
+        // Below the focused pane's own mode either way, so `[diff]`'s file
+        // jumps keep the keys where the main region has the keyboard: the
+        // sideways pair a diff needs is older and more urgent than a tab
+        // there is no section for.
+        bind("tabs", "[", "tab.prev");
+        bind("tabs", "]", "tab.next");
         k
     }
 
