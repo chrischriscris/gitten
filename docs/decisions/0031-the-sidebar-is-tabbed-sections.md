@@ -114,3 +114,24 @@ extensions. An empty section draws nothing, which is the same answer an absent
   fourteen would be readable and the tabs would be costing something. The
   layout is a `Layout` implementation, so that is a policy change and not a
   rewrite.
+
+## Superseded 2026-09: equal shares, like lazygit
+
+The expand-the-focused-section policy above was replaced: every section now
+keeps an equal share of the column (remainder to the earlier sections),
+focused or not, and focus is header highlight alone. The trigger was the
+reference itself — lazygit shows every section with real rows at all times,
+and the one-row collapsed sections meant anything read off an unfocused list
+needed the title bar or a keypress. Four sections at 6, 6, 5, 5 rows over a
+22-row body is glanceable in a way eight slices at three rows never was, and
+it is what the reference does, so the trade the old Consequences section
+defended is gone rather than rebalanced.
+
+Two companion changes landed with it. The number keys focus *sections*: a
+section head's `<name>.focus` lands on the tab that section is showing
+(`Panes::shown_tab`), so `2` with worktrees showing focuses worktrees. The
+`<name>.focus` names themselves are unchanged — no new command, no help
+churn — and `App::focus_named`, the walk, the cycle, the clicks and the tab
+keys all still move to exactly the pane they name. `Spot::open` and
+`Header::open` are removed: nothing outside the layout's own tests read
+them, and height no longer has an expanded state to record.
