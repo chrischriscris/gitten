@@ -33,20 +33,21 @@
 //! # Sections, and why the column is not eight slices
 //!
 //! The lists do not each get a slice of the column — they are grouped into
-//! [`SECTIONS`] and take turns. Eight equal slices of twenty-two rows is three
-//! rows each: a header, two commits, and nothing anybody can read. So a
-//! section draws **one header row of tabs**, and the section with the keyboard
-//! draws every row the column has left. `[`/`]` walk the tabs of the focused
-//! section; the number keys name a tab and reach its section through it, which
-//! is why `2` is still `files.focus` and not a command invented for the
-//! sidebar.
+//! [`SECTIONS`], and the sections split the column in equal shares, the way
+//! lazygit's panels do. Eight equal slices of twenty-two rows is three rows
+//! each: a header, two commits, and nothing anybody can read. Four sections
+//! is a header row of tabs plus four or five content rows each, and every
+//! section keeps its rows whether the keyboard is in it or not — the focused
+//! one is told apart by its header highlight alone. `[`/`]` walk the tabs of
+//! the focused section; the number keys name a section and reach the tab it
+//! is showing, which is why `2` is still `files.focus` and not a command
+//! invented for the sidebar.
 //!
-//! Which tab a section shows, and which section is open while the *diff* has
-//! the keyboard, are one fact at two scopes — "the one the keyboard sat on
-//! last" — so [`Panes`] keeps one recency list and [`Panes::spots`] resolves
-//! both from it, once per layout. A [`Layout`] is still a pure function of the
-//! spots and the body: [`Spot::shown`] and [`Spot::open`] are the registry's
-//! memory arriving as data, not state the geometry keeps.
+//! Which tab each section shows is "the one the keyboard sat on last" — so
+//! [`Panes`] keeps one recency list and [`Panes::spots`] resolves it once per
+//! layout, including while the *diff* has the keyboard. A [`Layout`] is still
+//! a pure function of the spots and the body: [`Spot::shown`] is the
+//! registry's memory arriving as data, not state the geometry keeps.
 //!
 //! A tab whose pane never registered is not drawn and not reachable — a
 //! fixture launch has one list, so it draws one header and not five — and a
@@ -94,11 +95,12 @@ const SIDEBAR_SHARE: usize = 32;
 /// Columns between the sidebar and the main region, owned by neither.
 pub const DIVIDER: usize = 1;
 
-/// One sidebar section: a group of lists that share a slot in the column and
-/// take turns in it, the way lazygit's panels do.
+/// One sidebar section: a group of lists that share a slot in the column,
+/// the way lazygit's panels do.
 ///
 /// A section draws one header row of tabs — one per *registered* list in it —
-/// and, when it holds the keyboard, every row the column has left. The tabs
+/// and every section gets an equal share of the column's rows below its
+/// header, focused or not. The tabs
 /// are the pane names, in the order they are written here, and the order they
 /// are written here is the order the keyboard walks: [`canonical_rank`] is the
 /// flattened index of this table and nothing else.
@@ -290,9 +292,6 @@ pub struct Header {
     /// drawn tab's `<name>.focus`, carried in on [`Spot::key`]. Empty when
     /// nothing is bound, in which case the header shows no key at all.
     pub key: String,
-    /// Whether this is the expanded section: the one with the keyboard, and
-    /// the only one with rows under its header.
-    pub open: bool,
     /// The tabs, left to right, in [`SECTIONS`] order.
     pub tabs: Vec<Tab>,
 }
@@ -383,10 +382,6 @@ pub struct Spot<'a> {
     /// keyboard sat on last. Exactly one registered spot per section carries
     /// it, and the main region always does: it is nobody's tab.
     pub shown: bool,
-    /// Whether this pane's section is the expanded one. Carried by every tab
-    /// of that section, so a layout that ignores tabs still finds it. False
-    /// for the main region, which is not a section.
-    pub open: bool,
     /// The key that focuses this pane, from the live keymap — data the
     /// registry does not hold, filled in by the caller. Empty is honest: an
     /// unbound pane advertises no key rather than a stale one.
@@ -439,7 +434,7 @@ fn sections<'s, 'a>(spots: &'s [Spot<'a>]) -> Vec<Vec<&'s Spot<'a>>> {
 /// Public because a replacement [`Layout`] that keeps the tabs is entitled to
 /// the same arithmetic — the alternative is a second copy of it, and a second
 /// copy is what puts the highlight and the click on different words.
-pub fn header(group: &[&Spot<'_>], rect: Rect, open: bool) -> Header {
+pub fn header(group: &[&Spot<'_>], rect: Rect) -> Header {
     let key = group
         .iter()
         .find_map(|s| (!s.key.is_empty()).then_some(s.key))
@@ -467,12 +462,7 @@ pub fn header(group: &[&Spot<'_>], rect: Rect, open: bool) -> Header {
         });
         x += full;
     }
-    Header {
-        rect,
-        key,
-        open,
-        tabs,
-    }
+    Header { rect, key, tabs }
 }
 
 /// The built-in layout: a sidebar column of tabbed sections beside one main
@@ -483,13 +473,14 @@ pub fn header(group: &[&Spot<'_>], rect: Rect, open: bool) -> Header {
 /// should look like at any width.
 ///
 /// The sidebar is lazygit's: every section gets one header row of tabs, and
-/// the **focused** section gets every row the column has left. Equal slices
-/// were the shape before this and they were worth abandoning — eight lists
-/// over twenty-two rows is three rows each, which is a viewport nobody can
-/// read. Only the tab a section is showing gets a rectangle; the tabs behind
-/// it are hidden exactly as the narrow layout hides an unfocused pane, and
-/// are resized when they are next shown. A main pane beyond the first is not
-/// the built-in's to place — the slot is reserved for one diff, and a second
+/// the sections split the column's remaining rows in equal shares — the
+/// focused one told apart by its header highlight alone. Eight lists over
+/// twenty-two rows is three rows each, which is a viewport nobody can read;
+/// four sections is a header plus four or five content rows each. Only the
+/// tab a section is showing gets a rectangle; the tabs behind it are hidden
+/// exactly as the narrow layout hides an unfocused pane, and are resized
+/// when they are next shown. A main pane beyond the first is not the
+/// built-in's to place — the slot is reserved for one diff, and a second
 /// one is a layout an extension owns.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BuiltinLayout;
@@ -530,37 +521,31 @@ impl Layout for BuiltinLayout {
                     "{body:?}: sidebar {sidebar_w} + divider leaves {diff_w}"
                 );
                 let n = groups.len();
-                // The expanded section: the one the keyboard sat in last, and
-                // the first when nothing says. A pure function of the spots,
-                // so `open` is the registry's memory and not the layout's.
-                let open = groups
-                    .iter()
-                    .position(|group| group.iter().any(|s| s.open))
-                    .unwrap_or(0);
+                // Equal shares, remainder to the earlier sections — the same
+                // convention the eight slices used before sections existed.
+                // A pure function of the spots and the body: no section is
+                // expanded, so every section's rectangle is decided here.
+                let base = body.height / n;
+                let rem = body.height % n;
                 let mut y = body.y;
                 for (i, group) in groups.iter().enumerate() {
-                    let left = body.y + body.height - y.min(body.y + body.height);
-                    // Below one row there is no header to draw, so the tail of
-                    // the column is dropped rather than drawn upside down.
-                    if left == 0 {
-                        break;
+                    let tall = base + usize::from(i < rem);
+                    // A section with no rows is dropped, tail first — the
+                    // same answer as a body too short for its headers, and
+                    // for the same reason: nothing is drawn upside down.
+                    if tall == 0 {
+                        continue;
                     }
-                    // Every section under this one still wants its header row.
-                    let below = n - 1 - i;
-                    let tall = match i == open {
-                        true => left.saturating_sub(below).max(1),
-                        false => 1,
-                    };
                     let rect = Rect {
                         x: body.x,
                         y,
                         width: sidebar_w,
                         height: tall,
                     };
-                    g.headers.push(header(group, rect.header(), i == open));
+                    g.headers.push(header(group, rect.header()));
                     // One rectangle per section, and it is the shown tab's:
-                    // a collapsed section is its header row and nothing else,
-                    // which is what makes a click on it a click on that pane.
+                    // a section is its header row and its content rows, which
+                    // is what makes a click on it a click on that pane.
                     if let Some(spot) = group.iter().find(|s| s.shown).or_else(|| group.first()) {
                         g.put(spot.name, rect);
                     }
@@ -590,7 +575,7 @@ impl Layout for BuiltinLayout {
                         .iter()
                         .find(|group| group.iter().any(|s| s.name == spot.name))
                     {
-                        g.headers.push(header(group, body.header(), true));
+                        g.headers.push(header(group, body.header()));
                     }
                 }
             }
@@ -617,12 +602,11 @@ pub struct Panes<T> {
     focused: usize,
     /// The sidebar names the keyboard has sat on, most recent first.
     ///
-    /// Two facts a tabbed sidebar cannot draw without and focus alone cannot
-    /// answer: which tab a *collapsed* section is showing, and which section
-    /// is open while the diff has the keyboard. Both are "the one the keyboard
-    /// sat on last", at two scopes, so one recency list is the whole of the
-    /// state — and it is a list of names rather than of indices, so a
-    /// registration cannot silently repoint it.
+    /// The fact a tabbed sidebar cannot draw without and focus alone cannot
+    /// answer: which tab each section is showing. It is "the one the keyboard
+    /// sat on last", so one recency list is the whole of the state — and it
+    /// is a list of names rather than of indices, so a registration cannot
+    /// silently repoint it.
     recent: Vec<String>,
     /// Bumped on every registration, so a cached [`Geometry`] can be keyed on
     /// it and a replacement invalidates the cache without a comparison per
@@ -668,7 +652,7 @@ impl<T> Panes<T> {
     }
 
     /// Marks a sidebar entry as the one the keyboard sat on last, which makes
-    /// it its section's shown tab and its section the open one. A main pane is
+    /// it its section's shown tab. A main pane is
     /// not a tab and does not disturb the sidebar's memory: the diff taking
     /// the keyboard leaves the sidebar showing exactly what it was showing,
     /// which is what `esc` back into the column expects to find.
@@ -885,46 +869,47 @@ impl<T> Panes<T> {
         self.focus_named(&tabs[next])
     }
 
+    /// The tab `group` is showing: the registered member the keyboard sat on
+    /// last, earliest registration breaking ties. The one comparison the
+    /// layout and the section-focus commands both read, so a header, a click
+    /// and a number key agree on what a section shows.
+    fn shown_of(&self, group: (Option<usize>, &str)) -> Option<&str> {
+        self.list_order()
+            .into_iter()
+            .filter(|n| self.group_of(n) == Some(group))
+            .min_by_key(|n| (self.recency(n), self.position(n)))
+    }
+
+    /// The tab `name`'s section is showing — the member the keyboard sat on
+    /// last. `None` for the main region and for a name nothing registered:
+    /// neither sits in a section. What the section-focus commands (the number
+    /// keys' `<name>.focus` names) land on, and what a section header
+    /// highlights.
+    pub fn shown_tab(&self, name: &str) -> Option<&str> {
+        self.shown_of(self.group_of(name)?)
+    }
+
     /// The registry as a [`Layout`] sees it, in registration order.
     ///
-    /// The two tab facts are resolved here, once per layout rather than once
-    /// per row: which tab each section shows, and which section is open. Both
-    /// come off the recency list, so the sidebar keeps showing what it was
-    /// showing when the diff takes the keyboard. [`Spot::key`] is left empty —
-    /// the keymap is the caller's to read, not the registry's.
+    /// Which tab each section shows is resolved here, once per layout rather
+    /// than once per row, off the recency list — so the sidebar keeps showing
+    /// what it was showing when the diff takes the keyboard. [`Spot::key`] is
+    /// left empty — the keymap is the caller's to read, not the registry's.
     pub fn spots(&self) -> Vec<Spot<'_>> {
-        let mut shown: Vec<&str> = Vec::new();
-        for name in self.list_order() {
-            let group = self.group_of(name);
-            match shown.iter().position(|s| self.group_of(s) == group) {
-                Some(at) => {
-                    if (self.recency(name), self.position(name))
-                        < (self.recency(shown[at]), self.position(shown[at]))
-                    {
-                        shown[at] = name;
-                    }
-                }
-                None => shown.push(name),
-            }
-        }
-        let open = shown
-            .iter()
-            .copied()
-            .min_by_key(|n| (self.recency(n), self.position(n)))
-            .and_then(|n| self.group_of(n));
         self.entries
             .iter()
             .enumerate()
             .map(|(i, e)| {
-                let sidebar = matches!(e.placement, Placement::Sidebar { .. });
+                // The main region is nobody's tab, so it is always shown.
+                let shown = match self.group_of(&e.name) {
+                    None => true,
+                    Some(group) => self.shown_of(group) == Some(e.name.as_str()),
+                };
                 Spot {
                     name: e.name.as_str(),
                     placement: e.placement,
                     focused: i == self.focused,
-                    // The main region is nobody's tab, so it is always shown
-                    // and never open.
-                    shown: !sidebar || shown.contains(&e.name.as_str()),
-                    open: sidebar && open.is_some() && self.group_of(&e.name) == open,
+                    shown,
                     key: "",
                 }
             })
@@ -1097,9 +1082,10 @@ mod tests {
 
             // The sidebar column is one column: every section slice shares x
             // and width, and their heights tile the body. With one registered
-            // tab per section here, that is five slices — and their heights
-            // are no longer a share each: the four the keyboard is not in are
-            // exactly their header row, and the commits' has everything left.
+            // tab per section here, that is five slices in equal shares —
+            // the remainder to the earlier sections — focused or not: no
+            // section expands, and the keyboard is told apart by highlight
+            // alone.
             let slices: Vec<Rect> = ["status", "files", "branches", "commits", "stashes"]
                 .iter()
                 .filter_map(|n| g.rect(n))
@@ -1115,27 +1101,19 @@ mod tests {
             );
             assert_eq!(
                 slices.iter().map(|r| r.height).collect::<Vec<_>>(),
-                [1, 1, 1, body.height - 4, 1],
-                "{width}: the focused section did not take the column"
+                [5, 5, 4, 4, 4],
+                "{width}: the sections did not split the column equally"
             );
 
             // One header per section, in the same order, each on its slice's
-            // one header row — and exactly one of them open.
+            // one header row — and every slice has content rows under it.
             assert_eq!(g.headers().len(), 5, "{width}: a section lost its header");
             for (h, slice) in g.headers().iter().zip(&slices) {
                 assert_eq!(h.rect, slice.header(), "{width}: {h:?}");
                 assert_eq!(h.tabs.len(), 1, "{width}: {h:?}");
                 assert!(h.tabs[0].active, "{width}: a lone tab is not active");
+                assert!(slice.content().height > 0, "{width}: {h:?} drew no rows");
             }
-            assert_eq!(
-                g.headers().iter().filter(|h| h.open).count(),
-                1,
-                "{width}: two sections cannot both be open"
-            );
-            assert!(
-                g.headers()[3].open,
-                "{width}: the focused section is not the open one"
-            );
         }
     }
 
@@ -1222,7 +1200,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_open_section_gets_rows_and_only_its_shown_tab_is_placed() {
+    fn every_section_gets_an_equal_share_and_only_shown_tabs_are_placed() {
         let layout = BuiltinLayout;
         let body = Rect {
             x: 0,
@@ -1244,22 +1222,22 @@ mod tests {
             assert_eq!(g.rect(behind), None, "{behind} kept a rectangle");
         }
 
-        // Heights: a header row each, and everything left to the section the
-        // keyboard is in.
-        assert_eq!(g.rect("files").unwrap().height, 1);
-        assert_eq!(g.rect("branches").unwrap().height, 1);
-        assert_eq!(g.rect("commits").unwrap().height, body.height - 3);
-        assert_eq!(g.rect("stashes").unwrap().height, 1);
-        assert!(g.headers()[2].open, "{:?}", g.headers());
+        // Heights: a header row each, and an equal share of the rest — 22
+        // rows over four sections is 6, 6, 5, 5, remainder to the earlier
+        // sections. The keyboard being in the commits section changes
+        // nothing about the arithmetic: focus is highlight, not height.
+        assert_eq!(g.rect("files").unwrap().height, 6);
+        assert_eq!(g.rect("branches").unwrap().height, 6);
+        assert_eq!(g.rect("commits").unwrap().height, 5);
+        assert_eq!(g.rect("stashes").unwrap().height, 5);
 
         // Tabbing along a section moves the shown tab and the rectangle with
-        // it, and leaves the section open.
+        // it, and the section keeps its share.
         assert!(p.cycle_tab(1));
         assert_eq!(p.focused_name(), "reflog");
         let g = layout.arrange(&p.spots(), body);
         assert_eq!(g.rect("commits"), None, "the tab behind kept its rows");
-        assert_eq!(g.rect("reflog").unwrap().height, body.height - 3);
-        assert!(g.headers()[2].open);
+        assert_eq!(g.rect("reflog").unwrap().height, 5);
         assert_eq!(active(&g.headers()[2]), Some("reflog"));
         // It wraps within its own section and never leaves it.
         assert!(p.cycle_tab(1));
@@ -1277,10 +1255,9 @@ mod tests {
         assert_eq!(p.focused_name(), "diff");
 
         // The diff holding the keyboard leaves the sidebar showing what it
-        // was showing — `reflog`, in the section that stays open.
+        // was showing — `reflog`, in its section's unchanged share.
         let g = layout.arrange(&p.spots(), body);
-        assert_eq!(g.rect("reflog").unwrap().height, body.height - 3);
-        assert!(g.headers()[2].open, "the open section moved with the diff");
+        assert_eq!(g.rect("reflog").unwrap().height, 5);
         assert_eq!(active(&g.headers()[2]), Some("reflog"));
     }
 
@@ -1309,11 +1286,10 @@ mod tests {
             ["commits"],
             "an absent reflog was advertised as a tab"
         );
-        assert!(g.headers()[0].open);
         assert_eq!(g.rect("commits").unwrap().height, body.height);
 
         // Half a section: `tags` without `branches` or `remotes` is the whole
-        // header, and it is the tab that gets the rows.
+        // header, and the two sections split the column equally — 11 and 11.
         let mut p = Panes::new();
         p.register("tags", Placement::sidebar("tags"), "tags");
         p.register("files", Placement::sidebar("files"), "files");
@@ -1328,8 +1304,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["tags"]
         );
-        assert_eq!(g.rect("tags").unwrap().height, body.height - 1);
-        assert_eq!(g.rect("files").unwrap().height, 1);
+        assert_eq!(g.rect("tags").unwrap().height, 11);
+        assert_eq!(g.rect("files").unwrap().height, 11);
         assert_eq!(p.section_tabs("tags"), ["tags"]);
 
         // An ungrouped name is a section of its own at the tail, never tabbed
@@ -1391,10 +1367,12 @@ mod tests {
         assert_eq!(g.hit_tab(21, 1), Some("worktrees"));
         assert_eq!(g.hit_tab(22, 1), None);
         assert_eq!(g.hit(10, 1), Some("files"), "the header is its section's");
-        // A row inside a section rather than on its header has no tabs on it;
-        // row 2 is the *branches* header, and it answers for its own.
-        assert_eq!(g.hit_tab(5, 2), Some("branches"));
+        // A row inside a section rather than on its header has no tabs on it:
+        // row 2 is the files section's content, and the branches header is
+        // down at row 7 now that every section keeps its own share.
+        assert_eq!(g.hit_tab(5, 2), None);
         assert_eq!(g.hit_tab(5, 6), None);
+        assert_eq!(g.hit_tab(5, 7), Some("branches"));
         // And the header a pane's rows sit under is findable by name, which
         // is how the paint knows a section header from a lone pane's.
         assert_eq!(g.header_of("worktrees").map(|h| h.rect.y), Some(1));
